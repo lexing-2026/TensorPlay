@@ -7,18 +7,18 @@ namespace tensorplay {
 namespace cuda {
 namespace {
 
-template <typename T>
+template <typename T, int WarpSize = 32>
 __device__ inline T warpReduceMax(T val) {
 #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
+    for (int offset = WarpSize / 2; offset > 0; offset >>= 1)
         val = max(val, __shfl_down_sync(0xffffffffffffffffull, val, offset));
     return val;
 }
 
-template <typename T>
+template <typename T, int WarpSize = 32>
 __device__ inline T warpReduceSum(T val) {
 #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
+    for (int offset = WarpSize / 2; offset > 0; offset >>= 1)
         val += __shfl_down_sync(0xffffffffffffffffull, val, offset);
     return val;
 }

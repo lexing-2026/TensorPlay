@@ -71,6 +71,89 @@ void run_mha_fwd(Flash_fwd_params& params, cudaStream_t stream,
     } \
   } while (0)
 
+#if defined(USE_ROCM)
+// Host-side AMD architecture probe.  Device code picks the WMMA/MFMA path
+// with __gfx*__ macros at compile time; host code (launch parameter choice)
+// cannot, so it asks the runtime once per device.  Returns true for the
+// CDNA families that expose MFMA but no RDNA3 wave32 WMMA instruction.
+static bool tp_is_cdna_device() {
+    static thread_local int cached_device = -1;
+    static thread_local bool is_cdna = false;
+    int device = 0;
+    if (hipGetDevice(&device) != hipSuccess) return false;
+    if (cached_device != device) {
+        hipDeviceProp_t prop{};
+        if (hipGetDeviceProperties(&prop, device) == hipSuccess) {
+            const char* arch = prop.gcnArchName;
+            is_cdna = (strncmp(arch, "gfx90a", 6) == 0) ||
+                      (strncmp(arch, "gfx942", 6) == 0) ||
+                      (strncmp(arch, "gfx950", 6) == 0);
+        }
+        cached_device = device;
+    }
+    return is_cdna;
+}
+#endif
+
+#if defined(USE_ROCM) && \
+    (defined(__gfx90a__) || defined(__gfx942__) || defined(__gfx950__))
+// MFMA primitives for the CDNA flash-attention kernel.  The wave64
+// f32_16x16x16_f16 matrix instruction distributes one 16x16x16 product
+// over 64 lanes: each lane holds four A elements (one 16-column row slice),
+// four B elements (one 16-row column slice) and four f32 accumulators.
+// Operand addressing follows the instruction's data layout documented in
+// the CDNA ISA reference.
+using tp_mfma_f16x4 = _Float16 __attribute__((ext_vector_type(4)));
+using tp_mfma_f32x4 = float __attribute__((ext_vector_type(4)));
+
+__device__ inline tp_mfma_f32x4 tp_mfma_f32_f16(
+    tp_mfma_f16x4 a, tp_mfma_f16x4 b, tp_mfma_f32x4 c) {
+    return __builtin_amdgcn_mfma_f32_16x16x16f16(a, b, c, 0, 0, 0);
+}
+
+// Load one 16x16 row-major half tile from shared memory into the MFMA A
+// operand layout (row = lane % 16, column = 4*(lane/16) + i).
+__device__ inline tp_mfma_f16x4 tp_mfma_load_a(
+    const __half* base, int ldm, int lane) {
+    const _Float16* p = reinterpret_cast<const _Float16*>(base);
+    tp_mfma_f16x4 r;
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+        r[i] = p[(lane % 16) * ldm + 4 * (lane / 16) + i];
+    return r;
+}
+
+// Load one 16x16 half tile as the MFMA B operand (row = i + 4*(lane/16),
+// column = lane % 16).  `base` points at the row-major tile start.
+__device__ inline tp_mfma_f16x4 tp_mfma_load_b(
+    const __half* base, int ldm, int lane) {
+    const _Float16* p = reinterpret_cast<const _Float16*>(base);
+    tp_mfma_f16x4 r;
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+        r[i] = p[(i + 4 * (lane / 16)) * ldm + (lane % 16)];
+    return r;
+}
+
+// Store four f32 accumulator elements into a row-major float tile.
+__device__ inline void tp_mfma_store_c(
+    float* base, int ldm, int lane, tp_mfma_f32x4 c) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+        base[(i + 4 * (lane / 16)) * ldm + (lane % 16)] = c[i];
+}
+
+// Read four f32 accumulator elements from a row-major float tile.
+__device__ inline tp_mfma_f32x4 tp_mfma_load_c(
+    const float* base, int ldm, int lane) {
+    tp_mfma_f32x4 r;
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+        r[i] = base[(i + 4 * (lane / 16)) * ldm + (lane % 16)];
+    return r;
+}
+#endif
+
 
 // Scaled dot-product attention forward.
 // References:
@@ -1059,6 +1142,230 @@ __global__ void sdpa_wmma_flash_half_4warp_kernel(
     }
   }
 }
+
+#if defined(USE_ROCM)
+// CDNA (MI200/MI300/MI350) flash attention over the wave64 MFMA matrix
+// instruction.  The tile decomposition matches the WMMA 4-warp kernel but
+// each software warp is a full 64-lane wavefront: one warp owns a 16-column
+// key strip for QK^T and a 32-column output strip for P@V, with the MFMA
+// accumulator covering 16x16 tiles in four elements per lane.
+//
+// The kernel is compiled for every AMD target so host code can reference it
+// unconditionally; on non-CDNA targets the body is empty because the wave32
+// WMMA kernel handles those parts.  Host code selects the CDNA body at runtime
+// through the device-architecture probe and only launches it there.
+__global__ void sdpa_mfma_flash_half_4warp_kernel(
+    const tensorplay::Half* __restrict__ q,
+    const tensorplay::Half* __restrict__ k,
+    const tensorplay::Half* __restrict__ v,
+    tensorplay::Half* __restrict__ out,
+    int64_t B, int64_t H, int64_t T, int64_t D, float scale,
+    bool is_causal) {
+#if defined(__gfx90a__) || defined(__gfx942__) || defined(__gfx950__)
+  constexpr int q_tile = 64;
+  constexpr int k_tile = 64;
+  constexpr int tile_d = 128;
+  constexpr int warps = 4;
+  constexpr int warp_size = 64;
+  constexpr int threads = warps * warp_size;
+  constexpr unsigned long long full_mask = 0xffffffffffffffffull;
+  constexpr float log2e = 1.4426950408889634f;
+
+  extern __shared__ unsigned char smem_raw[];
+  TpWmmaFlashShared& smem = *reinterpret_cast<TpWmmaFlashShared*>(smem_raw);
+  const int thread = threadIdx.x;
+  const int warp = thread / warp_size;
+  const int lane = thread % warp_size;
+  const int64_t bh = static_cast<int64_t>(blockIdx.x);
+  const int64_t q0 = static_cast<int64_t>(blockIdx.y) * q_tile;
+  const int64_t bh_base = bh * T * D;
+
+  for (int idx = thread; idx < q_tile * tile_d; idx += threads) {
+    const int qr = idx / tile_d;
+    const int d = idx % tile_d;
+    const int64_t qg = q0 + qr;
+    smem.q[qr][d] =
+        (qg < T && d < D)
+        ? *reinterpret_cast<const __half*>(q + bh_base + qg * D + d)
+        : __float2half(0.f);
+  }
+  if (thread < q_tile) {
+    smem.row_max[thread] = -INFINITY;
+    smem.row_sum[thread] = 0.f;
+    smem.row_alpha[thread] = 0.f;
+  }
+  __syncthreads();
+
+  const int64_t last_k = is_causal ? min(T, q0 + q_tile) : T;
+
+  tp_mfma_f32x4 accum[4][2];
+  if (warp < warps) {
+#pragma unroll
+    for (int qr_tile = 0; qr_tile < 4; ++qr_tile)
+#pragma unroll
+      for (int d_tile = 0; d_tile < 2; ++d_tile)
+        accum[qr_tile][d_tile] = tp_mfma_f32x4{0.f, 0.f, 0.f, 0.f};
+  }
+  bool first_tile = true;
+
+  for (int64_t k0 = 0; k0 < last_k; k0 += k_tile) {
+    for (int idx = thread; idx < k_tile * tile_d; idx += threads) {
+      const int kr = idx / tile_d;
+      const int d = idx % tile_d;
+      const int64_t kg = k0 + kr;
+      const bool valid = kg < T && d < D;
+      smem.k[kr][d] = valid
+          ? *reinterpret_cast<const __half*>(k + bh_base + kg * D + d)
+          : __float2half(0.f);
+      smem.v[kr][d] = valid
+          ? *reinterpret_cast<const __half*>(v + bh_base + kg * D + d)
+          : __float2half(0.f);
+    }
+    __syncthreads();
+
+    // QK^T: warp w owns the 16-column key strip starting at n0 = warp*16
+    // and walks the four 16-row query strips.
+    if (warp < warps) {
+      const int n0 = warp * 16;
+#pragma unroll
+      for (int m0 = 0; m0 < q_tile; m0 += 16) {
+        tp_mfma_f32x4 c_frag = tp_mfma_f32x4{0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+        for (int d0 = 0; d0 < tile_d; d0 += 16) {
+          const tp_mfma_f16x4 a_frag = tp_mfma_load_a(
+              &smem.q[m0][d0], tile_d, lane);
+          // K strip transposed: B[k][n] = K[n0+n][d0+k].
+          const tp_mfma_f16x4 b_frag = tp_mfma_load_b(
+              &smem.k[n0][d0], tile_d, lane);
+          c_frag = tp_mfma_f32_f16(a_frag, b_frag, c_frag);
+        }
+        tp_mfma_store_c(&smem.score[m0][0], k_tile, lane, c_frag);
+      }
+    }
+    __syncthreads();
+
+    // Online softmax: one warp owns 16 rows; the 64 lanes walk the 64-key
+    // tile in a single pass.
+    if (warp < warps) {
+      const int row_begin = warp * 16;
+#pragma unroll 1
+      for (int qr = row_begin; qr < row_begin + 16; ++qr) {
+        const int64_t qg = q0 + qr;
+        float maximum = -INFINITY;
+        for (int kk = lane; kk < k_tile; kk += warp_size) {
+          const int64_t kg = k0 + kk;
+          float score = smem.score[qr][kk] * scale;
+          if ((is_causal && kg > qg) || kg >= T || qg >= T)
+            score = -INFINITY;
+          maximum = max(maximum, score);
+        }
+        maximum = warpReduceMax<float, warp_size>(maximum);
+        maximum = __shfl_sync(full_mask, maximum, 0);
+
+        const float old_max = smem.row_max[qr];
+        const float new_max = max(old_max, maximum);
+        const float alpha = isfinite(old_max)
+            ? exp2f((old_max - new_max) * log2e)
+            : 0.f;
+        float partial_sum = 0.f;
+        for (int kk = lane; kk < k_tile; kk += warp_size) {
+          const int64_t kg = k0 + kk;
+          const float score = smem.score[qr][kk] * scale;
+          const float p = ((is_causal && kg > qg) || kg >= T || qg >= T)
+              ? 0.f
+              : exp2f((score - new_max) * log2e);
+          smem.probability[qr][kk] = __float2half(p);
+          partial_sum += p;
+        }
+        partial_sum = warpReduceSum<float, warp_size>(partial_sum);
+        partial_sum = __shfl_sync(full_mask, partial_sum, 0);
+        if (lane == 0) {
+          smem.row_max[qr] = new_max;
+          smem.row_sum[qr] = smem.row_sum[qr] * alpha + partial_sum;
+          smem.row_alpha[qr] = alpha;
+        }
+      }
+    }
+    __syncthreads();
+
+    if (!first_tile && warp < warps) {
+#pragma unroll
+      for (int qr_tile = 0; qr_tile < 4; ++qr_tile) {
+#pragma unroll
+        for (int d_tile = 0; d_tile < 2; ++d_tile) {
+          tp_mfma_f32x4& c = accum[qr_tile][d_tile];
+#pragma unroll
+          for (int i = 0; i < 4; ++i) {
+            const int row = qr_tile * 16 + i + 4 * (lane / 16);
+            c[i] *= smem.row_alpha[row];
+          }
+        }
+      }
+    }
+
+    // P@V: warp w covers two 16-column output tiles and all four 16-row
+    // strips of its 64-row query block.
+    if (warp < warps) {
+      const int d0 = warp * 32;
+#pragma unroll
+      for (int qr_tile = 0; qr_tile < 4; ++qr_tile) {
+        const int qr0 = qr_tile * 16;
+#pragma unroll
+        for (int d_tile = 0; d_tile < 2; ++d_tile) {
+          tp_mfma_f32x4& c = accum[qr_tile][d_tile];
+#pragma unroll
+          for (int k1 = 0; k1 < k_tile; k1 += 16) {
+            const tp_mfma_f16x4 p_frag = tp_mfma_load_a(
+                &smem.probability[qr0][k1], k_tile, lane);
+            const tp_mfma_f16x4 v_frag = tp_mfma_load_b(
+                &smem.v[k1][d0 + d_tile * 16], tile_d, lane);
+            c = tp_mfma_f32_f16(p_frag, v_frag, c);
+          }
+        }
+      }
+    }
+    __syncthreads();
+    first_tile = false;
+  }
+
+  // Normalize and store from registers.
+  if (warp < warps) {
+    const int d0 = warp * 32;
+#pragma unroll
+    for (int qr_tile = 0; qr_tile < 4; ++qr_tile) {
+      const int qr0 = qr_tile * 16;
+#pragma unroll
+      for (int d_tile = 0; d_tile < 2; ++d_tile) {
+        const tp_mfma_f32x4& c = accum[qr_tile][d_tile];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          const int local_row = i + 4 * (lane / 16);
+          const int local_col = lane % 16;
+          const int qr = qr0 + local_row;
+          const int d = d0 + d_tile * 16 + local_col;
+          const float denom = smem.row_sum[qr];
+          out[bh_base + (q0 + qr) * D + d] = tp_half_from_cuda(
+              __float2half(denom > 0.f ? c[i] / denom : 0.f));
+        }
+      }
+    }
+  }
+#else
+  // Non-CDNA AMD targets: the wave32 WMMA kernel owns this path, so this
+  // body is intentionally empty; silence the unused-parameter diagnostics.
+  (void)q;
+  (void)k;
+  (void)v;
+  (void)out;
+  (void)B;
+  (void)H;
+  (void)T;
+  (void)D;
+  (void)scale;
+  (void)is_causal;
+#endif  // CDNA MFMA path
+}
+#endif  // ROCm MFMA flash kernel
 
 // Aligned native flash path for the benchmark's Llama head shape.  This is
 // symbols are part of the dependency graph.
@@ -2390,7 +2697,23 @@ Tensor sdpa_kernel_cuda_plain(const Tensor& query, const Tensor& key,
     }
 #endif
     if (impl == 0 && flash_tensor_core_dtype && tensor_cores_available) {
+#if defined(USE_ROCM)
+      if (tp_is_cdna_device()) {
+        // CDNA has no wave32 WMMA instruction and the wave32-shaped kernels
+        // below rely on warp-scoped shuffles that span half a wavefront
+        // there, so the matrix paths are restricted to the wave64 MFMA flash
+        // (one exact shape) and the BLAS GEMM schedule for everything else.
+        if (dtype == DType::Float16 && D == 128 && (T % 64) == 0) {
+          impl = 8;
+        } else {
+          impl = 2;
+        }
+      } else {
+        impl = 5;
+      }
+#else
       impl = 5;
+#endif
     } else if (impl == 0 && D <= 128) {
       // Scalar-precision attention outgrows the warp-per-row flash quickly:
       // the GEMM-native route runs tuned BLAS kernels and wins from short
@@ -2535,6 +2858,14 @@ Tensor sdpa_kernel_cuda_plain(const Tensor& query, const Tensor& key,
                "sdpa impl=8 (4-warp FP16 WMMA flash) requires dtype=float16 and D=128");
     }
     if ((T & 63) != 0) {
+#if defined(USE_ROCM)
+      // CDNA: the tail-shape wave32 WMMA prototype is unsafe on a wave64
+      // machine, so the GEMM schedule answers every tail instead.
+      if (tp_is_cdna_device()) {
+        return sdpa_gemm_native<tensorplay::Half>(
+            q, k, v, B, H, H, T, T, D, is_causal);
+      }
+#endif
       constexpr int q_tile = 16;
       dim3 grid((unsigned)(B * H),
                 (unsigned)((T + q_tile - 1) / q_tile));
@@ -2549,11 +2880,18 @@ Tensor sdpa_kernel_cuda_plain(const Tensor& query, const Tensor& key,
     static bool shared_memory_configured = false;
     if (!shared_memory_configured) {
 #if defined(USE_ROCM)
+      // CDNA launches the wave64 MFMA kernel with four 64-lane warps; other
+      // AMD targets and CUDA launch the wave32 WMMA kernel.  Both kernels
+      // share the same shared-memory descriptor, so a single attribute set
+      // covers the active one.
+      const bool use_mfma = tp_is_cdna_device();
       const void* flash_4warp_kernel =
-          reinterpret_cast<const void*>(&sdpa_wmma_flash_half_4warp_kernel);
+          use_mfma
+              ? reinterpret_cast<const void*>(&sdpa_mfma_flash_half_4warp_kernel)
+              : reinterpret_cast<const void*>(&sdpa_wmma_flash_half_4warp_kernel);
 #else
       const void* flash_4warp_kernel =
-          reinterpret_cast<const void*>(sdpa_wmma_flash_half_4warp_kernel);
+          reinterpret_cast<const void*>(&sdpa_wmma_flash_half_4warp_kernel);
 #endif
       TP_CUDA_CHECK(cudaFuncSetAttribute(
           flash_4warp_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -2563,12 +2901,31 @@ Tensor sdpa_kernel_cuda_plain(const Tensor& query, const Tensor& key,
     constexpr int q_tile = 64;
     dim3 grid((unsigned)(B * H),
               (unsigned)((T + q_tile - 1) / q_tile));
+#if defined(USE_ROCM)
+    const bool use_mfma = tp_is_cdna_device();
+    if (use_mfma) {
+      sdpa_mfma_flash_half_4warp_kernel<<<
+          grid, 256, sizeof(TpWmmaFlashShared),
+          getCurrentCUDAStream().stream()>>>(
+          q.data_ptr<tensorplay::Half>(), k.data_ptr<tensorplay::Half>(),
+          v.data_ptr<tensorplay::Half>(), out.data_ptr<tensorplay::Half>(),
+          B, H, T, D, scale, is_causal);
+    } else {
+      sdpa_wmma_flash_half_4warp_kernel<<<
+          grid, 128, sizeof(TpWmmaFlashShared),
+          getCurrentCUDAStream().stream()>>>(
+          q.data_ptr<tensorplay::Half>(), k.data_ptr<tensorplay::Half>(),
+          v.data_ptr<tensorplay::Half>(), out.data_ptr<tensorplay::Half>(),
+          B, H, T, D, scale, is_causal);
+    }
+#else
     sdpa_wmma_flash_half_4warp_kernel<<<
         grid, 128, sizeof(TpWmmaFlashShared),
         getCurrentCUDAStream().stream()>>>(
         q.data_ptr<tensorplay::Half>(), k.data_ptr<tensorplay::Half>(),
         v.data_ptr<tensorplay::Half>(), out.data_ptr<tensorplay::Half>(),
         B, H, T, D, scale, is_causal);
+#endif
     TP_CUDA_CHECK(cudaGetLastError());
     return out;
 #else
@@ -2597,6 +2954,18 @@ Tensor sdpa_kernel_cuda_plain(const Tensor& query, const Tensor& key,
     return std::get<0>(
         sdpa_fused_forward_cuda(q, k, v, launch, scale, /*enable_gqa=*/false));
 #elif defined(USE_ROCM) || !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 700)
+#if defined(USE_ROCM)
+    // CDNA has no wave32 WMMA instruction; the aligned flash body below is
+    // wave32-shaped and unsafe there, so the GEMM schedule answers instead.
+    if (tp_is_cdna_device()) {
+      if (dtype == DType::Float16) {
+        return sdpa_gemm_native<tensorplay::Half>(
+            q, k, v, B, H, H, T, T, D, is_causal);
+      }
+      return sdpa_gemm_native<tensorplay::BFloat16>(
+          q, k, v, B, H, H, T, T, D, is_causal);
+    }
+#endif
     Tensor out = Tensor::empty({B, H, T, D}, dtype, q.device());
     // The native 64x64 schedule deliberately requires the original aligned
     // Llama shape.  Keep the older tail-safe kernel for arbitrary lengths.
@@ -2643,6 +3012,16 @@ Tensor sdpa_kernel_cuda_plain(const Tensor& query, const Tensor& key,
 #endif  // TP_HAS_NATIVE_CUTE_FLASH
   } else if (impl == 4) {
 #if defined(USE_ROCM) || !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 700)
+#if defined(USE_ROCM)
+    if (tp_is_cdna_device()) {
+      if (dtype != DType::Float16 || D != 128) {
+        TP_THROW(NotImplementedError,
+                 "sdpa impl=4 (FP16 WMMA flash) requires dtype=float16 and D=128");
+      }
+      return sdpa_gemm_native<tensorplay::Half>(
+          q, k, v, B, H, H, T, T, D, is_causal);
+    }
+#endif
     Tensor out = Tensor::empty({B, H, T, D}, dtype, q.device());
     if (dtype != DType::Float16 || D != 128) {
       TP_THROW(NotImplementedError,

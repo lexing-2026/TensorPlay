@@ -1,7 +1,6 @@
 #pragma once
 
-// WMMA primitive subset for the HIP toolchain, built on the wave32
-// f32_16x16x16_f16 WMMA instruction of RDNA3 targets.  The public surface
+// WMMA primitive subset for the HIP toolchain.  The public surface
 // (fragment / load_matrix_sync / store_matrix_sync / fill_fragment /
 // mma_sync) matches the CUDA-toolchain primitive API restricted to the
 // shapes and layouts the attention kernels use:
@@ -9,8 +8,18 @@
 //   fragment<matrix_b, 16, 16, 16, __half, row_major | col_major>
 //   fragment<accumulator, 16, 16, 16, float>
 //
-// Per-wave instruction semantics (one wave = 32 lanes computes one 16x16x16
-// product D = A*B + C):
+// On RDNA3 the wave32 f32_16x16x16_f16 WMMA instruction backs the
+// fragment/mma surface directly.  On CDNA targets (gfx90a/gfx942/gfx950)
+// that instruction does not exist; the same fragment layout is instead
+// evaluated with warp-shuffle broadcasts so kernels written against this
+// surface keep compiling and stay numerically correct on every AMD
+// target.  The shuffle path is per-warp: each lane accumulates the eight
+// output elements it owns, fetching the A row and B column it needs from the
+// lanes that loaded them, so no shared-memory staging or block-wide
+// synchronization is involved.
+//
+// Per-wave instruction semantics (one wave = 32 lanes computes one
+// 16x16x16 product D = A*B + C):
 //   A operand: lane 2*m     slot k  -> A(m, k)   for m in [0, 8)   (upper half)
 //              lane 2*m + 17 slot k  -> A(m, k)   for m in [8, 16)  (lower half)
 //              remaining lanes are not read
@@ -47,9 +56,17 @@ namespace wmma_rocm_detail {
 using f16x16 = _Float16 __attribute__((ext_vector_type(16)));
 using f32x8 = float __attribute__((ext_vector_type(8)));
 
+// CDNA targets have no wave32 WMMA instruction; the mma_sync entry point
+// falls back to the shuffle-evaluated path below on those architectures.
+#if defined(__gfx90a__) || defined(__gfx942__) || defined(__gfx950__)
+#define TP_WMMA_CDNA_FALLBACK 1
+#endif
+
+#ifndef TP_WMMA_CDNA_FALLBACK
 __device__ inline f32x8 wmma_f32_f16(f16x16 a, f16x16 b, f32x8 c) {
     return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
 }
+#endif
 
 // A-operand matrix row served by a lane; lanes the instruction never reads
 // report -1.
@@ -214,6 +231,39 @@ __device__ inline void fill_fragment(
     for (int i = 0; i < 16; ++i) f.x[i] = v;
 }
 
+#ifdef TP_WMMA_CDNA_FALLBACK
+// Shuffle-evaluated 16x16x16 f16 product for CDNA targets.  Each lane
+// owns the same accumulator coordinates as the RDNA3 path; the A row for
+// that coordinate lives in one source lane and the B column in another,
+// so both operands are fetched per element with warp broadcasts.  All
+// lanes of the warp must reach this helper together.
+template <int M, int N, int K, class LayoutA, class LayoutB>
+__device__ inline void mma_sync(
+    fragment<accumulator, M, N, K, float, void>& d,
+    const fragment<matrix_a, M, N, K, __half, LayoutA>& a,
+    const fragment<matrix_b, M, N, K, __half, LayoutB>& b,
+    const fragment<accumulator, M, N, K, float, void>& c) {
+    constexpr unsigned long long full_mask = 0x00000000ffffffffull;
+    const int lane = static_cast<int>(threadIdx.x & 31u);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        int row, col;
+        wmma_rocm_detail::acc_coord(lane, i, &row, &col);
+        // A row `row` is loaded by lane 2*row (row < 8) or 2*(row-8)+17.
+        const int src_a = row < 8 ? 2 * row : 2 * (row - 8) + 17;
+        float acc = c.x[i];
+#pragma unroll
+        for (int k = 0; k < 16; ++k) {
+            const float av =
+                __shfl_sync(full_mask, __half2float(a.x[k]), src_a);
+            const float bv =
+                __shfl_sync(full_mask, __half2float(b.x[k]), col);
+            acc += av * bv;
+        }
+        d.x[i] = acc;
+    }
+}
+#else
 // d = a * b + c, one 16x16x16 product per wave.
 template <int M, int N, int K, class LayoutA, class LayoutB>
 __device__ inline void mma_sync(
@@ -226,6 +276,7 @@ __device__ inline void mma_sync(
 #pragma unroll
     for (int i = 0; i < 8; ++i) d.x[i] = r[i];
 }
+#endif
 
 }  // namespace wmma
 }  // namespace nvcuda
