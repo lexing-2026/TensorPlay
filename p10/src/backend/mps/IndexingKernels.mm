@@ -2,15 +2,22 @@
 #include "Dispatcher.h"
 #include "Scalar.h"
 #include "Exception.h"
-#include "OperationUtils.h"
 
 #include "backend/mps/MPSDevice.h"
+#include "backend/mps/MetalShaderLibrary.h"
+#include "backend/mps/MetalUtils.h"
+#include "backend/mps/MPSStream.h"
+
+#include <Metal/Metal.h>
 
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace tensorplay {
 namespace mps {
+
+static auto& lib = MetalShaderLibrary::getBundledLibrary();
 
 namespace {
 
@@ -26,7 +33,8 @@ int64_t wrap_dim(int64_t dim, int64_t ndim) {
 }
 
 // Returns a contiguous int64 copy of `index` with negative indices wrapped
-// and every entry bounds-checked against `dim_size`.
+// and every entry checked against `dim_size`. The returned tensor is what the
+// gather/scatter shaders read, so they can assume all entries are in bounds.
 Tensor normalize_index(const Tensor& index, int64_t dim_size) {
   Tensor idx = index;
   if (idx.dtype() != DType::Int64) {
@@ -46,77 +54,45 @@ Tensor normalize_index(const Tensor& index, int64_t dim_size) {
   return idx;
 }
 
-// Outer/inner element counts around `dim` for a given shape.
-void outer_inner(const std::vector<int64_t>& shape, int64_t dim,
-                 int64_t& outer, int64_t& inner) {
-  outer = 1;
-  inner = 1;
-  for (int64_t i = 0; i < dim; ++i) outer *= shape[i];
-  for (size_t i = dim + 1; i < shape.size(); ++i) inner *= shape[i];
+// Dispatches a dense indexing kernel that reads one element of `input` per
+// output element. `length` is the number of threads (output numel for
+// index_select/gather, index numel for scatter).
+void dispatch_indexing(const std::string& kernel, const Tensor& output,
+                       const Tensor& input, const Tensor& index,
+                       int64_t inner, int64_t dim_size, int64_t idx_dim,
+                       int64_t length) {
+  auto pso = lib.getPipelineStateForFunc(kernel);
+  MPSStream* stream = getCurrentMPSStream();
+  dispatch_sync_with_rethrow(stream->queue(), ^() {
+    @autoreleasepool {
+      stream->endKernelCoalescing();
+      auto encoder = stream->commandEncoder();
+      [encoder setComputePipelineState:pso];
+      mtl_setArgs(encoder, output, input, index, inner, dim_size, idx_dim);
+      mtl_dispatch1DJob(encoder, pso, static_cast<NSUInteger>(length));
+      stream->synchronize(SyncType::COMMIT_AND_WAIT);
+    }
+  });
 }
 
-double readScalar(const void* ptr, DType dtype) {
-  switch (dtype) {
-    case DType::Float32:
-      return *static_cast<const float*>(ptr);
-    case DType::Float64:
-      return *static_cast<const double*>(ptr);
-    case DType::Float16:
-      return static_cast<float>(*static_cast<const Half*>(ptr));
-    case DType::BFloat16:
-      return static_cast<float>(*static_cast<const BFloat16*>(ptr));
-    case DType::Int64:
-      return static_cast<double>(*static_cast<const int64_t*>(ptr));
-    case DType::Int32:
-      return static_cast<double>(*static_cast<const int32_t*>(ptr));
-    case DType::Int16:
-      return static_cast<double>(*static_cast<const int16_t*>(ptr));
-    case DType::Int8:
-      return static_cast<double>(*static_cast<const int8_t*>(ptr));
-    case DType::UInt8:
-      return static_cast<double>(*static_cast<const uint8_t*>(ptr));
-    case DType::Bool:
-      return *static_cast<const bool*>(ptr) ? 1.0 : 0.0;
-    default:
-      TP_THROW(TypeError, "scatter: unsupported dtype");
-  }
-}
-
-void writeScalar(void* ptr, DType dtype, double v) {
-  switch (dtype) {
-    case DType::Float32:
-      *static_cast<float*>(ptr) = static_cast<float>(v);
-      break;
-    case DType::Float64:
-      *static_cast<double*>(ptr) = v;
-      break;
-    case DType::Float16:
-      *static_cast<Half*>(ptr) = Half(static_cast<float>(v));
-      break;
-    case DType::BFloat16:
-      *static_cast<BFloat16*>(ptr) = BFloat16(static_cast<float>(v));
-      break;
-    case DType::Int64:
-      *static_cast<int64_t*>(ptr) = static_cast<int64_t>(v);
-      break;
-    case DType::Int32:
-      *static_cast<int32_t*>(ptr) = static_cast<int32_t>(v);
-      break;
-    case DType::Int16:
-      *static_cast<int16_t*>(ptr) = static_cast<int16_t>(v);
-      break;
-    case DType::Int8:
-      *static_cast<int8_t*>(ptr) = static_cast<int8_t>(v);
-      break;
-    case DType::UInt8:
-      *static_cast<uint8_t*>(ptr) = static_cast<uint8_t>(v);
-      break;
-    case DType::Bool:
-      *static_cast<bool*>(ptr) = (v != 0.0);
-      break;
-    default:
-      TP_THROW(TypeError, "scatter: unsupported dtype");
-  }
+// Dispatches the scalar-value scatter kernel. `value` is converted to the
+// output's dtype on the host so the shader reads the right byte width.
+template <typename T>
+void dispatch_scatter_value(const std::string& kernel, const Tensor& output,
+                            T value, const Tensor& index, int64_t inner,
+                            int64_t out_dim, int64_t idx_dim) {
+  auto pso = lib.getPipelineStateForFunc(kernel);
+  MPSStream* stream = getCurrentMPSStream();
+  dispatch_sync_with_rethrow(stream->queue(), ^() {
+    @autoreleasepool {
+      stream->endKernelCoalescing();
+      auto encoder = stream->commandEncoder();
+      [encoder setComputePipelineState:pso];
+      mtl_setArgs(encoder, output, value, index, inner, out_dim, idx_dim);
+      mtl_dispatch1DJob(encoder, pso, static_cast<NSUInteger>(index.numel()));
+      stream->synchronize(SyncType::COMMIT_AND_WAIT);
+    }
+  });
 }
 
 } // namespace
@@ -173,11 +149,6 @@ Tensor index_select_kernel(const Tensor& self, int64_t dim,
   Tensor idx_c = normalize_index(idx, self.size(dim));
   const int64_t n_idx = idx_c.numel();
   const int64_t row = self.size(dim);
-  const int64_t* ip = idx_c.data_ptr<int64_t>();
-  int64_t outer = 1;
-  int64_t inner = 1;
-  outer_inner(static_cast<std::vector<int64_t>>(self.shape()), dim, outer,
-              inner);
 
   std::vector<int64_t> out_shape =
       static_cast<std::vector<int64_t>>(self.shape());
@@ -187,27 +158,15 @@ Tensor index_select_kernel(const Tensor& self, int64_t dim,
     return result;
   }
   Tensor self_c = self.contiguous();
-  const int64_t itemsize = result.itemsize();
-  const char* s = static_cast<const char*>(self_c.data_ptr());
-  char* d = static_cast<char*>(result.data_ptr());
-  if (inner == 1) {
-    for (int64_t o = 0; o < outer; ++o) {
-      const char* src_row = s + o * row * itemsize;
-      char* dst_row = d + o * n_idx * itemsize;
-      for (int64_t k = 0; k < n_idx; ++k) {
-        std::memcpy(dst_row + k * itemsize, src_row + ip[k] * itemsize,
-                    itemsize);
-      }
-    }
-  } else {
-    const int64_t slice = inner * itemsize;
-    for (int64_t t = 0; t < outer * n_idx; ++t) {
-      const int64_t o = t / n_idx;
-      const int64_t k = t % n_idx;
-      std::memcpy(d + (o * n_idx + k) * inner * itemsize,
-                  s + (o * row + ip[k]) * inner * itemsize, slice);
-    }
+  int64_t inner = 1;
+  for (int64_t i = dim + 1; i < nd; ++i) {
+    inner *= self.size(i);
   }
+  const std::string kernel =
+      "index_select_dense_" + scalarToMetalTypeString(result.dtype()) +
+      "_long";
+  dispatch_indexing(kernel, result, self_c, idx_c, inner, row, n_idx,
+                    result.numel());
   return result;
 }
 
@@ -234,34 +193,16 @@ Tensor gather_kernel(const Tensor& self, int64_t dim, const Tensor& index) {
   if (result.numel() == 0) {
     return result;
   }
-  const int64_t* ip = idx_c.data_ptr<int64_t>();
-  const char* s = static_cast<const char*>(self_c.data_ptr());
-  char* d = static_cast<char*>(result.data_ptr());
-  const int64_t itemsize = result.itemsize();
-
-  int64_t idx_outer = 1;
   int64_t idx_inner = 1;
-  outer_inner(static_cast<std::vector<int64_t>>(idx_c.shape()), dim, idx_outer,
-              idx_inner);
-  int64_t self_inner = 1;
   for (int64_t i = dim + 1; i < nd; ++i) {
-    self_inner *= self.size(i);
+    idx_inner *= idx_c.size(i);
   }
   const int64_t idx_dim = idx_c.size(dim);
   const int64_t self_dim = self.size(dim);
-
-  for (int64_t g = 0; g < idx_outer; ++g) {
-    const char* s_row = s + g * self_dim * self_inner * itemsize;
-    char* d_row = d + g * idx_dim * idx_inner * itemsize;
-    const int64_t* idx_row = ip + g * idx_dim * idx_inner;
-    for (int64_t c = 0; c < idx_dim; ++c) {
-      for (int64_t t = 0; t < idx_inner; ++t) {
-        const int64_t ix = idx_row[c * idx_inner + t];
-        std::memcpy(d_row + (c * idx_inner + t) * itemsize,
-                    s_row + (ix * self_inner + t) * itemsize, itemsize);
-      }
-    }
-  }
+  const std::string kernel =
+      "gather_dense_" + scalarToMetalTypeString(result.dtype()) + "_long";
+  dispatch_indexing(kernel, result, self_c, idx_c, idx_inner, self_dim,
+                    idx_dim, result.numel());
   return result;
 }
 
@@ -272,62 +213,78 @@ Tensor gather_kernel(const Tensor& self, int64_t dim, const Tensor& index) {
 enum class ScatterMode { Assign, Add };
 
 // Applies scatter with source values from `src` (or a constant `value` when
-// `src` is undefined) into `result`, walking the index tensor in order.
+// `src` is undefined) into `result`, walking the index tensor on the GPU.
 void scatter_impl(Tensor& result, int64_t dim, const Tensor& index,
                   const Tensor* src, const Scalar* value, ScatterMode mode) {
   const int64_t nd = result.dim();
   dim = wrap_dim(dim, nd);
   Tensor idx_c = normalize_index(index, result.size(dim));
-  const int64_t* ip = idx_c.data_ptr<int64_t>();
-  const int64_t itemsize = result.itemsize();
-  char* d = static_cast<char*>(result.data_ptr());
+  if (idx_c.numel() == 0) {
+    return;
+  }
 
-  int64_t idx_outer = 1;
   int64_t idx_inner = 1;
-  outer_inner(static_cast<std::vector<int64_t>>(idx_c.shape()), dim, idx_outer,
-              idx_inner);
-  int64_t self_inner = 1;
   for (int64_t i = dim + 1; i < nd; ++i) {
-    self_inner *= result.size(i);
+    idx_inner *= idx_c.size(i);
   }
   const int64_t idx_dim = idx_c.size(dim);
   const int64_t self_dim = result.size(dim);
+  const std::string suffix = scalarToMetalTypeString(result.dtype());
 
-  const char* src_base = nullptr;
-  if (src != nullptr) {
-    Tensor src_c = src->contiguous();
-    src_base = static_cast<const char*>(src_c.data_ptr());
-  }
-  double scalar_val = 0.0;
-  if (value != nullptr) {
-    scalar_val = value->to<double>();
-  }
-
-  for (int64_t g = 0; g < idx_outer; ++g) {
-    char* d_row = d + g * self_dim * self_inner * itemsize;
-    const int64_t* idx_row = ip + g * idx_dim * idx_inner;
-    const char* src_row = src_base != nullptr
-        ? src_base + g * idx_dim * idx_inner * itemsize
-        : nullptr;
-    for (int64_t c = 0; c < idx_dim; ++c) {
-      for (int64_t t = 0; t < idx_inner; ++t) {
-        const int64_t ix = idx_row[c * idx_inner + t];
-        char* dst = d_row + (ix * self_inner + t) * itemsize;
-        if (mode == ScatterMode::Assign) {
-          if (src_base != nullptr) {
-            std::memcpy(dst, src_row + (c * idx_inner + t) * itemsize,
-                        itemsize);
-          } else {
-            writeScalar(dst, result.dtype(), scalar_val);
-          }
-        } else {
-          double acc = readScalar(dst, result.dtype()) + readScalar(
-              src_row + (c * idx_inner + t) * itemsize, result.dtype());
-          writeScalar(dst, result.dtype(), acc);
-        }
-      }
+  if (mode == ScatterMode::Assign && value != nullptr) {
+    const std::string kernel = "scatter_set_dense_value_" + suffix + "_long";
+    switch (result.dtype()) {
+      case DType::Float32:
+        dispatch_scatter_value(kernel, result, value->to<float>(), idx_c,
+                               idx_inner, self_dim, idx_dim);
+        return;
+      case DType::Float16:
+        dispatch_scatter_value(kernel, result, value->to<Half>(), idx_c,
+                               idx_inner, self_dim, idx_dim);
+        return;
+      case DType::BFloat16:
+        dispatch_scatter_value(kernel, result, value->to<BFloat16>(), idx_c,
+                               idx_inner, self_dim, idx_dim);
+        return;
+      case DType::Int64:
+        dispatch_scatter_value(kernel, result, value->to<int64_t>(), idx_c,
+                               idx_inner, self_dim, idx_dim);
+        return;
+      case DType::Int32:
+        dispatch_scatter_value(kernel, result, value->to<int32_t>(), idx_c,
+                               idx_inner, self_dim, idx_dim);
+        return;
+      case DType::Int16:
+        dispatch_scatter_value(kernel, result, value->to<int16_t>(), idx_c,
+                               idx_inner, self_dim, idx_dim);
+        return;
+      case DType::Int8:
+        dispatch_scatter_value(kernel, result, value->to<int8_t>(), idx_c,
+                               idx_inner, self_dim, idx_dim);
+        return;
+      case DType::UInt8:
+        dispatch_scatter_value(kernel, result, value->to<uint8_t>(), idx_c,
+                               idx_inner, self_dim, idx_dim);
+        return;
+      case DType::Bool:
+        dispatch_scatter_value(kernel, result, value->to<bool>(), idx_c,
+                               idx_inner, self_dim, idx_dim);
+        return;
+      default:
+        break;
     }
+  } else {
+    const std::string kernel = (mode == ScatterMode::Add)
+        ? "scatter_add_dense_" + suffix + "_long"
+        : "scatter_set_dense_" + suffix + "_long";
+    Tensor src_c = src->contiguous();
+    dispatch_indexing(kernel, result, src_c, idx_c, idx_inner, self_dim,
+                      idx_dim, idx_c.numel());
+    return;
   }
+  TP_THROW(RuntimeError,
+           "scatter: unsupported dtype for the MPS shader: ",
+           toString(result.dtype()));
 }
 
 Tensor scatter_src_kernel(const Tensor& self, int64_t dim,

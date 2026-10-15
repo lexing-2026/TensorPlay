@@ -405,7 +405,7 @@ Tensor eye_kernel(int64_t n, int64_t m, DType dtype, Device device) {
   const bool use_shader =
       suffix == "float" || suffix == "half" || suffix == "bfloat" ||
       suffix == "long" || suffix == "int" || suffix == "short" ||
-      suffix == "char" || suffix == "uchar";
+      suffix == "char" || suffix == "uchar" || suffix == "bool";
   if (use_shader) {
     const uint32_t rows = static_cast<uint32_t>(n);
     const uint32_t cols = static_cast<uint32_t>(m);
@@ -426,7 +426,7 @@ Tensor eye_kernel(int64_t n, int64_t m, DType dtype, Device device) {
     return t;
   }
 
-  // Host fallback for dtypes without a shader (double, bool, complex).
+  // Host fallback for dtypes without a shader (double and complex).
   const int64_t min_dim = std::min(n, m);
   std::memset(t.data_ptr(), 0, static_cast<size_t>(n) * m * t.itemsize());
 #define EYE_CASE(ctype, name)                                            case DType::name: {                                                      ctype* data = t.data_ptr<ctype>();                                     for (int64_t i = 0; i < min_dim; ++i) data[i * m + i] = ctype(1);      break;                                                               }
