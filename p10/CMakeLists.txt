@@ -520,6 +520,7 @@ if(USE_MPS)
         src/backend/mps/MPSStream.mm
         src/backend/mps/MPSRuntime.mm
         src/backend/mps/OperationUtils.mm
+        src/backend/mps/MetalShaderLibrary.mm
         src/backend/mps/FactoryKernels.mm
         src/backend/mps/CopyKernels.mm
         src/backend/mps/ArithmeticKernels.mm
@@ -533,11 +534,57 @@ if(USE_MPS)
         src/backend/mps/NormalizationKernels.mm
         src/backend/mps/IndexingKernels.mm
         src/backend/mps/ConvolutionKernels.mm
+        src/backend/mps/TriangularOpsKernels.mm
+        src/backend/mps/PadKernels.mm
         src/backend/mps/LossKernels.mm
         src/backend/mps/QuantizedKernels.mm
         src/backend/mps/SparseKernels.mm
     )
     list(APPEND P10_SOURCES ${TP_MPS_BACKEND_SOURCES})
+
+    # Compile the Metal shader sources (.metal) into a single .metallib and
+    # embed it as a C++ byte array header (mps/Quantized_metallib.h) that
+    # MetalShaderLibrary loads at runtime.  Only macOS has the Metal toolchain.
+    if(APPLE)
+        set(MPS_SHADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/backend/mps/kernels)
+        set(MPS_SHADER_GEN_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
+        file(GLOB MPS_METAL_SOURCES CONFIGURE_DEPENDS
+             "${MPS_SHADER_DIR}/*.metal")
+        set(MPS_AIR_OBJECTS "")
+        foreach(metal_src ${MPS_METAL_SOURCES})
+            get_filename_component(metal_stem ${metal_src} NAME_WE)
+            set(air_obj ${CMAKE_CURRENT_BINARY_DIR}/${metal_stem}.air)
+            add_custom_command(
+                OUTPUT ${air_obj}
+                COMMAND xcrun metal -std=metal3.1 -c ${metal_src}
+                        -I ${MPS_SHADER_DIR}
+                        -o ${air_obj}
+                DEPENDS ${metal_src}
+                COMMENT "Compiling Metal shader ${metal_stem}.metal"
+                VERBATIM)
+            list(APPEND MPS_AIR_OBJECTS ${air_obj})
+        endforeach()
+        set(MPS_METALLIB ${CMAKE_CURRENT_BINARY_DIR}/mps_shaders.metallib)
+        add_custom_command(
+            OUTPUT ${MPS_METALLIB}
+            COMMAND xcrun metallib -o ${MPS_METALLIB} ${MPS_AIR_OBJECTS}
+            DEPENDS ${MPS_AIR_OBJECTS}
+            COMMENT "Linking Metal shader library"
+            VERBATIM)
+        set(MPS_SHADER_HDR ${MPS_SHADER_GEN_DIR}/mps/Quantized_metallib.h)
+        add_custom_command(
+            OUTPUT ${MPS_SHADER_HDR}
+            COMMAND ${Python_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/../tools/write_metallib_headers.py
+                    ${MPS_METALLIB} ${MPS_SHADER_HDR}
+            DEPENDS ${MPS_METALLIB}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/../tools/write_metallib_headers.py
+            COMMENT "Generating metallib wrapper header"
+            VERBATIM)
+        add_custom_target(mps_shaders DEPENDS ${MPS_SHADER_HDR})
+        add_dependencies(p10 mps_shaders)
+        target_include_directories(p10 PRIVATE ${MPS_SHADER_GEN_DIR})
+    endif()
 endif()
 if(USE_VULKAN)
     # Vulkan backend: api layer, ops and the generated SPIR-V registry.

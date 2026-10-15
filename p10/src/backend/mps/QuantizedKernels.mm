@@ -5,24 +5,33 @@
 #include "OperationUtils.h"
 #include "Quantizer.h"
 
+#include "backend/mps/MPSAllocator.h"
 #include "backend/mps/MPSDevice.h"
+#include "backend/mps/MetalShaderLibrary.h"
+#include "backend/mps/MPSStream.h"
 
+#include <Metal/Metal.h>
 #include <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
 
+#include <array>
 #include <cmath>
+#include <cstring>
 #include <limits>
+#include <string>
 #include <vector>
 
 namespace tensorplay {
 namespace mps {
 
+// The bundled Metal shader library (Quantized.metal).
+static auto& lib = MetalShaderLibrary::getBundledLibrary();
+
 // ---------------------------------------------------------------------------
-// Weight-only quantization (int8) and per-tensor affine quantization.
+// Weight-only quantization (int4/int8, Metal shader based) and per-tensor /
+// per-channel affine quantization.
 //
-// The quantized factory/dequantize kernels write through the host-visible
-// shared-memory mapping of the MPS buffers (valid on unified-memory Apple
-// silicon), matching the CPU kernel semantics bit-for-bit.  The int8 packed
-// matmul runs as an MPSGraph: C = A @ B^T * scales.
+// The int4/int8 packed matmuls run as Metal compute shaders (ported from the
+// upstream MPS backend): C = A @ B^T * scales, with groupwise int4 dequant.
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -59,8 +68,8 @@ std::pair<int64_t, int64_t> quantized_range(DType dtype) {
 // `value` must already be checked against the quantized range.
 template <typename code_t>
 void quantize_host(const float* input, code_t* codes, int64_t numel,
-                   double scale, int64_t zero_point, int64_t quant_min,
-                   int64_t quant_max) {
+                 double scale, int64_t zero_point, int64_t quant_min,
+                 int64_t quant_max) {
   const float inv_scale = 1.0f / static_cast<float>(scale);
   for (int64_t i = 0; i < numel; ++i) {
     const int64_t rounded =
@@ -71,10 +80,67 @@ void quantize_host(const float* input, code_t* codes, int64_t numel,
   }
 }
 
+// Shader dtype suffix used to select int4/int8 kernels.
+std::string scalarToMetalTypeString(DType dtype) {
+  switch (dtype) {
+    case DType::Float32:
+      return "float";
+    case DType::Float16:
+      return "half";
+    case DType::BFloat16:
+      return "bfloat";
+    default:
+      TP_THROW(RuntimeError, "unsupported dtype for Metal shader: ",
+               toString(dtype));
+  }
+}
+
+// Binds a contiguous, offset-0 tensor's storage to a shader buffer slot.
+void set_shader_arg(id<MTLComputeCommandEncoder> encoder, const Tensor& t,
+                    unsigned idx) {
+  const Tensor c = (t.is_contiguous() && t.storage_offset() == 0)
+      ? t : materializeForGraph(t);
+  void* buf = getMTLBufferFromPointer(c.data_ptr());
+  if (!buf) {
+    TP_THROW(RuntimeError,
+             "MPS tensor storage is not managed by the MPS allocator");
+  }
+  [encoder setBuffer:(__bridge id<MTLBuffer>)buf offset:0 atIndex:idx];
+}
+
+void set_shader_arg(id<MTLComputeCommandEncoder> encoder, id<MTLBuffer> val,
+                    unsigned idx) {
+  [encoder setBuffer:val offset:0 atIndex:idx];
+}
+
+template <typename T>
+void set_shader_arg(id<MTLComputeCommandEncoder> encoder, const T& val,
+                     unsigned idx) {
+  [encoder setBytes:&val length:sizeof(T) atIndex:idx];
+}
+
+template <typename T, size_t N>
+void set_shader_arg(id<MTLComputeCommandEncoder> encoder,
+                    const std::array<T, N>& values, unsigned idx) {
+  [encoder setBytes:values.data() length:sizeof(T) * values.size() atIndex:idx];
+}
+
+template <unsigned idx = 0, typename T>
+void mtl_setArgs(id<MTLComputeCommandEncoder> encoder, const T& val) {
+  set_shader_arg(encoder, val, idx);
+}
+
+template <unsigned idx = 0, typename T, typename... Args>
+void mtl_setArgs(id<MTLComputeCommandEncoder> encoder, const T& val,
+                 Args&&... args) {
+  set_shader_arg(encoder, val, idx);
+  mtl_setArgs<idx + 1>(encoder, std::forward<Args>(args)...);
+}
+
 } // namespace
 
 Tensor weight_int8pack_mm_kernel(const Tensor& self, const Tensor& mat2,
-                                 const Tensor& scales) {
+                                  const Tensor& scales) {
   if (!self.device().is_mps() || !mat2.device().is_mps() ||
       !scales.device().is_mps()) {
     TP_THROW(RuntimeError,
@@ -104,84 +170,161 @@ Tensor weight_int8pack_mm_kernel(const Tensor& self, const Tensor& mat2,
     TP_THROW(RuntimeError,
              "_weight_int8pack_mm(): weight must be an int8 tensor");
   }
-
-  const std::vector<int64_t> a_shape = {self.size(0), self.size(1)};
-  const std::vector<int64_t> b_shape = {mat2.size(0), mat2.size(1)};
-  const std::vector<int64_t> s_shape = {mat2.size(0)};
-  const std::vector<int64_t> out_shape = {self.size(0), mat2.size(0)};
-  Tensor output = Tensor(out_shape, input_dt, self.device());
+  const int64_t M = self.size(0);
+  const int64_t N = mat2.size(0);
+  const int64_t K = self.size(1);
+  if (N % 32 != 0 || K % 32 != 0) {
+    TP_THROW(RuntimeError,
+             "_weight_int8pack_mm(): N and K must be divisible by 32");
+  }
+  Tensor output = Tensor({M, N}, input_dt, self.device());
   if (output.numel() == 0) {
     return output;
   }
+  Tensor A = materializeForGraph(self);
+  Tensor B = materializeForGraph(mat2);
+  Tensor S = materializeForGraph(scales);
 
-  Tensor self_c = materializeForGraph(self);
-  Tensor mat2_c = materializeForGraph(mat2);
-  Tensor scales_c = materializeForGraph(scales);
-
-  @autoreleasepool {
-    MPSGraph* graph = [[MPSGraph new] autorelease];
-    MPSShape* aShape = getMPSShape(a_shape);
-    MPSShape* bShape = getMPSShape(b_shape);
-    MPSShape* sShape = getMPSShape(s_shape);
-    MPSShape* outShape = getMPSShape(out_shape);
-    const MPSDataType a_dt = getMPSDataType(input_dt);
-    const MPSDataType b_dt = getMPSDataType(mat2_c.dtype());
-    const MPSDataType s_dt = getMPSDataType(scales_c.dtype());
-    const MPSDataType out_dt = getMPSDataType(output.dtype());
-
-    MPSGraphTensor* at = [graph placeholderWithShape:aShape
-                                           dataType:a_dt
-                                                name:@"a"];
-    MPSGraphTensor* bt = [graph placeholderWithShape:bShape
-                                           dataType:b_dt
-                                                name:@"b"];
-    MPSGraphTensor* st = [graph placeholderWithShape:sShape
-                                           dataType:s_dt
-                                                name:@"scales"];
-    MPSGraphTensor* bCast = [graph castTensor:bt toType:a_dt name:@"cast_b"];
-    MPSGraphTensor* bT = [graph transposeTensor:bCast
-                                      dimension:1
-                                   withDimension:0
-                                            name:nil];
-    MPSGraphTensor* mm = [graph matrixMultiplicationWithPrimaryTensor:at
-                                                      secondaryTensor:bT
-                                                                 name:nil];
-    MPSGraphTensor* scalesCast = [graph castTensor:st toType:a_dt
-                                              name:@"cast_scales"];
-    MPSGraphTensor* result =
-        [graph multiplicationWithPrimaryTensor:mm
-                                 secondaryTensor:scalesCast
-                                            name:nil];
-    if ([result dataType] != out_dt) {
-      result = [graph castTensor:result toType:out_dt name:@"cast_out"];
+  MPSStream* mpsStream = getCurrentMPSStream();
+  std::array<uint32_t, 3> sizes = {
+      static_cast<uint32_t>(M), static_cast<uint32_t>(K),
+      static_cast<uint32_t>(N)};
+  dispatch_sync(mpsStream->queue(), ^{
+    @autoreleasepool {
+      id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
+      const std::string kernel = (M < 12)
+          ? "int8pack_mv_" + scalarToMetalTypeString(input_dt)
+          : "large_m_int8pack_mm_" + scalarToMetalTypeString(input_dt);
+      id<MTLComputePipelineState> PSO =
+          lib.getPipelineStateForFunc(kernel);
+      [computeEncoder setComputePipelineState:PSO];
+      mtl_setArgs(computeEncoder, A, B, S, output, sizes);
+      if (M < 12) {
+        [computeEncoder setThreadgroupMemoryLength:32 atIndex:0];
+        [computeEncoder dispatchThreadgroups:MTLSizeMake((N + 7) / 8, M, 1)
+                       threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+      } else {
+        [computeEncoder setThreadgroupMemoryLength:12288 atIndex:0];
+        [computeEncoder dispatchThreadgroups:MTLSizeMake((M + 31) / 32,
+                                                        (N + 63) / 64, 1)
+                       threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+      }
+      mpsStream->endKernelCoalescing();
     }
+  });
+  return output;
+}
 
-    id<MTLBuffer> aBuf = mtlBufferOf(self_c);
-    id<MTLBuffer> bBuf = mtlBufferOf(mat2_c);
-    id<MTLBuffer> sBuf = mtlBufferOf(scales_c);
-    id<MTLBuffer> outBuf = mtlBufferOf(output);
-    MPSGraphTensorData* aData =
-        [[[MPSGraphTensorData alloc] initWithMTLBuffer:aBuf
-                                                shape:aShape
-                                             dataType:a_dt] autorelease];
-    MPSGraphTensorData* bData =
-        [[[MPSGraphTensorData alloc] initWithMTLBuffer:bBuf
-                                                shape:bShape
-                                             dataType:b_dt] autorelease];
-    MPSGraphTensorData* sData =
-        [[[MPSGraphTensorData alloc] initWithMTLBuffer:sBuf
-                                                shape:sShape
-                                             dataType:s_dt] autorelease];
-    MPSGraphTensorData* outData =
-        [[[MPSGraphTensorData alloc] initWithMTLBuffer:outBuf
-                                                shape:outShape
-                                             dataType:out_dt] autorelease];
-
-    NSDictionary* feeds = @{at : aData, bt : bData, st : sData};
-    NSDictionary* results = @{result : outData};
-    getCurrentMPSStream()->executeMPSGraph(graph, feeds, results,
-                                          SyncType::COMMIT_AND_WAIT);
+// Packs an int4 weight (uint8, N x K/2) into the int32 4-D format consumed by
+// _weight_int4pack_mm.  Runs the `weight_to_int4pack` Metal shader.
+Tensor convert_weight_to_int4pack_kernel(const Tensor& in,
+                                         int64_t innerKTiles) {
+  if (in.dim() != 2) {
+    TP_THROW(RuntimeError,
+             "_convert_weight_to_int4pack(): expect weight to be 2D tensor");
   }
+  if (in.dtype() != DType::UInt8) {
+    TP_THROW(RuntimeError,
+             "_convert_weight_to_int4pack(): expect weight to be kByte");
+  }
+  if (innerKTiles != 2 && innerKTiles != 4 && innerKTiles != 8) {
+    TP_THROW(RuntimeError,
+             "_convert_weight_to_int4pack(): innerKTiles need to be 2, 4, or "
+             "8, got ",
+             innerKTiles);
+  }
+  const Tensor weight = in.is_contiguous() ? in : in.contiguous();
+  const int64_t N = weight.size(0);
+  const int64_t Kdiv2 = weight.size(1);
+  const int64_t K = Kdiv2 * 2;
+
+  Tensor weight_packed =
+      Tensor::empty({N / 8, K / (16 * innerKTiles), 32, innerKTiles / 2},
+                  DType::Int32, in.device());
+  MPSStream* mpsStream = getCurrentMPSStream();
+  std::array<uint32_t, 2> sizes = {
+      static_cast<uint32_t>(N), static_cast<uint32_t>(Kdiv2 / 4)};
+  dispatch_sync(mpsStream->queue(), ^{
+    @autoreleasepool {
+      id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
+      id<MTLComputePipelineState> PSO =
+          lib.getPipelineStateForFunc("weight_to_int4pack");
+      [computeEncoder setComputePipelineState:PSO];
+      mtl_setArgs(computeEncoder, weight, weight_packed, sizes);
+      [computeEncoder dispatchThreads:MTLSizeMake(N, Kdiv2 / 4, 1)
+               threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+      mpsStream->endKernelCoalescing();
+    }
+  });
+  return weight_packed;
+}
+
+// Groupwise int4 packed matmul: C = A @ dequant(B)^T.  B is the int32 4-D
+// packed weight; runs the `int4pack_mm_<group>_<dtype>` Metal shader.
+Tensor weight_int4pack_mm_kernel(const Tensor& self, const Tensor& mat2,
+                                  int64_t qGroupSize,
+                                  const Tensor& qScaleAndZeros) {
+  const int64_t M = self.size(0);
+  const int64_t N = mat2.size(0) * 8;
+  const int64_t K = self.size(1);
+  const DType input_dt = self.dtype();
+  if (input_dt != DType::BFloat16 && input_dt != DType::Float16 &&
+      input_dt != DType::Float32) {
+    TP_THROW(RuntimeError,
+             "_weight_int4pack_mm(): expect A to be either 32-bit or 16-bit "
+             "float tensor");
+  }
+  if (!self.is_contiguous() || self.dim() != 2) {
+    TP_THROW(RuntimeError,
+             "_weight_int4pack_mm(): expect A to be contiguous 2D tensor");
+  }
+  if (mat2.dtype() != DType::Int32 || !mat2.is_contiguous() ||
+      mat2.dim() != 4) {
+    TP_THROW(RuntimeError,
+             "_weight_int4pack_mm(): expect B to be contiguous int32 4D "
+             "tensor");
+  }
+  if (qGroupSize != 32 && qGroupSize != 64 && qGroupSize != 128 &&
+      qGroupSize != 256) {
+    TP_THROW(RuntimeError,
+             "_weight_int4pack_mm(): expect qGroupSize to be 32, 64, 128 or "
+             "256, got ",
+             qGroupSize);
+  }
+  if (qScaleAndZeros.dim() != 3 || qScaleAndZeros.size(1) != N ||
+      qScaleAndZeros.size(2) != 2) {
+    TP_THROW(RuntimeError,
+             "_weight_int4pack_mm(): expect qScaleAndZeros to be 3d tensor "
+             "with sizes [:,",
+             N, ", 2]");
+  }
+
+  Tensor output = Tensor({M, N}, input_dt, self.device());
+  if (output.numel() == 0) {
+    return output;
+  }
+  Tensor A = materializeForGraph(self);
+  Tensor B = materializeForGraph(mat2);
+  Tensor Q = materializeForGraph(qScaleAndZeros);
+
+  MPSStream* mpsStream = getCurrentMPSStream();
+  std::array<uint32_t, 3> sizes = {
+      static_cast<uint32_t>(M), static_cast<uint32_t>(K),
+      static_cast<uint32_t>(N)};
+  dispatch_sync(mpsStream->queue(), ^{
+    @autoreleasepool {
+      id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
+      const std::string kernel = "int4pack_mm_" +
+          std::to_string(qGroupSize) + "_" +
+          scalarToMetalTypeString(input_dt);
+      id<MTLComputePipelineState> PSO = lib.getPipelineStateForFunc(kernel);
+      [computeEncoder setComputePipelineState:PSO];
+      mtl_setArgs(computeEncoder, A, B, Q, output, sizes);
+      [computeEncoder dispatchThreads:MTLSizeMake(N / 4 * 32, 1, M)
+               threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+      mpsStream->endKernelCoalescing();
+    }
+  });
   return output;
 }
 
@@ -558,6 +701,8 @@ Tensor dequantize_self_kernel(const Tensor& self) {
 
 TENSORPLAY_LIBRARY_IMPL(MPS, QuantizedKernels) {
   m.impl("_weight_int8pack_mm", weight_int8pack_mm_kernel);
+  m.impl("_convert_weight_to_int4pack", convert_weight_to_int4pack_kernel);
+  m.impl("_weight_int4pack_mm", weight_int4pack_mm_kernel);
   m.impl("quantize_per_tensor", quantize_per_tensor_kernel);
   m.impl("quantize_per_channel", quantize_per_channel_kernel);
   m.impl("_make_per_tensor_quantized_tensor",
