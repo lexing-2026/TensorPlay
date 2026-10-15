@@ -87,7 +87,9 @@ Tensor build_attn_mask(const std::optional<Tensor>& attn_mask, bool is_causal,
 // caller fall back to the MPSGraph path.
 std::optional<Tensor> sdpa_decode_shader(const Tensor& q_in,
                                          const Tensor& k_in,
-                                         const Tensor& v_in, bool is_causal,
+                                         const Tensor& v_in,
+                                         const std::optional<Tensor>& attn_mask,
+                                         bool is_causal,
                                          double scale_factor,
                                          int64_t gqa_factor,
                                          bool unsqueezed) {
@@ -96,7 +98,7 @@ std::optional<Tensor> sdpa_decode_shader(const Tensor& q_in,
   const int64_t L = q_in.size(2);
   const int64_t E = q_in.size(3);
   const int64_t S = k_in.size(2);
-  if (L > 32) {
+  if (L > 8) {
     return std::nullopt;
   }
   if (E != 64 && E != 96 && E != 128 && E != 256) {
@@ -115,15 +117,37 @@ std::optional<Tensor> sdpa_decode_shader(const Tensor& q_in,
   Tensor k = materializeForGraph(k_in);
   Tensor v = materializeForGraph(v_in);
 
+  bool has_mask = false;
+  bool mask_is_bool = false;
+  Tensor mask;
+  if (attn_mask.has_value() && attn_mask->defined()) {
+    Tensor m = *attn_mask;
+    if (m.dtype() == DType::Bool) {
+      mask_is_bool = true;
+    } else if (m.dtype() != dt) {
+      return std::nullopt;
+    }
+    if (m.dim() == 2) {
+      m = ops::view(m, {1, 1, m.size(0), m.size(1)});
+    } else if (m.dim() != 4) {
+      return std::nullopt;
+    }
+    mask = m.is_contiguous() ? m : m.contiguous();
+    has_mask = true;
+  }
+
   std::vector<int64_t> out_shape = {B, H, L, E};
   Tensor output = Tensor::empty(out_shape, dt, q.device());
   if (output.numel() == 0) {
     return output;
   }
 
-  const std::string kernel = "sdpa_vector_" + dtype + "_" +
-      std::to_string(E) + "_" + std::to_string(E) +
-      (is_causal ? "_masknone_causal" : "_masknone");
+  const std::string kernel =
+      "sdpa_vector_" + dtype + "_" + std::to_string(E) + "_" +
+      std::to_string(E) +
+      (has_mask
+           ? (mask_is_bool ? "_maskbool" : "_mask" + dtype)
+           : (is_causal ? "_masknone_causal" : "_masknone"));
   const uint32_t N = static_cast<uint32_t>(S);
   const uint32_t gqa_u = static_cast<uint32_t>(gqa_factor);
   const p10::metal::vec3<uint32_t> head_strides{
@@ -134,7 +158,13 @@ std::optional<Tensor> sdpa_decode_shader(const Tensor& q_in,
       static_cast<uint32_t>(q.stride(2)),
       static_cast<uint32_t>(k.stride(2)),
       static_cast<uint32_t>(v.stride(2))};
-  const std::array<uint32_t, 4> mask_strides{0, 0, 0, 0};
+  std::array<uint32_t, 4> mask_strides{0, 0, 0, 0};
+  if (has_mask) {
+    mask_strides = {static_cast<uint32_t>(mask.size(3) > 1 ? mask.stride(3) : 0),
+                    static_cast<uint32_t>(mask.size(2) > 1 ? mask.stride(2) : 0),
+                    static_cast<uint32_t>(mask.size(1) > 1 ? mask.stride(1) : 0),
+                    static_cast<uint32_t>(mask.size(0) > 1 ? mask.stride(0) : 0)};
+  }
   const std::array<uint32_t, 4> batch_strides{
       static_cast<uint32_t>(q.stride(0)),
       static_cast<uint32_t>(k.stride(0)),
@@ -162,7 +192,11 @@ std::optional<Tensor> sdpa_decode_shader(const Tensor& q_in,
       [computeEncoder setBytes:&seq_strides length:sizeof(seq_strides)
                         atIndex:idx++];
       [computeEncoder setBytes:&scale_f length:sizeof(float) atIndex:idx++];
-      [computeEncoder setBuffer:nil offset:0 atIndex:idx++];
+      if (has_mask) {
+        [computeEncoder setBuffer:mtlBufferOf(mask) offset:0 atIndex:idx++];
+      } else {
+        [computeEncoder setBuffer:nil offset:0 atIndex:idx++];
+      }
       [computeEncoder setBytes:&mask_strides length:sizeof(mask_strides)
                         atIndex:idx++];
       [computeEncoder setBytes:&batch_strides length:sizeof(batch_strides)
@@ -173,6 +207,162 @@ std::optional<Tensor> sdpa_decode_shader(const Tensor& q_in,
       MTLSize threads = MTLSizeMake(32, 1, 1);
       [computeEncoder dispatchThreadgroups:grid
                      threadsPerThreadgroup:threads];
+      mpsStream->endKernelCoalescing();
+    }
+  });
+
+  if (unsqueezed) {
+    output = ops::squeeze(output, 1);
+  }
+  return output;
+}
+
+// Two-pass decode attention for long key sequences: pass 1 splits the K
+// loop into 32 blocks writing partial sums/maxs; pass 2 aggregates them.
+std::optional<Tensor> sdpa_decode_2pass_shader(
+    const Tensor& q_in, const Tensor& k_in, const Tensor& v_in,
+    const std::optional<Tensor>& attn_mask, bool is_causal,
+    double scale_factor, int64_t gqa_factor, bool unsqueezed) {
+  const int64_t B = q_in.size(0);
+  const int64_t H = q_in.size(1);
+  const int64_t L = q_in.size(2);
+  const int64_t E = q_in.size(3);
+  const int64_t S = k_in.size(2);
+  if (L > 8) {
+    return std::nullopt;
+  }
+  if (E != 64 && E != 96 && E != 128 && E != 256) {
+    return std::nullopt;
+  }
+  const DType dt = q_in.dtype();
+  const std::string dtype = scalarToMetalTypeString(dt);
+  if (dtype != "float" && dtype != "half" && dtype != "bfloat") {
+    return std::nullopt;
+  }
+  if (v_in.size(1) != k_in.size(1)) {
+    return std::nullopt;
+  }
+
+  Tensor q = materializeForGraph(q_in);
+  Tensor k = materializeForGraph(k_in);
+  Tensor v = materializeForGraph(v_in);
+
+  bool has_mask = false;
+  bool mask_is_bool = false;
+  Tensor mask;
+  if (attn_mask.has_value() && attn_mask->defined()) {
+    Tensor m = *attn_mask;
+    if (m.dtype() == DType::Bool) {
+      mask_is_bool = true;
+    } else if (m.dtype() != dt) {
+      return std::nullopt;
+    }
+    if (m.dim() == 2) {
+      m = ops::view(m, {1, 1, m.size(0), m.size(1)});
+    } else if (m.dim() != 4) {
+      return std::nullopt;
+    }
+    mask = m.is_contiguous() ? m : m.contiguous();
+    has_mask = true;
+  }
+
+  constexpr int64_t kBlocks = 32;
+  std::vector<int64_t> out_shape = {B, H, L, E};
+  std::vector<int64_t> partial_shape = {B, H, L, kBlocks, E};
+  std::vector<int64_t> stats_shape = {B, H, L, kBlocks};
+  Tensor output = Tensor::empty(out_shape, dt, q.device());
+  if (output.numel() == 0) {
+    return output;
+  }
+  Tensor intermediate = Tensor::empty(partial_shape, dt, q.device());
+  Tensor sums = Tensor::empty(stats_shape, DType::Float32, q.device());
+  Tensor maxs = Tensor::empty(stats_shape, DType::Float32, q.device());
+
+  const std::string pass1_kernel =
+      "sdpa_vector_2pass_1_" + dtype + "_" + std::to_string(E) + "_" +
+      std::to_string(E) +
+      (has_mask
+           ? (mask_is_bool ? "_maskbool" : "_mask" + dtype)
+           : (is_causal ? "_masknone_causal" : "_masknone"));
+  const std::string pass2_kernel =
+      "sdpa_vector_2pass_2_" + dtype + "_" + std::to_string(E);
+
+  const uint32_t N = static_cast<uint32_t>(S);
+  const uint32_t gqa_u = static_cast<uint32_t>(gqa_factor);
+  const p10::metal::vec3<uint32_t> head_strides{
+      static_cast<uint32_t>(q.stride(1)),
+      static_cast<uint32_t>(k.stride(1)),
+      static_cast<uint32_t>(v.stride(1))};
+  const p10::metal::vec3<uint32_t> seq_strides{
+      static_cast<uint32_t>(q.stride(2)),
+      static_cast<uint32_t>(k.stride(2)),
+      static_cast<uint32_t>(v.stride(2))};
+  std::array<uint32_t, 4> mask_strides{0, 0, 0, 0};
+  if (has_mask) {
+    mask_strides = {static_cast<uint32_t>(mask.size(3) > 1 ? mask.stride(3) : 0),
+                    static_cast<uint32_t>(mask.size(2) > 1 ? mask.stride(2) : 0),
+                    static_cast<uint32_t>(mask.size(1) > 1 ? mask.stride(1) : 0),
+                    static_cast<uint32_t>(mask.size(0) > 1 ? mask.stride(0) : 0)};
+  }
+  const std::array<uint32_t, 4> batch_strides{
+      static_cast<uint32_t>(q.stride(0)),
+      static_cast<uint32_t>(k.stride(0)),
+      static_cast<uint32_t>(v.stride(0)),
+      static_cast<uint32_t>(H)};
+  const float scale_f = static_cast<float>(scale_factor);
+
+  MPSStream* mpsStream = getCurrentMPSStream();
+  dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+    @autoreleasepool {
+      id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
+      id<MTLComputePipelineState> pass1PSO =
+          MetalShaderLibrary::getBundledLibrary().getPipelineStateForFunc(
+              pass1_kernel);
+      [computeEncoder setComputePipelineState:pass1PSO];
+      unsigned idx = 0;
+      [computeEncoder setBuffer:mtlBufferOf(q) offset:0 atIndex:idx++];
+      [computeEncoder setBuffer:mtlBufferOf(k) offset:0 atIndex:idx++];
+      [computeEncoder setBuffer:mtlBufferOf(v) offset:0 atIndex:idx++];
+      [computeEncoder setBuffer:mtlBufferOf(intermediate) offset:0 atIndex:idx++];
+      [computeEncoder setBuffer:mtlBufferOf(sums) offset:0 atIndex:idx++];
+      [computeEncoder setBuffer:mtlBufferOf(maxs) offset:0 atIndex:idx++];
+      [computeEncoder setBytes:&gqa_u length:sizeof(uint32_t) atIndex:idx++];
+      [computeEncoder setBytes:&N length:sizeof(uint32_t) atIndex:idx++];
+      [computeEncoder setBytes:&head_strides length:sizeof(head_strides)
+                        atIndex:idx++];
+      [computeEncoder setBytes:&seq_strides length:sizeof(seq_strides)
+                        atIndex:idx++];
+      [computeEncoder setBytes:&scale_f length:sizeof(float) atIndex:idx++];
+      if (has_mask) {
+        [computeEncoder setBuffer:mtlBufferOf(mask) offset:0 atIndex:idx++];
+      } else {
+        [computeEncoder setBuffer:nil offset:0 atIndex:idx++];
+      }
+      [computeEncoder setBytes:&mask_strides length:sizeof(mask_strides)
+                        atIndex:idx++];
+      [computeEncoder setBytes:&batch_strides length:sizeof(batch_strides)
+                        atIndex:idx++];
+
+      MTLSize grid = MTLSizeMake(static_cast<NSUInteger>(B * H),
+                                 static_cast<NSUInteger>(L),
+                                 static_cast<NSUInteger>(kBlocks));
+      MTLSize group = MTLSizeMake(256, 1, 1);
+      [computeEncoder dispatchThreadgroups:grid
+                     threadsPerThreadgroup:group];
+
+      id<MTLComputePipelineState> pass2PSO =
+          MetalShaderLibrary::getBundledLibrary().getPipelineStateForFunc(
+              pass2_kernel);
+      [computeEncoder setComputePipelineState:pass2PSO];
+      [computeEncoder setBuffer:mtlBufferOf(intermediate) offset:0 atIndex:0];
+      [computeEncoder setBuffer:mtlBufferOf(sums) offset:0 atIndex:1];
+      [computeEncoder setBuffer:mtlBufferOf(maxs) offset:0 atIndex:2];
+      [computeEncoder setBuffer:mtlBufferOf(output) offset:0 atIndex:3];
+      MTLSize grid2 = MTLSizeMake(static_cast<NSUInteger>(B * H),
+                                  static_cast<NSUInteger>(L), 1);
+      MTLSize group2 = MTLSizeMake(1024, 1, 1);
+      [computeEncoder dispatchThreadgroups:grid2
+                     threadsPerThreadgroup:group2];
       mpsStream->endKernelCoalescing();
     }
   });
@@ -467,17 +657,34 @@ Tensor scaled_dot_product_attention_kernel(
   const double scale_factor =
       scale.has_value() ? *scale : 1.0 / std::sqrt(static_cast<double>(E));
 
-  // Fast decode path: short query, no external mask -> one-pass shader.
-  if ((!attn_mask.has_value() || !attn_mask->defined()) && dropout_p == 0) {
-    auto decoded = sdpa_decode_shader(q, k, v, is_causal, scale_factor,
-                                      gqa_factor, unsqueezed);
+  // Kernel path selection:
+  //  - qL <= 8, compatible mask, no causal+mask combo -> decode shaders
+  //    (two-pass for long K, one-pass otherwise)
+  //  - qL > 8, supported head dim, compatible mask -> prefill flash
+  //  - otherwise MPSGraph
+  const bool mask_compatible =
+      !attn_mask.has_value() || !attn_mask->defined() ||
+      attn_mask->dtype() == DType::Bool || attn_mask->dtype() == dt;
+  const bool vector_head_supported =
+      E == 64 || E == 96 || E == 128 || E == 256;
+  const bool causal_with_mask =
+      is_causal && attn_mask.has_value() && attn_mask->defined();
+  const bool supports_vector =
+      L <= 8 && mask_compatible && vector_head_supported && !causal_with_mask;
+  if (supports_vector && dropout_p == 0) {
+    const bool use_2pass = S >= 1024 || (kH < H && S >= 4096);
+    auto decoded = use_2pass
+        ? sdpa_decode_2pass_shader(q, k, v, attn_mask, is_causal,
+                                scale_factor, gqa_factor, unsqueezed)
+        : sdpa_decode_shader(q, k, v, attn_mask, is_causal,
+                             scale_factor, gqa_factor, unsqueezed);
     if (decoded.has_value()) {
       return *decoded;
     }
   }
 
   // Flash-attention prefill path (long query / any mask).
-  {
+  if (L > 8) {
     auto prefilled = sdpa_prefill_shader(q, k, v, attn_mask, is_causal,
                                          scale_factor, gqa_factor,
                                          unsqueezed);
