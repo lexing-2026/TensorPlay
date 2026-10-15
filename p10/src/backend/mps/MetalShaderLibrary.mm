@@ -61,6 +61,15 @@ MTLComputePipelineState_t MetalShaderLibrary::getPipelineStateForFunc(
   return cpl;
 }
 
+MTLFunction_t MetalShaderLibrary::getFunction(const std::string& fname) {
+  MTLFunction_t func = [library_ newFunctionWithName:
+      [NSString stringWithUTF8String:fname.c_str()]];
+  if (!func) {
+    TP_THROW(RuntimeError, "Metal shader function not found: ", fname);
+  }
+  return func;
+}
+
 MetalShaderLibrary& MetalShaderLibrary::getBundledLibrary() {
   static MetalShaderLibrary lib(kQuantizedMetallib, kQuantizedMetallibSize);
   return lib;

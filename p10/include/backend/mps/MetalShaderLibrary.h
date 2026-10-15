@@ -28,6 +28,9 @@ class P10_API MetalShaderLibrary {
   // Returns (and caches) the compute pipeline state for `fname`.
   MTLComputePipelineState_t getPipelineStateForFunc(const std::string& fname);
 
+  // Returns a new (retained) function for `fname`; caller must release it.
+  MTLFunction_t getFunction(const std::string& fname);
+
   // The process-lifetime bundled shader library (Quantized.metal).
   static MetalShaderLibrary& getBundledLibrary();
 
