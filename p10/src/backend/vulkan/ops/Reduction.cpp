@@ -623,7 +623,7 @@ Tensor reduce_int64(
   context->submit_compute_job(
       VK_KERNEL_FROM_STR(shader), barrier,
       {groups * 64u, api::utils::div_up(static_cast<uint32_t>(output.numel()), groups), 1u},
-      {64u, 1u, 1u}, VK_NULL_HANDLE,
+      {256u, 1u, 1u}, VK_NULL_HANDLE,
       output.buffer(barrier, api::PipelineStage::COMPUTE, api::MemoryAccessType::WRITE),
       input.image(barrier, api::PipelineStage::COMPUTE), params.buffer());
   return convert(output);

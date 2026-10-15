@@ -53,7 +53,7 @@ Tensor& zero_kernel(Tensor& self) {
     api::UniformParamsBuffer params(context, blockb);
     api::PipelineBarrier pipeline_barrier{};
     context->submit_compute_job(
-        VK_KERNEL(buffer_zero), pipeline_barrier, {n, 1u, 1u}, {64u, 1u, 1u},
+        VK_KERNEL(buffer_zero), pipeline_barrier, {n, 1u, 1u}, {256u, 1u, 1u},
         VK_NULL_HANDLE,
         v_self.buffer(pipeline_barrier, api::PipelineStage::COMPUTE,
                       api::MemoryAccessType::WRITE),

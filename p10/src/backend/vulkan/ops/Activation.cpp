@@ -76,7 +76,7 @@ Tensor& activation_dispatch(
       api::PipelineBarrier pipeline_barrier{};
       context->submit_compute_job(
           VK_KERNEL_FROM_STR((buffer_shader + "inplace").c_str()),
-          pipeline_barrier, {n, 1u, 1u}, {64u, 1u, 1u}, VK_NULL_HANDLE,
+          pipeline_barrier, {n, 1u, 1u}, {256u, 1u, 1u}, VK_NULL_HANDLE,
           v_output.buffer(
               pipeline_barrier,
               api::PipelineStage::COMPUTE,
@@ -94,7 +94,7 @@ Tensor& activation_dispatch(
     api::PipelineBarrier pipeline_barrier{};
     context->submit_compute_job(
         VK_KERNEL_FROM_STR(buffer_shader.c_str()), pipeline_barrier,
-        {n, 1u, 1u}, {64u, 1u, 1u}, VK_NULL_HANDLE,
+        {n, 1u, 1u}, {256u, 1u, 1u}, VK_NULL_HANDLE,
         v_output.buffer(
             pipeline_barrier,
             api::PipelineStage::COMPUTE,

@@ -70,7 +70,7 @@ std::tuple<Tensor, Tensor> sort_impl(
   context->submit_compute_job(
       VK_KERNEL(sort), barrier,
       {static_cast<uint32_t>(tiles) * 64u, static_cast<uint32_t>(rows), 1u},
-      {64u, 1u, 1u}, VK_NULL_HANDLE,
+      {256u, 1u, 1u}, VK_NULL_HANDLE,
       scratch.buffer(),
       input.image(barrier, api::PipelineStage::COMPUTE), params.buffer());
 
@@ -97,7 +97,7 @@ std::tuple<Tensor, Tensor> sort_impl(
     context->submit_compute_job(
         VK_KERNEL(sort_merge), merge_barrier,
         {static_cast<uint32_t>(length), static_cast<uint32_t>(rows), 1u},
-        {64u, 1u, 1u}, VK_NULL_HANDLE,
+        {256u, 1u, 1u}, VK_NULL_HANDLE,
         *next, *current, merge_params.buffer());
     std::swap(current, next);
   }
