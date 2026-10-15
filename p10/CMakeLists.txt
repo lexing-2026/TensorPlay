@@ -545,6 +545,7 @@ if(USE_MPS)
         src/backend/mps/SparseKernels.mm
         src/backend/mps/RMSNormKernels.mm
         src/backend/mps/EmbeddingKernels.mm
+        src/backend/mps/EmbeddingBagKernels.mm
         src/backend/mps/FusedOptimizerKernels.mm
         src/backend/mps/ShapeExpandKernels.mm
         src/backend/mps/TopKSamplingKernels.mm
