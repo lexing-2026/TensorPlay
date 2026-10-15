@@ -42,6 +42,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <type_traits>
 
 #ifdef USE_CUDA
 
@@ -73,13 +74,30 @@ struct StaxFastLauncherObject {
 // Device pointer of one pointer-typed argument: an int is taken as the raw
 // address, None is a NULL, a plain tensor wrapper is read through the C++
 // value holder, and anything else falls back to a ``data_ptr()`` call.
+//
+// CUdeviceptr is an integer type on Linux and a pointer type on Windows, so
+// no single cast spelling is valid on both; branch on the platform typedef.
+template <typename T>
+CUdeviceptr to_device_pointer(T addr) {
+    if constexpr (std::is_pointer_v<CUdeviceptr>) {
+        // The driver API spells device addresses as pointers on Windows.
+        return static_cast<CUdeviceptr>(addr);
+    } else if constexpr (std::is_pointer_v<T>) {
+        // ... and as integer-sized handles elsewhere; a pointer-to-integer
+        // conversion needs reinterpret_cast.
+        return reinterpret_cast<CUdeviceptr>(addr);
+    } else {
+        return static_cast<CUdeviceptr>(addr);
+    }
+}
+
 CUdeviceptr device_pointer(PyObject* obj) {
     if (PyLong_Check(obj)) {
         unsigned long long raw = PyLong_AsUnsignedLongLong(obj);
         if (raw == static_cast<unsigned long long>(-1) && PyErr_Occurred()) {
             return 0;
         }
-        return reinterpret_cast<CUdeviceptr>(raw);
+        return to_device_pointer(raw);
     }
     if (Py_IsNone(obj)) {
         return 0;
@@ -88,7 +106,7 @@ CUdeviceptr device_pointer(PyObject* obj) {
     if (tensorplay::python_c::tpx_tensor_guard_probe(obj, &version) >= 0) {
         const tensorplay::Tensor& tensor =
             tensorplay::python_c::tpx_py_tensor_cref(obj);
-        return reinterpret_cast<CUdeviceptr>(tensor.data_ptr());
+        return to_device_pointer(tensor.data_ptr());
     }
     PyObject* method = PyObject_GetAttrString(obj, "data_ptr");
     if (method == nullptr) {
@@ -104,7 +122,7 @@ CUdeviceptr device_pointer(PyObject* obj) {
     if (address == static_cast<unsigned long long>(-1) && PyErr_Occurred()) {
         return 0;
     }
-    return reinterpret_cast<CUdeviceptr>(address);
+    return to_device_pointer(address);
 }
 
 int64_t as_int64(PyObject* obj) {
