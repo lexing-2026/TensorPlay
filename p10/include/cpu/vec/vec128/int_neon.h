@@ -147,6 +147,10 @@ class Vectorized<int64_t> {
     return lo <= hi ? lo : hi;
   }
 
+  Vectorized<int64_t> abs() const {
+    return vabsq_s64(values);
+  }
+
   TP_NEON_DEFINE_MEMBER_CMP(operator==, int64_t, s64, vceqq_s64, u64)
   Vectorized<int64_t> operator!=(const Vectorized<int64_t>& other) const {
     return Vectorized<int64_t>(vreinterpretq_s64_u64(
@@ -439,6 +443,10 @@ class Vectorized<int32_t> {
   }
   int32_t reduce_min() const {
     return vminvq_s32(values);
+  }
+
+  Vectorized<int32_t> abs() const {
+    return vabsq_s32(values);
   }
 
   TP_NEON_DEFINE_MEMBER_CMP(operator==, int32_t, s32, vceqq_s32, u32)

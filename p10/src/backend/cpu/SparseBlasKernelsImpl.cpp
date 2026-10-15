@@ -303,6 +303,8 @@ void sampled_addmm_sparse_csr_kernel(const Tensor& mat1, const Tensor& mat2_t,
     });
 }
 
+} // namespace CPU_CAPABILITY
+
 #ifndef CPU_CAPABILITY_AVX512
 REGISTER_DISPATCH(sampled_addmm_stub, &sampled_addmm_sparse_csr_kernel)
 REGISTER_DISPATCH(sparse_addmm_stub, &sparse_addmm_sparse_csr_kernel)
@@ -311,6 +313,5 @@ ALSO_REGISTER_AVX512_DISPATCH(sampled_addmm_stub, &sampled_addmm_sparse_csr_kern
 ALSO_REGISTER_AVX512_DISPATCH(sparse_addmm_stub, &sparse_addmm_sparse_csr_kernel)
 #endif
 
-} // namespace CPU_CAPABILITY
 } // namespace cpu
 } // namespace tensorplay
