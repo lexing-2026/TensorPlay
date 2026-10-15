@@ -690,6 +690,18 @@ class TestMPSQuantization(unittest.TestCase):
         self.assertEqual(tp.int_repr(y).cpu().tolist(), tp.int_repr(q).cpu().tolist())
         self.assertTrue(tp.allclose(tp.dequantize(y).cpu(), x.cpu(), atol=0.51))
 
+    def test_quantize_per_channel_roundtrip(self):
+        x = tp.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=tp.float32, device="mps")
+        scales = tp.tensor([0.1, 0.2], dtype=tp.float32, device="mps")
+        zps = tp.tensor([0, 0], dtype=tp.int64).mps()
+        q = tp.quantize_per_channel(x, scales, zps, 0, tp.qint8)
+        self.assertEqual(q.device.type, "mps")
+        self.assertEqual(q.dtype, tp.qint8)
+        codes = tp.int_repr(q).cpu().tolist()
+        self.assertEqual(codes, [[10, 10], [30, 20]])
+        d = tp.dequantize(q)
+        self.assertTrue(tp.allclose(d.cpu(), x.cpu(), atol=1e-6))
+
     def test_weight_int8pack_mm(self):
         a = tp.tensor([[0.5, -1.0, 2.0, 0.25],
                        [1.0, 0.5, -0.5, 2.0]], dtype=tp.float32, device="mps")
