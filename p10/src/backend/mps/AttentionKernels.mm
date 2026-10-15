@@ -183,6 +183,215 @@ std::optional<Tensor> sdpa_decode_shader(const Tensor& q_in,
   return output;
 }
 
+// Host-side counterparts of the shader parameter structs (PrefillAttention.h).
+struct PrefillAttnParamsHost {
+  int B;
+  int H;
+  int D;
+  int qL;
+  int kL;
+  int gqa_factor;
+  float scale;
+  float softcapping;
+  int64_t Q_strides[3];
+  int64_t K_strides[3];
+  int64_t V_strides[3];
+  int64_t O_strides[3];
+};
+
+struct PrefillAttnMaskParamsHost {
+  int64_t M_strides[4];
+};
+
+struct PrefillBlockShape {
+  int BQ;
+  int BK;
+  int WM;
+  int WN;
+};
+
+PrefillBlockShape prefill_block_shape_for_head_dim(int64_t head_dim) {
+  switch (head_dim) {
+    case 256:
+      return {16, 8, 2, 1};
+    case 128:
+      return {32, 16, 4, 1};
+    case 96:
+    case 80:
+    case 72:
+    case 64:
+    case 32:
+      return {32, 32, 4, 1};
+    default:
+      TP_THROW(RuntimeError,
+               "scaled_dot_product_attention: unsupported head_dim for "
+               "prefill attention: ",
+               head_dim);
+  }
+}
+
+bool prefill_attention_supports_head_dim(int64_t head_dim) {
+  switch (head_dim) {
+    case 32:
+    case 64:
+    case 72:
+    case 80:
+    case 96:
+    case 128:
+    case 256:
+      return true;
+    default:
+      return false;
+  }
+}
+
+std::string prefill_dtype_str(DType dt) {
+  switch (dt) {
+    case DType::Float32:
+      return "float32";
+    case DType::Float16:
+      return "float16";
+    case DType::BFloat16:
+      return "bfloat16";
+    default:
+      TP_THROW(RuntimeError, "unsupported dtype for prefill attention");
+  }
+}
+
+// Flash-attention prefill (long query).  Returns nullopt when the inputs do
+// not fit the shader so the caller falls back to the MPSGraph path.
+std::optional<Tensor> sdpa_prefill_shader(const Tensor& q_in,
+                                          const Tensor& k_in,
+                                          const Tensor& v_in,
+                                          const std::optional<Tensor>& mask_,
+                                          bool is_causal,
+                                          double scale_factor,
+                                          int64_t gqa_factor,
+                                          bool unsqueezed) {
+  const int64_t B = q_in.size(0);
+  const int64_t H = q_in.size(1);
+  const int64_t qL = q_in.size(2);
+  const int64_t kL = k_in.size(2);
+  const int64_t D = q_in.size(3);
+  const DType dt = q_in.dtype();
+  if (!prefill_attention_supports_head_dim(D)) {
+    return std::nullopt;
+  }
+  if (dt != DType::Float32 && dt != DType::Float16 &&
+      dt != DType::BFloat16) {
+    return std::nullopt;
+  }
+  if (v_in.size(1) != k_in.size(1)) {
+    return std::nullopt;
+  }
+
+  Tensor q = materializeForGraph(q_in);
+  Tensor k = materializeForGraph(k_in);
+  Tensor v = materializeForGraph(v_in);
+  if (q.stride(-1) != 1 || k.stride(-1) != 1 || v.stride(-1) != 1) {
+    return std::nullopt;
+  }
+
+  const bool has_mask = mask_.has_value() && mask_->defined();
+  Tensor mask;
+  if (has_mask) {
+    Tensor m = *mask_;
+    if (m.dtype() == DType::Bool || m.dtype() == dt) {
+      // Accept [L,S] and broadcast to [1,1,L,S].
+      if (m.dim() == 2) {
+        m = ops::view(m, {1, 1, m.size(0), m.size(1)});
+      }
+      if (m.dim() != 4) {
+        return std::nullopt;
+      }
+      mask = m.is_contiguous() ? m : m.contiguous();
+    } else {
+      return std::nullopt;
+    }
+  }
+
+  const PrefillBlockShape shape = prefill_block_shape_for_head_dim(D);
+  const std::string dtype_str = prefill_dtype_str(dt);
+  std::string mask_dtype_str = dtype_str;
+  if (has_mask && mask.dtype() == DType::Bool) {
+    mask_dtype_str = "bool_";
+  }
+  const std::string kname = "prefill_attention_" + dtype_str + "_bq" +
+      std::to_string(shape.BQ) + "_bk" + std::to_string(shape.BK) + "_bd" +
+      std::to_string(D) + "_wm" + std::to_string(shape.WM) + "_wn" +
+      std::to_string(shape.WN) + "_hm" + (has_mask ? "1" : "0") + "_dc" +
+      (is_causal ? "1" : "0") + "_mask" + mask_dtype_str;
+
+  std::vector<int64_t> out_shape = static_cast<std::vector<int64_t>>(q.shape());
+  Tensor output = Tensor::empty(out_shape, dt, q.device());
+  if (output.numel() == 0) {
+    return output;
+  }
+
+  PrefillAttnParamsHost params{};
+  params.B = static_cast<int>(B);
+  params.H = static_cast<int>(H);
+  params.D = static_cast<int>(D);
+  params.qL = static_cast<int>(qL);
+  params.kL = static_cast<int>(kL);
+  params.gqa_factor = static_cast<int>(gqa_factor);
+  params.scale = static_cast<float>(scale_factor);
+  params.softcapping = 1.0f;
+  params.Q_strides[0] = q.stride(0);
+  params.Q_strides[1] = q.stride(1);
+  params.Q_strides[2] = q.stride(2);
+  params.K_strides[0] = k.stride(0);
+  params.K_strides[1] = k.stride(1);
+  params.K_strides[2] = k.stride(2);
+  params.V_strides[0] = v.stride(0);
+  params.V_strides[1] = v.stride(1);
+  params.V_strides[2] = v.stride(2);
+  params.O_strides[0] = output.stride(0);
+  params.O_strides[1] = output.stride(1);
+  params.O_strides[2] = output.stride(2);
+
+  PrefillAttnMaskParamsHost mask_params{};
+  if (has_mask) {
+    mask_params.M_strides[0] = mask.stride(0);
+    mask_params.M_strides[1] = mask.stride(1);
+    mask_params.M_strides[2] = mask.stride(2);
+    mask_params.M_strides[3] = mask.stride(3);
+  }
+
+  const int64_t nQ = (qL + shape.BQ - 1) / shape.BQ;
+  MPSStream* mpsStream = getCurrentMPSStream();
+  dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+    @autoreleasepool {
+      id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
+      id<MTLComputePipelineState> PSO =
+          MetalShaderLibrary::getBundledLibrary().getPipelineStateForFunc(
+              kname);
+      [computeEncoder setComputePipelineState:PSO];
+      mtl_setArgs(computeEncoder, q, k, v, output, params);
+      if (has_mask) {
+        mtl_setArgs<5>(computeEncoder, mask_params, mask);
+      } else {
+        // Dummy bindings to satisfy buffer slots 5/6 when HAS_MASK=false.
+        mtl_setArgs<5>(computeEncoder, uint32_t(0), uint32_t(0));
+      }
+      MTLSize gridSize = MTLSizeMake(static_cast<NSUInteger>(nQ),
+                                     static_cast<NSUInteger>(H),
+                                     static_cast<NSUInteger>(B));
+      MTLSize threadgroupSize =
+          MTLSizeMake(32, static_cast<NSUInteger>(shape.WM),
+                      static_cast<NSUInteger>(shape.WN));
+      [computeEncoder dispatchThreadgroups:gridSize
+                     threadsPerThreadgroup:threadgroupSize];
+      mpsStream->endKernelCoalescing();
+    }
+  });
+
+  if (unsqueezed) {
+    output = ops::squeeze(output, 1);
+  }
+  return output;
+}
+
 } // namespace
 
 // MPSGraph-based scaled dot product attention:
@@ -264,6 +473,16 @@ Tensor scaled_dot_product_attention_kernel(
                                       gqa_factor, unsqueezed);
     if (decoded.has_value()) {
       return *decoded;
+    }
+  }
+
+  // Flash-attention prefill path (long query / any mask).
+  {
+    auto prefilled = sdpa_prefill_shader(q, k, v, attn_mask, is_causal,
+                                         scale_factor, gqa_factor,
+                                         unsqueezed);
+    if (prefilled.has_value()) {
+      return *prefilled;
     }
   }
 
