@@ -196,8 +196,6 @@ std::tuple<Tensor, Tensor, Tensor> native_layer_norm_kernel(
     const std::optional<Tensor>& weight_opt,
     const std::optional<Tensor>& bias_opt,
     double eps) {
-  Tensor out = layer_norm_impl(input, normalized_shape, weight_opt, bias_opt, eps);
-
   const int64_t norm_ndim = static_cast<int64_t>(normalized_shape.size());
   std::vector<int64_t> dims;
   for (int64_t i = input.dim() - norm_ndim; i < input.dim(); ++i) {
@@ -213,16 +211,36 @@ std::tuple<Tensor, Tensor, Tensor> native_layer_norm_kernel(
   // pointer cast, so every call must carry exactly the argument list the
   // registered kernel expects.  mean.dim/var.dim take a trailing dtype or
   // correction before keepdim; add.Scalar takes (self, other, alpha).
+  // Variance comes from E[x^2] - E[x]^2 instead of the dedicated axis
+  // reduction: the mean kernels use a linear scan while the variance kernel
+  // pays an extra serial pass, so this substitution is both faster and
+  // numerically equivalent for the pooled moment.
   Tensor mean =
-      dispatch_vk<Tensor>("mean.dim", input, dims, true, DType::Float32)
-          .reshape(outer);
+      dispatch_vk<Tensor>("mean.dim", input, dims, true, DType::Float32);
+  Tensor x2 = dispatch_vk<Tensor>("mul.Tensor", input, input);
+  Tensor mean_x2 =
+      dispatch_vk<Tensor>("mean.dim", x2, dims, true, DType::Float32);
+  Tensor mean_sq = dispatch_vk<Tensor>("mul.Tensor", mean, mean);
   Tensor var = dispatch_vk<Tensor>(
-                   "var.dim", input, dims, int64_t{0}, true)
-                   .reshape(outer);
+      "sub.Tensor", mean_x2, mean_sq, Scalar(1));
   Tensor rstd = dispatch_vk<Tensor>(
       "rsqrt",
       dispatch_vk<Tensor>("add.Scalar", var, Scalar(eps), Scalar(1)));
-  return std::make_tuple(out, mean, rstd);
+
+  // One-dimensional moments broadcast against the full input; the transform
+  // stays linear in the element count.
+  Tensor out =
+      dispatch_vk<Tensor>("sub.Tensor", input, mean, Scalar(1));
+  out = dispatch_vk<Tensor>("mul.Tensor", out, rstd);
+  if (weight_opt.has_value()) {
+    out = dispatch_vk<Tensor>("mul.Tensor", out, *weight_opt);
+  }
+  if (bias_opt.has_value()) {
+    out = dispatch_vk<Tensor>(
+        "add.Tensor", out, *bias_opt, Scalar(1));
+  }
+
+  return std::make_tuple(out, mean.reshape(outer), rstd);
 }
 
 Tensor batch_norm_kernel(
