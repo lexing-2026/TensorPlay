@@ -917,7 +917,7 @@ Vectorized<tensorplay::quint8> inline maximum(
   return a.maximum(b);
 }
 
-#elif !defined(CPU_CAPABILITY_SVE256)
+#else
 
 // NOTE: These are low-performance implementations that we fall back on
 // if we are not building with AVX2. This may not be an issue, because
