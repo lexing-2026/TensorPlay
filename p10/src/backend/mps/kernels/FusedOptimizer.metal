@@ -289,6 +289,8 @@ constexpr constant uint kExpAvgIdx = kGradIdx + kmaxTensors;
 constexpr constant uint kExpAvgSqIdx = kExpAvgIdx + kmaxTensors;
 constexpr constant uint kMaxExpAvgSqIdx = kExpAvgSqIdx + kmaxTensors;
 constexpr constant uint kStateStepsIdx = kExpAvgSqIdx + kmaxTensors;
+constexpr constant uint kStateStepsIdxForAmsgrad =
+    kMaxExpAvgSqIdx + kmaxTensors;
 
 template <typename T, typename state_steps_t>
 struct AdamArguments {
@@ -308,7 +310,7 @@ struct AdamAmsgradArguments {
   metal::array<device T*, kmaxTensors> exp_avg_sqs [[id(kExpAvgSqIdx)]];
   metal::array<device T*, kmaxTensors> max_exp_avg_sqs [[id(kMaxExpAvgSqIdx)]];
   metal::array<device state_steps_t*, kmaxTensors> state_steps
-      [[id(kStateStepsIdx)]];
+      [[id(kStateStepsIdxForAmsgrad)]];
 };
 
 struct MetadataArguments {
