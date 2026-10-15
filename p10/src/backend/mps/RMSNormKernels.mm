@@ -15,8 +15,12 @@
 #include <string>
 #include <vector>
 
+#include "tensorplay/ops/TPXOpsGenerated.h"
+
 namespace tensorplay {
 namespace mps {
+
+namespace ops = tpx::ops;
 
 namespace {
 
@@ -71,6 +75,20 @@ std::tuple<Tensor, Tensor> rms_norm_forward(
   Tensor output = Tensor::empty(
       static_cast<std::vector<int64_t>>(input.shape()), dt, input.device());
 
+  // Reciprocal standard deviation, one value per outer row (broadcastable
+  // to the normalized axes).
+  const int64_t input_ndim = input.dim();
+  const int64_t norm_ndim = static_cast<int64_t>(normalized_shape.size());
+  const int64_t axis = input_ndim - norm_ndim;
+  std::vector<int64_t> stat_shape;
+  for (int64_t i = 0; i < axis; ++i) {
+    stat_shape.push_back(input.size(i));
+  }
+  for (int64_t i = axis; i < input_ndim; ++i) {
+    stat_shape.push_back(1);
+  }
+  Tensor rstd = Tensor::empty(stat_shape, DType::Float32, input.device());
+
   const bool has_w = weight_opt.has_value() && weight_opt->defined();
   Tensor weight;
   if (has_w) {
@@ -85,7 +103,7 @@ std::tuple<Tensor, Tensor> rms_norm_forward(
   }
 
   if (input_c.numel() == 0) {
-    return {output, Tensor()};
+    return {output, rstd};
   }
 
   MPSStream* mpsStream = getCurrentMPSStream();
@@ -103,8 +121,8 @@ std::tuple<Tensor, Tensor> rms_norm_forward(
       id<MTLComputePipelineState> PSO =
           MetalShaderLibrary::getBundledLibrary().getPipelineStateForFunc(kernel);
       [computeEncoder setComputePipelineState:PSO];
-      mtl_setArgs(computeEncoder, input_c, weight, output, eps_f, axis_size,
-                  w_stride);
+      mtl_setArgs(computeEncoder, input_c, weight, output, rstd, eps_f,
+                  axis_size, w_stride);
 
       const auto maxThreadsPerGroup =
           static_cast<size_t>([PSO maxTotalThreadsPerThreadgroup]);
@@ -127,7 +145,7 @@ std::tuple<Tensor, Tensor> rms_norm_forward(
     }
   });
 
-  return {output, Tensor()};
+  return {output, rstd};
 }
 
 Tensor rms_norm_kernel(const Tensor& input,
@@ -145,11 +163,79 @@ std::tuple<Tensor, Tensor> fused_rms_norm_kernel(
   return rms_norm_forward(input, normalized_shape, weight, eps);
 }
 
+// Backward for fused RMSNorm, composed from GPU primitives in float32
+// accumulation.  Formulas (with x_hat = x * rstd):
+//   d_input  = (d_y * w - x_hat * mean(d_y * w * x_hat)) * rstd
+//   d_weight = sum(d_y * x_hat) over the outer (non-normalized) dims
+std::tuple<Tensor, Tensor> fused_rms_norm_backward_kernel(
+    const Tensor& grad_out,
+    const Tensor& input,
+    const std::vector<int64_t>& normalized_shape,
+    const Tensor& rstd,
+    const std::optional<Tensor>& weight,
+    const std::vector<bool>& output_mask) {
+  const int64_t input_ndim = input.dim();
+  const int64_t norm_ndim = static_cast<int64_t>(normalized_shape.size());
+  const int64_t axis = input_ndim - norm_ndim;
+  std::vector<int64_t> inner_dims;
+  std::vector<int64_t> outer_dims;
+  for (int64_t i = 0; i < input_ndim; ++i) {
+    if (i >= axis) {
+      inner_dims.push_back(i);
+    } else {
+      outer_dims.push_back(i);
+    }
+  }
+  int64_t inner_size = 1;
+  for (int64_t s : normalized_shape) {
+    inner_size *= s;
+  }
+
+  const DType dt = input.dtype();
+  Tensor compute = input.is_contiguous() ? input : input.contiguous();
+  if (compute.dtype() != DType::Float32) {
+    compute = compute.to(DType::Float32);
+  }
+  Tensor g_o = grad_out.is_contiguous() ? grad_out : grad_out.contiguous();
+  if (g_o.dtype() != DType::Float32) {
+    g_o = g_o.to(DType::Float32);
+  }
+  Tensor rstd_f = rstd.dtype() == DType::Float32 ? rstd : rstd.to(DType::Float32);
+  const bool has_w = weight.has_value() && weight->defined();
+  Tensor w_f;
+  if (has_w) {
+    w_f = weight->is_contiguous() ? *weight : weight->contiguous();
+    if (w_f.dtype() != DType::Float32) {
+      w_f = w_f.to(DType::Float32);
+    }
+  }
+
+  Tensor x_hat = ops::mul(compute, rstd_f);
+  Tensor grad_x_hat = has_w ? ops::mul(g_o, w_f) : g_o;
+  Tensor grad_input;
+  if (output_mask[0]) {
+    Tensor total = ops::sum(ops::mul(x_hat, grad_x_hat), inner_dims,
+                            /*keepdim=*/true);
+    Tensor mean_total = ops::div(total, Scalar(static_cast<double>(inner_size)));
+    Tensor grad_input_f32 =
+        ops::mul(ops::sub(grad_x_hat, ops::mul(x_hat, mean_total)), rstd_f);
+    grad_input = grad_input_f32.to(dt);
+  }
+  Tensor grad_weight;
+  if (output_mask[1] && has_w) {
+    Tensor grad_weight_f32 =
+        ops::sum(ops::mul(g_o, x_hat), outer_dims, /*keepdim=*/false);
+    grad_weight = grad_weight_f32.to(w_f.dtype());
+  }
+  return {grad_input, grad_weight};
+}
+
 } // namespace
 
 TENSORPLAY_LIBRARY_IMPL(MPS, RMSNormKernels) {
   m.impl("rms_norm", rms_norm_kernel);
   m.impl("_fused_rms_norm", fused_rms_norm_kernel);
+  m.impl("_fused_rms_norm_backward", fused_rms_norm_backward_kernel);
 }
 
 } // namespace mps

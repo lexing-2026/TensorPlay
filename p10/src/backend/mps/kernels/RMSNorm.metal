@@ -25,6 +25,7 @@ template <typename T>
     constant T* x,
     constant T* w,
     device T* out,
+    device float* rstd_out,
     constant float& eps,
     constant uint& axis_size,
     constant uint& w_stride,
@@ -88,6 +89,11 @@ template <typename T>
       }
     }
   }
+
+  // Publish the reciprocal standard deviation for the backward pass.
+  if (simd_group_id == 0 && simd_lane_id == 0) {
+    rstd_out[gid] = local_inv_mean[0];
+  }
 }
 
 template <typename T>
@@ -95,6 +101,7 @@ template <typename T>
     constant T* x,
     constant T* w,
     device T* out,
+    device float* rstd_out,
     constant float& eps,
     constant uint& axis_size,
     constant uint& w_stride,
@@ -164,6 +171,11 @@ template <typename T>
       }
     }
   }
+
+  // Publish the reciprocal standard deviation for the backward pass.
+  if (simd_group_id == 0 && simd_lane_id == 0) {
+    rstd_out[gid] = local_inv_mean[0];
+  }
 }
 
 // clang-format off
@@ -173,6 +185,7 @@ template <typename T>
       constant itype* x,                                      \
       constant itype* w,                                      \
       device itype* out,                                      \
+      device float* rstd_out,                                 \
       constant float& eps,                                    \
       constant uint& axis_size,                               \
       constant uint& w_stride,                                \
@@ -187,6 +200,7 @@ template <typename T>
       constant itype* x,                                            \
       constant itype* w,                                            \
       device itype* out,                                            \
+      device float* rstd_out,                                       \
       constant float& eps,                                          \
       constant uint& axis_size,                                     \
       constant uint& w_stride,                                      \
