@@ -21,7 +21,7 @@ kernel void arange_fill(device T* out [[buffer(0)]],
                      constant double& start [[buffer(1)]],                \
                      constant double& step [[buffer(2)]],                \
                      constant uint& numel [[buffer(3)]],                \
-                     uint tid [[thread_position_in_grid]])
+                     uint tid [[thread_position_in_grid]]);
 
 REGISTER_ARANGE(float)
 REGISTER_ARANGE(half)
@@ -63,7 +63,7 @@ kernel void logspace_fill(device T* out [[buffer(0)]],
                        constant double& start [[buffer(1)]],               \
                        constant double& step [[buffer(2)]],                \
                        constant uint& numel [[buffer(3)]],                  \
-                       uint tid [[thread_position_in_grid]])
+                       uint tid [[thread_position_in_grid]]);
 
 #define REGISTER_LOGSPACE(DTYPE)                                            \
   template [[host_name("logspace_" #DTYPE)]] kernel void                   \
@@ -72,7 +72,7 @@ kernel void logspace_fill(device T* out [[buffer(0)]],
                        constant double& start [[buffer(2)]],                \
                        constant double& step [[buffer(3)]],                \
                        constant uint& numel [[buffer(4)]],                \
-                       uint tid [[thread_position_in_grid]])
+                       uint tid [[thread_position_in_grid]]);
 
 REGISTER_LINSPACE(float)
 REGISTER_LINSPACE(half)

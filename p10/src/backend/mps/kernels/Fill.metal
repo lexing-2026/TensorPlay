@@ -19,7 +19,7 @@ kernel void fill_constant(device T* out [[buffer(0)]],
   fill_constant<DTYPE>(device DTYPE * out [[buffer(0)]],                 \
                        constant DTYPE& value [[buffer(1)]],                \
                        constant uint& numel [[buffer(2)]],               \
-                       uint tid [[thread_position_in_grid]])
+                       uint tid [[thread_position_in_grid]]);
 
 REGISTER_FILL(float)
 REGISTER_FILL(half)

@@ -311,7 +311,7 @@ kernel void conv2d_mpp(
       device DT * dst [[buffer(2)]],                                        \
       constant Conv2DParams & p [[buffer(3)]],                              \
       device const DT * bias [[buffer(4)]],                                 \
-      uint3 tgid [[threadgroup_position_in_grid]])
+      uint3 tgid [[threadgroup_position_in_grid]]);
 
 #define INSTANTIATE_CONV2D_MPP_DTYPES(                                     \
     BO, BW, BH, NSG, KH, KW, SX, SY, DX, DY, CNAME, SRCC, BNAME, HAS_BIAS) \
@@ -320,13 +320,13 @@ kernel void conv2d_mpp(
       SRCC, BNAME, HAS_BIAS)                                                \
   INSTANTIATE_CONV2D_MPP(                                                  \
       half, true, BO, BW, BH, NSG, 1, KH, KW, SX, SY, DX, DY, CNAME,        \
-      SRCC, BNAME, HAS_BIAS)
+      SRCC, BNAME, HAS_BIAS);
 
 #define INSTANTIATE_CONV2D_MPP_KERNEL(KH, KW, CNAME, SRCC)                 \
   INSTANTIATE_CONV2D_MPP_DTYPES(                                           \
       32, 8, 8, 2, KH, KW, 1, 1, 1, 1, CNAME, SRCC, "bias", true)          \
   INSTANTIATE_CONV2D_MPP_DTYPES(                                           \
-      32, 8, 8, 2, KH, KW, 1, 1, 1, 1, CNAME, SRCC, "nobias", false)
+      32, 8, 8, 2, KH, KW, 1, 1, 1, 1, CNAME, SRCC, "nobias", false);
 
 INSTANTIATE_CONV2D_MPP_KERNEL(1, 1, "c1", 1)
 INSTANTIATE_CONV2D_MPP_KERNEL(1, 1, "c3", 3)
@@ -350,7 +350,7 @@ INSTANTIATE_CONV2D_MPP_KERNEL(3, 3, "c64", 64)
       device const DT * source [[buffer(0)]],                               \
       device DT * destination [[buffer(1)]],                                \
       constant ConvWeightPermuteParams & params [[buffer(2)]],              \
-      uint3 position [[thread_position_in_grid]])
+      uint3 position [[thread_position_in_grid]]);
 
 #define REGISTER_NCHW_TO_NHWC(DT)                                          \
   template [[host_name("nchw_to_nhwc_" #DT)]] kernel void                   \
@@ -359,7 +359,7 @@ INSTANTIATE_CONV2D_MPP_KERNEL(3, 3, "c64", 64)
       device DT * dst [[buffer(1)]],                                        \
       constant uint & channels [[buffer(2)]],                               \
       constant uint & spatial [[buffer(3)]],                                \
-      uint3 tid [[thread_position_in_grid]])
+      uint3 tid [[thread_position_in_grid]]);
 
 REGISTER_CONV_WEIGHT_TO_HWIO(float)
 REGISTER_CONV_WEIGHT_TO_HWIO(half)

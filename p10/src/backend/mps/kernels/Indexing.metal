@@ -121,7 +121,7 @@ kernel void scatter_add_dense(
       constant long & inner [[buffer(3)]],                                    \
       constant long & in_dim [[buffer(4)]],                                   \
       constant long & n_idx [[buffer(5)]],                                    \
-      uint tid [[thread_position_in_grid]])
+      uint tid [[thread_position_in_grid]]);
 
 #define REGISTER_GATHER_DTYPE(DTYPE)                                         \
   template [[host_name("gather_dense_" #DTYPE "_long")]] kernel void         \
@@ -132,7 +132,7 @@ kernel void scatter_add_dense(
       constant long & inner [[buffer(3)]],                                    \
       constant long & in_dim [[buffer(4)]],                                   \
       constant long & idx_dim [[buffer(5)]],                                  \
-      uint tid [[thread_position_in_grid]])
+      uint tid [[thread_position_in_grid]]);
 
 #define REGISTER_SCATTER_SET_DTYPE(DTYPE)                                    \
   template [[host_name("scatter_set_dense_" #DTYPE "_long")]] kernel void    \
@@ -152,7 +152,7 @@ kernel void scatter_add_dense(
       constant long & inner [[buffer(3)]],                                    \
       constant long & out_dim [[buffer(4)]],                                  \
       constant long & idx_dim [[buffer(5)]],                                  \
-      uint tid [[thread_position_in_grid]])
+      uint tid [[thread_position_in_grid]]);
 
 #define REGISTER_SCATTER_ADD_DTYPE(DTYPE)                                    \
   template [[host_name("scatter_add_dense_" #DTYPE "_long")]] kernel void    \
@@ -163,13 +163,13 @@ kernel void scatter_add_dense(
       constant long & inner [[buffer(3)]],                                    \
       constant long & out_dim [[buffer(4)]],                                  \
       constant long & idx_dim [[buffer(5)]],                                  \
-      uint tid [[thread_position_in_grid]])
+      uint tid [[thread_position_in_grid]]);
 
 #define REGISTER_INDEXING_DTYPE(DTYPE) \
   REGISTER_INDEX_SELECT_DTYPE(DTYPE)  \
   REGISTER_GATHER_DTYPE(DTYPE)        \
   REGISTER_SCATTER_SET_DTYPE(DTYPE)   \
-  REGISTER_SCATTER_ADD_DTYPE(DTYPE)
+  REGISTER_SCATTER_ADD_DTYPE(DTYPE);
 
 REGISTER_INDEXING_DTYPE(float)
 REGISTER_INDEXING_DTYPE(half)

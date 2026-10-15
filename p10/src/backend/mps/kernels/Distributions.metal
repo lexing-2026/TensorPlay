@@ -56,7 +56,7 @@ kernel void rand_normal(device T* out [[buffer(0)]],
   rand_normal<DTYPE>(device DTYPE * out [[buffer(0)]],                    \
                      constant uint& seed [[buffer(1)]],                \
                      constant uint& numel [[buffer(2)]],                 \
-                     uint tid [[thread_position_in_grid]])
+                     uint tid [[thread_position_in_grid]]);
 
 REGISTER_RAND(float)
 REGISTER_RAND(half)

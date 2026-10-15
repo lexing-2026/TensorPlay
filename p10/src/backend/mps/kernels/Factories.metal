@@ -49,7 +49,7 @@ kernel void randint_fill(device T* out [[buffer(0)]],
   eye_fill<DTYPE>(device DTYPE * out [[buffer(0)]],                        \
                   constant uint& rows [[buffer(1)]],                        \
                   constant uint& cols [[buffer(2)]],                       \
-                  uint tid [[thread_position_in_grid]])
+                  uint tid [[thread_position_in_grid]]);
 
 #define REGISTER_RANDINT(DTYPE)                                             \
   template [[host_name("randint_" #DTYPE)]] kernel void                     \
@@ -58,7 +58,7 @@ kernel void randint_fill(device T* out [[buffer(0)]],
                       constant ulong& range [[buffer(2)]],                 \
                       constant uint& seed [[buffer(3)]],                  \
                       constant uint& numel [[buffer(4)]],                \
-                      uint tid [[thread_position_in_grid]])
+                      uint tid [[thread_position_in_grid]]);
 
 REGISTER_EYE(float)
 REGISTER_EYE(half)
