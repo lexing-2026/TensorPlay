@@ -141,6 +141,56 @@ class TestMPSSDPA(unittest.TestCase):
                                                   is_causal=True)
         self.assertTrue(close(out.cpu(), out_cpu, 1e-2))
 
+    def test_sdpa_prefill(self):
+        q = tp.randn(1, 2, 16, 64, device="mps")
+        k = tp.randn(1, 2, 32, 64, device="mps")
+        v = tp.randn(1, 2, 32, 64, device="mps")
+        out = tp.scaled_dot_product_attention(q, k, v)
+        out_cpu = tp.scaled_dot_product_attention(q.cpu(), k.cpu(), v.cpu())
+        self.assertEqual(list(out.shape), [1, 2, 16, 64])
+        self.assertTrue(close(out.cpu(), out_cpu, 1e-2))
+
+    def test_sdpa_2pass(self):
+        q = tp.randn(1, 1, 4, 64, device="mps")
+        k = tp.randn(1, 1, 1024, 64, device="mps")
+        v = tp.randn(1, 1, 1024, 64, device="mps")
+        out = tp.scaled_dot_product_attention(q, k, v)
+        out_cpu = tp.scaled_dot_product_attention(q.cpu(), k.cpu(), v.cpu())
+        self.assertTrue(close(out.cpu(), out_cpu, 1e-2))
+
+    def test_sdpa_bool_mask(self):
+        q = tp.randn(1, 2, 4, 64, device="mps")
+        k = tp.randn(1, 2, 6, 64, device="mps")
+        v = tp.randn(1, 2, 6, 64, device="mps")
+        mask = tp.randint(0, 2, (1, 1, 4, 6), device="mps").bool()
+        out = tp.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        out_cpu = tp.scaled_dot_product_attention(q.cpu(), k.cpu(), v.cpu(),
+                                                  attn_mask=mask.cpu())
+        self.assertTrue(close(out.cpu(), out_cpu, 1e-2))
+
+    def test_sdpa_gqa(self):
+        q = tp.randn(1, 4, 4, 64, device="mps")
+        k = tp.randn(1, 2, 6, 64, device="mps")
+        v = tp.randn(1, 2, 6, 64, device="mps")
+        out = tp.scaled_dot_product_attention(q, k, v, enable_gqa=True)
+        out_cpu = tp.scaled_dot_product_attention(q.cpu(), k.cpu(), v.cpu(),
+                                                  enable_gqa=True)
+        self.assertTrue(close(out.cpu(), out_cpu, 1e-2))
+
+
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSEmbeddingBag(unittest.TestCase):
+    def test_embedding_bag_sum(self):
+        weight = tp.randn(10, 4, device="mps")
+        indices = tp.tensor([0, 1, 2, 2, 5], device="mps")
+        offsets = tp.tensor([0, 3], device="mps")
+        out, offset2bag, bag_size, max_idx = tp.functional._embedding_bag(
+            weight, indices, offsets, mode=0)
+        out_cpu, _, _, _ = tp.functional._embedding_bag(
+            weight.cpu(), indices.cpu(), offsets.cpu(), mode=0)
+        self.assertEqual(list(out.shape), [2, 4])
+        self.assertTrue(close(out.cpu(), out_cpu, 1e-3))
+
 
 @unittest.skipUnless(mps_available(), "MPS not available")
 class TestMPSFactoryShaders(unittest.TestCase):
