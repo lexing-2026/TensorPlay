@@ -267,6 +267,25 @@ Tensor randn_like_kernel(
   return normal_kernel(out, 0.0, 1.0, std::nullopt);
 }
 
+// Nullary normal factory: allocate a Float32 tensor on the device and fill
+// it in place from the same counter-based stream as normal_.  The host
+// generator advances per call, so seeded runs reproduce their tensors.
+Tensor randn_kernel(
+    const std::vector<int64_t>& size,
+    std::optional<DType> dtype,
+    std::optional<Device> device) {
+  const DType out_dtype = dtype.has_value() ? *dtype : DType::Float32;
+  const Device out_device =
+      device.has_value() ? *device : Device(DeviceType::Vulkan);
+  TP_CHECK(
+      out_device.is_vulkan(), "Vulkan randn expects a Vulkan device");
+  Tensor out = empty_kernel(size, out_dtype, out_device, false);
+  if (out.numel() > 0) {
+    normal_kernel(out, 0.0, 1.0, std::nullopt);
+  }
+  return out;
+}
+
 } // namespace ops
 } // namespace vulkan
 } // namespace tensorplay
@@ -276,6 +295,7 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, RandomKernels) {
   m.impl("normal_", &tensorplay::vulkan::ops::normal_kernel);
   m.impl("bernoulli_.float", &tensorplay::vulkan::ops::bernoulli_scalar_kernel);
   m.impl("bernoulli_.Tensor", &tensorplay::vulkan::ops::bernoulli_tensor_kernel);
+  m.impl("randn", &tensorplay::vulkan::ops::randn_kernel);
   m.impl("rand_like", &tensorplay::vulkan::ops::rand_like_kernel);
   m.impl("randn_like", &tensorplay::vulkan::ops::randn_like_kernel);
 }
