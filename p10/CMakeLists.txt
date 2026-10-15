@@ -561,6 +561,7 @@ if(USE_VULKAN)
         src/backend/vulkan/impl/Packing.cpp
         src/backend/vulkan/ops/Activation.cpp
         src/backend/vulkan/ops/Allocator.cpp
+        src/backend/vulkan/ops/AutogradOps.cpp
         src/backend/vulkan/ops/BinaryOp.cpp
         src/backend/vulkan/ops/Clamp.cpp
         src/backend/vulkan/ops/Clone.cpp
