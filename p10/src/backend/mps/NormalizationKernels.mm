@@ -216,9 +216,376 @@ Tensor layer_norm_kernel(const Tensor& input,
                                               weight_opt, bias_opt, eps));
 }
 
+// ---------------------------------------------------------------------------
+// batch_norm
+//
+// Training mode computes batch statistics with meanOfTensor/varianceOfTensor
+// over all non-channel axes, normalizes with the confirmed
+// normalizationWithTensor selector, and updates running statistics on the
+// host (only C elements).  Evaluation mode normalizes directly with the
+// running statistics.
+// ---------------------------------------------------------------------------
+
+Tensor batch_norm_kernel(const Tensor& input,
+                          const std::optional<Tensor>& weight_opt,
+                          const std::optional<Tensor>& bias_opt,
+                          const std::optional<Tensor>& running_mean_opt,
+                          const std::optional<Tensor>& running_var_opt,
+                          bool training, double momentum, double eps) {
+  if (!input.device().is_mps()) {
+    TP_THROW(RuntimeError, "batch_norm(): input must be on the MPS device");
+  }
+  if (input.dim() < 2 || input.dim() > 5) {
+    TP_THROW(RuntimeError, "batch_norm: Input must be between 2D and 5D");
+  }
+  if (!isFloatingType(input.dtype())) {
+    TP_THROW(NotImplementedError,
+             "batch_norm: only floating point dtypes are supported");
+  }
+  const int64_t C = input.size(1);
+  const bool has_running_mean =
+      running_mean_opt.has_value() && running_mean_opt->defined();
+  const bool has_running_var =
+      running_var_opt.has_value() && running_var_opt->defined();
+  if (has_running_mean != has_running_var) {
+    TP_THROW(RuntimeError,
+             "batch_norm: running_mean and running_var must either both be "
+             "defined or both be absent");
+  }
+  if (!training && !(has_running_mean && has_running_var)) {
+    TP_THROW(RuntimeError,
+             "batch_norm: running_mean and running_var must be defined in "
+             "evaluation mode");
+  }
+
+  std::vector<int64_t> axes;
+  std::vector<int64_t> mean_shape(static_cast<size_t>(input.dim()), 1);
+  for (int64_t i = 0; i < input.dim(); ++i) {
+    if (i != 1) axes.push_back(i);
+  }
+  mean_shape[1] = C;
+
+  std::vector<int64_t> out_shape =
+      static_cast<std::vector<int64_t>>(input.shape());
+  Tensor output = Tensor(out_shape, input.dtype(), input.device());
+  if (output.numel() == 0) {
+    return output;
+  }
+
+  Tensor input_c = materializeForGraph(input);
+  Tensor weight_c;
+  Tensor bias_c;
+  if (weight_opt.has_value() && weight_opt->defined()) {
+    weight_c = materializeForGraph(*weight_opt);
+  }
+  if (bias_opt.has_value() && bias_opt->defined()) {
+    bias_c = materializeForGraph(*bias_opt);
+  }
+
+  // Batch statistics buffers (float32) used to refresh running stats.
+  Tensor batch_mean;
+  Tensor batch_var;
+  if (training) {
+    batch_mean = Tensor({C}, DType::Float32, input.device());
+    batch_var = Tensor({C}, DType::Float32, input.device());
+  }
+
+  @autoreleasepool {
+    MPSGraph* graph = [[MPSGraph new] autorelease];
+    MPSShape* inShape = getMPSShape(out_shape);
+    MPSShape* meanShape = getMPSShape(mean_shape);
+    MPSShape* cShape = getMPSShape(std::vector<int64_t>{C});
+    const MPSDataType dt = getMPSDataType(input_c.dtype());
+    const MPSDataType f32 = MPSDataTypeFloat32;
+
+    MPSGraphTensor* x = [graph placeholderWithShape:inShape
+                                          dataType:dt
+                                               name:@"x"];
+    NSMutableArray<NSNumber*>* axesArr =
+        [NSMutableArray arrayWithCapacity:axes.size()];
+    for (int64_t a : axes) {
+      [axesArr addObject:@(a)];
+    }
+
+    MPSGraphTensor* mean0 = nil;
+    MPSGraphTensor* var0 = nil;
+    if (training) {
+      mean0 = [graph meanOfTensor:x axes:axesArr name:nil];
+      var0 = [graph varianceOfTensor:x axes:axesArr name:nil];
+    } else {
+      mean0 = [graph placeholderWithShape:meanShape
+                              dataType:dt
+                                   name:@"rm"];
+      var0 = [graph placeholderWithShape:meanShape
+                              dataType:dt
+                                   name:@"rv"];
+    }
+    MPSGraphTensor* meanB = training
+        ? [graph reshapeTensor:mean0 withShape:meanShape name:nil]
+        : mean0;
+    MPSGraphTensor* varB = training
+        ? [graph reshapeTensor:var0 withShape:meanShape name:nil]
+        : var0;
+
+    MPSGraphTensor* gamma = nil;
+    MPSGraphTensor* beta = nil;
+    if (weight_c.defined()) {
+      gamma = [graph placeholderWithShape:meanShape dataType:dt name:@"w"];
+    }
+    if (bias_c.defined()) {
+      beta = [graph placeholderWithShape:meanShape dataType:dt name:@"b"];
+    }
+    MPSGraphTensor* outT = [graph normalizationWithTensor:x
+                                               meanTensor:meanB
+                                           varianceTensor:varB
+                                              gammaTensor:gamma
+                                               betaTensor:beta
+                                                  epsilon:(float)eps
+                                                     name:nil];
+
+    id<MTLBuffer> inBuf = mtlBufferOf(input_c);
+    id<MTLBuffer> outBuf = mtlBufferOf(output);
+    MPSGraphTensorData* inData =
+        [[[MPSGraphTensorData alloc] initWithMTLBuffer:inBuf
+                                                shape:inShape
+                                             dataType:dt] autorelease];
+    MPSGraphTensorData* outData =
+        [[[MPSGraphTensorData alloc] initWithMTLBuffer:outBuf
+                                                shape:inShape
+                                             dataType:dt] autorelease];
+    NSMutableDictionary* feeds =
+        [NSMutableDictionary dictionaryWithObjectsAndKeys:inData, x, nil];
+    NSMutableDictionary* results =
+        [NSMutableDictionary dictionaryWithObjectsAndKeys:outData, outT, nil];
+
+    if (training) {
+      MPSGraphTensor* meanF32 = ([mean0 dataType] == f32)
+          ? mean0
+          : [graph castTensor:mean0 toType:f32 name:@"cast_mean"];
+      MPSGraphTensor* varF32 = ([var0 dataType] == f32)
+          ? var0
+          : [graph castTensor:var0 toType:f32 name:@"cast_var"];
+      MPSGraphTensorData* meanData =
+          [[[MPSGraphTensorData alloc] initWithMTLBuffer:mtlBufferOf(batch_mean)
+                                                  shape:cShape
+                                               dataType:f32] autorelease];
+      MPSGraphTensorData* varData =
+          [[[MPSGraphTensorData alloc] initWithMTLBuffer:mtlBufferOf(batch_var)
+                                                  shape:cShape
+                                               dataType:f32] autorelease];
+      results[meanF32] = meanData;
+      results[varF32] = varData;
+    } else {
+      Tensor rm_c = materializeForGraph(*running_mean_opt);
+      Tensor rv_c = materializeForGraph(*running_var_opt);
+      MPSGraphTensorData* rmData =
+          [[[MPSGraphTensorData alloc] initWithMTLBuffer:mtlBufferOf(rm_c)
+                                                  shape:meanShape
+                                               dataType:dt] autorelease];
+      MPSGraphTensorData* rvData =
+          [[[MPSGraphTensorData alloc] initWithMTLBuffer:mtlBufferOf(rv_c)
+                                                  shape:meanShape
+                                               dataType:dt] autorelease];
+      feeds[mean0] = rmData;
+      feeds[var0] = rvData;
+    }
+    if (weight_c.defined()) {
+      MPSGraphTensorData* wData =
+          [[[MPSGraphTensorData alloc] initWithMTLBuffer:mtlBufferOf(weight_c)
+                                                  shape:meanShape
+                                               dataType:dt] autorelease];
+      feeds[gamma] = wData;
+    }
+    if (bias_c.defined()) {
+      MPSGraphTensorData* bData =
+          [[[MPSGraphTensorData alloc] initWithMTLBuffer:mtlBufferOf(bias_c)
+                                                  shape:meanShape
+                                               dataType:dt] autorelease];
+      feeds[beta] = bData;
+    }
+
+    getCurrentMPSStream()->executeMPSGraph(graph, feeds, results,
+                                          SyncType::COMMIT_AND_WAIT);
+  }
+
+  if (training && has_running_mean) {
+    const int64_t count = input.numel() / C;
+    const double unbiased = count > 1.0 ? count / (count - 1.0) : 1.0;
+    std::vector<double> mean(C), var(C);
+    if (batch_mean.dtype() == DType::Float32) {
+      const float* mp = batch_mean.data_ptr<float>();
+      const float* vp = batch_var.data_ptr<float>();
+      for (int64_t c = 0; c < C; ++c) {
+        mean[c] = mp[c];
+        var[c] = vp[c];
+      }
+    } else {
+      const double* mp = batch_mean.data_ptr<double>();
+      const double* vp = batch_var.data_ptr<double>();
+      for (int64_t c = 0; c < C; ++c) {
+        mean[c] = mp[c];
+        var[c] = vp[c];
+      }
+    }
+    Tensor rm = *running_mean_opt;
+    Tensor rv = *running_var_opt;
+    if (rm.dtype() == DType::Float32) {
+      float* rmp = rm.data_ptr<float>();
+      float* rvp = rv.data_ptr<float>();
+      for (int64_t c = 0; c < C; ++c) {
+        rmp[c] = static_cast<float>((1.0 - momentum) * rmp[c] +
+                                    momentum * mean[c]);
+        rvp[c] = static_cast<float>((1.0 - momentum) * rvp[c] +
+                                      momentum * var[c] * unbiased);
+      }
+    } else {
+      double* rmp = rm.data_ptr<double>();
+      double* rvp = rv.data_ptr<double>();
+      for (int64_t c = 0; c < C; ++c) {
+        rmp[c] = (1.0 - momentum) * rmp[c] + momentum * mean[c];
+        rvp[c] = (1.0 - momentum) * rvp[c] + momentum * var[c] * unbiased;
+      }
+    }
+  }
+  return output;
+}
+
+// ---------------------------------------------------------------------------
+// group_norm
+//
+// The input is reshaped to (N, G, -1), normalized over the last axis with
+// meanOfTensor/varianceOfTensor, reshaped back, then per-channel weight/bias
+// are applied.
+// ---------------------------------------------------------------------------
+
+Tensor group_norm_kernel(const Tensor& input, int64_t num_groups,
+                          const std::optional<Tensor>& weight_opt,
+                          const std::optional<Tensor>& bias_opt, double eps) {
+  if (!input.device().is_mps()) {
+    TP_THROW(RuntimeError, "group_norm(): input must be on the MPS device");
+  }
+  if (input.dim() < 2) {
+    TP_THROW(RuntimeError, "group_norm(): expected at least 2D input");
+  }
+  const int64_t N = input.size(0);
+  const int64_t C = input.size(1);
+  if (C % num_groups != 0) {
+    TP_THROW(RuntimeError, "group_norm(): num_groups must divide channels");
+  }
+  const int64_t G = num_groups;
+  const int64_t spatial = input.numel() / (N * C);
+  const int64_t per_group = (C / G) * spatial;
+
+  std::vector<int64_t> out_shape =
+      static_cast<std::vector<int64_t>>(input.shape());
+  Tensor output = Tensor(out_shape, input.dtype(), input.device());
+  if (output.numel() == 0) {
+    return output;
+  }
+
+  // Reshaped view: (N, G, C/G * spatial).
+  std::vector<int64_t> grouped_shape = {N, G, per_group};
+  std::vector<int64_t> bcast_shape = {N, G, 1};
+  std::vector<int64_t> affine_shape(static_cast<size_t>(input.dim()), 1);
+  affine_shape[1] = C;
+
+  Tensor input_c = materializeForGraph(input);
+  Tensor weight_c;
+  Tensor bias_c;
+  if (weight_opt.has_value() && weight_opt->defined()) {
+    weight_c = materializeForGraph(*weight_opt);
+  }
+  if (bias_opt.has_value() && bias_opt->defined()) {
+    bias_c = materializeForGraph(*bias_opt);
+  }
+
+  @autoreleasepool {
+    MPSGraph* graph = [[MPSGraph new] autorelease];
+    MPSShape* groupedShape = getMPSShape(grouped_shape);
+    MPSShape* bcastShape = getMPSShape(bcast_shape);
+    MPSShape* outShape = getMPSShape(out_shape);
+    MPSShape* affineShape = getMPSShape(affine_shape);
+    const MPSDataType dt = getMPSDataType(input_c.dtype());
+
+    MPSGraphTensor* xr = [graph placeholderWithShape:groupedShape
+                                           dataType:dt
+                                                name:@"x"];
+    NSArray* lastAxis = @[ @2 ];
+    MPSGraphTensor* mean0 = [graph meanOfTensor:xr axes:lastAxis name:nil];
+    MPSGraphTensor* var0 = [graph varianceOfTensor:xr axes:lastAxis name:nil];
+    MPSGraphTensor* epsT = [graph constantWithScalar:eps dataType:dt];
+    MPSGraphTensor* varEps = [graph additionWithPrimaryTensor:var0
+                                          secondaryTensor:epsT
+                                                     name:nil];
+    MPSGraphTensor* sqrtVar = [graph squareRootWithTensor:varEps name:nil];
+    MPSGraphTensor* rstd0 = [graph reciprocalWithTensor:sqrtVar name:nil];
+    MPSGraphTensor* meanB =
+        [graph reshapeTensor:mean0 withShape:bcastShape name:nil];
+    MPSGraphTensor* rstdB =
+        [graph reshapeTensor:rstd0 withShape:bcastShape name:nil];
+    MPSGraphTensor* centered = [graph subtractionWithPrimaryTensor:xr
+                                                  secondaryTensor:meanB
+                                                              name:nil];
+    MPSGraphTensor* normalized = [graph multiplicationWithPrimaryTensor:centered
+                                                       secondaryTensor:rstdB
+                                                                  name:nil];
+    MPSGraphTensor* result =
+        [graph reshapeTensor:normalized withShape:outShape name:nil];
+    MPSGraphTensor* wt = nil;
+    MPSGraphTensor* bt = nil;
+    if (weight_c.defined()) {
+      wt = [graph placeholderWithShape:affineShape dataType:dt name:@"w"];
+      result = [graph multiplicationWithPrimaryTensor:result
+                                     secondaryTensor:wt
+                                                name:nil];
+    }
+    if (bias_c.defined()) {
+      bt = [graph placeholderWithShape:affineShape dataType:dt name:@"b"];
+      result = [graph additionWithPrimaryTensor:result
+                               secondaryTensor:bt
+                                          name:nil];
+    }
+
+    id<MTLBuffer> inBuf = mtlBufferOf(input_c);
+    id<MTLBuffer> outBuf = mtlBufferOf(output);
+    MPSGraphTensorData* inData =
+        [[[MPSGraphTensorData alloc] initWithMTLBuffer:inBuf
+                                            shape:groupedShape
+                                         dataType:dt] autorelease];
+    MPSGraphTensorData* outData =
+        [[[MPSGraphTensorData alloc] initWithMTLBuffer:outBuf
+                                                 shape:outShape
+                                              dataType:dt] autorelease];
+    NSMutableDictionary* feeds =
+        [NSMutableDictionary dictionaryWithObjectsAndKeys:inData, xr, nil];
+    NSMutableDictionary* results =
+        [NSMutableDictionary dictionaryWithObjectsAndKeys:outData, result, nil];
+    if (weight_c.defined()) {
+      MPSGraphTensorData* wData =
+          [[[MPSGraphTensorData alloc] initWithMTLBuffer:mtlBufferOf(weight_c)
+                                                  shape:affineShape
+                                               dataType:dt] autorelease];
+      feeds[wt] = wData;
+    }
+    if (bias_c.defined()) {
+      MPSGraphTensorData* bData =
+          [[[MPSGraphTensorData alloc] initWithMTLBuffer:mtlBufferOf(bias_c)
+                                                  shape:affineShape
+                                               dataType:dt] autorelease];
+      feeds[bt] = bData;
+    }
+
+    getCurrentMPSStream()->executeMPSGraph(graph, feeds, results,
+                                          SyncType::COMMIT_AND_WAIT);
+  }
+  return output;
+}
+
 TENSORPLAY_LIBRARY_IMPL(MPS, NormalizationKernels) {
   m.impl("native_layer_norm", native_layer_norm_kernel);
   m.impl("layer_norm", layer_norm_kernel);
+  m.impl("batch_norm", batch_norm_kernel);
+  m.impl("group_norm", group_norm_kernel);
 }
 
 } // namespace mps

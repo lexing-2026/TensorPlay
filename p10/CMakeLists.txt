@@ -532,6 +532,7 @@ if(USE_MPS)
         src/backend/mps/PoolingKernels.mm
         src/backend/mps/NormalizationKernels.mm
         src/backend/mps/IndexingKernels.mm
+        src/backend/mps/ConvolutionKernels.mm
         src/backend/mps/LossKernels.mm
         src/backend/mps/QuantizedKernels.mm
     )

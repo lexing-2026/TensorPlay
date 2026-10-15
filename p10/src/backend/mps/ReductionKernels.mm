@@ -492,6 +492,133 @@ Tensor std_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim,
   return varStdOp(self, dim, keepdim, correction, true);
 }
 
+// ---------------------------------------------------------------------------
+// argmax / argmin / max.dim / min.dim
+//
+// Values for max.dim/min.dim come from the GPU reduction selectors; the
+// index tensors are found with a host-side scan over the shared-memory
+// mapping (correct, and cheap enough for the index-only pass).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+double read_element(const void* base, int64_t idx, DType dtype) {
+  switch (dtype) {
+    case DType::Float32:
+      return static_cast<const float*>(base)[idx];
+    case DType::Float64:
+      return static_cast<const double*>(base)[idx];
+    case DType::Float16:
+      return static_cast<float>(static_cast<const Half*>(base)[idx]);
+    case DType::BFloat16:
+      return static_cast<float>(static_cast<const BFloat16*>(base)[idx]);
+    case DType::Int64:
+      return static_cast<double>(static_cast<const int64_t*>(base)[idx]);
+    case DType::Int32:
+      return static_cast<double>(static_cast<const int32_t*>(base)[idx]);
+    case DType::Int16:
+      return static_cast<double>(static_cast<const int16_t*>(base)[idx]);
+    case DType::Int8:
+      return static_cast<double>(static_cast<const int8_t*>(base)[idx]);
+    case DType::UInt8:
+      return static_cast<double>(static_cast<const uint8_t*>(base)[idx]);
+    default:
+      TP_THROW(NotImplementedError,
+               "argmax/argmin: unsupported dtype on MPS");
+  }
+}
+
+// Host-side scan for the index of the first extremum along `dim`.
+Tensor arg_reduce_impl(const Tensor& self, int64_t dim, bool keepdim,
+                       bool is_max) {
+  Tensor self_c = self.contiguous();
+  const std::vector<int64_t> in_shape =
+      static_cast<std::vector<int64_t>>(self.shape());
+  const int64_t ndim = self.dim();
+  if (dim < 0) dim += ndim;
+  if (dim < 0 || dim >= ndim) {
+    TP_THROW(IndexError, "Dimension out of range");
+  }
+  std::vector<int64_t> out_shape;
+  if (keepdim) {
+    out_shape = in_shape;
+    out_shape[dim] = 1;
+  } else {
+    for (int64_t i = 0; i < ndim; ++i) {
+      if (i != dim) out_shape.push_back(in_shape[i]);
+    }
+  }
+  Tensor indices = Tensor::empty(out_shape, DType::Int64, self.device());
+  if (indices.numel() == 0) {
+    return indices;
+  }
+  int64_t outer = 1;
+  int64_t inner = 1;
+  for (int64_t i = 0; i < dim; ++i) outer *= in_shape[i];
+  for (int64_t i = dim + 1; i < ndim; ++i) inner *= in_shape[i];
+  const int64_t dim_size = in_shape[dim];
+  const DType dt = self_c.dtype();
+  const void* data = self_c.data_ptr();
+  int64_t* ip = indices.data_ptr<int64_t>();
+  const double init = is_max ? -std::numeric_limits<double>::infinity()
+                             : std::numeric_limits<double>::infinity();
+  for (int64_t o = 0; o < outer; ++o) {
+    const void* base = static_cast<const char*>(data) +
+                       (o * dim_size) * inner * self_c.itemsize();
+    int64_t* out_row = ip + o * inner;
+    for (int64_t i = 0; i < inner; ++i) {
+      double best = init;
+      int64_t best_idx = 0;
+      for (int64_t k = 0; k < dim_size; ++k) {
+        const double v = read_element(
+            static_cast<const char*>(base) + k * inner * self_c.itemsize(), i,
+            dt);
+        if (is_max ? (v > best) : (v < best)) {
+          best = v;
+          best_idx = k;
+        }
+      }
+      out_row[i] = best_idx;
+    }
+  }
+  return indices;
+}
+
+} // namespace
+
+Tensor argmax_kernel(const Tensor& self, std::optional<int64_t> dim,
+                     bool keepdim) {
+  if (!dim.has_value()) {
+    // Flatten and scan the whole tensor.
+    Tensor flat = self.contiguous().reshape({self.numel()});
+    return arg_reduce_impl(flat, 0, false, true);
+  }
+  return arg_reduce_impl(self, *dim, keepdim, true);
+}
+
+Tensor argmin_kernel(const Tensor& self, std::optional<int64_t> dim,
+                     bool keepdim) {
+  if (!dim.has_value()) {
+    Tensor flat = self.contiguous().reshape({self.numel()});
+    return arg_reduce_impl(flat, 0, false, false);
+  }
+  return arg_reduce_impl(self, *dim, keepdim, false);
+}
+
+std::tuple<Tensor, Tensor> max_dim_kernel(const Tensor& self, int64_t dim,
+                                            bool keepdim) {
+  Tensor values = amax_kernel(self, std::vector<int64_t>{dim}, keepdim);
+  Tensor indices = arg_reduce_impl(self, dim, keepdim, true);
+  return std::make_tuple(values, indices);
+}
+
+std::tuple<Tensor, Tensor> min_dim_kernel(const Tensor& self, int64_t dim,
+                                            bool keepdim) {
+  Tensor values = amin_kernel(self, std::vector<int64_t>{dim}, keepdim);
+  Tensor indices = arg_reduce_impl(self, dim, keepdim, false);
+  return std::make_tuple(values, indices);
+}
+
 TENSORPLAY_LIBRARY_IMPL(MPS, ReductionKernels) {
   m.impl("sum", sum_kernel);
   m.impl("sum.dim_IntList", sum_dim_kernel);
@@ -511,6 +638,10 @@ TENSORPLAY_LIBRARY_IMPL(MPS, ReductionKernels) {
   m.impl("var.dim", var_dim_kernel);
   m.impl("std", std_kernel);
   m.impl("std.dim", std_dim_kernel);
+  m.impl("argmax", argmax_kernel);
+  m.impl("argmin", argmin_kernel);
+  m.impl("max.dim", max_dim_kernel);
+  m.impl("min.dim", min_dim_kernel);
 }
 
 } // namespace mps

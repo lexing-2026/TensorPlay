@@ -571,6 +571,88 @@ class TestMPSIndexing(unittest.TestCase):
         self.assertEqual(y.cpu().tolist(), [[3.0, 3.0, 0.0]])
 
 
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSBatchNorm(unittest.TestCase):
+    def test_batch_norm_eval(self):
+        x = tp.tensor([[[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]]],
+                      dtype=tp.float32, device="mps")
+        rm = tp.tensor([0.0, 0.0], dtype=tp.float32, device="mps")
+        rv = tp.tensor([1.0, 1.0], dtype=tp.float32, device="mps")
+        w = tp.tensor([1.0, 1.0], dtype=tp.float32, device="mps")
+        b = tp.tensor([0.0, 0.0], dtype=tp.float32, device="mps")
+        y = tp.batch_norm(x, w, b, rm, rv, training=False, momentum=0.1,
+                          eps=1e-5)
+        ref = x.cpu() / (1.0 + 1e-5) ** 0.5
+        self.assertTrue(tp.allclose(y.cpu(), ref, atol=1e-4))
+
+    def test_batch_norm_training_updates_stats(self):
+        x = tp.tensor([[[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]]],
+                      dtype=tp.float32, device="mps")
+        rm = tp.tensor([0.0, 0.0], dtype=tp.float32, device="mps")
+        rv = tp.tensor([1.0, 1.0], dtype=tp.float32, device="mps")
+        w = tp.tensor([1.0, 1.0], dtype=tp.float32, device="mps")
+        b = tp.tensor([0.0, 0.0], dtype=tp.float32, device="mps")
+        tp.batch_norm(x, w, b, rm, rv, training=True, momentum=0.1, eps=1e-5)
+        # channel 0: mean 2.5, var 1.25, count=4, unbiased=4/3
+        self.assertAlmostEqual(rm.cpu().tolist()[0], 0.25, places=5)
+        self.assertAlmostEqual(rv.cpu().tolist()[0],
+                               0.9 + 0.1 * 1.25 * 4.0 / 3.0, places=5)
+        # channel 1: mean 6.5
+        self.assertAlmostEqual(rm.cpu().tolist()[1], 0.65, places=5)
+
+
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSGroupNorm(unittest.TestCase):
+    def test_group_norm(self):
+        x = tp.tensor([[[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]]],
+                      dtype=tp.float32, device="mps")
+        y = tp.group_norm(x, 1, eps=1e-5)
+        mean = 4.5
+        var = 5.25
+        ref = (x.cpu() - mean) / (var + 1e-5) ** 0.5
+        self.assertTrue(tp.allclose(y.cpu(), ref, atol=1e-4))
+
+
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSConv2d(unittest.TestCase):
+    def test_conv2d(self):
+        x = tp.ones((1, 1, 4, 4), dtype=tp.float32, device="mps")
+        w = tp.ones((1, 1, 2, 2), dtype=tp.float32, device="mps")
+        y = tp.conv2d(x, w, None, stride=[1, 1], padding=[0, 0],
+                      dilation=[1, 1], groups=1)
+        self.assertEqual(y.shape, (1, 1, 3, 3))
+        self.assertTrue(tp.all(y.cpu() == 4).item())
+
+    def test_conv2d_bias(self):
+        x = tp.ones((1, 1, 4, 4), dtype=tp.float32, device="mps")
+        w = tp.ones((1, 1, 2, 2), dtype=tp.float32, device="mps")
+        b = tp.tensor([1.0], dtype=tp.float32, device="mps")
+        y = tp.conv2d(x, w, b, stride=[1, 1], padding=[0, 0],
+                      dilation=[1, 1], groups=1)
+        self.assertTrue(tp.all(y.cpu() == 5).item())
+
+
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSArgExtrema(unittest.TestCase):
+    def test_argmax_argmin(self):
+        x = tp.tensor([[1.0, 5.0, 3.0], [4.0, 2.0, 6.0]],
+                      dtype=tp.float32, device="mps")
+        self.assertEqual(tp.argmax(x).item(), 5)  # flattened index of 6.0
+        self.assertEqual(tp.argmax(x, dim=1).cpu().tolist(), [1, 2])
+        self.assertEqual(tp.argmin(x, dim=1).cpu().tolist(), [0, 1])
+        self.assertEqual(tp.argmax(x, dim=0).cpu().tolist(), [1, 0, 1])
+
+    def test_max_min_dim(self):
+        x = tp.tensor([[1.0, 5.0, 3.0], [4.0, 2.0, 6.0]],
+                      dtype=tp.float32, device="mps")
+        values, indices = tp.max(x, dim=1)
+        self.assertEqual(values.cpu().tolist(), [5.0, 6.0])
+        self.assertEqual(indices.cpu().tolist(), [1, 2])
+        vmin, imin = tp.min(x, dim=0)
+        self.assertEqual(vmin.cpu().tolist(), [1.0, 2.0, 3.0])
+        self.assertEqual(imin.cpu().tolist(), [0, 1, 0])
+
+
 def ref_computed(x_cpu, w_cpu, b_cpu):
     # Reference layer-norm output with affine for a single row.
     mean = x_cpu.mean(dim=1, keepdim=True)
@@ -618,6 +700,63 @@ class TestMPSQuantization(unittest.TestCase):
         c = tp._C._weight_int8pack_mm(a, w, s)
         ref = (a.cpu() @ w.cpu().to(tp.float32).T) * s.cpu()
         self.assertTrue(tp.allclose(c.cpu(), ref, atol=1e-5))
+
+
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSSparse(unittest.TestCase):
+    def test_sparse_coo_tensor_and_to_dense(self):
+        indices = tp.tensor([[0, 1, 1], [2, 0, 2]], dtype=tp.int64).mps()
+        values = tp.tensor([1.0, 2.0, 3.0], dtype=tp.float32, device="mps")
+        s = tp.sparse_coo_tensor(indices, values, (2, 3))
+        self.assertEqual(s.device.type, "mps")
+        self.assertTrue(s.is_sparse)
+        dense = s.to_dense()
+        self.assertEqual(dense.cpu().tolist(), [[0.0, 0.0, 1.0],
+                                                [2.0, 0.0, 3.0]])
+        self.assertEqual(s._nnz(), 3)
+
+    def test_to_sparse_roundtrip(self):
+        x = tp.tensor([[0.0, 1.0, 0.0], [2.0, 0.0, 3.0]],
+                      dtype=tp.float32, device="mps")
+        s = x.to_sparse()
+        self.assertTrue(s.is_sparse)
+        self.assertEqual(s._nnz(), 3)
+        back = s.to_dense()
+        self.assertTrue(tp.allclose(back.cpu(), x.cpu()))
+
+    def test_coalesce(self):
+        indices = tp.tensor([[0, 0], [1, 1]], dtype=tp.int64).mps()
+        values = tp.tensor([1.0, 2.0], dtype=tp.float32, device="mps")
+        s = tp.sparse_coo_tensor(indices, values, (1, 2))
+        c = s.coalesce()
+        self.assertEqual(c._nnz(), 1)
+        self.assertTrue(tp.allclose(c.to_dense().cpu(), [[3.0, 0.0]]))
+
+    def test_sparse_mm(self):
+        indices = tp.tensor([[0, 1], [0, 1]], dtype=tp.int64).mps()
+        values = tp.tensor([2.0, 3.0], dtype=tp.float32, device="mps")
+        s = tp.sparse_coo_tensor(indices, values, (2, 2))
+        dense = tp.tensor([[1.0, 0.0], [0.0, 1.0]], dtype=tp.float32,
+                       device="mps")
+        out = tp.sparse_mm(s, dense)
+        self.assertEqual(out.cpu().tolist(), [[2.0, 0.0], [0.0, 3.0]])
+
+    def test_sparse_add_mul(self):
+        i = tp.tensor([[0], [0]], dtype=tp.int64).mps()
+        a = tp.sparse_coo_tensor(i, tp.tensor([1.0], device="mps"), (1, 1))
+        b = tp.sparse_coo_tensor(i, tp.tensor([2.0], device="mps"), (1, 1))
+        s = tp.sparse_add(a, b)
+        self.assertEqual(s.to_dense().cpu().tolist(), [[3.0]])
+        m = tp.sparse_mul(a, b)
+        self.assertEqual(m.to_dense().cpu().tolist(), [[2.0]])
+
+    def test_sparse_sum(self):
+        indices = tp.tensor([[0, 1, 1], [2, 0, 2]], dtype=tp.int64).mps()
+        values = tp.tensor([1.0, 2.0, 3.0], dtype=tp.float32, device="mps")
+        s = tp.sparse_coo_tensor(indices, values, (2, 3))
+        self.assertAlmostEqual(tp.sparse_sum(s).item(), 6.0, places=5)
+        row = tp.sparse_sum(s, dim=[0])
+        self.assertEqual(row.to_dense().cpu().tolist(), [[2.0, 0.0, 4.0]])
 
 
 if __name__ == "__main__":
