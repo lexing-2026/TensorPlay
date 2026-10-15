@@ -535,6 +535,7 @@ if(USE_MPS)
         src/backend/mps/ConvolutionKernels.mm
         src/backend/mps/LossKernels.mm
         src/backend/mps/QuantizedKernels.mm
+        src/backend/mps/SparseKernels.mm
     )
     list(APPEND P10_SOURCES ${TP_MPS_BACKEND_SOURCES})
 endif()
