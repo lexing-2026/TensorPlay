@@ -3,6 +3,8 @@
 #include "Blocks.h"
 #include "Common.h"
 #include "Convert.h"
+#include "Factory.h"
+#include "Generator.h"
 #include "Utils.h"
 
 #include <optional>
@@ -11,6 +13,15 @@
 namespace tensorplay {
 namespace vulkan {
 namespace ops {
+
+// Forward declarations of kernels defined in sibling translation units.
+Tensor mul_kernel(const Tensor& self, const Tensor& other);
+Tensor mul_scalar_kernel(const Tensor& self, const Scalar& other);
+Tensor gt_scalar_kernel(const Tensor& self, const Scalar& other);
+Tensor& bernoulli_scalar_kernel(
+    Tensor& self,
+    double p,
+    std::optional<Generator> generator);
 
 namespace {
 
@@ -24,6 +35,46 @@ void validate_elementwise_4d(const Tensor& t, const char* name) {
 }
 
 } // namespace
+
+std::tuple<Tensor, Tensor> native_dropout_kernel(
+    const Tensor& input,
+    double p,
+    std::optional<bool> train) {
+  if (input.numel() == 0) {
+    return std::make_tuple(
+        input, empty_like_kernel(input, DType::Bool, std::nullopt));
+  }
+  if (p < 0 || p > 1) {
+    TP_THROW(ValueError, "native_dropout: p must be in [0, 1]");
+  }
+  if (train.has_value() && !train.value()) {
+    // Inference: nothing is dropped and the mask records every element kept.
+    return std::make_tuple(
+        clone_kernel(input),
+        ones_like_kernel(input, DType::Bool, std::nullopt));
+  }
+  if (p == 1) {
+    // Everything is dropped; the mask records that state for backward.
+    return std::make_tuple(
+        zeros_like_kernel(input, DType::Undefined, std::nullopt),
+        zeros_like_kernel(input, DType::Bool, std::nullopt));
+  }
+  TP_CHECK(
+      input.dtype() == DType::Float32,
+      "Vulkan native_dropout supports Float32 tensors only");
+
+  // Device-side Bernoulli draw: a float mask holds 1 for kept elements.
+  Tensor mask = empty_like_kernel(input, DType::Float32, std::nullopt);
+  bernoulli_scalar_kernel(mask, 1.0 - p, std::nullopt);
+
+  const float scale = static_cast<float>(1.0 / (1.0 - p));
+  Tensor out = mul_kernel(input, mask);
+  out = mul_scalar_kernel(out, Scalar(scale));
+
+  // The saved mask is boolean, matching the CPU/CUDA contract.
+  Tensor mask_bool = gt_scalar_kernel(mask, Scalar(0.5));
+  return std::make_tuple(out, mask_bool);
+}
 
 Tensor pow_scalar_kernel(const Tensor& self, const Scalar& exponent) {
   validate_elementwise_4d(self, "pow");
@@ -462,6 +513,7 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, MiscKernels) {
   m.impl("flip", &tensorplay::vulkan::ops::flip_kernel);
   m.impl("reflection_pad_nd", &tensorplay::vulkan::ops::reflection_pad_nd_kernel);
   m.impl("replication_pad_nd", &tensorplay::vulkan::ops::replication_pad_nd_kernel);
+  m.impl("native_dropout", &tensorplay::vulkan::ops::native_dropout_kernel);
 }
 
 #endif /* USE_VULKAN */
