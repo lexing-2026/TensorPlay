@@ -85,7 +85,10 @@ Tensor unary_op(
     context->submit_compute_job(
         VK_KERNEL_FROM_STR(buffer_shader_name),
         pipeline_barrier,
-        {safe_downcast_to_u32(static_cast<int64_t>(v_output.numel())), 1u, 1u},
+        {safe_downcast_to_u32(
+             static_cast<int64_t>((v_output.numel() + 3u) / 4u)),
+         1u,
+         1u},
         {256u, 1u, 1u},
         VK_NULL_HANDLE,
         v_output.buffer(pipeline_barrier, api::PipelineStage::COMPUTE,
@@ -148,7 +151,10 @@ Tensor& unary_op_(
     context->submit_compute_job(
         VK_KERNEL_FROM_STR(buffer_shader_name),
         pipeline_barrier,
-        {safe_downcast_to_u32(static_cast<int64_t>(v_self.numel())), 1u, 1u},
+        {safe_downcast_to_u32(
+             static_cast<int64_t>((v_self.numel() + 3u) / 4u)),
+         1u,
+         1u},
         {256u, 1u, 1u},
         VK_NULL_HANDLE,
         v_self.buffer(pipeline_barrier, api::PipelineStage::COMPUTE,

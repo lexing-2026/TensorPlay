@@ -10,14 +10,16 @@
 layout(std430) buffer;
 
 $if DTYPE == "int":
-  // Signed-word storage buffers: every member reads and writes int words.
+  // Signed-word storage buffers for the integer variants.  Data is laid out
+  // as 16-byte vectors so the bulk of the work uses aligned 128-bit loads.
+  #define VECTOR ivec4
   $if not INPLACE:
     layout(set = 0, binding = 0) buffer PRECISION restrict writeonly OutBuffer {
-      int data[];
+      VECTOR data[];
     }
     uOutput;
     layout(set = 0, binding = 1) buffer PRECISION restrict readonly InBuffer {
-      int data[];
+      VECTOR data[];
     }
     uInput;
     layout(set = 0, binding = 2) uniform PRECISION Block {
@@ -26,7 +28,7 @@ $if DTYPE == "int":
     uBlock;
   $else:
     layout(set = 0, binding = 0) buffer PRECISION restrict OutBuffer {
-      int data[];
+      VECTOR data[];
     }
     uOutput;
     layout(set = 0, binding = 2) uniform PRECISION Block {
@@ -35,13 +37,14 @@ $if DTYPE == "int":
     uBlock;
 $else:
   // clang-format off
+  #define VECTOR vec4
   $if not INPLACE:
     layout(set = 0, binding = 0) buffer PRECISION restrict writeonly OutBuffer {
-      float data[];
+      VECTOR data[];
     }
     uOutput;
     layout(set = 0, binding = 1) buffer PRECISION restrict readonly InBuffer {
-      float data[];
+      VECTOR data[];
     }
     uInput;
     layout(set = 0, binding = 2) uniform PRECISION Block {
@@ -50,7 +53,7 @@ $else:
     uBlock;
   $else:
     layout(set = 0, binding = 0) buffer PRECISION restrict OutBuffer {
-      float data[];
+      VECTOR data[];
     }
     uOutput;
     layout(set = 0, binding = 2) uniform PRECISION Block {
@@ -62,20 +65,37 @@ $else:
 layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
 
 /*
- * Applies a unary operation to every element of a linear buffer.  One
- * invocation handles one element.
+ * Applies a unary operation to every element of a linear buffer.  Each
+ * invocation handles one 16-byte vector (four elements); a small scalar
+ * tail covers lengths that are not a multiple of four.  Buffer allocations
+ * are rounded up to 16 bytes so the tail accesses never leave the
+ * allocation.
  */
 void main() {
   const uint idx = gl_GlobalInvocationID.x;
+  const uint n = uBlock.buf_length;
+  const uint nvec = n >> 2u;
+  const uint rem = n & 3u;
 
-  if (idx >= uBlock.buf_length) {
-    return;
+  if (idx < nvec) {
+    // Apply the scalar operator to each 16-byte-vector component.  The
+    // operator expressions are authored for scalar elements (some integer
+    // variants cast X to float), so expand per component and reassemble.
+    // clang-format off
+    $if not INPLACE:
+      uOutput.data[idx] = VECTOR(OP(uInput.data[idx].x), OP(uInput.data[idx].y), OP(uInput.data[idx].z), OP(uInput.data[idx].w));
+    $else:
+      uOutput.data[idx] = VECTOR(OP(uOutput.data[idx].x), OP(uOutput.data[idx].y), OP(uOutput.data[idx].z), OP(uOutput.data[idx].w));
+    // clang-format on
+  } else if (idx < nvec + rem) {
+    const uint i = (nvec << 2u) + (idx - nvec);
+    const uint j = i >> 2u;
+    const uint k = i & 3u;
+    // clang-format off
+    $if not INPLACE:
+      uOutput.data[j][k] = OP(uInput.data[j][k]);
+    $else:
+      uOutput.data[j][k] = OP(uOutput.data[j][k]);
+    // clang-format on
   }
-
-  // clang-format off
-  $if not INPLACE:
-    uOutput.data[idx] = OP(uInput.data[idx]);
-  $else:
-    uOutput.data[idx] = OP(uOutput.data[idx]);
-  // clang-format on
 }
