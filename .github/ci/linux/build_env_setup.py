@@ -17,9 +17,15 @@ The CUDA lane relies on the toolkit the workflow installs (PATH); no
 GPU-dependent extras are configured here -- free hosted runners have no
 GPU, so kernels are never executed.
 
+The ROCm lane runs inside the ROCm build container the workflow starts;
+this script only translates GPU_ARCH_TYPE=rocm into the USE_ROCM /
+TP_ROCM_ARCH flags the CMake detector consumes and points the BLAS
+probe at the system OpenBLAS the container carries.
+
 Environment variables expected:
-    GPU_ARCH_TYPE - cpu (default) or cuda
+    GPU_ARCH_TYPE - cpu, cuda or rocm
     CUDA_PATH     - CUDA toolkit root (CUDA lanes only)
+    TP_ROCM_ARCH  - semicolon-separated HIP architecture list (ROCm lanes only)
 """
 
 import argparse
@@ -91,6 +97,25 @@ def setup_cuda() -> dict[str, str]:
         "CUDNN_ROOT": str(cudnn_root),
         "NCCL_ROOT": str(nccl_root),
         "LD_LIBRARY_PATH": runtime_libs,
+    }
+
+
+def setup_rocm() -> dict[str, str]:
+    """Wire the ROCm/HIP toolchain staged in the build container.
+
+    The container image carries the HIP compiler and runtime under the
+    default ROCm path; the CMake detector (cmake/LoadHIP.cmake) reads
+    TP_ROCM_ARCH to select target architectures, and the BLAS probe is
+    pointed at the system OpenBLAS the container provides.
+    """
+    rocm_arch = os.environ.get("TP_ROCM_ARCH", "")
+    if not rocm_arch:
+        sys.exit("TP_ROCM_ARCH is not set for the ROCm build")
+    return {
+        "USE_CUDA": "0",
+        "USE_ROCM": "1",
+        "TP_ROCM_ARCH": rocm_arch,
+        "OPENBLAS_ROOT_DIR": "/usr",
     }
 
 
@@ -174,12 +199,15 @@ def main() -> None:
 
     if gpu_arch_type == "cuda":
         env_out.update(setup_cuda())
+    elif gpu_arch_type == "rocm":
+        env_out.update(setup_rocm())
     else:
         env_out.update(CPU_BUILD_ENV)
 
     if arch == "x86_64":
-        setup_mkl()
-        env_out["MKLROOT"] = str(MKL_ROOT)
+        if gpu_arch_type != "rocm":
+            setup_mkl()
+            env_out["MKLROOT"] = str(MKL_ROOT)
         print(f"MKLROOT={MKL_ROOT}")
     elif arch == "aarch64":
         # build_install_deps.py installs the system OpenBLAS; export the

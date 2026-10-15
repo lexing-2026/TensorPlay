@@ -31,15 +31,16 @@ cd "${REPO_ROOT}"
 # auditwheel: it bundles the libraries the manylinux policy requires to
 # capture (libgomp among them), rewrites their RPATHs, and retags the
 # wheel from the bare linux_* that PyPI rejects to the manylinux_<glibc>
-# the builder qualifies for. CUDA wheels keep the bare tag: they carry a
-# dependency on the toolkit libraries by design and ship through the
-# release assets and the variant wheel indexes instead of PyPI.
+# the builder qualifies for. CUDA and ROCm wheels keep the bare tag:
+# they carry a dependency on the toolkit libraries by design and ship
+# through the release assets and the variant wheel indexes instead of
+# PyPI.
 RAW_WHEEL_DIR="$(mktemp -d)"
 python3 "${SCRIPTPATH}/build_wheel.py" "${RAW_WHEEL_DIR}"
 mkdir -p dist
 for raw_wheel in "${RAW_WHEEL_DIR}"/*.whl; do
   case "${raw_wheel}" in
-    *+cu*.whl) cp "${raw_wheel}" dist/ ;;
+    *+cu*.whl|*+rocm*.whl) cp "${raw_wheel}" dist/ ;;
     *) auditwheel repair -w dist "${raw_wheel}" ;;
   esac
 done

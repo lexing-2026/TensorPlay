@@ -169,13 +169,13 @@ def main() -> None:
             retry(["install", "-m", "0755", str(payload), str(sccache_bin)])
             shutil.rmtree(workdir, ignore_errors=True)
 
-    if platform.machine() == "aarch64":
+    if platform.machine() == "aarch64" or os.environ.get("GPU_ARCH_TYPE", "cpu") == "rocm":
         # Redirection is shell syntax and must not leak into argv: an arg
         # like "1>/dev/null" reaches apt-get as a package name.
         apt_prefix = [] if os.geteuid() == 0 else ["sudo"]
         retry(apt_prefix + ["apt-get", "update", "-qq"])
         retry(apt_prefix + ["apt-get", "install", "-y", "-qq", "libopenblas-dev"])
-        print("aarch64: system OpenBLAS installed")
+        print("system OpenBLAS installed")
 
     print("build_install_deps complete")
 

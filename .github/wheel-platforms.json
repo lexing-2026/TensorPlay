@@ -32,5 +32,12 @@
       "name": "windows-x86_64",
       "runner": "windows-2022"
     }
+  ],
+  "rocm_platforms": [
+    {
+      "name": "linux-x86_64",
+      "runner": "ubuntu-22.04",
+      "variants": ["rocm72-multiarch"]
+    }
   ]
 }

@@ -10,7 +10,7 @@ name: wheel-index
 # matrix finishes.
 #
 # The trigger listens on workflow_run rather than release events because
-# every release write in this repository (trunk, nightly, publish, rocm)
+# every release write in this repository (trunk, nightly, publish)
 # happens through the default GITHUB_TOKEN, and GitHub suppresses
 # workflow-triggering for events created by it to prevent recursion.
 # Workflow completion events are not affected, so a finished publisher
@@ -22,7 +22,6 @@ on:
       - trunk
       - nightly
       - publish
-      - rocm-wheel
     types: [completed]
   release:
     types: [published, edited, unpublished, deleted]

@@ -33,6 +33,29 @@ on:
         type: string
         default: "12.4.1"
         description: CUDA Toolkit version
+      rocm:
+        required: false
+        type: string
+        default: ""
+        description: >
+          ROCm variant tag (e.g. "rocm72-multiarch"). Empty means this lane
+          is not a ROCm build; a non-empty value activates the HIP toolchain
+          path inside the ROCm build container.
+      rocm_arch:
+        required: false
+        type: string
+        default: ""
+        description: >
+          Semicolon-separated HIP architecture list for the ROCm build
+          (e.g. "gfx90a;gfx942;gfx950;gfx1100"), forwarded as TP_ROCM_ARCH.
+      rocm_image:
+        required: false
+        type: string
+        default: ""
+        description: >
+          Docker image for the ROCm build container (e.g.
+          "rocm/dev-ubuntu-22.04:7.2.4-complete"). Empty means the lane runs
+          directly on the runner host.
       upload_release:
         required: false
         type: boolean
@@ -125,6 +148,9 @@ jobs:
   build:
     name: ${{ inputs.build_name }}-build
     runs-on: ${{ inputs.runs_on }}
+    # ROCm lanes run inside the ROCm toolchain container; an empty
+    # rocm_image leaves the lane on the runner host (CPU/CUDA).
+    container: ${{ inputs.rocm_image }}
     permissions:
       contents: read
       actions: read
@@ -182,6 +208,22 @@ jobs:
 
       # The wheel links vendored SLEEF/NNPACK trees that CI checkouts do
       # not carry; fetch the pinned revisions before configuring.
+      - name: Provision ROCm build container
+        if: ${{ inputs.rocm != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The ROCm container ships the HIP toolchain but not the base
+          # tooling the wheel build needs (git for the vendored-dependency
+          # restore, build-essential for host objects, python3-venv for
+          # isolated wheel builds) nor the system BLAS the CMake detector
+          # prefers. Container jobs run as root here, so no sudo is needed.
+          SUDO=""
+          if [ "$(id -u)" != "0" ]; then SUDO=sudo; fi
+          $SUDO apt-get update -qq
+          $SUDO apt-get install -y -qq \
+            git build-essential python3-venv libopenblas-dev 1>/dev/null
+
       - name: Restore vendored build dependencies
         shell: bash
         run: bash .github/scripts/restore-vendored-deps.sh
@@ -275,6 +317,8 @@ jobs:
           build_version="${build_version/-rc/rc}"
           if [[ "${{ inputs.cuda }}" != "cpu" ]]; then
             build_version="${build_version}+${{ inputs.cuda }}"
+          elif [[ "${{ inputs.rocm }}" != "" ]]; then
+            build_version="${build_version}+${{ inputs.rocm }}"
           fi
           echo "TENSORPLAY_BUILD_VERSION=${build_version}" >> "$GITHUB_ENV"
           echo "TENSORPLAY_BUILD_NUMBER=1" >> "$GITHUB_ENV"
@@ -290,7 +334,9 @@ jobs:
           build_version="${{ inputs.build_version }}"
           case "${{ inputs.cuda }}" in
             cpu)
-              if [[ "$RUNNER_OS" != "macOS" ]]; then
+              if [[ "${{ inputs.rocm }}" != "" ]]; then
+                build_version="${build_version}+${{ inputs.rocm }}"
+              elif [[ "$RUNNER_OS" != "macOS" ]]; then
                 build_version="${build_version}+cpu"
               fi
               ;;
@@ -415,10 +461,11 @@ jobs:
       - name: Build wheel
         shell: bash
         env:
-          GPU_ARCH_TYPE: ${{ inputs.cuda != 'cpu' && 'cuda' || 'cpu' }}
+          GPU_ARCH_TYPE: ${{ inputs.rocm != '' && 'rocm' || (inputs.cuda != 'cpu' && 'cuda' || 'cpu') }}
           SKBUILD_CMAKE_DEFINE: >-
-            ${{ inputs.cuda != 'cpu' && 'USE_CUDA=ON' || 'USE_CUDA=OFF' }};USE_MPI=OFF
-          MAX_JOBS: ${{ inputs.max_jobs != '' && inputs.max_jobs || (runner.os == 'Windows' && '3' || (inputs.cuda != 'cpu' && (contains(runner.name, 'tensorplay-runner') && '4' || '2') || '')) }}
+            ${{ inputs.rocm != '' && 'USE_CUDA=OFF;USE_ROCM=ON' || (inputs.cuda != 'cpu' && 'USE_CUDA=ON' || 'USE_CUDA=OFF') }};USE_MPI=OFF
+          TP_ROCM_ARCH: ${{ inputs.rocm_arch }}
+          MAX_JOBS: ${{ inputs.max_jobs != '' && inputs.max_jobs || (runner.os == 'Windows' && '3' || ((inputs.cuda != 'cpu' || inputs.rocm != '') && (contains(runner.name, 'tensorplay-runner') && '4' || '2') || '')) }}
           CCACHE_MAXSIZE: 2G
           SCCACHE_CACHE_SIZE: 5G
         run: |
@@ -513,6 +560,9 @@ jobs:
     name: ${{ inputs.build_name }}-test-${{ matrix.name }}
     needs: build
     runs-on: ${{ inputs.runs_on }}
+    # ROCm wheels need the container's HIP runtime to import; CPU/CUDA
+    # lanes run directly on the runner host.
+    container: ${{ inputs.rocm_image }}
     strategy:
       fail-fast: false
       matrix:
@@ -577,7 +627,7 @@ jobs:
           fi
 
       - name: Install Linux CPU runtime dependencies
-        if: ${{ inputs.cuda == 'cpu' && runner.os == 'Linux' }}
+        if: ${{ inputs.cuda == 'cpu' && inputs.rocm == '' && runner.os == 'Linux' }}
         shell: bash
         run: |
           sudo apt-get update -qq
@@ -595,7 +645,7 @@ jobs:
           python -m pip install dist/*.whl numpy PyYAML typing-extensions pytest
 
       - name: Smoke test (CPU import plus tiny op)
-        if: ${{ inputs.cuda == 'cpu' }}
+        if: ${{ inputs.cuda == 'cpu' && inputs.rocm == '' }}
         shell: bash
         # Run outside the checkout: the source tree carries the CMake-generated
         # version.py and the _C shared object, so a repo-root import would
@@ -611,7 +661,7 @@ jobs:
           PY
 
       - name: Smoke test (CUDA import only)
-        if: ${{ inputs.cuda != 'cpu' }}
+        if: ${{ inputs.cuda != 'cpu' && inputs.rocm == '' }}
         shell: bash
         working-directory: ${{ runner.temp }}
         run: |
@@ -620,8 +670,18 @@ jobs:
           print("CUDA wheel import ok:", getattr(tp, "__version__", "ok"))
           PY
 
+      - name: Smoke test (ROCm import only)
+        if: ${{ inputs.rocm != '' }}
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        run: |
+          python - <<'PY'
+          import tensorplay as tp
+          print("ROCm wheel import ok:", getattr(tp, "__version__", "ok"))
+          PY
+
       - name: Run CPU regression tests
-        if: ${{ inputs.cuda == 'cpu' }}
+        if: ${{ inputs.cuda == 'cpu' && inputs.rocm == '' }}
         shell: bash
         env:
           TEST_FILES: ${{ matrix.test_files }}
@@ -647,7 +707,7 @@ jobs:
             2>&1 | tee "$result_root/pytest.log"
 
       - name: Upload CPU test results
-        if: ${{ always() && inputs.cuda == 'cpu' }}
+        if: ${{ always() && inputs.cuda == 'cpu' && inputs.rocm == '' }}
         uses: actions/upload-artifact@v7
         with:
           name: ${{ inputs.build_name }}-tests-${{ matrix.name }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -656,7 +716,7 @@ jobs:
           if-no-files-found: warn
 
       - name: Run CPU operator, training, and Stax benchmarks
-        if: ${{ inputs.run_cpu_benchmarks && inputs.cuda == 'cpu' }}
+        if: ${{ inputs.run_cpu_benchmarks && inputs.cuda == 'cpu' && inputs.rocm == '' }}
         shell: bash
         env:
           OMP_NUM_THREADS: "2"
@@ -692,7 +752,7 @@ jobs:
             | tee benchmark-results/scaling.log
 
       - name: Enforce CPU performance floor
-        if: ${{ inputs.run_cpu_benchmarks && inputs.cuda == 'cpu' }}
+        if: ${{ inputs.run_cpu_benchmarks && inputs.cuda == 'cpu' && inputs.rocm == '' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -729,7 +789,7 @@ jobs:
             --summary-out benchmark-results/cpu-regression-summary.md
 
       - name: Publish CPU performance summary
-        if: ${{ always() && inputs.run_cpu_benchmarks && inputs.cuda == 'cpu' }}
+        if: ${{ always() && inputs.run_cpu_benchmarks && inputs.cuda == 'cpu' && inputs.rocm == '' }}
         shell: bash
         run: |
           if [[ -f benchmark-results/cpu-regression-summary.md ]]; then
@@ -737,7 +797,7 @@ jobs:
           fi
 
       - name: Upload CPU performance logs
-        if: ${{ always() && inputs.run_cpu_benchmarks && inputs.cuda == 'cpu' }}
+        if: ${{ always() && inputs.run_cpu_benchmarks && inputs.cuda == 'cpu' && inputs.rocm == '' }}
         uses: actions/upload-artifact@v7
         with:
           name: ${{ inputs.build_name }}-performance

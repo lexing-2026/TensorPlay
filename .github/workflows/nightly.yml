@@ -53,6 +53,14 @@ on:
         description: >-
           Space-separated CUDA variants from .github/cuda-variants.json to
           build. Only "cu130" is supported; empty also selects cu130.
+      rocm_variants:
+        required: false
+        type: string
+        default: ""
+        description: >-
+          Space-separated ROCm variants from .github/rocm-variants.json to
+          build. Empty builds every variant listed in the rocm platform
+          definitions of .github/wheel-platforms.json.
 
 permissions: read-all
 
@@ -69,6 +77,7 @@ jobs:
     outputs:
       cpu: ${{ steps.skip-published.outputs.cpu }}
       cuda: ${{ steps.skip-published.outputs.cuda }}
+      rocm: ${{ steps.skip-published.outputs.rocm }}
       variants: ${{ steps.read-matrix.outputs.variants }}
     steps:
       - uses: actions/checkout@v7
@@ -80,6 +89,7 @@ jobs:
         env:
           CPU_PLATFORMS: ${{ inputs.cpu_platforms }}
           CUDA_VARIANTS: ${{ inputs.cuda_variants }}
+          ROCM_VARIANTS: ${{ inputs.rocm_variants }}
           NIGHTLY_VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
@@ -97,6 +107,10 @@ jobs:
           if [[ "$invalid_cuda" != "0" ]]; then
             echo "Nightly CUDA builds support only cu130" >&2
             exit 1
+          fi
+          rocm_list='[]'
+          if [[ -n "$ROCM_VARIANTS" ]]; then
+            rocm_list="$(printf '%s\n' $ROCM_VARIANTS | jq -R . | jq -s -c .)"
           fi
           cpu_matrix="$(jq -c --argjson cpu_list "$cpu_list" '
             [
@@ -129,17 +143,41 @@ jobs:
                 }
             ]
           ' .github/wheel-platforms.json)"
+          rocm_matrix="$(jq -c \
+            --slurpfile variants .github/rocm-variants.json \
+            --argjson rocm_list "$rocm_list" '
+            [
+              .rocm_platforms[] as $platform
+              | .python_versions[] as $python
+              | $variants[0][] as $rocm
+              | select(($platform.variants | index($rocm.variant)))
+              | select(($rocm_list | length == 0) or ($rocm.variant | IN($rocm_list[])))
+              | {
+                  platform: $platform.name,
+                  runner: $platform.runner,
+                  python: $python,
+                  variant: $rocm.variant,
+                  toolkit: $rocm.toolkit,
+                  arch: (if ($rocm.arch | type) == "array"
+                         then ($rocm.arch | join(";"))
+                         else $rocm.arch end),
+                  image: $rocm.image,
+                  build_name: ("tensorplay-" + $platform.name + "-" + $rocm.variant + "-py" + ($python | gsub("\\."; "_")) + "-nightly")
+                }
+            ]
+          ' .github/wheel-platforms.json)"
           active_variants="$(jq -c \
             --slurpfile variants .github/cuda-variants.json \
             --argjson cuda_list "$cuda_list" '
             [$variants[0][] | select(($cuda_list | length == 0) or (.variant | IN($cuda_list[])))]
           ' .github/wheel-platforms.json)"
-          if [[ "$(jq 'length' <<< "$cpu_matrix")" == "0" && "$(jq 'length' <<< "$cuda_matrix")" == "0" ]]; then
+          if [[ "$(jq 'length' <<< "$cpu_matrix")" == "0" && "$(jq 'length' <<< "$cuda_matrix")" == "0" && "$(jq 'length' <<< "$rocm_matrix")" == "0" ]]; then
             echo "The platform/variant filters selected no wheels" >&2
             exit 1
           fi
           echo "cpu=$cpu_matrix" >> "$GITHUB_OUTPUT"
           echo "cuda=$cuda_matrix" >> "$GITHUB_OUTPUT"
+          echo "rocm=$rocm_matrix" >> "$GITHUB_OUTPUT"
           echo "variants=$active_variants" >> "$GITHUB_OUTPUT"
 
       - id: skip-published
@@ -148,6 +186,7 @@ jobs:
           NIGHTLY_VERSION: ${{ needs.prepare.outputs.version }}
           CPU_MATRIX: ${{ steps.read-matrix.outputs.cpu }}
           CUDA_MATRIX: ${{ steps.read-matrix.outputs.cuda }}
+          ROCM_MATRIX: ${{ steps.read-matrix.outputs.rocm }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -163,6 +202,7 @@ jobs:
             --version "$NIGHTLY_VERSION" \
             --cpu-matrix "$CPU_MATRIX" \
             --cuda-matrix "$CUDA_MATRIX" \
+            --rocm-matrix "$ROCM_MATRIX" \
             --existing "$RUNNER_TEMP/nightly-assets.txt" \
             >> "$GITHUB_OUTPUT"
 
@@ -333,6 +373,39 @@ jobs:
       python_version: ${{ matrix.python }}
       cuda: ${{ matrix.variant }}
       cuda_toolkit: ${{ matrix.toolkit }}
+      build_version: ${{ needs.prepare.outputs.version }}
+      build_number: ${{ needs.prepare.outputs.build_number }}
+      upload_release: true
+    secrets: inherit
+
+  rocm-build:
+    name: ${{ matrix.build_name }}-build-test
+    needs:
+      - define-wheel-matrix
+      - prepare
+      - create-nightly-release
+    # An unchanged main (schedule guard) yields an empty version: every
+    # wheel for today was already published by the trunk runs.
+    if: needs.prepare.outputs.version != ''
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.define-wheel-matrix.outputs.rocm) }}
+    permissions:
+      contents: write
+      actions: read
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/_binary-build-test.yml
+    with:
+      build_name: ${{ matrix.build_name }}
+      build_environment: ${{ format('nightly-{0}-py{1}-{2}', matrix.platform, matrix.python, matrix.variant) }}
+      runs_on: ${{ matrix.runner }}
+      python_version: ${{ matrix.python }}
+      rocm: ${{ matrix.variant }}
+      rocm_arch: ${{ matrix.arch }}
+      rocm_image: ${{ matrix.image }}
+      test_matrix: '[{"name":"rocm","test_files":""}]'
       build_version: ${{ needs.prepare.outputs.version }}
       build_number: ${{ needs.prepare.outputs.build_number }}
       upload_release: true

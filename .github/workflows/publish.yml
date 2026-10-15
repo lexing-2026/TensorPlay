@@ -113,6 +113,7 @@ jobs:
     outputs:
       cpu: ${{ steps.read-matrix.outputs.cpu }}
       cuda: ${{ steps.read-matrix.outputs.cuda }}
+      rocm: ${{ steps.read-matrix.outputs.rocm }}
       release_tag: ${{ steps.read-matrix.outputs.release_tag }}
       stable_tag: ${{ steps.read-matrix.outputs.stable_tag }}
     steps:
@@ -194,7 +195,31 @@ jobs:
               }
             ]
           ' .github/wheel-platforms.json)"
-          # A repair dispatch narrows both matrices to build names whose
+          # The ROCm matrix is a first-class release lane, exactly like the
+          # CUDA one: the platform list in wheel-platforms.json names the
+          # variants to build by default, and rocm-variants.json carries
+          # the per-variant HIP architecture list and build container.
+          rocm_matrix="$(jq -c --slurpfile variants .github/rocm-variants.json '
+            [
+              .rocm_platforms[] as $platform
+              | .python_versions[] as $python
+              | $variants[0][] as $rocm
+              | select(($platform.variants | index($rocm.variant)))
+              | {
+                  platform: $platform.name,
+                  runner: $platform.runner,
+                  python: $python,
+                  variant: $rocm.variant,
+                  toolkit: $rocm.toolkit,
+                  arch: (if ($rocm.arch | type) == "array"
+                         then ($rocm.arch | join(";"))
+                         else $rocm.arch end),
+                  image: $rocm.image,
+                  build_name: ("tensorplay-" + $platform.name + "-" + $rocm.variant + "-py" + ($python | gsub("\\."; "_")))
+                }
+            ]
+          ' .github/wheel-platforms.json)"
+          # A repair dispatch narrows the matrices to build names whose
           # text matches any comma-separated substring; an empty filter
           # keeps every lane.
           lanes="${{ inputs.lanes }}"
@@ -202,9 +227,11 @@ jobs:
             lane_pattern="$(printf '%s' "$lanes" | tr ',' '\n' | sed 's/[][\.*^$()+?{}|]/\\&/g' | paste -sd'|' -)"
             cuda_matrix="$(jq -c --arg re "$lane_pattern" 'map(select(.build_name | test($re)))' <<<"$cuda_matrix")"
             cpu_matrix="$(jq -c --arg re "$lane_pattern" 'map(select(.build_name | test($re)))' <<<"$cpu_matrix")"
+            rocm_matrix="$(jq -c --arg re "$lane_pattern" 'map(select(.build_name | test($re)))' <<<"$rocm_matrix")"
           fi
           echo "cuda=$cuda_matrix" >> "$GITHUB_OUTPUT"
           echo "cpu=$cpu_matrix" >> "$GITHUB_OUTPUT"
+          echo "rocm=$rocm_matrix" >> "$GITHUB_OUTPUT"
 
   # The release exists before any matrix job uploads its tested wheel. A
   # manual dispatch from a branch simply skips this step and runs CI locally.
@@ -323,6 +350,40 @@ jobs:
       s3_cache: ${{ inputs.s3_cache }}
     secrets: inherit
 
+  rocm-build:
+    name: ${{ matrix.build_name }}-build-test
+    if: inputs.pypi_only != 'true'
+    needs:
+      - define-wheel-matrix
+      - create-release
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ inputs.max_parallel == '' && 20 || fromJSON(inputs.max_parallel) }}
+      matrix:
+        include: ${{ fromJSON(needs.define-wheel-matrix.outputs.rocm) }}
+    permissions:
+      contents: write
+      actions: read
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/_binary-build-test.yml
+    with:
+      build_name: ${{ matrix.build_name }}
+      build_environment: ${{ format('release-{0}-py{1}-{2}', matrix.platform, matrix.python, matrix.variant) }}
+      runs_on: ${{ matrix.runner }}
+      python_version: ${{ matrix.python }}
+      rocm: ${{ matrix.variant }}
+      rocm_arch: ${{ matrix.arch }}
+      rocm_image: ${{ matrix.image }}
+      test_matrix: '[{"name":"rocm","test_files":""}]'
+      upload_release: ${{ needs.define-wheel-matrix.outputs.release_tag == 'true' }}
+      save_cache: false
+      checkout_ref: ${{ inputs.build_ref != '' && inputs.build_ref || inputs.tag }}
+      release_tag_name: ${{ inputs.tag }}
+      max_jobs: ${{ inputs.max_jobs }}
+      s3_cache: ${{ inputs.s3_cache }}
+    secrets: inherit
+
   pypi-upload:
     # CPU wheels remain on PyPI -- stable releases only, never release
     # candidates. Release assets are downloaded after every CPU build has
@@ -357,7 +418,7 @@ jobs:
           shopt -s nullglob
           for wheel in release-assets/*.whl; do
             case "$wheel" in
-              *+cu*.whl) ;;
+              *+cu*.whl|*+rocm*.whl) ;;
               *) cp "$wheel" dist/ ;;
             esac
           done

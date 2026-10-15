@@ -15,7 +15,8 @@ no local label at all.
 
 Usage:
   filter_published_wheels.py --version V --cpu-matrix JSON \
-      --cuda-matrix JSON [--existing FILE]   # emits cpu=... cuda=...
+      --cuda-matrix JSON --rocm-matrix JSON [--existing FILE]
+      # emits cpu=... cuda=... rocm=...
 """
 
 from __future__ import annotations
@@ -63,6 +64,7 @@ def main() -> None:
     parser.add_argument("--version", required=True, help="Computed PEP 440 version, e.g. 1.0.0.dev20260828 or 1.2.0rc1")
     parser.add_argument("--cpu-matrix", required=True, help="CPU matrix JSON from the matrix job")
     parser.add_argument("--cuda-matrix", required=True, help="CUDA matrix JSON from the matrix job")
+    parser.add_argument("--rocm-matrix", required=True, help="ROCm matrix JSON from the matrix job")
     parser.add_argument(
         "--existing",
         default="",
@@ -77,11 +79,13 @@ def main() -> None:
 
     cpu, cpu_skipped = filter_matrix(args.cpu_matrix, args.version, existing)
     cuda, cuda_skipped = filter_matrix(args.cuda_matrix, args.version, existing)
-    for entry in cpu_skipped + cuda_skipped:
+    rocm, rocm_skipped = filter_matrix(args.rocm_matrix, args.version, existing)
+    for entry in cpu_skipped + cuda_skipped + rocm_skipped:
         # Diagnostics go to stderr: stdout is appended to GITHUB_OUTPUT.
         print(f"Skipping {entry['build_name']}: wheel already published for {args.version}", file=sys.stderr)
     print(f"cpu={json.dumps(cpu)}")
     print(f"cuda={json.dumps(cuda)}")
+    print(f"rocm={json.dumps(rocm)}")
 
 
 if __name__ == "__main__":
