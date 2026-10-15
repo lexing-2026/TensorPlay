@@ -10,6 +10,7 @@
 #include <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
 
 #include <cmath>
+#include <limits>
 #include <optional>
 #include <vector>
 
@@ -77,10 +78,11 @@ Tensor build_attn_mask(const std::optional<Tensor>& attn_mask, bool is_causal,
 } // namespace
 
 // MPSGraph-based scaled dot product attention:
-//   scores = (Q @ K^T) * scale + mask
-//   probs  = softmax(scores, dim=-1)
-//   out    = probs @ V
-// Runs entirely as an MPSGraph on the GPU.  dropout_p > 0 is not fused yet.
+//   probs = softmax((Q @ K^T) * scale + mask)
+//   out   = probs @ V
+// The attention probabilities are produced by the first MPSGraph; when
+// dropout_p > 0 they pass through the GPU dropout shader before the second
+// MPSGraph multiplies them with V.
 Tensor scaled_dot_product_attention_kernel(
     const Tensor& query, const Tensor& key, const Tensor& value,
     const std::optional<Tensor>& attn_mask, double dropout_p, bool is_causal,
@@ -90,11 +92,6 @@ Tensor scaled_dot_product_attention_kernel(
     TP_THROW(RuntimeError,
              "scaled_dot_product_attention: tensors must be on the MPS "
              "device");
-  }
-  if (dropout_p != 0.0) {
-    TP_THROW(NotImplementedError,
-             "scaled_dot_product_attention: MPS fused path supports "
-             "dropout_p == 0 only");
   }
 
   Tensor q = query;
@@ -145,13 +142,14 @@ Tensor scaled_dot_product_attention_kernel(
 
   const double scale_factor =
       scale.has_value() ? *scale : 1.0 / std::sqrt(static_cast<double>(E));
-
   Tensor mask =
       build_attn_mask(attn_mask, is_causal, L, S, dt, q.device());
 
   Tensor q_c = q.is_contiguous() ? q : q.contiguous();
   Tensor k_c = k.is_contiguous() ? k : k.contiguous();
   Tensor v_c = v.is_contiguous() ? v : v.contiguous();
+
+  std::vector<int64_t> probs_shape = {B, H, L, S};
   std::vector<int64_t> out_shape = {B, H, L, E};
   Tensor output = Tensor::empty(out_shape, dt, q_c.device());
   if (output.numel() == 0) {
@@ -161,12 +159,13 @@ Tensor scaled_dot_product_attention_kernel(
     return output;
   }
 
+  // Pass 1: attention probabilities.
+  Tensor probs = Tensor::empty(probs_shape, dt, q_c.device());
   @autoreleasepool {
     MPSGraph* graph = [[MPSGraph new] autorelease];
     MPSShape* qShape = getMPSShape(static_cast<std::vector<int64_t>>(q_c.shape()));
     MPSShape* kShape = getMPSShape(static_cast<std::vector<int64_t>>(k_c.shape()));
-    MPSShape* vShape = getMPSShape(static_cast<std::vector<int64_t>>(v_c.shape()));
-    MPSShape* outShape = getMPSShape(out_shape);
+    MPSShape* probsShape = getMPSShape(probs_shape);
     const MPSDataType mtl_dt = getMPSDataType(dt);
 
     MPSGraphTensor* qt = [graph placeholderWithShape:qShape
@@ -175,9 +174,6 @@ Tensor scaled_dot_product_attention_kernel(
     MPSGraphTensor* kt = [graph placeholderWithShape:kShape
                                             dataType:mtl_dt
                                                  name:@"k"];
-    MPSGraphTensor* vt = [graph placeholderWithShape:vShape
-                                            dataType:mtl_dt
-                                                 name:@"v"];
     MPSGraphTensor* kT = [graph transposeTensor:kt
                                       dimension:2
                                    withDimension:3
@@ -200,18 +196,13 @@ Tensor scaled_dot_product_attention_kernel(
                                  secondaryTensor:mt
                                             name:@"masked"];
     }
-    MPSGraphTensor* probs = [graph softMaxWithTensor:scores
-                                                axis:3
-                                                name:@"probs"];
-    MPSGraphTensor* result =
-        [graph matrixMultiplicationWithPrimaryTensor:probs
-                                       secondaryTensor:vt
-                                                  name:@"out"];
+    MPSGraphTensor* probsT = [graph softMaxWithTensor:scores
+                                                 axis:3
+                                                 name:@"probs"];
 
     id<MTLBuffer> qBuf = mtlBufferOf(q_c);
     id<MTLBuffer> kBuf = mtlBufferOf(k_c);
-    id<MTLBuffer> vBuf = mtlBufferOf(v_c);
-    id<MTLBuffer> outBuf = mtlBufferOf(output);
+    id<MTLBuffer> probsBuf = mtlBufferOf(probs);
     MPSGraphTensorData* qData =
         [[[MPSGraphTensorData alloc] initWithMTLBuffer:qBuf
                                                 shape:qShape
@@ -220,21 +211,16 @@ Tensor scaled_dot_product_attention_kernel(
         [[[MPSGraphTensorData alloc] initWithMTLBuffer:kBuf
                                                 shape:kShape
                                              dataType:mtl_dt] autorelease];
-    MPSGraphTensorData* vData =
-        [[[MPSGraphTensorData alloc] initWithMTLBuffer:vBuf
-                                                shape:vShape
-                                             dataType:mtl_dt] autorelease];
-    MPSGraphTensorData* outData =
-        [[[MPSGraphTensorData alloc] initWithMTLBuffer:outBuf
-                                                shape:outShape
+    MPSGraphTensorData* probsData =
+        [[[MPSGraphTensorData alloc] initWithMTLBuffer:probsBuf
+                                                shape:probsShape
                                              dataType:mtl_dt] autorelease];
 
     NSMutableDictionary* feeds = [NSMutableDictionary dictionary];
     feeds[qt] = qData;
     feeds[kt] = kData;
-    feeds[vt] = vData;
     NSMutableDictionary* results = [NSMutableDictionary dictionary];
-    results[result] = outData;
+    results[probsT] = probsData;
     if (mask.defined()) {
       Tensor mask_c = mask.is_contiguous() ? mask : mask.contiguous();
       id<MTLBuffer> maskBuf = mtlBufferOf(mask_c);
@@ -245,6 +231,54 @@ Tensor scaled_dot_product_attention_kernel(
                                                dataType:mtl_dt] autorelease];
       feeds[mt] = maskData;
     }
+    getCurrentMPSStream()->executeMPSGraph(graph, feeds, results,
+                                      SyncType::COMMIT_AND_WAIT);
+  }
+
+  Tensor probs_in = probs;
+  if (dropout_p > 0) {
+    auto [dropped, dropout_mask] = ops::native_dropout(probs, dropout_p, true);
+    (void)dropout_mask;
+    probs_in = dropped;
+  }
+
+  // Pass 2: output = probs @ V.
+  @autoreleasepool {
+    MPSGraph* graph = [[MPSGraph new] autorelease];
+    MPSShape* pShape = getMPSShape(static_cast<std::vector<int64_t>>(probs_in.shape()));
+    MPSShape* vShape = getMPSShape(static_cast<std::vector<int64_t>>(v_c.shape()));
+    MPSShape* outShape = getMPSShape(out_shape);
+    const MPSDataType mtl_dt = getMPSDataType(dt);
+
+    MPSGraphTensor* pt = [graph placeholderWithShape:pShape
+                                            dataType:mtl_dt
+                                                 name:@"probs"];
+    MPSGraphTensor* vt = [graph placeholderWithShape:vShape
+                                            dataType:mtl_dt
+                                                 name:@"v"];
+    MPSGraphTensor* result =
+        [graph matrixMultiplicationWithPrimaryTensor:pt
+                                       secondaryTensor:vt
+                                                  name:@"out"];
+
+    id<MTLBuffer> pBuf = mtlBufferOf(probs_in);
+    id<MTLBuffer> vBuf = mtlBufferOf(v_c);
+    id<MTLBuffer> outBuf = mtlBufferOf(output);
+    MPSGraphTensorData* pData =
+        [[[MPSGraphTensorData alloc] initWithMTLBuffer:pBuf
+                                                shape:pShape
+                                             dataType:mtl_dt] autorelease];
+    MPSGraphTensorData* vData =
+        [[[MPSGraphTensorData alloc] initWithMTLBuffer:vBuf
+                                                shape:vShape
+                                             dataType:mtl_dt] autorelease];
+    MPSGraphTensorData* outData =
+        [[[MPSGraphTensorData alloc] initWithMTLBuffer:outBuf
+                                                shape:outShape
+                                             dataType:mtl_dt] autorelease];
+
+    NSDictionary* feeds = @{pt : pData, vt : vData};
+    NSDictionary* results = @{result : outData};
     getCurrentMPSStream()->executeMPSGraph(graph, feeds, results,
                                       SyncType::COMMIT_AND_WAIT);
   }

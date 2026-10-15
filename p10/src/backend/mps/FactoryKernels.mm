@@ -439,43 +439,36 @@ Tensor arange_start_step_kernel(Scalar start, Scalar end, Scalar step,
   Tensor t({len}, dtype, device);
   if (len == 0) return t;
 
-  const double st = st_d;
-  const double s = s_d;
-  switch (dtype) {
-    MPS_RANGE_CASE(float, Float32, t.data_ptr(), len,
-                   [&](int64_t i) { return static_cast<float>(s + i * st); })
-    MPS_RANGE_CASE(double, Float64, t.data_ptr(), len,
-                   [&](int64_t i) { return s + i * st; })
-    MPS_RANGE_CASE(int64_t, Int64, t.data_ptr(), len,
-                   [&](int64_t i) {
-                     return static_cast<int64_t>(s + i * st);
-                   })
-    MPS_RANGE_CASE(int32_t, Int32, t.data_ptr(), len,
-                   [&](int64_t i) {
-                     return static_cast<int32_t>(s + i * st);
-                   })
-    MPS_RANGE_CASE(int16_t, Int16, t.data_ptr(), len,
-                   [&](int64_t i) {
-                     return static_cast<int16_t>(s + i * st);
-                   })
-    MPS_RANGE_CASE(int8_t, Int8, t.data_ptr(), len,
-                   [&](int64_t i) { return static_cast<int8_t>(s + i * st); })
-    MPS_RANGE_CASE(uint8_t, UInt8, t.data_ptr(), len,
-                   [&](int64_t i) {
-                     return static_cast<uint8_t>(s + i * st);
-                   })
-    MPS_RANGE_CASE(Half, Float16, t.data_ptr(), len,
-                   [&](int64_t i) {
-                     return Half(static_cast<float>(s + i * st));
-                   })
-    MPS_RANGE_CASE(BFloat16, BFloat16, t.data_ptr(), len,
-                   [&](int64_t i) {
-                     return BFloat16(static_cast<float>(s + i * st));
-                   })
-    default:
-      TP_THROW(NotImplementedError,
-               "arange does not support this dtype on MPS");
+  // Float64 keeps the host path (the shaders do not target double).
+  if (dtype == DType::Float64) {
+    double* data = t.data_ptr<double>();
+    for (int64_t i = 0; i < len; ++i) {
+      data[i] = s_d + i * st_d;
+    }
+    return t;
   }
+
+  const std::string suffix = scalarToMetalTypeString(dtype);
+  if (suffix != "float" && suffix != "half" && suffix != "bfloat" &&
+      suffix != "long" && suffix != "int" && suffix != "short" &&
+      suffix != "char" && suffix != "uchar") {
+    TP_THROW(NotImplementedError, "arange does not support this dtype on MPS");
+  }
+  const double s = s_d;
+  const double st = st_d;
+  MPSStream* mpsStream = getCurrentMPSStream();
+  dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+    @autoreleasepool {
+      id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
+      id<MTLComputePipelineState> PSO =
+          MetalShaderLibrary::getBundledLibrary().getPipelineStateForFunc(
+              "arange_" + suffix);
+      [computeEncoder setComputePipelineState:PSO];
+      mtl_setArgs(computeEncoder, t, s, st, static_cast<uint32_t>(len));
+      mtl_dispatch1DJob(computeEncoder, PSO, static_cast<NSUInteger>(len));
+      mpsStream->endKernelCoalescing();
+    }
+  });
   return t;
 }
 
