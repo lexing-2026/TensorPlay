@@ -318,7 +318,11 @@ Tensor dequantize_self_kernel(const Tensor& self) {
   }
 
   // Per-channel affine: each channel along `axis` has its own scale/zp.
-  const int64_t axis = q->axis();
+  int64_t axis = q->axis();
+  if (axis < 0) axis += self.dim();
+  if (axis < 0 || axis >= self.dim()) {
+    TP_THROW(ValueError, "dequantize(): quantized axis out of range");
+  }
   const Tensor scales = q->scales().to(DType::Float64)
                             .to(Device(DeviceType::CPU)).contiguous();
   const Tensor zero_points = q->zero_points().to(DType::Int64)

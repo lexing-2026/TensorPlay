@@ -64,6 +64,11 @@ Tensor& fill_kernel(Tensor& self, const Scalar& value) {
                "fill_ for non-per-tensor quantized MPS tensors is not "
                "implemented");
     }
+    if (!self.is_contiguous()) {
+      TP_THROW(NotImplementedError,
+               "fill_ for non-contiguous quantized MPS tensors is not "
+               "implemented");
+    }
     const double scale = self.impl()->quantizer()->scale();
     const int64_t zp = self.impl()->quantizer()->zero_point();
     const float v = static_cast<float>(value.toDouble());

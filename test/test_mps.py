@@ -579,5 +579,46 @@ def ref_computed(x_cpu, w_cpu, b_cpu):
     return norm * w_cpu + b_cpu
 
 
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSQuantization(unittest.TestCase):
+    def test_quantize_per_tensor_roundtrip(self):
+        x = tp.tensor([-1.0, 0.0, 1.0, 2.0], dtype=tp.float32, device="mps")
+        for dtype in (tp.quint8, tp.qint8, tp.qint32):
+            q = tp.quantize_per_tensor(x, 0.1, 10, dtype)
+            self.assertEqual(q.device.type, "mps")
+            self.assertEqual(q.dtype, dtype)
+            d = tp.dequantize(q)
+            self.assertTrue(tp.allclose(d.cpu(), x.cpu(), atol=0.11))
+
+    def test_quantize_per_tensor_int_repr(self):
+        x = tp.tensor([-1.0, 0.0, 1.0, 2.0], dtype=tp.float32, device="mps")
+        q = tp.quantize_per_tensor(x, 0.1, 10, tp.quint8)
+        codes = tp.int_repr(q).cpu().tolist()
+        # round(-1/0.1)+10 = 0, round(0)+10 = 10, round(1/0.1)+10 = 20,
+        # round(2/0.1)+10 = 30.
+        self.assertEqual(codes, [0, 10, 20, 30])
+
+    def test_quantized_empty_like_and_copy(self):
+        x = tp.tensor([1.0, 2.0], dtype=tp.float32, device="mps")
+        q = tp.quantize_per_tensor(x, 0.5, 0, tp.qint8)
+        y = tp.empty_like(q)
+        self.assertEqual(y.device.type, "mps")
+        self.assertEqual(y.dtype, tp.qint8)
+        y.copy_(q)
+        self.assertEqual(tp.int_repr(y).cpu().tolist(), tp.int_repr(q).cpu().tolist())
+        self.assertTrue(tp.allclose(tp.dequantize(y).cpu(), x.cpu(), atol=0.51))
+
+    def test_weight_int8pack_mm(self):
+        a = tp.tensor([[0.5, -1.0, 2.0, 0.25],
+                       [1.0, 0.5, -0.5, 2.0]], dtype=tp.float32, device="mps")
+        w = tp.tensor([[1, -2, 0, 1],
+                       [0, 1, -1, 2],
+                       [2, 0, 1, -1]], dtype=tp.int8, device="mps")
+        s = tp.tensor([0.5, 1.0, 2.0], dtype=tp.float32, device="mps")
+        c = tp._C._weight_int8pack_mm(a, w, s)
+        ref = (a.cpu() @ w.cpu().to(tp.float32).T) * s.cpu()
+        self.assertTrue(tp.allclose(c.cpu(), ref, atol=1e-5))
+
+
 if __name__ == "__main__":
     unittest.main()
