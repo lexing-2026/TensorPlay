@@ -236,6 +236,11 @@ class Context final {
       const bool final_use = false);
 
   void flush();
+
+  // Promotes over-budget pending staging buffers and clears retired tensor
+  // resources after the queue drains; called from submit_cmd_to_gpu so
+  // asynchronous-only workloads stay bounded.
+  void recycle_pending_resources();
 };
 
 namespace detail {

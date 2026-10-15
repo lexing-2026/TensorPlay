@@ -196,6 +196,21 @@ api::utils::uvec3 create_image_extents(
   }
 }
 
+// True when a 3-D image with these extents can be created on the current
+// device. Texture storage packs up to four scalar channels into one texel,
+// but Vulkan still caps every image axis at maxImageDimension3D; shapes that
+// exceed the cap (typically long 1-D tensors) must fall back to buffer
+// storage or the allocation fails outright with out-of-device-memory.
+bool texture_extents_supported(
+    api::Context* const context,
+    const api::utils::uvec3& extents) {
+  const VkPhysicalDeviceLimits& limits =
+      context->adapter_ptr()->properties().limits;
+  return extents[0u] <= limits.maxImageDimension3D &&
+         extents[1u] <= limits.maxImageDimension3D &&
+         extents[2u] <= limits.maxImageDimension3D;
+}
+
 api::UniformParamsBuffer make_metadata_uniform(
     api::Context* const context,
     const std::vector<int64_t>& sizes,
@@ -282,6 +297,9 @@ vTensorStorage::vTensorStorage(
       last_access_{} {
   verify();
 
+  const std::vector<int64_t> gpu_sizes =
+      calc_gpu_sizes(sizes, gpu_memory_layout, storage_type);
+
   if (api::StorageType::BUFFER == storage_type) {
     buffer_length_ = static_cast<int64_t>(utils::multiply_integers(sizes));
 
@@ -289,14 +307,34 @@ vTensorStorage::vTensorStorage(
         buffer_length_ * tensorplay::elementSize(dtype),
         !context_->adapter_ptr()->has_unified_memory(),
         allocate_memory);
-  } else if (api::StorageType::TEXTURE_3D == storage_type) {
-    extents_ = create_image_extents(sizes, storage_type, gpu_memory_layout);
+    return;
+  }
+
+  if (api::StorageType::TEXTURE_3D == storage_type) {
+    extents_ = create_image_extents(gpu_sizes, storage_type, gpu_memory_layout);
+
+    if (!texture_extents_supported(context_, extents_)) {
+      // This shape maps to image axes beyond the device limit (long 1-D
+      // vectors are the usual case). Allocate linear buffer storage instead;
+      // elementwise and reduction kernels already provide buffer variants.
+      // Buffer storage uses the width-packed (contiguous) layout.
+      storage_type_ = api::StorageType::BUFFER;
+      gpu_memory_layout_ = api::GPUMemoryLayout::TENSOR_WIDTH_PACKED;
+      extents_ = {0u, 0u, 0u}; // buffer storage has no image extents
+      buffer_length_ = static_cast<int64_t>(utils::multiply_integers(sizes));
+      buffer_ = context_->adapter_ptr()->vma().create_storage_buffer(
+          buffer_length_ * tensorplay::elementSize(dtype),
+          !context_->adapter_ptr()->has_unified_memory(),
+          allocate_memory);
+      return;
+    }
 
     image_ = allocate_image(
         context_, extents_, storage_type, to_vkformat(dtype), allocate_memory);
-  } else {
-    VK_THROW("Not implemented!");
+    return;
   }
+
+  VK_THROW("Not implemented!");
 }
 
 vTensorStorage::~vTensorStorage() {
@@ -443,8 +481,20 @@ void vTensorStorage::discard_and_reallocate(
   } else if (api::StorageType::TEXTURE_3D == storage_type_) {
     extents_ = create_image_extents(gpu_sizes, storage_type_, gpu_memory_layout);
 
-    image_ = allocate_image(
-        context_, extents_, storage_type_, to_vkformat(dtype), true);
+    if (!texture_extents_supported(context_, extents_)) {
+      // Same fallback as construction: shapes that exceed the device image
+      // limits switch to linear buffer storage instead of failing.
+      storage_type_ = api::StorageType::BUFFER;
+      gpu_memory_layout_ = api::GPUMemoryLayout::TENSOR_WIDTH_PACKED;
+      extents_ = {0u, 0u, 0u};
+      buffer_length_ = static_cast<int64_t>(utils::multiply_integers(gpu_sizes));
+      buffer_ = context_->adapter_ptr()->vma().create_storage_buffer(
+          buffer_length_ * tensorplay::elementSize(dtype),
+          !context_->adapter_ptr()->has_unified_memory());
+    } else {
+      image_ = allocate_image(
+          context_, extents_, storage_type_, to_vkformat(dtype), true);
+    }
   } else {
     VK_THROW("Not implemented!");
   }
@@ -482,9 +532,25 @@ vTensor::vTensor(
           context,
           storage_type,
           memory_layout_,
-          gpu_sizes_,
+          sizes,
           dtype_,
-          allocate_memory)) {}
+          allocate_memory)) {
+  // When the storage fell back to buffer mode (oversized image axes), the
+  // view metadata must follow the same layout so numel/strides agree with
+  // the linear payload.
+  if (view_->storage_type() != storage_type) {
+    const api::GPUMemoryLayout linear_layout =
+        api::GPUMemoryLayout::TENSOR_WIDTH_PACKED;
+    memory_layout_ = linear_layout;
+    strides_ =
+        calc_strides(sizes, linear_layout, api::StorageType::BUFFER);
+    gpu_sizes_ =
+        calc_gpu_sizes(sizes, linear_layout, api::StorageType::BUFFER);
+    gpu_strides_ =
+        calc_strides(gpu_sizes_, linear_layout, api::StorageType::BUFFER);
+    virtual_extents_ = {0u, 0u, 0u};
+  }
+}
 
 vTensor::vTensor(
     api::Context* context,

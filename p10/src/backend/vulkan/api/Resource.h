@@ -343,6 +343,15 @@ class VulkanImage final {
     return image_properties_.image_format;
   }
 
+  inline VkDeviceSize mem_size() const {
+    if (!memory_.allocation) {
+      return 0u;
+    }
+    VmaAllocationInfo info{};
+    vmaGetAllocationInfo(allocator_, memory_.allocation, &info);
+    return info.size;
+  }
+
   inline VkExtent3D extents() const {
     return image_properties_.image_extents;
   }

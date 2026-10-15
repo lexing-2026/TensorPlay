@@ -131,14 +131,32 @@ uint32_t select_first(const std::vector<Runtime::DeviceMapping>& devices) {
     return devices.size() + 1; // return out of range to signal invalidity
   }
 
-  // Select the first adapter that has compute capability
+  // Prefer a discrete GPU when one is present; otherwise fall back to the
+  // first adapter with compute capability. This keeps the default device
+  // on the fastest compute path instead of an integrated or software device
+  // that happens to be enumerated first.
+  int fallback = -1;
   for (size_t i = 0; i < devices.size(); ++i) {
-    if (devices[i].first.num_compute_queues > 0) {
-      return i;
+    if (devices[i].first.num_compute_queues == 0) {
+      continue;
+    }
+    const VkPhysicalDeviceType type =
+        devices[i].first.properties.deviceType;
+    std::fprintf(
+        stderr,
+        "[tensorplay/vulkan] adapter %zu: %s (%s)\n",
+        i,
+        devices[i].first.properties.deviceName,
+        get_device_type_str(type));
+    if (type == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+      return static_cast<uint32_t>(i);
+    }
+    if (fallback < 0) {
+      fallback = static_cast<int>(i);
     }
   }
 
-  return devices.size() + 1;
+  return fallback < 0 ? devices.size() + 1 : static_cast<uint32_t>(fallback);
 }
 
 //

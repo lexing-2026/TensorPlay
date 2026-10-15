@@ -283,9 +283,13 @@ class vTensor final {
   /*
    * Get a DType that corresponds to the image format of the texture. Note
    * that this mapping is different from dtype(), since different dtypes may
-   * share one VkFormat.
+   * share one VkFormat. Buffer-backed tensors have no image format, so the
+   * logical dtype is returned for them.
    */
   inline DType texture_dtype() const {
+    if (view_->storage_type() == api::StorageType::BUFFER) {
+      return dtype_;
+    }
     return api::element_scalartype(view_->texture_format());
   }
 

@@ -221,20 +221,6 @@ VkDevice create_logical_device(
 
 // Print utils
 
-std::string get_device_type_str(const VkPhysicalDeviceType type) {
-  switch (type) {
-    case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU:
-      return "INTEGRATED_GPU";
-    case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:
-      return "DISCRETE_GPU";
-    case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:
-      return "VIRTUAL_GPU";
-    case VK_PHYSICAL_DEVICE_TYPE_CPU:
-      return "CPU";
-    default:
-      return "UNKNOWN";
-  }
-}
 
 std::string get_memory_properties_str(const VkMemoryPropertyFlags flags) {
   std::bitset<10> values(flags);
@@ -275,6 +261,21 @@ std::string get_queue_family_properties_str(const VkQueueFlags flags) {
 }
 
 } // namespace
+
+std::string get_device_type_str(const VkPhysicalDeviceType type) {
+  switch (type) {
+    case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU:
+      return "INTEGRATED_GPU";
+    case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:
+      return "DISCRETE_GPU";
+    case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:
+      return "VIRTUAL_GPU";
+    case VK_PHYSICAL_DEVICE_TYPE_CPU:
+      return "CPU";
+    default:
+      return "UNKNOWN";
+  }
+}
 
 //
 // DeviceHandle

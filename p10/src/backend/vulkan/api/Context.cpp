@@ -15,7 +15,7 @@
 // Steady-state inference re-requests the same few sizes every batch, so a
 // small budget captures virtually all reuse; larger transfers simply
 // allocate fresh and are destroyed at flush.
-constexpr size_t kHostVisiblePoolByteBudget = 8u * 1024u * 1024u;
+constexpr size_t kHostVisiblePoolByteBudget = 256u * 1024u * 1024u;
 
 namespace tensorplay {
 namespace vulkan {
@@ -103,6 +103,7 @@ void Context::submit_cmd_to_gpu(VkFence fence_handle, const bool final_use) {
 
     submit_count_ = 0u;
   }
+  recycle_pending_resources();
 }
 
 std::pair<VkQueryPool, uint32_t> Context::write_timestamp() {
@@ -112,6 +113,71 @@ std::pair<VkQueryPool, uint32_t> Context::write_timestamp() {
   auto slot = querypool_.get_new_query();
   cmd_.write_timestamp(slot.first, slot.second);
   return slot;
+}
+
+void Context::recycle_pending_resources() {
+  size_t pending_bytes = 0u;
+  {
+    std::lock_guard<std::mutex> lock(staging_pool_mutex_);
+    for (const VulkanBuffer& buffer : staging_pending_) {
+      pending_bytes += static_cast<size_t>(buffer.mem_size());
+    }
+  }
+  {
+    std::lock_guard<std::mutex> lock(buffer_clearlist_mutex_);
+    for (const VulkanBuffer& buffer : buffers_to_clear_) {
+      pending_bytes += static_cast<size_t>(buffer.mem_size());
+    }
+  }
+  {
+    std::lock_guard<std::mutex> lock(image_clearlist_mutex_);
+    for (const VulkanImage& image : images_to_clear_) {
+      pending_bytes += static_cast<size_t>(image.mem_size());
+    }
+  }
+  if (pending_bytes <= kHostVisiblePoolByteBudget) {
+    return;
+  }
+
+  // Pending staging buffers and cleared tensor resources were referenced by
+  // recorded command buffers, so wait for the queue to drain before
+  // promoting, destroying, or recycling them. This bounds device memory when
+  // callers never synchronize explicitly (e.g. a long chain of device-side
+  // ops without any .cpu()/item() reads).
+  VK_CHECK(vkQueueWaitIdle(queue()));
+
+  std::lock_guard<std::mutex> lock(staging_pool_mutex_);
+  staging_pool_.insert(
+      staging_pool_.end(),
+      std::make_move_iterator(staging_pending_.begin()),
+      std::make_move_iterator(staging_pending_.end()));
+  staging_pending_.clear();
+  size_t pooled_bytes = 0u;
+  for (const VulkanBuffer& buffer : staging_pool_) {
+    pooled_bytes += static_cast<size_t>(buffer.mem_size());
+  }
+  while (!staging_pool_.empty() &&
+         pooled_bytes > kHostVisiblePoolByteBudget) {
+    pooled_bytes -= static_cast<size_t>(staging_pool_.back().mem_size());
+    staging_pool_.pop_back();
+  }
+
+  // The queue is idle, so every cleared tensor resource can be destroyed
+  // now instead of waiting for an explicit flush.
+  {
+    std::lock_guard<std::mutex> lock(buffer_clearlist_mutex_);
+    buffers_to_clear_.clear();
+  }
+  {
+    std::lock_guard<std::mutex> lock(image_clearlist_mutex_);
+    images_to_clear_.clear();
+  }
+
+  command_pool_.flush();
+  descriptor_pool_.flush();
+  if (cmd_) {
+    cmd_.invalidate();
+  }
 }
 
 void Context::flush() {

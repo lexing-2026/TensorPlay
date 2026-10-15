@@ -59,6 +59,9 @@ class DeviceHandle final {
   friend class Adapter;
 };
 
+// Human-readable name for a Vulkan physical device type.
+std::string get_device_type_str(VkPhysicalDeviceType type);
+
 //
 // A Vulkan Adapter represents a logical device and all its properties. It
 // manages all relevant properties of the underlying physical device, a

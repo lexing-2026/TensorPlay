@@ -63,9 +63,9 @@ void transfer_cpu_to_vulkan(const Tensor& src, api::vTensor& v_dst) {
 
   // Buffer payloads hold a plain linear layout.
   if (v_dst.storage_type() == api::StorageType::BUFFER) {
-    Tensor src_lin = prepare_source(src, v_dst.texture_dtype());
+    Tensor src_lin = prepare_source(src, v_dst.dtype());
 
-    api::StorageBuffer staging(context, v_dst.texture_dtype(), v_dst.gpu_numel());
+    api::StorageBuffer staging(context, v_dst.dtype(), v_dst.gpu_numel());
     {
       api::MemoryMap mapping(staging.buffer(), api::MemoryAccessType::WRITE);
       mapping.invalidate();
