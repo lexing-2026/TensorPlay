@@ -479,6 +479,8 @@ void spmm_reduce_backward_other_kernel(
     }
 }
 
+} // namespace CPU_CAPABILITY
+
 #ifndef CPU_CAPABILITY_AVX512
 REGISTER_DISPATCH(spmm_reduce_stub, &spmm_reduce_kernel)
 REGISTER_DISPATCH(spmm_reduce_backward_input_stub,
@@ -493,6 +495,5 @@ ALSO_REGISTER_AVX512_DISPATCH(spmm_reduce_backward_other_stub,
                              &spmm_reduce_backward_other_kernel)
 #endif
 
-} // namespace CPU_CAPABILITY
 } // namespace cpu
 } // namespace tensorplay
