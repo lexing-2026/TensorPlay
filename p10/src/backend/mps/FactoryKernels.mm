@@ -56,6 +56,26 @@ DType infer_full_dtype(const Scalar& fill_value) {
   return globalContext().defaultDType();
 }
 
+// GPU constant fill for a contiguous, offset-0 tensor.
+template <typename T>
+void fill_shader_impl(Tensor& self, T value) {
+  const uint32_t numel = static_cast<uint32_t>(self.numel());
+  MPSStream* mpsStream = getCurrentMPSStream();
+  dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+    @autoreleasepool {
+      id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
+      const std::string kernel = "fill_" + scalarToMetalTypeString(self.dtype());
+      id<MTLComputePipelineState> PSO =
+          MetalShaderLibrary::getBundledLibrary().getPipelineStateForFunc(
+              kernel);
+      [computeEncoder setComputePipelineState:PSO];
+      mtl_setArgs(computeEncoder, self, value, numel);
+      mtl_dispatch1DJob(computeEncoder, PSO, static_cast<NSUInteger>(numel));
+      mpsStream->endKernelCoalescing();
+    }
+  });
+}
+
 } // namespace
 
 Tensor& fill_kernel(Tensor& self, const Scalar& value) {
@@ -120,23 +140,41 @@ Tensor& fill_kernel(Tensor& self, const Scalar& value) {
     }
     return self;
   }
-  // Shared-memory buffers are host-visible; fill in place through the mapping.
-  if (self.is_contiguous()) {
-#define OP_CASE(ctype, name)                                             \
-  case DType::name: {                                                    \
-    const ctype val = value.to<ctype>();                                 \
-    ctype* data = self.data_ptr<ctype>();                                \
-    std::fill(data, data + self.numel(), val);                           \
-    break;                                                               \
-  }
+  // Contiguous offset-0 tensors are filled on the GPU by the Fill shader
+  // (float/half/bfloat/int*/uint8/bool); double and complex dtypes fall back
+  // to the host path since the shaders do not target them.
+  if (self.is_contiguous() && self.storage_offset() == 0) {
     switch (self.dtype()) {
-      TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(OP_CASE)
+      case DType::Float32:
+        fill_shader_impl<float>(self, value.to<float>());
+        return self;
+      case DType::Float16:
+        fill_shader_impl<Half>(self, value.to<Half>());
+        return self;
+      case DType::BFloat16:
+        fill_shader_impl<BFloat16>(self, value.to<BFloat16>());
+        return self;
+      case DType::Int64:
+        fill_shader_impl<int64_t>(self, value.to<int64_t>());
+        return self;
+      case DType::Int32:
+        fill_shader_impl<int32_t>(self, value.to<int32_t>());
+        return self;
+      case DType::Int16:
+        fill_shader_impl<int16_t>(self, value.to<int16_t>());
+        return self;
+      case DType::Int8:
+        fill_shader_impl<int8_t>(self, value.to<int8_t>());
+        return self;
+      case DType::UInt8:
+        fill_shader_impl<uint8_t>(self, value.to<uint8_t>());
+        return self;
+      case DType::Bool:
+        fill_shader_impl<bool>(self, value.to<bool>());
+        return self;
       default:
-        TP_THROW(NotImplementedError,
-                 "fill_ not implemented for this dtype on MPS");
+        break;
     }
-#undef OP_CASE
-    return self;
   }
   // Strided path: only contiguous tensors are expected in the skeleton
   // backend; non-contiguous views fall back to a flat walk over the storage.
@@ -170,6 +208,39 @@ Tensor& fill_kernel(Tensor& self, const Scalar& value) {
 
 Tensor& zero_inplace_kernel(Tensor& self) {
   if (self.numel() == 0) return self;
+  if (self.is_contiguous() && self.storage_offset() == 0) {
+    switch (self.dtype()) {
+      case DType::Float32:
+        fill_shader_impl<float>(self, 0.0f);
+        return self;
+      case DType::Float16:
+        fill_shader_impl<Half>(self, Half(0.0f));
+        return self;
+      case DType::BFloat16:
+        fill_shader_impl<BFloat16>(self, BFloat16(0.0f));
+        return self;
+      case DType::Int64:
+        fill_shader_impl<int64_t>(self, int64_t(0));
+        return self;
+      case DType::Int32:
+        fill_shader_impl<int32_t>(self, int32_t(0));
+        return self;
+      case DType::Int16:
+        fill_shader_impl<int16_t>(self, int16_t(0));
+        return self;
+      case DType::Int8:
+        fill_shader_impl<int8_t>(self, int8_t(0));
+        return self;
+      case DType::UInt8:
+        fill_shader_impl<uint8_t>(self, uint8_t(0));
+        return self;
+      case DType::Bool:
+        fill_shader_impl<bool>(self, false);
+        return self;
+      default:
+        break;
+    }
+  }
   void* data = self.data_ptr();
   if (self.is_contiguous()) {
     std::memset(data, 0, static_cast<size_t>(self.numel()) * self.itemsize());

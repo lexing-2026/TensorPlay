@@ -118,3 +118,43 @@ REGISTER_EMBEDDING_DENSE_BACKWARD(bfloat, int, uint, 32);
 REGISTER_EMBEDDING_DENSE_BACKWARD(bfloat, int, ulong, 64);
 REGISTER_EMBEDDING_DENSE_BACKWARD(bfloat, long, uint, 32);
 REGISTER_EMBEDDING_DENSE_BACKWARD(bfloat, long, ulong, 64);
+
+// Embedding forward: gathers `weight[indices[i]]` rows into the output.
+template <typename T, typename I>
+kernel void embedding_forward(
+    constant T* weight [[buffer(0)]],
+    constant I* indices [[buffer(1)]],
+    device T* out [[buffer(2)]],
+    constant uint& num_embeddings [[buffer(3)]],
+    constant uint& emb_dim [[buffer(4)]],
+    constant uint& num_indices [[buffer(5)]],
+    uint tid [[thread_position_in_grid]]) {
+  if (tid >= num_indices) {
+    return;
+  }
+  const long ix_raw = static_cast<long>(indices[tid]);
+  const long ix = ix_raw < 0 ? ix_raw + num_embeddings : ix_raw;
+  const ulong src = static_cast<ulong>(ix) * emb_dim;
+  const ulong dst = static_cast<ulong>(tid) * emb_dim;
+  for (uint d = 0; d < emb_dim; ++d) {
+    out[dst + d] = weight[src + d];
+  }
+}
+
+#define REGISTER_EMBEDDING_FORWARD(T, I)                                  \
+  template [[host_name("embedding_forward_" #T "_" #I)]] kernel void      \
+  embedding_forward<T, I>(                                                \
+      constant T * weight [[buffer(0)]],                                  \
+      constant I * indices [[buffer(1)]],                                 \
+      device T * out [[buffer(2)]],                                       \
+      constant uint& num_embeddings [[buffer(3)]],                        \
+      constant uint& emb_dim [[buffer(4)]],                               \
+      constant uint& num_indices [[buffer(5)]],                           \
+      uint tid [[thread_position_in_grid]])
+
+REGISTER_EMBEDDING_FORWARD(float, int);
+REGISTER_EMBEDDING_FORWARD(float, long);
+REGISTER_EMBEDDING_FORWARD(half, int);
+REGISTER_EMBEDDING_FORWARD(half, long);
+REGISTER_EMBEDDING_FORWARD(bfloat, int);
+REGISTER_EMBEDDING_FORWARD(bfloat, long);

@@ -2,7 +2,11 @@
 #include "Dispatcher.h"
 #include "Exception.h"
 
+#include "backend/mps/MPSAllocator.h"
 #include "backend/mps/MPSDevice.h"
+#include "backend/mps/MetalShaderLibrary.h"
+#include "backend/mps/MetalUtils.h"
+#include "backend/mps/MPSStream.h"
 
 #include <cstring>
 #include <vector>
@@ -148,6 +152,7 @@ Tensor embedding_kernel(const Tensor& weight, const Tensor& indices,
              "embedding(): indices must be int32 or int64");
   }
   Tensor indices_c = indices.is_contiguous() ? indices : indices.contiguous();
+  Tensor weight_c = weight.is_contiguous() ? weight : weight.contiguous();
 
   std::vector<int64_t> out_shape =
       static_cast<std::vector<int64_t>>(indices.shape());
@@ -158,32 +163,49 @@ Tensor embedding_kernel(const Tensor& weight, const Tensor& indices,
   }
 
   const int64_t emb_dim = weight.size(1);
-  const int64_t itemsize = output.itemsize();
   const int64_t num_embeddings = weight.size(0);
   const int64_t n = indices_c.numel();
 
-#define EMBEDDING_CASE(ctype)                                            \
-  const ctype* idx = indices_c.data_ptr<ctype>();                        \
-  char* out_base = static_cast<char*>(output.data_ptr());                \
-  const char* w_base = static_cast<const char*>(weight.data_ptr());     \
-  for (int64_t i = 0; i < n; ++i) {                                     \
-    int64_t ix = static_cast<int64_t>(idx[i]);                          \
-    if (ix < 0) ix += num_embeddings;                                   \
-    if (ix < 0 || ix >= num_embeddings) {                              \
-      TP_THROW(IndexError,                                               \
-               "embedding(): index out of range in self");               \
-    }                                                                    \
-    std::memcpy(out_base + i * emb_dim * itemsize,                       \
-               w_base + ix * emb_dim * itemsize,                         \
-               emb_dim * itemsize);                                      \
+  // Range-check the indices on the host (unified memory makes the buffer
+  // host-readable); the shader assumes valid indices afterwards.
+  if (indices_c.dtype() == DType::Int64) {
+    const int64_t* idx = indices_c.data_ptr<int64_t>();
+    for (int64_t i = 0; i < n; ++i) {
+      const int64_t ix = idx[i] < 0 ? idx[i] + num_embeddings : idx[i];
+      if (ix < 0 || ix >= num_embeddings) {
+        TP_THROW(IndexError, "embedding(): index out of range in self");
+      }
+    }
+  } else {
+    const int32_t* idx = indices_c.data_ptr<int32_t>();
+    for (int64_t i = 0; i < n; ++i) {
+      const int64_t ix = idx[i] < 0 ? static_cast<int64_t>(idx[i]) + num_embeddings
+                                    : static_cast<int64_t>(idx[i]);
+      if (ix < 0 || ix >= num_embeddings) {
+        TP_THROW(IndexError, "embedding(): index out of range in self");
+      }
+    }
   }
 
-  if (indices_c.dtype() == DType::Int64) {
-    EMBEDDING_CASE(int64_t)
-  } else {
-    EMBEDDING_CASE(int32_t)
-  }
-#undef EMBEDDING_CASE
+  MPSStream* mpsStream = getCurrentMPSStream();
+  dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+    @autoreleasepool {
+      id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
+      const std::string kernel = "embedding_forward_" +
+          scalarToMetalTypeString(weight_c.dtype()) + "_" +
+          scalarToMetalTypeString(indices_c.dtype());
+      id<MTLComputePipelineState> PSO =
+          MetalShaderLibrary::getBundledLibrary().getPipelineStateForFunc(
+              kernel);
+      [computeEncoder setComputePipelineState:PSO];
+      mtl_setArgs(computeEncoder, weight_c, indices_c, output,
+                  static_cast<uint32_t>(num_embeddings),
+                  static_cast<uint32_t>(emb_dim),
+                  static_cast<uint32_t>(n));
+      mtl_dispatch1DJob(computeEncoder, PSO, static_cast<NSUInteger>(n));
+      mpsStream->endKernelCoalescing();
+    }
+  });
   return output;
 }
 
