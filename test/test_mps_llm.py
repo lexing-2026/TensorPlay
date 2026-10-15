@@ -1,0 +1,172 @@
+"""MPS LLM-oriented kernel tests: rms_norm, embedding backward,
+expand/repeat, topk/sample, fused AdamW, SDPA and the GPU factory shaders.
+
+Every test is skipped when the runner has no Metal device, matching the
+conventions of test_mps.py.
+"""
+
+import os
+import sys
+import unittest
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import tensorplay as tp
+
+
+def mps_available():
+    return tp.mps.is_available()
+
+
+def close(a, b, tol=1e-3):
+    return tp.all((a - b).abs() < tol).item()
+
+
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSRMSNorm(unittest.TestCase):
+    def test_rms_norm(self):
+        x = tp.randn(4, 8, device="mps")
+        w = tp.randn(8, device="mps")
+        y = tp.rms_norm(x, [8], w)
+        y_cpu = tp.rms_norm(x.cpu(), [8], w.cpu())
+        self.assertTrue(close(y.cpu(), y_cpu, 1e-3))
+
+    def test_fused_rms_norm(self):
+        x = tp.randn(2, 16, device="mps")
+        w = tp.randn(16, device="mps")
+        out, rstd = tp._fused_rms_norm(x, [16], w, 1e-5)
+        out_cpu, rstd_cpu = tp._fused_rms_norm(x.cpu(), [16], w.cpu(), 1e-5)
+        self.assertTrue(close(out.cpu(), out_cpu, 1e-3))
+        self.assertEqual(rstd.shape, rstd_cpu.shape)
+        self.assertTrue(close(rstd.cpu(), rstd_cpu, 1e-3))
+
+
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSEmbedding(unittest.TestCase):
+    def test_embedding_forward_backward(self):
+        weight = tp.randn(10, 4, device="mps", requires_grad=True)
+        indices = tp.tensor([1, 3, 5], device="mps")
+        out = tp.embedding(weight, indices)
+        self.assertEqual(list(out.shape), [3, 4])
+        out.sum().backward()
+        self.assertIsNotNone(weight.grad)
+        # Compare against CPU backward.
+        weight_cpu = tp.randn(10, 4, device="cpu", requires_grad=True)
+        out_cpu = tp.embedding(weight_cpu, indices.cpu())
+        out_cpu.sum().backward()
+        # Shape and nonzero-row structure must match (grad is index-scattered).
+        self.assertEqual(weight.grad.shape, weight_cpu.grad.shape)
+        self.assertTrue(close(weight.grad.cpu(), weight_cpu.grad, 1e-3))
+
+
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSExpandRepeat(unittest.TestCase):
+    def test_expand(self):
+        x = tp.randn(1, 3, device="mps")
+        y = x.expand(4, 3)
+        self.assertEqual(list(y.shape), [4, 3])
+        self.assertTrue(close(y.cpu(), x.cpu().expand(4, 3), 1e-5))
+
+    def test_repeat(self):
+        x = tp.randn(2, 3, device="mps")
+        y = x.repeat(2, 2)
+        self.assertEqual(list(y.shape), [4, 6])
+        self.assertTrue(close(y.cpu(), x.cpu().repeat(2, 2), 1e-5))
+
+
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSTopKSample(unittest.TestCase):
+    def test_topk(self):
+        x = tp.randn(2, 8, device="mps")
+        values, indices = tp.topk(x, 3, dim=-1)
+        self.assertEqual(list(values.shape), [2, 3])
+        self.assertEqual(list(indices.shape), [2, 3])
+        values_cpu, indices_cpu = tp.topk(x.cpu(), 3, dim=-1)
+        self.assertTrue(close(values.cpu(), values_cpu, 1e-3))
+
+    def test_sample(self):
+        logits = tp.randn(4, 16, device="mps")
+        tokens = tp.sample(logits, temperature=1.0, top_k=0, top_p=1.0)
+        self.assertEqual(list(tokens.shape), [4])
+        self.assertEqual(tokens.dtype, tp.int64)
+        self.assertTrue(tp.all((tokens >= 0) & (tokens < 16)).item())
+
+        tokens_p = tp.sample(logits, temperature=0.8, top_k=5, top_p=0.9)
+        self.assertEqual(list(tokens_p.shape), [4])
+
+
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSFusedOptimizer(unittest.TestCase):
+    def _step(self, device, adamw):
+        p = tp.randn(6, device=device)
+        g = tp.randn(6, device=device)
+        ea = tp.zeros(6, device=device)
+        es = tp.zeros(6, device=device)
+        me = tp.zeros(6, device=device)
+        step = tp.tensor(0.0, dtype=tp.float32, device=device)
+        fn = tp._fused_adamw_ if adamw else tp._fused_adam_
+        fn([p], [g], [ea], [es], [me], [step], lr=0.01, beta1=0.9,
+           beta2=0.999, weight_decay=0.01, eps=1e-8, amsgrad=False,
+           maximize=False)
+        return p.cpu()
+
+    def test_fused_adamw(self):
+        p_mps = self._step("mps", adamw=True)
+        p_cpu = self._step("cpu", adamw=True)
+        self.assertTrue(close(p_mps, p_cpu, 1e-4))
+
+    def test_fused_adam(self):
+        p_mps = self._step("mps", adamw=False)
+        p_cpu = self._step("cpu", adamw=False)
+        self.assertTrue(close(p_mps, p_cpu, 1e-4))
+
+
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSSDPA(unittest.TestCase):
+    def test_sdpa_mha(self):
+        q = tp.randn(2, 4, 6, 8, device="mps")
+        k = tp.randn(2, 4, 10, 8, device="mps")
+        v = tp.randn(2, 4, 10, 8, device="mps")
+        out = tp.scaled_dot_product_attention(q, k, v)
+        out_cpu = tp.scaled_dot_product_attention(q.cpu(), k.cpu(), v.cpu())
+        self.assertEqual(list(out.shape), [2, 4, 6, 8])
+        self.assertTrue(close(out.cpu(), out_cpu, 1e-2))
+
+    def test_sdpa_causal(self):
+        q = tp.randn(1, 2, 4, 8, device="mps")
+        k = tp.randn(1, 2, 4, 8, device="mps")
+        v = tp.randn(1, 2, 4, 8, device="mps")
+        out = tp.scaled_dot_product_attention(q, k, v, is_causal=True)
+        out_cpu = tp.scaled_dot_product_attention(q.cpu(), k.cpu(), v.cpu(),
+                                                  is_causal=True)
+        self.assertTrue(close(out.cpu(), out_cpu, 1e-2))
+
+
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSFactoryShaders(unittest.TestCase):
+    def test_rand_range(self):
+        x = tp.rand(1000, device="mps")
+        self.assertTrue(tp.all(x >= 0).item())
+        self.assertTrue(tp.all(x < 1).item())
+
+    def test_randn_shape(self):
+        x = tp.randn(64, 64, device="mps")
+        self.assertEqual(list(x.shape), [64, 64])
+        self.assertTrue(tp.all(tp.isfinite(x)).item())
+
+    def test_arange(self):
+        x = tp.arange(10, device="mps")
+        self.assertTrue(close(x.cpu(), tp.arange(10), 1e-5))
+
+    def test_eye(self):
+        x = tp.eye(4, device="mps")
+        self.assertTrue(close(x.cpu(), tp.eye(4), 1e-5))
+
+    def test_randint(self):
+        x = tp.randint(0, 100, (50,), device="mps")
+        self.assertTrue(tp.all(x >= 0).item())
+        self.assertTrue(tp.all(x < 100).item())
+
+
+if __name__ == "__main__":
+    unittest.main()
