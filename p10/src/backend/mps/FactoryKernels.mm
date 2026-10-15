@@ -12,6 +12,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <climits>
+#include <cstdint>
 #include <cstring>
 #include <functional>
 #include <vector>
@@ -54,7 +56,59 @@ DType infer_full_dtype(const Scalar& fill_value) {
 Tensor& fill_kernel(Tensor& self, const Scalar& value) {
   if (self.numel() == 0) return self;
   if (isQuantizedType(self.dtype())) {
-    TP_THROW(NotImplementedError, "fill_ not implemented for quantized MPS tensors");
+    // Per-tensor affine quantized tensors store round(value/scale)+zero_point
+    // codes; other schemes are not supported on MPS yet.
+    if (!self.impl()->has_quantizer() ||
+        self.impl()->quantizer()->qscheme() != kPerTensorAffine) {
+      TP_THROW(NotImplementedError,
+               "fill_ for non-per-tensor quantized MPS tensors is not "
+               "implemented");
+    }
+    const double scale = self.impl()->quantizer()->scale();
+    const int64_t zp = self.impl()->quantizer()->zero_point();
+    const float v = static_cast<float>(value.toDouble());
+    const float inverse = 1.0f / static_cast<float>(scale);
+    const bool is_nan = std::isnan(v);
+    void* data = self.data_ptr();
+    switch (self.dtype()) {
+      case DType::QInt8: {
+        const int64_t code =
+            is_nan ? INT8_MAX
+                   : std::clamp(static_cast<int64_t>(std::nearbyint(v * inverse)) + zp,
+                                static_cast<int64_t>(INT8_MIN),
+                                static_cast<int64_t>(INT8_MAX));
+        std::fill(static_cast<int8_t*>(data),
+                  static_cast<int8_t*>(data) + self.numel(),
+                  static_cast<int8_t>(code));
+        break;
+      }
+      case DType::QUInt8: {
+        const int64_t code =
+            is_nan ? UINT8_MAX
+                   : std::clamp(static_cast<int64_t>(std::nearbyint(v * inverse)) + zp,
+                                static_cast<int64_t>(0),
+                                static_cast<int64_t>(UINT8_MAX));
+        std::fill(static_cast<uint8_t*>(data),
+                  static_cast<uint8_t*>(data) + self.numel(),
+                  static_cast<uint8_t>(code));
+        break;
+      }
+      case DType::QInt32: {
+        const int64_t code =
+            is_nan ? INT32_MIN
+                   : std::clamp(static_cast<int64_t>(std::nearbyint(v * inverse)) + zp,
+                                static_cast<int64_t>(INT32_MIN),
+                                static_cast<int64_t>(INT32_MAX));
+        std::fill(static_cast<int32_t*>(data),
+                  static_cast<int32_t*>(data) + self.numel(),
+                  static_cast<int32_t>(code));
+        break;
+      }
+      default:
+        TP_THROW(NotImplementedError,
+                 "fill_ not implemented for this quantized dtype on MPS");
+    }
+    return self;
   }
   // Shared-memory buffers are host-visible; fill in place through the mapping.
   if (self.is_contiguous()) {
