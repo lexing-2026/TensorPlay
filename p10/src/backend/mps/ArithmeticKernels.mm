@@ -3,14 +3,12 @@
 #include "Scalar.h"
 #include "Exception.h"
 #include "Utils.h"
+#include "TypePromotion.h"
+#include "OperationUtils.h"
 
-#include "backend/mps/MPSAllocator.h"
 #include "backend/mps/MPSDevice.h"
-#include "backend/mps/MPSStream.h"
 
 #include <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
-
-#include <vector>
 
 namespace tensorplay {
 namespace mps {
@@ -20,173 +18,105 @@ Tensor& fill_kernel(Tensor& self, const Scalar& value);
 
 namespace {
 
-// Maps a storage dtype to the Metal data type used by MPSGraph.  Double,
-// complex and the 8-bit float formats are not representable in MPSGraph and
-// are rejected explicitly rather than silently truncated.
-MPSDataType getMPSDataType(DType dtype) {
-  switch (dtype) {
-    case DType::Float32:
-      return MPSDataTypeFloat32;
-    case DType::Float16:
-      return MPSDataTypeFloat16;
-    case DType::BFloat16:
-      return MPSDataTypeBFloat16;
-    case DType::Int32:
-      return MPSDataTypeInt32;
-    case DType::Int64:
-      return MPSDataTypeInt64;
-    case DType::Int16:
-      return MPSDataTypeInt16;
-    case DType::Int8:
-      return MPSDataTypeInt8;
-    case DType::UInt8:
-      return MPSDataTypeUInt8;
-    case DType::Bool:
-      return MPSDataTypeBool;
-    default:
-      TP_THROW(NotImplementedError,
-               "MPS add does not support dtype ", toString(dtype));
-  }
+// Materializes a Scalar as a 1-element MPS tensor of the promoted dtype so
+// the scalar variants of binary ops reuse the tensor path.
+Tensor scalarToMPS(const Scalar& s, DType dtype, const Device& device) {
+  Tensor t = Tensor({1}, dtype, device);
+  fill_kernel(t, s);
+  return t;
 }
 
-MPSShape* getMPSShape(const std::vector<int64_t>& sizes) {
-  NSMutableArray<NSNumber*>* shape =
-      [NSMutableArray arrayWithCapacity:sizes.size()];
-  for (int64_t s : sizes) {
-    [shape addObject:@(s)];
-  }
-  return shape;
-}
+MPSBinaryOpBlock addBlock = ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* a,
+                                             MPSGraphTensor* b) {
+  return [g additionWithPrimaryTensor:a secondaryTensor:b name:nil];
+};
 
-// Returns a contiguous, zero-storage-offset view of `t` so its contents can
-// be wrapped directly in an MPSGraphTensorData (which has no offset concept).
-Tensor materializeForGraph(const Tensor& t) {
-  if (t.is_contiguous() && t.storage_offset() == 0) {
-    return t;
-  }
-  Tensor c = t.contiguous();
-  if (c.storage_offset() != 0) {
-    Tensor copy = Tensor(c.sizes(), c.dtype(), c.device());
-    copy.copy_(c);
-    c = copy;
-  }
-  return c;
-}
+MPSBinaryOpBlock subBlock = ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* a,
+                                             MPSGraphTensor* b) {
+  return [g subtractionWithPrimaryTensor:a secondaryTensor:b name:nil];
+};
 
-id<MTLBuffer> mtlBufferOf(const Tensor& t) {
-  void* buf = getMTLBufferFromPointer(t.data_ptr());
-  if (!buf) {
-    TP_THROW(RuntimeError,
-             "MPS tensor storage is not managed by the MPS allocator");
-  }
-  return (__bridge id<MTLBuffer>)buf;
-}
+MPSBinaryOpBlock mulBlock = ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* a,
+                                             MPSGraphTensor* b) {
+  return [g multiplicationWithPrimaryTensor:a secondaryTensor:b name:nil];
+};
 
-// Runs an MPSGraph that computes `self + alpha * other` into `output`. All
-// three tensors must be contiguous, offset-0, same-dtype and same-shape.
-void runAddGraph(const Tensor& self, const Tensor& other, const Scalar& alpha,
-                 Tensor& output) {
-  @autoreleasepool {
-    const std::vector<int64_t> sizes =
-        static_cast<std::vector<int64_t>>(self.shape());
-    // MPSGraphTensorData needs a non-empty shape; a 0-d tensor (numel 1) is
-    // represented as a single-element shape.
-    const std::vector<int64_t> graph_sizes =
-        sizes.empty() ? std::vector<int64_t>{1} : sizes;
-    MPSGraph* graph = [[MPSGraph new] autorelease];
-    MPSShape* shape = getMPSShape(graph_sizes);
-    const MPSDataType dt = getMPSDataType(self.dtype());
+MPSBinaryOpBlock divBlock = ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* a,
+                                             MPSGraphTensor* b) {
+  return [g divisionWithPrimaryTensor:a secondaryTensor:b name:nil];
+};
 
-    MPSGraphTensor* x = [graph placeholderWithShape:shape dataType:dt name:@"x"];
-    MPSGraphTensor* y = [graph placeholderWithShape:shape dataType:dt name:@"y"];
-    MPSGraphTensor* sum = nil;
-    const double alphaVal = alpha.to<double>();
-    if (alphaVal == 1.0) {
-      sum = [graph additionWithPrimaryTensor:x secondaryTensor:y name:@"add"];
-    } else {
-      MPSGraphTensor* alphaConst = [graph constant:alphaVal dataType:dt];
-      MPSGraphTensor* yScaled =
-          [graph multiplicationWithPrimaryTensor:y
-                                  secondaryTensor:alphaConst
-                                             name:@"scale"];
-      sum = [graph additionWithPrimaryTensor:x
-                             secondaryTensor:yScaled
-                                         name:@"add"];
-    }
+MPSBinaryOpBlock powBlock = ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* a,
+                                            MPSGraphTensor* b) {
+  return [g powerWithPrimaryTensor:a secondaryTensor:b name:nil];
+};
 
-    id<MTLBuffer> xBuf = mtlBufferOf(self);
-    id<MTLBuffer> yBuf = mtlBufferOf(other);
-    id<MTLBuffer> outBuf = mtlBufferOf(output);
+MPSBinaryOpBlock remainderBlock = ^MPSGraphTensor*(MPSGraph* g,
+                                                  MPSGraphTensor* a,
+                                                  MPSGraphTensor* b) {
+  // Python-style remainder: a - floor(a/b) * b
+  MPSGraphTensor* q = [g divisionWithPrimaryTensor:a secondaryTensor:b name:nil];
+  MPSGraphTensor* qf = [g floorWithTensor:q name:nil];
+  MPSGraphTensor* prod = [g multiplicationWithPrimaryTensor:qf
+                                            secondaryTensor:b
+                                                       name:nil];
+  return [g subtractionWithPrimaryTensor:a secondaryTensor:prod name:nil];
+};
 
-    MPSGraphTensorData* xData =
-        [[[MPSGraphTensorData alloc] initWithMTLBuffer:xBuf
-                                                 shape:shape
-                                              dataType:dt] autorelease];
-    MPSGraphTensorData* yData =
-        [[[MPSGraphTensorData alloc] initWithMTLBuffer:yBuf
-                                                 shape:shape
-                                              dataType:dt] autorelease];
-    MPSGraphTensorData* outData =
-        [[[MPSGraphTensorData alloc] initWithMTLBuffer:outBuf
-                                                shape:shape
-                                             dataType:dt] autorelease];
+MPSBinaryOpBlock fmodBlock = ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* a,
+                                             MPSGraphTensor* b) {
+  // C-style fmod: a - trunc(a/b) * b
+  MPSGraphTensor* q = [g divisionWithPrimaryTensor:a secondaryTensor:b name:nil];
+  MPSGraphTensor* qt = [g truncateWithTensor:q name:nil];
+  MPSGraphTensor* prod = [g multiplicationWithPrimaryTensor:qt
+                                            secondaryTensor:b
+                                                       name:nil];
+  return [g subtractionWithPrimaryTensor:a secondaryTensor:prod name:nil];
+};
 
-    NSDictionary* feeds = @{x : xData, y : yData};
-    NSDictionary* results = @{sum : outData};
+MPSBinaryOpBlock maximumBlock = ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* a,
+                                                MPSGraphTensor* b) {
+  return [g maximumWithPrimaryTensor:a secondaryTensor:b name:nil];
+};
 
-    getCurrentMPSStream()->executeMPSGraph(graph, feeds, results,
-                                          SyncType::COMMIT_AND_WAIT);
-  }
-}
+MPSBinaryOpBlock minimumBlock = ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* a,
+                                                MPSGraphTensor* b) {
+  return [g minimumWithPrimaryTensor:a secondaryTensor:b name:nil];
+};
 
-Tensor add_impl(const Tensor& self, const Tensor& other,
-                const Scalar& alpha) {
-  if (!self.device().is_mps() || !other.device().is_mps()) {
-    TP_THROW(RuntimeError, "MPS add requires both inputs on the MPS device");
-  }
-  if (self.dtype() != other.dtype()) {
-    TP_THROW(NotImplementedError,
-             "MPS add does not yet support mixed-dtype inputs");
-  }
-  const std::vector<int64_t> out_shape = broadcast_shapes(
-      static_cast<std::vector<int64_t>>(self.shape()),
-      static_cast<std::vector<int64_t>>(other.shape()));
-  Tensor self_b = self.shape() == out_shape
-      ? self : self.expand(out_shape);
-  Tensor other_b = other.shape() == out_shape
-      ? other : other.expand(out_shape);
-  Tensor self_c = materializeForGraph(self_b);
-  Tensor other_c = materializeForGraph(other_b);
+MPSBinaryOpBlock atan2Block = ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* a,
+                                             MPSGraphTensor* b) {
+  return [g atan2WithPrimaryTensor:a secondaryTensor:b name:nil];
+};
 
-  Tensor output = Tensor(out_shape, self.dtype(), self.device());
-  if (output.numel() == 0) {
-    return output;
-  }
-  runAddGraph(self_c, other_c, alpha, output);
-  return output;
-}
+MPSBinaryOpBlock hypotBlock = ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* a,
+                                              MPSGraphTensor* b) {
+  return [g hypotWithPrimaryTensor:a secondaryTensor:b name:nil];
+};
 
 } // namespace
 
+// ---------------------------------------------------------------------------
+// add / sub / mul / div
+// ---------------------------------------------------------------------------
+
 Tensor add_kernel(const Tensor& self, const Tensor& other,
                   const Scalar& alpha) {
-  return add_impl(self, other, alpha);
+  return binaryOp(self, other, addBlock, alpha);
+}
+
+Tensor& add_inplace_kernel(Tensor& self, const Tensor& other,
+                        const Scalar& alpha) {
+  Tensor result = add_kernel(self, other, alpha);
+  self.copy_(result);
+  return self;
 }
 
 Tensor add_scalar_kernel(const Tensor& self, const Scalar& other,
                          const Scalar& alpha) {
-  // Materialize the scalar as a 1-element MPS tensor on the same device and
-  // reuse the tensor path, keeping the graph construction uniform.
-  Tensor other_t = Tensor({1}, self.dtype(), self.device());
-  fill_kernel(other_t, other);
-  return add_impl(self, other_t, alpha);
-}
-
-Tensor& add_inplace_kernel(Tensor& self, const Tensor& other,
-                           const Scalar& alpha) {
-  Tensor result = add_impl(self, other, alpha);
-  self.copy_(result);
-  return self;
+  const DType common = result_type(other, self.dtype());
+  Tensor other_t = scalarToMPS(other, common, self.device());
+  return add_kernel(self, other_t, alpha);
 }
 
 Tensor& add_scalar_inplace_kernel(Tensor& self, const Scalar& other,
@@ -196,11 +126,278 @@ Tensor& add_scalar_inplace_kernel(Tensor& self, const Scalar& other,
   return self;
 }
 
+Tensor sub_kernel(const Tensor& self, const Tensor& other,
+                  const Scalar& alpha) {
+  if (self.dtype() == DType::Bool && other.dtype() == DType::Bool) {
+    TP_THROW(RuntimeError,
+             "Subtraction, the `-` operator, with two bool tensors is not "
+             "supported on the MPS backend");
+  }
+  return binaryOp(self, other, subBlock, alpha);
+}
+
+Tensor& sub_inplace_kernel(Tensor& self, const Tensor& other,
+                           const Scalar& alpha) {
+  Tensor result = sub_kernel(self, other, alpha);
+  self.copy_(result);
+  return self;
+}
+
+Tensor sub_scalar_kernel(const Tensor& self, const Scalar& other,
+                         const Scalar& alpha) {
+  const DType common = result_type(other, self.dtype());
+  Tensor other_t = scalarToMPS(other, common, self.device());
+  return sub_kernel(self, other_t, alpha);
+}
+
+Tensor& sub_scalar_inplace_kernel(Tensor& self, const Scalar& other,
+                                  const Scalar& alpha) {
+  Tensor result = sub_scalar_kernel(self, other, alpha);
+  self.copy_(result);
+  return self;
+}
+
+Tensor mul_kernel(const Tensor& self, const Tensor& other) {
+  return binaryOp(self, other, mulBlock);
+}
+
+Tensor& mul_inplace_kernel(Tensor& self, const Tensor& other) {
+  Tensor result = mul_kernel(self, other);
+  self.copy_(result);
+  return self;
+}
+
+Tensor mul_scalar_kernel(const Tensor& self, const Scalar& other) {
+  const DType common = result_type(other, self.dtype());
+  Tensor other_t = scalarToMPS(other, common, self.device());
+  return mul_kernel(self, other_t);
+}
+
+Tensor& mul_scalar_inplace_kernel(Tensor& self, const Scalar& other) {
+  Tensor result = mul_scalar_kernel(self, other);
+  self.copy_(result);
+  return self;
+}
+
+Tensor div_kernel(const Tensor& self, const Tensor& other) {
+  // Integral division promotes to the default floating dtype, matching the
+  // framework-wide div semantics.
+  std::optional<DType> common;
+  if (isIntegralType(self.dtype(), true) &&
+      isIntegralType(other.dtype(), true)) {
+    common = DType::Float32;
+  }
+  return binaryOp(self, other, divBlock, std::nullopt, common);
+}
+
+Tensor& div_inplace_kernel(Tensor& self, const Tensor& other) {
+  Tensor result = div_kernel(self, other);
+  self.copy_(result);
+  return self;
+}
+
+Tensor div_scalar_kernel(const Tensor& self, const Scalar& other) {
+  const DType common = result_type(other, self.dtype());
+  Tensor other_t = scalarToMPS(other, common, self.device());
+  return div_kernel(self, other_t);
+}
+
+Tensor& div_scalar_inplace_kernel(Tensor& self, const Scalar& other) {
+  Tensor result = div_scalar_kernel(self, other);
+  self.copy_(result);
+  return self;
+}
+
+// ---------------------------------------------------------------------------
+// pow
+// ---------------------------------------------------------------------------
+
+Tensor pow_tensor_tensor_kernel(const Tensor& self, const Tensor& exponent) {
+  return binaryOp(self, exponent, powBlock);
+}
+
+Tensor pow_scalar_kernel(const Tensor& self, const Scalar& exponent) {
+  const DType common = result_type(exponent, self.dtype());
+  Tensor exponent_t = scalarToMPS(exponent, common, self.device());
+  return pow_tensor_tensor_kernel(self, exponent_t);
+}
+
+Tensor pow_scalar_tensor_kernel(const Scalar& base, const Tensor& exponent) {
+  const DType common = result_type(base, exponent.dtype());
+  Tensor base_t = scalarToMPS(base, common, exponent.device());
+  return pow_tensor_tensor_kernel(base_t, exponent);
+}
+
+Tensor& pow_tensor_inplace_kernel(Tensor& self, const Tensor& exponent) {
+  Tensor result = pow_tensor_tensor_kernel(self, exponent);
+  self.copy_(result);
+  return self;
+}
+
+Tensor& pow_scalar_inplace_kernel(Tensor& self, const Scalar& exponent) {
+  Tensor result = pow_scalar_kernel(self, exponent);
+  self.copy_(result);
+  return self;
+}
+
+// ---------------------------------------------------------------------------
+// remainder / fmod
+// ---------------------------------------------------------------------------
+
+Tensor remainder_tensor_kernel(const Tensor& self, const Tensor& other) {
+  return binaryOp(self, other, remainderBlock);
+}
+
+Tensor remainder_scalar_kernel(const Tensor& self, const Scalar& other) {
+  const DType common = result_type(other, self.dtype());
+  Tensor other_t = scalarToMPS(other, common, self.device());
+  return remainder_tensor_kernel(self, other_t);
+}
+
+Tensor fmod_tensor_kernel(const Tensor& self, const Tensor& other) {
+  return binaryOp(self, other, fmodBlock);
+}
+
+Tensor fmod_scalar_kernel(const Tensor& self, const Scalar& other) {
+  const DType common = result_type(other, self.dtype());
+  Tensor other_t = scalarToMPS(other, common, self.device());
+  return fmod_tensor_kernel(self, other_t);
+}
+
+// ---------------------------------------------------------------------------
+// maximum / minimum / fmax / fmin
+// ---------------------------------------------------------------------------
+
+Tensor maximum_kernel(const Tensor& self, const Tensor& other) {
+  return binaryOp(self, other, maximumBlock);
+}
+
+Tensor minimum_kernel(const Tensor& self, const Tensor& other) {
+  return binaryOp(self, other, minimumBlock);
+}
+
+Tensor fmax_kernel(const Tensor& self, const Tensor& other) {
+  return binaryOp(self, other, maximumBlock);
+}
+
+Tensor fmin_kernel(const Tensor& self, const Tensor& other) {
+  return binaryOp(self, other, minimumBlock);
+}
+
+// ---------------------------------------------------------------------------
+// atan2 / hypot
+// ---------------------------------------------------------------------------
+
+Tensor atan2_kernel(const Tensor& self, const Tensor& other) {
+  return binaryOp(self, other, atan2Block);
+}
+
+Tensor& atan2_inplace_kernel(Tensor& self, const Tensor& other) {
+  Tensor result = atan2_kernel(self, other);
+  self.copy_(result);
+  return self;
+}
+
+Tensor hypot_kernel(const Tensor& self, const Tensor& other) {
+  return binaryOp(self, other, hypotBlock);
+}
+
+Tensor& hypot_inplace_kernel(Tensor& self, const Tensor& other) {
+  Tensor result = hypot_kernel(self, other);
+  self.copy_(result);
+  return self;
+}
+
+// ---------------------------------------------------------------------------
+// addcmul / addcdiv
+// ---------------------------------------------------------------------------
+
+Tensor addcmul_kernel(const Tensor& self, const Tensor& tensor1,
+                      const Tensor& tensor2, const Scalar& value) {
+  // self + value * tensor1 * tensor2
+  const DType common = promoteTypes(
+      promoteTypes(self.dtype(), tensor1.dtype()), tensor2.dtype());
+  Tensor v_t = scalarToMPS(value, common, self.device());
+  Tensor t1 = binaryOp(tensor1, tensor2, mulBlock);
+  Tensor t1v = binaryOp(t1, v_t, mulBlock);
+  return binaryOp(self, t1v, addBlock);
+}
+
+Tensor& addcmul_inplace_kernel(Tensor& self, const Tensor& tensor1,
+                               const Tensor& tensor2, const Scalar& value) {
+  Tensor result = addcmul_kernel(self, tensor1, tensor2, value);
+  self.copy_(result);
+  return self;
+}
+
+Tensor addcdiv_kernel(const Tensor& self, const Tensor& tensor1,
+                      const Tensor& tensor2, const Scalar& value) {
+  if (isIntegralType(tensor1.dtype(), true) &&
+      isIntegralType(tensor2.dtype(), true)) {
+    TP_THROW(RuntimeError, "Integer division with addcdiv is not supported");
+  }
+  // self + value * tensor1 / tensor2
+  const DType common = promoteTypes(
+      promoteTypes(self.dtype(), tensor1.dtype()), tensor2.dtype());
+  Tensor v_t = scalarToMPS(value, common, self.device());
+  Tensor t1v = binaryOp(tensor1, v_t, mulBlock);
+  Tensor t12 = binaryOp(t1v, tensor2, divBlock);
+  return binaryOp(self, t12, addBlock);
+}
+
+Tensor& addcdiv_inplace_kernel(Tensor& self, const Tensor& tensor1,
+                               const Tensor& tensor2, const Scalar& value) {
+  Tensor result = addcdiv_kernel(self, tensor1, tensor2, value);
+  self.copy_(result);
+  return self;
+}
+
 TENSORPLAY_LIBRARY_IMPL(MPS, ArithmeticKernels) {
   m.impl("add.Tensor", add_kernel);
-  m.impl("add_.Tensor", add_inplace_kernel);
   m.impl("add.Scalar", add_scalar_kernel);
+  m.impl("add_.Tensor", add_inplace_kernel);
   m.impl("add_.Scalar", add_scalar_inplace_kernel);
+
+  m.impl("sub.Tensor", sub_kernel);
+  m.impl("sub.Scalar", sub_scalar_kernel);
+  m.impl("sub_.Tensor", sub_inplace_kernel);
+  m.impl("sub_.Scalar", sub_scalar_inplace_kernel);
+
+  m.impl("mul.Tensor", mul_kernel);
+  m.impl("mul.Scalar", mul_scalar_kernel);
+  m.impl("mul_.Tensor", mul_inplace_kernel);
+  m.impl("mul_.Scalar", mul_scalar_inplace_kernel);
+
+  m.impl("div.Tensor", div_kernel);
+  m.impl("div.Scalar", div_scalar_kernel);
+  m.impl("div_.Tensor", div_inplace_kernel);
+  m.impl("div_.Scalar", div_scalar_inplace_kernel);
+
+  m.impl("pow.Tensor_Tensor", pow_tensor_tensor_kernel);
+  m.impl("pow.Tensor_Scalar", pow_scalar_kernel);
+  m.impl("pow.Scalar", pow_scalar_tensor_kernel);
+  m.impl("pow_.Tensor", pow_tensor_inplace_kernel);
+  m.impl("pow_.Scalar", pow_scalar_inplace_kernel);
+
+  m.impl("remainder.Tensor", remainder_tensor_kernel);
+  m.impl("remainder.Scalar", remainder_scalar_kernel);
+  m.impl("fmod.Tensor", fmod_tensor_kernel);
+  m.impl("fmod.Scalar", fmod_scalar_kernel);
+
+  m.impl("maximum", maximum_kernel);
+  m.impl("minimum", minimum_kernel);
+  m.impl("fmax", fmax_kernel);
+  m.impl("fmin", fmin_kernel);
+
+  m.impl("atan2", atan2_kernel);
+  m.impl("atan2_", atan2_inplace_kernel);
+  m.impl("hypot", hypot_kernel);
+  m.impl("hypot_", hypot_inplace_kernel);
+
+  m.impl("addcmul", addcmul_kernel);
+  m.impl("addcmul_", addcmul_inplace_kernel);
+  m.impl("addcdiv", addcdiv_kernel);
+  m.impl("addcdiv_", addcdiv_inplace_kernel);
 }
 
 } // namespace mps

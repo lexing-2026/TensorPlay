@@ -7,7 +7,9 @@
 #include "backend/mps/MPSDevice.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
+#include <functional>
 #include <vector>
 
 namespace tensorplay {
@@ -211,6 +213,199 @@ Tensor full_like_kernel(const Tensor& self, const Scalar& fill_value,
   return t;
 }
 
+// ---------------------------------------------------------------------------
+// Range factories.  These write through the host-visible shared-memory
+// mapping of the MPS buffers, which is valid on unified-memory Apple
+// silicon and keeps the factories free of per-op Metal kernels.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+template <typename ctype>
+void fill_host_sequence(ctype* data, int64_t len,
+                          const std::function<ctype(int64_t)>& value_at) {
+  for (int64_t i = 0; i < len; ++i) {
+    data[i] = value_at(i);
+  }
+}
+
+#define MPS_RANGE_CASE(ctype, name, DATA, LEN, VALUE_AT)        \
+  case DType::name:                                             \
+    fill_host_sequence<ctype>((ctype*)(DATA), (LEN), (VALUE_AT)); \
+    break;
+
+} // namespace
+
+Tensor eye_kernel(int64_t n, int64_t m, DType dtype, Device device) {
+  if (m < 0) m = n;
+  Tensor t = Tensor({n, m}, dtype, device);
+  if (n * m > 0) {
+    std::memset(t.data_ptr(), 0, static_cast<size_t>(n) * m * t.itemsize());
+  }
+  const int64_t min_dim = std::min(n, m);
+  if (min_dim == 0) return t;
+#define EYE_CASE(ctype, name)                                          \
+  case DType::name: {                                                  \
+    ctype* data = t.data_ptr<ctype>();                                 \
+    for (int64_t i = 0; i < min_dim; ++i) data[i * m + i] = ctype(1);  \
+    break;                                                             \
+  }
+  switch (dtype) {
+    TENSORPLAY_FORALL_SCALAR_TYPES(EYE_CASE)
+    default:
+      TP_THROW(NotImplementedError, "eye: unsupported dtype on MPS");
+  }
+#undef EYE_CASE
+  return t;
+}
+
+Tensor arange_start_step_kernel(Scalar start, Scalar end, Scalar step,
+                                DType dtype, Device device) {
+  const double s_d = start.toDouble();
+  const double e_d = end.toDouble();
+  const double st_d = step.toDouble();
+  if (st_d == 0) {
+    TP_THROW(RuntimeError, "step must be nonzero");
+  }
+  int64_t len = static_cast<int64_t>(std::ceil((e_d - s_d) / st_d));
+  if (len < 0) len = 0;
+
+  if (dtype == DType::Undefined) {
+    if (start.isFloatingPoint() || end.isFloatingPoint() ||
+        step.isFloatingPoint()) {
+      dtype = globalContext().defaultDType();
+    } else {
+      dtype = DType::Int64;
+    }
+  }
+  Tensor t({len}, dtype, device);
+  if (len == 0) return t;
+
+  const double st = st_d;
+  const double s = s_d;
+  switch (dtype) {
+    MPS_RANGE_CASE(float, Float32, t.data_ptr(), len,
+                   [&](int64_t i) { return static_cast<float>(s + i * st); })
+    MPS_RANGE_CASE(double, Float64, t.data_ptr(), len,
+                   [&](int64_t i) { return s + i * st; })
+    MPS_RANGE_CASE(int64_t, Int64, t.data_ptr(), len,
+                   [&](int64_t i) {
+                     return static_cast<int64_t>(s + i * st);
+                   })
+    MPS_RANGE_CASE(int32_t, Int32, t.data_ptr(), len,
+                   [&](int64_t i) {
+                     return static_cast<int32_t>(s + i * st);
+                   })
+    MPS_RANGE_CASE(int16_t, Int16, t.data_ptr(), len,
+                   [&](int64_t i) {
+                     return static_cast<int16_t>(s + i * st);
+                   })
+    MPS_RANGE_CASE(int8_t, Int8, t.data_ptr(), len,
+                   [&](int64_t i) { return static_cast<int8_t>(s + i * st); })
+    MPS_RANGE_CASE(uint8_t, UInt8, t.data_ptr(), len,
+                   [&](int64_t i) {
+                     return static_cast<uint8_t>(s + i * st);
+                   })
+    MPS_RANGE_CASE(Half, Float16, t.data_ptr(), len,
+                   [&](int64_t i) {
+                     return Half(static_cast<float>(s + i * st));
+                   })
+    MPS_RANGE_CASE(BFloat16, BFloat16, t.data_ptr(), len,
+                   [&](int64_t i) {
+                     return BFloat16(static_cast<float>(s + i * st));
+                   })
+    default:
+      TP_THROW(NotImplementedError,
+               "arange does not support this dtype on MPS");
+  }
+  return t;
+}
+
+Tensor arange_kernel(Scalar end, DType dtype, Device device) {
+  return arange_start_step_kernel(0, end, 1, dtype, device);
+}
+
+Tensor linspace_kernel(Scalar start, Scalar end, int64_t steps, DType dtype,
+                       Device device) {
+  if (steps < 0) {
+    TP_THROW(RuntimeError, "number of steps must be non-negative");
+  }
+  Tensor t({steps}, dtype, device);
+  if (steps == 0) return t;
+  if (steps == 1) {
+    fill_kernel(t, start);
+    return t;
+  }
+  const double s = start.toDouble();
+  const double e = end.toDouble();
+  const double step = (e - s) / static_cast<double>(steps - 1);
+  switch (dtype) {
+    MPS_RANGE_CASE(float, Float32, t.data_ptr(), steps,
+                   [&](int64_t i) { return static_cast<float>(s + i * step); })
+    MPS_RANGE_CASE(double, Float64, t.data_ptr(), steps,
+                   [&](int64_t i) { return s + i * step; })
+    MPS_RANGE_CASE(int64_t, Int64, t.data_ptr(), steps,
+                   [&](int64_t i) {
+                     return static_cast<int64_t>(s + i * step);
+                   })
+    MPS_RANGE_CASE(int32_t, Int32, t.data_ptr(), steps,
+                   [&](int64_t i) {
+                     return static_cast<int32_t>(s + i * step);
+                   })
+    MPS_RANGE_CASE(Half, Float16, t.data_ptr(), steps,
+                   [&](int64_t i) {
+                     return Half(static_cast<float>(s + i * step));
+                   })
+    MPS_RANGE_CASE(BFloat16, BFloat16, t.data_ptr(), steps,
+                   [&](int64_t i) {
+                     return BFloat16(static_cast<float>(s + i * step));
+                   })
+    default:
+      TP_THROW(NotImplementedError,
+               "linspace does not support this dtype on MPS");
+  }
+  return t;
+}
+
+Tensor logspace_kernel(Scalar start, Scalar end, int64_t steps, double base,
+                       DType dtype, Device device) {
+  if (steps < 0) {
+    TP_THROW(RuntimeError, "number of steps must be non-negative");
+  }
+  Tensor t({steps}, dtype, device);
+  if (steps == 0) return t;
+  if (steps == 1) {
+    fill_kernel(t, Scalar(std::pow(base, start.toDouble())));
+    return t;
+  }
+  const double s = start.toDouble();
+  const double e = end.toDouble();
+  const double step = (e - s) / static_cast<double>(steps - 1);
+  switch (dtype) {
+    MPS_RANGE_CASE(float, Float32, t.data_ptr(), steps,
+                   [&](int64_t i) {
+                     return static_cast<float>(
+                         std::pow(base, s + i * step));
+                   })
+    MPS_RANGE_CASE(double, Float64, t.data_ptr(), steps,
+                   [&](int64_t i) { return std::pow(base, s + i * step); })
+    MPS_RANGE_CASE(Half, Float16, t.data_ptr(), steps,
+                   [&](int64_t i) {
+                     return Half(static_cast<float>(
+                         std::pow(base, s + i * step)));
+                   })
+    MPS_RANGE_CASE(BFloat16, BFloat16, t.data_ptr(), steps,
+                   [&](int64_t i) {
+                     return BFloat16(static_cast<float>(
+                         std::pow(base, s + i * step)));
+                   })
+    default:
+      TP_THROW(NotImplementedError,
+               "logspace does not support this dtype on MPS");
+  }
+  return t;
+}
+
 namespace {
 
 Tensor empty_stub(const std::vector<int64_t>& size, std::optional<DType> dtype,
@@ -262,6 +457,38 @@ Tensor full_stub(const std::vector<int64_t>& size, const Scalar& fill_value,
                      device.value_or(Device(DeviceType::MPS)), pin_memory);
 }
 
+Tensor eye_stub(int64_t n, int64_t m, DType dtype,
+                std::optional<Device> device) {
+  return eye_kernel(n, m, dtype,
+                    device.value_or(Device(DeviceType::MPS)));
+}
+
+Tensor arange_start_step_stub(const Scalar& start, const Scalar& end,
+                              const Scalar& step, DType dtype,
+                              std::optional<Device> device) {
+  return arange_start_step_kernel(start, end, step, dtype,
+                                  device.value_or(Device(DeviceType::MPS)));
+}
+
+Tensor arange_end_stub(const Scalar& end, DType dtype,
+                       std::optional<Device> device) {
+  return arange_kernel(end, dtype,
+                       device.value_or(Device(DeviceType::MPS)));
+}
+
+Tensor linspace_stub(const Scalar& start, const Scalar& end, int64_t steps,
+                     DType dtype, std::optional<Device> device) {
+  return linspace_kernel(start, end, steps, dtype,
+                         device.value_or(Device(DeviceType::MPS)));
+}
+
+Tensor logspace_stub(const Scalar& start, const Scalar& end, int64_t steps,
+                     double base, DType dtype,
+                     std::optional<Device> device) {
+  return logspace_kernel(start, end, steps, base, dtype,
+                         device.value_or(Device(DeviceType::MPS)));
+}
+
 } // namespace
 
 TENSORPLAY_LIBRARY_IMPL(MPS, FactoryKernels) {
@@ -276,6 +503,11 @@ TENSORPLAY_LIBRARY_IMPL(MPS, FactoryKernels) {
   m.impl("zeros_like", zeros_like_kernel);
   m.impl("ones_like", ones_like_kernel);
   m.impl("full_like", full_like_kernel);
+  m.impl("eye", eye_stub);
+  m.impl("arange", arange_start_step_stub);
+  m.impl("arange.end", arange_end_stub);
+  m.impl("linspace", linspace_stub);
+  m.impl("logspace", logspace_stub);
 }
 
 } // namespace mps

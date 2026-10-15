@@ -512,16 +512,19 @@ if(USE_CUDA OR USE_ROCM)
 endif()
 if(USE_MPS)
     # MPS backend: device/allocator/stream infrastructure plus the factory,
-    # copy and arithmetic kernels.  The sources are Objective-C++ and follow
-    # manual reference counting.
+    # copy, arithmetic, elementwise and reduction kernels.  The sources are
+    # Objective-C++ and follow manual reference counting.
     set(TP_MPS_BACKEND_SOURCES
         src/backend/mps/MPSDevice.mm
         src/backend/mps/MPSAllocator.mm
         src/backend/mps/MPSStream.mm
         src/backend/mps/MPSRuntime.mm
+        src/backend/mps/OperationUtils.mm
         src/backend/mps/FactoryKernels.mm
         src/backend/mps/CopyKernels.mm
         src/backend/mps/ArithmeticKernels.mm
+        src/backend/mps/ElementwiseKernels.mm
+        src/backend/mps/ReductionKernels.mm
     )
     list(APPEND P10_SOURCES ${TP_MPS_BACKEND_SOURCES})
 endif()

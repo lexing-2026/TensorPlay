@@ -1,5 +1,6 @@
-"""MPS backend smoke tests: device availability, tensor factories, host/device
-copy and a minimal elementwise op.
+"""MPS backend tests: device availability, tensor factories, host/device
+copy, arithmetic, elementwise, comparison, activation, softmax and reduction
+ops.
 
 Every test is skipped when the runner has no Metal device (Linux CI, Intel
 macs without a supported GPU), so the file is safe to include in the macOS
@@ -41,6 +42,16 @@ class TestMPSDevice(unittest.TestCase):
         e = tp.empty((2, 3), device="mps")
         self.assertEqual(e.shape, (2, 3))
 
+    def test_range_factories(self):
+        a = tp.arange(6, dtype=tp.float32, device="mps")
+        self.assertEqual(a.cpu().tolist(), [0, 1, 2, 3, 4, 5])
+
+        l = tp.linspace(0, 1, 5, device="mps")
+        self.assertEqual(l.cpu().tolist(), [0.0, 0.25, 0.5, 0.75, 1.0])
+
+        eye = tp.eye(3, device="mps")
+        self.assertTrue(tp.all(eye.cpu() == tp.eye(3)).item())
+
     def test_like_factories(self):
         x = tp.zeros((2, 3), device="mps")
         self.assertEqual(tp.zeros_like(x).device.type, "mps")
@@ -62,30 +73,160 @@ class TestMPSDevice(unittest.TestCase):
         self.assertEqual(back.device.type, "cpu")
         self.assertTrue(tp.all(back == cpu).item())
 
+
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSArithmetic(unittest.TestCase):
+    def setUp(self):
+        self.a = tp.full((2, 3), 6, device="mps", dtype=tp.float32)
+        self.b = tp.full((2, 3), 4, device="mps", dtype=tp.float32)
+
     def test_add(self):
-        a = tp.full((4, 4), 2, device="mps", dtype=tp.float32)
-        b = tp.full((4, 4), 3, device="mps", dtype=tp.float32)
-        c = a + b
+        c = self.a + self.b
         self.assertEqual(c.device.type, "mps")
-        self.assertTrue(tp.all(c.cpu() == 5).item())
+        self.assertTrue(tp.all(c.cpu() == 10).item())
 
-    def test_add_scalar_and_inplace(self):
-        a = tp.ones(4, device="mps")
-        c = a + 2
-        self.assertTrue(tp.all(c.cpu() == 3).item())
-        a.add_(2)
-        self.assertTrue(tp.all(a.cpu() == 3).item())
-        b = tp.ones(4, device="mps")
-        b.add_(a)
-        self.assertTrue(tp.all(b.cpu() == 4).item())
+    def test_sub_mul_div(self):
+        self.assertTrue(tp.all((self.a - self.b).cpu() == 2).item())
+        self.assertTrue(tp.all((self.a * self.b).cpu() == 24).item())
+        self.assertTrue(tp.allclose((self.a / self.b).cpu(),
+                                    tp.full((2, 3), 1.5)))
 
-    def test_synchronize(self):
-        a = tp.ones(4, 4, device="mps")
-        b = a + a
-        tp.mps.synchronize()
-        self.assertEqual(b.shape, (4, 4))
-        self.assertTrue(tp.all(b.cpu() == 2).item())
+    def test_scalar_ops(self):
+        self.assertTrue(tp.all((self.a + 2).cpu() == 8).item())
+        self.assertTrue(tp.all((self.a - 2).cpu() == 4).item())
+        self.assertTrue(tp.all((self.a * 2).cpu() == 12).item())
+        self.assertTrue(tp.all((self.a / 2).cpu() == 3).item())
 
+    def test_inplace_ops(self):
+        x = self.a.clone()
+        x.add_(2)
+        self.assertTrue(tp.all(x.cpu() == 8).item())
+        x = self.a.clone()
+        x.sub_(2)
+        self.assertTrue(tp.all(x.cpu() == 4).item())
+        x = self.a.clone()
+        x.mul_(2)
+        self.assertTrue(tp.all(x.cpu() == 12).item())
+        x = self.a.clone()
+        x.div_(2)
+        self.assertTrue(tp.all(x.cpu() == 3).item())
+
+    def test_pow_remainder_fmod(self):
+        self.assertTrue(tp.all(tp.pow(self.a, 2).cpu() == 36).item())
+        self.assertTrue(tp.all((self.a ** self.b).cpu() == 6**4).item())
+        self.assertTrue(tp.all((self.a % self.b).cpu() == 2).item())
+        self.assertTrue(tp.all(tp.fmod(self.a, self.b).cpu() == 2).item())
+
+    def test_max_min(self):
+        self.assertTrue(tp.all(tp.maximum(self.a, self.b).cpu() == 6).item())
+        self.assertTrue(tp.all(tp.minimum(self.a, self.b).cpu() == 4).item())
+
+    def test_addcmul_addcdiv(self):
+        x = tp.full((2, 3), 1, device="mps", dtype=tp.float32)
+        y = tp.full((2, 3), 2, device="mps", dtype=tp.float32)
+        z = tp.full((2, 3), 3, device="mps", dtype=tp.float32)
+        self.assertTrue(tp.all(tp.addcmul(x, y, z).cpu() == 7).item())
+        self.assertTrue(tp.allclose(tp.addcdiv(x, y, z).cpu(),
+                                    tp.full((2, 3), 1 + 2 / 3.0)))
+
+
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSUnary(unittest.TestCase):
+    def test_unary(self):
+        x = tp.full((2, 2), 4, device="mps", dtype=tp.float32)
+        self.assertTrue(tp.all(tp.abs(-x).cpu() == 4).item())
+        self.assertTrue(tp.all(tp.neg(x).cpu() == -4).item())
+        self.assertTrue(tp.all(tp.square(x).cpu() == 16).item())
+        self.assertTrue(tp.all(tp.sqrt(x).cpu() == 2).item())
+        self.assertTrue(tp.all(tp.rsqrt(x).cpu() == 0.5).item())
+        self.assertTrue(tp.all(tp.reciprocal(x).cpu() == 0.25).item())
+        self.assertTrue(tp.all(tp.exp(tp.zeros((2, 2), device="mps")).cpu() == 1).item())
+        self.assertTrue(tp.all(tp.log(tp.ones((2, 2), device="mps")).cpu() == 0).item())
+        self.assertTrue(tp.allclose(tp.sin(tp.zeros((2, 2), device="mps")).cpu(),
+                                    tp.zeros((2, 2))))
+        self.assertTrue(tp.allclose(tp.cos(tp.zeros((2, 2), device="mps")).cpu(),
+                                    tp.ones((2, 2))))
+        self.assertTrue(tp.allclose(tp.tanh(tp.zeros((2, 2), device="mps")).cpu(),
+                                    tp.zeros((2, 2))))
+        self.assertTrue(tp.all(tp.floor(tp.full((2, 2), 3.7, device="mps")).cpu() == 3).item())
+        self.assertTrue(tp.all(tp.ceil(tp.full((2, 2), 3.2, device="mps")).cpu() == 4).item())
+        self.assertTrue(tp.all(tp.round(tp.full((2, 2), 3.5, device="mps")).cpu() == 4).item())
+        self.assertTrue(tp.all(tp.trunc(tp.full((2, 2), -3.7, device="mps")).cpu() == -3).item())
+
+    def test_activations(self):
+        x = tp.full((2, 2), -1, device="mps", dtype=tp.float32)
+        self.assertTrue(tp.all(tp.relu(x).cpu() == 0).item())
+        self.assertTrue(tp.all(tp.relu(-x).cpu() == 1).item())
+        self.assertTrue(tp.allclose(tp.sigmoid(tp.zeros((2, 2), device="mps")).cpu(),
+                                    tp.full((2, 2), 0.5)))
+        self.assertTrue(tp.all(tp.leaky_relu(x, 0.1).cpu() == -0.1).item())
+        self.assertTrue(tp.all(tp.hardtanh(x, -2, 2).cpu() == -1).item())
+        self.assertTrue(tp.allclose(tp.silu(tp.zeros((2, 2), device="mps")).cpu(),
+                                    tp.zeros((2, 2))))
+        self.assertTrue(tp.all(tp.softplus(tp.zeros((2, 2), device="mps")).cpu() > 0).item())
+
+    def test_bitwise_not(self):
+        x = tp.full((2,), 0, device="mps", dtype=tp.int32)
+        self.assertTrue(tp.all(tp.bitwise_not(x).cpu() == -1).item())
+
+
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSComparison(unittest.TestCase):
+    def test_tensor_comparisons(self):
+        a = tp.full((2, 3), 2, device="mps", dtype=tp.float32)
+        b = tp.full((2, 3), 3, device="mps", dtype=tp.float32)
+        self.assertTrue((a < b).cpu().all().item())
+        self.assertTrue((a <= b).cpu().all().item())
+        self.assertTrue((a == a).cpu().all().item())
+        self.assertTrue((a != b).cpu().all().item())
+        self.assertFalse((a > b).cpu().any().item())
+        self.assertFalse((a >= b).cpu().any().item())
+
+    def test_scalar_comparisons(self):
+        a = tp.full((2, 3), 2, device="mps", dtype=tp.float32)
+        self.assertTrue((a < 3).cpu().all().item())
+        self.assertTrue((a == 2).cpu().all().item())
+        self.assertTrue((a != 3).cpu().all().item())
+
+    def test_where(self):
+        cond = tp.full((2, 3), 1, device="mps", dtype=tp.float32) > 0
+        a = tp.full((2, 3), 1, device="mps", dtype=tp.float32)
+        b = tp.full((2, 3), 2, device="mps", dtype=tp.float32)
+        w = tp.where(cond, a, b)
+        self.assertTrue(tp.all(w.cpu() == 1).item())
+
+    def test_clamp(self):
+        x = tp.full((4,), 5, device="mps", dtype=tp.float32)
+        self.assertTrue(tp.all(tp.clamp(x, 1, 3).cpu() == 3).item())
+        self.assertTrue(tp.all(tp.clamp_min(x, 2).cpu() == 5).item())
+        self.assertTrue(tp.all(tp.clamp_max(x, 2).cpu() == 2).item())
+        y = x.clone()
+        y.clamp_(1, 3)
+        self.assertTrue(tp.all(y.cpu() == 3).item())
+
+
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSSoftmaxReduction(unittest.TestCase):
+    def test_softmax(self):
+        x = tp.full((2, 3), 2, device="mps", dtype=tp.float32)
+        s = tp.softmax(x, dim=1)
+        self.assertTrue(tp.allclose(s.cpu().sum(dim=1), tp.ones((2,))))
+
+    def test_reductions(self):
+        x = tp.arange(6, dtype=tp.float32, device="mps").reshape(2, 3)
+        self.assertEqual(tp.sum(x).item(), 15)
+        self.assertEqual(tp.sum(x, dim=1).cpu().tolist(), [3, 12])
+        self.assertEqual(tp.mean(x).item(), 2.5)
+        self.assertEqual(tp.max(x).item(), 5)
+        self.assertEqual(tp.min(x).item(), 0)
+        self.assertEqual(tp.prod(x).item(), 0)
+        self.assertEqual(tp.amax(x).item(), 5)
+        self.assertEqual(tp.amin(x).item(), 0)
+        self.assertEqual(tp.sum(x, dim=1, keepdim=True).cpu().tolist(), [[3], [12]])
+
+
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSMemory(unittest.TestCase):
     def test_memory_accounting(self):
         tp.mps.empty_cache()
         a = tp.ones(1024, dtype=tp.float32, device="mps")
@@ -93,6 +234,13 @@ class TestMPSDevice(unittest.TestCase):
         self.assertGreaterEqual(tp.mps.memory_reserved(), 1024 * 4)
         del a
         tp.mps.empty_cache()
+
+    def test_synchronize(self):
+        a = tp.ones(4, 4, device="mps")
+        b = a + a
+        tp.mps.synchronize()
+        self.assertEqual(b.shape, (4, 4))
+        self.assertTrue(tp.all(b.cpu() == 2).item())
 
 
 if __name__ == "__main__":

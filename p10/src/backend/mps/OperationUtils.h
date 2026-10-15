@@ -1,0 +1,67 @@
+#pragma once
+
+// Private helpers shared by the MPS backend kernels.  This header is only
+// included from Objective-C++ translation units; the MPSGraph types used in
+// the block signatures are available there.
+
+#include "Tensor.h"
+#include "Scalar.h"
+#include "Exception.h"
+
+#include <Metal/Metal.h>
+#include <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
+
+namespace tensorplay {
+namespace mps {
+
+// Maps a storage dtype to the Metal data type used by MPSGraph. Double,
+// complex and the 8-bit float formats are rejected explicitly.
+MPSDataType getMPSDataType(DType dtype);
+
+// Builds an MPSShape (NSArray<NSNumber*>) from tensor sizes. A 0-d tensor is
+// represented as a single-element shape because MPSGraphTensorData cannot
+// describe an empty shape.
+MPSShape* getMPSShape(const std::vector<int64_t>& sizes);
+
+// Returns a contiguous, storage-offset-0 view of `t` so its contents can be
+// wrapped directly in an MPSGraphTensorData (which has no offset concept).
+Tensor materializeForGraph(const Tensor& t);
+
+// Returns the MTLBuffer backing `t`. `t` must own MPS-managed storage at
+// offset 0 (materializeForGraph guarantees this).
+id<MTLBuffer> mtlBufferOf(const Tensor& t);
+
+// Allocates an empty MPS tensor on `device`.
+Tensor emptyMPS(const std::vector<int64_t>& sizes, DType dtype,
+               const Device& device);
+
+// Block building the graph body of a binary operation. Receives the graph and
+// both inputs already cast to the common dtype; returns the result tensor.
+using MPSBinaryOpBlock = MPSGraphTensor* (^)(MPSGraph*, MPSGraphTensor*,
+                                             MPSGraphTensor*);
+
+// Block building the graph body of a unary operation.
+using MPSUnaryOpBlock = MPSGraphTensor* (^)(MPSGraph*, MPSGraphTensor*);
+
+// Executes a broadcastable binary operation on the MPS device. `alpha`, when
+// present, is folded in as `self + alpha * other` before the block runs;
+// `common_dtype` overrides the promoted input dtype (used by div to force
+// float output for integral inputs); `out_dtype` overrides the output dtype
+// (used by comparisons to produce bool).
+Tensor binaryOp(const Tensor& self, const Tensor& other, MPSBinaryOpBlock block,
+                const std::optional<Scalar>& alpha = std::nullopt,
+                std::optional<DType> common_dtype = std::nullopt,
+                std::optional<DType> out_dtype = std::nullopt);
+
+// Executes a unary operation on the MPS device, preserving the input dtype
+// unless `out_dtype` is given.
+Tensor unaryOp(const Tensor& self, MPSUnaryOpBlock block,
+               std::optional<DType> out_dtype = std::nullopt);
+
+// Executes `where(condition, self, other)` with broadcasting and dtype
+// promotion of self/other.
+Tensor whereOp(const Tensor& condition, const Tensor& self,
+               const Tensor& other);
+
+} // namespace mps
+} // namespace tensorplay
