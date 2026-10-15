@@ -32,13 +32,15 @@ int affine_mode(const std::optional<Tensor>& param, int64_t input_ndim) {
   if (pdim == input_ndim) {
     return 1;
   }
-  if (pdim == input_ndim - 1) {
-    return 2;
-  }
+  // A rank-1 parameter walks the normalized width axis, one scalar per x
+  // position; it must win over the spatial mode below, which would otherwise
+  // sample the 1d texture out of bounds on its extra axes.
   if (pdim == 1) {
     return 3;
   }
-  TP_THROW(RuntimeError, "Vulkan layer_norm: unsupported parameter rank");
+  // Every other rank (>= 2) is a spatial parameter fetched per texel position
+  // and replicated across the vec4 lanes.
+  return 2;
 }
 
 Tensor layer_norm_impl(
@@ -83,9 +85,14 @@ Tensor layer_norm_impl(
   const int64_t span_wh = input_arg.size(ndim - 1) *
       (norm_ndim >= 2 ? input_arg.size(ndim - 2) : 1);
 
-  // The span covers the channel slot only when every input axis is
-  // normalized; statistics then collapse across lanes.
-  const bool norm_channels = norm_ndim == ndim;
+  // The span covers the channel slot whenever normalization starts at or
+  // before the channel axis (the third axis from the end in NCHW order);
+  // statistics then collapse across lanes.  A trailing-only span (H,W) or
+  // (W) keeps per-lane statistics.
+  const int64_t channel_axis = ndim - 3;
+  const bool norm_channels = (ndim - norm_ndim) <= channel_axis;
+  // Whole-tensor normalization also collapses across the batch axis.
+  const bool norm_batch = norm_ndim == ndim;
 
   const int weight_mode = affine_mode(weight_opt, ndim);
   const int bias_mode = affine_mode(bias_opt, ndim);
@@ -107,7 +114,7 @@ Tensor layer_norm_impl(
     int norm_channels;
     float eps;
     int weight_len;
-    int fill0;
+    int norm_batch;
   } block{
       make_whcn_ivec4(v_input.sizes()),
       c_depth_of(v_input.sizes()),
@@ -116,7 +123,7 @@ Tensor layer_norm_impl(
       norm_channels ? 1 : 0,
       static_cast<float>(eps),
       static_cast<int32_t>(param_len),
-      0,
+      norm_batch ? 1 : 0,
   };
 
   api::UniformParamsBuffer params(context, block);
@@ -202,11 +209,19 @@ std::tuple<Tensor, Tensor, Tensor> native_layer_norm_kernel(
   }
   if (outer.empty()) outer.push_back(1);
 
-  Tensor mean = dispatch_vk<Tensor>("mean.dim", input, dims, true).reshape(outer);
-  Tensor var =
-      dispatch_vk<Tensor>("var.dim", input, dims, 0, true).reshape(outer);
+  // The dispatcher looks kernels up by name and calls them through a
+  // pointer cast, so every call must carry exactly the argument list the
+  // registered kernel expects.  mean.dim/var.dim take a trailing dtype or
+  // correction before keepdim; add.Scalar takes (self, other, alpha).
+  Tensor mean =
+      dispatch_vk<Tensor>("mean.dim", input, dims, true, DType::Float32)
+          .reshape(outer);
+  Tensor var = dispatch_vk<Tensor>(
+                   "var.dim", input, dims, int64_t{0}, true)
+                   .reshape(outer);
   Tensor rstd = dispatch_vk<Tensor>(
-      "rsqrt", dispatch_vk<Tensor>("add.Scalar", var, Scalar(eps)));
+      "rsqrt",
+      dispatch_vk<Tensor>("add.Scalar", var, Scalar(eps), Scalar(1)));
   return std::make_tuple(out, mean, rstd);
 }
 

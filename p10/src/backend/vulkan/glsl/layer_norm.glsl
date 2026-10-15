@@ -25,7 +25,9 @@ layout(set = 0, binding = 4) uniform PRECISION restrict Block {
   int norm_channels;
   float eps;
   int weight_len; // element count of a 1d affine parameter
-  int fill0;
+  // 1 when the whole tensor is normalized: statistics additionally collapse
+  // across every batch slice stacked along the texture depth.
+  int norm_batch;
 }
 uBlock;
 
@@ -54,7 +56,9 @@ vec4 fetch_weight(const ivec3 pos, const int c4) {
   $elif WEIGHT_MODE == 2:
     return vec4(texelFetch(uWeight, ivec3(pos.x, pos.y, 0), 0).x);
   $elif WEIGHT_MODE == 3:
-    return param_vec(uWeight, c4, uBlock.weight_len);
+    // 1d parameter along the normalized width axis: one scalar per x
+    // position, replicated across the vec4 lanes of that texel.
+    return vec4(texelFetch(uWeight, ivec3(pos.x, 0, 0), 0).x);
   $else:
     return vec4(1.0f);
   // clang-format on
@@ -67,7 +71,9 @@ vec4 fetch_bias(const ivec3 pos, const int c4) {
   $elif BIAS_MODE == 2:
     return vec4(texelFetch(uBias, ivec3(pos.x, pos.y, 0), 0).x);
   $elif BIAS_MODE == 3:
-    return param_vec(uBias, c4, uBlock.weight_len);
+    // 1d parameter along the normalized width axis: one scalar per x
+    // position, replicated across the vec4 lanes of that texel.
+    return vec4(texelFetch(uBias, ivec3(pos.x, 0, 0), 0).x);
   $else:
     return vec4(0.0f);
   // clang-format on
@@ -102,23 +108,33 @@ void main() {
     mean = acc / float(uBlock.span);
     var = sq / float(uBlock.span) - mean * mean;
   } else {
+    // Channel-collapsing statistics.  Unless the whole tensor is normalized,
+    // only the current batch slice (depth = n * c_depth + c4i) contributes;
+    // whole-tensor normalization additionally folds every batch slice in.
     const int n = pos.z / uBlock.c_depth;
     const vec4 lane_mask = vec4(lessThan(
         ivec4(0, 1, 2, 3), ivec4(uBlock.channels)));
     vec4 acc = vec4(0.0f);
     vec4 sq = vec4(0.0f);
-    for (int c4i = 0; c4i < uBlock.c_depth; ++c4i) {
-      for (int i = 0; i < uBlock.span; ++i) {
-        const int x = i % uBlock.in_sizes.x;
-        const int y = i / uBlock.in_sizes.x;
-        const vec4 vi = lane_mask *
-            texelFetch(
-                uInput, ivec3(x, y, n * uBlock.c_depth + c4i), 0);
-        acc += vi;
-        sq += vi * vi;
+    const int batch_lo = (uBlock.norm_batch == 1) ? 0 : n;
+    const int batch_hi = (uBlock.norm_batch == 1)
+        ? uBlock.in_sizes.w * uBlock.c_depth
+        : (n + 1);
+    for (int nz = batch_lo; nz < batch_hi; ++nz) {
+      for (int c4i = 0; c4i < uBlock.c_depth; ++c4i) {
+        for (int i = 0; i < uBlock.span; ++i) {
+          const int x = i % uBlock.in_sizes.x;
+          const int y = i / uBlock.in_sizes.x;
+          const vec4 vi = lane_mask *
+              texelFetch(
+                  uInput, ivec3(x, y, nz * uBlock.c_depth + c4i), 0);
+          acc += vi;
+          sq += vi * vi;
+        }
       }
     }
-    const float count = float(uBlock.span * uBlock.channels);
+    const float count =
+        float(uBlock.span * uBlock.channels) * float(batch_hi - batch_lo);
     const float m = dot(acc, vec4(1.0f)) / count;
     const float m2 = dot(sq, vec4(1.0f)) / count;
     mean = vec4(m);
