@@ -54,7 +54,7 @@ kernel void randint_fill(device T* out [[buffer(0)]],
 #define REGISTER_RANDINT(DTYPE)                                             \
   template [[host_name("randint_" #DTYPE)]] kernel void                     \
   randint_fill<DTYPE>(device DTYPE * out [[buffer(0)]],                     \
-                      constant ulong& low [[buffer(1)]],                    \
+                      constant long& low [[buffer(1)]],                     \
                       constant ulong& range [[buffer(2)]],                 \
                       constant uint& seed [[buffer(3)]],                  \
                       constant uint& numel [[buffer(4)]],                \
