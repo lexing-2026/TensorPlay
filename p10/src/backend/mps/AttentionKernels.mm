@@ -5,13 +5,20 @@
 #include "OperationUtils.h"
 
 #include "backend/mps/MPSDevice.h"
+#include "backend/mps/MetalShaderLibrary.h"
+#include "backend/mps/MetalUtils.h"
 #include "backend/mps/MPSStream.h"
+#include "backend/mps/kernels/common.h"
 
+#include <Metal/Metal.h>
 #include <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
 
+#include <array>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "tensorplay/ops/TPXOpsGenerated.h"
@@ -75,6 +82,107 @@ Tensor build_attn_mask(const std::optional<Tensor>& attn_mask, bool is_causal,
   return mask.defined() ? mask : Tensor();
 }
 
+// One-pass decode-phase attention shader (`sdpa_vector_*`).  Only used for
+// short query sequences with no external mask; returns nullopt to let the
+// caller fall back to the MPSGraph path.
+std::optional<Tensor> sdpa_decode_shader(const Tensor& q_in,
+                                         const Tensor& k_in,
+                                         const Tensor& v_in, bool is_causal,
+                                         double scale_factor,
+                                         int64_t gqa_factor,
+                                         bool unsqueezed) {
+  const int64_t B = q_in.size(0);
+  const int64_t H = q_in.size(1);
+  const int64_t L = q_in.size(2);
+  const int64_t E = q_in.size(3);
+  const int64_t S = k_in.size(2);
+  if (L > 32) {
+    return std::nullopt;
+  }
+  if (E != 64 && E != 96 && E != 128 && E != 256) {
+    return std::nullopt;
+  }
+  const DType dt = q_in.dtype();
+  const std::string dtype = scalarToMetalTypeString(dt);
+  if (dtype != "float" && dtype != "half" && dtype != "bfloat") {
+    return std::nullopt;
+  }
+  if (v_in.size(1) != k_in.size(1)) {
+    return std::nullopt;
+  }
+
+  Tensor q = materializeForGraph(q_in);
+  Tensor k = materializeForGraph(k_in);
+  Tensor v = materializeForGraph(v_in);
+
+  std::vector<int64_t> out_shape = {B, H, L, E};
+  Tensor output = Tensor::empty(out_shape, dt, q.device());
+  if (output.numel() == 0) {
+    return output;
+  }
+
+  const std::string kernel = "sdpa_vector_" + dtype + "_" +
+      std::to_string(E) + "_" + std::to_string(E) +
+      (is_causal ? "_masknone_causal" : "_masknone");
+  const uint32_t N = static_cast<uint32_t>(S);
+  const uint32_t gqa_u = static_cast<uint32_t>(gqa_factor);
+  const p10::metal::vec3<uint32_t> head_strides{
+      static_cast<uint32_t>(q.stride(1)),
+      static_cast<uint32_t>(k.stride(1)),
+      static_cast<uint32_t>(v.stride(1))};
+  const p10::metal::vec3<uint32_t> seq_strides{
+      static_cast<uint32_t>(q.stride(2)),
+      static_cast<uint32_t>(k.stride(2)),
+      static_cast<uint32_t>(v.stride(2))};
+  const std::array<uint32_t, 4> mask_strides{0, 0, 0, 0};
+  const std::array<uint32_t, 4> batch_strides{
+      static_cast<uint32_t>(q.stride(0)),
+      static_cast<uint32_t>(k.stride(0)),
+      static_cast<uint32_t>(v.stride(0)),
+      static_cast<uint32_t>(H)};
+  const float scale_f = static_cast<float>(scale_factor);
+
+  MPSStream* mpsStream = getCurrentMPSStream();
+  dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+    @autoreleasepool {
+      id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
+      id<MTLComputePipelineState> PSO =
+          MetalShaderLibrary::getBundledLibrary().getPipelineStateForFunc(
+              kernel);
+      [computeEncoder setComputePipelineState:PSO];
+      unsigned idx = 0;
+      [computeEncoder setBuffer:mtlBufferOf(q) offset:0 atIndex:idx++];
+      [computeEncoder setBuffer:mtlBufferOf(k) offset:0 atIndex:idx++];
+      [computeEncoder setBuffer:mtlBufferOf(v) offset:0 atIndex:idx++];
+      [computeEncoder setBuffer:mtlBufferOf(output) offset:0 atIndex:idx++];
+      [computeEncoder setBytes:&gqa_u length:sizeof(uint32_t) atIndex:idx++];
+      [computeEncoder setBytes:&N length:sizeof(uint32_t) atIndex:idx++];
+      [computeEncoder setBytes:&head_strides length:sizeof(head_strides)
+                        atIndex:idx++];
+      [computeEncoder setBytes:&seq_strides length:sizeof(seq_strides)
+                        atIndex:idx++];
+      [computeEncoder setBytes:&scale_f length:sizeof(float) atIndex:idx++];
+      [computeEncoder setBuffer:nil offset:0 atIndex:idx++];
+      [computeEncoder setBytes:&mask_strides length:sizeof(mask_strides)
+                        atIndex:idx++];
+      [computeEncoder setBytes:&batch_strides length:sizeof(batch_strides)
+                        atIndex:idx++];
+
+      MTLSize grid = MTLSizeMake(static_cast<NSUInteger>(B * H),
+                                 static_cast<NSUInteger>(L), 1);
+      MTLSize threads = MTLSizeMake(32, 1, 1);
+      [computeEncoder dispatchThreadgroups:grid
+                     threadsPerThreadgroup:threads];
+      mpsStream->endKernelCoalescing();
+    }
+  });
+
+  if (unsqueezed) {
+    output = ops::squeeze(output, 1);
+  }
+  return output;
+}
+
 } // namespace
 
 // MPSGraph-based scaled dot product attention:
@@ -123,13 +231,20 @@ Tensor scaled_dot_product_attention_kernel(
              "scaled_dot_product_attention: key/value head counts must match");
   }
 
-  if (enable_gqa && k.size(1) != H) {
-    k = expand_kv_heads(k, H);
-    v = expand_kv_heads(v, H);
-  } else if (k.size(1) != H || v.size(1) != H) {
-    TP_THROW(RuntimeError,
-             "scaled_dot_product_attention: key/value head count must match "
-             "query heads (enable GQA with enable_gqa=True)");
+  const int64_t kH = k.size(1);
+  int64_t gqa_factor = 1;
+  if (kH != H) {
+    if (!enable_gqa) {
+      TP_THROW(RuntimeError,
+               "scaled_dot_product_attention: key/value head count must match "
+               "query heads (enable GQA with enable_gqa=True)");
+    }
+    if (H % kH != 0) {
+      TP_THROW(RuntimeError,
+               "scaled_dot_product_attention: GQA requires q_heads % "
+               "kv_heads == 0");
+    }
+    gqa_factor = H / kH;
   }
 
   const DType dt = q.dtype();
@@ -142,6 +257,21 @@ Tensor scaled_dot_product_attention_kernel(
 
   const double scale_factor =
       scale.has_value() ? *scale : 1.0 / std::sqrt(static_cast<double>(E));
+
+  // Fast decode path: short query, no external mask -> one-pass shader.
+  if ((!attn_mask.has_value() || !attn_mask->defined()) && dropout_p == 0) {
+    auto decoded = sdpa_decode_shader(q, k, v, is_causal, scale_factor,
+                                      gqa_factor, unsqueezed);
+    if (decoded.has_value()) {
+      return *decoded;
+    }
+  }
+
+  // MPSGraph path requires matched head counts; expand K/V for GQA.
+  if (gqa_factor > 1) {
+    k = expand_kv_heads(k, H);
+    v = expand_kv_heads(v, H);
+  }
   Tensor mask =
       build_attn_mask(attn_mask, is_causal, L, S, dt, q.device());
 
