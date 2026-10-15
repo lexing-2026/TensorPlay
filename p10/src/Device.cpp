@@ -54,6 +54,18 @@ Device::Device(const std::string& device_str) : type_(DeviceType::CPU), index_(-
             TP_THROW(ValueError, "Invalid device string: " + device_str);
         }
         type_ = DeviceType::Meta;
+    } else if (s.rfind("mps", 0) == 0) {
+        type_ = DeviceType::MPS;
+        size_t colon = s.find(':');
+        if (colon != std::string::npos) {
+            try {
+                index_ = std::stoi(s.substr(colon + 1));
+            } catch (...) {
+                TP_THROW(ValueError, "Invalid device string: " + device_str);
+            }
+        } else {
+            index_ = 0;
+        }
     } else {
         TP_THROW(ValueError, "Invalid device string: " + device_str);
     }
@@ -71,6 +83,8 @@ Device::Device(const std::string& type_str, int64_t index) : index_(index) {
         type_ = DeviceType::Vulkan;
     } else if (s == "meta") {
         type_ = DeviceType::Meta;
+    } else if (s == "mps") {
+        type_ = DeviceType::MPS;
     } else {
         TP_THROW(ValueError, "Invalid device type: " + type_str);
     }

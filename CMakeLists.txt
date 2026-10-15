@@ -195,6 +195,34 @@ else()
     message(STATUS "CUDA support disabled by user or not found.")
 endif()
 
+# MPS backend (macOS Metal Performance Shaders). Auto-enabled on Apple where
+# the Metal frameworks are always present; the backend compiles Objective-C++
+# (.mm) sources and links Metal / MetalPerformanceShaders frameworks. The
+# DeviceType and dispatch slots already exist, so a CPU build on other
+# platforms simply leaves the MPS sources out.
+if(NOT DEFINED USE_MPS)
+    if(APPLE)
+        set(USE_MPS ON)
+    else()
+        set(USE_MPS OFF)
+    endif()
+endif()
+option(USE_MPS "Enable Apple MPS (Metal) support" ${USE_MPS})
+if(USE_MPS)
+    if(NOT APPLE)
+        message(FATAL_ERROR "USE_MPS is ON but this is not an Apple platform")
+    endif()
+    enable_language(OBJCXX)
+    set(CMAKE_OBJCXX_STANDARD 20)
+    set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
+    # The guard macro must reach both the C++ translation units (e.g. the
+    # CPU copy kernel's MPS branch) and the Objective-C++ backend sources.
+    add_compile_definitions(USE_MPS)
+    message(STATUS "MPS backend enabled (macOS Metal Performance Shaders)")
+else()
+    message(STATUS "MPS backend disabled")
+endif()
+
 # Check for cuDNN.  Discovery (root hints, CUDA toolkit layout, pip wheel,
 # Windows v9 nesting, version parsing, frontend header) lives in
 # cmake/Modules/FindCUDNN.cmake; only the enable/bundling policy stays here.

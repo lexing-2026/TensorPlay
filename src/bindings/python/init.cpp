@@ -23,6 +23,9 @@
 #include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
 #endif
+#ifdef USE_MPS
+#include "backend/mps/MPSDevice.h"
+#endif
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -544,6 +547,15 @@ PYBIND11_MODULE(_C, m) {
     m.def("is_cuda_available", []() {
 #ifdef TENSORPLAY_USE_CUDA
         return true;
+#else
+        return false;
+#endif
+    });
+
+    // MPS availability
+    m.def("is_mps_available", []() {
+#ifdef USE_MPS
+        return tensorplay::mps::is_available();
 #else
         return false;
 #endif

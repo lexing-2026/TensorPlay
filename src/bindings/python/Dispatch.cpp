@@ -30,6 +30,7 @@ const tensorplay::DispatchKey kDumpKeys[] = {
     tensorplay::DispatchKey::SparseCUDA,
     tensorplay::DispatchKey::Sparse,
     tensorplay::DispatchKey::Meta,
+    tensorplay::DispatchKey::MPS,
     tensorplay::DispatchKey::Python,
     tensorplay::DispatchKey::AutogradCPU,
     tensorplay::DispatchKey::AutogradCUDA,
@@ -38,6 +39,7 @@ const tensorplay::DispatchKey kDumpKeys[] = {
     tensorplay::DispatchKey::AutogradSparseCUDA,
     tensorplay::DispatchKey::AutogradSparse,
     tensorplay::DispatchKey::AutogradMeta,
+    tensorplay::DispatchKey::AutogradMPS,
     tensorplay::DispatchKey::AutocastCPU,
     tensorplay::DispatchKey::AutocastCUDA,
     tensorplay::DispatchKey::AutocastVulkan,
@@ -45,6 +47,7 @@ const tensorplay::DispatchKey kDumpKeys[] = {
     tensorplay::DispatchKey::AutocastSparseCUDA,
     tensorplay::DispatchKey::AutocastSparse,
     tensorplay::DispatchKey::AutocastMeta,
+    tensorplay::DispatchKey::AutocastMPS,
     tensorplay::DispatchKey::VmapCPU,
     tensorplay::DispatchKey::VmapCUDA,
     tensorplay::DispatchKey::VmapVulkan,
@@ -52,6 +55,7 @@ const tensorplay::DispatchKey kDumpKeys[] = {
     tensorplay::DispatchKey::VmapSparseCUDA,
     tensorplay::DispatchKey::VmapSparse,
     tensorplay::DispatchKey::VmapMeta,
+    tensorplay::DispatchKey::VmapMPS,
     tensorplay::DispatchKey::Composite,
     tensorplay::DispatchKey::VmapMode,
     tensorplay::DispatchKey::DynamicLayerFrontMode,
@@ -68,6 +72,7 @@ tensorplay::DispatchKey parse_key_or_throw(const std::string& name) {
             {"SparseCUDA", tensorplay::DispatchKey::SparseCUDA},
             {"Sparse", tensorplay::DispatchKey::Sparse},
             {"Meta", tensorplay::DispatchKey::Meta},
+            {"MPS", tensorplay::DispatchKey::MPS},
             {"Python", tensorplay::DispatchKey::Python},
             {"AutogradCPU", tensorplay::DispatchKey::AutogradCPU},
             {"AutogradCUDA", tensorplay::DispatchKey::AutogradCUDA},
@@ -76,6 +81,7 @@ tensorplay::DispatchKey parse_key_or_throw(const std::string& name) {
             {"AutogradSparseCUDA", tensorplay::DispatchKey::AutogradSparseCUDA},
             {"AutogradSparse", tensorplay::DispatchKey::AutogradSparse},
             {"AutogradMeta", tensorplay::DispatchKey::AutogradMeta},
+            {"AutogradMPS", tensorplay::DispatchKey::AutogradMPS},
             {"AutocastCPU", tensorplay::DispatchKey::AutocastCPU},
             {"AutocastCUDA", tensorplay::DispatchKey::AutocastCUDA},
             {"AutocastVulkan", tensorplay::DispatchKey::AutocastVulkan},
@@ -83,6 +89,7 @@ tensorplay::DispatchKey parse_key_or_throw(const std::string& name) {
             {"AutocastSparseCUDA", tensorplay::DispatchKey::AutocastSparseCUDA},
             {"AutocastSparse", tensorplay::DispatchKey::AutocastSparse},
             {"AutocastMeta", tensorplay::DispatchKey::AutocastMeta},
+            {"AutocastMPS", tensorplay::DispatchKey::AutocastMPS},
             {"VmapCPU", tensorplay::DispatchKey::VmapCPU},
             {"VmapCUDA", tensorplay::DispatchKey::VmapCUDA},
             {"VmapVulkan", tensorplay::DispatchKey::VmapVulkan},
@@ -90,6 +97,7 @@ tensorplay::DispatchKey parse_key_or_throw(const std::string& name) {
             {"VmapSparseCUDA", tensorplay::DispatchKey::VmapSparseCUDA},
             {"VmapSparse", tensorplay::DispatchKey::VmapSparse},
             {"VmapMeta", tensorplay::DispatchKey::VmapMeta},
+            {"VmapMPS", tensorplay::DispatchKey::VmapMPS},
             {"Composite", tensorplay::DispatchKey::Composite},
             {"VmapMode", tensorplay::DispatchKey::VmapMode},
             {"DynamicLayerFrontMode", tensorplay::DispatchKey::DynamicLayerFrontMode},
@@ -189,24 +197,32 @@ void init_dispatch(py::module_& m) {
         .value("SparseCPU", tensorplay::DispatchKey::SparseCPU)
         .value("SparseCUDA", tensorplay::DispatchKey::SparseCUDA)
         .value("Sparse", tensorplay::DispatchKey::Sparse)
+        .value("Meta", tensorplay::DispatchKey::Meta)
+        .value("MPS", tensorplay::DispatchKey::MPS)
         .value("AutogradCPU", tensorplay::DispatchKey::AutogradCPU)
         .value("AutogradCUDA", tensorplay::DispatchKey::AutogradCUDA)
         .value("AutogradVulkan", tensorplay::DispatchKey::AutogradVulkan)
         .value("AutogradSparseCPU", tensorplay::DispatchKey::AutogradSparseCPU)
         .value("AutogradSparseCUDA", tensorplay::DispatchKey::AutogradSparseCUDA)
         .value("AutogradSparse", tensorplay::DispatchKey::AutogradSparse)
+        .value("AutogradMeta", tensorplay::DispatchKey::AutogradMeta)
+        .value("AutogradMPS", tensorplay::DispatchKey::AutogradMPS)
         .value("AutocastCPU", tensorplay::DispatchKey::AutocastCPU)
         .value("AutocastCUDA", tensorplay::DispatchKey::AutocastCUDA)
         .value("AutocastVulkan", tensorplay::DispatchKey::AutocastVulkan)
         .value("AutocastSparseCPU", tensorplay::DispatchKey::AutocastSparseCPU)
         .value("AutocastSparseCUDA", tensorplay::DispatchKey::AutocastSparseCUDA)
         .value("AutocastSparse", tensorplay::DispatchKey::AutocastSparse)
+        .value("AutocastMeta", tensorplay::DispatchKey::AutocastMeta)
+        .value("AutocastMPS", tensorplay::DispatchKey::AutocastMPS)
         .value("VmapCPU", tensorplay::DispatchKey::VmapCPU)
         .value("VmapCUDA", tensorplay::DispatchKey::VmapCUDA)
         .value("VmapVulkan", tensorplay::DispatchKey::VmapVulkan)
         .value("VmapSparseCPU", tensorplay::DispatchKey::VmapSparseCPU)
         .value("VmapSparseCUDA", tensorplay::DispatchKey::VmapSparseCUDA)
         .value("VmapSparse", tensorplay::DispatchKey::VmapSparse)
+        .value("VmapMeta", tensorplay::DispatchKey::VmapMeta)
+        .value("VmapMPS", tensorplay::DispatchKey::VmapMPS)
         .value("Composite", tensorplay::DispatchKey::Composite)
         .value("VmapMode", tensorplay::DispatchKey::VmapMode)
         .value("DynamicLayerFrontMode", tensorplay::DispatchKey::DynamicLayerFrontMode)

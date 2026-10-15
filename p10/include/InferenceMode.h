@@ -28,7 +28,9 @@ inline bool autograd_dispatch_excluded() {
            excluded.has(DispatchKey::AutogradVulkan) ||
            excluded.has(DispatchKey::AutogradSparseCPU) ||
            excluded.has(DispatchKey::AutogradSparseCUDA) ||
-           excluded.has(DispatchKey::AutogradSparse);
+           excluded.has(DispatchKey::AutogradSparse) ||
+           excluded.has(DispatchKey::AutogradMeta) ||
+           excluded.has(DispatchKey::AutogradMPS);
 }
 
 // RAII helper for C++ call sites.

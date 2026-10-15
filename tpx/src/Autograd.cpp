@@ -987,7 +987,9 @@ struct BelowConversionAutograd {
                 DispatchKeySet::make(DispatchKey::AutogradVulkan) |
                 DispatchKeySet::make(DispatchKey::AutogradSparseCPU) |
                 DispatchKeySet::make(DispatchKey::AutogradSparseCUDA) |
-                DispatchKeySet::make(DispatchKey::AutogradSparse));
+                DispatchKeySet::make(DispatchKey::AutogradSparse) |
+                DispatchKeySet::make(DispatchKey::AutogradMeta) |
+                DispatchKeySet::make(DispatchKey::AutogradMPS));
         }
     }
 };

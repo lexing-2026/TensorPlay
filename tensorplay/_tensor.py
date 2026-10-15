@@ -54,6 +54,31 @@ def cuda(self, device=None, non_blocking=False):
     
     return self.to(_C.Device(_C.DeviceType.CUDA, device_idx), non_blocking=non_blocking)
 
+def mps(self, device=None, non_blocking=False):
+    """
+    Returns a copy of this object in MPS memory.
+    If this object is already in MPS memory, then no copy is performed and the original object is returned.
+    """
+    if device is None:
+        device_idx = _C._mps.current_device() if _C._mps.is_available() else 0
+    elif isinstance(device, int):
+        device_idx = device
+    elif isinstance(device, str):
+        parsed = _C.Device(device)
+        device_idx = parsed.index
+        if device_idx < 0:
+            device_idx = _C._mps.current_device() if _C._mps.is_available() else 0
+    elif isinstance(device, _C.Device):
+        if not device.is_mps():
+            raise ValueError(f"Expected an MPS device, got {device}")
+        device_idx = device.index
+        if device_idx < 0:
+            device_idx = _C._mps.current_device() if _C._mps.is_available() else 0
+    else:
+        raise TypeError(f"Invalid MPS device: {device!r}")
+
+    return self.to(_C.Device(_C.DeviceType.MPS, device_idx), non_blocking=non_blocking)
+
 def cpu(self):
     """
     Returns a copy of this object in CPU memory.
@@ -69,6 +94,8 @@ def type(self, dtype=None, non_blocking=False, **kwargs):
         device_str = ""
         if self.is_cuda:
             device_str = "cuda."
+        elif self.is_mps:
+            device_str = "mps."
         
         dtype_map = {
             _C.float32: "FloatTensor",
@@ -614,10 +641,15 @@ def _is_meta(self):
     return str(self.device.type) == "meta"
 
 
+def _is_mps(self):
+    return str(self.device.type) == "mps"
+
+
 Tensor.is_cpu = property(_is_cpu)
 Tensor.is_cuda = property(_is_cuda)
 Tensor.is_meta = property(_is_meta)
-del _is_cpu, _is_cuda
+Tensor.is_mps = property(_is_mps)
+del _is_cpu, _is_cuda, _is_meta, _is_mps
 
 
 def xpu(self, device=None):

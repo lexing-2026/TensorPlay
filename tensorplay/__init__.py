@@ -695,6 +695,7 @@ from . import profiler
 # Submodules
 # -------------------------------------------------------------------------
 from . import cuda
+from . import mps
 # Imported after the op names, nn, and cuda are bound: the multiprocessing
 # reducers pull in tensorplay.primitives (via nn) which references eager op
 # names, so this must not run during partial initialization.
@@ -739,6 +740,7 @@ __all__.extend([
     "GradScaler",
     "amp",
     "cuda",
+    "mps",
     "autocast",
     "autocast_decrement_nesting",
     "autocast_increment_nesting",

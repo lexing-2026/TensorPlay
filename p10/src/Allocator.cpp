@@ -17,6 +17,11 @@
 #include "VulkanRuntime.h"
 #endif
 
+#ifdef USE_MPS
+#include "backend/mps/MPSRuntime.h"
+#include "backend/mps/MPSStream.h"
+#endif
+
 #ifdef _WIN32
 #include <malloc.h>
 #endif
@@ -167,6 +172,20 @@ void copyAllocationBytes(void* destination, const Device& destination_device,
         return;
     }
 #endif
+#ifdef USE_MPS
+    if (destination_device.is_mps() || source_device.is_mps()) {
+        // MPS buffers use shared (unified) memory, so both sides of the
+        // copy are host-visible.  Synchronize pending MPS work before the
+        // host copy so a still-in-flight GPU write is observed.
+        const Device mps_device = destination_device.is_mps()
+            ? destination_device
+            : source_device;
+        mps::MPSGuard guard(mps_device);
+        mps::getCurrentMPSStream()->synchronize(mps::SyncType::COMMIT_AND_WAIT);
+        std::memcpy(destination, source, nbytes);
+        return;
+    }
+#endif
 #ifdef USE_CUDA
     const Device cuda_device = destination_device.is_cuda()
         ? destination_device
@@ -201,6 +220,9 @@ Allocator* getCUDAAllocator();
 #ifdef USE_VULKAN
 Allocator* getVulkanAllocator();
 #endif
+#ifdef USE_MPS
+Allocator* getMPSAllocator();
+#endif
 
 Allocator* getAllocator(DeviceType t) {
     if (t == DeviceType::CPU) {
@@ -217,6 +239,11 @@ Allocator* getAllocator(DeviceType t) {
 #ifdef USE_VULKAN
     if (t == DeviceType::Vulkan) {
         return getVulkanAllocator();
+    }
+#endif
+#ifdef USE_MPS
+    if (t == DeviceType::MPS) {
+        return getMPSAllocator();
     }
 #endif
 

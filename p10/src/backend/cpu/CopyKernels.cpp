@@ -29,6 +29,11 @@
 #include "backend/vulkan/ops/Copy.h"
 #endif
 
+#ifdef USE_MPS
+#include "backend/mps/MPSRuntime.h"
+#include "backend/mps/MPSStream.h"
+#endif
+
 namespace tensorplay {
 namespace cpu {
 
@@ -423,8 +428,61 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src_in, bool non_blocking) {
     }
 #endif
 
+#ifdef USE_MPS
+    if (src.device().is_mps()) {
+        // The MPS allocator uses shared (unified) memory, so the source's
+        // data_ptr() is host-visible.  Synchronize the MPS stream first so a
+        // still-in-flight GPU write to the source is visible before the CPU
+        // reads it, then run the same strided/dtype-converting walk as the
+        // CPU-to-CPU path.
+        mps::MPSGuard device_guard(src.device());
+        mps::getCurrentMPSStream()->synchronize(mps::SyncType::COMMIT_AND_WAIT);
+
+        if (self.dtype() == src.dtype() && self.is_contiguous() &&
+            src.is_contiguous()) {
+            std::memcpy(self.data_ptr(), src.data_ptr(),
+                        static_cast<size_t>(self.numel()) * self.itemsize());
+            return self;
+        }
+        dispatch_dtype(self.dtype(), [&](auto self_tag) {
+            using self_t = typename decltype(self_tag)::type;
+            dispatch_dtype(src.dtype(), [&](auto src_tag) {
+                using src_t = typename decltype(src_tag)::type;
+                const auto rm_strides =
+                    SizesAndStrides::compute_contiguous_strides(
+                        static_cast<std::vector<int64_t>>(self.shape()));
+                if (self.shape() == src.shape() &&
+                    static_cast<std::vector<int64_t>>(self.strides()) ==
+                        rm_strides &&
+                    static_cast<std::vector<int64_t>>(src.strides()) ==
+                        rm_strides) {
+                    if (std::is_same_v<self_t, src_t>) {
+                        std::memcpy(self.data_ptr(), src.data_ptr(),
+                                    static_cast<size_t>(self.numel()) *
+                                        self.itemsize());
+                        return;
+                    }
+                    self_t* d = self.data_ptr<self_t>();
+                    const src_t* s = src.data_ptr<src_t>();
+                    for (int64_t i = 0; i < self.numel(); ++i) {
+                        d[i] = cast_value<self_t>(s[i]);
+                    }
+                    return;
+                }
+                parallel_strided_copy(
+                    self.data_ptr<self_t>(),
+                    static_cast<std::vector<int64_t>>(self.strides()),
+                    src.data_ptr<src_t>(),
+                    static_cast<std::vector<int64_t>>(src.strides()),
+                    static_cast<std::vector<int64_t>>(self.shape()));
+            });
+        });
+        return self;
+    }
+#endif
+
     if (!src.device().is_cpu()) {
-        throw std::runtime_error("copy_kernel only supports CPU, CUDA or Vulkan source");
+        throw std::runtime_error("copy_kernel only supports CPU, CUDA, Vulkan or MPS source");
     }
 
     if (self.dim() == 0 && src.dim() == 0) {

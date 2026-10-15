@@ -510,6 +510,21 @@ if(USE_CUDA OR USE_ROCM)
         list(APPEND P10_SOURCES ${TP_CUDA_BACKEND_SOURCES})
     endif()
 endif()
+if(USE_MPS)
+    # MPS backend: device/allocator/stream infrastructure plus the factory,
+    # copy and arithmetic kernels.  The sources are Objective-C++ and follow
+    # manual reference counting.
+    set(TP_MPS_BACKEND_SOURCES
+        src/backend/mps/MPSDevice.mm
+        src/backend/mps/MPSAllocator.mm
+        src/backend/mps/MPSStream.mm
+        src/backend/mps/MPSRuntime.mm
+        src/backend/mps/FactoryKernels.mm
+        src/backend/mps/CopyKernels.mm
+        src/backend/mps/ArithmeticKernels.mm
+    )
+    list(APPEND P10_SOURCES ${TP_MPS_BACKEND_SOURCES})
+endif()
 if(USE_VULKAN)
     # Vulkan backend: api layer, ops and the generated SPIR-V registry.
     # The shader registry is produced at build time from the GLSL sources by
@@ -998,6 +1013,18 @@ if(USE_VULKAN)
     target_link_libraries(p10 PRIVATE ${VULKAN_LIBRARY})
     target_compile_definitions(p10 PRIVATE USE_VULKAN)
     add_dependencies(p10 vulkan_spv_gen)
+endif()
+if(USE_MPS)
+    # Metal / MetalPerformanceShaders frameworks back the MPS device, the
+    # command streams and the MPSGraph-based kernels.
+    target_link_libraries(p10 PRIVATE
+        "-framework Metal"
+        "-framework MetalPerformanceShaders"
+        "-framework MetalPerformanceShadersGraph"
+        "-framework Foundation")
+    target_compile_definitions(p10 PRIVATE USE_MPS)
+    target_include_directories(p10 PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include/backend/mps)
 endif()
 if(USE_CUDA)
     target_link_libraries(p10 PRIVATE CUDA::cudart CUDA::cublas CUDA::cublasLt CUDA::cufft CUDA::cusolver CUDA::cusparse CUDA::nvrtc)

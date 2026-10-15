@@ -52,6 +52,10 @@ public:
     // real memory, so its storage hands out a null data pointer.
     bool is_meta() const { return type_ == DeviceType::Meta; }
 
+    // The accelerator slots use the same ":index" suffix as CUDA, so a
+    // parsed "mps:0" round-trips to the same spelling.
+    bool is_mps() const { return type_ == DeviceType::MPS; }
+
     // Convert device to string representation using macro-based mapping
     std::string toString() const {
         switch (type_) {
@@ -61,7 +65,7 @@ public:
                     /* Convert to lowercase */ \
                     for (auto& c : result) c = std::tolower(c); \
                     /* Handle device index for accelerator devices */ \
-                    if ((DeviceType::name == DeviceType::CUDA || DeviceType::name == DeviceType::Vulkan || DeviceType::name == DeviceType::CPU) && index_ >= 0) { \
+                    if ((DeviceType::name == DeviceType::CUDA || DeviceType::name == DeviceType::Vulkan || DeviceType::name == DeviceType::MPS || DeviceType::name == DeviceType::CPU) && index_ >= 0) { \
                         result += ":" + std::to_string(index_); \
                     } \
                     return result; \

@@ -45,6 +45,12 @@ struct CudaDeviceProperties {
 };
 #endif
 
+#ifdef USE_MPS
+#include "backend/mps/MPSAllocator.h"
+#include "backend/mps/MPSDevice.h"
+#include "backend/mps/MPSRuntime.h"
+#endif
+
 void init_device(py::module_& m) {
     py::enum_<DeviceType>(m, "DeviceType")
         .value("CPU", DeviceType::CPU)
@@ -129,6 +135,7 @@ void init_device(py::module_& m) {
         .def("is_cuda", &Device::is_cuda)
         .def("is_vulkan", &Device::is_vulkan)
         .def("is_meta", &Device::is_meta)
+        .def("is_mps", &Device::is_mps)
         .def("__repr__", &Device::toString)
         .def("__str__", &Device::toString)
         .def(py::self == py::self)
@@ -578,6 +585,61 @@ void init_device(py::module_& m) {
     });
 
     cuda.def("_sleep", &tensorplay::cuda::sleep, "cycles"_a);
+#endif
+
+    py::module_ mps_mod = m.def_submodule("_mps", "Apple MPS (Metal) computation backend");
+
+#ifdef USE_MPS
+    mps_mod.def("is_available", []() {
+        return tensorplay::mps::is_available();
+    });
+
+    mps_mod.def("device_count", []() {
+        return tensorplay::mps::deviceCount();
+    });
+
+    mps_mod.def("current_device", []() {
+        return tensorplay::mps::currentDevice();
+    });
+
+    mps_mod.def("get_device_name", []() {
+        return tensorplay::mps::MPSDevice::getInstance()->getName();
+    });
+
+    mps_mod.def("synchronize", [](int device) {
+        tensorplay::mps::MPSGuard guard(device);
+        tensorplay::mps::synchronizeAllMPSStreams(
+            tensorplay::mps::SyncType::COMMIT_AND_WAIT);
+    }, "device"_a = -1);
+
+    mps_mod.def("memory_allocated", [](int device) {
+        (void)device;
+        return tensorplay::mps::getIMPSAllocator()->getCurrentAllocatedMemory();
+    }, "device"_a = 0);
+
+    mps_mod.def("memory_reserved", [](int device) {
+        (void)device;
+        return tensorplay::mps::getIMPSAllocator()->getTotalAllocatedMemory();
+    }, "device"_a = 0);
+
+    mps_mod.def("empty_cache", []() {
+        tensorplay::mps::getIMPSAllocator()->emptyCache();
+    });
+#else
+    mps_mod.def("is_available", []() { return false; });
+    mps_mod.def("device_count", []() { return 0; });
+    mps_mod.def("current_device", []() {
+        throw std::runtime_error("MPS is not available");
+    });
+    mps_mod.def("get_device_name", []() {
+        throw std::runtime_error("MPS is not available");
+    });
+    mps_mod.def("synchronize", [](int) {
+        throw std::runtime_error("MPS is not available");
+    }, "device"_a = -1);
+    mps_mod.def("memory_allocated", [](int) { return 0; }, "device"_a = 0);
+    mps_mod.def("memory_reserved", [](int) { return 0; }, "device"_a = 0);
+    mps_mod.def("empty_cache", []() {});
 #endif
 
     py::module_ cpu = m.def_submodule("_cpu", "Host computation backend");

@@ -22,39 +22,43 @@ enum class DispatchKey : uint8_t {
     SparseCUDA = 4,
     Sparse = 5,
     Meta = 6,
-    Python = 7,
-    DynamicLayerBackMode = 8,
-    AutogradCPU = 9,
-    AutogradCUDA = 10,
-    AutogradVulkan = 11,
-    AutogradSparseCPU = 12,
-    AutogradSparseCUDA = 13,
-    AutogradSparse = 14,
-    AutogradMeta = 15,
-    AutocastCPU = 16,
-    AutocastCUDA = 17,
-    AutocastVulkan = 18,
-    AutocastSparseCPU = 19,
-    AutocastSparseCUDA = 20,
-    AutocastSparse = 21,
-    AutocastMeta = 22,
-    VmapCPU = 23,
-    VmapCUDA = 24,
-    VmapVulkan = 25,
-    VmapSparseCPU = 26,
-    VmapSparseCUDA = 27,
-    VmapSparse = 28,
-    VmapMeta = 29,
-    Composite = 30,
-    VmapMode = 31,
-    DynamicLayerFrontMode = 32,
-    EndOfKeys = 33
+    MPS = 7,
+    Python = 8,
+    DynamicLayerBackMode = 9,
+    AutogradCPU = 10,
+    AutogradCUDA = 11,
+    AutogradVulkan = 12,
+    AutogradSparseCPU = 13,
+    AutogradSparseCUDA = 14,
+    AutogradSparse = 15,
+    AutogradMeta = 16,
+    AutogradMPS = 17,
+    AutocastCPU = 18,
+    AutocastCUDA = 19,
+    AutocastVulkan = 20,
+    AutocastSparseCPU = 21,
+    AutocastSparseCUDA = 22,
+    AutocastSparse = 23,
+    AutocastMeta = 24,
+    AutocastMPS = 25,
+    VmapCPU = 26,
+    VmapCUDA = 27,
+    VmapVulkan = 28,
+    VmapSparseCPU = 29,
+    VmapSparseCUDA = 30,
+    VmapSparse = 31,
+    VmapMeta = 32,
+    VmapMPS = 33,
+    Composite = 34,
+    VmapMode = 35,
+    DynamicLayerFrontMode = 36,
+    EndOfKeys = 37
 };
 
-constexpr size_t kBackendKeyCount = 7;
-constexpr size_t kAutogradKeyOffset = 9;
-constexpr size_t kAutocastKeyOffset = 16;
-constexpr size_t kVmapKeyOffset = 23;
+constexpr size_t kBackendKeyCount = 8;
+constexpr size_t kAutogradKeyOffset = 10;
+constexpr size_t kAutocastKeyOffset = 18;
+constexpr size_t kVmapKeyOffset = 26;
 
 static_assert(static_cast<size_t>(DispatchKey::AutogradCPU) ==
                   static_cast<size_t>(DispatchKey::CPU) + kAutogradKeyOffset,
@@ -105,7 +109,7 @@ inline constexpr bool is_backend_key(DispatchKey key) {
     return key == DispatchKey::CPU || key == DispatchKey::CUDA ||
            key == DispatchKey::Vulkan || key == DispatchKey::SparseCPU ||
            key == DispatchKey::SparseCUDA || key == DispatchKey::Sparse ||
-           key == DispatchKey::Meta;
+           key == DispatchKey::Meta || key == DispatchKey::MPS;
 }
 
 // The backend component of an autocast or autograd key (identity for backend keys).
@@ -128,6 +132,7 @@ inline std::string toString(DispatchKey key) {
         case DispatchKey::SparseCUDA: return "SparseCUDA";
         case DispatchKey::Sparse: return "Sparse";
         case DispatchKey::Meta: return "Meta";
+        case DispatchKey::MPS: return "MPS";
         case DispatchKey::AutocastCPU: return "AutocastCPU";
         case DispatchKey::AutocastCUDA: return "AutocastCUDA";
         case DispatchKey::AutocastVulkan: return "AutocastVulkan";
@@ -135,6 +140,7 @@ inline std::string toString(DispatchKey key) {
         case DispatchKey::AutocastSparseCUDA: return "AutocastSparseCUDA";
         case DispatchKey::AutocastSparse: return "AutocastSparse";
         case DispatchKey::AutocastMeta: return "AutocastMeta";
+        case DispatchKey::AutocastMPS: return "AutocastMPS";
         case DispatchKey::AutogradCPU: return "AutogradCPU";
         case DispatchKey::AutogradCUDA: return "AutogradCUDA";
         case DispatchKey::AutogradVulkan: return "AutogradVulkan";
@@ -142,6 +148,7 @@ inline std::string toString(DispatchKey key) {
         case DispatchKey::AutogradSparseCUDA: return "AutogradSparseCUDA";
         case DispatchKey::AutogradSparse: return "AutogradSparse";
         case DispatchKey::AutogradMeta: return "AutogradMeta";
+        case DispatchKey::AutogradMPS: return "AutogradMPS";
         case DispatchKey::VmapCPU: return "VmapCPU";
         case DispatchKey::VmapCUDA: return "VmapCUDA";
         case DispatchKey::VmapVulkan: return "VmapVulkan";
@@ -149,6 +156,7 @@ inline std::string toString(DispatchKey key) {
         case DispatchKey::VmapSparseCUDA: return "VmapSparseCUDA";
         case DispatchKey::VmapSparse: return "VmapSparse";
         case DispatchKey::VmapMeta: return "VmapMeta";
+        case DispatchKey::VmapMPS: return "VmapMPS";
         case DispatchKey::Composite: return "Composite";
         case DispatchKey::VmapMode: return "VmapMode";
         case DispatchKey::DynamicLayerFrontMode: return "DynamicLayerFrontMode";
