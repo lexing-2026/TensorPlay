@@ -1,4 +1,4 @@
-#include <c10/metal/utils.h>
+#include <p10/metal/utils.h>
 
 #include <metal_stdlib>
 using namespace metal;
@@ -107,7 +107,7 @@ kernel void int4pack_mm(constant T *A [[buffer(0)]],
   uint k = (tid_in_simdgroup % threads_per_channel) * ks_per_thread;
   constexpr int k_jump = threads_per_channel * ks_per_thread;
 
-  using vecT = typename c10::metal::vec4type_t<T>;
+  using vecT = typename p10::metal::vec4type_t<T>;
   constant vecT *A_ptr = reinterpret_cast<constant vecT *>(A + m * K);
   constant uchar *B_ptr = B + ((n * K) / k_pack_factor);
 
@@ -215,7 +215,7 @@ INSTANTIATE_INT4MV(bfloat, 256);
  * 3. Repeat 1 & 2 along K axis, with K block size 32, accumulate the result in the 2x4 8x8 block.
  * 4. Dequantize the final result and store it in the output matrix.
  *
- * Variable names are changed to adapt to PyTorch convention such as M, N, K, etc.
+ * Variable names follow the M, N, K matrix convention.
  * Assuming row major order.
  * For more details please see inline comments.
  */
@@ -269,7 +269,7 @@ kernel void kernel_mul_mm(
     using T4 = typename BlockType<T>::type4;
     using Tsimd8x8 = typename BlockType<T>::simdgroup_type8x8;
     // sizes: x = M, y = K, z = N
-    // pytorch: M x K @ N x K -> M x N
+    // M x K @ N x K -> M x N
     // ggml: K x N @ K x M -> N x M
     uint32_t M = sizes.x; // M
     uint32_t K = sizes.y; // K
@@ -547,7 +547,7 @@ kernel void kernel_mul_mv(
     const int nw  = N_SIMDWIDTH;
 
     // sizes: x = M, y = K, z = N, given mv, x = M = 1
-    // pytorch: M x K @ N x K -> M x N
+    // M x K @ N x K -> M x N
     // ggml: K x N @ K x M -> N x M
     uint32_t K = sizes.y; // K
     uint32_t N = sizes.z; // N

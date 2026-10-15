@@ -30,8 +30,8 @@ static auto& lib = MetalShaderLibrary::getBundledLibrary();
 // Weight-only quantization (int4/int8, Metal shader based) and per-tensor /
 // per-channel affine quantization.
 //
-// The int4/int8 packed matmuls run as Metal compute shaders (ported from the
-// upstream MPS backend): C = A @ B^T * scales, with groupwise int4 dequant.
+// The int4/int8 packed matmuls run as Metal compute shaders:
+// C = A @ B^T * scales, with groupwise int4 dequant.
 // ---------------------------------------------------------------------------
 
 namespace {

@@ -653,6 +653,89 @@ class TestMPSArgExtrema(unittest.TestCase):
         self.assertEqual(imin.cpu().tolist(), [0, 1, 0])
 
 
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSTriangular(unittest.TestCase):
+    def test_tril_triu(self):
+        x = tp.arange(9, dtype=tp.float32, device="mps").reshape(3, 3)
+        self.assertTrue(tp.all(tp.tril(x).cpu() == x.cpu().tril()).item())
+        self.assertTrue(tp.all(tp.triu(x).cpu() == x.cpu().triu()).item())
+        self.assertTrue(tp.all(tp.tril(x, diagonal=1).cpu() == x.cpu().tril(1)).item())
+
+    def test_tril_inplace(self):
+        x = tp.arange(9, dtype=tp.float32, device="mps").reshape(3, 3)
+        x.tril_()
+        self.assertTrue(tp.all(x.cpu() == tp.tril(tp.arange(9, dtype=tp.float32, device="mps").reshape(3, 3)).cpu()).item())
+
+
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSPad(unittest.TestCase):
+    def test_constant_pad_nd(self):
+        x = tp.ones((1, 2, 2), dtype=tp.float32, device="mps")
+        y = tp.constant_pad_nd(x, [1, 1, 0, 0], 0.0)
+        self.assertEqual(y.shape, (1, 2, 4))
+        self.assertTrue(tp.all(y.cpu()[:, :, 0] == 0).item())
+        self.assertTrue(tp.all(y.cpu()[:, :, -1] == 0).item())
+
+
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSScan(unittest.TestCase):
+    def test_cumsum_cumprod(self):
+        x = tp.tensor([1.0, 2.0, 3.0, 4.0], dtype=tp.float32, device="mps")
+        self.assertTrue(tp.allclose(tp.cumsum(x, 0).cpu(), x.cpu().cumsum(0)))
+        self.assertTrue(tp.allclose(tp.cumprod(x, 0).cpu(), x.cpu().cumprod(0)))
+        m = tp.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=tp.float32, device="mps")
+        self.assertTrue(tp.allclose(tp.cumsum(m, dim=1).cpu(), m.cpu().cumsum(1)))
+
+
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSSort(unittest.TestCase):
+    def test_sort(self):
+        x = tp.tensor([[3.0, 1.0, 2.0], [6.0, 5.0, 4.0]],
+                      dtype=tp.float32, device="mps")
+        values, indices = tp.sort(x, dim=1, descending=False)
+        self.assertEqual(values.cpu().tolist(),
+                         [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+        self.assertEqual(indices.cpu().tolist(), [[1, 2, 0], [2, 1, 0]])
+        vd, _ = tp.sort(x, dim=1, descending=True)
+        self.assertEqual(vd.cpu().tolist(),
+                         [[3.0, 2.0, 1.0], [6.0, 5.0, 4.0]])
+
+    def test_argsort(self):
+        x = tp.tensor([3.0, 1.0, 2.0], dtype=tp.float32, device="mps")
+        self.assertEqual(tp.argsort(x, dim=0).cpu().tolist(), [1, 2, 0])
+
+
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSBucketize(unittest.TestCase):
+    def test_searchsorted(self):
+        seq = tp.tensor([1, 3, 5, 7], dtype=tp.int64, device="mps")
+        q = tp.tensor([0, 2, 5, 8], dtype=tp.int64, device="mps")
+        r = tp.searchsorted(seq, q, out_int32=False, right=False, side=None,
+                            sorter=None)
+        self.assertEqual(r.cpu().tolist(), [0, 1, 2, 4])
+        rr = tp.searchsorted(seq, q, out_int32=False, right=True, side=None,
+                             sorter=None)
+        self.assertEqual(rr.cpu().tolist(), [0, 1, 3, 4])
+
+    def test_bucketize(self):
+        boundaries = tp.tensor([1, 3, 5, 7], dtype=tp.int64, device="mps")
+        x = tp.tensor([0, 2, 5, 8], dtype=tp.int64, device="mps")
+        r = tp.bucketize(x, boundaries, out_int32=False, right=False)
+        self.assertEqual(r.cpu().tolist(), [0, 1, 2, 4])
+
+
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSDropout(unittest.TestCase):
+    def test_dropout(self):
+        x = tp.ones((100,), dtype=tp.float32, device="mps")
+        y = tp.dropout(x, p=0.5, train=True)
+        self.assertEqual(y.shape, (100,))
+        vals = set(y.cpu().tolist())
+        self.assertTrue(vals.issubset({0.0, 2.0}))
+        y2 = tp.dropout(x, p=0.5, train=False)
+        self.assertTrue(tp.all(y2.cpu() == 1.0).item())
+
+
 def ref_computed(x_cpu, w_cpu, b_cpu):
     # Reference layer-norm output with affine for a single row.
     mean = x_cpu.mean(dim=1, keepdim=True)

@@ -1,9 +1,9 @@
 // Metal helper functions
 #pragma once
-#include <c10/metal/common.h>
+#include <p10/metal/common.h>
 #include <metal_stdlib>
 
-namespace c10 {
+namespace p10 {
 namespace metal {
 
 namespace detail {
@@ -219,8 +219,8 @@ inline common_dtype<T, U> floor_divide(T x, U y) {
   return ::metal::floor(x / y);
 }
 
-// Python floor-division semantics (torch `rounding_mode="floor"`), a port of
-// c10::div_floor_floating. Unlike floor_divide's naive floor(x/y), this handles
+// Python floor-division semantics (`rounding_mode="floor"`), a port of
+// div_floor_floating. Unlike floor_divide's naive floor(x/y), this handles
 // non-finite and signed-zero inputs (e.g. inf // 1 -> nan, 1 // -inf -> -1).
 template <
     typename T,
@@ -407,7 +407,6 @@ inline common_dtype<T, U> remainder(const T x, const U y) {
   return rc == 0 || (x ^ y) > 0 ? rc : rc + y;
 }
 
-// Based on aten/src/ATen/native/Pow.h
 template <
     typename T,
     ::metal::enable_if_t<is_scalar_integral_v<T>, bool> = true>
@@ -512,7 +511,7 @@ inline float log1p(float x) {
   return rc;
 }
 
-// The function is ported from mlx
+// log1p computed with a fused formulation
 inline float2 log1p(float2 in) {
   float x = in.x;
   float y = in.y;
@@ -586,8 +585,8 @@ inline float hypot(float a_, float b_) {
   auto a = max(a_, b_);
   auto b = min(a_, b_);
 
-  auto b_over_a = c10::metal::div(b, a);
-  auto r = c10::metal::mul(b_over_a, b_over_a);
+  auto b_over_a = p10::metal::div(b, a);
+  auto r = p10::metal::mul(b_over_a, b_over_a);
   auto sqrt_1_plus_r = ::metal::precise::sqrt(1 + r);
 
   auto h1 = M_SQRT2_F * a;
@@ -648,4 +647,4 @@ inline void copy_bytes_aligned(device uchar* dst, constant uchar* src, uint n) {
 }
 
 } // namespace metal
-} // namespace c10
+} // namespace p10

@@ -534,7 +534,10 @@ if(USE_MPS)
         src/backend/mps/NormalizationKernels.mm
         src/backend/mps/IndexingKernels.mm
         src/backend/mps/ConvolutionKernels.mm
+        src/backend/mps/ScanSortKernels.mm
+        src/backend/mps/BucketizationKernels.mm
         src/backend/mps/TriangularOpsKernels.mm
+        src/backend/mps/DropoutKernels.mm
         src/backend/mps/PadKernels.mm
         src/backend/mps/LossKernels.mm
         src/backend/mps/QuantizedKernels.mm
