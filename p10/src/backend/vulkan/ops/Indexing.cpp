@@ -73,9 +73,6 @@ Tensor embedding_kernel(
       indices.dtype() == DType::Int64 || indices.dtype() == DType::Int32,
       "Vulkan embedding: indices must be Int64 or Int32");
   TP_CHECK(
-      indices.dim() == 1,
-      "Vulkan embedding supports a 1d index payload");
-  TP_CHECK(
       weight.dim() == 2,
       "Vulkan embedding expects a 2d [rows, features] weight");
 
@@ -88,7 +85,8 @@ Tensor embedding_kernel(
   const int64_t features = weight.size(1);
 
   // Output {index_count, features}: the 2-D texture geometry puts feature
-  // columns on x and the lookup row on y.
+  // columns on x and the lookup row on y.  Non-1d index tensors are flattened
+  // for the lookup and reshaped back to `index_shape + (features,)`.
   api::vTensor v_output{context, {index_count, features}, DType::Float32};
 
   const struct EmbeddingBlock block{
@@ -112,7 +110,13 @@ Tensor embedding_kernel(
       v_indices.image(pipeline_barrier, api::PipelineStage::COMPUTE),
       params.buffer());
 
-  return convert(v_output);
+  Tensor out = convert(v_output);
+  if (indices.dim() != 1) {
+    std::vector<int64_t> out_sizes = static_cast<std::vector<int64_t>>(indices.shape());
+    out_sizes.push_back(features);
+    out = out.reshape(out_sizes);
+  }
+  return out;
 }
 
 Tensor index_select_kernel(
