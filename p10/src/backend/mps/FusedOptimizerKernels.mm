@@ -269,6 +269,210 @@ void dispatch_fused_adam_multi(
   }
 }
 
+// Multi-tensor (foreach) fused SGD dispatch.  Uses the same chunked
+// threadgroup scheme as the Adam path: up to 32 parameters per launch, each
+// split into 64K-element chunks.  With momentum the depth is 3 (params,
+// grads, momentum buffers), otherwise 2.
+void dispatch_fused_sgd_multi(
+    id<MTLComputeCommandEncoder> computeEncoder,
+    const std::vector<Tensor>& params,
+    const std::vector<Tensor>& grads,
+    const std::vector<Tensor>& momentum_buffers,
+    bool momentum,
+    double weight_decay,
+    double lr,
+    const std::optional<Tensor>& lr_tensor,
+    double momentum_coeff,
+    double dampening,
+    bool nesterov,
+    bool maximize,
+    bool is_first_step,
+    const std::optional<Tensor>& grad_scale,
+    const std::optional<Tensor>& found_inf) {
+  constexpr int64_t kChunkSize = 65536;
+  constexpr int64_t kmaxThreadGroups = 32;
+  constexpr int64_t kmaxTensors = 32;
+  constexpr int64_t kThreadGroupSize = 512;
+  const int64_t depth = momentum ? 3 : 2;
+  const size_t num_tensors = params.size();
+  if (num_tensors == 0) {
+    return;
+  }
+
+  const std::string dtype = scalarToMetalTypeString(params[0].dtype());
+  const std::string kernel =
+      (momentum ? "fused_sgd_momentum_" : "fused_sgd_") + dtype;
+  id<MTLComputePipelineState> PSO =
+      MetalShaderLibrary::getBundledLibrary().getPipelineStateForFunc(kernel);
+  [computeEncoder setComputePipelineState:PSO];
+  MTLFunction_t func =
+      MetalShaderLibrary::getBundledLibrary().getFunction(kernel);
+  id<MTLArgumentEncoder> tensorArgumentEncoder =
+      [func newArgumentEncoderWithBufferIndex:0];
+  [func release];
+  id<MTLDevice> device = MPSDevice::getInstance()->device();
+
+  int64_t tensor_loc = 0;
+  int64_t threadgroup_loc = 0;
+  MPSMetadataArguments metadata_arguments;
+  memset(&metadata_arguments, 0, sizeof(metadata_arguments));
+  id<MTLBuffer> tensorArgumentBuffer = nil;
+
+  for (size_t tensor_index = 0; tensor_index < num_tensors; ++tensor_index) {
+    const int64_t numel = params[tensor_index].numel();
+    if (numel == 0) {
+      continue;
+    }
+    if (tensorArgumentBuffer == nil) {
+      tensorArgumentBuffer =
+          [[device newBufferWithLength:tensorArgumentEncoder.encodedLength
+                              options:0] autorelease];
+      [tensorArgumentEncoder setArgumentBuffer:tensorArgumentBuffer offset:0];
+    }
+    for (int64_t d = 0; d < depth; ++d) {
+      const Tensor* t = (d == 0)   ? &params[tensor_index]
+                        : (d == 1) ? &grads[tensor_index]
+                                   : &momentum_buffers[tensor_index];
+      [tensorArgumentEncoder setBuffer:mtl_buffer_of(*t)
+                                offset:0
+                               atIndex:static_cast<NSUInteger>(
+                                           d * kmaxTensors + tensor_loc)];
+    }
+    metadata_arguments.numels[tensor_loc] = static_cast<uint64_t>(numel);
+    tensor_loc++;
+
+    const int64_t chunks = numel / kChunkSize + (numel % kChunkSize != 0);
+    for (int64_t chunk = 0; chunk < chunks; ++chunk) {
+      metadata_arguments.threadgroup_to_tensor[threadgroup_loc] =
+          static_cast<uint64_t>(tensor_loc - 1);
+      metadata_arguments.threadgroup_to_chunk[threadgroup_loc] =
+          static_cast<uint64_t>(chunk);
+      threadgroup_loc++;
+
+      const bool tensor_full =
+          tensor_loc == kmaxTensors && chunk == chunks - 1;
+      const bool blocks_full = threadgroup_loc == kmaxThreadGroups;
+
+      if (tensor_full || blocks_full) {
+        [computeEncoder setBuffer:tensorArgumentBuffer offset:0 atIndex:0];
+        [computeEncoder setBytes:&metadata_arguments
+                          length:sizeof(MPSMetadataArguments)
+                           atIndex:1];
+        const float wd_f = static_cast<float>(weight_decay);
+        [computeEncoder setBytes:&wd_f length:sizeof(float) atIndex:2];
+        unsigned idx = 3;
+        if (momentum) {
+          const float mom_f = static_cast<float>(momentum_coeff);
+          [computeEncoder setBytes:&mom_f length:sizeof(float) atIndex:idx++];
+        }
+        if (lr_tensor.has_value() && lr_tensor->defined()) {
+          Tensor lr_c = shader_tensor(*lr_tensor);
+          [computeEncoder setBuffer:mtl_buffer_of(lr_c) offset:0 atIndex:idx++];
+        } else {
+          const float lr_f = static_cast<float>(lr);
+          [computeEncoder setBytes:&lr_f length:sizeof(float) atIndex:idx++];
+        }
+        if (momentum) {
+          const float damp_f = static_cast<float>(dampening);
+          const uint8_t nest_f = nesterov ? 1 : 0;
+          const uint8_t max_f = maximize ? 1 : 0;
+          const uint8_t first_f = is_first_step ? 1 : 0;
+          [computeEncoder setBytes:&damp_f length:sizeof(float) atIndex:idx++];
+          [computeEncoder setBytes:&nest_f length:sizeof(uint8_t) atIndex:idx++];
+          [computeEncoder setBytes:&max_f length:sizeof(uint8_t) atIndex:idx++];
+          [computeEncoder setBytes:&first_f length:sizeof(uint8_t) atIndex:idx++];
+        } else {
+          const uint8_t max_f = maximize ? 1 : 0;
+          [computeEncoder setBytes:&max_f length:sizeof(uint8_t) atIndex:idx++];
+        }
+        set_optional_float_buffer(computeEncoder, grad_scale, idx++);
+        set_optional_float_buffer(computeEncoder, found_inf, idx++);
+
+        MTLSize gridSize = MTLSizeMake(threadgroup_loc, 1, 1);
+        const uint32_t maxThreadsPerGroup =
+            [PSO maxTotalThreadsPerThreadgroup];
+        MTLSize threadGroupSize = MTLSizeMake(
+            std::min<uint32_t>(maxThreadsPerGroup, kThreadGroupSize), 1, 1);
+        [computeEncoder dispatchThreadgroups:gridSize
+                        threadsPerThreadgroup:threadGroupSize];
+
+        threadgroup_loc = 0;
+        if (chunk == chunks - 1) {
+          tensor_loc = 0;
+          tensorArgumentBuffer =
+              [[device newBufferWithLength:tensorArgumentEncoder.encodedLength
+                                  options:0] autorelease];
+          [tensorArgumentEncoder setArgumentBuffer:tensorArgumentBuffer
+                                            offset:0];
+        } else {
+          // Reuse the current tensor for the remaining chunks.
+          metadata_arguments.numels[0] =
+              metadata_arguments.numels[tensor_loc - 1];
+          tensorArgumentBuffer =
+              [[device newBufferWithLength:tensorArgumentEncoder.encodedLength
+                                  options:0] autorelease];
+          [tensorArgumentEncoder setArgumentBuffer:tensorArgumentBuffer
+                                            offset:0];
+          for (int64_t d = 0; d < depth; ++d) {
+            const Tensor* t = (d == 0)   ? &params[tensor_index]
+                              : (d == 1) ? &grads[tensor_index]
+                                         : &momentum_buffers[tensor_index];
+            [tensorArgumentEncoder
+                setBuffer:mtl_buffer_of(*t)
+                   offset:0
+                  atIndex:static_cast<NSUInteger>(d * kmaxTensors)];
+          }
+          tensor_loc = 1;
+        }
+      }
+    }
+  }
+
+  if (threadgroup_loc != 0) {
+    [computeEncoder setBuffer:tensorArgumentBuffer offset:0 atIndex:0];
+    [computeEncoder setBytes:&metadata_arguments
+                      length:sizeof(MPSMetadataArguments)
+                       atIndex:1];
+    const float wd_f = static_cast<float>(weight_decay);
+    [computeEncoder setBytes:&wd_f length:sizeof(float) atIndex:2];
+    unsigned idx = 3;
+    if (momentum) {
+      const float mom_f = static_cast<float>(momentum_coeff);
+      [computeEncoder setBytes:&mom_f length:sizeof(float) atIndex:idx++];
+    }
+    if (lr_tensor.has_value() && lr_tensor->defined()) {
+      Tensor lr_c = shader_tensor(*lr_tensor);
+      [computeEncoder setBuffer:mtl_buffer_of(lr_c) offset:0 atIndex:idx++];
+    } else {
+      const float lr_f = static_cast<float>(lr);
+      [computeEncoder setBytes:&lr_f length:sizeof(float) atIndex:idx++];
+    }
+    if (momentum) {
+      const float damp_f = static_cast<float>(dampening);
+      const uint8_t nest_f = nesterov ? 1 : 0;
+      const uint8_t max_f = maximize ? 1 : 0;
+      const uint8_t first_f = is_first_step ? 1 : 0;
+      [computeEncoder setBytes:&damp_f length:sizeof(float) atIndex:idx++];
+      [computeEncoder setBytes:&nest_f length:sizeof(uint8_t) atIndex:idx++];
+      [computeEncoder setBytes:&max_f length:sizeof(uint8_t) atIndex:idx++];
+      [computeEncoder setBytes:&first_f length:sizeof(uint8_t) atIndex:idx++];
+    } else {
+      const uint8_t max_f = maximize ? 1 : 0;
+      [computeEncoder setBytes:&max_f length:sizeof(uint8_t) atIndex:idx++];
+    }
+    set_optional_float_buffer(computeEncoder, grad_scale, idx++);
+    set_optional_float_buffer(computeEncoder, found_inf, idx++);
+
+    MTLSize gridSize = MTLSizeMake(threadgroup_loc, 1, 1);
+    const uint32_t maxThreadsPerGroup = [PSO maxTotalThreadsPerThreadgroup];
+    MTLSize threadGroupSize =
+        MTLSizeMake(std::min<uint32_t>(maxThreadsPerGroup, kThreadGroupSize),
+                    1, 1);
+    [computeEncoder dispatchThreadgroups:gridSize
+                    threadsPerThreadgroup:threadGroupSize];
+  }
+}
+
 void fused_adam_impl(std::vector<Tensor> params,
                     const std::vector<Tensor>& grads,
                     const std::vector<Tensor>& exp_avgs,
@@ -476,6 +680,128 @@ void fused_adamw_tensor_lr_mps(std::vector<Tensor> params,
                   grad_scale, found_inf);
 }
 
+void fused_sgd_impl(std::vector<Tensor> params,
+                    const std::vector<Tensor>& grads,
+                    const std::vector<Tensor>& momentum_buffers,
+                    double weight_decay,
+                    double momentum,
+                    double lr,
+                    const std::optional<Tensor>& lr_tensor,
+                    double dampening,
+                    bool nesterov,
+                    bool maximize,
+                    bool is_first_step,
+                    const std::optional<Tensor>& grad_scale,
+                    const std::optional<Tensor>& found_inf) {
+  const char* op = "_fused_sgd_";
+  const size_t n = params.size();
+  if (n == 0) {
+    return;
+  }
+  if (grads.size() != n) {
+    TP_THROW(ValueError, op, ": parameter and gradient list sizes mismatch");
+  }
+  if (!momentum_buffers.empty() && momentum_buffers.size() != n) {
+    TP_THROW(ValueError, op, ": momentum buffer list size mismatch");
+  }
+  for (size_t i = 0; i < n; ++i) {
+    is_mps_tensor(params[i], op);
+    is_mps_tensor(grads[i], op);
+  }
+  for (size_t i = 0; i < momentum_buffers.size(); ++i) {
+    is_mps_tensor(momentum_buffers[i], op);
+  }
+
+  const bool use_momentum = !momentum_buffers.empty();
+  if (use_momentum && momentum <= 0) {
+    TP_THROW(RuntimeError,
+             op, ": momentum must be > 0 when momentum buffers are provided");
+  }
+  if (!use_momentum && momentum != 0) {
+    TP_THROW(RuntimeError,
+             op, ": momentum must be 0 when momentum buffers are empty");
+  }
+
+  std::vector<Tensor> p_nz, g_nz, m_nz;
+  for (size_t i = 0; i < n; ++i) {
+    if (params[i].numel() == 0) {
+      continue;
+    }
+    p_nz.push_back(shader_tensor(params[i]));
+    g_nz.push_back(shader_tensor(grads[i]));
+    if (use_momentum) {
+      m_nz.push_back(shader_tensor(momentum_buffers[i]));
+    }
+  }
+  if (p_nz.empty()) {
+    return;
+  }
+  const std::string dtype = scalarToMetalTypeString(p_nz[0].dtype());
+  if (dtype != "float" && dtype != "half" && dtype != "bfloat") {
+    TP_THROW(RuntimeError,
+             op, ": MPS fused SGD supports float32/float16/bfloat16");
+  }
+
+  MPSStream* mpsStream = getCurrentMPSStream();
+  dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+    @autoreleasepool {
+      id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
+      dispatch_fused_sgd_multi(computeEncoder, p_nz, g_nz, m_nz, use_momentum,
+                               weight_decay, lr, lr_tensor, momentum,
+                               dampening, nesterov, maximize, is_first_step,
+                               grad_scale, found_inf);
+      mpsStream->endKernelCoalescing();
+    }
+  });
+}
+
+void fused_sgd_mps(std::vector<Tensor> params,
+                   std::vector<Tensor> grads,
+                   std::vector<Tensor> momentum_buffers,
+                   double weight_decay,
+                   double momentum,
+                   double lr,
+                   double dampening,
+                   bool nesterov,
+                   bool maximize,
+                   bool is_first_step,
+                   const std::optional<Tensor>& grad_scale,
+                   const std::optional<Tensor>& found_inf) {
+  fused_sgd_impl(std::move(params), std::move(grads),
+                 std::move(momentum_buffers), weight_decay, momentum, lr,
+                 std::nullopt, dampening, nesterov, maximize, is_first_step,
+                 grad_scale, found_inf);
+}
+
+void fused_sgd_tensor_lr_mps(std::vector<Tensor> params,
+                             std::vector<Tensor> grads,
+                             std::vector<Tensor> momentum_buffers,
+                             double weight_decay,
+                             double momentum,
+                             const Tensor& lr,
+                             double dampening,
+                             bool nesterov,
+                             bool maximize,
+                             bool is_first_step,
+                             const std::optional<Tensor>& grad_scale,
+                             const std::optional<Tensor>& found_inf) {
+  if (lr.device().is_cpu()) {
+    fused_sgd_impl(std::move(params), std::move(grads),
+                   std::move(momentum_buffers), weight_decay, momentum,
+                   read_scalar_lr(lr), std::nullopt, dampening, nesterov,
+                   maximize, is_first_step, grad_scale, found_inf);
+    return;
+  }
+  if (lr.numel() != 1) {
+    TP_THROW(RuntimeError,
+             "_fused_sgd_.tensor_lr: lr must be a scalar tensor");
+  }
+  fused_sgd_impl(std::move(params), std::move(grads),
+                 std::move(momentum_buffers), weight_decay, momentum, 0.0, lr,
+                 dampening, nesterov, maximize, is_first_step, grad_scale,
+                 found_inf);
+}
+
 } // namespace
 
 TENSORPLAY_LIBRARY_IMPL(MPS, FusedOptimizerKernels) {
@@ -483,6 +809,8 @@ TENSORPLAY_LIBRARY_IMPL(MPS, FusedOptimizerKernels) {
   m.impl("_fused_adamw_", fused_adamw_mps);
   m.impl("_fused_adam_.tensor_lr", fused_adam_tensor_lr_mps);
   m.impl("_fused_adamw_.tensor_lr", fused_adamw_tensor_lr_mps);
+  m.impl("_fused_sgd_", fused_sgd_mps);
+  m.impl("_fused_sgd_.tensor_lr", fused_sgd_tensor_lr_mps);
 }
 
 } // namespace mps
