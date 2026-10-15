@@ -19,6 +19,8 @@
 #include "Exception.h"
 #include "Parallel.h"
 
+#include <bit>
+
 #include <algorithm>
 #include <cstdint>
 #include <vector>
@@ -350,7 +352,7 @@ void pauli_expectation_kernel(const scalar_t* state, real_t* partial, int64_t ba
                 const real_t im = amplitude.real() * turned.imag() -
                                   amplitude.imag() * turned.real();
                 // Z and Y factors each contribute a sign where their bit reads 1.
-                const int64_t ones = __builtin_popcountll(
+                const int64_t ones = std::popcount(
                     static_cast<uint64_t>(x) & word.sign_mask);
                 if (ones & 1) {
                     acc_re -= re;
