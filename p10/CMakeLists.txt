@@ -515,6 +515,7 @@ if(USE_MPS)
     # copy, arithmetic, elementwise and reduction kernels.  The sources are
     # Objective-C++ and follow manual reference counting.
     set(TP_MPS_BACKEND_SOURCES
+        src/ProfilerMps.mm
         src/backend/mps/MPSDevice.mm
         src/backend/mps/MPSAllocator.mm
         src/backend/mps/MPSStream.mm
@@ -542,6 +543,12 @@ if(USE_MPS)
         src/backend/mps/LossKernels.mm
         src/backend/mps/QuantizedKernels.mm
         src/backend/mps/SparseKernels.mm
+        src/backend/mps/RMSNormKernels.mm
+        src/backend/mps/EmbeddingKernels.mm
+        src/backend/mps/FusedOptimizerKernels.mm
+        src/backend/mps/ShapeExpandKernels.mm
+        src/backend/mps/TopKSamplingKernels.mm
+        src/backend/mps/AttentionKernels.mm
     )
     list(APPEND P10_SOURCES ${TP_MPS_BACKEND_SOURCES})
 

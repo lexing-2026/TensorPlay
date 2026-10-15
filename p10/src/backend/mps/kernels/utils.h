@@ -1,6 +1,6 @@
 // Metal helper functions
 #pragma once
-#include <p10/metal/common.h>
+#include "common.h"
 #include <metal_stdlib>
 
 namespace p10 {

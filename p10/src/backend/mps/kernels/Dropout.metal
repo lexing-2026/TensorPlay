@@ -1,5 +1,5 @@
-#include <p10/metal/random.h>
-#include <p10/metal/utils.h>
+#include "random.h"
+#include "utils.h"
 #include <metal_stdlib>
 
 using namespace metal;

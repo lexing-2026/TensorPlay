@@ -1,4 +1,4 @@
-#include <p10/metal/utils.h>
+#include "utils.h"
 
 #include <metal_stdlib>
 using namespace metal;
