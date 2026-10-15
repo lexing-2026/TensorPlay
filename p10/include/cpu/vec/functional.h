@@ -8,8 +8,10 @@
 // partial register for the tail, so an array of any length is covered and no
 // element past its end is read or written.
 
+#include "Macros.h"
 #include "cpu/vec/vec.h"
 #include "cpu/vec/vec_n.h"
+#include "cpu/vec/vec_convert.h"
 #include "Exception.h"
 
 #include <cstdint>
@@ -25,7 +27,7 @@ namespace tensorplay {
 template <int n>
 struct ForcedUnroll {
   template <typename Func, typename... Args>
-  inline __attribute__((always_inline)) void operator()(
+  TP_ALWAYS_INLINE void operator()(
       const Func& f, Args... args) const {
     ForcedUnroll<n - 1>{}(f, args...);
     f(std::integral_constant<int, n - 1>{}, args...);
@@ -35,7 +37,7 @@ struct ForcedUnroll {
 template <>
 struct ForcedUnroll<1> {
   template <typename Func, typename... Args>
-  inline __attribute__((always_inline)) void operator()(
+  TP_ALWAYS_INLINE void operator()(
       const Func& f, Args... args) const {
     f(std::integral_constant<int, 0>{}, args...);
   }
@@ -299,7 +301,11 @@ inline void transpose_block(VectorizedN<T, N>& input) {
 
 // A sixteen-bit float register widened to the two float registers holding its
 // lanes, and two float registers narrowed back into one -- the conversions a
-// whole-array helper computing a narrow type in float goes through.
+// whole-array helper computing a narrow type in float goes through.  Only the
+// x86 vector layers provide the intrinsic bf16/fp16 widening helpers; other
+// backends fall back to the generic buffer conversion in vec_convert.h.
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || \
+    defined(_M_IX86)
 template <>
 inline std::tuple<Vectorized<float>, Vectorized<float>> convert_to_float<
     tensorplay::BFloat16>(const Vectorized<tensorplay::BFloat16>& a) {
@@ -325,6 +331,7 @@ inline Vectorized<tensorplay::Half> convert_from_float<tensorplay::Half>(
     const Vectorized<float>& b) {
   return convert_float_half(a, b);
 }
+#endif
 
 } // namespace tensorplay::vec
 

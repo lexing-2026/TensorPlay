@@ -1,3 +1,4 @@
+#include "Macros.h"
 #include "cpu/QuantizedElementwiseKernels.h"
 #include "cpu/vec/functional.h"
 #include "cpu/vec/vec.h"
@@ -328,8 +329,8 @@ void int4_pack_impl(const int32_t* src, uint8_t* dst, int64_t n, int64_t k) {
 }
 
 template<class T, class X = T, class P = T>
-void int4_mm_codes(const X* __restrict__ x, const uint8_t* __restrict__ packed,
-        const P* __restrict__ params, T* __restrict__ output,
+void int4_mm_codes(const X* TP_RESTRICT x, const uint8_t* TP_RESTRICT packed,
+        const P* TP_RESTRICT params, T* TP_RESTRICT output,
         int64_t m, int64_t n, int64_t k, int64_t group) {
     using FV = vec::Vectorized<float>;
     constexpr int lanes = FV::size(), columns = int4_columns;
@@ -446,8 +447,8 @@ void int4_mm_codes(const X* __restrict__ x, const uint8_t* __restrict__ packed,
 
 #ifdef CPU_CAPABILITY_AVX512
 template<int Rows, int Columns>
-void int4_bfloat16_rows(const BFloat16* __restrict__ x, const uint8_t* __restrict__ packed,
-        const BFloat16* __restrict__ params, BFloat16* __restrict__ output,
+void int4_bfloat16_rows(const BFloat16* TP_RESTRICT x, const uint8_t* TP_RESTRICT packed,
+        const BFloat16* TP_RESTRICT params, BFloat16* TP_RESTRICT output,
         int64_t m, int64_t n, int64_t k, int64_t group) {
     using V = vec::Vectorized<float>;
     using B = vec::Vectorized<BFloat16>;
@@ -503,9 +504,9 @@ void int4_bfloat16_rows(const BFloat16* __restrict__ x, const uint8_t* __restric
 
 #if defined(CPU_CAPABILITY_AVX2) && !defined(CPU_CAPABILITY_AVX512)
 template<int Rows>
-void int4_bfloat16_avx2_tile(const BFloat16* __restrict__ input,
-        const uint8_t* __restrict__ packed, const BFloat16* __restrict__ params,
-        BFloat16* __restrict__ output, int64_t n, int64_t k, int64_t group) {
+void int4_bfloat16_avx2_tile(const BFloat16* TP_RESTRICT input,
+        const uint8_t* TP_RESTRICT packed, const BFloat16* TP_RESTRICT params,
+        BFloat16* TP_RESTRICT output, int64_t n, int64_t k, int64_t group) {
     constexpr int columns = 32;
     constexpr int vectors = columns / 8;
     constexpr int prefetch_features = 16 * 4;

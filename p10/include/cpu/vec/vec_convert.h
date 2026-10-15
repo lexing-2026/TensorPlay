@@ -151,17 +151,46 @@ round_convert(const VectorizedN<src_t, src_n>& src) {
 
 } // namespace CPU_CAPABILITY
 
+// Generic widening/narrowing conversions for the reduced-precision floating
+// point types.  The x86 vector layers override these with intrinsic
+// register conversions (see functional.h); every other backend falls back to
+// this buffer path, which is portable across all Vectorized specializations.
 template <
     typename scalar_t,
     typename std::enable_if_t<is_reduced_floating_point_v<scalar_t>, int> = 0>
 inline std::tuple<Vectorized<float>, Vectorized<float>> convert_to_float(
-    const Vectorized<scalar_t>&);
+    const Vectorized<scalar_t>& a) {
+  constexpr int narrow_size = Vectorized<scalar_t>::size();
+  constexpr int float_size = Vectorized<float>::size();
+  static_assert(narrow_size == 2 * float_size);
+  __at_align__ scalar_t narrow[narrow_size];
+  a.store(narrow);
+  __at_align__ float wide[narrow_size];
+  for (const auto i : tensorplay::irange(narrow_size)) {
+    wide[i] = static_cast<float>(narrow[i]);
+  }
+  return std::make_tuple(
+      Vectorized<float>::loadu(wide),
+      Vectorized<float>::loadu(wide + float_size));
+}
 
 template <
     typename scalar_t,
     typename std::enable_if_t<is_reduced_floating_point_v<scalar_t>, int> = 0>
 inline Vectorized<scalar_t> convert_from_float(
-    const Vectorized<float>&,
-    const Vectorized<float>&);
+    const Vectorized<float>& a,
+    const Vectorized<float>& b) {
+  constexpr int narrow_size = Vectorized<scalar_t>::size();
+  constexpr int float_size = Vectorized<float>::size();
+  static_assert(narrow_size == 2 * float_size);
+  __at_align__ float wide[narrow_size];
+  a.store(wide);
+  b.store(wide + float_size);
+  __at_align__ scalar_t narrow[narrow_size];
+  for (const auto i : tensorplay::irange(narrow_size)) {
+    narrow[i] = static_cast<scalar_t>(wide[i]);
+  }
+  return Vectorized<scalar_t>::loadu(narrow);
+}
 
 } // namespace tensorplay::vec

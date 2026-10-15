@@ -973,15 +973,19 @@ struct VectorizedQuantizedConverter {
       Vectorized<float> zero_point,
       Vectorized<float> /*scale_zp_premul*/) const {
     float_vec_return_type rv;
+    __at_align__ float scale_vals[Vectorized<float>::size()];
+    __at_align__ float zp_vals[Vectorized<float>::size()];
+    scale.store(scale_vals);
+    zero_point.store(zp_vals);
     for (const auto i : tensorplay::irange(float_num_vecs())) {
       float tmp_vals[Vectorized<float>::size()];
       for (const auto j : tensorplay::irange(Vectorized<float>::size())) {
         tmp_vals[j] = tensorplay::dequantize_val<T>(
-            scale[j],
-            zero_point[j],
+            scale_vals[j],
+            zp_vals[j],
             T(vals[Vectorized<float>::size() * i + j]));
       }
-      rv[i] = Vectorized<float>(tmp_vals);
+      rv[i] = Vectorized<float>::loadu(tmp_vals);
     }
     return rv;
   }
@@ -1360,54 +1364,6 @@ Vectorized<tensorplay::quint8> inline maximum(
 }
 
 #endif // if defined(CPU_CAPABILITY_AVX2)
-
-#if (defined(__aarch64__) && !defined(CPU_CAPABILITY_SVE256))
-std::pair<Vectorized<float>, Vectorized<float>> inline convert_int8_to_float(
-    tensorplay::vec::Vectorized<int8_t> src) {
-  auto s8x8 = vget_low_s8(src);
-  auto s16x8 = vmovl_s8(s8x8);
-
-  auto s32x4_hi = vmovl_s16(vget_high_s16(s16x8));
-  auto s32x4_lo = vmovl_s16(vget_low_s16(s16x8));
-
-  return std::make_pair(
-      Vectorized<float>(vcvtq_f32_s32(s32x4_lo)),
-      Vectorized<float>(vcvtq_f32_s32(s32x4_hi)));
-}
-
-std::pair<Vectorized<float>, Vectorized<float>> inline convert_int8_to_float(
-    tensorplay::vec::Vectorized<uint8_t> src) {
-  auto u8x8 = vget_low_u8(src);
-  auto u16x8 = vmovl_u8(u8x8);
-  auto u32x4_hi = vmovl_u16(vget_high_u16(u16x8));
-  auto u32x4_lo = vmovl_u16(vget_low_u16(u16x8));
-
-  return std::make_pair(
-      Vectorized<float>(vcvtq_f32_u32(u32x4_lo)),
-      Vectorized<float>(vcvtq_f32_u32(u32x4_hi)));
-}
-
-Vectorized<float> inline convert_int8_half_register_to_float(
-    tensorplay::vec::Vectorized<int8_t> src) {
-  auto s8x8 = vget_low_s8(src);
-  auto s16x8 = vmovl_s8(s8x8);
-
-  auto s32x4_lo = vmovl_s16(vget_low_s16(s16x8));
-
-  return Vectorized<float>(vcvtq_f32_s32(s32x4_lo));
-}
-
-Vectorized<float> inline convert_int8_half_register_to_float(
-    tensorplay::vec::Vectorized<uint8_t> src) {
-  auto u8x8 = vget_low_u8(src);
-  auto u16x8 = vmovl_u8(u8x8);
-  auto u32x4_lo = vmovl_u16(vget_low_u16(u16x8));
-
-  return Vectorized<float>(vcvtq_f32_u32(u32x4_lo));
-}
-
-#endif
-
 
 } // namespace CPU_CAPABILITY
 } // namespace tensorplay::vec
