@@ -112,8 +112,10 @@ struct InputBuffer {
         if (pos >= buffer.size() || !var.defined()) return;
 
         const bool is_accelerator =
-            var.device().type() == DeviceType::CUDA ||
-            var.device().type() == DeviceType::Vulkan;
+            var.device().type() == DeviceType::CUDA;
+        // Vulkan intentionally does not take this path: it has no stream or
+        // event support in this file, so accelerator accumulation ordering
+        // does not apply and the plain path below is correct.
         if (!is_accelerator) {
             if (!buffer[pos].defined()) {
                 buffer[pos] = std::move(var);

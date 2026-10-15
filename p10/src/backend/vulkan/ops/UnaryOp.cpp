@@ -463,6 +463,12 @@ Tensor& erf_inplace_kernel(Tensor& self) {
       self, "erfinplace", "buffer_erfinplace", "unary erf");
 }
 
+// Conjugation is the identity for the real and integer dtypes this backend
+// supports; complex tensors are rejected at allocation time.
+Tensor conj_kernel(const Tensor& self) {
+  return self;
+}
+
 TENSORPLAY_LIBRARY_IMPL(Vulkan, UnaryOpKernels) {
   m.impl("exp", &tensorplay::vulkan::ops::exp_kernel);
   m.impl("exp_", &tensorplay::vulkan::ops::exp_inplace_kernel);
@@ -522,6 +528,7 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, UnaryOpKernels) {
   m.impl("reciprocal_", &tensorplay::vulkan::ops::reciprocal_inplace_kernel);
   m.impl("erf", &tensorplay::vulkan::ops::erf_kernel);
   m.impl("erf_", &tensorplay::vulkan::ops::erf_inplace_kernel);
+  m.impl("conj", &tensorplay::vulkan::ops::conj_kernel);
 }
 
 } // namespace ops

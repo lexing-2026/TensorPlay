@@ -17,7 +17,12 @@ namespace ops {
 // Forward declarations of kernels defined in sibling translation units.
 Tensor mul_kernel(const Tensor& self, const Tensor& other);
 Tensor mul_scalar_kernel(const Tensor& self, const Scalar& other);
+Tensor div_kernel(const Tensor& self, const Tensor& other);
 Tensor gt_scalar_kernel(const Tensor& self, const Scalar& other);
+Tensor& add_inplace_kernel(
+    Tensor& self,
+    const Tensor& other,
+    const Scalar& alpha);
 Tensor& bernoulli_scalar_kernel(
     Tensor& self,
     double p,
@@ -74,6 +79,30 @@ std::tuple<Tensor, Tensor> native_dropout_kernel(
   // The saved mask is boolean, matching the CPU/CUDA contract.
   Tensor mask_bool = gt_scalar_kernel(mask, Scalar(0.5));
   return std::make_tuple(out, mask_bool);
+}
+
+Tensor& addcdiv__kernel(
+    Tensor& self,
+    const Tensor& tensor1,
+    const Tensor& tensor2,
+    const Scalar& value) {
+  Tensor q = div_kernel(tensor1, tensor2);
+  if (value.to<double>() != 1.0) {
+    q = mul_scalar_kernel(q, value);
+  }
+  return add_inplace_kernel(self, q, Scalar(1.0));
+}
+
+Tensor& addcmul__kernel(
+    Tensor& self,
+    const Tensor& tensor1,
+    const Tensor& tensor2,
+    const Scalar& value) {
+  Tensor p = mul_kernel(tensor1, tensor2);
+  if (value.to<double>() != 1.0) {
+    p = mul_scalar_kernel(p, value);
+  }
+  return add_inplace_kernel(self, p, Scalar(1.0));
 }
 
 Tensor pow_scalar_kernel(const Tensor& self, const Scalar& exponent) {
@@ -514,6 +543,8 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, MiscKernels) {
   m.impl("reflection_pad_nd", &tensorplay::vulkan::ops::reflection_pad_nd_kernel);
   m.impl("replication_pad_nd", &tensorplay::vulkan::ops::replication_pad_nd_kernel);
   m.impl("native_dropout", &tensorplay::vulkan::ops::native_dropout_kernel);
+  m.impl("addcdiv_", &tensorplay::vulkan::ops::addcdiv__kernel);
+  m.impl("addcmul_", &tensorplay::vulkan::ops::addcmul__kernel);
 }
 
 #endif /* USE_VULKAN */
