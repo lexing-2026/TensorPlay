@@ -12,8 +12,12 @@
 #include <limits>
 #include <vector>
 
+#include "tensorplay/ops/TPXOpsGenerated.h"
+
 namespace tensorplay {
 namespace mps {
+
+namespace ops = tpx::ops;
 
 // ---------------------------------------------------------------------------
 // logsumexp
@@ -90,10 +94,21 @@ Tensor norm_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim,
   return self.abs().pow(Scalar(p)).sum(dim, keepdim).pow(Scalar(1.0 / p));
 }
 
+bool equal_kernel(const Tensor& self, const Tensor& src) {
+  if (self.sizes() != src.sizes()) {
+    return false;
+  }
+  if (self.numel() == 0) {
+    return true;
+  }
+  return ops::item(ops::all(ops::eq(self, src))).to<bool>();
+}
+
 TENSORPLAY_LIBRARY_IMPL(MPS, MiscKernels) {
   m.impl("logsumexp", logsumexp_kernel);
   m.impl("norm", norm_kernel);
   m.impl("norm.dim", norm_dim_kernel);
+  m.impl("equal", equal_kernel);
 }
 
 } // namespace mps
