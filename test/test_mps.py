@@ -854,5 +854,74 @@ class TestMPSSparse(unittest.TestCase):
         self.assertEqual(row.to_dense().cpu().tolist(), [[2.0, 0.0, 4.0]])
 
 
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSProfiler(unittest.TestCase):
+    """MPS-specific profiler behavior.
+
+    The shared profiler frontend (tensorplay.profiler) is backend-agnostic and
+    is covered by test/profiler/test_profiler.py; these tests only pin the
+    MPS-specific pieces: the activity flag, the automatic event-pair timing
+    request, and the resolution of per-op GPU time from the Metal command
+    buffer.
+
+    The MPS profiler support is gated on the ProfilerActivity.MPS enum member
+    being present, so these tests skip on builds where the MPS profiler has
+    not been compiled in yet.
+    """
+
+    def _mps_profiler_available(self):
+        from tensorplay import profiler as tp_prof
+
+        return hasattr(tp_prof.ProfilerActivity, "MPS")
+
+    def test_supported_activities_includes_mps(self):
+        from tensorplay import profiler as tp_prof
+
+        if not self._mps_profiler_available():
+            self.skipTest("MPS profiler not available in this build")
+        self.assertIn(tp_prof.ProfilerActivity.MPS,
+                      tp_prof.supported_activities())
+
+    def test_mps_activity_implies_gpu_timing(self):
+        from tensorplay import profiler as tp_prof
+
+        if not self._mps_profiler_available():
+            self.skipTest("MPS profiler not available in this build")
+        # MPS has no kernel-level trace collector; requesting the MPS
+        # activity must turn on the event-pair timing path automatically.
+        with tp_prof.profile(activities=[tp_prof.ProfilerActivity.MPS]) as prof:
+            self.assertTrue(prof.gpu_timing)
+            a = tp.ones((64, 64), dtype=tp.float32, device="mps")
+            b = a + a
+
+    def test_mps_gpu_timing_resolves(self):
+        from tensorplay import profiler as tp_prof
+
+        if not self._mps_profiler_available():
+            self.skipTest("MPS profiler not available in this build")
+        a = tp.ones((4096,), dtype=tp.float32, device="mps")
+        with tp_prof.profile(
+            activities=[tp_prof.ProfilerActivity.MPS],
+            record_shapes=True,
+        ) as prof:
+            a.add(a)
+            a.mul(a)
+        tp.mps.synchronize()
+        timed = [ev for ev in prof.events if ev[0].startswith(("add", "mul"))]
+        self.assertTrue(timed)
+        # Event field 8 is the per-op GPU time in milliseconds; MPS fills it
+        # from the committed command buffer's GPUStartTime/GPUEndTime.
+        self.assertTrue(all(ev[8] >= 0 for ev in timed))
+
+    def test_cpu_only_profile_keeps_negative_gpu_time(self):
+        from tensorplay import profiler as tp_prof
+
+        # Without the MPS activity request the frontend must behave exactly
+        # as on any other backend: no device timing, gpu_ms stays negative.
+        with tp_prof.profile() as prof:
+            tp.ones((4, 4)).add(tp.ones((4, 4)))
+        self.assertTrue(all(ev[8] < 0 for ev in prof.events))
+
+
 if __name__ == "__main__":
     unittest.main()

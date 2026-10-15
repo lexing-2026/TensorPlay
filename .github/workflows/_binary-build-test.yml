@@ -89,6 +89,16 @@ on:
         type: string
         default: short
         description: "CPU benchmark suite size: short, long, or all"
+      run_mps_benchmarks:
+        required: false
+        type: boolean
+        default: false
+        description: Run MPS operator performance benchmarks (macOS only)
+      mps_benchmark_suite:
+        required: false
+        type: string
+        default: short
+        description: "MPS benchmark suite size: short, long, or all"
       test_matrix:
         required: false
         type: string
@@ -731,6 +741,72 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: ${{ inputs.build_name }}-performance
+          path: benchmark-results/
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Run MPS operator benchmark
+        if: ${{ inputs.run_mps_benchmarks && runner.os == 'macOS' }}
+        shell: bash
+        env:
+          MPS_BENCH_SUITE: ${{ inputs.mps_benchmark_suite }}
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark-results
+          suite="$MPS_BENCH_SUITE"
+          if [[ "$suite" == "all" ]]; then
+            suite=long
+          fi
+          python benchmark/host_probe.py \
+            --json-out benchmark-results/host-probe.json \
+            | tee benchmark-results/host-probe.log
+          python benchmark/bench_mps_operator.py --suite "$suite" --dtype f32 \
+            --reps 3 --json-out benchmark-results/mps-operator.json \
+            | tee benchmark-results/mps-operator.log
+
+      - name: Enforce MPS performance floor
+        if: ${{ inputs.run_mps_benchmarks && runner.os == 'macOS' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          suite="${{ inputs.mps_benchmark_suite }}"
+          if [[ "$suite" == "all" ]]; then
+            suite=long
+          fi
+          # The gate compares against the same-runner history maintained on
+          # the bench-data branch: each hardware model keeps the most recent
+          # runs, and a new model has no baseline yet, so its first run is
+          # recorded rather than gated.
+          rm -rf bench-data-history
+          if git ls-remote --heads \
+              "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+              bench-data >/dev/null 2>&1; then
+            git clone -q --depth 1 --branch bench-data \
+              "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+              bench-data-history || true
+          fi
+          python benchmark/check_mps_performance_regression.py \
+            --operator-json benchmark-results/mps-operator.json \
+            --history bench-data-history/latest.json \
+            --host-probe benchmark-results/host-probe.json \
+            --operator-max-slowdown 0.30 \
+            --summary-out benchmark-results/mps-regression-summary.md
+
+      - name: Publish MPS performance summary
+        if: ${{ always() && inputs.run_mps_benchmarks && runner.os == 'macOS' }}
+        shell: bash
+        run: |
+          if [[ -f benchmark-results/mps-regression-summary.md ]]; then
+            cat benchmark-results/mps-regression-summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload MPS performance logs
+        if: ${{ always() && inputs.run_mps_benchmarks && runner.os == 'macOS' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.build_name }}-mps-performance
           path: benchmark-results/
           retention-days: 30
           if-no-files-found: warn

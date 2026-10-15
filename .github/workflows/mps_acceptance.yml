@@ -1,0 +1,46 @@
+name: mps_acceptance
+
+# MPS backend acceptance: builds the macOS arm64 wheel and runs the full MPS
+# test suite (test/test_mps.py) on a Metal-capable runner.  The lane is
+# path-filtered on PRs so only changes that can affect the MPS backend pay for
+# a macOS wheel build; manual dispatches always run the full acceptance.
+# Main-branch pushes already run the same suite in trunk.yml's "mps" shard.
+
+on:
+  pull_request:
+    paths:
+      - "p10/src/backend/mps/**"
+      - "p10/include/backend/mps/**"
+      - "p10/src/ProfilerMps.mm"
+      - "p10/src/ProfilerGpu.cpp"
+      - "p10/src/ProfilerCuptiStub.cpp"
+      - "tensorplay/profiler/**"
+      - "test/test_mps.py"
+      - "p10/CMakeLists.txt"
+      - ".github/workflows/mps_acceptance.yml"
+      - ".github/workflows/_binary-build-test.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref_name }}
+  cancel-in-progress: true
+
+permissions: read-all
+
+jobs:
+  mps-acceptance:
+    name: mps-acceptance
+    permissions:
+      contents: write
+      actions: read
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/_binary-build-test.yml
+    with:
+      build_name: tensorplay-macos-arm64-py3_12-cpu
+      build_environment: mps-acceptance-macos-arm64-py3_12
+      runs_on: macos-14
+      python_version: "3.12"
+      test_matrix: '[{"name":"mps","test_files":"test/test_mps.py"}]'
+      upload_release: false
+    secrets: inherit
