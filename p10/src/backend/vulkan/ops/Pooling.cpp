@@ -29,8 +29,16 @@ Tensor pool2d_impl(
     bool ceil_mode) {
   validate_pool_input(input_arg);
 
+  // Empty strides default to the kernel size and empty padding to zero,
+  // matching the module-level entry points that normalize before dispatch.
+  const std::vector<int64_t> resolved_stride =
+      stride.empty() ? kernel_size : stride;
+  const std::vector<int64_t> resolved_padding =
+      padding.empty() ? std::vector<int64_t>(2, 0) : padding;
+
   TP_CHECK(
-      kernel_size.size() == 2 && stride.size() == 2 && padding.size() == 2,
+      kernel_size.size() == 2 && resolved_stride.size() == 2 &&
+          resolved_padding.size() == 2,
       "Vulkan pooling expects 2d kernel, stride, and padding");
 
   api::Context* const context = api::context();
@@ -47,11 +55,11 @@ Tensor pool2d_impl(
   };
 
   const int64_t OH = ceil_mode
-      ? div_ceil(H + 2 * padding[1] - kernel_size[1], stride[1]) + 1
-      : (H + 2 * padding[1] - kernel_size[1]) / stride[1] + 1;
+      ? div_ceil(H + 2 * resolved_padding[1] - kernel_size[1], resolved_stride[1]) + 1
+      : (H + 2 * resolved_padding[1] - kernel_size[1]) / resolved_stride[1] + 1;
   const int64_t OW = ceil_mode
-      ? div_ceil(W + 2 * padding[0] - kernel_size[0], stride[0]) + 1
-      : (W + 2 * padding[0] - kernel_size[0]) / stride[0] + 1;
+      ? div_ceil(W + 2 * resolved_padding[0] - kernel_size[0], resolved_stride[0]) + 1
+      : (W + 2 * resolved_padding[0] - kernel_size[0]) / resolved_stride[0] + 1;
 
   TP_CHECK(OH > 0 && OW > 0, "Vulkan pooling: computed output size is empty");
 
@@ -81,11 +89,11 @@ Tensor pool2d_impl(
           static_cast<int32_t>(kernel_size[0]),
           static_cast<int32_t>(kernel_size[1])),
       ivec2(
-          static_cast<int32_t>(stride[0]),
-          static_cast<int32_t>(stride[1])),
+          static_cast<int32_t>(resolved_stride[0]),
+          static_cast<int32_t>(resolved_stride[1])),
       ivec2(
-          static_cast<int32_t>(padding[0]),
-          static_cast<int32_t>(padding[1])),
+          static_cast<int32_t>(resolved_padding[0]),
+          static_cast<int32_t>(resolved_padding[1])),
       c_depth_of(v_input.sizes()),
       1,
       0.0f,
@@ -129,6 +137,17 @@ Tensor avg_pool2d_kernel(
     std::optional<int64_t> divisor_override) {
   validate_pool_input(input);
 
+  // Empty strides default to the kernel size and empty padding to zero.
+  const std::vector<int64_t> resolved_stride =
+      stride.empty() ? kernel_size : stride;
+  const std::vector<int64_t> resolved_padding =
+      padding.empty() ? std::vector<int64_t>(2, 0) : padding;
+
+  TP_CHECK(
+      kernel_size.size() == 2 && resolved_stride.size() == 2 &&
+          resolved_padding.size() == 2,
+      "Vulkan pooling expects 2d kernel, stride, and padding");
+
   api::Context* const context = api::context();
 
   api::vTensor v_input = convert(input);
@@ -143,11 +162,11 @@ Tensor avg_pool2d_kernel(
   };
 
   const int64_t OH = ceil_mode
-      ? div_ceil(H + 2 * padding[1] - kernel_size[1], stride[1]) + 1
-      : (H + 2 * padding[1] - kernel_size[1]) / stride[1] + 1;
+      ? div_ceil(H + 2 * resolved_padding[1] - kernel_size[1], resolved_stride[1]) + 1
+      : (H + 2 * resolved_padding[1] - kernel_size[1]) / resolved_stride[1] + 1;
   const int64_t OW = ceil_mode
-      ? div_ceil(W + 2 * padding[0] - kernel_size[0], stride[0]) + 1
-      : (W + 2 * padding[0] - kernel_size[0]) / stride[0] + 1;
+      ? div_ceil(W + 2 * resolved_padding[0] - kernel_size[0], resolved_stride[0]) + 1
+      : (W + 2 * resolved_padding[0] - kernel_size[0]) / resolved_stride[0] + 1;
 
   TP_CHECK(OH > 0 && OW > 0, "Vulkan pooling: computed output size is empty");
 
@@ -177,11 +196,11 @@ Tensor avg_pool2d_kernel(
           static_cast<int32_t>(kernel_size[0]),
           static_cast<int32_t>(kernel_size[1])),
       ivec2(
-          static_cast<int32_t>(stride[0]),
-          static_cast<int32_t>(stride[1])),
+          static_cast<int32_t>(resolved_stride[0]),
+          static_cast<int32_t>(resolved_stride[1])),
       ivec2(
-          static_cast<int32_t>(padding[0]),
-          static_cast<int32_t>(padding[1])),
+          static_cast<int32_t>(resolved_padding[0]),
+          static_cast<int32_t>(resolved_padding[1])),
       c_depth_of(v_input.sizes()),
       count_include_pad ? 1 : 0,
       static_cast<float>(

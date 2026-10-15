@@ -2860,19 +2860,35 @@ def masked_select(input, mask, *, out=None):
 def zero_(input):
     return input.zero_()
 
+def _pool_geometry(kernel_size, stride, padding, dilation, ndim):
+    """Normalize pooling geometry to fixed-length lists.
+
+    Scalars and single-element sequences repeat to ``ndim`` entries; an empty
+    stride defaults to the kernel size.  Backends expect the full-length form.
+    """
+
+    def expand(x):
+        if isinstance(x, int) and not isinstance(x, bool):
+            return [x] * ndim
+        x = list(x)
+        if len(x) == 1:
+            return [x[0]] * ndim
+        return x
+
+    kernel_size = expand(kernel_size)
+    stride = expand(stride) if stride else kernel_size
+    padding = expand(padding)
+    dilation = expand(dilation)
+    return kernel_size, stride, padding, dilation
+
+
 def max_pool2d(input, kernel_size, stride=([]), padding=([0, 0]), dilation=([1, 1]), ceil_mode=False):
     if _capturing():
         _captured = _capture_call(max_pool2d, (input, kernel_size, stride, padding, dilation, ceil_mode), {})
         if _captured is not None:
             return _captured
-    if isinstance(kernel_size, int) and not isinstance(kernel_size, bool):
-        kernel_size = [kernel_size]
-    if isinstance(stride, int) and not isinstance(stride, bool):
-        stride = [stride]
-    if isinstance(padding, int) and not isinstance(padding, bool):
-        padding = [padding]
-    if isinstance(dilation, int) and not isinstance(dilation, bool):
-        dilation = [dilation]
+    kernel_size, stride, padding, dilation = _pool_geometry(
+        kernel_size, stride, padding, dilation, 2)
     return _C.max_pool2d(input, kernel_size, stride, padding, dilation, ceil_mode)
 
 def max_pool3d(input, kernel_size, stride=([]), padding=([0, 0, 0]), dilation=([1, 1, 1]), ceil_mode=False):
@@ -2880,14 +2896,8 @@ def max_pool3d(input, kernel_size, stride=([]), padding=([0, 0, 0]), dilation=([
         _captured = _capture_call(max_pool3d, (input, kernel_size, stride, padding, dilation, ceil_mode), {})
         if _captured is not None:
             return _captured
-    if isinstance(kernel_size, int) and not isinstance(kernel_size, bool):
-        kernel_size = [kernel_size]
-    if isinstance(stride, int) and not isinstance(stride, bool):
-        stride = [stride]
-    if isinstance(padding, int) and not isinstance(padding, bool):
-        padding = [padding]
-    if isinstance(dilation, int) and not isinstance(dilation, bool):
-        dilation = [dilation]
+    kernel_size, stride, padding, dilation = _pool_geometry(
+        kernel_size, stride, padding, dilation, 3)
     return _C.max_pool3d(input, kernel_size, stride, padding, dilation, ceil_mode)
 
 def max_pool2d_with_indices(input, kernel_size, stride=[], padding=[], dilation=[], ceil_mode=False, *, out=None):
@@ -2922,11 +2932,15 @@ def avg_pool2d(input, kernel_size, stride=[], padding=[], ceil_mode=False, count
             _captured = _capture_call(avg_pool2d, (input, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override), {'out': out})
             if _captured is not None:
                 return _captured
+        kernel_size, stride, padding, _ = _pool_geometry(
+            kernel_size, stride, padding, [1, 1], 2)
         return _C.avg_pool2d(input=input, kernel_size=kernel_size, stride=stride, padding=padding, ceil_mode=ceil_mode, count_include_pad=count_include_pad, divisor_override=divisor_override, out=out)
     if _capturing():
         _captured = _capture_call(avg_pool2d, (input, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override), {})
         if _captured is not None:
             return _captured
+    kernel_size, stride, padding, _ = _pool_geometry(
+        kernel_size, stride, padding, [1, 1], 2)
     return _C.avg_pool2d(input=input, kernel_size=kernel_size, stride=stride, padding=padding, ceil_mode=ceil_mode, count_include_pad=count_include_pad, divisor_override=divisor_override)
 
 def avg_pool3d(input, kernel_size, stride=[], padding=[], ceil_mode=False, count_include_pad=True, divisor_override=None, *, out=None):
@@ -2935,11 +2949,15 @@ def avg_pool3d(input, kernel_size, stride=[], padding=[], ceil_mode=False, count
             _captured = _capture_call(avg_pool3d, (input, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override), {'out': out})
             if _captured is not None:
                 return _captured
+        kernel_size, stride, padding, _ = _pool_geometry(
+            kernel_size, stride, padding, [1, 1, 1], 3)
         return _C.avg_pool3d(input=input, kernel_size=kernel_size, stride=stride, padding=padding, ceil_mode=ceil_mode, count_include_pad=count_include_pad, divisor_override=divisor_override, out=out)
     if _capturing():
         _captured = _capture_call(avg_pool3d, (input, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override), {})
         if _captured is not None:
             return _captured
+    kernel_size, stride, padding, _ = _pool_geometry(
+        kernel_size, stride, padding, [1, 1, 1], 3)
     return _C.avg_pool3d(input=input, kernel_size=kernel_size, stride=stride, padding=padding, ceil_mode=ceil_mode, count_include_pad=count_include_pad, divisor_override=divisor_override)
 
 def avg_pool3d_backward(grad_output, input, kernel_size, stride=[], padding=[], ceil_mode=False, count_include_pad=True, divisor_override=None, *, out=None):
