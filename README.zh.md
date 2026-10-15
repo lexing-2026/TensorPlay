@@ -70,6 +70,7 @@
     <img src="https://img.shields.io/badge/CUDA-12.x%20%7C%2013.x-23347A?style=flat-square&labelColor=11B5D1&logo=nvidia&logoColor=white" alt="NVIDIA CUDA">
     <img src="https://img.shields.io/badge/ROCm-7.2-23347A?style=flat-square&labelColor=11B5D1&logo=amd&logoColor=white" alt="AMD ROCm">
     <img src="https://img.shields.io/badge/Vulkan-1.0-23347A?style=flat-square&labelColor=11B5D1&logo=vulkan&logoColor=white" alt="Vulkan">
+    <img src="https://img.shields.io/badge/MPS-macOS%20Metal-23347A?style=flat-square&labelColor=11B5D1&logo=apple&logoColor=white" alt="Apple MPS">
 </p>
 
 <!-- CI -->
@@ -157,7 +158,7 @@ TensorPlay 是一个面向学习者的深度学习框架：它融合了类 NumPy
 | 组件 | 说明 |
 | ---- | ---- |
 | **tensorplay** | Python API：张量、自动微分、`nn`、`optim`、数据加载、序列化——对外公开层 |
-| **p10** | C++ 核心引擎：张量存储与内存管理、基础的 CPU 与 CUDA 内核实现 |
+| **p10** | C++ 核心引擎：张量存储与内存管理、基础的 CPU、CUDA、ROCm/HIP、MPS 与 Vulkan 内核实现 |
 | **tpx** | 自动微分层：显式构建计算图并执行反向传播，与核心完全解耦 |
 | **stax** | JIT 编译器试验场：静态图捕获与算子融合实验，支持自定义算子的原生下沉 |
 | **tensorplay.nn** | 神经网络构件：`Module`、`Linear`、`Conv2d`、激活函数、损失函数与容器抽象——以及现代 LLM 全家桶：旋转位置编码、分组查询/潜在/压缩稀疏注意力、delta 规则线性注意力、KV 缓存、自回归生成 |
@@ -174,13 +175,26 @@ TensorPlay 是一个面向学习者的深度学习框架：它融合了类 NumPy
 ```mermaid
 flowchart TB
     py["Python API — tensorplay / nn / optim / data"] --> ag["TPX autograd — 显式 DAG"]
-    py --> disp["P10 dispatcher — 33 个 dispatch key"]
+    py --> disp["P10 dispatcher — 37 个 dispatch key"]
     ag --> disp
     disp --> cpu["CPU 内核"]
     disp --> cuda["CUDA 内核"]
+    disp --> mps["MPS 内核"]
     disp --> vulkan["Vulkan 内核"]
     disp --> stax["Stax — 图捕获与融合"]
 ```
+
+### 支持的后端与设备
+
+TensorPlay 将请求分派到五大后端家族，每个后端都有一张透明、可读的内核表：
+
+| 后端 | 目标硬件 | 启用方式 | 可用性检测 |
+| ---- | ---- | ---- | ---- |
+| **CPU** | x86_64 / aarch64 CPU，SIMD 分派（AVX2/AVX512/NEON），可选 BLAS、oneDNN、MKL、NNPACK 与 OpenMP 加速 | 始终内置 | `tp.cpu.is_available()` |
+| **CUDA** | NVIDIA GPU —— CUDA 12.x / 13.x，cuBLAS/cuDNN | `USE_CUDA=ON`（自动探测） | `tp.cuda.is_available()` |
+| **ROCm / HIP** | AMD GPU —— ROCm 7.2，MIOpen | `USE_ROCM=ON`（与 CUDA 互斥） | 构建期开关 |
+| **Vulkan** | 任意支持 Vulkan 1.0+ 的 GPU —— 独立 NVIDIA/AMD 或 Intel/AMD 集成显卡（iGPU） | `USE_VULKAN=ON`（自动探测） | `tp.is_vulkan_available()` |
+| **MPS** | 通过 Metal Performance Shaders 使用 Apple GPU —— Apple 芯片集成显卡及受支持的 Mac 独立显卡 | `USE_MPS=ON`（Apple 平台自动启用） | `tp.mps.is_available()` |
 
 ### 为什么选择 TensorPlay
 
@@ -198,7 +212,7 @@ TensorPlay 不是套在不透明引擎上的薄封装。公开接口——`tenso
 
 #### DIY 硬件加速
 
-CPU 与 CUDA 后端刻意做了简化：每个文件一族内核、每个单元一个注册宏、没有隐藏的调度。这让它们成为学习并行计算、原型化内核的游乐场——带上你自己的设备后端接入 dispatcher，不需要改动框架本身。
+CPU、CUDA、Vulkan 与 MPS 后端刻意做了简化：每个文件一族内核、每个单元一个注册宏、没有隐藏的调度。这让它们成为学习并行计算、原型化内核的游乐场——带上你自己的设备后端接入 dispatcher，不需要改动框架本身。在 macOS 上，MPS 后端会自动启用，并遵循同样的可读结构——每个算子家族对应一个 Objective-C++/Metal 内核文件。
 
 #### 显式的自动微分引擎
 
@@ -254,7 +268,7 @@ energy.backward()                                        # 一次 VQE 迭代
 ### 二进制安装
 
 ```bash
-# 从 PyPI 安装 CPU 版本
+# 从 PyPI 安装 CPU 版本（macOS wheel 自带 Apple MPS 后端）
 pip install tensorplay --upgrade
 
 # 从 TensorPlay CUDA 源安装 CUDA 内核版本——按工具链选变体：cu124 / cu126 / cu130
@@ -262,10 +276,17 @@ pip install tensorplay --upgrade
 pip install tensorplay \
   --index-url https://download.tensorplay.cn/whl/cu130/ \
   --extra-index-url https://pypi.org/simple
+
+# AMD GPU 的 ROCm wheel（ROCm 7.2 / HIP，多架构：gfx90a/gfx942/gfx950/gfx1100）
+pip install tensorplay \
+  --index-url https://download.tensorplay.cn/whl/rocm72-multiarch/ \
+  --extra-index-url https://pypi.org/simple
 ```
 
 > [!NOTE]
 > 请确保 Python 版本与 wheel 标签匹配（如 `cp310` 对应 Python 3.10）。CUDA 版本要求驱动与运行时支持对应 CUDA 版本。完整变体列表见 [`.github/cuda-variants.json`](.github/cuda-variants.json)。
+>
+> **按渠道划分的后端。** macOS CPU wheel 默认携带 **MPS**（Metal Performance Shaders）后端——无需单独的 wheel。**ROCm**（AMD GPU，ROCm 7.2/HIP）wheel 作为默认发布渠道构建，并发布到独立的 ROCm pip index（见 [`.github/rocm-variants.json`](.github/rocm-variants.json)）。
 
 > [!TIP]
 > CUDA 13.0 wheel 仅面向计算能力 8.6 的 GPU。若你的 GPU 计算能力不同（或 wheel 无法在你的设备上运行），请改为[从源码构建](#从源码构建)，并通过 `CMAKE_CUDA_ARCHITECTURES` 指定目标架构——默认值 `native` 会自动探测本机 GPU。
@@ -275,14 +296,19 @@ pip install tensorplay \
 预览明天的功能：每一处通过构建与冒烟流水线的改动都会自动进入滚动的 `nightly` 通道，采用 nightly 版本号格式（`X.Y.0.dev<日期>+cuXXX` / `+cpu`）。每个变体仅保留最新一次构建。
 
 ```bash
-# CUDA nightly——变体与稳定通道一致：cu124 / cu126 / cu130
+# CUDA nightly——nightly 渠道当前只构建 cu130 变体
 pip install --pre tensorplay \
   --index-url https://download.tensorplay.cn/whl/nightly/cu130/ \
   --extra-index-url https://pypi.org/simple
 
-# CPU nightly
+# CPU nightly——Linux x86_64/aarch64、macOS arm64（含 MPS）、Windows x86_64
 pip install --pre tensorplay \
   --index-url https://download.tensorplay.cn/whl/nightly/cpu/ \
+  --extra-index-url https://pypi.org/simple
+
+# ROCm nightly——AMD GPU 渠道（rocm72-multiarch）
+pip install --pre tensorplay \
+  --index-url https://download.tensorplay.cn/whl/nightly/rocm72-multiarch/ \
   --extra-index-url https://pypi.org/simple
 ```
 
@@ -297,6 +323,7 @@ pip install --pre tensorplay \
 - 支持 C++20 的编译器（Windows 使用 MSVC 2022，Linux 使用 GCC/Clang）
 - CUDA Toolkit（可选，用于 GPU 支持）；可通过 `CMAKE_CUDA_ARCHITECTURES` 指定目标 GPU 架构
 - ROCm 7.2.x（可选，用于 AMD GPU 支持）；HIP 后端当前通过源码构建
+- Apple MPS（Metal Performance Shaders）——在 macOS 上自动启用；需要支持 Metal 的 GPU（Apple 芯片或受支持的 Mac 独立显卡）
 - [Ninja](https://ninja-build.org/)（随构建依赖自动安装）
 
 #### 获取源码
@@ -337,7 +364,7 @@ python -m build --wheel
 构建成功后，`import tensorplay` 会加载安装包内编译好的 `_C` 扩展。快速验证：
 
 ```bash
-python -c "import tensorplay as tp; print(tp.__version__); print('vulkan:', tp.is_vulkan_available())"
+python -c "import tensorplay as tp; print(tp.__version__); print('vulkan:', tp.is_vulkan_available()); print('mps:', tp.mps.is_available())"
 ```
 
 > [!TIP]
@@ -348,6 +375,7 @@ python -c "import tensorplay as tp; print(tp.__version__); print('vulkan:', tp.i
 ```bash
 pytest test/ -q          # 全部
 pytest test/test_vulkan.py -q   # 单个后端套件，例如 Vulkan
+pytest test/test_mps.py -q      # Apple MPS（Metal）后端套件——仅 macOS
 ```
 
 #### 调整构建选项（可选）
@@ -364,6 +392,9 @@ USE_CUDA=OFF pip install .
 # 使用 ROCm 7.2 / HIP 构建 AMD GPU 版本
 USE_CUDA=OFF USE_ROCM=ON pip install .
 
+# Apple MPS（Metal）后端——macOS 上默认启用
+USE_MPS=ON pip install .
+
 # 指定目标 GPU 架构
 CMAKE_CUDA_ARCHITECTURES="70;75;86" pip install .
 ```
@@ -373,6 +404,7 @@ CMAKE_CUDA_ARCHITECTURES="70;75;86" pip install .
 | `USE_CUDA` | 自动探测 | 启用/禁用 CUDA 构建 |
 | `USE_ROCM` | `OFF` | 启用 AMD GPU / HIP 构建（与 `USE_CUDA` 互斥） |
 | `USE_VULKAN` | 自动探测 | 启用 Vulkan 构建；需要机器上有 Vulkan loader，以及 submodule 提供的头文件与 GLSL 编译器 |
+| `USE_MPS` | 自动探测 | 启用 Apple MPS（Metal）后端；macOS 上自动启用，需要 Apple 平台 |
 | `BUILD_TESTS` | `OFF` | 构建 C++ 测试套件 |
 | `USE_BLAS` / `USE_ONEDNN` | `ON` | BLAS 加速 / oneDNN 算子库 |
 | `MAX_JOBS` | 机器默认 | 限制编译并行度 |
@@ -542,7 +574,7 @@ trace = ActivationPatching(model).causal_trace(clean_ids, corrupted_ids, target_
 [benchmark/](benchmark/) 套件度量的是一个「可读的框架」要付出什么代价——同时验证正确性。每项对比都在完全相同的初始权重、确定性数据顺序、相同的优化器与批次设置下运行两套运行时；门槛很严：任何计时开始之前，logits 必须在 `allclose` 容差内一致，Top-1 预测必须完全相同。
 
 - **端到端训练**：ResNet-18 图像分类，覆盖 CPU 与 CUDA、eager 与编译模式（`stax`，原生下沉），报告 train/eval/test 精度与吞吐
-- **微观与子系统**：GEMM、优化器 step、dataloader、序列化、autograd Function 开销、自定义算子调用开销、LLaMA 端到端
+- **微观与子系统**：GEMM、优化器 step、dataloader、序列化、autograd Function 开销、自定义算子调用开销、LLaMA 端到端、MPS 算子延迟
 - **报告**：每个脚本输出 JSON 报告（`--json-out`）——吞吐、延迟分位数、编译开销——可直接绘图并用于[白皮书](docs/whitepaper/main.pdf)评估
 
 指标内核在可能处使用融合归约。在 CPU（AVX2，8 线程）上，部分回归指标以明显优势超过参考实现：
@@ -553,7 +585,7 @@ trace = ActivationPatching(model).causal_trace(clean_ids, corrupted_ids, target_
 | MAE（10k×64） | 0.01 ms | 0.04 ms | 2.8× |
 | Kendall tau-b（n=200） | 4.8 ms | 124 ms | 26× |
 
-实测亮点（见[白皮书](docs/whitepaper/main.pdf) §9，对应当前 `main` 的快照）：dispatcher 在 CPU、CUDA 与 Vulkan 路径上都只增加不到 1% 的开销；CUDA 后端覆盖 1,262 个独立算子（CPU 面 1,233 个的 97%）；Vulkan 教学后端交付 224 个算子，背后是 102 个文件、6.8k 行 GLSL shader。pytest 套件共定义 <!-- tp-stats:tests-collected:begin -->3,660<!-- tp-stats:tests-collected:end --> 个测试函数。
+实测亮点（见[白皮书](docs/whitepaper/main.pdf) §9，对应当前 `main` 的快照）：dispatcher 在 CPU、CUDA 与 Vulkan 路径上都只增加不到 1% 的开销；CUDA 后端覆盖 1,262 个独立算子（CPU 面 1,233 个的 97%）；Vulkan 教学后端交付 224 个算子，背后是 102 个文件、6.8k 行 GLSL shader。**MPS** 后端在 macOS 上提供 Metal 加速内核——张量算子、卷积、注意力/LLM 内核（RMSNorm、SDPA、top-k 采样、融合 AdamW）——并配有独立算子基准与 CI 性能底线（[`bench_mps_operator.py`](benchmark/bench_mps_operator.py)、[`mps_benchmark.yml`](.github/workflows/mps_benchmark.yml)）。**ROCm** 渠道在每次发布与 nightly 运行中于 ROCm 容器内构建并冒烟测试 AMD/HIP wheel。pytest 套件共定义 <!-- tp-stats:tests-collected:begin -->3,660<!-- tp-stats:tests-collected:end --> 个测试函数。
 
 脚本与方法论：[benchmark/README.md](benchmark/README.md)。
 
@@ -567,7 +599,7 @@ pytest test/
 
 指标套件在 `test/test_metrics*.py` 中新增约 184 个测试——覆盖有状态指标、functional 形式、曲线与绘图、AIGC、音频、检索、名义、遥感、包装器以及懒加载的外部依赖指标。
 
-CI 会在每个 PR 和 main 推送上构建完整 wheel 矩阵（Python 3.10–3.13；CPU 覆盖 Linux x86_64/aarch64、macOS arm64、Windows x86_64；CUDA 覆盖 Linux 和 Windows x86_64）并验证每个 wheel；参见 [.github/workflows/](.github/workflows/)（`pull`、`trunk`、`publish`、`lint`）。Lint 规则位于 `pyproject.toml` 的 `[tool.ruff]` 段。
+CI 会在每个 PR 和 main 推送上构建完整 wheel 矩阵（Python 3.10–3.13；CPU 覆盖 Linux x86_64/aarch64、macOS arm64、Windows x86_64；CUDA 覆盖 Linux 和 Windows x86_64；ROCm 覆盖 Linux x86_64）并验证每个 wheel。macOS arm64 wheel 携带 **MPS** 后端，配有专门的 Metal 验收与基准工作流；**ROCm** 渠道在发布与 nightly 同一条流水线上于 ROCm 构建容器内运行。参见 [.github/workflows/](.github/workflows/)（`pull`、`trunk`、`publish`、`nightly`、`lint`）。Lint 规则位于 `pyproject.toml` 的 `[tool.ruff]` 段。
 
 ## 资源
 
@@ -586,7 +618,7 @@ CI 会在每个 PR 和 main 推送上构建完整 wheel 矩阵（Python 3.10–3
 
 ## 发布与贡献
 
-包版本号以 [`version.txt`](version.txt) 为单一来源（开发安装会带 `+git<sha>` 后缀）。正式发布通过推送 `v主版本.次版本.0` tag 触发；例如 `v1.2.1` 这样的修订版本 tag 不会发布二进制包。CI 流水线自动构建并验证完整 wheel 矩阵，CPU wheel 发布到 PyPI，CUDA wheel 上传到 GitHub Release，并将其 PEP 503 索引部署到 Cloudflare Pages。wheel 矩阵基础设施（平台 runner、CUDA 变体、可选 ROCm 通道）见 [RELEASE.md](RELEASE.md)。
+包版本号以 [`version.txt`](version.txt) 为单一来源（开发安装会带 `+git<sha>` 后缀）。正式发布通过推送 `v主版本.次版本.0` tag 触发；例如 `v1.2.1` 这样的修订版本 tag 不会发布二进制包。CI 流水线自动构建并验证完整 wheel 矩阵——CPU（macOS wheel 含 MPS 后端）、CUDA（cu124/cu126/cu130）与 ROCm（AMD/HIP）渠道——CPU wheel 发布到 PyPI，CUDA 与 ROCm wheel 上传到 GitHub Release，并将其 PEP 503 索引部署到 Cloudflare Pages。wheel 矩阵基础设施（平台 runner、CUDA 变体、ROCm 渠道）见 [RELEASE.md](RELEASE.md)。
 
 我们欢迎各种形式的贡献——bug 修复、文档改进、新功能建议。开发流程与编码规范见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 

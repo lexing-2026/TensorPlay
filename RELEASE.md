@@ -17,8 +17,15 @@ through three channels.
   suffix, e.g. `1.0.0a0`, like the main release). Dev builds append
   `+git<sha>` via `tools/generate_tensorplay_version.py`.
 - Variant local labels follow the `binary_populate_env.sh` rule: CUDA
-  wheels get `+cuXXX`, Linux/Windows CPU wheels get `+cpu`, macOS wheels get
-  no suffix.
+  wheels get `+cuXXX`, ROCm wheels get `+rocm<variant>` (e.g. `+rocm72-multiarch`),
+  Linux/Windows CPU wheels get `+cpu`, macOS wheels get no suffix.
+- The **ROCm** lane (AMD/HIP, ROCm 7.2) is a default part of the release and
+  nightly wheel matrices, exactly like the CUDA lanes. ROCm wheels are built
+  in the ROCm build container (`rocm/dev-ubuntu-22.04:7.2.4-complete`), keep
+  the bare `linux_*` platform tag, and land on the same GitHub Release as the
+  CUDA wheels. The download-site rebuild publishes them on a ROCm pip index:
+  `whl/rocm72-multiarch/` for stable and `whl/nightly/rocm72-multiarch/` for
+  nightly.
 - `cz bump` is never used; commitizen only drafts changelogs.
 
 ## Nightly (manual preview channel)

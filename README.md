@@ -70,6 +70,7 @@
     <img src="https://img.shields.io/badge/CUDA-12.x%20%7C%2013.x-23347A?style=flat-square&labelColor=11B5D1&logo=nvidia&logoColor=white" alt="NVIDIA CUDA">
     <img src="https://img.shields.io/badge/ROCm-7.2-23347A?style=flat-square&labelColor=11B5D1&logo=amd&logoColor=white" alt="AMD ROCm">
     <img src="https://img.shields.io/badge/Vulkan-1.0-23347A?style=flat-square&labelColor=11B5D1&logo=vulkan&logoColor=white" alt="Vulkan">
+    <img src="https://img.shields.io/badge/MPS-macOS%20Metal-23347A?style=flat-square&labelColor=11B5D1&logo=apple&logoColor=white" alt="Apple MPS">
 </p>
 
 <!-- CI -->
@@ -158,7 +159,7 @@ At a granular level, TensorPlay consists of the following components:
 | Component | Description |
 | ---- | ---- |
 | **tensorplay** | The Python API: tensors, autograd, `nn`, `optim`, data loading, serialization — the public surface |
-| **p10** | C++ core engine: tensor storage and memory management, foundational CPU and CUDA kernels |
+| **p10** | C++ core engine: tensor storage and memory management, foundational CPU, CUDA, ROCm/HIP, MPS and Vulkan kernels |
 | **tpx** | Autograd layer: explicit computation-graph construction and backward execution, fully decoupled from the core |
 | **stax** | JIT compiler playground: static graph capture and operator fusion experiments, including native lowering of custom ops |
 | **tensorplay.nn** | Neural network building blocks: `Module`, `Linear`, `Conv2d`, activations, losses, containers — plus the modern LLM stack: rotary embeddings, grouped-query / latent / compressed-sparse attention, delta-rule linear attention, KV caches, autoregressive generation |
@@ -175,13 +176,26 @@ Every call is one short, visible path — no black box between your model and th
 ```mermaid
 flowchart TB
     py["Python API — tensorplay / nn / optim / data"] --> ag["TPX autograd — explicit DAG"]
-    py --> disp["P10 dispatcher — 33 dispatch keys"]
+    py --> disp["P10 dispatcher — 37 dispatch keys"]
     ag --> disp
     disp --> cpu["CPU kernels"]
     disp --> cuda["CUDA kernels"]
+    disp --> mps["MPS kernels"]
     disp --> vulkan["Vulkan kernels"]
     disp --> stax["Stax — graph capture & fusion"]
 ```
+
+### Supported Backends and Devices
+
+TensorPlay dispatches to five backend families, each with a transparent, readable kernel table:
+
+| Backend | Target hardware | How to enable | Check availability |
+| ---- | ---- | ---- | ---- |
+| **CPU** | x86_64 / aarch64 CPUs with SIMD dispatch (AVX2/AVX512/NEON) and optional BLAS, oneDNN, MKL, NNPACK and OpenMP acceleration | always built in | `tp.cpu.is_available()` |
+| **CUDA** | NVIDIA GPUs — CUDA 12.x / 13.x, cuBLAS/cuDNN | `USE_CUDA=ON` (auto-detected) | `tp.cuda.is_available()` |
+| **ROCm / HIP** | AMD GPUs — ROCm 7.2, MIOpen | `USE_ROCM=ON` (mutually exclusive with CUDA) | build-time flag |
+| **Vulkan** | Any Vulkan 1.0+ GPU — discrete NVIDIA/AMD or integrated Intel/AMD iGPU | `USE_VULKAN=ON` (auto-detected) | `tp.is_vulkan_available()` |
+| **MPS** | Apple GPUs on macOS via Metal Performance Shaders — Apple silicon integrated GPU and supported Mac discrete GPUs | `USE_MPS=ON` (auto-enabled on Apple) | `tp.mps.is_available()` |
 
 ### Why TensorPlay
 
@@ -199,7 +213,7 @@ TensorPlay is not a thin binding over an opaque engine. The public surface — `
 
 #### DIY Hardware Acceleration
 
-The CPU and CUDA backends are deliberately simplified: one kernel family per file, one registration macro per unit, no hidden scheduling. That makes them a playground for learning parallel computing and prototyping kernels — bring your own device backend and wire it into the dispatcher without touching the framework itself.
+The CPU, CUDA, Vulkan and MPS backends are deliberately simplified: one kernel family per file, one registration macro per unit, no hidden scheduling. That makes them a playground for learning parallel computing and prototyping kernels — bring your own device backend and wire it into the dispatcher without touching the framework itself. On macOS the MPS backend is enabled automatically and follows the same readable structure with one Objective-C++/Metal kernel file per operator family.
 
 #### An Explicit Autograd Engine
 
@@ -255,7 +269,7 @@ energy.backward()                                        # one VQE step
 ### Binaries
 
 ```bash
-# CPU wheels from PyPI
+# CPU wheels from PyPI (macOS wheels ship the Apple MPS backend)
 pip install tensorplay --upgrade
 
 # CUDA wheels from the TensorPlay CUDA index — pick the variant matching
@@ -264,10 +278,17 @@ pip install tensorplay --upgrade
 pip install tensorplay \
   --index-url https://download.tensorplay.cn/whl/cu130/ \
   --extra-index-url https://pypi.org/simple
+
+# ROCm wheels for AMD GPUs (ROCm 7.2 / HIP, multi-arch: gfx90a/gfx942/gfx950/gfx1100)
+pip install tensorplay \
+  --index-url https://download.tensorplay.cn/whl/rocm72-multiarch/ \
+  --extra-index-url https://pypi.org/simple
 ```
 
 > [!NOTE]
 > Make sure your Python version matches the wheel tags (e.g. `cp310` for Python 3.10). For CUDA wheels, the driver and runtime must support the CUDA version of the wheel. The full variant list lives in [`.github/cuda-variants.json`](.github/cuda-variants.json).
+>
+> **Backends by channel.** The macOS CPU wheels carry the **MPS** (Metal Performance Shaders) backend enabled by default — no separate wheel is needed. **ROCm** wheels (AMD/HIP) are built as a default release lane and published on their own ROCm pip index ([`.github/rocm-variants.json`](.github/rocm-variants.json)).
 
 > [!TIP]
 > The CUDA 13.0 wheels target compute capability 8.6 GPUs only. If your GPU has a different compute capability (or the wheel fails to run on your device), [build from source](#from-source) instead and set `CMAKE_CUDA_ARCHITECTURES` to your target — it defaults to `native`, which auto-detects the local GPU.
@@ -277,14 +298,19 @@ pip install tensorplay \
 Try tomorrow's features today: every change that passes our build-and-smoke pipeline lands on the rolling `nightly` channel automatically, following the nightly version format (`X.Y.0.dev<date>+cuXXX` / `+cpu`). Only the latest build per variant is kept.
 
 ```bash
-# CUDA nightly — same variants as the stable channel: cu124, cu126, cu130
+# CUDA nightly — the nightly channel currently builds the cu130 variant
 pip install --pre tensorplay \
   --index-url https://download.tensorplay.cn/whl/nightly/cu130/ \
   --extra-index-url https://pypi.org/simple
 
-# CPU nightly
+# CPU nightly — Linux x86_64/aarch64, macOS arm64 (with MPS), Windows x86_64
 pip install --pre tensorplay \
   --index-url https://download.tensorplay.cn/whl/nightly/cpu/ \
+  --extra-index-url https://pypi.org/simple
+
+# ROCm nightly — AMD GPU lane (rocm72-multiarch)
+pip install --pre tensorplay \
+  --index-url https://download.tensorplay.cn/whl/nightly/rocm72-multiarch/ \
   --extra-index-url https://pypi.org/simple
 ```
 
@@ -299,6 +325,7 @@ Building from source gives you a hackable, debuggable install — the recommende
 - A C++20-capable compiler (MSVC 2022 on Windows, GCC/Clang on Linux)
 - CUDA Toolkit (optional, for GPU support); set `CMAKE_CUDA_ARCHITECTURES` to target specific GPU architectures
 - ROCm 7.2.x (optional, for AMD GPU support); the HIP backend is currently built from source
+- Apple MPS (Metal Performance Shaders) — enabled automatically on macOS; requires a Metal-capable GPU (Apple silicon or a supported Mac discrete GPU)
 - [Ninja](https://ninja-build.org/) (installed automatically with the build dependencies)
 
 #### Get the TensorPlay Source
@@ -339,7 +366,7 @@ python -m build --wheel
 On success, `import tensorplay` picks up the compiled `_C` extension from the installed package. A quick check:
 
 ```bash
-python -c "import tensorplay as tp; print(tp.__version__); print('vulkan:', tp.is_vulkan_available())"
+python -c "import tensorplay as tp; print(tp.__version__); print('vulkan:', tp.is_vulkan_available()); print('mps:', tp.mps.is_available())"
 ```
 
 > [!TIP]
@@ -350,6 +377,7 @@ python -c "import tensorplay as tp; print(tp.__version__); print('vulkan:', tp.i
 ```bash
 pytest test/ -q          # everything
 pytest test/test_vulkan.py -q   # a single backend suite, e.g. Vulkan
+pytest test/test_mps.py -q      # the Apple MPS (Metal) backend suite — macOS only
 ```
 
 #### Adjusting Build Options (Optional)
@@ -365,6 +393,9 @@ USE_CUDA=OFF pip install .
 
 # AMD GPU build with ROCm 7.2 / HIP
 USE_CUDA=OFF USE_ROCM=ON pip install .
+
+# Apple MPS (Metal) backend — enabled by default on macOS
+USE_MPS=ON pip install .
 
 # Target specific GPU architectures
 CMAKE_CUDA_ARCHITECTURES="70;75;86" pip install .
@@ -544,7 +575,7 @@ A fused dual-input reduction (`sum_squared_error` / `sum_abs_error`) powers the 
 The [benchmark/](benchmark/) suite measures what a readable framework costs — and proves correctness at the same time. Every comparison runs both runtimes from identical initial weights, deterministic data order, and the same optimizer and batch settings; the gate is strict: logits must match within `allclose` tolerance and Top-1 predictions must be identical before any timing is reported.
 
 - **End-to-end training**: ResNet-18 image classification on CPU and CUDA, eager and compiled (`stax`, native lowering), reporting train/eval/test accuracy and throughput
-- **Micro and subsystem**: GEMM, optimizer steps, dataloader, serialization, autograd Function overhead, custom-op call overhead, LLaMA end-to-end
+- **Micro and subsystem**: GEMM, optimizer steps, dataloader, serialization, autograd Function overhead, custom-op call overhead, LLaMA end-to-end, MPS operator latencies
 - **Reports**: every script emits a JSON report (`--json-out`) — throughput, latency percentiles, compile cost — ready for plotting and for the [white paper](docs/whitepaper/main.pdf) evaluation
 
 Metric kernels use fused reductions where possible. On CPU (AVX2, 8 threads), selected regression metrics beat the reference implementation by a wide margin:
@@ -555,7 +586,7 @@ Metric kernels use fused reductions where possible. On CPU (AVX2, 8 threads), se
 | MAE (10k×64) | 0.01 ms | 0.04 ms | 2.8× |
 | Kendall tau-b (n=200) | 4.8 ms | 124 ms | 26× |
 
-Measured highlights from the [white paper](docs/whitepaper/main.pdf), §9 — a snapshot of current `main`: the dispatcher adds the same sub-1% sliver on CPU, CUDA and Vulkan paths; the CUDA backend covers 1,262 unique ops (97% of the CPU surface, 1,233 ops); the Vulkan teaching backend ships 224 ops backed by 6.8k lines of GLSL shaders across 102 files. The pytest suite defines <!-- tp-stats:tests-collected:begin -->3,660<!-- tp-stats:tests-collected:end --> test functions.
+Measured highlights from the [white paper](docs/whitepaper/main.pdf), §9 — a snapshot of current `main`: the dispatcher adds the same sub-1% sliver on CPU, CUDA and Vulkan paths; the CUDA backend covers 1,262 unique ops (97% of the CPU surface, 1,233 ops); the Vulkan teaching backend ships 224 ops backed by 6.8k lines of GLSL shaders across 102 files. The **MPS** backend adds Metal-accelerated kernels on macOS — tensor ops, convolutions, attention/LLM kernels (RMSNorm, SDPA, top-k sampling, fused AdamW) — with its own operator benchmark and a CI performance floor ([`bench_mps_operator.py`](benchmark/bench_mps_operator.py), [`mps_benchmark.yml`](.github/workflows/mps_benchmark.yml)). The **ROCm** lane builds and smoke-tests AMD/HIP wheels in the ROCm container on every release and nightly run. The pytest suite defines <!-- tp-stats:tests-collected:begin -->3,660<!-- tp-stats:tests-collected:end --> test functions.
 
 Scripts and methodology: [benchmark/README.md](benchmark/README.md).
 
@@ -569,7 +600,7 @@ pytest test/
 
 The metrics suite adds about 184 tests across `test/test_metrics*.py` — stateful metrics, functional forms, curves and plots, AIGC, audio, retrieval, nominal, remote sensing, wrappers and lazy-loaded external-dependency metrics.
 
-CI builds the full wheel matrix (Python 3.10–3.13; CPU on Linux x86_64/aarch64, macOS arm64, and Windows x86_64; CUDA on Linux and Windows x86_64) and validates every wheel on every pull request and push to `main`; see [.github/workflows/](.github/workflows/) (`pull`, `trunk`, `publish`, `lint`). Lint rules live under `[tool.ruff]` in `pyproject.toml`.
+CI builds the full wheel matrix (Python 3.10–3.13; CPU on Linux x86_64/aarch64, macOS arm64, and Windows x86_64; CUDA on Linux and Windows x86_64; ROCm on Linux x86_64) and validates every wheel on every pull request and push to `main`. macOS arm64 wheels ship the **MPS** backend, with dedicated Metal acceptance and benchmark workflows; the **ROCm** lane runs in the ROCm build container on the same release/nightly pipelines. See [.github/workflows/](.github/workflows/) (`pull`, `trunk`, `publish`, `nightly`, `lint`). Lint rules live under `[tool.ruff]` in `pyproject.toml`.
 
 ## Resources
 
@@ -588,7 +619,7 @@ CI builds the full wheel matrix (Python 3.10–3.13; CPU on Linux x86_64/aarch64
 
 ## Releases and Contributing
 
-The package version lives in [`version.txt`](version.txt) (single source of truth; development installs carry a `+git<sha>` suffix). Releases are cut by pushing a `vMAJOR.MINOR.0` tag; patch tags such as `v1.2.1` do not publish binaries. CI then builds and validates the full wheel matrix, publishes CPU wheels to PyPI, and uploads CUDA wheels to a GitHub Release with a PEP 503 index on Cloudflare Pages. Wheel-matrix infrastructure (platform runners, CUDA variants, the optional ROCm channel) is documented in [RELEASE.md](RELEASE.md).
+The package version lives in [`version.txt`](version.txt) (single source of truth; development installs carry a `+git<sha>` suffix). Releases are cut by pushing a `vMAJOR.MINOR.0` tag; patch tags such as `v1.2.1` do not publish binaries. CI then builds and validates the full wheel matrix — CPU (macOS wheels with the MPS backend), CUDA (cu124/cu126/cu130) and ROCm (AMD/HIP) lanes — publishes CPU wheels to PyPI, and uploads the CUDA and ROCm wheels to a GitHub Release with a PEP 503 index on Cloudflare Pages. Wheel-matrix infrastructure (platform runners, CUDA variants, the ROCm channel) is documented in [RELEASE.md](RELEASE.md).
 
 We welcome contributions of all kinds — bug fixes, documentation, new features. See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow and coding standards.
 
