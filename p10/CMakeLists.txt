@@ -525,6 +525,8 @@ if(USE_MPS)
         src/backend/mps/ArithmeticKernels.mm
         src/backend/mps/ElementwiseKernels.mm
         src/backend/mps/ReductionKernels.mm
+        src/backend/mps/ShapeKernels.mm
+        src/backend/mps/BlasKernels.mm
     )
     list(APPEND P10_SOURCES ${TP_MPS_BACKEND_SOURCES})
 endif()

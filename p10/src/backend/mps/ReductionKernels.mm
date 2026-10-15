@@ -23,7 +23,7 @@ Tensor& fill_kernel(Tensor& self, const Scalar& value);
 
 namespace {
 
-enum class ReductionKind { SUM, PROD, MEAN, MAX, MIN };
+enum class ReductionKind { SUM, PROD, MEAN, MAX, MIN, ALL, ANY };
 
 DType resolve_sum_dtype(DType dtype, DType self_dtype) {
   DType out_dtype = dtype;
@@ -121,6 +121,16 @@ Tensor reductionOp(const Tensor& self, const std::vector<int64_t>& dims,
         fill_kernel(out, std::numeric_limits<float>::quiet_NaN());
         return out;
       }
+      case ReductionKind::ALL: {
+        Tensor out = Tensor(out_shape, DType::Bool, self.device());
+        fill_kernel(out, true);
+        return out;
+      }
+      case ReductionKind::ANY: {
+        Tensor out = Tensor(out_shape, DType::Bool, self.device());
+        fill_kernel(out, false);
+        return out;
+      }
       default:
         TP_THROW(RuntimeError,
                  "Expected reduction dim to be specified for input.numel() == 0");
@@ -180,6 +190,27 @@ Tensor reductionOp(const Tensor& self, const std::vector<int64_t>& dims,
         }
         if (kind == ReductionKind::MIN) {
           reduced = [graph negativeWithTensor:reduced name:nil];
+        }
+        break;
+      }
+      case ReductionKind::ALL:
+      case ReductionKind::ANY: {
+        // Cast to bool first, then reduce one axis at a time (highest
+        // first) with the logical reduction selectors.
+        const MPSDataType bool_dt = MPSDataTypeBool;
+        reduced = ([xc dataType] == bool_dt)
+            ? xc
+            : [graph castTensor:xc toType:bool_dt name:@"cast_bool"];
+        for (NSNumber* axis in [axesArray reverseObjectEnumerator]) {
+          if (kind == ReductionKind::ALL) {
+            reduced = [graph reductionAndWithTensor:reduced
+                                               axis:[axis integerValue]
+                                              name:nil];
+          } else {
+            reduced = [graph reductionOrWithTensor:reduced
+                                               axis:[axis integerValue]
+                                              name:nil];
+          }
         }
         break;
       }
@@ -298,6 +329,40 @@ Tensor amin_kernel(const Tensor& self, const std::vector<int64_t>& dims,
                      ReductionKind::MIN);
 }
 
+// ---------------------------------------------------------------------------
+// all / any
+// ---------------------------------------------------------------------------
+
+Tensor all_kernel(const Tensor& self) {
+  return reductionOp(self, {}, false, DType::Bool, DType::Bool,
+                     ReductionKind::ALL);
+}
+
+Tensor all_dim_kernel(const Tensor& self, const std::vector<int64_t>& dims,
+                      bool keepdim) {
+  return reductionOp(self, dims, keepdim, DType::Bool, DType::Bool,
+                     ReductionKind::ALL);
+}
+
+Tensor all_dim_int_kernel(const Tensor& self, int64_t dim, bool keepdim) {
+  return all_dim_kernel(self, std::vector<int64_t>{dim}, keepdim);
+}
+
+Tensor any_kernel(const Tensor& self) {
+  return reductionOp(self, {}, false, DType::Bool, DType::Bool,
+                     ReductionKind::ANY);
+}
+
+Tensor any_dim_kernel(const Tensor& self, const std::vector<int64_t>& dims,
+                      bool keepdim) {
+  return reductionOp(self, dims, keepdim, DType::Bool, DType::Bool,
+                     ReductionKind::ANY);
+}
+
+Tensor any_dim_int_kernel(const Tensor& self, int64_t dim, bool keepdim) {
+  return any_dim_kernel(self, std::vector<int64_t>{dim}, keepdim);
+}
+
 TENSORPLAY_LIBRARY_IMPL(MPS, ReductionKernels) {
   m.impl("sum", sum_kernel);
   m.impl("sum.dim_IntList", sum_dim_kernel);
@@ -309,6 +374,10 @@ TENSORPLAY_LIBRARY_IMPL(MPS, ReductionKernels) {
   m.impl("prod.dim_IntList", prod_dim_kernel);
   m.impl("amax", amax_kernel);
   m.impl("amin", amin_kernel);
+  m.impl("all", all_kernel);
+  m.impl("all.dim", all_dim_int_kernel);
+  m.impl("any", any_kernel);
+  m.impl("any.dim", any_dim_int_kernel);
 }
 
 } // namespace mps

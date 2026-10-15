@@ -243,5 +243,109 @@ class TestMPSMemory(unittest.TestCase):
         self.assertTrue(tp.all(b.cpu() == 2).item())
 
 
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSRandom(unittest.TestCase):
+    def test_rand(self):
+        x = tp.rand(100, device="mps")
+        self.assertEqual(x.shape, (100,))
+        self.assertTrue(tp.all(x.cpu() >= 0).item())
+        self.assertTrue(tp.all(x.cpu() < 1).item())
+
+    def test_randn(self):
+        x = tp.randn(100, device="mps")
+        self.assertEqual(x.shape, (100,))
+        self.assertAlmostEqual(x.cpu().mean().item(), 0.0, places=1)
+
+    def test_randint(self):
+        x = tp.randint(0, 10, (100,), device="mps")
+        self.assertTrue(tp.all(x.cpu() >= 0).item())
+        self.assertTrue(tp.all(x.cpu() < 10).item())
+
+    def test_randperm(self):
+        x = tp.randperm(20, device="mps")
+        self.assertEqual(sorted(x.cpu().tolist()), list(range(20)))
+
+    def test_rand_like(self):
+        a = tp.zeros((4, 5), device="mps")
+        r = tp.rand_like(a)
+        self.assertEqual(r.shape, (4, 5))
+        self.assertEqual(r.device.type, "mps")
+
+
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSShapeOps(unittest.TestCase):
+    def test_cat(self):
+        a = tp.ones((2, 3), device="mps")
+        b = tp.full((2, 3), 2, device="mps")
+        c = tp.cat([a, b], dim=0)
+        self.assertEqual(c.shape, (4, 3))
+        self.assertTrue(tp.all(c.cpu()[:2] == 1).item())
+        self.assertTrue(tp.all(c.cpu()[2:] == 2).item())
+
+    def test_stack(self):
+        a = tp.ones((2, 3), device="mps")
+        b = tp.full((2, 3), 2, device="mps")
+        c = tp.stack([a, b], dim=0)
+        self.assertEqual(c.shape, (2, 2, 3))
+        self.assertTrue(tp.all(c.cpu()[0] == 1).item())
+        self.assertTrue(tp.all(c.cpu()[1] == 2).item())
+
+    def test_embedding(self):
+        weight = tp.arange(6, dtype=tp.float32, device="mps").reshape(3, 2)
+        indices = tp.tensor([0, 2], dtype=tp.int64).mps()
+        out = tp.embedding(weight, indices)
+        self.assertEqual(out.shape, (2, 2))
+        self.assertTrue(tp.all(out.cpu() == weight.cpu()[indices.cpu()]).item())
+
+
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSBlas(unittest.TestCase):
+    def test_mm(self):
+        a = tp.arange(6, dtype=tp.float32, device="mps").reshape(2, 3)
+        b = tp.arange(12, dtype=tp.float32, device="mps").reshape(3, 4)
+        c = tp.mm(a, b)
+        self.assertEqual(c.shape, (2, 4))
+        self.assertTrue(tp.allclose(c.cpu(), a.cpu() @ b.cpu()))
+
+    def test_matmul_2d(self):
+        a = tp.ones((2, 3), device="mps")
+        b = tp.ones((3, 4), device="mps")
+        self.assertTrue(tp.all(tp.matmul(a, b).cpu() == 3).item())
+
+    def test_bmm(self):
+        a = tp.ones((2, 3, 4), device="mps")
+        b = tp.ones((2, 4, 5), device="mps")
+        c = tp.bmm(a, b)
+        self.assertEqual(c.shape, (2, 3, 5))
+        self.assertTrue(tp.all(c.cpu() == 4).item())
+
+    def test_addmm(self):
+        inp = tp.ones((2, 4), device="mps")
+        m1 = tp.ones((2, 3), device="mps")
+        m2 = tp.ones((3, 4), device="mps")
+        c = tp.addmm(inp, m1, m2)
+        # 1*input + 1*(m1@m2) = 1 + 3 = 4
+        self.assertTrue(tp.all(c.cpu() == 4).item())
+
+    def test_mv_dot(self):
+        a = tp.ones((2, 3), device="mps")
+        v = tp.ones((3,), device="mps")
+        self.assertTrue(tp.all(tp.mv(a, v).cpu() == 3).item())
+        x = tp.full((4,), 2, device="mps")
+        y = tp.full((4,), 3, device="mps")
+        self.assertEqual(tp.dot(x, y).item(), 24)
+
+
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSAllAny(unittest.TestCase):
+    def test_all_any(self):
+        t = tp.ones((2, 3), dtype=tp.bool, device="mps")
+        f = tp.zeros((2, 3), dtype=tp.bool, device="mps")
+        self.assertTrue(tp.all(t).item())
+        self.assertFalse(tp.all(f).item())
+        self.assertTrue(tp.any(f).item())
+        self.assertTrue(tp.all(t, dim=1).cpu().all().item())
+
+
 if __name__ == "__main__":
     unittest.main()

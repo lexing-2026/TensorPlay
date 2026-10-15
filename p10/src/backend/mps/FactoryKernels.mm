@@ -3,6 +3,9 @@
 #include "Scalar.h"
 #include "Context.h"
 #include "Exception.h"
+#include "Generator.h"
+#include "DistributionsHelper.h"
+#include "DistributionDispatch.h"
 
 #include "backend/mps/MPSDevice.h"
 
@@ -406,6 +409,172 @@ Tensor logspace_kernel(Scalar start, Scalar end, int64_t steps, double base,
   return t;
 }
 
+// ---------------------------------------------------------------------------
+// Random factories.  Samples are drawn on the host through the shared-memory
+// mapping of the MPS buffers (valid on unified-memory Apple silicon), using
+// the same generator and distributions as the CPU backend.
+// ---------------------------------------------------------------------------
+
+Tensor rand_kernel(const std::vector<int64_t>& size, DType dtype,
+                   Device device) {
+  Tensor t = Tensor(size, dtype, device);
+  const int64_t n = t.numel();
+  auto& gen = default_generator();
+  switch (dtype) {
+    case DType::Float32: {
+      float* data = t.data_ptr<float>();
+      uniform_real_distribution<float> dist(0.0f, 1.0f);
+      for (int64_t i = 0; i < n; ++i) data[i] = dist(&gen);
+      break;
+    }
+    case DType::Float64: {
+      double* data = t.data_ptr<double>();
+      uniform_real_distribution<double> dist(0.0, 1.0);
+      for (int64_t i = 0; i < n; ++i) data[i] = dist(&gen);
+      break;
+    }
+    case DType::Float16: {
+      Half* data = t.data_ptr<Half>();
+      uniform_real_distribution<float> dist(0.0f, 1.0f);
+      for (int64_t i = 0; i < n; ++i) {
+        data[i] = Half(dist(&gen));
+      }
+      break;
+    }
+    case DType::BFloat16: {
+      BFloat16* data = t.data_ptr<BFloat16>();
+      uniform_real_distribution<float> dist(0.0f, 1.0f);
+      for (int64_t i = 0; i < n; ++i) {
+        data[i] = BFloat16(dist(&gen));
+      }
+      break;
+    }
+    default:
+      TP_THROW(NotImplementedError,
+               "rand does not support this dtype on MPS");
+  }
+  return t;
+}
+
+Tensor randn_kernel(const std::vector<int64_t>& size, DType dtype,
+                    Device device) {
+  Tensor t = Tensor(size, dtype, device);
+  const int64_t n = t.numel();
+  auto& gen = default_generator();
+  switch (dtype) {
+    case DType::Float32: {
+      float* data = t.data_ptr<float>();
+      normal_distribution<double> dist(0.0, 1.0);
+      for (int64_t i = 0; i < n; ++i) {
+        data[i] = static_cast<float>(dist(&gen));
+      }
+      break;
+    }
+    case DType::Float64: {
+      double* data = t.data_ptr<double>();
+      normal_distribution<double> dist(0.0, 1.0);
+      for (int64_t i = 0; i < n; ++i) data[i] = dist(&gen);
+      break;
+    }
+    case DType::Float16: {
+      Half* data = t.data_ptr<Half>();
+      normal_distribution<double> dist(0.0, 1.0);
+      for (int64_t i = 0; i < n; ++i) {
+        data[i] = Half(static_cast<float>(dist(&gen)));
+      }
+      break;
+    }
+    case DType::BFloat16: {
+      BFloat16* data = t.data_ptr<BFloat16>();
+      normal_distribution<double> dist(0.0, 1.0);
+      for (int64_t i = 0; i < n; ++i) {
+        data[i] = BFloat16(static_cast<float>(dist(&gen)));
+      }
+      break;
+    }
+    default:
+      TP_THROW(NotImplementedError,
+               "randn does not support this dtype on MPS");
+  }
+  return t;
+}
+
+Tensor randint_kernel(int64_t low, int64_t high,
+                      const std::vector<int64_t>& size, DType dtype,
+                      Device device) {
+  TP_THROW_IF(high <= low, RuntimeError,
+              "randint expects 'from' to be less than 'to', but got from=",
+              low, " >= to=", high);
+  distribution::check_random_from_to_bounds(low, high, dtype);
+  Tensor t = Tensor(size, dtype, device);
+  const int64_t n = t.numel();
+  auto& gen = default_generator();
+  const uint64_t range =
+      static_cast<uint64_t>(high) - static_cast<uint64_t>(low);
+  const int64_t base = low;
+  distribution::dispatch_dtype(dtype, [&](auto tag) {
+    using scalar_t = typename decltype(tag)::type;
+    scalar_t* data = t.data_ptr<scalar_t>();
+    uniform_int_from_to_distribution<scalar_t> dist(range, base);
+    for (int64_t i = 0; i < n; ++i) {
+      data[i] = dist(&gen);
+    }
+  });
+  return t;
+}
+
+Tensor randperm_kernel(int64_t n, DType dtype, Device device) {
+  if (n < 0) {
+    TP_THROW(RuntimeError, "randperm(): n must be non-negative, got ", n);
+  }
+  Tensor t = Tensor({n}, dtype, device);
+  if (n == 0) return t;
+  auto& gen = default_generator();
+  distribution::dispatch_dtype(dtype, [&](auto tag) {
+    using scalar_t = typename decltype(tag)::type;
+    scalar_t* data = t.data_ptr<scalar_t>();
+    for (int64_t i = 0; i < n; ++i) {
+      data[i] = static_cast<scalar_t>(i);
+    }
+    for (int64_t i = 0; i < n - 1; ++i) {
+      const uint64_t tail = static_cast<uint64_t>(n - i);
+      const uint64_t draw = tail >= (1ULL << 32)
+          ? gen.random64()
+          : static_cast<uint64_t>(gen.random());
+      const int64_t z = static_cast<int64_t>(draw % tail);
+      scalar_t save = data[i];
+      data[i] = data[z + i];
+      data[z + i] = save;
+    }
+  });
+  return t;
+}
+
+Tensor rand_like_kernel(const Tensor& self, DType dtype,
+                        std::optional<Device> device) {
+  if (dtype == DType::Undefined) dtype = self.dtype();
+  Device dev = device.has_value() ? *device : self.device();
+  return rand_kernel(static_cast<std::vector<int64_t>>(self.shape()), dtype,
+                     dev);
+}
+
+Tensor randn_like_kernel(const Tensor& self, DType dtype,
+                         std::optional<Device> device) {
+  if (dtype == DType::Undefined) dtype = self.dtype();
+  Device dev = device.has_value() ? *device : self.device();
+  return randn_kernel(static_cast<std::vector<int64_t>>(self.shape()), dtype,
+                      dev);
+}
+
+Tensor randint_like_kernel(const Tensor& self, int64_t low, int64_t high,
+                           DType dtype, std::optional<Device> device) {
+  if (dtype == DType::Undefined) dtype = self.dtype();
+  Device dev = device.has_value() ? *device : self.device();
+  return randint_kernel(low, high,
+                        static_cast<std::vector<int64_t>>(self.shape()),
+                        dtype, dev);
+}
+
 namespace {
 
 Tensor empty_stub(const std::vector<int64_t>& size, std::optional<DType> dtype,
@@ -489,6 +658,31 @@ Tensor logspace_stub(const Scalar& start, const Scalar& end, int64_t steps,
                          device.value_or(Device(DeviceType::MPS)));
 }
 
+Tensor rand_stub(const std::vector<int64_t>& size, std::optional<DType> dtype,
+                 std::optional<Device> device) {
+  return rand_kernel(size, resolve_factory_dtype(dtype),
+                     device.value_or(Device(DeviceType::MPS)));
+}
+
+Tensor randn_stub(const std::vector<int64_t>& size, std::optional<DType> dtype,
+                  std::optional<Device> device) {
+  return randn_kernel(size, resolve_factory_dtype(dtype),
+                      device.value_or(Device(DeviceType::MPS)));
+}
+
+Tensor randint_stub(int64_t low, int64_t high,
+                    const std::vector<int64_t>& size, DType dtype,
+                    std::optional<Device> device) {
+  return randint_kernel(low, high, size, dtype,
+                        device.value_or(Device(DeviceType::MPS)));
+}
+
+Tensor randperm_stub(int64_t n, DType dtype,
+                     std::optional<Device> device) {
+  return randperm_kernel(n, dtype,
+                         device.value_or(Device(DeviceType::MPS)));
+}
+
 } // namespace
 
 TENSORPLAY_LIBRARY_IMPL(MPS, FactoryKernels) {
@@ -508,6 +702,13 @@ TENSORPLAY_LIBRARY_IMPL(MPS, FactoryKernels) {
   m.impl("arange.end", arange_end_stub);
   m.impl("linspace", linspace_stub);
   m.impl("logspace", logspace_stub);
+  m.impl("rand", rand_stub);
+  m.impl("randn", randn_stub);
+  m.impl("randint", randint_stub);
+  m.impl("randperm", randperm_stub);
+  m.impl("rand_like", rand_like_kernel);
+  m.impl("randn_like", randn_like_kernel);
+  m.impl("randint_like", randint_like_kernel);
 }
 
 } // namespace mps
