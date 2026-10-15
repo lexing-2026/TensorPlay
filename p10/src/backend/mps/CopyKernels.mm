@@ -3,6 +3,7 @@
 #include "Exception.h"
 #include "DistributionDispatch.h"
 #include "Parallel.h"
+#include "Quantizer.h"
 
 #include "backend/mps/MPSAllocator.h"
 #include "backend/mps/MPSDevice.h"
@@ -106,9 +107,19 @@ void copy_via_host(Tensor& self, const Tensor& src) {
 } // namespace
 
 Tensor& copy_kernel(Tensor& self, const Tensor& src_in, bool non_blocking) {
-  if (self.impl()->quantizer() || src_in.impl()->quantizer()) {
+  const bool self_q = self.impl()->quantizer() != nullptr;
+  const bool src_q = src_in.impl()->quantizer() != nullptr;
+  if (self_q != src_q) {
     TP_THROW(NotImplementedError,
-             "quantized copy is not implemented on the MPS backend");
+             "mixed quantized/non-quantized copy is not implemented on the "
+             "MPS backend");
+  }
+  if (self_q) {
+    // Copy the underlying integer codes; the destination keeps its own
+    // quantizer (the codes view aliases the quantized tensor's storage).
+    Tensor self_codes = quantized::strip_quantizer(self);
+    Tensor src_codes = quantized::strip_quantizer(src_in);
+    return copy_kernel(self_codes, src_codes, non_blocking);
   }
   // The source broadcasts to the destination's shape; a source that does
   // not is refused rather than read past its own elements.

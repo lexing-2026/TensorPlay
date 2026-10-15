@@ -533,6 +533,7 @@ if(USE_MPS)
         src/backend/mps/NormalizationKernels.mm
         src/backend/mps/IndexingKernels.mm
         src/backend/mps/LossKernels.mm
+        src/backend/mps/QuantizedKernels.mm
     )
     list(APPEND P10_SOURCES ${TP_MPS_BACKEND_SOURCES})
 endif()

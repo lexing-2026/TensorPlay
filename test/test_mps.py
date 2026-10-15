@@ -407,5 +407,177 @@ class TestMPSLosses(unittest.TestCase):
         self.assertAlmostEqual(total.item(), 1.0, places=5)
 
 
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSVarStd(unittest.TestCase):
+    def test_var_std(self):
+        x = tp.tensor([1.0, 2.0, 3.0, 4.0], dtype=tp.float32, device="mps")
+        # population variance (correction=0): 1.25
+        self.assertAlmostEqual(tp.var(x, correction=0).item(), 1.25, places=5)
+        # sample variance (correction=1): 5/3
+        self.assertAlmostEqual(tp.var(x).item(), 5.0 / 3.0, places=5)
+        self.assertAlmostEqual(tp.std(x).item(), (5.0 / 3.0) ** 0.5, places=5)
+
+    def test_var_dim(self):
+        m = tp.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=tp.float32, device="mps")
+        # population variance over dim 0: [1,3] -> mean 2, var 1
+        v = tp.var(m, dim=[0], correction=0)
+        self.assertAlmostEqual(v.cpu().tolist()[0], 1.0, places=5)
+        self.assertAlmostEqual(v.cpu().tolist()[1], 1.0, places=5)
+        vk = tp.var(m, dim=[0], correction=0, keepdim=True)
+        self.assertEqual(vk.shape, (1, 2))
+        s = tp.std(m, dim=[0], correction=0)
+        self.assertAlmostEqual(s.cpu().tolist()[0], 1.0, places=5)
+
+
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSMiscReductions(unittest.TestCase):
+    def test_logsumexp(self):
+        x = tp.tensor([[1.0, 2.0, 3.0]], dtype=tp.float32, device="mps")
+        r = tp.logsumexp(x, dim=[1])
+        self.assertAlmostEqual(r.item(), 3.4076059, places=5)
+        # CPU reference: log(exp1+exp2+exp3)
+        xc = x.cpu()
+        rc = xc.exp().sum(dim=1).log()
+        self.assertTrue(tp.allclose(r.cpu(), rc))
+
+    def test_norm(self):
+        x = tp.tensor([3.0, 4.0], dtype=tp.float32, device="mps")
+        self.assertAlmostEqual(tp.norm(x, 2.0).item(), 5.0, places=5)
+        self.assertAlmostEqual(tp.norm(x, 1.0).item(), 7.0, places=5)
+        self.assertAlmostEqual(tp.norm(x, float("inf")).item(), 4.0, places=5)
+
+    def test_norm_dim(self):
+        m = tp.tensor([[3.0, 4.0], [6.0, 8.0]], dtype=tp.float32, device="mps")
+        n = tp.norm(m, p=2.0, dim=[1])
+        self.assertAlmostEqual(n.cpu().tolist()[0], 5.0, places=5)
+        self.assertAlmostEqual(n.cpu().tolist()[1], 10.0, places=5)
+
+
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSViewOps(unittest.TestCase):
+    def test_transpose_permute(self):
+        x = tp.arange(6, dtype=tp.float32, device="mps").reshape(2, 3)
+        self.assertTrue(tp.allclose(tp.transpose(x, 0, 1).cpu(), x.cpu().T))
+        p = tp.permute(x, [1, 0])
+        self.assertTrue(tp.allclose(p.cpu(), x.cpu().T))
+
+    def test_squeeze_unsqueeze(self):
+        x = tp.zeros((1, 3, 1), device="mps")
+        self.assertEqual(tp.squeeze(x).shape, (3,))
+        self.assertEqual(tp.unsqueeze(x, 0).shape, (1, 1, 3, 1))
+        self.assertEqual(tp.squeeze(x, dim=0).shape, (3, 1))
+
+    def test_reshape_slice(self):
+        x = tp.arange(12, dtype=tp.float32, device="mps").reshape(3, 4)
+        self.assertEqual(tp.reshape(x, [2, 6]).shape, (2, 6))
+        self.assertTrue(tp.all(tp.reshape(x, [2, 6]).cpu() == x.cpu().reshape(2, 6)).item())
+        s = x[1:3]
+        self.assertEqual(s.shape, (2, 4))
+
+    def test_split_chunk(self):
+        x = tp.arange(6, dtype=tp.float32, device="mps")
+        parts = tp.split(x, 2, 0)
+        self.assertEqual(len(parts), 3)
+        self.assertTrue(tp.allclose(parts[0].cpu(), tp.arange(2, dtype=tp.float32)))
+        chunks = tp.chunk(x, 3, 0)
+        self.assertEqual(len(chunks), 3)
+
+
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSPooling(unittest.TestCase):
+    def test_avg_pool2d(self):
+        x = tp.ones((1, 1, 4, 4), dtype=tp.float32, device="mps")
+        y = tp.avg_pool2d(x, kernel_size=[2, 2])
+        self.assertEqual(y.shape, (1, 1, 2, 2))
+        self.assertTrue(tp.all(y.cpu() == 1).item())
+
+    def test_max_pool2d(self):
+        x = tp.arange(16, dtype=tp.float32, device="mps").reshape(1, 1, 4, 4)
+        y = tp.max_pool2d(x, kernel_size=[2, 2], stride=[2, 2])
+        self.assertEqual(y.shape, (1, 1, 2, 2))
+        self.assertEqual(y.cpu().tolist()[0][0][0][0], 5)
+        self.assertEqual(y.cpu().tolist()[0][0][0][1], 7)
+        self.assertEqual(y.cpu().tolist()[0][0][1][0], 13)
+        self.assertEqual(y.cpu().tolist()[0][0][1][1], 15)
+
+    def test_adaptive_avg_pool2d(self):
+        x = tp.arange(16, dtype=tp.float32, device="mps").reshape(1, 1, 4, 4)
+        y = tp.adaptive_avg_pool2d(x, (2, 2))
+        self.assertEqual(y.shape, (1, 1, 2, 2))
+        self.assertAlmostEqual(y.cpu().tolist()[0][0][0][0], 2.5, places=5)
+
+
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSLayerNorm(unittest.TestCase):
+    def test_layer_norm(self):
+        x = tp.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+                      dtype=tp.float32, device="mps")
+        y = tp.layer_norm(x, [3])
+        mean = x.cpu().mean(dim=1, keepdim=True)
+        var = x.cpu().var(dim=1, keepdim=True, correction=0)
+        ref = (x.cpu() - mean) / (var + 1e-5).sqrt()
+        self.assertTrue(tp.allclose(y.cpu(), ref, atol=1e-4))
+
+    def test_layer_norm_affine(self):
+        x = tp.tensor([[1.0, 2.0, 3.0]], dtype=tp.float32, device="mps")
+        w = tp.tensor([1.0, 2.0, 3.0], dtype=tp.float32, device="mps")
+        b = tp.tensor([0.5, 0.5, 0.5], dtype=tp.float32, device="mps")
+        y = tp.layer_norm(x, [3], weight=w, bias=b)
+        self.assertEqual(y.shape, (1, 3))
+        self.assertTrue(tp.allclose(y.cpu(), ref_computed(x.cpu(), w.cpu(), b.cpu())))
+
+    def test_native_layer_norm_stats(self):
+        x = tp.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+                      dtype=tp.float32, device="mps")
+        y = tp.layer_norm(x, [3])
+        self.assertEqual(y.shape, (2, 3))
+
+
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSIndexing(unittest.TestCase):
+    def test_masked_fill(self):
+        x = tp.ones((2, 3), dtype=tp.float32, device="mps")
+        mask = tp.tensor([[True, False, True], [False, True, False]],
+                         device="mps")
+        y = tp.masked_fill(x, mask, tp.tensor(0.0, dtype=tp.float32))
+        self.assertEqual(y.cpu().tolist()[0][0], 0.0)
+        self.assertEqual(y.cpu().tolist()[0][1], 1.0)
+
+    def test_index_select(self):
+        x = tp.arange(6, dtype=tp.float32, device="mps").reshape(3, 2)
+        idx = tp.tensor([0, 2], dtype=tp.int64).mps()
+        y = tp.index_select(x, 0, idx)
+        self.assertEqual(y.shape, (2, 2))
+        self.assertTrue(tp.all(y.cpu() == x.cpu()[[0, 2]]).item())
+
+    def test_gather(self):
+        x = tp.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=tp.float32, device="mps")
+        idx = tp.tensor([[0, 0], [1, 0]], dtype=tp.int64).mps()
+        y = tp.gather(x, 1, idx)
+        self.assertEqual(y.cpu().tolist(), [[1.0, 1.0], [4.0, 3.0]])
+
+    def test_scatter(self):
+        x = tp.zeros((2, 3), dtype=tp.float32, device="mps")
+        idx = tp.tensor([[0, 1], [1, 2]], dtype=tp.int64).mps()
+        src = tp.ones((2, 2), dtype=tp.float32, device="mps")
+        y = tp.scatter(x, 1, idx, src)
+        self.assertEqual(y.cpu().tolist(), [[1.0, 1.0, 0.0], [0.0, 1.0, 1.0]])
+
+    def test_scatter_add(self):
+        x = tp.zeros((1, 3), dtype=tp.float32, device="mps")
+        idx = tp.tensor([[0, 0, 1]], dtype=tp.int64).mps()
+        src = tp.tensor([[1.0, 2.0, 3.0]], dtype=tp.float32, device="mps")
+        y = tp.scatter_add(x, 1, idx, src)
+        self.assertEqual(y.cpu().tolist(), [[3.0, 3.0, 0.0]])
+
+
+def ref_computed(x_cpu, w_cpu, b_cpu):
+    # Reference layer-norm output with affine for a single row.
+    mean = x_cpu.mean(dim=1, keepdim=True)
+    var = x_cpu.var(dim=1, keepdim=True, correction=0)
+    norm = (x_cpu - mean) / (var + 1e-5).sqrt()
+    return norm * w_cpu + b_cpu
+
+
 if __name__ == "__main__":
     unittest.main()

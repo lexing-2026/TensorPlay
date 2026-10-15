@@ -6,6 +6,7 @@
 #include "Generator.h"
 #include "DistributionsHelper.h"
 #include "DistributionDispatch.h"
+#include "Quantizer.h"
 
 #include "backend/mps/MPSDevice.h"
 
@@ -198,12 +199,31 @@ Tensor empty_like_kernel(const Tensor& self, DType dtype,
                          std::optional<Device> device) {
   if (dtype == DType::Undefined) dtype = self.dtype();
   Device dev = device.has_value() ? *device : self.device();
+  Tensor out = empty_kernel(static_cast<std::vector<int64_t>>(self.shape()),
+                            dtype, dev, false);
   if (self.impl()->has_quantizer()) {
-    TP_THROW(NotImplementedError,
-             "empty_like not implemented for quantized MPS tensors");
+    const QuantizerPtr src_q = self.impl()->quantizer();
+    switch (src_q->qscheme()) {
+      case kPerTensorAffine:
+        out.impl()->set_quantizer(make_per_tensor_affine_quantizer(
+            src_q->scale(), src_q->zero_point(), dtype));
+        break;
+      case kPerChannelAffine:
+      case kPerChannelAffineFloatQParams: {
+        Tensor scales = src_q->scales();
+        Tensor zero_points = src_q->zero_points();
+        if (scales.device() != dev) scales = scales.to(dev);
+        if (zero_points.device() != dev) zero_points = zero_points.to(dev);
+        out.impl()->set_quantizer(make_per_channel_affine_quantizer(
+            scales, zero_points, src_q->axis(), dtype));
+        break;
+      }
+      default:
+        TP_THROW(ValueError,
+                 "empty_like: unsupported quantization scheme on MPS");
+    }
   }
-  return empty_kernel(static_cast<std::vector<int64_t>>(self.shape()), dtype,
-                      dev, false);
+  return out;
 }
 
 Tensor full_like_kernel(const Tensor& self, const Scalar& fill_value,

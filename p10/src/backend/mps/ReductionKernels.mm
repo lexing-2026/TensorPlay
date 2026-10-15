@@ -363,6 +363,135 @@ Tensor any_dim_int_kernel(const Tensor& self, int64_t dim, bool keepdim) {
   return any_dim_kernel(self, std::vector<int64_t>{dim}, keepdim);
 }
 
+// ---------------------------------------------------------------------------
+// var / std
+// ---------------------------------------------------------------------------
+
+// Computes variance (or std when `is_std`) over `dims` (empty = all dims).
+// The biased variance comes from the confirmed varianceOfTensor selector;
+// Bessel's correction is applied afterwards as a multiplication by
+// N / (N - correction) (N = number of reduced elements).
+Tensor varStdOp(const Tensor& self, const std::vector<int64_t>& dims,
+                bool keepdim, int64_t correction, bool is_std) {
+  if (!self.device().is_mps()) {
+    TP_THROW(RuntimeError, "MPS var/std requires input on the MPS device");
+  }
+  if (!isFloatingType(self.dtype()) && !isComplexType(self.dtype())) {
+    TP_THROW(RuntimeError,
+             "std and var only support floating point and complex dtypes");
+  }
+  const std::vector<int64_t> in_shape =
+      static_cast<std::vector<int64_t>>(self.shape());
+  std::vector<int64_t> axes = normalize_dims(dims, self.dim());
+  if (axes.empty()) {
+    for (int64_t i = 0; i < self.dim(); ++i) {
+      axes.push_back(i);
+    }
+  }
+  const std::vector<int64_t> out_shape =
+      compute_out_shape(in_shape, axes, keepdim);
+
+  // A 0-d input reduced over all dims: var of a single value with
+  // correction 0 is 0; with any correction it is NaN (0/0).
+  if (self.dim() == 0) {
+    Tensor out = Tensor(out_shape, self.dtype(), self.device());
+    if (correction == 0) {
+      fill_kernel(out, 0);
+    } else {
+      fill_kernel(out, std::numeric_limits<float>::quiet_NaN());
+    }
+    return out;
+  }
+
+  if (self.numel() == 0) {
+    Tensor out = Tensor(out_shape, self.dtype(), self.device());
+    if (out.numel() > 0) {
+      fill_kernel(out, std::numeric_limits<float>::quiet_NaN());
+    }
+    return out;
+  }
+
+  int64_t correction_n = 1;
+  for (int64_t a : axes) {
+    correction_n *= in_shape[a];
+  }
+  const int64_t dof_i = std::max<int64_t>(0, correction_n - correction);
+  const double bessel =
+      static_cast<double>(correction_n) / static_cast<double>(dof_i);
+  // (inf when dof == 0)
+
+  Tensor self_c = materializeForGraph(self);
+  Tensor output = Tensor(out_shape, self.dtype(), self.device());
+  if (output.numel() == 0) {
+    return output;
+  }
+
+  @autoreleasepool {
+    MPSGraph* graph = [[MPSGraph new] autorelease];
+    MPSShape* inShape = getMPSShape(in_shape);
+    const MPSDataType dt = getMPSDataType(self_c.dtype());
+    MPSGraphTensor* x = [graph placeholderWithShape:inShape
+                                          dataType:dt
+                                               name:@"x"];
+    NSMutableArray<NSNumber*>* axesArray =
+        [NSMutableArray arrayWithCapacity:axes.size()];
+    for (int64_t a : axes) {
+      [axesArray addObject:@(a)];
+    }
+    MPSGraphTensor* variance =
+        [graph varianceOfTensor:x axes:axesArray name:nil];
+    MPSGraphTensor* corrected = variance;
+    if (correction != 0) {
+      MPSGraphTensor* besselTensor =
+          [graph constantWithScalar:bessel dataType:dt];
+      corrected = [graph multiplicationWithPrimaryTensor:variance
+                                         secondaryTensor:besselTensor
+                                                    name:nil];
+    }
+    MPSGraphTensor* reduced =
+        is_std ? [graph squareRootWithTensor:corrected name:nil] : corrected;
+
+    const std::vector<int64_t> graph_shape =
+        out_shape.empty() ? std::vector<int64_t>{1} : out_shape;
+    MPSGraphTensor* reshaped =
+        [graph reshapeTensor:reduced withShape:getMPSShape(graph_shape) name:nil];
+
+    id<MTLBuffer> inBuf = mtlBufferOf(self_c);
+    id<MTLBuffer> outBuf = mtlBufferOf(output);
+    MPSGraphTensorData* inData =
+        [[[MPSGraphTensorData alloc] initWithMTLBuffer:inBuf
+                                                shape:inShape
+                                             dataType:dt] autorelease];
+    MPSGraphTensorData* outData =
+        [[[MPSGraphTensorData alloc] initWithMTLBuffer:outBuf
+                                                shape:getMPSShape(graph_shape)
+                                             dataType:dt] autorelease];
+    NSDictionary* feeds = @{x : inData};
+    NSDictionary* results = @{reshaped : outData};
+    getCurrentMPSStream()->executeMPSGraph(graph, feeds, results,
+                                          SyncType::COMMIT_AND_WAIT);
+  }
+  return output;
+}
+
+Tensor var_kernel(const Tensor& self, int64_t correction) {
+  return varStdOp(self, {}, false, correction, false);
+}
+
+Tensor var_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim,
+                      int64_t correction, bool keepdim) {
+  return varStdOp(self, dim, keepdim, correction, false);
+}
+
+Tensor std_kernel(const Tensor& self, int64_t correction) {
+  return varStdOp(self, {}, false, correction, true);
+}
+
+Tensor std_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim,
+                      int64_t correction, bool keepdim) {
+  return varStdOp(self, dim, keepdim, correction, true);
+}
+
 TENSORPLAY_LIBRARY_IMPL(MPS, ReductionKernels) {
   m.impl("sum", sum_kernel);
   m.impl("sum.dim_IntList", sum_dim_kernel);
@@ -378,6 +507,10 @@ TENSORPLAY_LIBRARY_IMPL(MPS, ReductionKernels) {
   m.impl("all.dim", all_dim_int_kernel);
   m.impl("any", any_kernel);
   m.impl("any.dim", any_dim_int_kernel);
+  m.impl("var", var_kernel);
+  m.impl("var.dim", var_dim_kernel);
+  m.impl("std", std_kernel);
+  m.impl("std.dim", std_dim_kernel);
 }
 
 } // namespace mps
