@@ -492,10 +492,16 @@ class StorageBuffer final {
         dtype_(dtype),
         numel_(numel),
         nbytes_(numel_ * tensorplay::elementSize(dtype_)),
-        vulkan_buffer_(context_p_->acquire_staging_buffer(nbytes_)) {
+        // Round the allocation up to the allocator alignment quantum so the
+        // backing size reported by VMA equals the requested size.  The reuse
+        // pools match sizes exactly, and without rounding a large staging
+        // buffer is never recycled (its aligned backing size is a few bytes
+        // larger than the request) and gets re-allocated on every readback.
+        vulkan_buffer_(context_p_->acquire_staging_buffer(
+            (nbytes_ + 255u) & ~size_t(255u))) {
     if (!vulkan_buffer_) {
       vulkan_buffer_ = context_p_->adapter_ptr()->vma().create_staging_buffer(
-          nbytes_);
+          (nbytes_ + 255u) & ~size_t(255u));
     }
   }
 

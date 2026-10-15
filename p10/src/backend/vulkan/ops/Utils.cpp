@@ -145,9 +145,9 @@ void copy_buffer_to_vtensor(
   api::Context* const context = api::context();
 
   TP_CHECK(
-      src_buffer.mem_size() == v_dst.gpu_nbytes(),
-      "Vulkan copy_buffer_to_vtensor: source buffer and destination texture "
-      "do not have the same number of bytes");
+      src_buffer.mem_size() >= v_dst.gpu_nbytes(),
+      "Vulkan copy_buffer_to_vtensor: source buffer is smaller than the "
+      "destination texture");
 
   context->submit_copy<api::VulkanBuffer, api::VulkanImage>(
       // pipeline barrier
@@ -195,9 +195,9 @@ void copy_vtensor_to_buffer(
   api::Context* const context = api::context();
 
   TP_CHECK(
-      v_src.gpu_nbytes() == dst_buffer.mem_size(),
-      "Vulkan copy_vtensor_to_buffer: source texture and destination buffer "
-      "do not have the same number of bytes");
+      v_src.gpu_nbytes() <= dst_buffer.mem_size(),
+      "Vulkan copy_vtensor_to_buffer: destination buffer is smaller than "
+      "the source texture");
 
   context->submit_copy<api::VulkanImage, api::VulkanBuffer>(
       // pipeline barrier
