@@ -21,6 +21,10 @@ constexpr size_t kHostVisiblePoolByteBudget = 256u * 1024u * 1024u;
 // many small tensor resources whose descriptor sets would exhaust the pool
 // long before the host-visible bytes reach the budget above.
 constexpr size_t kMaxPendingResourceCount = 1024u;
+// Reused tensor buffers may be a few KB larger than the request due to
+// allocator alignment; accepting a modest slack keeps hits high while
+// avoiding the waste of rebinding a much larger allocation.
+constexpr VkDeviceSize kReusableBufferSlack = 512u * 1024u;
 
 namespace tensorplay {
 namespace vulkan {
@@ -188,6 +192,45 @@ void Context::recycle_pending_resources() {
   if (cmd_) {
     cmd_.invalidate();
   }
+}
+
+bool Context::acquire_reusable_buffer(
+    VkDeviceSize size,
+    VulkanBuffer& buffer) {
+  std::lock_guard<std::mutex> lock(buffer_clearlist_mutex_);
+  // Search newest-first so the most recently released resource is reused
+  // (LIFO).  This keeps the clearlist small and bounds reserved device
+  // memory to the live working set instead of accumulating stale entries.
+  for (auto it = buffers_to_clear_.rbegin(); it != buffers_to_clear_.rend();
+       ++it) {
+    const VkDeviceSize candidate_size = it->mem_size();
+    if (candidate_size >= size &&
+        candidate_size <= size + kReusableBufferSlack) {
+      buffer = std::move(*it);
+      buffers_to_clear_.erase(std::next(it).base());
+      return true;
+    }
+  }
+  return false;
+}
+
+bool Context::acquire_reusable_image(
+    const utils::uvec3& extents,
+    VkFormat format,
+    VulkanImage& image) {
+  std::lock_guard<std::mutex> lock(image_clearlist_mutex_);
+  // Newest-first reuse (LIFO), same as buffers: keeps the clearlist small.
+  for (auto it = images_to_clear_.rbegin(); it != images_to_clear_.rend();
+       ++it) {
+    const VkExtent3D e = it->extents();
+    if (e.width == extents[0u] && e.height == extents[1u] &&
+        e.depth == extents[2u] && it->format() == format) {
+      image = std::move(*it);
+      images_to_clear_.erase(std::next(it).base());
+      return true;
+    }
+  }
+  return false;
 }
 
 void Context::flush() {

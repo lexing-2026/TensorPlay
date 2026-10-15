@@ -122,7 +122,7 @@ Tensor binary_op_tensor(
     api::PipelineBarrier pipeline_barrier{};
     context->submit_compute_job(
         VK_KERNEL_FROM_STR(buffer_variant.c_str()), pipeline_barrier,
-        {n, 1u, 1u}, {256u, 1u, 1u}, VK_NULL_HANDLE,
+        {(n + 3u) / 4u, 1u, 1u}, {256u, 1u, 1u}, VK_NULL_HANDLE,
         v_output.buffer(pipeline_barrier, api::PipelineStage::COMPUTE,
                         api::MemoryAccessType::WRITE),
         v_self.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
@@ -213,7 +213,7 @@ Tensor& binary_op_tensor_inplace(
     api::PipelineBarrier pipeline_barrier{};
     context->submit_compute_job(
         VK_KERNEL_FROM_STR(buffer_variant.c_str()), pipeline_barrier,
-        {n, 1u, 1u}, {256u, 1u, 1u}, VK_NULL_HANDLE,
+        {(n + 3u) / 4u, 1u, 1u}, {256u, 1u, 1u}, VK_NULL_HANDLE,
         v_self.buffer(pipeline_barrier, api::PipelineStage::COMPUTE,
                       api::MemoryAccessType::WRITE),
         v_other.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
@@ -341,7 +341,7 @@ Tensor binary_op_scalar(
     api::PipelineBarrier pipeline_barrier{};
     context->submit_compute_job(
         VK_KERNEL_FROM_STR(buffer_variant.c_str()), pipeline_barrier,
-        {n, 1u, 1u}, {256u, 1u, 1u}, VK_NULL_HANDLE,
+        {(n + 3u) / 4u, 1u, 1u}, {256u, 1u, 1u}, VK_NULL_HANDLE,
         v_output.buffer(pipeline_barrier, api::PipelineStage::COMPUTE,
                         api::MemoryAccessType::WRITE),
         v_self.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
@@ -407,7 +407,7 @@ Tensor& binary_op_scalar_inplace(
     api::PipelineBarrier pipeline_barrier{};
     context->submit_compute_job(
         VK_KERNEL_FROM_STR(buffer_variant.c_str()), pipeline_barrier,
-        {n, 1u, 1u}, {256u, 1u, 1u}, VK_NULL_HANDLE,
+        {(n + 3u) / 4u, 1u, 1u}, {256u, 1u, 1u}, VK_NULL_HANDLE,
         v_self.buffer(pipeline_barrier, api::PipelineStage::COMPUTE,
                       api::MemoryAccessType::WRITE),
         params.buffer());

@@ -150,6 +150,19 @@ class Context final {
     images_to_clear_.emplace_back(std::move(image));
   }
 
+  // Reuse pool for cleared tensor storage.  A vTensorStorage that dies parks
+  // its image/buffer in the clearlist above; acquiring first checks the list
+  // for a compatible resource (byte size / image extents+format) and, when one
+  // is found, waits for in-flight work to drain so the recycled resource can
+  // be safely rebound.  This avoids a fresh device allocation (and its
+  // associated driver cost) on the hot out-of-place op path.  Returns false
+  // when no compatible resource is available; the caller allocates new.
+  bool acquire_reusable_buffer(VkDeviceSize size, VulkanBuffer& buffer);
+  bool acquire_reusable_image(
+      const utils::uvec3& extents,
+      VkFormat format,
+      VulkanImage& image);
+
   // Host-visible buffer recycling.  `release_*` parks a dead buffer in the
   // pending list; flush() promotes pending buffers to the pools after the
   // queue is idle.  `acquire_*` returns a pooled buffer whose allocation is

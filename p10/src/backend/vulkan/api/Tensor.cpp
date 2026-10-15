@@ -303,10 +303,20 @@ vTensorStorage::vTensorStorage(
   if (api::StorageType::BUFFER == storage_type) {
     buffer_length_ = static_cast<int64_t>(utils::multiply_integers(sizes));
 
-    buffer_ = context_->adapter_ptr()->vma().create_storage_buffer(
-        buffer_length_ * tensorplay::elementSize(dtype),
-        !context_->adapter_ptr()->has_unified_memory(),
-        allocate_memory);
+    const VkDeviceSize nbytes =
+        static_cast<VkDeviceSize>(buffer_length_) *
+        static_cast<VkDeviceSize>(tensorplay::elementSize(dtype));
+    // Round up to a multiple of 16 so buffer kernels can use aligned vec4
+    // (128-bit) accesses for the bulk of their work.  The byte-exact element
+    // count stays in buffer_length_/uBlock.buf_length.
+    const VkDeviceSize nbytes_aligned = (nbytes + 15u) & ~VkDeviceSize(15u);
+    if (!allocate_memory ||
+        !context_->acquire_reusable_buffer(nbytes_aligned, buffer_)) {
+      buffer_ = context_->adapter_ptr()->vma().create_storage_buffer(
+          nbytes_aligned,
+          !context_->adapter_ptr()->has_unified_memory(),
+          allocate_memory);
+    }
     return;
   }
 
@@ -322,15 +332,26 @@ vTensorStorage::vTensorStorage(
       gpu_memory_layout_ = api::GPUMemoryLayout::TENSOR_WIDTH_PACKED;
       extents_ = {0u, 0u, 0u}; // buffer storage has no image extents
       buffer_length_ = static_cast<int64_t>(utils::multiply_integers(sizes));
-      buffer_ = context_->adapter_ptr()->vma().create_storage_buffer(
-          buffer_length_ * tensorplay::elementSize(dtype),
-          !context_->adapter_ptr()->has_unified_memory(),
-          allocate_memory);
+      const VkDeviceSize nbytes =
+          static_cast<VkDeviceSize>(buffer_length_) *
+          static_cast<VkDeviceSize>(tensorplay::elementSize(dtype));
+      const VkDeviceSize nbytes_aligned = (nbytes + 15u) & ~VkDeviceSize(15u);
+      if (!allocate_memory ||
+          !context_->acquire_reusable_buffer(nbytes_aligned, buffer_)) {
+        buffer_ = context_->adapter_ptr()->vma().create_storage_buffer(
+            nbytes_aligned,
+            !context_->adapter_ptr()->has_unified_memory(),
+            allocate_memory);
+      }
       return;
     }
 
-    image_ = allocate_image(
-        context_, extents_, storage_type, to_vkformat(dtype), allocate_memory);
+    if (!allocate_memory ||
+        !context_->acquire_reusable_image(
+            extents_, to_vkformat(dtype), image_)) {
+      image_ = allocate_image(
+          context_, extents_, storage_type, to_vkformat(dtype), allocate_memory);
+    }
     return;
   }
 
