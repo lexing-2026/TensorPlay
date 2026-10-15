@@ -6,6 +6,7 @@
 #include "backend/mps/MetalShaderLibrary.h"
 #include "backend/mps/MetalUtils.h"
 #include "backend/mps/MPSStream.h"
+#include "backend/mps/kernels/Embedding.h"
 
 #include <Metal/Metal.h>
 
