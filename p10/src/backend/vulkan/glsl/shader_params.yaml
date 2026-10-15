@@ -561,6 +561,16 @@ pool2d:
     - NAME: max_pool2d
       MAX_POOLING: true
 
+max_pool2d_backward:
+  parameter_names_with_default_values: {}
+  shader_variants:
+    - NAME: max_pool2d_backward
+
+avg_pool2d_backward:
+  parameter_names_with_default_values: {}
+  shader_variants:
+    - NAME: avg_pool2d_backward
+
 adaptive_avg_pool2d:
   parameter_names_with_default_values: {}
   shader_variants:

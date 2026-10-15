@@ -237,6 +237,178 @@ Tensor max_pool2d_kernel(
   return pool2d_impl(input, kernel_size, stride, padding, ceil_mode);
 }
 
+Tensor max_pool2d_backward_kernel(
+    const Tensor& grad_output,
+    const Tensor& input,
+    const std::vector<int64_t>& kernel_size,
+    const std::vector<int64_t>& stride,
+    const std::vector<int64_t>& padding,
+    const std::vector<int64_t>& dilation,
+    bool ceil_mode) {
+  TP_CHECK(
+      dilation.size() == 2 && dilation[0] == 1 && dilation[1] == 1,
+      "Vulkan max_pool2d_backward does not support dilation yet");
+  validate_pool_input(input);
+  TP_CHECK(
+      grad_output.dim() == 4,
+      "Vulkan max_pool2d_backward requires a 4d grad_output");
+
+  const std::vector<int64_t> resolved_stride =
+      stride.empty() ? kernel_size : stride;
+  const std::vector<int64_t> resolved_padding =
+      padding.empty() ? std::vector<int64_t>(2, 0) : padding;
+
+  TP_CHECK(
+      kernel_size.size() == 2 && resolved_stride.size() == 2 &&
+          resolved_padding.size() == 2,
+      "Vulkan max_pool2d_backward expects 2d kernel, stride, and padding");
+
+  api::Context* const context = api::context();
+
+  api::vTensor v_input = convert(input);
+  api::vTensor v_grad = convert(grad_output);
+
+  api::vTensor v_output{
+      context,
+      v_input.sizes(),
+      input.dtype(),
+  };
+
+  if (v_output.storage_type() == api::StorageType::BUFFER) {
+    TP_THROW(
+        NotImplementedError,
+        "Vulkan max_pool2d_backward requires texture storage");
+  }
+
+  const struct MaxPool2DBackwardBlock final {
+    ivec4 in_sizes;
+    ivec4 out_sizes;
+    ivec2 kernel;
+    ivec2 stride;
+    ivec2 padding;
+    int c_depth;
+  } block{
+      make_whcn_ivec4(v_input.sizes()),
+      make_whcn_ivec4(v_grad.sizes()),
+      ivec2(
+          static_cast<int32_t>(kernel_size[0]),
+          static_cast<int32_t>(kernel_size[1])),
+      ivec2(
+          static_cast<int32_t>(resolved_stride[0]),
+          static_cast<int32_t>(resolved_stride[1])),
+      ivec2(
+          static_cast<int32_t>(resolved_padding[0]),
+          static_cast<int32_t>(resolved_padding[1])),
+      c_depth_of(v_input.sizes())};
+
+  api::UniformParamsBuffer params(context, block);
+  api::PipelineBarrier pipeline_barrier{};
+
+  context->submit_compute_job(
+      VK_KERNEL(max_pool2d_backward),
+      pipeline_barrier,
+      v_output.extents(),
+      adaptive_work_group_size(v_output.extents()),
+      VK_NULL_HANDLE,
+      v_output.image(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::WRITE),
+      v_grad.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+      v_input.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+      params.buffer());
+
+  return convert(v_output);
+}
+
+Tensor avg_pool2d_backward_kernel(
+    const Tensor& grad_output,
+    const Tensor& input,
+    const std::vector<int64_t>& kernel_size,
+    const std::vector<int64_t>& stride,
+    const std::vector<int64_t>& padding,
+    bool ceil_mode,
+    bool count_include_pad,
+    std::optional<int64_t> divisor_override) {
+  (void)ceil_mode;
+  validate_pool_input(input);
+  TP_CHECK(
+      grad_output.dim() == 4,
+      "Vulkan avg_pool2d_backward requires a 4d grad_output");
+
+  const std::vector<int64_t> resolved_stride =
+      stride.empty() ? kernel_size : stride;
+  const std::vector<int64_t> resolved_padding =
+      padding.empty() ? std::vector<int64_t>(2, 0) : padding;
+
+  TP_CHECK(
+      kernel_size.size() == 2 && resolved_stride.size() == 2 &&
+          resolved_padding.size() == 2,
+      "Vulkan avg_pool2d_backward expects 2d kernel, stride, and padding");
+
+  api::Context* const context = api::context();
+
+  api::vTensor v_input = convert(input);
+  api::vTensor v_grad = convert(grad_output);
+
+  api::vTensor v_output{
+      context,
+      v_input.sizes(),
+      input.dtype(),
+  };
+
+  if (v_output.storage_type() == api::StorageType::BUFFER) {
+    TP_THROW(
+        NotImplementedError,
+        "Vulkan avg_pool2d_backward requires texture storage");
+  }
+
+  const struct AvgPool2DBackwardBlock final {
+    ivec4 in_sizes;
+    ivec4 out_sizes;
+    ivec2 kernel;
+    ivec2 stride;
+    ivec2 padding;
+    int c_depth;
+    int count_include_pad;
+    float divisor_override;
+  } block{
+      make_whcn_ivec4(v_input.sizes()),
+      make_whcn_ivec4(v_grad.sizes()),
+      ivec2(
+          static_cast<int32_t>(kernel_size[0]),
+          static_cast<int32_t>(kernel_size[1])),
+      ivec2(
+          static_cast<int32_t>(resolved_stride[0]),
+          static_cast<int32_t>(resolved_stride[1])),
+      ivec2(
+          static_cast<int32_t>(resolved_padding[0]),
+          static_cast<int32_t>(resolved_padding[1])),
+      c_depth_of(v_input.sizes()),
+      count_include_pad ? 1 : 0,
+      divisor_override.has_value()
+          ? static_cast<float>(*divisor_override)
+          : 0.0f};
+
+  api::UniformParamsBuffer params(context, block);
+  api::PipelineBarrier pipeline_barrier{};
+
+  context->submit_compute_job(
+      VK_KERNEL(avg_pool2d_backward),
+      pipeline_barrier,
+      v_output.extents(),
+      adaptive_work_group_size(v_output.extents()),
+      VK_NULL_HANDLE,
+      v_output.image(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::WRITE),
+      v_grad.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+      params.buffer());
+
+  return convert(v_output);
+}
+
 Tensor adaptive_avg_pool2d_kernel(
     const Tensor& input,
     const std::vector<int64_t>& output_size) {
@@ -295,6 +467,8 @@ Tensor adaptive_avg_pool2d_kernel(
 TENSORPLAY_LIBRARY_IMPL(Vulkan, PoolingKernels) {
   m.impl("avg_pool2d", &tensorplay::vulkan::ops::avg_pool2d_kernel);
   m.impl("max_pool2d", &tensorplay::vulkan::ops::max_pool2d_kernel);
+  m.impl("max_pool2d_backward", &tensorplay::vulkan::ops::max_pool2d_backward_kernel);
+  m.impl("avg_pool2d_backward", &tensorplay::vulkan::ops::avg_pool2d_backward_kernel);
   m.impl("adaptive_avg_pool2d", &tensorplay::vulkan::ops::adaptive_avg_pool2d_kernel);
 }
 

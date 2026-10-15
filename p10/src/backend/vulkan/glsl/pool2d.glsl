@@ -58,14 +58,20 @@ void main() {
       const bool inside = all(greaterThanEqual(in_pos, ivec2(0))) &&
           in_pos.x < uBlock.in_sizes.x &&
           in_pos.y < uBlock.in_sizes.y;
-      const vec4 v = inside
-          ? texelFetch(
-                uInput, ivec3(in_pos.x, in_pos.y, pos.z), 0)
-          : vec4(0.0f);
       // clang-format off
       $if MAX_POOLING:
+        // Padded positions are outside the tensor and must never win the
+        // window maximum; a zero lane would dominate all-negative inputs.
+        const vec4 v = inside
+            ? texelFetch(
+                  uInput, ivec3(in_pos.x, in_pos.y, pos.z), 0)
+            : vec4(-3.0e38f);
         acc = max(acc, v);
       $else:
+        const vec4 v = inside
+            ? texelFetch(
+                  uInput, ivec3(in_pos.x, in_pos.y, pos.z), 0)
+            : vec4(0.0f);
         count += inside ? 1 : 0;
         acc += v;
       // clang-format on
