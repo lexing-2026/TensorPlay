@@ -885,7 +885,7 @@ struct GridSampleCodes {
             }
         }
         if (padding) v = ::fminf(size - 1.f, ::fmaxf(v, 0.f));
-        if (!std::isfinite(v) || v < -2147483648.f || v > 2147483520.f) v = -100.f;
+        if (!::isfinite(static_cast<double>(v)) || v < -2147483648.f || v > 2147483520.f) v = -100.f;
         return v;
     }
     TP_QN_DEVICE float sample(int64_t base, int64_t h, int64_t w) const {
