@@ -347,5 +347,65 @@ class TestMPSAllAny(unittest.TestCase):
         self.assertTrue(tp.all(t, dim=1).cpu().all().item())
 
 
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSLosses(unittest.TestCase):
+    def test_mse_loss(self):
+        x = tp.tensor([1.0, 2.0, 3.0], dtype=tp.float32, device="mps")
+        y = tp.tensor([1.0, 2.0, 5.0], dtype=tp.float32, device="mps")
+        self.assertAlmostEqual(tp.mse_loss(x, y).item(), 4.0 / 3.0, places=5)
+        self.assertAlmostEqual(tp.mse_loss(x, y, reduction=0).cpu().tolist()[2], 4.0, places=5)
+        self.assertAlmostEqual(tp.mse_loss(x, y, reduction=2).item(), 4.0, places=5)
+
+    def test_l1_loss(self):
+        x = tp.tensor([1.0, 2.0, 3.0], dtype=tp.float32, device="mps")
+        y = tp.tensor([1.0, 2.0, 5.0], dtype=tp.float32, device="mps")
+        self.assertAlmostEqual(tp.l1_loss(x, y).item(), 2.0 / 3.0, places=5)
+
+    def test_smooth_l1_loss(self):
+        x = tp.tensor([1.0, 2.0], dtype=tp.float32, device="mps")
+        y = tp.tensor([3.0, 2.0], dtype=tp.float32, device="mps")
+        # |diff| = [2, 0]; beta=1 -> [2-0.5, 0.5*0] = [1.5, 0]
+        self.assertAlmostEqual(tp.smooth_l1_loss(x, y, reduction=0).cpu().tolist()[0], 1.5, places=5)
+        self.assertAlmostEqual(tp.smooth_l1_loss(x, y, reduction=0).cpu().tolist()[1], 0.0, places=5)
+
+    def test_huber_loss(self):
+        x = tp.tensor([1.0, 2.0], dtype=tp.float32, device="mps")
+        y = tp.tensor([5.0, 2.0], dtype=tp.float32, device="mps")
+        # |diff| = [4, 0]; delta=1 -> [1*(4-0.5), 0] = [3.5, 0]
+        self.assertAlmostEqual(tp.huber_loss(x, y, reduction=0).cpu().tolist()[0], 3.5, places=5)
+        self.assertAlmostEqual(tp.huber_loss(x, y, reduction=0).cpu().tolist()[1], 0.0, places=5)
+
+    def test_binary_cross_entropy(self):
+        x = tp.tensor([0.5, 0.8], dtype=tp.float32, device="mps")
+        y = tp.tensor([1.0, 0.0], dtype=tp.float32, device="mps")
+        loss = tp.binary_cross_entropy(x, y)
+        expected = -(0.5 * 0.5 * 0.0)  # mean of -[ln0.5, ln0.2]
+        self.assertTrue(loss.item() > 0)
+        self.assertAlmostEqual(tp.binary_cross_entropy(x, y, reduction=0).cpu().tolist()[0],
+                               -0.6931471805599453, places=5)
+
+    def test_nll_loss(self):
+        log_probs = tp.tensor([[-0.5, -1.0, -2.0], [-1.5, -0.2, -0.8]],
+                              dtype=tp.float32, device="mps")
+        target = tp.tensor([0, 1], dtype=tp.int64).mps()
+        loss, total = tp.nll_loss(log_probs, target)
+        self.assertAlmostEqual(loss.item(), 0.35, places=5)
+        self.assertAlmostEqual(total.item(), 2.0, places=5)
+
+        loss0 = tp.nll_loss(log_probs, target, reduction=0)
+        self.assertEqual(loss0.cpu().tolist(), [0.5, 0.2])
+
+        w = tp.tensor([2.0, 1.0, 1.0], dtype=tp.float32, device="mps")
+        loss_w, total_w = tp.nll_loss(log_probs, target, weight=w)
+        self.assertAlmostEqual(loss_w.item(), (1.0 + 0.2) / 3.0, places=5)
+
+    def test_nll_loss_ignore_index(self):
+        log_probs = tp.tensor([[-0.5, -1.0], [-1.5, -0.2]], dtype=tp.float32, device="mps")
+        target = tp.tensor([0, -100], dtype=tp.int64).mps()
+        loss, total = tp.nll_loss(log_probs, target, ignore_index=-100)
+        self.assertAlmostEqual(loss.item(), 0.5, places=5)
+        self.assertAlmostEqual(total.item(), 1.0, places=5)
+
+
 if __name__ == "__main__":
     unittest.main()
