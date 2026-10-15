@@ -132,6 +132,10 @@ class Vectorized<int64_t> {
     return svminv_s64(svptrue_b64(), values);
   }
 
+  Vectorized<int64_t> abs() const {
+    return Vectorized<int64_t>(svabs_s64_x(svptrue_b64(), values));
+  }
+
   Vectorized<int64_t> operator==(const Vectorized<int64_t>& other) const {
     return sve_cmp_s64(svcmpeq_s64(svptrue_b64(), values, other.values));
   }
@@ -387,6 +391,10 @@ class Vectorized<int32_t> {
   }
   int32_t reduce_min() const {
     return svminv_s32(svptrue_b32(), values);
+  }
+
+  Vectorized<int32_t> abs() const {
+    return Vectorized<int32_t>(svabs_s32_x(svptrue_b32(), values));
   }
 
   Vectorized<int32_t> operator==(const Vectorized<int32_t>& other) const {
