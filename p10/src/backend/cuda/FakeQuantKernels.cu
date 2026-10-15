@@ -69,7 +69,7 @@ __global__ void fake_quant_per_tensor_kernel_double(
                        static_cast<double>(zero_point);
     const int64_t q = static_cast<int64_t>(fmin(
         static_cast<double>(quant_max),
-        fmax(static_cast<double>(quant_min), raw)));
+        fmax(static_cast<double>(quant_min), static_cast<double>(raw))));
     output[i] = static_cast<float>(q - zero_point) * scale_f;
     mask[i] = raw >= static_cast<double>(quant_min) &&
               raw <= static_cast<double>(quant_max);
