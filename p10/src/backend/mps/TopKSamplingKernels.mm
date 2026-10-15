@@ -144,9 +144,67 @@ Tensor sample_kernel(const Tensor& logits, double temperature, int64_t top_k,
   return ops::squeeze(pos_2d, -1);  // token id == position in unsorted cdf
 }
 
+// multinomial: replacement=True samples via inverse-CDF (cumsum + random +
+// searchsorted); replacement=False uses the Gumbel-top-k trick (add Gumbel
+// noise to log probabilities, take top-k).  Both paths stay on the GPU.
+Tensor multinomial_kernel(const Tensor& self, int64_t num_samples,
+                          bool replacement,
+                          std::optional<Generator> generator) {
+  (void)generator;
+  if (num_samples < 0) {
+    TP_THROW(RuntimeError, "multinomial: num_samples must be >= 0");
+  }
+  if (!self.device().is_mps()) {
+    TP_THROW(RuntimeError, "multinomial: tensor must be on the MPS device");
+  }
+  if (self.dim() != 1 && self.dim() != 2) {
+    TP_THROW(RuntimeError, "multinomial: input must be 1D or 2D");
+  }
+  const bool is_1d = self.dim() == 1;
+  const int64_t rows = is_1d ? 1 : self.size(0);
+  const int64_t cols = is_1d ? self.numel() : self.size(1);
+  if (cols == 0 && num_samples > 0) {
+    TP_THROW(RuntimeError, "multinomial: input must have at least one category");
+  }
+  const std::vector<int64_t> out_shape =
+      is_1d ? std::vector<int64_t>{num_samples}
+            : std::vector<int64_t>{rows, num_samples};
+  if (num_samples == 0) {
+    return Tensor::empty(out_shape, DType::Int64, self.device());
+  }
+
+  Tensor probs =
+      self.dtype() == DType::Float32 ? self : self.to(DType::Float32);
+
+  if (replacement) {
+    // Unnormalized CDF, sampled with u in [0, total); searchsorted gives the
+    // category index, clamped to [0, cols-1].
+    Tensor cdf = ops::cumsum(probs, -1, DType::Float32);
+    Tensor totals = ops::unsqueeze(ops::select(cdf, -1, cols - 1), -1);
+    Tensor uniform =
+        ops::mul(ops::rand(out_shape, DType::Float32, self.device()), totals);
+    Tensor indices = ops::searchsorted(cdf, uniform, false, false,
+                                       std::nullopt, std::nullopt);
+    return ops::clamp(indices, Scalar(0), Scalar(cols - 1));
+  }
+
+  // Without replacement: Gumbel-top-k on log probabilities.  Zero-probability
+  // categories get -inf scores and are naturally avoided.
+  Tensor u = ops::clamp_min(ops::rand({rows, cols}, DType::Float32,
+                                       self.device()),
+                            Scalar(1e-9f));
+  Tensor gumbel = ops::neg(ops::log(ops::neg(ops::log(u))));
+  Tensor scores = ops::add(ops::log(probs), gumbel);
+  auto top = ops::topk(scores, num_samples, -1, true, true);
+  // topk already returns 1D [num_samples] for 1D input and [rows, samples]
+  // for 2D input, matching the expected output shape in both cases.
+  return std::get<1>(top);
+}
+
 TENSORPLAY_LIBRARY_IMPL(MPS, TopKSamplingKernels) {
   m.impl("topk", topk_kernel);
   m.impl("sample", sample_kernel);
+  m.impl("multinomial", multinomial_kernel);
 }
 
 } // namespace mps
