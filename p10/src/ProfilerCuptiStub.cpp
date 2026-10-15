@@ -1,15 +1,25 @@
 // Kernel-level GPU tracing for HIP builds, backed by the ROCm tracer
 // library (dlopen'd libroctracer64.so.4; never a hard link dependency).
+// This TU replaces ProfilerCupti.cpp in HIP builds and exports the same
+// cupti_* symbols so the binding layer is identical across GPU backends.
 //
 // The tracer exports a generic callback/activity API: we open a record pool
 // with a completion callback, enable the HIP API and HIP ops (kernel) activity
 // domains, and parse the resulting fixed-layout activity records on the
-// flush/completion path.  Record layout and field semantics were verified
-// against the tracer's 4.1 protocol (domain/kind/op at offsets 0/4/8,
-// correlation id at 16, host timestamps at 24/32, pid/tid at 40, device and
+// flush/completion path.  Record layout and field semantics follow the
+// tracer's 4.1 protocol (domain/kind/op at offsets 0/4/8, correlation id at
+// 16, host timestamps at 24/32, device/process/external-id union at 40,
 // queue id at 48, kernel symbol pointer at 56); HIP-API records carry the
 // runtime function code in `op`, HIP-OPS records carry the kernel code in
 // `kind` and the mangled kernel symbol in the name field.
+//
+// Exact op->kernel correlation uses the tracer's external-correlation API:
+// every HIP-targeting dispatch pushes the OpRecord slot as an external id
+// for the duration of its dispatch, the tracer emits an EXT_API record that
+// carries the correlation id shared by the launching HIP-API row and the
+// device activity row, and stop-time parsing maps device records back to
+// their slot through that id -- the HIP analogue of the CUPTI
+// external-correlation stack.
 //
 // Sessions degrade gracefully: without the library (or on init failure) the
 // collector reports unavailable and gpu_trace sessions simply record no GPU
@@ -45,6 +55,8 @@ using Fn_OpString = const char* (*)(uint32_t /*domain*/, uint32_t /*op*/,
                                     uint32_t /*kind*/);
 using Fn_VersionMajor = uint32_t (*)();
 using Fn_VersionMinor = uint32_t (*)();
+using Fn_PushExtCorrelationId = int (*)(uint64_t /*external id*/);
+using Fn_PopExtCorrelationId = int (*)(uint64_t* /*last id*/);
 
 struct TracerFns {
     Fn_GetTimestamp GetTimestamp = nullptr;
@@ -56,6 +68,14 @@ struct TracerFns {
     Fn_OpString OpString = nullptr;
     Fn_VersionMajor VersionMajor = nullptr;
     Fn_VersionMinor VersionMinor = nullptr;
+    // External-correlation region markers (roctracer_ext.h).  Push/pop are
+    // called around every HIP-targeting dispatch while a gpu_trace session
+    // runs, exactly like the CUPTI external-correlation stack on the CUDA
+    // lane.  The tracer emits an EXT_API record carrying the correlation id
+    // of the launching HIP-API row, which is how device records join back
+    // to the op that launched them.
+    Fn_PushExtCorrelationId PushExtCorrelationId = nullptr;
+    Fn_PopExtCorrelationId PopExtCorrelationId = nullptr;
 };
 
 // Memory-pool properties passed to open: mode/buffer_size/allocator/arg/
@@ -71,8 +91,9 @@ struct PoolProps {
 };
 
 // Activity domains of interest.
-constexpr uint32_t kDomainHipOps = 2;  // device activity (kernels, copies)
-constexpr uint32_t kDomainHipApi = 3;  // runtime API calls
+constexpr uint32_t kDomainHipOps = 2;   // device activity (kernels, copies)
+constexpr uint32_t kDomainHipApi = 3;    // runtime API calls
+constexpr uint32_t kDomainExtApi = 5;  // external-correlation id records
 
 // Buffer the tracer hands back on completion; parsed incrementally.
 constexpr size_t kBufSize = 1u << 20;
@@ -191,9 +212,13 @@ void reset_session_locked() {
     if (g_name_index) g_name_index->clear();
 }
 
-// Record parsing.  Fixed offsets validated against the tracer's activity
-// protocol; kernel symbols arrive as a pointer into tracer-owned storage
-// valid for the duration of the callback.
+// Record parsing.  Fixed offsets match the tracer's activity protocol
+// (domain/kind/op at 0/4/8, correlation id at 16, host timestamps at
+// 24/32, then a union at 40 holding device id / process+thread id /
+// external correlation id and a union at 48 holding the queue id or
+// payload size; the kernel symbol pointer sits at 56).  Kernel symbols
+// arrive as a pointer into tracer-owned storage valid for the duration of
+// the callback, so they are copied into the session arena.
 void parse_buffer_locked(const char* begin, const char* end) {
     auto next_record = g_fns ? g_fns->NextRecord : nullptr;
     const char* r = begin;
@@ -206,17 +231,27 @@ void parse_buffer_locked(const char* begin, const char* end) {
         std::memcpy(&correlation, r + 16, 8);
         std::memcpy(&begin_ns, r + 24, 8);
         std::memcpy(&end_ns, r + 32, 8);
-        uint64_t pid_tid = 0, dev_queue = 0;
-        std::memcpy(&pid_tid, r + 40, 8);
-        std::memcpy(&dev_queue, r + 48, 8);
-        const uint32_t thread_id =
-            static_cast<uint32_t>(pid_tid & 0xffffffffu);
-        const int32_t device =
-            static_cast<int32_t>(dev_queue & 0xffffffffu);
-        const int64_t queue =
-            static_cast<int64_t>(dev_queue >> 32);
+        uint64_t union_a = 0, union_b = 0;
+        std::memcpy(&union_a, r + 40, 8);
+        std::memcpy(&union_b, r + 48, 8);
+
+        if (domain == kDomainExtApi) {
+            // External-correlation record emitted right before the HIP-API
+            // row of the same correlation id: it names the OpRecord slot the
+            // enclosing op occupies, which is what device records are joined
+            // through at stop time.
+            if (g_corr2ext) (*g_corr2ext)[correlation] = union_a;
+            if (next_record == nullptr ||
+                next_record(r, reinterpret_cast<const void**>(&r)) != 0) {
+                break;
+            }
+            continue;
+        }
 
         if (domain == kDomainHipOps) {
+            const int32_t device =
+                static_cast<int32_t>(union_a & 0xffffffffu);
+            const int64_t queue = static_cast<int64_t>(union_b);
             const char* symbol = nullptr;
             std::memcpy(&symbol, r + 56, 8);
             GpuActivity a;
@@ -236,6 +271,10 @@ void parse_buffer_locked(const char* begin, const char* end) {
             a.value = 0;
             g_acts->push_back(a);
         } else if (domain == kDomainHipApi) {
+            const uint32_t process_id =
+                static_cast<uint32_t>(union_a & 0xffffffffu);
+            const uint32_t thread_id =
+                static_cast<uint32_t>(union_a >> 32);
             GpuActivity a;
             a.name = hip_api_name(op);
             a.start_ns = begin_ns + static_cast<uint64_t>(g_time_offset_ns);
@@ -297,6 +336,15 @@ bool load_fns_locked() {
     TP_TRACER_DLSYM(NextRecord, "roctracer_next_record")
     TP_TRACER_DLSYM(OpString, "roctracer_op_string")
     #undef TP_TRACER_DLSYM
+    // External-correlation markers are part of the 4.1 interface, but an
+    // older installed tracer may predate them; without them the collector
+    // still works (device records join via the timestamp sweep at stop).
+    fns->PushExtCorrelationId = reinterpret_cast<Fn_PushExtCorrelationId>(
+        dlsym(g_tracer_lib,
+              "roctracer_activity_push_external_correlation_id"));
+    fns->PopExtCorrelationId = reinterpret_cast<Fn_PopExtCorrelationId>(
+        dlsym(g_tracer_lib,
+              "roctracer_activity_pop_external_correlation_id"));
     // Version probes are optional diagnostics.
     fns->VersionMajor = reinterpret_cast<Fn_VersionMajor>(
         dlsym(g_tracer_lib, "roctracer_version_major"));
@@ -309,6 +357,7 @@ bool load_fns_locked() {
 } // namespace
 
 TENSORPLAY_API std::atomic<bool> g_gpu_trace{false};
+TENSORPLAY_API std::atomic<bool> g_ext_corr_mode{false};
 
 TENSORPLAY_API bool cupti_available() {
     std::lock_guard<std::mutex> lock(g_tracer_mutex);
@@ -349,6 +398,7 @@ TENSORPLAY_API bool cupti_start() {
     ensure_state_locked();
     reset_session_locked();
     g_last_error.clear();
+    g_ext_corr_mode.store(false, std::memory_order_release);
 
     if (!load_fns_locked()) return false;
 
@@ -427,25 +477,24 @@ TENSORPLAY_API void cupti_stop_and_collect(std::vector<GpuActivity>& out) {
 
 TENSORPLAY_API bool cupti_push_ext(uint64_t id) {
     if (!g_gpu_trace.load(std::memory_order_acquire)) return false;
-    // The tracer carries external correlation ids through the record's
-    // dedicated union slot on HIP-OPS records; our correlation join maps the
-    // API-level correlation id instead, which the probe showed is shared
-    // between the launching HIP-API record and the device activity record.
-    // Nothing needs to be pushed per-thread here; the id travels in the map
-    // below via the correlation captured at API level.
-    // Record the current correlation chain: the enclosing op stamps its slot
-    // under the next correlation id issued on this thread.  We approximate by
-    // remembering (thread -> slot) and binding it in pop; device records are
-    // joined through their API row's correlation.
-    struct TlsSlot {
-        uint64_t slot;
-    };
-    static thread_local TlsSlot tls{0};
-    tls.slot = id;
-    return true;
+    // The tracer writes an EXT_API record (carrying this external id and the
+    // correlation id of the launching HIP-API row) immediately before the API
+    // row; device records share that correlation id, so the EXT_API record is
+    // what pins a kernel to the op that launched it.  The push/pop pair is
+    // balanced per dispatch by GpuTimerPair around the HIP calls.
+    std::lock_guard<std::mutex> lock(g_tracer_mutex);
+    if (g_fns == nullptr || g_fns->PushExtCorrelationId == nullptr) {
+        return false;
+    }
+    return g_fns->PushExtCorrelationId(id) == 0;
 }
 
-TENSORPLAY_API void cupti_pop_ext() {}
+TENSORPLAY_API void cupti_pop_ext() {
+    std::lock_guard<std::mutex> lock(g_tracer_mutex);
+    if (g_fns == nullptr || g_fns->PopExtCorrelationId == nullptr) return;
+    uint64_t last = 0;
+    (void)g_fns->PopExtCorrelationId(&last);
+}
 
 } // namespace prof
 } // namespace tensorplay

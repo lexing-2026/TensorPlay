@@ -1,8 +1,9 @@
-// GPU-timeline support for the native profiler (USE_CUDA builds only; this
-// TU compiles to nothing otherwise).  A pool-backed cudaEvent pair is armed
-// around dispatched CUDA work from the generated redispatch funnels
-// (tools/codegen/gen_api.py emits the arm/close calls under USE_CUDA when
-// profiler gpu-timing is requested).
+// GPU-timeline support for the native profiler (CUDA and HIP builds; this
+// TU compiles to nothing on MPS builds, which provide the symbols from
+// ProfilerMps.mm, and to stub no-ops on CPU-only builds).  A pool-backed
+// cudaEvent/hipEvent pair is armed around dispatched GPU work from the
+// generated redispatch funnels (tools/codegen/gen_api.py emits the arm/close
+// calls for every GPU backend when profiler gpu-timing is requested).
 //
 // Elapsed times are NOT read per-op (that would force a stream sync in the
 // hot path).  At stop, the binding layer waits on only the last end event of
@@ -16,7 +17,7 @@
 
 #include "Profiler.h"
 
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_ROCM)
 
 #include "CUDARuntime.h"
 
@@ -310,7 +311,7 @@ TENSORPLAY_API void gpu_drain_pool() {
 } // namespace prof
 } // namespace tensorplay
 
-#else  // !USE_CUDA
+#elif !defined(USE_MPS)
 
 #include <functional>
 #include <vector>
@@ -318,6 +319,7 @@ TENSORPLAY_API void gpu_drain_pool() {
 namespace tensorplay {
 namespace prof {
 // CPU builds: keep the symbols so generated code links without ifdef noise.
+// MPS builds provide the real implementation from ProfilerMps.mm instead.
 GpuTimerPair::~GpuTimerPair() {}
 void GpuTimerPair::arm(const Device&) {}
 void GpuTimerPair::close() {}
@@ -330,4 +332,4 @@ TENSORPLAY_API void gpu_drain_pool() {}
 } // namespace prof
 } // namespace tensorplay
 
-#endif // USE_CUDA
+#endif // GPU builds

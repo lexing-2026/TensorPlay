@@ -29,6 +29,7 @@ class ProfilerActivity(str, Enum):
 
     CPU = "cpu"
     CUDA = "cuda"
+    MPS = "mps"
 
 
 def supported_activities():
@@ -39,6 +40,8 @@ def supported_activities():
 
         if tp.cuda.is_available():
             activities.add(ProfilerActivity.CUDA)
+        if tp.mps.is_available():
+            activities.add(ProfilerActivity.MPS)
     except Exception:
         pass
     return activities
@@ -178,6 +181,10 @@ class profile:
             "cuda" in activity_names
             or (use_device is not None and _activity_name(use_device) == "cuda")
         )
+        mps_requested = (
+            "mps" in activity_names
+            or (use_device is not None and _activity_name(use_device) == "mps")
+        )
         # GPU durations come from the CUPTI activity stream by default: it
         # collects kernel/memcpy records asynchronously on its own thread,
         # so the dispatch hot path pays no per-op driver calls.  An explicit
@@ -185,9 +192,13 @@ class profile:
         # coexist with gpu_trace for exact per-op times); the session start
         # falls back to event pairs automatically when the CUPTI runtime
         # cannot load.
+        # MPS has no kernel-level trace collector: GPU durations always come
+        # from the event-pair path, so an MPS request implies gpu_timing.
+        if gpu_timing is None and mps_requested:
+            gpu_timing = True
         self.gpu_timing = bool(gpu_timing)
         if gpu_trace is None:
-            self.gpu_trace = cuda_requested and gpu_timing is None
+            self.gpu_trace = (cuda_requested or mps_requested) and gpu_timing is None
         else:
             self.gpu_trace = bool(gpu_trace)
 

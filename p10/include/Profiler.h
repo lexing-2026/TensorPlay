@@ -10,10 +10,13 @@
 //   * allocator-level memory events (CPU + CUDA caching allocators) when
 //     memory capture is requested -- real alloc/free accounting, not the
 //     factory-op estimate the snapshot view falls back to;
-//   * CUPTI kernel-level GPU tracing (USE_CUDA builds): kernel/memcpy/
-//     memset activity records plus CUDA runtime/driver API rows, with
-//     op->runtime->kernel correlation via CUPTI external correlation ids
-//     (see ProfilerCupti.cpp);
+//   * CUPTI kernel-level GPU tracing (USE_CUDA builds) / rocTracer kernel-level
+//     tracing (USE_ROCM builds): kernel/memcpy/memset activity records plus
+//     GPU runtime API rows, with op->runtime->kernel correlation via external
+//     correlation ids (see ProfilerCupti.cpp / ProfilerCuptiStub.cpp);
+//   * MPS GPU durations (USE_MPS builds) come from Metal command-buffer
+//     completion handlers, committed per op only inside a gpu_timing session
+//     (see ProfilerMps.mm);
 //   * Python stack sampling runs binding-side (tensorplay/profiler.py);
 //
 // Performance contract: when inactive the only hot-path cost is one
@@ -22,8 +25,8 @@
 // GradMode/InferenceMode checks already emitted around every call. When
 // active, recording costs a timestamp pair plus a short critical section.
 //
-// The CUPTI collector is dlopen'd (never a hard link dependency) and only
-// runs during a gpu_trace session.
+// The CUPTI/rocTracer collector is dlopen'd (never a hard link dependency)
+// and only runs during a gpu_trace session.
 
 #pragma once
 
@@ -267,11 +270,13 @@ TENSORPLAY_API void mem_record_free(void* ptr, int64_t bytes,
 // Moves out the collected memory events (binding calls at session stop).
 TENSORPLAY_API std::vector<MemEvent> mem_take();
 
-// ---- GPU timeline (USE_CUDA builds; validated on remote sm_89) ----------
-// A pool-backed cudaEvent pair around dispatched CUDA work.  arm(device)
-// before the kernel launch, close() after; elapsed times are resolved at
-// session stop by the binding layer.  CPU-device and inactive calls are
-// no-ops.
+// ---- GPU timeline (USE_CUDA / USE_ROCM builds; validated on remote sm_89)
+// ----------
+// A pool-backed cudaEvent/hipEvent pair around dispatched GPU work.
+// arm(device) before the kernel launch, close() after; elapsed times are
+// resolved at session stop by the binding layer.  CPU-device and inactive
+// calls are no-ops.  MPS builds implement the same symbols in ProfilerMps.mm
+// using Metal command-buffer boundaries.
 struct TENSORPLAY_API GpuTimerPair {
     explicit GpuTimerPair(OpRecord& rec) : rec_(rec) {}
     ~GpuTimerPair();
@@ -295,14 +300,15 @@ TENSORPLAY_API void gpu_resolve_all(
         const std::function<void(Event&, float ms)>& emit);
 TENSORPLAY_API void gpu_drain_pool();
 
-// ---- CUPTI kernel-level tracing (USE_CUDA builds; dlopen'd libcupti) -----
-// gpu_trace sessions enable the CUPTI activity API: CONCURRENT_KERNEL,
-// MEMCPY, MEMSET, RUNTIME, DRIVER and EXTERNAL_CORRELATION.  Every CUDA-
-// targeting op pushes its OpRecord slot as an external correlation id for
-// the duration of its dispatch (GpuTimerPair), so kernel activity records
-// join back to the op that launched them (op -> runtime API -> kernel).
-// All CUPTI entry points are runtime-loaded; unavailable libraries degrade
-// to cupti_available() == false and no GPU rows.
+// ---- CUPTI / rocTracer kernel-level tracing (USE_CUDA / USE_ROCM builds)
+// -----
+// gpu_trace sessions enable the device-activity API (CUPTI on CUDA,
+// roctracer on HIP): kernels, copies, and GPU runtime API rows, with every
+// GPU-targeting op pushing its OpRecord slot as an external correlation id
+// for the duration of its dispatch (GpuTimerPair), so device activity
+// records join back to the op that launched them (op -> runtime API ->
+// kernel).  All vendor entry points are runtime-loaded; unavailable
+// libraries degrade to cupti_available() == false and no GPU rows.
 TENSORPLAY_API extern std::atomic<bool> g_gpu_trace;
 // Session falls back to explicit external-correlation ids when the
 // CUPTI record timebase failed the start-time consistency check.

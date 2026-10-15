@@ -642,6 +642,26 @@ class TestGpuTraceCpuBuild:
         assert avail  # binding surface intact
 
 
+class TestMpsActivity:
+    """MPS device activity is exposed as its own ProfilerActivity."""
+
+    def test_supported_activities_include_mps_when_available(self):
+        if not tp.mps.is_available():
+            pytest.skip("MPS not available")
+        assert tp_prof.ProfilerActivity.MPS in tp_prof.supported_activities()
+
+    def test_mps_profile_reports_gpu_ms(self):
+        if not tp.mps.is_available():
+            pytest.skip("MPS not available")
+        with tp_prof.profile(
+            activities=[tp_prof.ProfilerActivity.CPU, tp_prof.ProfilerActivity.MPS]
+        ) as prof:
+            a = tp.ones([64, 64], device="mps")
+            a.add(a)
+        gpu_timed = [ev for ev in prof.events if len(ev) > 8 and ev[8] is not None and ev[8] >= 0]
+        assert gpu_timed, "expected at least one MPS op with a GPU duration"
+
+
 class TestFlops:
     """with_flops: C++-estimated FLOPs stamped per event at session stop."""
 
