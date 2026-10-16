@@ -55,6 +55,12 @@ void init_device(py::module_& m) {
     py::enum_<DeviceType>(m, "DeviceType")
         .value("CPU", DeviceType::CPU)
         .value("CUDA", DeviceType::CUDA)
+        .value("HIP", DeviceType::HIP)
+        .value("MPS", DeviceType::MPS)
+        .value("MTIA", DeviceType::MTIA)
+        .value("XPU", DeviceType::XPU)
+        .value("HPU", DeviceType::HPU)
+        .value("PrivateUse1", DeviceType::PrivateUse1)
         .value("Vulkan", DeviceType::Vulkan)
         .value("META", DeviceType::Meta)
         .value("Unknown", DeviceType::Unknown);
