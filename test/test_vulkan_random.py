@@ -198,3 +198,16 @@ def test_sample_top_k_restricts_domain():
         tp.sample(logits, 1.0, 2, 1.0).cpu().item() for _ in range(200)
     ]
     assert set(vals) <= {0, 1}
+
+
+def test_sample_feed_embedding_chain():
+    """Sampled Int64 tokens must feed the embedding table directly."""
+    emb = tp.randn(128, 16, device="vulkan")
+    logits = tp.randn(1, 128, device="vulkan")
+    tok = tp.sample(logits, 0.8, 50, 0.95)
+    assert tok.dtype == tp.int64
+    assert tok.shape == (1,)
+    x = tp._C.embedding(emb, tok)                      # [1, 16]
+    assert x.shape == (1, 16)
+    ref = tp._C.embedding(emb.cpu(), tok.cpu()).cpu().numpy()
+    assert np.allclose(x.cpu().numpy(), ref, atol=1e-6)
