@@ -702,10 +702,13 @@ Tensor scaled_dot_product_attention_kernel(
           : v_key.image(barrier, api::PipelineStage::COMPUTE),
       qk_params.buffer());
 
-  // Stage 2: output.  Softmax over the key axis is fused into this walk:
-  // the shaders derive the per-row statistics from the scores of the row
+  // Stage 2: output.  For short queries over long key ranges the softmax
+  // over the key axis splits across memory chunks (scan + combine), which
+  // keeps every invocation's serial walk short and the chunk reduction
+  // parallel; other shapes fuse the normalization into the single walk:
+  // the shader derives the per-row statistics from the scores of the row
   // (the key walk is the texel x axis of a channel-packed [B, Hq, Sq, Skv]
-  // image) and accumulate the normalized weights against the value.
+  // image) and accumulates the normalized weights against the value.
   // The probability lanes ride the query heads exactly as stage 1 laid
   // them out, so the group mapping matches the value planes without an
   // epilogue relayout.
@@ -716,6 +719,114 @@ Tensor scaled_dot_product_attention_kernel(
       api::StorageType::TEXTURE_3D,
       api::GPUMemoryLayout::TENSOR_CHANNELS_PACKED,
   };
+
+  const int64_t scan_chunk_len = 128;
+  const int64_t scan_chunks =
+      Sq <= 8 && Skv > 2 * scan_chunk_len
+          ? (Skv + scan_chunk_len - 1) / scan_chunk_len
+          : 0;
+  if (scan_chunks > 1) {
+    // Split-memory scan: unnormalized per-chunk accumulators ride a
+    // [B, Hq, Sq, chunks * D] image, chunk maxima and sums ride a
+    // [B, Hq, Sq, chunks * 2] image, both in Float32.
+    api::vTensor v_partial{
+        context,
+        {B, Hq, Sq, scan_chunks * D},
+        DType::Float32,
+        api::StorageType::TEXTURE_3D,
+        api::GPUMemoryLayout::TENSOR_CHANNELS_PACKED,
+    };
+    api::vTensor v_stats{
+        context,
+        {B, Hq, Sq, scan_chunks * 2},
+        DType::Float32,
+        api::StorageType::TEXTURE_3D,
+        api::GPUMemoryLayout::TENSOR_CHANNELS_PACKED,
+    };
+
+    const struct SdpaScanBlock final {
+      ivec4 extents;      // (D, Sq, planes, chunks)
+      int skv;            // Skv
+      int chunk_len;
+      int q_c_depth;      // ceil(Hq / 4)
+      int kv_c_depth;     // ceil(Hkv / 4)
+      int gqa_group;
+      int hq;
+    } scan_block{
+        ivec4(static_cast<int32_t>(D),
+              static_cast<int32_t>(Sq),
+              sdpa_planes(Hq, B),
+              static_cast<int32_t>(scan_chunks)),
+        static_cast<int32_t>(Skv),
+        static_cast<int32_t>(scan_chunk_len),
+        static_cast<int32_t>(sdpa_plane_div4(Hq)),
+        static_cast<int32_t>(sdpa_plane_div4(Hkv)),
+        static_cast<int32_t>(group),
+        static_cast<int32_t>(Hq),
+    };
+
+    api::UniformParamsBuffer scan_params(context, scan_block);
+    api::PipelineBarrier scan_barrier{};
+    const api::utils::uvec3 scan_grid{
+        static_cast<uint32_t>(scan_chunks),
+        static_cast<uint32_t>(Sq),
+        static_cast<uint32_t>(sdpa_planes(Hq, B)),
+    };
+    context->submit_compute_job(
+        kernel_for("sdpa_scan", query.dtype()),
+        scan_barrier,
+        scan_grid,
+        adaptive_work_group_size(scan_grid),
+        VK_NULL_HANDLE,
+        v_scores.image(scan_barrier, api::PipelineStage::COMPUTE),
+        v_value.image(scan_barrier, api::PipelineStage::COMPUTE),
+        v_partial.image(
+            scan_barrier, api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::WRITE),
+        v_stats.image(
+            scan_barrier, api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::WRITE),
+        scan_params.buffer());
+
+    const struct SdpaCombineBlock final {
+      ivec4 extents;      // (D, Sq, planes, unused)
+      int chunks;
+      int q_c_depth;      // ceil(Hq / 4)
+      int kv_c_depth;     // ceil(Hkv / 4)
+      int gqa_group;
+      int hq;
+      int fill1;
+      int fill2;
+      int fill3;
+    } combine_block{
+        ivec4(static_cast<int32_t>(D),
+              static_cast<int32_t>(Sq),
+              sdpa_planes(Hq, B),
+              0),
+        static_cast<int32_t>(scan_chunks),
+        static_cast<int32_t>(sdpa_plane_div4(Hq)),
+        static_cast<int32_t>(sdpa_plane_div4(Hkv)),
+        static_cast<int32_t>(group),
+        static_cast<int32_t>(Hq),
+    };
+
+    api::UniformParamsBuffer combine_params(context, combine_block);
+    api::PipelineBarrier combine_barrier{};
+    context->submit_compute_job(
+        kernel_for("sdpa_combine", query.dtype()),
+        combine_barrier,
+        v_output.extents(),
+        adaptive_work_group_size(v_output.extents()),
+        VK_NULL_HANDLE,
+        v_output.image(
+            combine_barrier, api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::WRITE),
+        v_partial.image(combine_barrier, api::PipelineStage::COMPUTE),
+        v_stats.image(combine_barrier, api::PipelineStage::COMPUTE),
+        combine_params.buffer());
+
+    return convert(v_output);
+  }
 
   const struct SdpaPvBlock final {
     ivec4 extents;      // (D, Sq, planes, unused)

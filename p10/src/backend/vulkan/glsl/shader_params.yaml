@@ -1245,6 +1245,26 @@ sdpa_qk:
       SUFFIX: _f16
   shader_variants:
   - NAME: sdpa_qk
+sdpa_scan:
+  parameter_names_with_default_values: {}
+  generate_variant_forall:
+    FORMAT:
+    - VALUE: rgba32f
+      SUFFIX: ''
+    - VALUE: rgba16f
+      SUFFIX: _f16
+  shader_variants:
+  - NAME: sdpa_scan
+sdpa_combine:
+  parameter_names_with_default_values: {}
+  generate_variant_forall:
+    FORMAT:
+    - VALUE: rgba32f
+      SUFFIX: ''
+    - VALUE: rgba16f
+      SUFFIX: _f16
+  shader_variants:
+  - NAME: sdpa_combine
 sdpa_pv:
   parameter_names_with_default_values: {}
   generate_variant_forall:
