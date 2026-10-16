@@ -1651,6 +1651,31 @@ Tensor w4a16_linear_kernel(
       pack_in_params.buffer());
 
   api::vTensor v_output{context, {M, N}, DType::Float16};
+
+  if (M == 1) {
+    // Decode shape: one thread per output channel, no shared-memory
+    // staging (see w4a16_linear_m1.glsl).
+    const struct W4A16M1Block final {
+      int k;
+      int out_n;
+    } m1_block{static_cast<int32_t>(K), static_cast<int32_t>(N)};
+    api::UniformParamsBuffer params(context, m1_block);
+    const api::utils::uvec3 grid{
+        api::utils::safe_downcast_to_u32(N), 1u, 1u};
+    context->submit_compute_job(
+        VK_KERNEL(w4a16_linear_m1), pipeline_barrier, grid,
+        adaptive_work_group_size(grid), VK_NULL_HANDLE,
+        v_output.image(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::WRITE),
+        v_input_packed.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+        v_weight_packed.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+        v_params.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+        params.buffer());
+    return convert(v_output);
+  }
+
   const struct W4A16Block final {
     int out_m;
     int out_n;
