@@ -653,15 +653,19 @@ Tensor quantized_linear_kernel(
   // the output channel: scale (row 0), zero point (row 1), bias (row 2).
   // The callers may hand the qparams over as device tensors; the packing
   // happens on the host, so everything is gathered to CPU first.
+  // Rows are padded to a multiple of four so the width-packed params
+  // texture never straddles a row boundary (a plain [3, N] upload would
+  // leak the next row into the tail lanes of an unaligned row).
+  const int64_t params_width = api::utils::align_up(out_features, 4);
   Tensor params_cpu = Tensor::zeros(
-      {3, out_features}, DType::Float32, Device(DeviceType::CPU));
+      {3, params_width}, DType::Float32, Device(DeviceType::CPU));
   Tensor sc =
       weight_scales.to(Device(DeviceType::CPU)).to(DType::Float32).contiguous();
   Tensor zp = weight_zero_points.to(Device(DeviceType::CPU))
                   .to(DType::Float32)
                   .contiguous();
   std::memcpy(
-      params_cpu.impl()->storage().data() + sizeof(float) * out_features,
+      params_cpu.impl()->storage().data() + sizeof(float) * params_width,
       zp.data_ptr<float>(),
       sizeof(float) * out_features);
   std::memcpy(
@@ -674,17 +678,22 @@ Tensor quantized_linear_kernel(
                         .contiguous();
     std::memcpy(
         params_cpu.impl()->storage().data() +
-            sizeof(float) * 2 * out_features,
+            sizeof(float) * 2 * params_width,
         bias_f.data_ptr<float>(),
         sizeof(float) * out_features);
   }
 
-  api::vTensor v_params{context, {3, out_features}, DType::Float32};
+  api::vTensor v_params{
+      context,
+      {3, params_width},
+      DType::Float32,
+      api::StorageType::TEXTURE_3D,
+      api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
   {
     // The params texture is width-packed: texel (n/4, row) carries four
     // consecutive output channels of row `row` (scale, zero point, bias).
-    // A plain row-major upload of the [3, out_features] host buffer lands
-    // exactly in that layout, so no channel repacking is needed here.
+    // A row-major upload of the padded [3, params_width] host buffer
+    // lands exactly in that layout.
     utils::upload_host_bytes(
         v_params,
         params_cpu.contiguous().impl()->storage().data(),
@@ -710,8 +719,8 @@ Tensor quantized_linear_kernel(
   api::PipelineBarrier pipeline_barrier{};
 
   const api::utils::uvec3 grid{
-      api::utils::safe_downcast_to_u32((N + 3) / 4),
-      api::utils::safe_downcast_to_u32((M + 3) / 4),
+      api::utils::safe_downcast_to_u32(N),
+      api::utils::safe_downcast_to_u32(M),
       1u};
 
   context->submit_compute_job(
