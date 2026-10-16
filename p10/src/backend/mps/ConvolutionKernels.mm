@@ -153,7 +153,7 @@ bool try_mpp_conv2d(const Tensor& input, const Tensor& weight,
           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
       [encoder setComputePipelineState:pso];
       mtl_setArgs(encoder, nhwc, hwio, output, params,
-                  params.has_bias ? bias_c : input_c);
+                  params.has_bias ? bias : input);
       const uint32_t o_tiles =
           (static_cast<uint32_t>(params.C_out) + 31) / 32;
       const uint32_t w_tiles =
