@@ -234,6 +234,10 @@ MPSUnaryOpBlock bitwiseNotBlock = ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* 
 
 MPSBinaryOpBlock bitwiseAndBlock = ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* a,
                                                    MPSGraphTensor* b) {
+  if (a.dataType == MPSDataTypeBool) {
+    // Bool is logical rather than bitwise; MPSGraph's bitwiseAnd rejects it.
+    return [g logicalANDWithPrimaryTensor:a secondaryTensor:b name:nil];
+  }
   return [g bitwiseAndWithPrimaryTensor:a secondaryTensor:b name:nil];
 };
 

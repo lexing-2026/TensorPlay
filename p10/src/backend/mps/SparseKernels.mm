@@ -718,6 +718,10 @@ TENSORPLAY_LIBRARY_IMPL(MPS, SparseKernelsMPS) {
     m.impl("to_sparse", to_sparse_kernel);
     m.impl("to_sparse.sparse_dim", to_sparse_sparse_dim_kernel);
     m.impl("_sparse_addmm", sparse_addmm_kernel);
+    // sparse_mm takes a dense tensor alongside the sparse input; the dense
+    // operand's MPS key wins the dispatch, so the kernel must also be
+    // reachable from the MPS key.
+    m.impl("sparse_mm", sparse_mm_kernel);
 }
 
 TENSORPLAY_LIBRARY_IMPL(Sparse, SparseKernelsSparse) {

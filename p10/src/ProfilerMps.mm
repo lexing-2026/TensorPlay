@@ -129,9 +129,11 @@ void GpuTimerPair::close() {
         }
     }];
     // Commit the command buffer so the completion handler above fires once
-    // this op's encoded work has executed; commit-and-continue leaves the
-    // stream ready for the next op.
-    stream->synchronize(mps::SyncType::COMMIT_AND_CONTINUE);
+    // this op's encoded work has executed.  The stream runs with
+    // commit-and-continue disabled, so a plain COMMIT (flush) is used: the
+    // handler was attached before the commit, and the stream is left with a
+    // nil command buffer ready for the next dispatch.
+    stream->synchronize(mps::SyncType::COMMIT);
 }
 
 // Binding-layer resolution API.

@@ -827,7 +827,7 @@ class TestMPSSparse(unittest.TestCase):
         s = tp.sparse_coo_tensor(indices, values, (1, 2))
         c = s.coalesce()
         self.assertEqual(c._nnz(), 1)
-        self.assertTrue(tp.allclose(c.to_dense().cpu(), [[3.0, 0.0]]))
+        self.assertTrue(tp.allclose(c.to_dense().cpu(), tp.tensor([[0.0, 3.0]])))
 
     def test_sparse_mm(self):
         indices = tp.tensor([[0, 1], [0, 1]], dtype=tp.int64).mps()
@@ -853,7 +853,7 @@ class TestMPSSparse(unittest.TestCase):
         s = tp.sparse_coo_tensor(indices, values, (2, 3))
         self.assertAlmostEqual(tp.sparse_sum(s).item(), 6.0, places=5)
         row = tp.sparse_sum(s, dim=[0])
-        self.assertEqual(row.to_dense().cpu().tolist(), [[2.0, 0.0, 4.0]])
+        self.assertEqual(row.to_dense().cpu().tolist(), [2.0, 0.0, 4.0])
 
 
 @unittest.skipUnless(mps_available(), "MPS not available")
