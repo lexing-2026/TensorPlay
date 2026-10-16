@@ -131,6 +131,7 @@ Tensor.float = float
 Tensor.int = int
 Tensor.double = double
 Tensor.cuda = cuda
+Tensor.mps = mps
 Tensor.cpu = cpu
 Tensor.type = type
 
