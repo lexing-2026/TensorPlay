@@ -86,6 +86,20 @@ void tpx_prof_capture_site() {
 } // namespace python
 } // namespace tensorplay
 
+#ifdef USE_VULKAN
+namespace tensorplay {
+namespace vulkan {
+namespace ops {
+Tensor w4a16_linear_kernel(
+    const Tensor& input,
+    const Tensor& weight,
+    const Tensor& weight_scales,
+    const std::optional<Tensor>& bias);
+}  // namespace ops
+}  // namespace vulkan
+}  // namespace tensorplay
+#endif
+
 namespace {
 
 // ---------------------------------------------------------------------------
@@ -452,6 +466,33 @@ PYBIND11_MODULE(_C, m) {
     init_ops(m);
     init_dispatch(m);
     init_python_dispatch(m);
+#ifdef USE_VULKAN
+    // W4A16 (weight-only 4-bit) quantized linear for the Vulkan backend,
+    // exposed directly to the Python layer for quantized LLM inference.
+    // Signature: w4a16_linear(input: Float16 [M,K], weight: QInt8 [N,K]
+    // (4-bit codes in [-8,7]), weight_scales: Float32 [N],
+    // bias: Float32 [N] | None) -> Float16 [M,N].
+    m.def("w4a16_linear", [](py::args args, py::kwargs kwargs) -> py::object {
+        if (!kwargs.empty() || args.size() < 3 || args.size() > 4) {
+            throw py::type_error(
+                "w4a16_linear(input, weight, weight_scales, bias=None)");
+        }
+        using tensorplay::python_c::tpx_py_tensor;
+        using tensorplay::python_c::tpx_py_wrap;
+        using tensorplay::vulkan::ops::w4a16_linear_kernel;
+        const Tensor input = tpx_py_tensor(args[0].ptr());
+        const Tensor weight = tpx_py_tensor(args[1].ptr());
+        const Tensor weight_scales = tpx_py_tensor(args[2].ptr());
+        std::optional<Tensor> bias;
+        if (args.size() == 4 && !args[3].is_none()) {
+            bias = tpx_py_tensor(args[3].ptr());
+        }
+        return py::reinterpret_steal<py::object>(
+            tpx_py_wrap(
+                w4a16_linear_kernel(input, weight, weight_scales, bias)));
+    });
+#endif
+
     // Operator overload objects call exactly one overload through its
     // hook-free generated entry.
     m.def("_call_overload", [](const std::string& name, py::tuple args, py::dict kwargs) -> py::object {

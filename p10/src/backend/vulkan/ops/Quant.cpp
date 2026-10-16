@@ -24,6 +24,8 @@ namespace ops {
 // Distinct from the mm packing tags in Matmul.cpp (10..15).
 constexpr uint32_t kTagQLinearWeightHeightPacked = 20u;
 constexpr uint32_t kTagQLinearParams = 21u;
+constexpr uint32_t kTagW4A16WeightHeightPacked = 22u;
+constexpr uint32_t kTagW4A16Params = 23u;
 
 //
 // Quantized elementwise arithmetic over Int8 textures with explicit affine
@@ -1498,6 +1500,187 @@ Tensor int_repr_kernel(const Tensor& self) {
   return quantized::strip_quantizer(self).clone();
 }
 
+Tensor w4a16_linear_kernel(
+    const Tensor& input,
+    const Tensor& weight,
+    const Tensor& weight_scales,
+    const std::optional<Tensor>& bias) {
+  TP_CHECK(
+      input.dtype() == DType::Float16,
+      "Vulkan w4a16_linear: activations must be Float16");
+  TP_CHECK(
+      weight.dtype() == DType::QInt8,
+      "Vulkan w4a16_linear: weights must be QInt8 with 4-bit codes in "
+      "[-8, 7]");
+  TP_CHECK(
+      input.dim() == 2 && weight.dim() == 2,
+      "Vulkan w4a16_linear: expected 2-D [M,K] activations and [N,K] "
+      "weights");
+  TP_CHECK(
+      input.size(1) == weight.size(1),
+      "Vulkan w4a16_linear: incompatible K dimensions");
+  const int64_t out_features = weight.size(0);
+  TP_CHECK(
+      weight_scales.dim() == 1 && weight_scales.size(0) == out_features,
+      "Vulkan w4a16_linear: weight_scales must be 1-D of length "
+      "out_features");
+  if (bias.has_value()) {
+    TP_CHECK(
+        bias->dtype() == DType::Float32 && bias->dim() == 1 &&
+            bias->size(0) == out_features,
+        "Vulkan w4a16_linear: bias must be a 1-D Float32 tensor of "
+        "length out_features");
+  }
+
+  api::Context* const context = api::context();
+
+  api::vTensor v_input = convert(input);
+  api::vTensor v_weight = convert(weight);
+  if (v_input.storage_type() != api::StorageType::TEXTURE_3D ||
+      v_weight.storage_type() != api::StorageType::TEXTURE_3D) {
+    TP_THROW(
+        NotImplementedError,
+        "Vulkan w4a16_linear requires texture storage");
+  }
+
+  const int64_t M = input.size(0);
+  const int64_t N = weight.size(0);
+  const int64_t K = input.size(1);
+  const int64_t K_tex8 = (K + 7) / 8;
+  const int64_t params_width = api::utils::align_up(out_features, 4);
+
+  // Per-channel scale (row 0) and bias (row 2) float texture, cached on
+  // the weight identity.  Row 1 (zero points) is unused by the symmetric
+  // W4A16 scheme and stays zero.
+  api::vTensor v_params = ParamTextureCache::singleton().get_or_create(
+      weight, {3, params_width}, api::GPUMemoryLayout::TENSOR_WIDTH_PACKED,
+      kTagW4A16Params,
+      [&]() {
+        Tensor params_cpu = Tensor::zeros(
+            {3, params_width}, DType::Float32, Device(DeviceType::CPU));
+        Tensor sc = weight_scales.to(Device(DeviceType::CPU))
+                        .to(DType::Float32)
+                        .contiguous();
+        std::memcpy(
+            params_cpu.impl()->storage().data(),
+            sc.data_ptr<float>(),
+            sizeof(float) * out_features);
+        if (bias.has_value()) {
+          Tensor bias_f = bias->to(Device(DeviceType::CPU))
+                              .to(DType::Float32)
+                              .contiguous();
+          std::memcpy(
+              params_cpu.impl()->storage().data() +
+                  sizeof(float) * 2 * params_width,
+              bias_f.data_ptr<float>(),
+              sizeof(float) * out_features);
+        }
+        api::vTensor v_p{
+            context,
+            {3, params_width},
+            DType::Float32,
+            api::StorageType::TEXTURE_3D,
+            api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+        utils::upload_host_bytes(
+            v_p,
+            params_cpu.contiguous().impl()->storage().data(),
+            params_cpu.numel() * params_cpu.itemsize());
+        return v_p;
+      });
+
+  // The packed 4-bit weight payload (eight nibbles per texel) is
+  // materialized once per weight identity (weight prepack).
+  api::PipelineBarrier pipeline_barrier{};
+  api::vTensor v_weight_packed = ParamTextureCache::singleton().get_or_create(
+      weight, {K, N}, api::GPUMemoryLayout::TENSOR_HEIGHT_PACKED,
+      kTagW4A16WeightHeightPacked,
+      [&]() {
+        const struct PackBlock final {
+          int k;
+          int n;
+        } pack_w_block{static_cast<int32_t>(K), static_cast<int32_t>(N)};
+        api::UniformParamsBuffer pack_w_params(context, pack_w_block);
+        // Logical [K, N] under TENSOR_HEIGHT_PACKED yields a texture of
+        // {N, ceil(K/4), 1}; pack_int4_height writes only the first
+        // ceil(K/8) rows (eight nibbles per texel) and the GEMM reads no
+        // further, so the extra rows are simply never touched.
+        api::vTensor v_wp{
+            context,
+            {K, N},
+            DType::Int8,
+            api::StorageType::TEXTURE_3D,
+            api::GPUMemoryLayout::TENSOR_HEIGHT_PACKED};
+        const api::utils::uvec3 pack_grid{
+            api::utils::safe_downcast_to_u32(N),
+            api::utils::safe_downcast_to_u32(K_tex8),
+            1u};
+        context->submit_compute_job(
+            VK_KERNEL(pack_int4_height), pipeline_barrier, pack_grid,
+            adaptive_work_group_size(pack_grid), VK_NULL_HANDLE,
+            v_wp.image(
+                pipeline_barrier,
+                api::PipelineStage::COMPUTE,
+                api::MemoryAccessType::WRITE),
+            v_weight.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+            pack_w_params.buffer());
+        return v_wp;
+      });
+
+  // Width-pack the FP16 activations (one half per texel in the dense
+  // channel-packed layout -> four halves per texel) using the same
+  // relayout kernel the FP16 matmul path relies on.
+  api::vTensor v_input_packed{
+      context,
+      {M, K},
+      DType::Float16,
+      api::StorageType::TEXTURE_3D,
+      api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+  const struct PackBlockAct final {
+    ivec4 sizes;
+  } pack_in_block{api::utils::make_ivec4_prepadded1({M, K})};
+  api::UniformParamsBuffer pack_in_params(context, pack_in_block);
+  context->submit_compute_job(
+      VK_KERNEL(convert_channels_to_width_packed_f16), pipeline_barrier,
+      v_input_packed.extents(),
+      adaptive_work_group_size(v_input_packed.extents()), VK_NULL_HANDLE,
+      v_input_packed.image(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::WRITE),
+      v_input.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+      pack_in_params.buffer());
+
+  api::vTensor v_output{context, {M, N}, DType::Float16};
+  const struct W4A16Block final {
+    int out_m;
+    int out_n;
+    int k; // logical reduction width
+  } gemm_block{
+      static_cast<int32_t>(M),
+      static_cast<int32_t>(N),
+      static_cast<int32_t>(K)};
+  api::UniformParamsBuffer params(context, gemm_block);
+
+  const api::utils::uvec3 grid{
+      api::utils::safe_downcast_to_u32((N + 3) / 4),
+      api::utils::safe_downcast_to_u32((M + 3) / 4),
+      1u};
+
+  context->submit_compute_job(
+      VK_KERNEL(w4a16_linear_tiled), pipeline_barrier, grid,
+      {8u, 8u, 1u}, VK_NULL_HANDLE,
+      v_output.image(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::WRITE),
+      v_input_packed.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+      v_weight_packed.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+      v_params.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+      params.buffer());
+
+  return convert(v_output);
+}
+
 Tensor dequantize_self_kernel(const Tensor& self) {
   if (!quantized::is_quantized(self)) {
     return self.to(DType::Float32);
@@ -1521,6 +1704,8 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, QuantKernels) {
          &tensorplay::vulkan::ops::quantized_max_pool2d_kernel);
   m.impl("quantized_linear",
          &tensorplay::vulkan::ops::quantized_linear_kernel);
+  m.impl("w4a16_linear",
+         &tensorplay::vulkan::ops::w4a16_linear_kernel);
   m.impl("quantized_conv2d",
          &tensorplay::vulkan::ops::quantized_conv2d_kernel);
   m.impl("quantized_conv2d_run",
