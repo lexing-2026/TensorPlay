@@ -236,10 +236,6 @@ Tensor batch_norm_kernel(const Tensor& input,
   if (!input.device().is_mps()) {
     TP_THROW(RuntimeError, "batch_norm(): input must be on the MPS device");
   }
-  {
-    FILE* f = fopen("/tmp/tp_bn_trace.txt", "a");
-    if (f) { fprintf(f, "kernel entry, training=%d dim=%lld\\n", (int)training, (long long)input.dim()); fclose(f); }
-  }
   if (input.dim() < 2 || input.dim() > 5) {
     TP_THROW(RuntimeError, "batch_norm: Input must be between 2D and 5D");
   }
@@ -291,18 +287,7 @@ Tensor batch_norm_kernel(const Tensor& input,
     batch_var = Tensor({C}, DType::Float32, input.device());
   }
 
-  fprintf(stderr, "TP_BN_TRACE: before graph, training=%d C=%lld\\n", (int)training, (long long)C);
-  {
-    FILE* f = fopen("/tmp/tp_bn_trace.txt", "a");
-    if (f) { fprintf(f, "before graph, training=%d C=%lld\\n", (int)training, (long long)C); fclose(f); }
-  }
-
   @autoreleasepool {
-    fprintf(stderr, "TP_BN_TRACE: graph start\\n");
-    {
-      FILE* f = fopen("/tmp/tp_bn_trace.txt", "a");
-      if (f) { fprintf(f, "graph start\\n"); fclose(f); }
-    }
     MPSGraph* graph = [[MPSGraph new] autorelease];
     MPSShape* inShape = getMPSShape(out_shape);
     MPSShape* meanShape = getMPSShape(mean_shape);
@@ -440,14 +425,7 @@ Tensor batch_norm_kernel(const Tensor& input,
 
     getCurrentMPSStream()->executeMPSGraph(graph, feeds, results,
                                           SyncType::COMMIT_AND_WAIT);
-    fprintf(stderr, "TP_BN_TRACE: graph executed\\n");
-    {
-      FILE* f = fopen("/tmp/tp_bn_trace.txt", "a");
-      if (f) { fprintf(f, "graph executed\\n"); fclose(f); }
-    }
   }
-
-  fprintf(stderr, "TP_BN_TRACE: after graph, training=%d has_rm=%d\\n", (int)training, (int)has_running_mean);
 
   if (training && has_running_mean) {
     const int64_t count = input.numel() / C;
