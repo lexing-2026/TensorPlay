@@ -469,6 +469,25 @@ Tensor rotary_embedding_kernel(
   return convert(v_output);
 }
 
+// Allocates a [batch, seq, seq] Float32 tensor whose upper triangle
+// (key column > query row) holds a large negative value, so a subsequent
+// softmax yields zero attention there.  The mask is produced directly on
+// the GPU by causal_mask.glsl and is identical for every batch/head lane.
+Tensor make_causal_mask(int64_t batch, int64_t seq) {
+  api::Context* const context = api::context();
+  api::vTensor v_mask{
+      context, {batch, seq, seq}, DType::Float32,
+      api::StorageType::TEXTURE_3D};
+  api::PipelineBarrier barrier{};
+  context->submit_compute_job(
+      VK_KERNEL_FROM_STR("causal_mask"), barrier, v_mask.extents(),
+      adaptive_work_group_size(v_mask.extents()), VK_NULL_HANDLE,
+      v_mask.image(
+          barrier, api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::WRITE));
+  return convert(v_mask);
+}
+
 Tensor scaled_dot_product_attention_kernel(
     const Tensor& query,
     const Tensor& key,
@@ -512,7 +531,6 @@ Tensor scaled_dot_product_attention_kernel(
 
   TP_CHECK(
       B == 1, "Vulkan sdpa composite path supports batch size 1 only");
-  TP_CHECK(!is_causal, "Vulkan sdpa causal masking is not implemented yet");
   TP_CHECK(
       !attn_mask_opt.has_value(),
       "Vulkan sdpa additive masks are not implemented yet");
@@ -525,6 +543,11 @@ Tensor scaled_dot_product_attention_kernel(
   Tensor scores = dispatch_vk<Tensor>("bmm", q3, kt);
   scores = dispatch_vk<Tensor>(
       "mul.Scalar", scores, Scalar(scale), Scalar(1));
+  if (is_causal) {
+    Tensor mask = make_causal_mask(B * H, S);
+    scores = dispatch_vk<Tensor, const Tensor&, const Tensor&, const Scalar&>(
+        "add.Tensor", scores, mask, Scalar(1));
+  }
   Tensor probs = dispatch_vk<Tensor>(
       "softmax", scores, static_cast<int64_t>(-1), DType::Float32);
   Tensor out3 = dispatch_vk<Tensor>("bmm", probs, v3);
