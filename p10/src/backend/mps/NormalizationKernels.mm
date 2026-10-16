@@ -295,36 +295,17 @@ Tensor batch_norm_kernel(const Tensor& input,
     MPSGraphTensor* mean0 = nil;
     MPSGraphTensor* var0 = nil;
     if (training) {
-      // Compute per-channel batch statistics with single-axis reductions
-      // only (the multi-axis mean/variance selectors are unreliable on
-      // older SDKs).  The input is viewed as (C, N) and reduced along the
-      // last axis: mean = sum/N, var = sumsq/N - mean^2.
-      const int64_t count = input.numel() / C;
-      std::vector<int64_t> reduced_shape = {C, count};
-      MPSGraphTensor* xr = [graph reshapeTensor:x
-                                withShape:getMPSShape(reduced_shape)
-                                     name:nil];
-      MPSGraphTensor* sum = [graph reductionSumWithTensor:xr axis:1 name:nil];
-      MPSGraphTensor* sq = [graph multiplicationWithPrimaryTensor:xr
-                                                  secondaryTensor:xr
-                                                             name:nil];
-      MPSGraphTensor* sumsq = [graph reductionSumWithTensor:sq axis:1 name:nil];
-      MPSGraphTensor* countT = [graph constantWithScalar:(double)count
-                                                shape:@[ @1 ]
-                                             dataType:dt];
-      MPSGraphTensor* meanSum = [graph divisionWithPrimaryTensor:sum
-                                                 secondaryTensor:countT
-                                                            name:nil];
-      MPSGraphTensor* meanSq = [graph multiplicationWithPrimaryTensor:meanSum
-                                                      secondaryTensor:meanSum
-                                                                 name:nil];
-      MPSGraphTensor* varSum = [graph divisionWithPrimaryTensor:sumsq
-                                                secondaryTensor:countT
-                                                           name:nil];
-      mean0 = meanSum;
-      var0 = [graph subtractionWithPrimaryTensor:varSum
-                                 secondaryTensor:meanSq
-                                            name:nil];
+      // Batch statistics over all non-channel axes (upstream-aligned
+      // selectors).  The reduced mean/var are reshaped back to the
+      // per-channel broadcast shape before normalization.
+      NSMutableArray<NSNumber*>* axesArr = [NSMutableArray array];
+      for (int64_t i = 0; i < input.dim(); ++i) {
+        if (i != 1) {
+          [axesArr addObject:@(i)];
+        }
+      }
+      mean0 = [graph meanOfTensor:x axes:axesArr name:nil];
+      var0 = [graph varianceOfTensor:x axes:axesArr name:nil];
     } else {
       mean0 = [graph placeholderWithShape:meanShape
                               dataType:dt
