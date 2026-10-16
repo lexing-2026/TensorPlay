@@ -297,11 +297,12 @@ inline Tensor list_to_tensor(PyObject* list, std::optional<DType> requested_dtyp
     // Determine target device
     Device target_device = device.value_or(globalContext().defaultDevice());
     
-    // Staging buffer: pinned host memory when the list will be copied to the
-    // GPU, so the H2D transfer runs asynchronously and is not pageable-
-    // copy bound.
+    // Staging buffer: pinned host memory is only available on CUDA builds
+    // (the H2D transfer then runs asynchronously and is not pageable-copy
+    // bound). Other non-CPU targets (MPS) stage through a plain CPU tensor
+    // and move with the regular device-transfer path.
     Tensor t = Tensor(shape, dtype, Device(DeviceType::CPU));
-    if (target_device.type() != DeviceType::CPU) {
+    if (target_device.is_cuda()) {
         t = ops::empty(shape, dtype, t.device(), /*pin_memory=*/true);
     }
     
