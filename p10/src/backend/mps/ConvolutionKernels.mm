@@ -311,14 +311,16 @@ Tensor conv2d_kernel(const Tensor& input, const Tensor& weight,
         [[[MPSGraphTensorData alloc] initWithMTLBuffer:outBuf
                                                 shape:outShape
                                              dataType:dt] autorelease];
-    NSDictionary* feeds = @{xt : inData, wt : wData};
+    NSMutableDictionary* feeds =
+        [NSMutableDictionary dictionaryWithObjectsAndKeys:inData, xt,
+                                                          wData, wt, nil];
     NSDictionary* results = @{result : outData};
     if (has_bias) {
       MPSGraphTensorData* bData =
           [[[MPSGraphTensorData alloc] initWithMTLBuffer:mtlBufferOf(bias_c)
                                                   shape:biasShape
                                                dataType:dt] autorelease];
-      [(NSMutableDictionary*)feeds setObject:bData forKey:bt];
+      feeds[bt] = bData;
     }
 
     getCurrentMPSStream()->executeMPSGraph(graph, feeds, results,
