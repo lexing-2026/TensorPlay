@@ -97,7 +97,7 @@ Tensor sample_kernel(const Tensor& logits, double temperature, int64_t top_k,
 
   // 1. Temperature-scaled probabilities.
   Tensor scaled = ops::div(input, Scalar(temperature));
-  Tensor probs = ops::softmax(scaled, -1);
+  Tensor probs = ops::softmax(scaled, -1, DType::Undefined);
 
   // 2. top-k threshold masking on the raw logits (before softmax is already
   //    applied, so threshold on probabilities is equivalent for ranking).

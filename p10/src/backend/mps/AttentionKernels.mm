@@ -743,8 +743,9 @@ Tensor scaled_dot_product_attention_kernel(
     scores = [graph multiplicationWithPrimaryTensor:scores
                                      secondaryTensor:scaleTensor
                                                 name:@"scaled"];
+    MPSGraphTensor* mt = nil;
     if (mask.defined()) {
-      MPSGraphTensor* mt = [graph placeholderWithShape:getMPSShape(
+      mt = [graph placeholderWithShape:getMPSShape(
           static_cast<std::vector<int64_t>>(mask.shape()))
                                              dataType:mtl_dt
                                                   name:@"mask"];
