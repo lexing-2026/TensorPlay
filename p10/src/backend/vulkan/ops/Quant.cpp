@@ -3,6 +3,7 @@
 #include "Blocks.h"
 #include "Common.h"
 #include "Convert.h"
+#include "ParamCache.h"
 #include "Quantizer.h"
 #include "Utils.h"
 
@@ -18,6 +19,11 @@
 namespace tensorplay {
 namespace vulkan {
 namespace ops {
+
+// Cache tag for the height-packed Int8 weight payload of quantized_linear.
+// Distinct from the mm packing tags in Matmul.cpp (10..15).
+constexpr uint32_t kTagQLinearWeightHeightPacked = 20u;
+constexpr uint32_t kTagQLinearParams = 21u;
 
 //
 // Quantized elementwise arithmetic over Int8 textures with explicit affine
@@ -651,54 +657,56 @@ Tensor quantized_linear_kernel(
 
   // Pack the per-channel parameters into a 3-row float texture indexed by
   // the output channel: scale (row 0), zero point (row 1), bias (row 2).
-  // The callers may hand the qparams over as device tensors; the packing
-  // happens on the host, so everything is gathered to CPU first.
-  // Rows are padded to a multiple of four so the width-packed params
-  // texture never straddles a row boundary (a plain [3, N] upload would
-  // leak the next row into the tail lanes of an unaligned row).
+  // The payload is cached on the weight identity so steady-state inference
+  // never rounds-trips the per-channel qparams through the host.  Rows are
+  // padded to a multiple of four so the width-packed params texture never
+  // straddles a row boundary.
   const int64_t params_width = api::utils::align_up(out_features, 4);
-  Tensor params_cpu = Tensor::zeros(
-      {3, params_width}, DType::Float32, Device(DeviceType::CPU));
-  Tensor sc =
-      weight_scales.to(Device(DeviceType::CPU)).to(DType::Float32).contiguous();
-  Tensor zp = weight_zero_points.to(Device(DeviceType::CPU))
-                  .to(DType::Float32)
-                  .contiguous();
-  std::memcpy(
-      params_cpu.impl()->storage().data() + sizeof(float) * params_width,
-      zp.data_ptr<float>(),
-      sizeof(float) * out_features);
-  std::memcpy(
-      params_cpu.impl()->storage().data(),
-      sc.data_ptr<float>(),
-      sizeof(float) * out_features);
-  if (bias.has_value()) {
-    Tensor bias_f = bias->to(Device(DeviceType::CPU))
+  api::vTensor v_params = ParamTextureCache::singleton().get_or_create(
+      weight, {3, params_width}, api::GPUMemoryLayout::TENSOR_WIDTH_PACKED,
+      kTagQLinearParams,
+      [&]() {
+        Tensor params_cpu = Tensor::zeros(
+            {3, params_width}, DType::Float32, Device(DeviceType::CPU));
+        Tensor sc = weight_scales.to(Device(DeviceType::CPU))
                         .to(DType::Float32)
                         .contiguous();
-    std::memcpy(
-        params_cpu.impl()->storage().data() +
-            sizeof(float) * 2 * params_width,
-        bias_f.data_ptr<float>(),
-        sizeof(float) * out_features);
-  }
-
-  api::vTensor v_params{
-      context,
-      {3, params_width},
-      DType::Float32,
-      api::StorageType::TEXTURE_3D,
-      api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
-  {
-    // The params texture is width-packed: texel (n/4, row) carries four
-    // consecutive output channels of row `row` (scale, zero point, bias).
-    // A row-major upload of the padded [3, params_width] host buffer
-    // lands exactly in that layout.
-    utils::upload_host_bytes(
-        v_params,
-        params_cpu.contiguous().impl()->storage().data(),
-        params_cpu.numel() * params_cpu.itemsize());
-  }
+        Tensor zp = weight_zero_points.to(Device(DeviceType::CPU))
+                        .to(DType::Float32)
+                        .contiguous();
+        std::memcpy(
+            params_cpu.impl()->storage().data() + sizeof(float) * params_width,
+            zp.data_ptr<float>(),
+            sizeof(float) * out_features);
+        std::memcpy(
+            params_cpu.impl()->storage().data(),
+            sc.data_ptr<float>(),
+            sizeof(float) * out_features);
+        if (bias.has_value()) {
+          Tensor bias_f = bias->to(Device(DeviceType::CPU))
+                              .to(DType::Float32)
+                              .contiguous();
+          std::memcpy(
+              params_cpu.impl()->storage().data() +
+                  sizeof(float) * 2 * params_width,
+              bias_f.data_ptr<float>(),
+              sizeof(float) * out_features);
+        }
+        api::vTensor v_p{
+            context,
+            {3, params_width},
+            DType::Float32,
+            api::StorageType::TEXTURE_3D,
+            api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+        // The params texture is width-packed: texel (n/4, row) carries four
+        // consecutive output channels of row `row`.  A row-major upload of
+        // the padded [3, params_width] host buffer lands exactly there.
+        utils::upload_host_bytes(
+            v_p,
+            params_cpu.contiguous().impl()->storage().data(),
+            params_cpu.numel() * params_cpu.itemsize());
+        return v_p;
+      });
 
   const int64_t M = input.size(0);
   const int64_t N = weight.size(0);
@@ -716,12 +724,6 @@ Tensor quantized_linear_kernel(
       DType::QInt8,
       api::StorageType::TEXTURE_3D,
       api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
-  api::vTensor v_weight_packed{
-      context,
-      {K, N},
-      DType::QInt8,
-      api::StorageType::TEXTURE_3D,
-      api::GPUMemoryLayout::TENSOR_HEIGHT_PACKED};
 
   const struct QuantizedLinearBlock block{
       static_cast<int32_t>(M),
@@ -770,15 +772,29 @@ Tensor quantized_linear_kernel(
           api::MemoryAccessType::WRITE),
       v_input.image(pipeline_barrier, api::PipelineStage::COMPUTE),
       pack_in_params.buffer());
-  context->submit_compute_job(
-      VK_KERNEL(pack_int8_height), pipeline_barrier, pack_w_grid,
-      adaptive_work_group_size(pack_w_grid), VK_NULL_HANDLE,
-      v_weight_packed.image(
-          pipeline_barrier,
-          api::PipelineStage::COMPUTE,
-          api::MemoryAccessType::WRITE),
-      v_weight.image(pipeline_barrier, api::PipelineStage::COMPUTE),
-      pack_w_params.buffer());
+  // The packed weight payload is materialized once per source storage
+  // identity and reused across calls (weight prepack for inference).
+  api::vTensor v_weight_packed = ParamTextureCache::singleton().get_or_create(
+      weight, {K, N}, api::GPUMemoryLayout::TENSOR_HEIGHT_PACKED,
+      kTagQLinearWeightHeightPacked,
+      [&]() {
+        api::vTensor v_wp{
+            context,
+            {K, N},
+            DType::QInt8,
+            api::StorageType::TEXTURE_3D,
+            api::GPUMemoryLayout::TENSOR_HEIGHT_PACKED};
+        context->submit_compute_job(
+            VK_KERNEL(pack_int8_height), pipeline_barrier, pack_w_grid,
+            adaptive_work_group_size(pack_w_grid), VK_NULL_HANDLE,
+            v_wp.image(
+                pipeline_barrier,
+                api::PipelineStage::COMPUTE,
+                api::MemoryAccessType::WRITE),
+            v_weight.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+            pack_w_params.buffer());
+        return v_wp;
+      });
 
   const api::utils::uvec3 grid{
       api::utils::safe_downcast_to_u32((N + 3) / 4),
