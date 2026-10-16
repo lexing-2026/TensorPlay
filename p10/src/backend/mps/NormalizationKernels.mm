@@ -319,12 +319,8 @@ Tensor batch_norm_kernel(const Tensor& input,
                               dataType:dt
                                    name:@"rv"];
     }
-    MPSGraphTensor* meanB = training
-        ? [graph reshapeTensor:mean0 withShape:meanShape name:nil]
-        : mean0;
-    MPSGraphTensor* varB = training
-        ? [graph reshapeTensor:var0 withShape:meanShape name:nil]
-        : var0;
+    MPSGraphTensor* meanB = mean0;
+    MPSGraphTensor* varB = var0;
 
     MPSGraphTensor* gamma = nil;
     MPSGraphTensor* beta = nil;
