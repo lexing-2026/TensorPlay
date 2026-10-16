@@ -25,7 +25,6 @@ bool defined_and_mps(const std::optional<Tensor>& t, const char* op) {
   return t.has_value() && t->defined() && t->device().is_mps();
 }
 
-template <typename ParamsT>
 void bind_bag_args(id<MTLComputeCommandEncoder> encoder,
                    const Tensor& t, unsigned idx) {
   Tensor c = materializeForGraph(t);
