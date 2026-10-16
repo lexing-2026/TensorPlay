@@ -117,7 +117,7 @@ void GpuTimerPair::close() {
     // command buffer's handler synchronously inside addCompletedHandler, and
     // the decrement must always have a matching increment.
     g_pending_count.fetch_add(1, std::memory_order_relaxed);
-    [stream->commandBuffer() addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+    stream->addCompletedHandler(^(id<MTLCommandBuffer> cb) {
         float ms = 0.f;
         if (cb.GPUEndTime > cb.GPUStartTime) {
             ms = static_cast<float>((cb.GPUEndTime - cb.GPUStartTime) * 1000.0);
@@ -127,7 +127,7 @@ void GpuTimerPair::close() {
         if (g_pending_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
             g_pending_cv.notify_all();
         }
-    }];
+    });
     // Commit the command buffer so the completion handler above fires once
     // this op's encoded work has executed.  The stream runs with
     // commit-and-continue disabled, so a plain COMMIT (flush) is used: the
