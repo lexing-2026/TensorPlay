@@ -702,12 +702,31 @@ Tensor quantized_linear_kernel(
 
   const int64_t M = input.size(0);
   const int64_t N = weight.size(0);
+  const int64_t K = input.size(1);
+  const int64_t K_tex = (K + 3) / 4;
   api::vTensor v_output{context, {M, N}, DType::Int8};
+
+  // Pack activations and weights into the packed Int8 layouts the tiled
+  // GEMM streams: width-packed activations (texel (k/4, m) holds four K of
+  // row m) and height-packed weights (texel (n, k/4) holds four K of
+  // column n).
+  api::vTensor v_input_packed{
+      context,
+      {M, K},
+      DType::QInt8,
+      api::StorageType::TEXTURE_3D,
+      api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+  api::vTensor v_weight_packed{
+      context,
+      {K, N},
+      DType::QInt8,
+      api::StorageType::TEXTURE_3D,
+      api::GPUMemoryLayout::TENSOR_HEIGHT_PACKED};
 
   const struct QuantizedLinearBlock block{
       static_cast<int32_t>(M),
       static_cast<int32_t>(N),
-      static_cast<int32_t>(input.size(1)),
+      static_cast<int32_t>(K),
       static_cast<float>(input_scale),
       static_cast<int32_t>(input_zero_point),
       static_cast<float>(1.0 / out_scale),
@@ -718,20 +737,63 @@ Tensor quantized_linear_kernel(
   api::UniformParamsBuffer params(context, block);
   api::PipelineBarrier pipeline_barrier{};
 
-  const api::utils::uvec3 grid{
-      api::utils::safe_downcast_to_u32(N),
+  const struct PackBlockWidth final {
+    int k;
+    int m;
+  } pack_in_block{
+      static_cast<int32_t>(K),
+      static_cast<int32_t>(M)};
+  const struct PackBlockHeight final {
+    int k;
+    int n;
+  } pack_w_block{
+      static_cast<int32_t>(K),
+      static_cast<int32_t>(N)};
+  api::UniformParamsBuffer pack_in_params(context, pack_in_block);
+  api::UniformParamsBuffer pack_w_params(context, pack_w_block);
+
+  const api::utils::uvec3 pack_in_grid{
+      api::utils::safe_downcast_to_u32(K_tex),
       api::utils::safe_downcast_to_u32(M),
+      1u};
+  const api::utils::uvec3 pack_w_grid{
+      api::utils::safe_downcast_to_u32(N),
+      api::utils::safe_downcast_to_u32(K_tex),
       1u};
 
   context->submit_compute_job(
-      VK_KERNEL(quantized_linear), pipeline_barrier, grid,
-      adaptive_work_group_size(grid), VK_NULL_HANDLE,
-      v_output.image(
+      VK_KERNEL(pack_int8_width), pipeline_barrier, pack_in_grid,
+      adaptive_work_group_size(pack_in_grid), VK_NULL_HANDLE,
+      v_input_packed.image(
           pipeline_barrier,
           api::PipelineStage::COMPUTE,
           api::MemoryAccessType::WRITE),
       v_input.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+      pack_in_params.buffer());
+  context->submit_compute_job(
+      VK_KERNEL(pack_int8_height), pipeline_barrier, pack_w_grid,
+      adaptive_work_group_size(pack_w_grid), VK_NULL_HANDLE,
+      v_weight_packed.image(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::WRITE),
       v_weight.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+      pack_w_params.buffer());
+
+  const api::utils::uvec3 grid{
+      api::utils::safe_downcast_to_u32((N + 3) / 4),
+      api::utils::safe_downcast_to_u32((M + 3) / 4),
+      1u};
+
+  context->submit_compute_job(
+      VK_KERNEL(quantized_linear_tiled), pipeline_barrier, grid,
+      {8u, 8u, 1u}, VK_NULL_HANDLE,
+      v_output.image(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::WRITE),
+      v_input_packed.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+      v_weight_packed.image(pipeline_barrier, api::PipelineStage::COMPUTE),
       v_params.image(pipeline_barrier, api::PipelineStage::COMPUTE),
       params.buffer());
 
