@@ -289,20 +289,7 @@ Tensor batch_norm_kernel(const Tensor& input,
     batch_var = Tensor({C}, DType::Float32, input.device());
   }
 
-  {
-    FILE* f = fopen("/tmp/tp_bn_trace.txt", "a");
-    if (f) {
-      fprintf(f, "before graph, training=%d C=%lld\n", (int)training,
-              (long long)C);
-      fclose(f);
-    }
-  }
-
   @autoreleasepool {
-    {
-      FILE* f = fopen("/tmp/tp_bn_trace.txt", "a");
-      if (f) { fprintf(f, "graph start\n"); fclose(f); }
-    }
     MPSGraph* graph = [[MPSGraph new] autorelease];
     MPSShape* inShape = getMPSShape(out_shape);
     MPSShape* meanShape = getMPSShape(mean_shape);
@@ -439,16 +426,8 @@ Tensor batch_norm_kernel(const Tensor& input,
       feeds[beta] = bData;
     }
 
-    {
-      FILE* f = fopen("/tmp/tp_bn_trace.txt", "a");
-      if (f) { fprintf(f, "before execute\n"); fclose(f); }
-    }
     getCurrentMPSStream()->executeMPSGraph(graph, feeds, results,
                                           SyncType::COMMIT_AND_WAIT);
-    {
-      FILE* f = fopen("/tmp/tp_bn_trace.txt", "a");
-      if (f) { fprintf(f, "graph executed\n"); fclose(f); }
-    }
   }
 
   if (training && has_running_mean) {
