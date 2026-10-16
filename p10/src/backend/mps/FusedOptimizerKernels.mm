@@ -20,6 +20,8 @@
 namespace tensorplay {
 namespace mps {
 
+namespace ops = tpx::ops;
+
 namespace {
 
 bool is_mps_tensor(const Tensor& t, const char* op) {
