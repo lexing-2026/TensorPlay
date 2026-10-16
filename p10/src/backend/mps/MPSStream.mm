@@ -1,5 +1,6 @@
 #include "backend/mps/MPSStream.h"
 
+#include "backend/mps/MetalUtils.h"
 #include "Exception.h"
 
 #include <array>
