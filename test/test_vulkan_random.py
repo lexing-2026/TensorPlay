@@ -152,3 +152,49 @@ def test_multinomial_distribution_unbiased():
     prob = _vk_prob([0.5, 0.5])
     samples = tp.multinomial(prob, 2000, replacement=True).cpu().numpy()
     assert abs((samples == 0).sum() - 1000) < 120
+
+
+def _vk_logits(values):
+    return tp.from_numpy(np.asarray(values, dtype=np.float32)).to("vulkan")
+
+
+def test_sample_deterministic_peak():
+    logits = _vk_logits([[10.0, 0.0, -100.0, -100.0]])
+    samples = tp.sample(logits, 1.0, 0, 1.0)
+    assert samples.dtype == tp.int64
+    assert samples.cpu().tolist() == [0]
+
+
+def test_sample_top_k_forces_top1():
+    logits = _vk_logits([[0.4, 0.3, 0.2, 0.1]])
+    samples = tp.sample(logits, 1.0, 1, 1.0)
+    assert samples.cpu().tolist() == [0]
+
+
+def test_sample_top_p_nucleus_cutoff():
+    logits = _vk_logits([[0.4, 0.3, 0.2, 0.1]])
+    samples = tp.sample(logits, 1.0, 0, 0.1)
+    assert samples.cpu().tolist() == [0]
+
+
+def test_sample_batch_rows():
+    logits = _vk_logits([[10.0, 0.0], [0.0, 10.0]])
+    samples = tp.sample(logits, 1.0, 0, 1.0)
+    assert samples.cpu().tolist() == [0, 1]
+
+
+def test_sample_distribution_unbiased():
+    logits = _vk_logits([[0.0, 0.0]])  # softmax = [0.5, 0.5]
+    counts = {0: 0, 1: 0}
+    for _ in range(1000):
+        idx = tp.sample(logits, 1.0, 0, 1.0).cpu().item()
+        counts[idx] += 1
+    assert abs(counts[0] - 500) < 100
+
+
+def test_sample_top_k_restricts_domain():
+    logits = _vk_logits([[0.4, 0.3, 0.2, 0.1]])
+    vals = [
+        tp.sample(logits, 1.0, 2, 1.0).cpu().item() for _ in range(200)
+    ]
+    assert set(vals) <= {0, 1}

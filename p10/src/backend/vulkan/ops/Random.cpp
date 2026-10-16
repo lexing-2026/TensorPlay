@@ -18,6 +18,11 @@ namespace ops {
 
 using namespace api::utils;
 
+// Sibling Vulkan kernels used by the token sampler.
+Tensor softmax_kernel(const Tensor& self, int64_t dim, DType dtype);
+std::tuple<Tensor, Tensor> sort_kernel(
+    const Tensor& self, int64_t dim, bool descending);
+
 namespace {
 
 //
@@ -369,6 +374,84 @@ Tensor multinomial_kernel(
   return convert(v_result);
 }
 
+Tensor sample_kernel(
+    const Tensor& logits,
+    double temperature,
+    int64_t top_k,
+    double top_p,
+    int64_t impl) {
+  (void)impl;
+  TP_CHECK(
+      logits.device().is_vulkan(),
+      "Vulkan sample expects a Vulkan tensor");
+  TP_CHECK(temperature > 0.0, "sample: temperature must be > 0");
+  TP_CHECK(
+      top_p > 0.0 && top_p <= 1.0, "sample: top_p must be in (0, 1]");
+  TP_CHECK(
+      logits.dim() == 2, "sample: logits must be 2D [batch, vocab]");
+
+  Tensor input =
+      logits.dtype() == DType::Float32 ? logits : logits.to(DType::Float32);
+  const int64_t rows = input.size(0);
+  const int64_t cols = input.size(1);
+  if (cols == 0) {
+    TP_THROW(RuntimeError, "sample: vocab size must be > 0");
+  }
+
+  // Temperature scaling -> softmax -> descending sort with original
+  // indices.  The sampler shader applies top-k / top-p cutoffs on the
+  // sorted row and draws one token by inverse CDF.
+  Tensor scaled = input * (1.0 / temperature);
+  Tensor probs = softmax_kernel(scaled, -1, DType::Float32);
+  auto sorted = sort_kernel(probs, -1, true);
+  const Tensor& values = std::get<0>(sorted);
+  const Tensor& indices = std::get<1>(sorted);
+
+  api::Context* const context = api::context();
+  api::vTensor v_result{
+      context, {rows}, DType::Int64, api::StorageType::BUFFER,
+      api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+  if (rows == 0) {
+    return convert(v_result);
+  }
+
+  Tensor noise = empty_kernel({rows}, DType::Float32, input.device(), false);
+  std::optional<Generator> no_generator;
+  dispatch_random_fill(noise, VK_KERNEL(uniform_fill), 0.0f, 1.0f, 0.0f,
+                      no_generator);
+
+  api::vTensor v_values = convert(values);
+  api::vTensor v_indices = convert(indices);
+  api::vTensor v_noise = convert(noise);
+
+  const struct SampleBlock final {
+    int k;
+    int rows;
+    int top_k;
+    float top_p;
+  } block{
+      static_cast<int32_t>(cols),
+      static_cast<int32_t>(rows),
+      static_cast<int32_t>(top_k),
+      static_cast<float>(top_p)};
+  api::UniformParamsBuffer params(context, block);
+  api::PipelineBarrier barrier{};
+  const api::utils::uvec3 grid{
+      api::utils::safe_downcast_to_u32(rows), 1u, 1u};
+
+  context->submit_compute_job(
+      VK_KERNEL(sample_from_sorted), barrier, grid, {1u, 1u, 1u},
+      VK_NULL_HANDLE,
+      v_result.buffer(
+          barrier, api::PipelineStage::COMPUTE, api::MemoryAccessType::WRITE),
+      v_values.image(barrier, api::PipelineStage::COMPUTE),
+      v_indices.image(barrier, api::PipelineStage::COMPUTE),
+      v_noise.image(barrier, api::PipelineStage::COMPUTE),
+      params.buffer());
+
+  return convert(v_result);
+}
+
 } // namespace ops
 } // namespace vulkan
 } // namespace tensorplay
@@ -383,6 +466,7 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, RandomKernels) {
   m.impl("rand_like", &tensorplay::vulkan::ops::rand_like_kernel);
   m.impl("randn_like", &tensorplay::vulkan::ops::randn_like_kernel);
   m.impl("multinomial", &tensorplay::vulkan::ops::multinomial_kernel);
+  m.impl("sample", &tensorplay::vulkan::ops::sample_kernel);
 }
 
 #endif /* USE_VULKAN */
