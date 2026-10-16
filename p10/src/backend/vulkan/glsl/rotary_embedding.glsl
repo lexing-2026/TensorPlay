@@ -6,12 +6,13 @@
 
 layout(std430) buffer;
 
-// Rotary position embedding (interleaved pairs) over a width-packed float
+// Rotary position embedding (interleaved pairs) over a channel-packed float
 // texture.  The input is [..., seq, head_dim] with head_dim = 2 * half_dim;
-// texel (x, row, batch) holds dimensions 4x..4x+3 of that row, i.e. two
-// rotation pairs.  cos/sin tables are [table_rows, half_dim] (also
-// width-packed, four pairs per texel).  Each invocation handles one cos
-// texel (four rotation pairs = two output texels):
+// the texture stores one head dimension per x position and packs four heads
+// per texel along z, so texel (x, row, batch) holds dimension x of four
+// heads.  cos/sin tables are [table_rows, half_dim], width-packed (four
+// rotation pairs per texel).  Each invocation rotates one pair of dimensions
+// (2i, 2i+1) for the four head lanes:
 //   out[2i]   = in[2i]   * cos[t][i] - in[2i+1] * sin[t][i]
 //   out[2i+1] = in[2i]   * sin[t][i] + in[2i+1] * cos[t][i]
 // where t = row % seq_len (+ position_offset for KV cache increments).
@@ -20,7 +21,7 @@ layout(set = 0, binding = 1) uniform PRECISION sampler3D uInput;
 layout(set = 0, binding = 2) uniform PRECISION sampler3D uCos;
 layout(set = 0, binding = 3) uniform PRECISION sampler3D uSin;
 layout(set = 0, binding = 4) uniform PRECISION restrict Block {
-  ivec4 extents;     // (head_dim/4, rows, batches, 0)
+  ivec4 extents;     // (half_dim, rows, batches, 0)
   int tokens;        // seq_len (the second-to-last logical dim)
   int half_dim;      // head_dim / 2
   int table_rows;    // cos/sin row count (1 = broadcast)
@@ -39,30 +40,19 @@ void main() {
     return;
   }
 
+  const int pair = pos.x;
   const int token = pos.y % uBlock.tokens;
   const int table_row =
       (uBlock.table_rows == 1) ? 0 : (uBlock.position_offset + token);
 
-  // Four rotation pairs for this invocation.
-  const vec4 c = texelFetch(uCos, ivec3(pos.x, table_row, 0), 0);
-  const vec4 s = texelFetch(uSin, ivec3(pos.x, table_row, 0), 0);
+  // cos/sin for this rotation pair.  The tables are ordinary [rows, half]
+  // textures (one value per texel x position in the .x lane).
+  const float c = texelFetch(uCos, ivec3(pair, table_row, 0), 0).x;
+  const float s = texelFetch(uSin, ivec3(pair, table_row, 0), 0).x;
 
-  // Output texel 0: dimensions 4*(2x) .. 4*(2x)+3 = pairs 4x, 4x+1.
-  const vec4 in0 = texelFetch(uInput, ivec3(2 * pos.x, pos.y, pos.z), 0);
-  vec4 out0;
-  out0.x = in0.x * c.x - in0.y * s.x;
-  out0.y = in0.x * s.x + in0.y * c.x;
-  out0.z = in0.z * c.y - in0.w * s.y;
-  out0.w = in0.z * s.y + in0.w * c.y;
-
-  // Output texel 1: dimensions 4*(2x+1) .. +3 = pairs 4x+2, 4x+3.
-  const vec4 in1 = texelFetch(uInput, ivec3(2 * pos.x + 1, pos.y, pos.z), 0);
-  vec4 out1;
-  out1.x = in1.x * c.z - in1.y * s.z;
-  out1.y = in1.x * s.z + in1.y * c.z;
-  out1.z = in1.z * c.w - in1.w * s.w;
-  out1.w = in1.z * s.w + in1.w * c.w;
-
-  imageStore(uOutput, ivec3(2 * pos.x, pos.y, pos.z), out0);
-  imageStore(uOutput, ivec3(2 * pos.x + 1, pos.y, pos.z), out1);
+  // Four head lanes share the same rotation.
+  const vec4 in_even = texelFetch(uInput, ivec3(2 * pair, pos.y, pos.z), 0);
+  const vec4 in_odd = texelFetch(uInput, ivec3(2 * pair + 1, pos.y, pos.z), 0);
+  imageStore(uOutput, ivec3(2 * pair, pos.y, pos.z), in_even * c - in_odd * s);
+  imageStore(uOutput, ivec3(2 * pair + 1, pos.y, pos.z), in_even * s + in_odd * c);
 }

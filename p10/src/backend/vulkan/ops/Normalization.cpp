@@ -344,7 +344,7 @@ Tensor rms_norm_kernel(
     const Tensor& input,
     const std::vector<int64_t>& normalized_shape,
     const std::optional<Tensor>& weight_opt,
-    const std::optional<double>& eps_opt) {
+    std::optional<double> eps_opt) {
   TP_CHECK(
       input.dtype() == DType::Float32,
       "Vulkan rms_norm supports Float32 tensors only");
@@ -377,7 +377,7 @@ Tensor silu_mul_kernel(const Tensor& gate, const Tensor& up) {
       gate.dtype() == DType::Float32 && up.dtype() == DType::Float32,
       "Vulkan silu_mul supports Float32 tensors only");
   Tensor gate_silu = dispatch_vk<Tensor>("silu", gate);
-  return dispatch_vk<Tensor>("mul.Tensor", gate_silu, up, Scalar(1));
+  return dispatch_vk<Tensor>("mul.Tensor", gate_silu, up);
 }
 
 Tensor silu_and_mul_kernel(const Tensor& input) {
@@ -389,12 +389,14 @@ Tensor silu_and_mul_kernel(const Tensor& input) {
   const int64_t dim = input.dim() - 1;
   // Packed layout: the first half is the gate, the second half is the up
   // projection; out = silu(gate) * up.
-  Tensor gate =
-      dispatch_vk<Tensor>("slice.Tensor", input, dim, 0, half, 1);
+  Tensor gate = dispatch_vk<Tensor>(
+      "slice.Tensor", input, dim, std::optional<int64_t>(0),
+      std::optional<int64_t>(half), int64_t(1));
   Tensor up = dispatch_vk<Tensor>(
-      "slice.Tensor", input, dim, half, packed_width, 1);
+      "slice.Tensor", input, dim, std::optional<int64_t>(half),
+      std::optional<int64_t>(packed_width), int64_t(1));
   Tensor gate_silu = dispatch_vk<Tensor>("silu", gate);
-  return dispatch_vk<Tensor>("mul.Tensor", gate_silu, up, Scalar(1));
+  return dispatch_vk<Tensor>("mul.Tensor", gate_silu, up);
 }
 
 Tensor rotary_embedding_kernel(
@@ -436,7 +438,7 @@ Tensor rotary_embedding_kernel(
     int32_t fill0;
   } block{
       ivec4(
-          v_output.extents()[0u],
+          static_cast<int32_t>(half_dim),
           v_output.extents()[1u],
           v_output.extents()[2u],
           0),
@@ -450,7 +452,7 @@ Tensor rotary_embedding_kernel(
   api::PipelineBarrier pipeline_barrier{};
 
   const api::utils::uvec3 grid{
-      api::utils::safe_downcast_to_u32(half_dim / 4),
+      api::utils::safe_downcast_to_u32(half_dim),
       v_output.extents()[1u],
       v_output.extents()[2u]};
 
