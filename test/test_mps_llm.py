@@ -102,10 +102,10 @@ class TestMPSFusedOptimizer(unittest.TestCase):
         g = tp.randn(6, device=device)
         ea = tp.zeros(6, device=device)
         es = tp.zeros(6, device=device)
-        me = tp.zeros(6, device=device)
         step = tp.tensor(0.0, dtype=tp.float32, device=device)
         fn = tp._fused_adamw_ if adamw else tp._fused_adam_
-        fn([p], [g], [ea], [es], [me], [step], lr=0.01, beta1=0.9,
+        # amsgrad is disabled, so the max-exp-avg-sqs list must be empty.
+        fn([p], [g], [ea], [es], [], [step], lr=0.01, beta1=0.9,
            beta2=0.999, weight_decay=0.01, eps=1e-8, amsgrad=False,
            maximize=False)
         return p.cpu()
