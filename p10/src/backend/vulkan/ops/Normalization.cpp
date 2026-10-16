@@ -50,8 +50,8 @@ Tensor layer_norm_impl(
     const std::optional<Tensor>& bias_opt,
     double eps) {
   TP_CHECK(
-      input_arg.dtype() == DType::Float32,
-      "Vulkan layer_norm supports Float32 tensors only");
+      (input_arg.dtype() == DType::Float32 || input_arg.dtype() == DType::Float16),
+      "Vulkan layer_norm supports Float32 and Float16 tensors only");
   TP_CHECK(
       input_arg.dim() >= 1 && input_arg.dim() <= 4,
       "Vulkan layer_norm supports 1d to 4d tensors");
@@ -346,8 +346,8 @@ Tensor rms_norm_kernel(
     const std::optional<Tensor>& weight_opt,
     std::optional<double> eps_opt) {
   TP_CHECK(
-      input.dtype() == DType::Float32,
-      "Vulkan rms_norm supports Float32 tensors only");
+      input.dtype() == DType::Float32 || input.dtype() == DType::Float16,
+      "Vulkan rms_norm supports Float32 and Float16 tensors only");
   const double eps = eps_opt.has_value() ? eps_opt.value() : 1e-6;
 
   const int64_t norm_ndim = static_cast<int64_t>(normalized_shape.size());
@@ -374,16 +374,17 @@ Tensor rms_norm_kernel(
 
 Tensor silu_mul_kernel(const Tensor& gate, const Tensor& up) {
   TP_CHECK(
-      gate.dtype() == DType::Float32 && up.dtype() == DType::Float32,
-      "Vulkan silu_mul supports Float32 tensors only");
+      (gate.dtype() == DType::Float32 || gate.dtype() == DType::Float16) &&
+          (up.dtype() == DType::Float32 || up.dtype() == DType::Float16),
+      "Vulkan silu_mul supports Float32 and Float16 tensors only");
   Tensor gate_silu = dispatch_vk<Tensor>("silu", gate);
   return dispatch_vk<Tensor>("mul.Tensor", gate_silu, up);
 }
 
 Tensor silu_and_mul_kernel(const Tensor& input) {
   TP_CHECK(
-      input.dtype() == DType::Float32,
-      "Vulkan silu_and_mul supports Float32 tensors only");
+      (input.dtype() == DType::Float32 || input.dtype() == DType::Float16),
+      "Vulkan silu_and_mul supports Float32 and Float16 tensors only");
   const int64_t packed_width = input.size(-1);
   const int64_t half = packed_width / 2;
   const int64_t dim = input.dim() - 1;
@@ -405,9 +406,10 @@ Tensor rotary_embedding_kernel(
     const Tensor& sin,
     int64_t position_offset) {
   TP_CHECK(
-      input.dtype() == DType::Float32 && cos.dtype() == DType::Float32 &&
-          sin.dtype() == DType::Float32,
-      "Vulkan rotary_embedding supports Float32 tensors only");
+      (input.dtype() == DType::Float32 || input.dtype() == DType::Float16) &&
+          (cos.dtype() == DType::Float32 || cos.dtype() == DType::Float16) &&
+          (sin.dtype() == DType::Float32 || sin.dtype() == DType::Float16),
+      "Vulkan rotary_embedding supports Float32 and Float16 tensors only");
   TP_CHECK(input.dim() >= 2, "Vulkan rotary_embedding needs ndim >= 2");
 
   api::Context* const context = api::context();
@@ -457,7 +459,7 @@ Tensor rotary_embedding_kernel(
       v_output.extents()[2u]};
 
   context->submit_compute_job(
-      VK_KERNEL(rotary_embedding), pipeline_barrier, grid,
+      kernel_for("rotary_embedding", input.dtype()), pipeline_barrier, grid,
       adaptive_work_group_size(grid), VK_NULL_HANDLE,
       v_output.image(
           pipeline_barrier,
@@ -500,9 +502,10 @@ Tensor scaled_dot_product_attention_kernel(
     std::optional<double> scale_opt,
     bool enable_gqa) {
   TP_CHECK(
-      query.dtype() == DType::Float32 && key.dtype() == DType::Float32 &&
-          value.dtype() == DType::Float32,
-      "Vulkan sdpa supports Float32 tensors only");
+      (query.dtype() == DType::Float32 || query.dtype() == DType::Float16) &&
+          (key.dtype() == DType::Float32 || key.dtype() == DType::Float16) &&
+          (value.dtype() == DType::Float32 || value.dtype() == DType::Float16),
+      "Vulkan sdpa supports Float32 and Float16 tensors only");
   TP_CHECK(
       query.dim() == 4 && key.dim() == 4 && value.dim() == 4,
       "Vulkan sdpa expects 4-D [B, H, S, D] tensors");

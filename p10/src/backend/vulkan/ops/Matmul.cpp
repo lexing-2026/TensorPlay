@@ -390,7 +390,7 @@ Tensor product_dispatch(
     };
 
     context->submit_compute_job(
-        VK_KERNEL(addmm),
+        kernel_for("addmm", dtype),
         pipeline_barrier,
         global_size,
         {8u, 8u, 1u},
@@ -422,7 +422,7 @@ Tensor product_dispatch(
     };
 
     context->submit_compute_job(
-        VK_KERNEL(mm),
+        kernel_for("mm", dtype),
         pipeline_barrier,
         global_size,
         {8u, 8u, 1u},
@@ -499,8 +499,9 @@ Tensor mm_impl(
 
 Tensor mm_kernel(const Tensor& self, const Tensor& mat2) {
   TP_CHECK(
-      self.dtype() == DType::Float32 && mat2.dtype() == DType::Float32,
-      "Vulkan mm supports Float32 tensors only");
+      (self.dtype() == DType::Float32 || self.dtype() == DType::Float16) &&
+          (mat2.dtype() == DType::Float32 || mat2.dtype() == DType::Float16),
+      "Vulkan mm supports Float32 and Float16 tensors only");
   TP_CHECK(self.dim() == 2, "Vulkan mm: self must be a matrix");
   TP_CHECK(mat2.dim() == 2, "Vulkan mm: mat2 must be a matrix");
   TP_CHECK(
@@ -517,8 +518,9 @@ Tensor addmm_kernel(
     const Scalar& beta,
     const Scalar& alpha) {
   TP_CHECK(
-      mat1.dtype() == DType::Float32 && mat2.dtype() == DType::Float32,
-      "Vulkan addmm supports Float32 tensors only");
+      (mat1.dtype() == DType::Float32 || mat1.dtype() == DType::Float16) &&
+          (mat2.dtype() == DType::Float32 || mat2.dtype() == DType::Float16),
+      "Vulkan addmm supports Float32 and Float16 tensors only");
   TP_CHECK(mat1.dim() == 2, "Vulkan addmm: mat1 must be a matrix");
   TP_CHECK(mat2.dim() == 2, "Vulkan addmm: mat2 must be a matrix");
   TP_CHECK(
@@ -615,7 +617,7 @@ Tensor bmm_impl(
   };
 
   context->submit_compute_job(
-      VK_KERNEL(bmm),
+      kernel_for("bmm", batch1.dtype()),
       pipeline_barrier,
       global_size,
       {4u, 4u, 1u},
@@ -633,8 +635,9 @@ Tensor bmm_impl(
 
 Tensor bmm_kernel(const Tensor& batch1, const Tensor& batch2) {
   TP_CHECK(
-      batch1.dtype() == DType::Float32 && batch2.dtype() == DType::Float32,
-      "Vulkan bmm supports Float32 tensors only");
+      (batch1.dtype() == DType::Float32 || batch1.dtype() == DType::Float16) &&
+          (batch2.dtype() == DType::Float32 || batch2.dtype() == DType::Float16),
+      "Vulkan bmm supports Float32 and Float16 tensors only");
   TP_CHECK(batch1.dim() == 3, "Vulkan bmm: batch1 must be 3d");
   TP_CHECK(batch2.dim() == 3, "Vulkan bmm: batch2 must be 3d");
   const int64_t B = batch1.size(0);
@@ -671,8 +674,9 @@ Tensor baddbmm_kernel(
     const Scalar& beta,
     const Scalar& alpha) {
   TP_CHECK(
-      batch1.dtype() == DType::Float32 && batch2.dtype() == DType::Float32,
-      "Vulkan baddbmm supports Float32 tensors only");
+      (batch1.dtype() == DType::Float32 || batch1.dtype() == DType::Float16) &&
+          (batch2.dtype() == DType::Float32 || batch2.dtype() == DType::Float16),
+      "Vulkan baddbmm supports Float32 and Float16 tensors only");
   TP_CHECK(batch1.dim() == 3, "Vulkan baddbmm: batch1 must be 3d");
   TP_CHECK(batch2.dim() == 3, "Vulkan baddbmm: batch2 must be 3d");
   const int64_t B = batch1.size(0);
@@ -730,8 +734,9 @@ Tensor baddbmm_kernel(
 
 Tensor matmul_kernel(const Tensor& self_in, const Tensor& other_in) {
   TP_CHECK(
-      self_in.dtype() == DType::Float32 && other_in.dtype() == DType::Float32,
-      "Vulkan matmul supports Float32 tensors only");
+      (self_in.dtype() == DType::Float32 || self_in.dtype() == DType::Float16) &&
+          (other_in.dtype() == DType::Float32 || other_in.dtype() == DType::Float16),
+      "Vulkan matmul supports Float32 and Float16 tensors only");
 
   const int64_t self_ndim = self_in.dim();
   const int64_t other_ndim = other_in.dim();
@@ -874,7 +879,7 @@ Tensor linear_kernel(
     const std::optional<Tensor>& bias_opt) {
   TP_CHECK(
       input.dtype() == DType::Float32 && weight.dtype() == DType::Float32,
-      "Vulkan linear supports Float32 tensors only");
+      "Vulkan linear supports Float32 and Float16 tensors only");
   TP_CHECK(
       weight.dim() == 2,
       "Vulkan linear: weight must be 2d (out_features, in_features)");

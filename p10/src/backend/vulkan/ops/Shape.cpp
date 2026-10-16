@@ -248,8 +248,9 @@ Tensor slice_kernel(
     std::optional<int64_t> end,
     int64_t step) {
   TP_CHECK(
-      self.dtype() == DType::Float32 || self.dtype() == DType::Int32,
-      "Vulkan slice supports Float32 and Int32 tensors only");
+      self.dtype() == DType::Float32 || self.dtype() == DType::Float16 ||
+          self.dtype() == DType::Int32,
+      "Vulkan slice supports Float32, Float16 and Int32 tensors only");
   TP_CHECK(
       self.dim() >= 1 && self.dim() <= 4,
       "Vulkan slice supports 1d to 4d tensors");
@@ -307,7 +308,7 @@ Tensor slice_kernel(
 
   const api::ShaderInfo shader = self.dtype() == DType::Int32
       ? VK_KERNEL(slice_int32)
-      : VK_KERNEL(slice);
+      : kernel_for("slice", self.dtype());
   context->submit_compute_job(
       shader, pipeline_barrier, v_output.extents(),
       adaptive_work_group_size(v_output.extents()), VK_NULL_HANDLE,

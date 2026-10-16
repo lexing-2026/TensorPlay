@@ -230,6 +230,10 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
           shader = "cast_i32_float";
         } else if (v_src.dtype() == DType::Float32 && v_self.dtype() == DType::Int32) {
           shader = "cast_float_i32";
+        } else if (v_src.dtype() == DType::Float32 && v_self.dtype() == DType::Float16) {
+          shader = "cast_float_float16";
+        } else if (v_src.dtype() == DType::Float16 && v_self.dtype() == DType::Float32) {
+          shader = "cast_float16_float";
         }
         TP_CHECK(shader != nullptr, "Unsupported Vulkan dtype conversion");
         api::PipelineBarrier barrier{};

@@ -94,7 +94,7 @@ Tensor reduce_one_axis(
     api::PipelineBarrier pipeline_barrier{};
 
     context->submit_compute_job(
-        VK_KERNEL(var_axis), pipeline_barrier, v_output.extents(),
+        kernel_for("var_axis", input.dtype()), pipeline_barrier, v_output.extents(),
         adaptive_work_group_size(v_output.extents()), VK_NULL_HANDLE,
         v_output.image(
             pipeline_barrier,
@@ -126,7 +126,7 @@ Tensor reduce_one_axis(
     api::PipelineBarrier pipeline_barrier{};
 
     context->submit_compute_job(
-        VK_KERNEL(sum_axis), pipeline_barrier, v_output.extents(),
+        kernel_for("sum_axis", input.dtype()), pipeline_barrier, v_output.extents(),
         adaptive_work_group_size(v_output.extents()), VK_NULL_HANDLE,
         v_output.image(
             pipeline_barrier,
@@ -171,8 +171,8 @@ Tensor reduce_impl(
     bool var_mode,
     int64_t correction) {
   TP_CHECK(
-      self.dtype() == DType::Float32,
-      "Vulkan reductions support Float32 tensors only");
+      self.dtype() == DType::Float32 || self.dtype() == DType::Float16,
+      "Vulkan reductions support Float32 and Float16 tensors only");
   TP_CHECK(
       self.dim() >= 1 && self.dim() <= 4,
       "Vulkan reductions support 1d to 4d tensors");

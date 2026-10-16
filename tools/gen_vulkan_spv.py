@@ -205,6 +205,7 @@ def create_shader_params(
         shader_params[key] = value
 
     shader_dtype = shader_params.get("DTYPE", "float")
+    explicit_format = "FORMAT" in variant_params
 
     if shader_dtype == "int":
         shader_params["FORMAT"] = env["INT_IMAGE_FORMAT"]
@@ -222,7 +223,8 @@ def create_shader_params(
         shader_params["FORMAT"] = "rgba32f"
     # Assume float by default
     else:
-        shader_params["FORMAT"] = env["FLOAT_IMAGE_FORMAT"]
+        if not explicit_format:
+            shader_params["FORMAT"] = env["FLOAT_IMAGE_FORMAT"]
 
     return shader_params
 

@@ -18,8 +18,8 @@ Tensor softmax_impl(
     int64_t dim,
     bool log_mode) {
   TP_CHECK(
-      input_arg.dtype() == DType::Float32,
-      "Vulkan softmax supports Float32 tensors only");
+      input_arg.dtype() == DType::Float32 || input_arg.dtype() == DType::Float16,
+      "Vulkan softmax supports Float32 and Float16 tensors only");
   TP_CHECK(
       input_arg.dim() >= 1 && input_arg.dim() <= 4,
       "Vulkan softmax supports 1d to 4d tensors");
@@ -61,9 +61,10 @@ Tensor softmax_impl(
 
   const api::ShaderInfo& shader =
       (wrapped_dim == 2)
-      ? (log_mode ? VK_KERNEL(log_softmax_channel)
-                  : VK_KERNEL(softmax_channel))
-      : (log_mode ? VK_KERNEL(log_softmax) : VK_KERNEL(softmax));
+      ? (log_mode ? kernel_for("log_softmax_channel", input_arg.dtype())
+                  : kernel_for("softmax_channel", input_arg.dtype()))
+      : (log_mode ? kernel_for("log_softmax", input_arg.dtype())
+                 : kernel_for("softmax", input_arg.dtype()));
 
   context->submit_compute_job(
       // shader descriptor

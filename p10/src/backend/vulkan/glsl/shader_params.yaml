@@ -5,113 +5,130 @@ unary_op:
     DTYPE: float
   generate_variant_forall:
     INPLACE:
-      - VALUE: false
-        SUFFIX: ""
-      - VALUE: true
-        SUFFIX: inplace
+    - VALUE: false
+      SUFFIX: ''
+    - VALUE: true
+      SUFFIX: inplace
+    FORMAT: &id001
+    - VALUE: rgba32f
+      SUFFIX: ''
+    - VALUE: rgba16f
+      SUFFIX: _f16
   shader_variants:
-    - NAME: exp
-      OPERATOR: exp(X)
-    - NAME: sqrt
-      OPERATOR: sqrt(X)
-    - NAME: log
-      OPERATOR: log(X)
-    - NAME: abs
-      OPERATOR: abs(X)
-    - NAME: abs_i32
-      DTYPE: int
-      OPERATOR: abs(X)
-    - NAME: neg
-      OPERATOR: -X
-    - NAME: neg_i32
-      DTYPE: int
-      OPERATOR: -X
-    - NAME: tanh
-      OPERATOR: tanh(X)
-    - NAME: sigmoid
-      OPERATOR: 1.0f / (1.0f + exp(-X))
-    - NAME: floor
-      OPERATOR: floor(X)
-    - NAME: sin
-      OPERATOR: sin(X)
-    - NAME: sin_i32
-      DTYPE: int
-      OPERATOR: X
-    - NAME: cos
-      OPERATOR: cos(X)
-    - NAME: cos_i32
-      DTYPE: int
-      OPERATOR: X
-    - NAME: relu
-      OPERATOR: max(X, 0.0f)
-    - NAME: relu_i32
-      DTYPE: int
-      OPERATOR: max(X, ivec4(0))
-    - NAME: rsqrt
-      OPERATOR: inversesqrt(X)
-    - NAME: sign
-      OPERATOR: sign(X)
-    - NAME: sign_i32
-      DTYPE: int
-      OPERATOR: sign(X)
-    - NAME: ceil
-      OPERATOR: ceil(X)
-    - NAME: round
-      OPERATOR: round(X)
-    - NAME: round_half_even
-      OPERATOR: roundEven(X)
-    - NAME: trunc
-      OPERATOR: trunc(X)
-    - NAME: tan
-      OPERATOR: tan(X)
-    - NAME: sinh
-      OPERATOR: sinh(X)
-    - NAME: cosh
-      OPERATOR: cosh(X)
-    - NAME: asin
-      OPERATOR: atan(X, sqrt(1.0f - X * X))
-    - NAME: acos
-      OPERATOR: atan(sqrt(1.0f - X * X), X)
-    - NAME: atan
-      OPERATOR: atan(X)
-    - NAME: exp2
-      OPERATOR: exp2(X)
-    - NAME: expm1
-      OPERATOR: exp(X) - 1.0f
-    - NAME: log1p
-      OPERATOR: log(1.0f + X)
-    - NAME: log2
-      OPERATOR: log2(X)
-    - NAME: log10
-      OPERATOR: log2(X) * 0.3010299956639812f
-    - NAME: square
-      OPERATOR: X * X
-    - NAME: reciprocal
-      OPERATOR: 1.0f / X
-    - NAME: erf
-      OPERATOR: sign(X) * (1.0f - ((((1.061405429f * (1.0f / (1.0f + 0.3275911f * abs(X))) - 1.453152027f) * (1.0f / (1.0f + 0.3275911f * abs(X))) + 1.421413741f) * (1.0f / (1.0f + 0.3275911f * abs(X))) - 0.284496736f) * (1.0f / (1.0f + 0.3275911f * abs(X))) + 0.254829592f) * (1.0f / (1.0f + 0.3275911f * abs(X))) * exp(-X * X))
-    - NAME: sqrt_i32
-      DTYPE: int
-      OPERATOR: ivec4(sqrt(vec4(X)))
-    - NAME: ceil_i32
-      DTYPE: int
-      OPERATOR: X
-    - NAME: floor_i32
-      DTYPE: int
-      OPERATOR: X
-    - NAME: trunc_i32
-      DTYPE: int
-      OPERATOR: X
-    - NAME: square_i32
-      DTYPE: int
-      OPERATOR: X * X
-    - NAME: reciprocal_i32
-      DTYPE: int
-      OPERATOR: ivec4(1.0f / vec4(X))
-    - NAME: sigmoid_i32
-      DTYPE: int
-      OPERATOR: ivec4(1.0f / (1.0f + exp(-vec4(X))))
-
+  - NAME: exp
+    OPERATOR: exp(X)
+  - NAME: sqrt
+    OPERATOR: sqrt(X)
+  - NAME: log
+    OPERATOR: log(X)
+  - NAME: abs
+    OPERATOR: abs(X)
+  - NAME: abs_i32
+    DTYPE: int
+    OPERATOR: abs(X)
+    FORMAT: rgba32i
+  - NAME: neg
+    OPERATOR: -X
+  - NAME: neg_i32
+    DTYPE: int
+    OPERATOR: -X
+    FORMAT: rgba32i
+  - NAME: tanh
+    OPERATOR: tanh(X)
+  - NAME: sigmoid
+    OPERATOR: 1.0f / (1.0f + exp(-X))
+  - NAME: floor
+    OPERATOR: floor(X)
+  - NAME: sin
+    OPERATOR: sin(X)
+  - NAME: sin_i32
+    DTYPE: int
+    OPERATOR: X
+    FORMAT: rgba32i
+  - NAME: cos
+    OPERATOR: cos(X)
+  - NAME: cos_i32
+    DTYPE: int
+    OPERATOR: X
+    FORMAT: rgba32i
+  - NAME: relu
+    OPERATOR: max(X, 0.0f)
+  - NAME: relu_i32
+    DTYPE: int
+    OPERATOR: max(X, ivec4(0))
+    FORMAT: rgba32i
+  - NAME: rsqrt
+    OPERATOR: inversesqrt(X)
+  - NAME: sign
+    OPERATOR: sign(X)
+  - NAME: sign_i32
+    DTYPE: int
+    OPERATOR: sign(X)
+    FORMAT: rgba32i
+  - NAME: ceil
+    OPERATOR: ceil(X)
+  - NAME: round
+    OPERATOR: round(X)
+  - NAME: round_half_even
+    OPERATOR: roundEven(X)
+  - NAME: trunc
+    OPERATOR: trunc(X)
+  - NAME: tan
+    OPERATOR: tan(X)
+  - NAME: sinh
+    OPERATOR: sinh(X)
+  - NAME: cosh
+    OPERATOR: cosh(X)
+  - NAME: asin
+    OPERATOR: atan(X, sqrt(1.0f - X * X))
+  - NAME: acos
+    OPERATOR: atan(sqrt(1.0f - X * X), X)
+  - NAME: atan
+    OPERATOR: atan(X)
+  - NAME: exp2
+    OPERATOR: exp2(X)
+  - NAME: expm1
+    OPERATOR: exp(X) - 1.0f
+  - NAME: log1p
+    OPERATOR: log(1.0f + X)
+  - NAME: log2
+    OPERATOR: log2(X)
+  - NAME: log10
+    OPERATOR: log2(X) * 0.3010299956639812f
+  - NAME: square
+    OPERATOR: X * X
+  - NAME: reciprocal
+    OPERATOR: 1.0f / X
+  - NAME: erf
+    OPERATOR: sign(X) * (1.0f - ((((1.061405429f * (1.0f / (1.0f + 0.3275911f * abs(X))) - 1.453152027f) * (1.0f / (1.0f + 0.3275911f * abs(X))) + 1.421413741f) * (1.0f / (1.0f + 0.3275911f * abs(X))) - 0.284496736f) * (1.0f / (1.0f + 0.3275911f * abs(X))) + 0.254829592f) * (1.0f / (1.0f + 0.3275911f * abs(X))) * exp(-X * X))
+  - NAME: sqrt_i32
+    DTYPE: int
+    OPERATOR: ivec4(sqrt(vec4(X)))
+    FORMAT: rgba32i
+  - NAME: ceil_i32
+    DTYPE: int
+    OPERATOR: X
+    FORMAT: rgba32i
+  - NAME: floor_i32
+    DTYPE: int
+    OPERATOR: X
+    FORMAT: rgba32i
+  - NAME: trunc_i32
+    DTYPE: int
+    OPERATOR: X
+    FORMAT: rgba32i
+  - NAME: square_i32
+    DTYPE: int
+    OPERATOR: X * X
+    FORMAT: rgba32i
+  - NAME: reciprocal_i32
+    DTYPE: int
+    OPERATOR: ivec4(1.0f / vec4(X))
+    FORMAT: rgba32i
+  - NAME: sigmoid_i32
+    DTYPE: int
+    OPERATOR: ivec4(1.0f / (1.0f + exp(-vec4(X))))
+    FORMAT: rgba32i
 binary_op_scalar:
   parameter_names_with_default_values:
     OPERATOR: X + Y
@@ -119,42 +136,48 @@ binary_op_scalar:
     DTYPE: float
   generate_variant_forall:
     INPLACE:
-      - VALUE: false
-        SUFFIX: ""
-      - VALUE: true
-        SUFFIX: inplace
+    - VALUE: false
+      SUFFIX: ''
+    - VALUE: true
+      SUFFIX: inplace
+    FORMAT: *id001
   shader_variants:
-    - NAME: add_scalar
-      OPERATOR: X + Y
-    - NAME: add_scalar_i32
-      DTYPE: int
-      OPERATOR: X + Y
-    - NAME: mul_scalar
-      OPERATOR: X * Y
-    - NAME: mul_scalar_i32
-      DTYPE: int
-      OPERATOR: X * Y
-    - NAME: pow_tensor_scalar
-      OPERATOR: '(fract(Y) == vec4(0.0)) ? (mod(Y, vec4(2.0)) == vec4(0.0) ? pow(abs(X), Y) : sign(X) * pow(abs(X), Y)) : pow(X, Y)'
-    - NAME: floor_mul_scalar
-      OPERATOR: floor(X * Y)
-    - NAME: floor_mul_scalar_i32
-      DTYPE: int
-      OPERATOR: ivec4(floor(vec4(X) * vec4(Y)))
-    - NAME: rsub_scalar
-      OPERATOR: Y - X
-    - NAME: rsub_scalar_i32
-      DTYPE: int
-      OPERATOR: Y - X
-    - NAME: pow_tensor_scalar_i32
-      DTYPE: int
-      OPERATOR: 'ivec4((fract(vec4(Y)) == vec4(0.0)) ? (mod(vec4(Y), vec4(2.0)) == vec4(0.0) ? pow(abs(vec4(X)), vec4(Y)) : sign(vec4(X)) * pow(abs(vec4(X)), vec4(Y))) : pow(vec4(X), vec4(Y)))'
-    - NAME: div_scalar_i32
-      DTYPE: int
-      OPERATOR: X / Y
-    - NAME: mul_scalar_recip
-      OPERATOR: X * Y
-
+  - NAME: add_scalar
+    OPERATOR: X + Y
+  - NAME: add_scalar_i32
+    DTYPE: int
+    OPERATOR: X + Y
+    FORMAT: rgba32i
+  - NAME: mul_scalar
+    OPERATOR: X * Y
+  - NAME: mul_scalar_i32
+    DTYPE: int
+    OPERATOR: X * Y
+    FORMAT: rgba32i
+  - NAME: pow_tensor_scalar
+    OPERATOR: '(fract(Y) == vec4(0.0)) ? (mod(Y, vec4(2.0)) == vec4(0.0) ? pow(abs(X), Y) : sign(X) * pow(abs(X), Y)) : pow(X, Y)'
+  - NAME: floor_mul_scalar
+    OPERATOR: floor(X * Y)
+  - NAME: floor_mul_scalar_i32
+    DTYPE: int
+    OPERATOR: ivec4(floor(vec4(X) * vec4(Y)))
+    FORMAT: rgba32i
+  - NAME: rsub_scalar
+    OPERATOR: Y - X
+  - NAME: rsub_scalar_i32
+    DTYPE: int
+    OPERATOR: Y - X
+    FORMAT: rgba32i
+  - NAME: pow_tensor_scalar_i32
+    DTYPE: int
+    OPERATOR: 'ivec4((fract(vec4(Y)) == vec4(0.0)) ? (mod(vec4(Y), vec4(2.0)) == vec4(0.0) ? pow(abs(vec4(X)), vec4(Y)) : sign(vec4(X)) * pow(abs(vec4(X)), vec4(Y))) : pow(vec4(X), vec4(Y)))'
+    FORMAT: rgba32i
+  - NAME: div_scalar_i32
+    DTYPE: int
+    OPERATOR: X / Y
+    FORMAT: rgba32i
+  - NAME: mul_scalar_recip
+    OPERATOR: X * Y
 binary_op_tensor:
   parameter_names_with_default_values:
     IS_DIV: false
@@ -163,72 +186,82 @@ binary_op_tensor:
     DTYPE: float
   generate_variant_forall:
     INPLACE:
-      - VALUE: false
-        SUFFIX: ""
-      - VALUE: true
-        SUFFIX: inplace
+    - VALUE: false
+      SUFFIX: ''
+    - VALUE: true
+      SUFFIX: inplace
+    FORMAT: *id001
   shader_variants:
-    - NAME: add
-      OPERATOR: X + A * Y
-    - NAME: add_i32
-      DTYPE: int
-      OPERATOR: X + A * Y
-    - NAME: sub
-      OPERATOR: X - A * Y
-    - NAME: sub_i32
-      DTYPE: int
-      OPERATOR: X - A * Y
-    - NAME: mul
-      OPERATOR: X * Y
-    - NAME: mul_i32
-      DTYPE: int
-      OPERATOR: X * Y
-    - NAME: div
-      IS_DIV: true
-      OPERATOR: X / Y
-    - NAME: div_i32
-      DTYPE: int
-      IS_DIV: true
-      OPERATOR: X / Y
-    - NAME: pow
-      OPERATOR: '(fract(Y) == vec4(0.0)) ? (mod(Y, vec4(2.0)) == vec4(0.0) ? pow(abs(X), Y) : sign(X) * pow(abs(X), Y)) : pow(X, Y)'
-    - NAME: floor_divide
-      IS_DIV: true
-      OPERATOR: floor(X / Y)
-    - NAME: floor_divide_i32
-      DTYPE: int
-      IS_DIV: true
-      OPERATOR: ivec4(floor(vec4(X) / vec4(Y)))
-    - NAME: sq_diff
-      OPERATOR: (X - Y) * (X - Y)
-    - NAME: maximum
-      OPERATOR: max(X, Y)
-    - NAME: maximum_i32
-      DTYPE: int
-      OPERATOR: max(X, Y)
-    - NAME: minimum
-      OPERATOR: min(X, Y)
-    - NAME: minimum_i32
-      DTYPE: int
-      OPERATOR: min(X, Y)
-    - NAME: atan2
-      OPERATOR: atan(X, Y)
-    - NAME: remainder
-      OPERATOR: X - Y * floor(X / Y)
-    - NAME: remainder_i32
-      DTYPE: int
-      OPERATOR: X - Y * (X / Y)
-    - NAME: fmod
-      OPERATOR: X - Y * trunc(X / Y)
-    - NAME: fmod_i32
-      DTYPE: int
-      OPERATOR: X - Y * (X / Y)
-    - NAME: logaddexp
-      OPERATOR: max(X, Y) + log(1.0f + exp(-abs(X - Y)))
-    - NAME: sq_diff_i32
-      DTYPE: int
-      OPERATOR: (X - Y) * (X - Y)
-
+  - NAME: add
+    OPERATOR: X + A * Y
+  - NAME: add_i32
+    DTYPE: int
+    OPERATOR: X + A * Y
+    FORMAT: rgba32i
+  - NAME: sub
+    OPERATOR: X - A * Y
+  - NAME: sub_i32
+    DTYPE: int
+    OPERATOR: X - A * Y
+    FORMAT: rgba32i
+  - NAME: mul
+    OPERATOR: X * Y
+  - NAME: mul_i32
+    DTYPE: int
+    OPERATOR: X * Y
+    FORMAT: rgba32i
+  - NAME: div
+    IS_DIV: true
+    OPERATOR: X / Y
+  - NAME: div_i32
+    DTYPE: int
+    IS_DIV: true
+    OPERATOR: X / Y
+    FORMAT: rgba32i
+  - NAME: pow
+    OPERATOR: '(fract(Y) == vec4(0.0)) ? (mod(Y, vec4(2.0)) == vec4(0.0) ? pow(abs(X), Y) : sign(X) * pow(abs(X), Y)) : pow(X, Y)'
+  - NAME: floor_divide
+    IS_DIV: true
+    OPERATOR: floor(X / Y)
+  - NAME: floor_divide_i32
+    DTYPE: int
+    IS_DIV: true
+    OPERATOR: ivec4(floor(vec4(X) / vec4(Y)))
+    FORMAT: rgba32i
+  - NAME: sq_diff
+    OPERATOR: (X - Y) * (X - Y)
+  - NAME: maximum
+    OPERATOR: max(X, Y)
+  - NAME: maximum_i32
+    DTYPE: int
+    OPERATOR: max(X, Y)
+    FORMAT: rgba32i
+  - NAME: minimum
+    OPERATOR: min(X, Y)
+  - NAME: minimum_i32
+    DTYPE: int
+    OPERATOR: min(X, Y)
+    FORMAT: rgba32i
+  - NAME: atan2
+    OPERATOR: atan(X, Y)
+  - NAME: remainder
+    OPERATOR: X - Y * floor(X / Y)
+  - NAME: remainder_i32
+    DTYPE: int
+    OPERATOR: X - Y * (X / Y)
+    FORMAT: rgba32i
+  - NAME: fmod
+    OPERATOR: X - Y * trunc(X / Y)
+  - NAME: fmod_i32
+    DTYPE: int
+    OPERATOR: X - Y * (X / Y)
+    FORMAT: rgba32i
+  - NAME: logaddexp
+    OPERATOR: max(X, Y) + log(1.0f + exp(-abs(X - Y)))
+  - NAME: sq_diff_i32
+    DTYPE: int
+    OPERATOR: (X - Y) * (X - Y)
+    FORMAT: rgba32i
 clamp:
   parameter_names_with_default_values:
     OPERATOR: clamp(X, min_val, max_val)
@@ -236,17 +269,18 @@ clamp:
     DTYPE: float
   generate_variant_forall:
     INPLACE:
-      - VALUE: false
-        SUFFIX: ""
-      - VALUE: true
-        SUFFIX: inplace
+    - VALUE: false
+      SUFFIX: ''
+    - VALUE: true
+      SUFFIX: inplace
+    FORMAT: *id001
   shader_variants:
-    - NAME: clamp
-      OPERATOR: clamp(X, min_val, max_val)
-    - NAME: clamp_i32
-      DTYPE: int
-      OPERATOR: clamp(X, min_val, max_val)
-
+  - NAME: clamp
+    OPERATOR: clamp(X, min_val, max_val)
+  - NAME: clamp_i32
+    DTYPE: int
+    OPERATOR: clamp(X, min_val, max_val)
+    FORMAT: rgba32i
 buffer_unary_op:
   parameter_names_with_default_values:
     OPERATOR: X
@@ -254,102 +288,101 @@ buffer_unary_op:
     DTYPE: float
   generate_variant_forall:
     INPLACE:
-      - VALUE: false
-        SUFFIX: ""
-      - VALUE: true
-        SUFFIX: inplace
+    - VALUE: false
+      SUFFIX: ''
+    - VALUE: true
+      SUFFIX: inplace
   shader_variants:
-    - NAME: buffer_exp
-      OPERATOR: exp(X)
-    - NAME: buffer_sqrt
-      OPERATOR: sqrt(X)
-    - NAME: buffer_log
-      OPERATOR: log(X)
-    - NAME: buffer_abs
-      OPERATOR: abs(X)
-    - NAME: buffer_abs_i32
-      DTYPE: int
-      OPERATOR: abs(X)
-    - NAME: buffer_neg
-      OPERATOR: -X
-    - NAME: buffer_neg_i32
-      DTYPE: int
-      OPERATOR: -X
-    - NAME: buffer_tanh
-      OPERATOR: tanh(X)
-    - NAME: buffer_sigmoid
-      OPERATOR: 1.0f / (1.0f + exp(-X))
-    - NAME: buffer_floor
-      OPERATOR: floor(X)
-    - NAME: buffer_sin
-      OPERATOR: sin(X)
-    - NAME: buffer_cos
-      OPERATOR: cos(X)
-    - NAME: buffer_relu
-      OPERATOR: max(X, 0.0f)
-    - NAME: buffer_relu_i32
-      DTYPE: int
-      OPERATOR: max(X, 0)
-    - NAME: buffer_rsqrt
-      OPERATOR: inversesqrt(X)
-    - NAME: buffer_sign
-      OPERATOR: sign(X)
-    - NAME: buffer_sign_i32
-      DTYPE: int
-      OPERATOR: sign(X)
-    - NAME: buffer_floor_i32
-      DTYPE: int
-      OPERATOR: X
-    - NAME: buffer_ceil
-      OPERATOR: ceil(X)
-    - NAME: buffer_ceil_i32
-      DTYPE: int
-      OPERATOR: X
-    - NAME: buffer_round
-      OPERATOR: round(X)
-    - NAME: buffer_trunc
-      OPERATOR: trunc(X)
-    - NAME: buffer_trunc_i32
-      DTYPE: int
-      OPERATOR: X
-    - NAME: buffer_tan
-      OPERATOR: tan(X)
-    - NAME: buffer_sinh
-      OPERATOR: sinh(X)
-    - NAME: buffer_cosh
-      OPERATOR: cosh(X)
-    - NAME: buffer_asin
-      OPERATOR: asin(X)
-    - NAME: buffer_acos
-      OPERATOR: acos(X)
-    - NAME: buffer_atan
-      OPERATOR: atan(X)
-    - NAME: buffer_exp2
-      OPERATOR: exp2(X)
-    - NAME: buffer_expm1
-      OPERATOR: exp(X) - 1.0f
-    - NAME: buffer_log1p
-      OPERATOR: log(1.0f + X)
-    - NAME: buffer_log2
-      OPERATOR: log2(X)
-    - NAME: buffer_log10
-      OPERATOR: log2(X) * 0.3010299956639812f
-    - NAME: buffer_square
-      OPERATOR: X * X
-    - NAME: buffer_square_i32
-      DTYPE: int
-      OPERATOR: X * X
-    - NAME: buffer_reciprocal
-      OPERATOR: 1.0f / X
-    - NAME: buffer_erf
-      OPERATOR: sign(X) * (1.0f - ((((1.061405429f * (1.0f / (1.0f + 0.3275911f * abs(X))) - 1.453152027f) * (1.0f / (1.0f + 0.3275911f * abs(X))) + 1.421413741f) * (1.0f / (1.0f + 0.3275911f * abs(X))) - 0.284496736f) * (1.0f / (1.0f + 0.3275911f * abs(X))) + 0.254829592f) * (1.0f / (1.0f + 0.3275911f * abs(X))) * exp(-X * X))
-    - NAME: buffer_reciprocal_i32
-      DTYPE: int
-      OPERATOR: int(1.0f / float(X))
-    - NAME: buffer_sigmoid_i32
-      DTYPE: int
-      OPERATOR: int(1.0f / (1.0f + exp(-float(X))))
-
+  - NAME: buffer_exp
+    OPERATOR: exp(X)
+  - NAME: buffer_sqrt
+    OPERATOR: sqrt(X)
+  - NAME: buffer_log
+    OPERATOR: log(X)
+  - NAME: buffer_abs
+    OPERATOR: abs(X)
+  - NAME: buffer_abs_i32
+    DTYPE: int
+    OPERATOR: abs(X)
+  - NAME: buffer_neg
+    OPERATOR: -X
+  - NAME: buffer_neg_i32
+    DTYPE: int
+    OPERATOR: -X
+  - NAME: buffer_tanh
+    OPERATOR: tanh(X)
+  - NAME: buffer_sigmoid
+    OPERATOR: 1.0f / (1.0f + exp(-X))
+  - NAME: buffer_floor
+    OPERATOR: floor(X)
+  - NAME: buffer_sin
+    OPERATOR: sin(X)
+  - NAME: buffer_cos
+    OPERATOR: cos(X)
+  - NAME: buffer_relu
+    OPERATOR: max(X, 0.0f)
+  - NAME: buffer_relu_i32
+    DTYPE: int
+    OPERATOR: max(X, 0)
+  - NAME: buffer_rsqrt
+    OPERATOR: inversesqrt(X)
+  - NAME: buffer_sign
+    OPERATOR: sign(X)
+  - NAME: buffer_sign_i32
+    DTYPE: int
+    OPERATOR: sign(X)
+  - NAME: buffer_floor_i32
+    DTYPE: int
+    OPERATOR: X
+  - NAME: buffer_ceil
+    OPERATOR: ceil(X)
+  - NAME: buffer_ceil_i32
+    DTYPE: int
+    OPERATOR: X
+  - NAME: buffer_round
+    OPERATOR: round(X)
+  - NAME: buffer_trunc
+    OPERATOR: trunc(X)
+  - NAME: buffer_trunc_i32
+    DTYPE: int
+    OPERATOR: X
+  - NAME: buffer_tan
+    OPERATOR: tan(X)
+  - NAME: buffer_sinh
+    OPERATOR: sinh(X)
+  - NAME: buffer_cosh
+    OPERATOR: cosh(X)
+  - NAME: buffer_asin
+    OPERATOR: asin(X)
+  - NAME: buffer_acos
+    OPERATOR: acos(X)
+  - NAME: buffer_atan
+    OPERATOR: atan(X)
+  - NAME: buffer_exp2
+    OPERATOR: exp2(X)
+  - NAME: buffer_expm1
+    OPERATOR: exp(X) - 1.0f
+  - NAME: buffer_log1p
+    OPERATOR: log(1.0f + X)
+  - NAME: buffer_log2
+    OPERATOR: log2(X)
+  - NAME: buffer_log10
+    OPERATOR: log2(X) * 0.3010299956639812f
+  - NAME: buffer_square
+    OPERATOR: X * X
+  - NAME: buffer_square_i32
+    DTYPE: int
+    OPERATOR: X * X
+  - NAME: buffer_reciprocal
+    OPERATOR: 1.0f / X
+  - NAME: buffer_erf
+    OPERATOR: sign(X) * (1.0f - ((((1.061405429f * (1.0f / (1.0f + 0.3275911f * abs(X))) - 1.453152027f) * (1.0f / (1.0f + 0.3275911f * abs(X))) + 1.421413741f) * (1.0f / (1.0f + 0.3275911f * abs(X))) - 0.284496736f) * (1.0f / (1.0f + 0.3275911f * abs(X))) + 0.254829592f) * (1.0f / (1.0f + 0.3275911f * abs(X))) * exp(-X * X))
+  - NAME: buffer_reciprocal_i32
+    DTYPE: int
+    OPERATOR: int(1.0f / float(X))
+  - NAME: buffer_sigmoid_i32
+    DTYPE: int
+    OPERATOR: int(1.0f / (1.0f + exp(-float(X))))
 buffer_binary_op_tensor:
   parameter_names_with_default_values:
     OPERATOR: X + A * Y
@@ -357,58 +390,57 @@ buffer_binary_op_tensor:
     DTYPE: float
   generate_variant_forall:
     INPLACE:
-      - VALUE: false
-        SUFFIX: ""
-      - VALUE: true
-        SUFFIX: inplace
+    - VALUE: false
+      SUFFIX: ''
+    - VALUE: true
+      SUFFIX: inplace
   shader_variants:
-    - NAME: buffer_add
-      OPERATOR: X + A * Y
-    - NAME: buffer_add_i32
-      DTYPE: int
-      OPERATOR: X + A * Y
-    - NAME: buffer_sub
-      OPERATOR: X - A * Y
-    - NAME: buffer_sub_i32
-      DTYPE: int
-      OPERATOR: X - A * Y
-    - NAME: buffer_mul
-      OPERATOR: X * Y
-    - NAME: buffer_mul_i32
-      DTYPE: int
-      OPERATOR: X * Y
-    - NAME: buffer_div
-      OPERATOR: X / Y
-    - NAME: buffer_div_i32
-      DTYPE: int
-      OPERATOR: X / Y
-    - NAME: buffer_floor_divide
-      OPERATOR: floor(X / Y)
-    - NAME: buffer_maximum
-      OPERATOR: max(X, Y)
-    - NAME: buffer_maximum_i32
-      DTYPE: int
-      OPERATOR: max(X, Y)
-    - NAME: buffer_minimum
-      OPERATOR: min(X, Y)
-    - NAME: buffer_minimum_i32
-      DTYPE: int
-      OPERATOR: min(X, Y)
-    - NAME: buffer_remainder
-      OPERATOR: X - Y * floor(X / Y)
-    - NAME: buffer_remainder_i32
-      DTYPE: int
-      OPERATOR: X - Y * (X / Y)
-    - NAME: buffer_fmod
-      OPERATOR: X - Y * trunc(X / Y)
-    - NAME: buffer_fmod_i32
-      DTYPE: int
-      OPERATOR: X - Y * (X / Y)
-    - NAME: buffer_atan2
-      OPERATOR: atan(X, Y)
-    - NAME: buffer_logaddexp
-      OPERATOR: max(X, Y) + log(1.0f + exp(-abs(X - Y)))
-
+  - NAME: buffer_add
+    OPERATOR: X + A * Y
+  - NAME: buffer_add_i32
+    DTYPE: int
+    OPERATOR: X + A * Y
+  - NAME: buffer_sub
+    OPERATOR: X - A * Y
+  - NAME: buffer_sub_i32
+    DTYPE: int
+    OPERATOR: X - A * Y
+  - NAME: buffer_mul
+    OPERATOR: X * Y
+  - NAME: buffer_mul_i32
+    DTYPE: int
+    OPERATOR: X * Y
+  - NAME: buffer_div
+    OPERATOR: X / Y
+  - NAME: buffer_div_i32
+    DTYPE: int
+    OPERATOR: X / Y
+  - NAME: buffer_floor_divide
+    OPERATOR: floor(X / Y)
+  - NAME: buffer_maximum
+    OPERATOR: max(X, Y)
+  - NAME: buffer_maximum_i32
+    DTYPE: int
+    OPERATOR: max(X, Y)
+  - NAME: buffer_minimum
+    OPERATOR: min(X, Y)
+  - NAME: buffer_minimum_i32
+    DTYPE: int
+    OPERATOR: min(X, Y)
+  - NAME: buffer_remainder
+    OPERATOR: X - Y * floor(X / Y)
+  - NAME: buffer_remainder_i32
+    DTYPE: int
+    OPERATOR: X - Y * (X / Y)
+  - NAME: buffer_fmod
+    OPERATOR: X - Y * trunc(X / Y)
+  - NAME: buffer_fmod_i32
+    DTYPE: int
+    OPERATOR: X - Y * (X / Y)
+  - NAME: buffer_atan2
+    OPERATOR: atan(X, Y)
+  - NAME: buffer_logaddexp
+    OPERATOR: max(X, Y) + log(1.0f + exp(-abs(X - Y)))
 buffer_binary_op_scalar:
   parameter_names_with_default_values:
     OPERATOR: X + A * Y
@@ -416,432 +448,478 @@ buffer_binary_op_scalar:
     DTYPE: float
   generate_variant_forall:
     INPLACE:
-      - VALUE: false
-        SUFFIX: ""
-      - VALUE: true
-        SUFFIX: inplace
+    - VALUE: false
+      SUFFIX: ''
+    - VALUE: true
+      SUFFIX: inplace
   shader_variants:
-    - NAME: buffer_add_scalar
-      OPERATOR: X + A * Y
-    - NAME: buffer_add_scalar_i32
-      DTYPE: int
-      OPERATOR: X + A * Y
-    - NAME: buffer_mul_scalar
-      OPERATOR: X * Y
-    - NAME: buffer_mul_scalar_i32
-      DTYPE: int
-      OPERATOR: X * Y
-    - NAME: buffer_floor_mul_scalar
-      OPERATOR: floor(X * Y)
-    - NAME: buffer_floor_mul_scalar_i32
-      DTYPE: int
-      OPERATOR: X * Y
-    - NAME: buffer_rsub_scalar
-      OPERATOR: Y - X
-    - NAME: buffer_rsub_scalar_i32
-      DTYPE: int
-      OPERATOR: Y - X
-    - NAME: buffer_div_scalar_i32
-      DTYPE: int
-      OPERATOR: X / Y
-
+  - NAME: buffer_add_scalar
+    OPERATOR: X + A * Y
+  - NAME: buffer_add_scalar_i32
+    DTYPE: int
+    OPERATOR: X + A * Y
+  - NAME: buffer_mul_scalar
+    OPERATOR: X * Y
+  - NAME: buffer_mul_scalar_i32
+    DTYPE: int
+    OPERATOR: X * Y
+  - NAME: buffer_floor_mul_scalar
+    OPERATOR: floor(X * Y)
+  - NAME: buffer_floor_mul_scalar_i32
+    DTYPE: int
+    OPERATOR: X * Y
+  - NAME: buffer_rsub_scalar
+    OPERATOR: Y - X
+  - NAME: buffer_rsub_scalar_i32
+    DTYPE: int
+    OPERATOR: Y - X
+  - NAME: buffer_div_scalar_i32
+    DTYPE: int
+    OPERATOR: X / Y
 mm:
   parameter_names_with_default_values: {}
+  generate_variant_forall:
+    FORMAT:
+    - VALUE: rgba32f
+      SUFFIX: ''
+    - VALUE: rgba16f
+      SUFFIX: _f16
   shader_variants:
-    - NAME: mm
-
+  - NAME: mm
 addmm:
   parameter_names_with_default_values: {}
+  generate_variant_forall:
+    FORMAT:
+    - VALUE: rgba32f
+      SUFFIX: ''
+    - VALUE: rgba16f
+      SUFFIX: _f16
   shader_variants:
-    - NAME: addmm
-
+  - NAME: addmm
 bmm:
   parameter_names_with_default_values: {}
+  generate_variant_forall:
+    FORMAT:
+    - VALUE: rgba32f
+      SUFFIX: ''
+    - VALUE: rgba16f
+      SUFFIX: _f16
   shader_variants:
-    - NAME: bmm
-
+  - NAME: bmm
 bmm_pack_lhs:
   parameter_names_with_default_values: {}
+  generate_variant_forall:
+    FORMAT:
+    - VALUE: rgba32f
+      SUFFIX: ''
+    - VALUE: rgba16f
+      SUFFIX: _f16
   shader_variants:
-    - NAME: bmm_pack_lhs
-
+  - NAME: bmm_pack_lhs
 bmm_pack_rhs:
   parameter_names_with_default_values: {}
+  generate_variant_forall:
+    FORMAT:
+    - VALUE: rgba32f
+      SUFFIX: ''
+    - VALUE: rgba16f
+      SUFFIX: _f16
   shader_variants:
-    - NAME: bmm_pack_rhs
-
+  - NAME: bmm_pack_rhs
 pack_lhs_transposed:
   parameter_names_with_default_values: {}
+  generate_variant_forall:
+    FORMAT:
+    - VALUE: rgba32f
+      SUFFIX: ''
+    - VALUE: rgba16f
+      SUFFIX: _f16
   shader_variants:
-    - NAME: pack_lhs_transposed
-
+  - NAME: pack_lhs_transposed
 pack_rhs_transposed:
   parameter_names_with_default_values: {}
+  generate_variant_forall:
+    FORMAT:
+    - VALUE: rgba32f
+      SUFFIX: ''
+    - VALUE: rgba16f
+      SUFFIX: _f16
   shader_variants:
-    - NAME: pack_rhs_transposed
-
+  - NAME: pack_rhs_transposed
 softmax_channel:
   parameter_names_with_default_values:
     LOG_SOFTMAX: false
+  generate_variant_forall:
+    FORMAT:
+    - VALUE: rgba32f
+      SUFFIX: ''
+    - VALUE: rgba16f
+      SUFFIX: _f16
   shader_variants:
-    - NAME: softmax_channel
-      LOG_SOFTMAX: false
-    - NAME: log_softmax_channel
-      LOG_SOFTMAX: true
-
+  - NAME: softmax_channel
+    LOG_SOFTMAX: false
+  - NAME: log_softmax_channel
+    LOG_SOFTMAX: true
 softmax_batch_height_width:
   parameter_names_with_default_values:
     LOG_SOFTMAX: false
+  generate_variant_forall:
+    FORMAT:
+    - VALUE: rgba32f
+      SUFFIX: ''
+    - VALUE: rgba16f
+      SUFFIX: _f16
   shader_variants:
-    - NAME: softmax
-      LOG_SOFTMAX: false
-    - NAME: log_softmax
-      LOG_SOFTMAX: true
-
+  - NAME: softmax
+    LOG_SOFTMAX: false
+  - NAME: log_softmax
+    LOG_SOFTMAX: true
 sum_axis:
   parameter_names_with_default_values: {}
+  generate_variant_forall:
+    FORMAT:
+    - VALUE: rgba32f
+      SUFFIX: ''
+    - VALUE: rgba16f
+      SUFFIX: _f16
   shader_variants:
-    - NAME: sum_axis
-
+  - NAME: sum_axis
 var_axis:
   parameter_names_with_default_values: {}
+  generate_variant_forall:
+    FORMAT:
+    - VALUE: rgba32f
+      SUFFIX: ''
+    - VALUE: rgba16f
+      SUFFIX: _f16
   shader_variants:
-    - NAME: var_axis
-
+  - NAME: var_axis
 layer_norm:
   parameter_names_with_default_values:
     WEIGHT_MODE: 0
     BIAS_MODE: 0
   generate_variant_forall:
     WEIGHT_MODE:
-      - VALUE: 0
-        SUFFIX: ""
-      - VALUE: 1
-        SUFFIX: w
-      - VALUE: 2
-        SUFFIX: w2
-      - VALUE: 3
-        SUFFIX: w1
+    - VALUE: 0
+      SUFFIX: ''
+    - VALUE: 1
+      SUFFIX: w
+    - VALUE: 2
+      SUFFIX: w2
+    - VALUE: 3
+      SUFFIX: w1
     BIAS_MODE:
-      - VALUE: 0
-        SUFFIX: ""
-      - VALUE: 1
-        SUFFIX: b
-      - VALUE: 2
-        SUFFIX: b2
-      - VALUE: 3
-        SUFFIX: b1
+    - VALUE: 0
+      SUFFIX: ''
+    - VALUE: 1
+      SUFFIX: b
+    - VALUE: 2
+      SUFFIX: b2
+    - VALUE: 3
+      SUFFIX: b1
   shader_variants:
-    - NAME: layer_norm
-
+  - NAME: layer_norm
 batchnorm:
   parameter_names_with_default_values:
     HAS_WEIGHT: true
     HAS_BIAS: true
   shader_variants:
-    - NAME: batchnorm
-      HAS_WEIGHT: true
-      HAS_BIAS: true
-    - NAME: batchnorm_w
-      HAS_WEIGHT: true
-      HAS_BIAS: false
-    - NAME: batchnorm_b
-      HAS_WEIGHT: false
-      HAS_BIAS: true
-    - NAME: batchnorm_nowb
-      HAS_WEIGHT: false
-      HAS_BIAS: false
-
+  - NAME: batchnorm
+    HAS_WEIGHT: true
+    HAS_BIAS: true
+  - NAME: batchnorm_w
+    HAS_WEIGHT: true
+    HAS_BIAS: false
+  - NAME: batchnorm_b
+    HAS_WEIGHT: false
+    HAS_BIAS: true
+  - NAME: batchnorm_nowb
+    HAS_WEIGHT: false
+    HAS_BIAS: false
 pool2d:
   parameter_names_with_default_values:
     MAX_POOLING: false
   shader_variants:
-    - NAME: avg_pool2d
-      MAX_POOLING: false
-    - NAME: max_pool2d
-      MAX_POOLING: true
-
+  - NAME: avg_pool2d
+    MAX_POOLING: false
+  - NAME: max_pool2d
+    MAX_POOLING: true
 max_pool2d_backward:
   parameter_names_with_default_values: {}
   shader_variants:
-    - NAME: max_pool2d_backward
-
+  - NAME: max_pool2d_backward
 avg_pool2d_backward:
   parameter_names_with_default_values: {}
   shader_variants:
-    - NAME: avg_pool2d_backward
-
+  - NAME: avg_pool2d_backward
 adaptive_avg_pool2d:
   parameter_names_with_default_values: {}
   shader_variants:
-    - NAME: adaptive_avg_pool2d
-
+  - NAME: adaptive_avg_pool2d
 upsample_nearest2d:
   parameter_names_with_default_values: {}
   shader_variants:
-    - NAME: upsample_nearest2d
-
+  - NAME: upsample_nearest2d
 upsample_bilinear2d:
   parameter_names_with_default_values:
     ALIGN_CORNERS: true
   shader_variants:
-    - NAME: upsample_bilinear2d
-      ALIGN_CORNERS: true
-    - NAME: upsample_bilinear2d_half
-      ALIGN_CORNERS: false
-
+  - NAME: upsample_bilinear2d
+    ALIGN_CORNERS: true
+  - NAME: upsample_bilinear2d_half
+    ALIGN_CORNERS: false
 cumsum:
   parameter_names_with_default_values: {}
   shader_variants:
-    - NAME: cumsum
-
+  - NAME: cumsum
 masked_fill:
   parameter_names_with_default_values:
     VALUE_FROM_TENSOR: false
   shader_variants:
-    - NAME: masked_fill_scalar
-      VALUE_FROM_TENSOR: false
-    - NAME: masked_fill_tensor
-      VALUE_FROM_TENSOR: true
-
+  - NAME: masked_fill_scalar
+    VALUE_FROM_TENSOR: false
+  - NAME: masked_fill_tensor
+    VALUE_FROM_TENSOR: true
 glu:
   parameter_names_with_default_values: {}
   shader_variants:
-    - NAME: glu
-
+  - NAME: glu
 compare:
   parameter_names_with_default_values:
     DTYPE: float
     OPERATOR: lessThan(X, Y)
   generate_variant_forall:
     DTYPE:
-      - VALUE: float
-        SUFFIX: ""
-      - VALUE: int
-        SUFFIX: _i32
-      - VALUE: int8
-        SUFFIX: _i8
-      - VALUE: uint8
-        SUFFIX: _u8
+    - VALUE: float
+      SUFFIX: ''
+    - VALUE: int
+      SUFFIX: _i32
+    - VALUE: int8
+      SUFFIX: _i8
+    - VALUE: uint8
+      SUFFIX: _u8
   shader_variants:
-    - NAME: eq
-      OPERATOR: equal(X, Y)
-    - NAME: ne
-      OPERATOR: notEqual(X, Y)
-    - NAME: lt
-      OPERATOR: lessThan(X, Y)
-    - NAME: le
-      OPERATOR: lessThanEqual(X, Y)
-    - NAME: gt
-      OPERATOR: greaterThan(X, Y)
-    - NAME: ge
-      OPERATOR: greaterThanEqual(X, Y)
-
+  - NAME: eq
+    OPERATOR: equal(X, Y)
+  - NAME: ne
+    OPERATOR: notEqual(X, Y)
+  - NAME: lt
+    OPERATOR: lessThan(X, Y)
+  - NAME: le
+    OPERATOR: lessThanEqual(X, Y)
+  - NAME: gt
+    OPERATOR: greaterThan(X, Y)
+  - NAME: ge
+    OPERATOR: greaterThanEqual(X, Y)
 compare_scalar:
   parameter_names_with_default_values:
     DTYPE: float
     OPERATOR: lessThan(X, Y)
   generate_variant_forall:
     DTYPE:
-      - VALUE: float
-        SUFFIX: ""
-      - VALUE: int
-        SUFFIX: _i32
-      - VALUE: uint8
-        SUFFIX: _u8
+    - VALUE: float
+      SUFFIX: ''
+    - VALUE: int
+      SUFFIX: _i32
+    - VALUE: uint8
+      SUFFIX: _u8
   shader_variants:
-    - NAME: eq_scalar
-      OPERATOR: equal(X, Y)
-    - NAME: ne_scalar
-      OPERATOR: notEqual(X, Y)
-    - NAME: lt_scalar
-      OPERATOR: lessThan(X, Y)
-    - NAME: le_scalar
-      OPERATOR: lessThanEqual(X, Y)
-    - NAME: gt_scalar
-      OPERATOR: greaterThan(X, Y)
-    - NAME: ge_scalar
-      OPERATOR: greaterThanEqual(X, Y)
-
+  - NAME: eq_scalar
+    OPERATOR: equal(X, Y)
+  - NAME: ne_scalar
+    OPERATOR: notEqual(X, Y)
+  - NAME: lt_scalar
+    OPERATOR: lessThan(X, Y)
+  - NAME: le_scalar
+    OPERATOR: lessThanEqual(X, Y)
+  - NAME: gt_scalar
+    OPERATOR: greaterThan(X, Y)
+  - NAME: ge_scalar
+    OPERATOR: greaterThanEqual(X, Y)
 where:
   parameter_names_with_default_values:
     DTYPE: float
   shader_variants:
-    - NAME: where
-    - NAME: where_i32
-      DTYPE: int
-
+  - NAME: where
+  - NAME: where_i32
+    DTYPE: int
 embedding:
   parameter_names_with_default_values: {}
   shader_variants:
-    - NAME: embedding
-
+  - NAME: embedding
 index_select:
   parameter_names_with_default_values: {}
   shader_variants:
-    - NAME: index_select
-
+  - NAME: index_select
 conv2d:
   parameter_names_with_default_values:
     HAS_BIAS: true
   shader_variants:
-    - NAME: conv2d
-      HAS_BIAS: true
-    - NAME: conv2d_nobias
-      HAS_BIAS: false
-
+  - NAME: conv2d
+    HAS_BIAS: true
+  - NAME: conv2d_nobias
+    HAS_BIAS: false
 conv2d_dw:
   parameter_names_with_default_values:
     HAS_BIAS: true
     OUTPUT_TILE: 1
   generate_variant_forall:
     OUTPUT_TILE:
-      - VALUE: 1
-        SUFFIX: ""
-      - VALUE: 2
-        SUFFIX: _ot2
-      - VALUE: 3
-        SUFFIX: _ot3
+    - VALUE: 1
+      SUFFIX: ''
+    - VALUE: 2
+      SUFFIX: _ot2
+    - VALUE: 3
+      SUFFIX: _ot3
   shader_variants:
-    - NAME: conv2d_dw
-      HAS_BIAS: true
-    - NAME: conv2d_dw_nobias
-      HAS_BIAS: false
+  - NAME: conv2d_dw
+    HAS_BIAS: true
+  - NAME: conv2d_dw_nobias
+    HAS_BIAS: false
   output_tile_sizes:
-    conv2d_dw: [1, 1, 1]
-    conv2d_dw_ot2: [2, 2, 1]
-    conv2d_dw_ot3: [3, 3, 1]
-    conv2d_dw_nobias: [1, 1, 1]
-    conv2d_dw_nobias_ot2: [2, 2, 1]
-    conv2d_dw_nobias_ot3: [3, 3, 1]
-
+    conv2d_dw:
+    - 1
+    - 1
+    - 1
+    conv2d_dw_ot2:
+    - 2
+    - 2
+    - 1
+    conv2d_dw_ot3:
+    - 3
+    - 3
+    - 1
+    conv2d_dw_nobias:
+    - 1
+    - 1
+    - 1
+    conv2d_dw_nobias_ot2:
+    - 2
+    - 2
+    - 1
+    conv2d_dw_nobias_ot3:
+    - 3
+    - 3
+    - 1
 conv2d_pw:
   parameter_names_with_default_values:
     HAS_BIAS: true
   shader_variants:
-    - NAME: conv2d_pw
-      HAS_BIAS: true
-    - NAME: conv2d_pw_nobias
-      HAS_BIAS: false
+  - NAME: conv2d_pw
+    HAS_BIAS: true
+  - NAME: conv2d_pw_nobias
+    HAS_BIAS: false
   output_tile_sizes:
-    conv2d_pw: [2, 2, 1]
-    conv2d_pw_nobias: [2, 2, 1]
-
+    conv2d_pw:
+    - 2
+    - 2
+    - 1
+    conv2d_pw_nobias:
+    - 2
+    - 2
+    - 1
 conv1d:
   parameter_names_with_default_values:
     HAS_BIAS: true
   shader_variants:
-    - NAME: conv1d
-      HAS_BIAS: true
-    - NAME: conv1d_nobias
-      HAS_BIAS: false
-
+  - NAME: conv1d
+    HAS_BIAS: true
+  - NAME: conv1d_nobias
+    HAS_BIAS: false
 conv_transpose2d:
   parameter_names_with_default_values:
     HAS_BIAS: true
   shader_variants:
-    - NAME: conv_transpose2d
-      HAS_BIAS: true
-    - NAME: conv_transpose2d_nobias
-      HAS_BIAS: false
-
+  - NAME: conv_transpose2d
+    HAS_BIAS: true
+  - NAME: conv_transpose2d_nobias
+    HAS_BIAS: false
 pack_weight_depthwise:
   parameter_names_with_default_values: {}
   shader_variants:
-    - NAME: pack_weight_depthwise
-
+  - NAME: pack_weight_depthwise
 pack_weight_pointwise:
   parameter_names_with_default_values: {}
   shader_variants:
-    - NAME: pack_weight_pointwise
-
+  - NAME: pack_weight_pointwise
 pack_weight_sliding_window:
   parameter_names_with_default_values: {}
   shader_variants:
-    - NAME: pack_weight_sliding_window
-
+  - NAME: pack_weight_sliding_window
 pack_weight_transpose2d:
   parameter_names_with_default_values: {}
   shader_variants:
-    - NAME: pack_weight_transpose2d
-
-pack_weight_transpose2d:
-  parameter_names_with_default_values: {}
-  shader_variants:
-    - NAME: pack_weight_transpose2d
-
-pack_weight_transpose2d:
-  parameter_names_with_default_values: {}
-  shader_variants:
-    - NAME: pack_weight_transpose2d
-
+  - NAME: pack_weight_transpose2d
 flip:
   parameter_names_with_default_values: {}
   shader_variants:
-    - NAME: flip
-
+  - NAME: flip
 cat_channel:
   parameter_names_with_default_values: {}
   shader_variants:
-    - NAME: cat_channel
-
+  - NAME: cat_channel
 cat:
   parameter_names_with_default_values: {}
   shader_variants:
-    - NAME: cat
-
+  - NAME: cat
 pad2d:
   parameter_names_with_default_values:
     REPLICATE: false
   shader_variants:
-    - NAME: reflection_pad2d
-      REPLICATE: false
-    - NAME: replication_pad2d
-      REPLICATE: true
-
+  - NAME: reflection_pad2d
+    REPLICATE: false
+  - NAME: replication_pad2d
+    REPLICATE: true
 permute:
   parameter_names_with_default_values: {}
   shader_variants:
-    - NAME: permute
-
+  - NAME: permute
 slice:
   parameter_names_with_default_values: {}
+  generate_variant_forall:
+    FORMAT:
+    - VALUE: rgba32f
+      SUFFIX: ''
+    - VALUE: rgba16f
+      SUFFIX: _f16
   shader_variants:
-    - NAME: slice
-
+  - NAME: slice
 view_gather:
   parameter_names_with_default_values: {}
+  generate_variant_forall:
+    FORMAT:
+    - VALUE: rgba32f
+      SUFFIX: ''
+    - VALUE: rgba16f
+      SUFFIX: _f16
   shader_variants:
-    - NAME: view_gather
-
+  - NAME: view_gather
 view_gather_int8:
   parameter_names_with_default_values: {}
   shader_variants:
-    - NAME: view_gather_int8
-
+  - NAME: view_gather_int8
 lerp:
   parameter_names_with_default_values:
     TENSOR_WEIGHT: false
     INPLACE: false
     BLOCK_BINDING: 5
   shader_variants:
-    - NAME: lerp
-      TENSOR_WEIGHT: false
-      INPLACE: false
-      BLOCK_BINDING: 3
-    - NAME: lerp_tensor
-      TENSOR_WEIGHT: true
-      INPLACE: false
-      BLOCK_BINDING: 4
-    - NAME: lerpinplace
-      TENSOR_WEIGHT: false
-      INPLACE: true
-      BLOCK_BINDING: 2
-    - NAME: lerp_tensorinplace
-      TENSOR_WEIGHT: true
-      INPLACE: true
-      BLOCK_BINDING: 3
-
+  - NAME: lerp
+    TENSOR_WEIGHT: false
+    INPLACE: false
+    BLOCK_BINDING: 3
+  - NAME: lerp_tensor
+    TENSOR_WEIGHT: true
+    INPLACE: false
+    BLOCK_BINDING: 4
+  - NAME: lerpinplace
+    TENSOR_WEIGHT: false
+    INPLACE: true
+    BLOCK_BINDING: 2
+  - NAME: lerp_tensorinplace
+    TENSOR_WEIGHT: true
+    INPLACE: true
+    BLOCK_BINDING: 3
 activation:
   parameter_names_with_default_values:
     OPERATOR: X
@@ -849,28 +927,27 @@ activation:
     DTYPE: float
   generate_variant_forall:
     INPLACE:
-      - VALUE: false
-        SUFFIX: ""
-      - VALUE: true
-        SUFFIX: inplace
+    - VALUE: false
+      SUFFIX: ''
+    - VALUE: true
+      SUFFIX: inplace
   shader_variants:
-    - NAME: silu
-      OPERATOR: "X / (1.0f + exp(-X))"
-    - NAME: mish
-      OPERATOR: "X * tanh(log1p_approx(exp(X)))"
-    - NAME: relu6
-      OPERATOR: "clamp(X, 0.0f, 6.0f)"
-    - NAME: relu6_i32
-      DTYPE: int
-      OPERATOR: "clamp(X, ivec4(0), ivec4(6))"
-    - NAME: hardsigmoid
-      OPERATOR: "clamp(X + 3.0f, 0.0f, 6.0f) / 6.0f"
-    - NAME: hardswish
-      OPERATOR: "X * clamp(X + 3.0f, 0.0f, 6.0f) / 6.0f"
-    - NAME: hardswish_i32
-      DTYPE: int
-      OPERATOR: "ivec4(hardswish_approx(vec4(X)))"
-
+  - NAME: silu
+    OPERATOR: X / (1.0f + exp(-X))
+  - NAME: mish
+    OPERATOR: X * tanh(log1p_approx(exp(X)))
+  - NAME: relu6
+    OPERATOR: clamp(X, 0.0f, 6.0f)
+  - NAME: relu6_i32
+    DTYPE: int
+    OPERATOR: clamp(X, ivec4(0), ivec4(6))
+  - NAME: hardsigmoid
+    OPERATOR: clamp(X + 3.0f, 0.0f, 6.0f) / 6.0f
+  - NAME: hardswish
+    OPERATOR: X * clamp(X + 3.0f, 0.0f, 6.0f) / 6.0f
+  - NAME: hardswish_i32
+    DTYPE: int
+    OPERATOR: ivec4(hardswish_approx(vec4(X)))
 activation_param:
   parameter_names_with_default_values:
     OPERATOR: X
@@ -878,94 +955,88 @@ activation_param:
     DTYPE: float
   generate_variant_forall:
     INPLACE:
-      - VALUE: false
-        SUFFIX: ""
-      - VALUE: true
-        SUFFIX: inplace
+    - VALUE: false
+      SUFFIX: ''
+    - VALUE: true
+      SUFFIX: inplace
   shader_variants:
-    - NAME: leaky_relu
-      OPERATOR: "mix((X * P0), X, step(0.0f, X))"
-    - NAME: leaky_relu_i32
-      DTYPE: int
-      OPERATOR: "max(X * P0, X)"
-    - NAME: threshold
-      OPERATOR: "mix(X, P1, lessThanEqual(X, P0))"
-    - NAME: threshold_i32
-      DTYPE: int
-      OPERATOR: "mix(X, P1, lessThanEqual(X, P0))"
-    - NAME: hardshrink
-      OPERATOR: "mix(X, vec4(0.0f), lessThanEqual(abs(X), P0))"
-    - NAME: hardshrink_i32
-      DTYPE: int
-      OPERATOR: "mix(X, ivec4(0), lessThanEqual(abs(X), P0))"
-
+  - NAME: leaky_relu
+    OPERATOR: mix((X * P0), X, step(0.0f, X))
+  - NAME: leaky_relu_i32
+    DTYPE: int
+    OPERATOR: max(X * P0, X)
+  - NAME: threshold
+    OPERATOR: mix(X, P1, lessThanEqual(X, P0))
+  - NAME: threshold_i32
+    DTYPE: int
+    OPERATOR: mix(X, P1, lessThanEqual(X, P0))
+  - NAME: hardshrink
+    OPERATOR: mix(X, vec4(0.0f), lessThanEqual(abs(X), P0))
+  - NAME: hardshrink_i32
+    DTYPE: int
+    OPERATOR: mix(X, ivec4(0), lessThanEqual(abs(X), P0))
 gelu:
   parameter_names_with_default_values:
     GELU_TANH: false
   shader_variants:
-    - NAME: gelu
-      GELU_TANH: false
-    - NAME: gelu_tanh
-      GELU_TANH: true
-
+  - NAME: gelu
+    GELU_TANH: false
+  - NAME: gelu_tanh
+    GELU_TANH: true
 buffer_activation:
   parameter_names_with_default_values:
     OPERATOR: X
     INPLACE: false
   generate_variant_forall:
     INPLACE:
-      - VALUE: false
-        SUFFIX: ""
-      - VALUE: true
-        SUFFIX: inplace
+    - VALUE: false
+      SUFFIX: ''
+    - VALUE: true
+      SUFFIX: inplace
   shader_variants:
-    - NAME: buffer_silu
-      OPERATOR: "X / (1.0f + exp(-X))"
-    - NAME: buffer_mish
-      OPERATOR: "X * tanh(log1p_approx(exp(X)))"
-    - NAME: buffer_relu6
-      OPERATOR: "clamp(X, 0.0f, 6.0f)"
-    - NAME: buffer_hardsigmoid
-      OPERATOR: "clamp(X + 3.0f, 0.0f, 6.0f) / 6.0f"
-    - NAME: buffer_hardswish
-      OPERATOR: "X * clamp(X + 3.0f, 0.0f, 6.0f) / 6.0f"
-
+  - NAME: buffer_silu
+    OPERATOR: X / (1.0f + exp(-X))
+  - NAME: buffer_mish
+    OPERATOR: X * tanh(log1p_approx(exp(X)))
+  - NAME: buffer_relu6
+    OPERATOR: clamp(X, 0.0f, 6.0f)
+  - NAME: buffer_hardsigmoid
+    OPERATOR: clamp(X + 3.0f, 0.0f, 6.0f) / 6.0f
+  - NAME: buffer_hardswish
+    OPERATOR: X * clamp(X + 3.0f, 0.0f, 6.0f) / 6.0f
 buffer_activation_param:
   parameter_names_with_default_values:
     OPERATOR: X
     INPLACE: false
   generate_variant_forall:
     INPLACE:
-      - VALUE: false
-        SUFFIX: ""
-      - VALUE: true
-        SUFFIX: inplace
+    - VALUE: false
+      SUFFIX: ''
+    - VALUE: true
+      SUFFIX: inplace
   shader_variants:
-    - NAME: buffer_leaky_relu
-      OPERATOR: "mix((X * P0), X, step(0.0f, X))"
-    - NAME: buffer_threshold
-      OPERATOR: "(X <= P0) ? P1 : X"
-    - NAME: buffer_hardshrink
-      OPERATOR: "((X >= -P0) && (X <= P0)) ? 0.0f : X"
-
+  - NAME: buffer_leaky_relu
+    OPERATOR: mix((X * P0), X, step(0.0f, X))
+  - NAME: buffer_threshold
+    OPERATOR: '(X <= P0) ? P1 : X'
+  - NAME: buffer_hardshrink
+    OPERATOR: '((X >= -P0) && (X <= P0)) ? 0.0f : X'
 buffer_gelu:
   parameter_names_with_default_values:
     GELU_TANH: false
   shader_variants:
-    - NAME: buffer_gelu
-      GELU_TANH: false
-    - NAME: buffer_gelu_tanh
-      GELU_TANH: true
-
+  - NAME: buffer_gelu
+    GELU_TANH: false
+  - NAME: buffer_gelu_tanh
+    GELU_TANH: true
 quantize_per_tensor:
   parameter_names_with_default_values: {}
   shader_variants:
-    - NAME: quantize_per_tensor
+  - NAME: quantize_per_tensor
 dequantize_per_tensor:
   parameter_names_with_default_values: {}
   shader_variants:
-    - NAME: dequantize_per_tensor
-
+  - NAME: dequantize_per_tensor
 reduce_extremum:
   parameter_names_with_default_values:
     OPERATOR: max(X, Y)
@@ -974,40 +1045,38 @@ reduce_extremum:
     FORMAT: rgba32f
   generate_variant_forall:
     FORMAT:
-      - VALUE: rgba32f
-        SUFFIX: ""
-      - VALUE: rgba16f
-        SUFFIX: _f16
+    - VALUE: rgba32f
+      SUFFIX: ''
+    - VALUE: rgba16f
+      SUFFIX: _f16
   shader_variants:
-    - NAME: reduce_max
-      OPERATOR: max(X, Y)
-      COLLAPSE: max(max(V.x, V.y), max(V.z, V.w))
-      NEUTRAL: -3.402823466e38
-    - NAME: reduce_min
-      OPERATOR: min(X, Y)
-      COLLAPSE: min(min(V.x, V.y), min(V.z, V.w))
-      NEUTRAL: 3.402823466e38
-    - NAME: reduce_prod
-      OPERATOR: X * Y
-      COLLAPSE: V.x * V.y * V.z * V.w
-      NEUTRAL: 1.0
-
+  - NAME: reduce_max
+    OPERATOR: max(X, Y)
+    COLLAPSE: max(max(V.x, V.y), max(V.z, V.w))
+    NEUTRAL: -3.402823466e38
+  - NAME: reduce_min
+    OPERATOR: min(X, Y)
+    COLLAPSE: min(min(V.x, V.y), min(V.z, V.w))
+    NEUTRAL: 3.402823466e38
+  - NAME: reduce_prod
+    OPERATOR: X * Y
+    COLLAPSE: V.x * V.y * V.z * V.w
+    NEUTRAL: 1.0
 reduce_argextremum:
   parameter_names_with_default_values:
     GREATER: 1
     FORMAT: rgba32f
   generate_variant_forall:
     FORMAT:
-      - VALUE: rgba32f
-        SUFFIX: ""
-      - VALUE: rgba16f
-        SUFFIX: _f16
+    - VALUE: rgba32f
+      SUFFIX: ''
+    - VALUE: rgba16f
+      SUFFIX: _f16
   shader_variants:
-    - NAME: reduce_argmax
-      GREATER: 1
-    - NAME: reduce_argmin
-      GREATER: 0
-
+  - NAME: reduce_argmax
+    GREATER: 1
+  - NAME: reduce_argmin
+    GREATER: 0
 reduce_bool:
   parameter_names_with_default_values:
     DTYPE: int8
@@ -1015,139 +1084,150 @@ reduce_bool:
     COLLAPSE: min(min(V.x, V.y), min(V.z, V.w))
     NEUTRAL: 1
   shader_variants:
-    - NAME: reduce_all
-      OPERATOR: min(X, Y)
-      COLLAPSE: min(min(V.x, V.y), min(V.z, V.w))
-      NEUTRAL: 1
-    - NAME: reduce_any
-      OPERATOR: max(X, Y)
-      COLLAPSE: max(max(V.x, V.y), max(V.z, V.w))
-      NEUTRAL: 0
-
+  - NAME: reduce_all
+    OPERATOR: min(X, Y)
+    COLLAPSE: min(min(V.x, V.y), min(V.z, V.w))
+    NEUTRAL: 1
+  - NAME: reduce_any
+    OPERATOR: max(X, Y)
+    COLLAPSE: max(max(V.x, V.y), max(V.z, V.w))
+    NEUTRAL: 0
 quantized_binary_op:
   parameter_names_with_default_values:
     OPERATOR: X + Y
   shader_variants:
-    - NAME: quantized_add
-      OPERATOR: X + Y
-    - NAME: quantized_sub
-      OPERATOR: X - Y
-    - NAME: quantized_mul
-      OPERATOR: X * Y
-    - NAME: quantized_div
-      OPERATOR: X / Y
-
+  - NAME: quantized_add
+    OPERATOR: X + Y
+  - NAME: quantized_sub
+    OPERATOR: X - Y
+  - NAME: quantized_mul
+    OPERATOR: X * Y
+  - NAME: quantized_div
+    OPERATOR: X / Y
 quantized_clamp:
   parameter_names_with_default_values: {}
   shader_variants:
-    - NAME: quantized_clamp
-
+  - NAME: quantized_clamp
 quantized_max_pool2d:
   parameter_names_with_default_values: {}
   shader_variants:
-    - NAME: quantized_max_pool2d
-
+  - NAME: quantized_max_pool2d
 quantized_linear:
   parameter_names_with_default_values: {}
   shader_variants:
-    - NAME: quantized_linear
-
+  - NAME: quantized_linear
 quantized_conv2d:
   parameter_names_with_default_values:
     HAS_BIAS: true
   shader_variants:
-    - NAME: quantized_conv2d
-      HAS_BIAS: true
-    - NAME: quantized_conv2d_nobias
-      HAS_BIAS: false
-
+  - NAME: quantized_conv2d
+    HAS_BIAS: true
+  - NAME: quantized_conv2d_nobias
+    HAS_BIAS: false
 quantize_per_tensor_quint8:
   parameter_names_with_default_values: {}
   shader_variants:
-    - NAME: quantize_per_tensor_quint8
-
+  - NAME: quantize_per_tensor_quint8
 quantized_conv2d_sw:
   parameter_names_with_default_values: {}
   shader_variants:
-    - NAME: quantized_conv2d_sw
-
+  - NAME: quantized_conv2d_sw
 quantized_conv2d_dw:
   parameter_names_with_default_values: {}
   shader_variants:
-    - NAME: quantized_conv2d_dw
-
+  - NAME: quantized_conv2d_dw
 quantized_conv2d_pw_2x2:
   parameter_names_with_default_values: {}
   shader_variants:
-    - NAME: quantized_conv2d_pw_2x2
-
+  - NAME: quantized_conv2d_pw_2x2
 quantized_conv_transpose2d:
   parameter_names_with_default_values: {}
   shader_variants:
-    - NAME: quantized_conv_transpose2d
-
+  - NAME: quantized_conv_transpose2d
 dequantize_per_tensor_quint8:
   parameter_names_with_default_values: {}
   shader_variants:
-    - NAME: dequantize_per_tensor_quint8
-
+  - NAME: dequantize_per_tensor_quint8
 quantize_per_tensor_qint32:
   parameter_names_with_default_values: {}
   shader_variants:
-    - NAME: quantize_per_tensor_qint32
-
+  - NAME: quantize_per_tensor_qint32
 dequantize_per_tensor_qint32:
   parameter_names_with_default_values: {}
   shader_variants:
-    - NAME: dequantize_per_tensor_qint32
-
+  - NAME: dequantize_per_tensor_qint32
 random_fill:
   parameter_names_with_default_values:
     DIST: 0
   shader_variants:
-    - NAME: uniform_fill
-      DIST: 0
-    - NAME: normal_fill
-      DIST: 1
-    - NAME: bernoulli_fill
-      DIST: 2
-
+  - NAME: uniform_fill
+    DIST: 0
+  - NAME: normal_fill
+    DIST: 1
+  - NAME: bernoulli_fill
+    DIST: 2
 bernoulli_tensor_fill:
   parameter_names_with_default_values: {}
   shader_variants:
-    - NAME: bernoulli_tensor_fill
-
+  - NAME: bernoulli_tensor_fill
 hardshrink_mask:
   parameter_names_with_default_values: {}
   shader_variants:
-    - NAME: hardshrink_mask
-
+  - NAME: hardshrink_mask
 one_minus:
   parameter_names_with_default_values:
     OPERATOR: 1.0f - X
   shader_variants:
-    - NAME: one_minus
-      OPERATOR: "1.0f - X"
-
+  - NAME: one_minus
+    OPERATOR: 1.0f - X
 reduce_int64:
   parameter_names_with_default_values:
     DTYPE: int
     PRODUCT: false
   shader_variants:
-    - NAME: prod_int64
-      PRODUCT: true
-    - NAME: count_int64_i32
-    - NAME: count_int64_float
-      DTYPE: float
-
+  - NAME: prod_int64
+    PRODUCT: true
+  - NAME: count_int64_i32
+  - NAME: count_int64_float
+    DTYPE: float
 eye:
   parameter_names_with_default_values:
     FORMAT: rgba32f
     DTYPE: float
   shader_variants:
-    - NAME: eye
-    - NAME: eye_f16
-      FORMAT: rgba16f
-    - NAME: eye_i32
-      FORMAT: rgba32i
-      DTYPE: int
+  - NAME: eye
+  - NAME: eye_f16
+    FORMAT: rgba16f
+  - NAME: eye_i32
+    FORMAT: rgba32i
+    DTYPE: int
+convert_channels_to_width_packed:
+  parameter_names_with_default_values: {}
+  generate_variant_forall:
+    FORMAT:
+    - VALUE: rgba32f
+      SUFFIX: ''
+    - VALUE: rgba16f
+      SUFFIX: _f16
+  shader_variants:
+  - NAME: convert_channels_to_width_packed
+convert_channels_to_height_packed:
+  parameter_names_with_default_values: {}
+  generate_variant_forall:
+    FORMAT:
+    - VALUE: rgba32f
+      SUFFIX: ''
+    - VALUE: rgba16f
+      SUFFIX: _f16
+  shader_variants:
+  - NAME: convert_channels_to_height_packed
+rotary_embedding:
+  parameter_names_with_default_values: {}
+  generate_variant_forall:
+    FORMAT:
+    - VALUE: rgba32f
+      SUFFIX: ''
+    - VALUE: rgba16f
+      SUFFIX: _f16
+  shader_variants:
+  - NAME: rotary_embedding

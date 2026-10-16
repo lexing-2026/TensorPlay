@@ -163,7 +163,7 @@ Tensor binary_op_tensor(
 
   context->submit_compute_job(
       // shader descriptor
-      VK_KERNEL_FROM_STR(variant.c_str()),
+      api::get_shader_info_for_dtype(variant.c_str(), v_output.dtype()),
       // pipeline barrier
       pipeline_barrier,
       // global work group size
@@ -249,7 +249,7 @@ Tensor& binary_op_tensor_inplace(
 
   context->submit_compute_job(
       // shader descriptor
-      VK_KERNEL_FROM_STR(variant.c_str()),
+      api::get_shader_info_for_dtype(variant.c_str(), v_self.dtype()),
       // pipeline barrier
       pipeline_barrier,
       // global work group size
@@ -357,7 +357,7 @@ Tensor binary_op_scalar(
 
   context->submit_compute_job(
       // shader descriptor
-      VK_KERNEL_FROM_STR(variant.c_str()),
+      api::get_shader_info_for_dtype(variant.c_str(), v_output.dtype()),
       // pipeline barrier
       pipeline_barrier,
       // global work group size
@@ -449,7 +449,7 @@ Tensor& binary_op_scalar_inplace(
 
   context->submit_compute_job(
       // shader descriptor
-      VK_KERNEL_FROM_STR(variant.c_str()),
+      api::get_shader_info_for_dtype(variant.c_str(), v_self.dtype()),
       // pipeline barrier
       pipeline_barrier,
       // global work group size
