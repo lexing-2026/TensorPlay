@@ -4,6 +4,7 @@
 #define FORMAT ${FORMAT}
 
 #define LOG_SOFTMAX ${LOG_SOFTMAX}
+#define SAFE_SOFTMAX ${SAFE_SOFTMAX}
 // clang-format on
 
 layout(std430) buffer;
@@ -70,7 +71,17 @@ void main() {
     const vec4 v = texelFetch(uInput, pos, 0);
     imageStore(uOutput, pos, v - vmax - log(vsum));
   $else:
-    const vec4 v = texelFetch(uInput, pos, 0);
-    imageStore(uOutput, pos, exp(v - vmax) / vsum);
+    $if SAFE_SOFTMAX:
+      // A row whose sum is zero made no sense to normalize (every entry
+      // competed with a pivot of -3.0e38 and lost); such rows emit zeros
+      // instead of the 0/0 the plain formula would produce.
+      const vec4 v = texelFetch(uInput, pos, 0);
+      imageStore(
+          uOutput,
+          pos,
+          mix(exp(v - vmax) / vsum, vec4(0.0f), equal(vsum, vec4(0.0f))));
+    $else:
+      const vec4 v = texelFetch(uInput, pos, 0);
+      imageStore(uOutput, pos, exp(v - vmax) / vsum);
   // clang-format on
 }

@@ -58,11 +58,16 @@ void main() {
     const ivec4 b = imageLoad(uOther, pos);
     imageStore(uOutput, pos, a * cond + b * (1 - cond));
   $else:
-    const vec4 cond = mix(
-        vec4(0.0f), vec4(1.0f),
-        notEqual(imageLoad(uCondition, pos), ivec4(0)));
+    const bvec4 cond = notEqual(imageLoad(uCondition, pos), ivec4(0));
     const vec4 a = texelFetch(uInput, pos, 0);
     const vec4 b = texelFetch(uOther, pos, 0);
-    imageStore(uOutput, pos, mix(b, a, cond));
+    // Selects per lane.  An arithmetic recombination (a*m - b*(1-m)) cannot
+    // represent infinities: the rejected operand multiplied by zero yields
+    // 0 * 0 or 0 * minus_infinity forms that turn into not-a-number and
+    // poison the surviving lanes, so the selection must be exact.
+    imageStore(
+        uOutput,
+        pos,
+        vec4(cond.x ? a.x : b.x, cond.y ? a.y : b.y, cond.z ? a.z : b.z, cond.w ? a.w : b.w));
   // clang-format on
 }

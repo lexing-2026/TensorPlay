@@ -473,23 +473,80 @@ Tensor rotary_embedding_kernel(
   return convert(v_output);
 }
 
-// Allocates a [batch, seq, seq] Float32 tensor whose upper triangle
-// (key column > query row) holds a large negative value, so a subsequent
-// softmax yields zero attention there.  The mask is produced directly on
-// the GPU by causal_mask.glsl and is identical for every batch/head lane.
-Tensor make_causal_mask(int64_t batch, int64_t seq) {
-  api::Context* const context = api::context();
-  api::vTensor v_mask{
-      context, {batch, seq, seq}, DType::Float32,
-      api::StorageType::TEXTURE_3D};
-  api::PipelineBarrier barrier{};
-  context->submit_compute_job(
-      VK_KERNEL_FROM_STR("causal_mask"), barrier, v_mask.extents(),
-      adaptive_work_group_size(v_mask.extents()), VK_NULL_HANDLE,
-      v_mask.image(
-          barrier, api::PipelineStage::COMPUTE,
-          api::MemoryAccessType::WRITE));
-  return convert(v_mask);
+//
+// Fused SDPA: three chained compute passes over channel-packed textures:
+//   stage 1  sdpa_qk     scores = Q K^T, scaled, causal-clamped, masked
+//   stage 2  softmax     probabilities over the key axis
+//   stage 3  sdpa_pv     output = P V
+// Every intermediate stays in a texture, so a prefill/decode loop churns no
+// host-visible intermediate tensor, and the composite's separate scalar
+// multiply, causal mask materialization, and mask add passes all fold into
+// stage 1.
+
+// Plane group depth of a channel-packed [B, H, S, D] image: one plane per
+// group of four heads.
+int32_t sdpa_plane_div4(int64_t heads) {
+  return static_cast<int32_t>(api::utils::div_up(
+      api::utils::safe_downcast_to_u32(heads), 4u));
+}
+
+// Plane axis length of the same image: one head group per plane, once
+// per batch.
+int32_t sdpa_planes(int64_t heads, int64_t batches) {
+  return static_cast<int32_t>(
+      batches * static_cast<int64_t>(sdpa_plane_div4(heads)));
+}
+
+
+//
+// Additive float mask from a bool mask.  True entries attend (0.0) and
+// False ones reject (finitely large negative); a row whose every entry is
+// rejected has no negative maximum to pivot on, so the exponent kernel
+// normalizes it to a uniform distribution.
+//
+Tensor additive_float_mask(const Tensor& mask, const DType dtype) {
+  const Tensor reject = full_kernel(
+      static_cast<std::vector<int64_t>>(mask.shape()),
+      Scalar(-std::numeric_limits<double>::infinity()),
+      dtype,
+      mask.device(),
+      false);
+  return dispatch_vk<Tensor>("where.ScalarSelf", mask, Scalar(0.0), reject);
+}
+
+//
+// Mask plane addressing mode for the stage-1 shader, read off the mask's
+// leading axes (the trailing axes must already be (Sq, Skv)):
+//   mode 0  one shared plane (data in lane 0), broadcast across batches
+//           and heads;
+//   mode 1  one plane per head, riding the scores planes one to one;
+//   mode 2  one plane per batch (data in lane 0), matching the batch field
+//           of the score planes;
+//   mode 3  one plane per head with a broadcast (size-1 or absent) batch
+//           axis, so the head planes cycle per batch.
+//
+int32_t sdpa_mask_mode(
+    const std::vector<int64_t>& mask_sizes,
+    const int64_t batch,
+    const int64_t heads) {
+  const int ndim = static_cast<int>(mask_sizes.size());
+  const int64_t lead_h = ndim >= 3 ? mask_sizes[ndim - 3] : 1;
+  const int64_t lead_b = ndim == 4 ? mask_sizes[0] : 1;
+  if (lead_h == heads) {
+    if (lead_b == batch) {
+      return 1;
+    }
+    if (lead_b == 1) {
+      return 3;
+    }
+  } else if (lead_h == 1 && lead_b == 1) {
+    return 0;
+  } else if (lead_h == 1 && lead_b == batch) {
+    return 2;
+  }
+  TP_THROW(
+      ValueError,
+      "Vulkan sdpa: the attention mask is not broadcastable to the query");
 }
 
 Tensor scaled_dot_product_attention_kernel(
@@ -510,54 +567,225 @@ Tensor scaled_dot_product_attention_kernel(
       query.dim() == 4 && key.dim() == 4 && value.dim() == 4,
       "Vulkan sdpa expects 4-D [B, H, S, D] tensors");
   TP_CHECK(
-      query.size(2) == key.size(2) && query.size(3) == key.size(3),
-      "Vulkan sdpa: query/key shape mismatch");
+      query.size(3) == key.size(3) && key.size(3) == value.size(3),
+      "Vulkan sdpa: Q/K/V must share the head size");
+  TP_CHECK(
+      query.size(2) >= 1 || key.size(2) == 0,
+      "Vulkan sdpa: an empty key sequence leaves no row to reduce");
   TP_CHECK(
       dropout_p == 0.0, "Vulkan sdpa does not support dropout yet");
-  TP_CHECK(
-      !enable_gqa, "Vulkan sdpa does not support GQA yet");
+
+  const int64_t B = query.size(0);
+  const int64_t Hq = query.size(1);
+  const int64_t Sq = query.size(2);
+  const int64_t Skv = key.size(2);
+  const int64_t Hkv = key.size(1);
+  const int64_t D = query.size(3);
+  if (enable_gqa) {
+    TP_CHECK(
+        Hkv < Hq && Hq % Hkv == 0,
+        "Vulkan sdpa: enable_gqa requires Hq to be a multiple of Hkv");
+  }
   if (attn_mask_opt.has_value()) {
     TP_CHECK(
-        attn_mask_opt->dtype() == DType::Float32,
-        "Vulkan sdpa supports Float32 attention masks only");
+        attn_mask_opt->dim() >= 2 &&
+            attn_mask_opt->size(attn_mask_opt->dim() - 1) == Skv &&
+            attn_mask_opt->size(attn_mask_opt->dim() - 2) == Sq,
+        "Vulkan sdpa: the attention mask must carry the (Sq, Skv) axes");
   }
 
-  // Composite implementation reusing the validated Vulkan primitives:
-  //   out = softmax((Q @ K^T) * scale) @ V
-  // The batched-product path reads [B*H, S, D] tensors whose batch lane
-  // matches the head layout, so batch size 1 (the LLM decode case) works
-  // with any number of heads.
-  const int64_t B = query.size(0);
-  const int64_t H = query.size(1);
-  const int64_t S = query.size(2);
-  const int64_t D = query.size(3);
+  api::Context* const context = api::context();
+
+  // Key/value shape: a single kv head broadcasts across the query heads
+  // through the group mapping; other leading shapes carry through their
+  // own planes.  Empty tensors need no work.
+  TP_CHECK(
+      key.size(2) == value.size(2) && key.size(1) == value.size(1),
+      "Vulkan sdpa: key and value shapes must match");
+
+  const int64_t group = enable_gqa ? (Hq / Hkv) : 1;
+  // One kv head below Hq broadcasts through the group mapping; above Hq
+  // (packing several kv heads against fewer query heads) has no mapping.
+  TP_CHECK(
+      Hkv == Hq || enable_gqa || Hkv == 1,
+      "Vulkan sdpa: key and value head counts must match or be "
+      "broadcastable through enable_gqa");
+
   const double scale =
       scale_opt.value_or(1.0 / std::sqrt(static_cast<double>(D)));
 
+  // Operands arrive channel-packed; a buffer-resident payload has no
+  // sampler view, so the boundary check fails before any dispatch.
+  api::vTensor v_query = convert(query);
+  api::vTensor v_key = convert(key);
+  api::vTensor v_value = convert(value);
   TP_CHECK(
-      B == 1, "Vulkan sdpa composite path supports batch size 1 only");
-  TP_CHECK(
-      !attn_mask_opt.has_value(),
-      "Vulkan sdpa additive masks are not implemented yet");
+      v_query.storage_type() == api::StorageType::TEXTURE_3D &&
+          v_key.storage_type() == api::StorageType::TEXTURE_3D &&
+          v_value.storage_type() == api::StorageType::TEXTURE_3D,
+      "Vulkan sdpa requires texture storage");
 
-  Tensor q3 = query.reshape(std::vector<int64_t>{B * H, S, D});
-  Tensor k3 = key.reshape(std::vector<int64_t>{B * H, S, D});
-  Tensor v3 = value.reshape(std::vector<int64_t>{B * H, S, D});
-  Tensor kt = dispatch_vk<Tensor>(
-      "transpose", k3, int64_t(1), int64_t(2));
-  Tensor scores = dispatch_vk<Tensor>("bmm", q3, kt);
-  scores = dispatch_vk<Tensor>(
-      "mul.Scalar", scores, Scalar(scale), Scalar(1));
-  if (is_causal) {
-    Tensor mask = make_causal_mask(B * H, S);
-    scores = dispatch_vk<Tensor, const Tensor&, const Tensor&, const Scalar&>(
-        "add.Tensor", scores, mask, Scalar(1));
+  // Attention mask: bool converts to an additive float mask; float masks
+  // ride the texture planes per the addressing mode.
+  Tensor mask_f;
+  int32_t mask_mode = 0;
+  if (attn_mask_opt.has_value()) {
+    mask_f = attn_mask_opt->dtype() == DType::Bool
+        ? additive_float_mask(*attn_mask_opt, query.dtype())
+        : *attn_mask_opt;
+    TP_CHECK(
+        mask_f.dtype() == query.dtype(),
+        "Vulkan sdpa: an attention mask must match the query dtype");
+    if (!mask_f.device().is_vulkan()) {
+      mask_f = mask_f.to(query.device());
+    }
+    mask_mode = sdpa_mask_mode(
+        static_cast<std::vector<int64_t>>(mask_f.shape()), B, Hq);
   }
-  Tensor probs = dispatch_vk<Tensor>(
-      "softmax", scores, static_cast<int64_t>(-1), DType::Float32);
-  Tensor out3 = dispatch_vk<Tensor>("bmm", probs, v3);
-  return out3.reshape(std::vector<int64_t>{B, H, S, D});
 
+  // Stage 1: scores.  One texel lane per query head, four lanes per plane.
+  api::vTensor v_scores{
+      context,
+      {B, Hq, Sq, Skv},
+      query.dtype(),
+      api::StorageType::TEXTURE_3D,
+      api::GPUMemoryLayout::TENSOR_CHANNELS_PACKED,
+  };
+  TP_CHECK(
+      v_scores.storage_type() == api::StorageType::TEXTURE_3D,
+      "Vulkan sdpa requires texture storage");
+
+  const struct SdpaQkBlock final {
+    ivec4 extents;      // (Skv, Sq, planes, unused)
+    int dim;            // head size D
+    float scale;
+    int is_causal;
+    int has_mask;
+    int mask_mode;
+    int q_c_depth;      // ceil(Hq / 4)
+    int kv_c_depth;     // ceil(Hkv / 4)
+    int gqa_group;
+    int hq;
+  } qk_block{
+      ivec4(static_cast<int32_t>(Skv),
+            static_cast<int32_t>(Sq),
+            sdpa_planes(Hq, B),
+            0),
+      static_cast<int32_t>(D),
+      static_cast<float>(scale),
+      is_causal ? 1 : 0,
+      attn_mask_opt.has_value() ? 1 : 0,
+      mask_mode,
+      static_cast<int32_t>(sdpa_plane_div4(Hq)),
+      static_cast<int32_t>(sdpa_plane_div4(Hkv)),
+      static_cast<int32_t>(group),
+      static_cast<int32_t>(Hq),
+  };
+
+  api::UniformParamsBuffer qk_params(context, qk_block);
+  api::PipelineBarrier barrier{};
+  context->submit_compute_job(
+      kernel_for("sdpa_qk", query.dtype()),
+      barrier,
+      v_scores.extents(),
+      adaptive_work_group_size(v_scores.extents()),
+      VK_NULL_HANDLE,
+      v_scores.image(
+          barrier, api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::WRITE),
+      v_query.image(barrier, api::PipelineStage::COMPUTE),
+      v_key.image(barrier, api::PipelineStage::COMPUTE),
+      // Without a mask, an operand texture (read-only here) occupies the
+      // unused sampler slot.
+      attn_mask_opt.has_value()
+          ? convert(mask_f).image(barrier, api::PipelineStage::COMPUTE)
+          : v_key.image(barrier, api::PipelineStage::COMPUTE),
+      qk_params.buffer());
+
+  // Stage 2: softmax over the key axis.  The scores tensor reads as a
+  // [B, Hq, Sq, Skv] channel-packed image, so the key walk is the texel x
+  // axis; per-row statistics run in the accumulate dtype of the payload.
+  api::vTensor v_probs{
+      context,
+      v_scores.sizes(),
+      query.dtype(),
+      api::StorageType::TEXTURE_3D,
+      api::GPUMemoryLayout::TENSOR_CHANNELS_PACKED,
+  };
+
+  const struct SoftmaxBlock final {
+    ivec4 sizes;
+    int c_depth;
+    int axis;
+  } softmax_block{
+      make_whcn_ivec4(v_scores.sizes()),
+      sdpa_plane_div4(Hq),
+      0,
+  };
+
+  api::UniformParamsBuffer softmax_params(context, softmax_block);
+  api::PipelineBarrier softmax_barrier{};
+  context->submit_compute_job(
+      kernel_for("sdpa_softmax", query.dtype()),
+      softmax_barrier,
+      v_probs.extents(),
+      adaptive_work_group_size(v_probs.extents()),
+      VK_NULL_HANDLE,
+      v_probs.image(
+          softmax_barrier, api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::WRITE),
+      v_scores.image(softmax_barrier, api::PipelineStage::COMPUTE),
+      softmax_params.buffer());
+
+  // Stage 3: output.  The probability lanes ride the query heads exactly
+  // as stage 1 laid them out, so the group mapping matches the value
+  // planes without an epilogue relayout.
+  api::vTensor v_output{
+      context,
+      {B, Hq, Sq, D},
+      query.dtype(),
+      api::StorageType::TEXTURE_3D,
+      api::GPUMemoryLayout::TENSOR_CHANNELS_PACKED,
+  };
+
+  const struct SdpaPvBlock final {
+    ivec4 extents;      // (D, Sq, planes, unused)
+    int seq_len;        // Skv
+    int q_c_depth;      // ceil(Hq / 4)
+    int kv_c_depth;     // ceil(Hkv / 4)
+    int gqa_group;
+    int hq;
+    int fill1;
+    int fill2;
+    int fill3;
+  } pv_block{
+      ivec4(static_cast<int32_t>(D),
+            static_cast<int32_t>(Sq),
+            sdpa_planes(Hq, B),
+            0),
+      static_cast<int32_t>(Skv),
+      static_cast<int32_t>(sdpa_plane_div4(Hq)),
+      static_cast<int32_t>(sdpa_plane_div4(Hkv)),
+      static_cast<int32_t>(group),
+      static_cast<int32_t>(Hq),
+  };
+
+  api::UniformParamsBuffer pv_params(context, pv_block);
+  api::PipelineBarrier pv_barrier{};
+  context->submit_compute_job(
+      kernel_for("sdpa_pv", query.dtype()),
+      pv_barrier,
+      v_output.extents(),
+      adaptive_work_group_size(v_output.extents()),
+      VK_NULL_HANDLE,
+      v_output.image(
+          pv_barrier, api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::WRITE),
+      v_probs.image(pv_barrier, api::PipelineStage::COMPUTE),
+      v_value.image(pv_barrier, api::PipelineStage::COMPUTE),
+      pv_params.buffer());
+
+  return convert(v_output);
 }
 
 } // namespace ops

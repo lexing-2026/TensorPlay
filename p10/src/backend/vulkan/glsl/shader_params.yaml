@@ -563,6 +563,7 @@ softmax_channel:
 softmax_batch_height_width:
   parameter_names_with_default_values:
     LOG_SOFTMAX: false
+    SAFE_SOFTMAX: false
   generate_variant_forall:
     FORMAT:
     - VALUE: rgba32f
@@ -574,6 +575,9 @@ softmax_batch_height_width:
     LOG_SOFTMAX: false
   - NAME: log_softmax
     LOG_SOFTMAX: true
+  - NAME: sdpa_softmax
+    LOG_SOFTMAX: false
+    SAFE_SOFTMAX: true
 sum_axis:
   parameter_names_with_default_values: {}
   generate_variant_forall:
@@ -1231,3 +1235,23 @@ rotary_embedding:
       SUFFIX: _f16
   shader_variants:
   - NAME: rotary_embedding
+sdpa_qk:
+  parameter_names_with_default_values: {}
+  generate_variant_forall:
+    FORMAT:
+    - VALUE: rgba32f
+      SUFFIX: ''
+    - VALUE: rgba16f
+      SUFFIX: _f16
+  shader_variants:
+  - NAME: sdpa_qk
+sdpa_pv:
+  parameter_names_with_default_values: {}
+  generate_variant_forall:
+    FORMAT:
+    - VALUE: rgba32f
+      SUFFIX: ''
+    - VALUE: rgba16f
+      SUFFIX: _f16
+  shader_variants:
+  - NAME: sdpa_pv
