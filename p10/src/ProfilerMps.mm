@@ -14,6 +14,7 @@
 // for every in-flight handler (bounded) before writing gpu_ms into events.
 
 #include "Profiler.h"
+#include "Exception.h"
 
 #ifdef USE_MPS
 
