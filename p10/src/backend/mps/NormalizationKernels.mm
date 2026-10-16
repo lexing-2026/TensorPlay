@@ -3,6 +3,7 @@
 #include "Exception.h"
 #include "TypePromotion.h"
 #include "OperationUtils.h"
+#include "DistributionDispatch.h"
 
 #include "backend/mps/MPSDevice.h"
 #include "backend/mps/MPSStream.h"
@@ -220,11 +221,11 @@ Tensor layer_norm_kernel(const Tensor& input,
 // ---------------------------------------------------------------------------
 // batch_norm
 //
-// Training mode computes batch statistics with meanOfTensor/varianceOfTensor
-// over all non-channel axes, normalizes with the confirmed
-// normalizationWithTensor selector, and updates running statistics on the
-// host (only C elements).  Evaluation mode normalizes directly with the
-// running statistics.
+// Training mode computes the batch statistics on the host through the
+// unified-memory mapping (only C channels), feeds them into the graph as
+// placeholders, normalizes with the confirmed normalizationWithTensor
+// selector, and updates running statistics in place.  Evaluation mode
+// normalizes directly with the running statistics.
 // ---------------------------------------------------------------------------
 
 Tensor batch_norm_kernel(const Tensor& input,
@@ -279,72 +280,69 @@ Tensor batch_norm_kernel(const Tensor& input,
     bias_c = materializeForGraph(*bias_opt);
   }
 
-  // Batch statistics buffers (float32) used to refresh running stats.
+  // Batch statistics buffers (input dtype) computed on the host for the
+  // training path; they are fed into the graph as placeholders and also
+  // drive the running-statistics update.
   Tensor batch_mean;
   Tensor batch_var;
   if (training) {
-    batch_mean = Tensor({C}, DType::Float32, input.device());
-    batch_var = Tensor({C}, DType::Float32, input.device());
+    batch_mean = Tensor({C}, input.dtype(), input.device());
+    batch_var = Tensor({C}, input.dtype(), input.device());
+    getCurrentMPSStream()->synchronize(SyncType::COMMIT_AND_WAIT);
+    const int64_t numel = input.numel();
+    const int64_t n_batch = input.size(0);
+    const int64_t spatial =
+        (n_batch > 0) ? numel / (n_batch * C) : 0;
+    std::vector<double> sum(static_cast<size_t>(C), 0.0);
+    std::vector<double> sumsq(static_cast<size_t>(C), 0.0);
+    distribution::dispatch_dtype(input.dtype(), [&](auto tag) {
+      using scalar_t = typename decltype(tag)::type;
+      const scalar_t* data = input_c.data_ptr<scalar_t>();
+      for (int64_t i = 0; i < numel; ++i) {
+        const int64_t c = (i / spatial) % C;
+        const double v = static_cast<double>(data[i]);
+        sum[static_cast<size_t>(c)] += v;
+        sumsq[static_cast<size_t>(c)] += v * v;
+      }
+    });
+    const int64_t count = numel / C;
+    distribution::dispatch_dtype(input.dtype(), [&](auto tag) {
+      using scalar_t = typename decltype(tag)::type;
+      scalar_t* mp = batch_mean.data_ptr<scalar_t>();
+      scalar_t* vp = batch_var.data_ptr<scalar_t>();
+      for (int64_t c = 0; c < C; ++c) {
+        const double mean =
+            sum[static_cast<size_t>(c)] / static_cast<double>(count);
+        const double var = sumsq[static_cast<size_t>(c)] /
+                               static_cast<double>(count) -
+                           mean * mean;
+        mp[c] = static_cast<scalar_t>(mean);
+        vp[c] = static_cast<scalar_t>(var);
+      }
+    });
   }
 
   @autoreleasepool {
     MPSGraph* graph = [[MPSGraph new] autorelease];
     MPSShape* inShape = getMPSShape(out_shape);
     MPSShape* meanShape = getMPSShape(mean_shape);
-    MPSShape* cShape = getMPSShape(std::vector<int64_t>{C});
     const MPSDataType dt = getMPSDataType(input_c.dtype());
-    const MPSDataType f32 = MPSDataTypeFloat32;
 
     MPSGraphTensor* x = [graph placeholderWithShape:inShape
                                           dataType:dt
                                                name:@"x"];
 
-    MPSGraphTensor* mean0 = nil;
-    MPSGraphTensor* var0 = nil;
-    if (training) {
-      // Compute per-channel batch statistics with single-axis reductions
-      // only (the multi-axis mean/variance selectors are unreliable on
-      // older SDKs).  The input is viewed as (C, N) and reduced along the
-      // last axis: mean = sum/N, var = sumsq/N - mean^2.
-      const int64_t count = input.numel() / C;
-      std::vector<int64_t> reduced_shape = {C, count};
-      MPSGraphTensor* xr = [graph reshapeTensor:x
-                                withShape:getMPSShape(reduced_shape)
-                                     name:nil];
-      MPSGraphTensor* sum = [graph reductionSumWithTensor:xr axis:1 name:nil];
-      MPSGraphTensor* sq = [graph multiplicationWithPrimaryTensor:xr
-                                                  secondaryTensor:xr
-                                                             name:nil];
-      MPSGraphTensor* sumsq = [graph reductionSumWithTensor:sq axis:1 name:nil];
-      MPSGraphTensor* countT = [graph constantWithScalar:(double)count
-                                                dataType:dt];
-      MPSGraphTensor* meanSum = [graph divisionWithPrimaryTensor:sum
-                                                 secondaryTensor:countT
-                                                            name:nil];
-      MPSGraphTensor* meanSq = [graph multiplicationWithPrimaryTensor:meanSum
-                                                      secondaryTensor:meanSum
-                                                                 name:nil];
-      MPSGraphTensor* varSum = [graph divisionWithPrimaryTensor:sumsq
-                                                secondaryTensor:countT
-                                                           name:nil];
-      mean0 = meanSum;
-      var0 = [graph subtractionWithPrimaryTensor:varSum
-                                 secondaryTensor:meanSq
-                                            name:nil];
-    } else {
-      mean0 = [graph placeholderWithShape:meanShape
-                              dataType:dt
-                                   name:@"rm"];
-      var0 = [graph placeholderWithShape:meanShape
-                              dataType:dt
-                                   name:@"rv"];
-    }
-    MPSGraphTensor* meanB = training
-        ? [graph reshapeTensor:mean0 withShape:meanShape name:nil]
-        : mean0;
-    MPSGraphTensor* varB = training
-        ? [graph reshapeTensor:var0 withShape:meanShape name:nil]
-        : var0;
+    // Both training and evaluation feed mean/variance as placeholders; the
+    // training path supplies the host-computed batch statistics, while
+    // evaluation supplies the running statistics.
+    MPSGraphTensor* mean0 = [graph placeholderWithShape:meanShape
+                                              dataType:dt
+                                                   name:@"mean"];
+    MPSGraphTensor* var0 = [graph placeholderWithShape:meanShape
+                                              dataType:dt
+                                                   name:@"var"];
+    MPSGraphTensor* meanB = mean0;
+    MPSGraphTensor* varB = var0;
 
     MPSGraphTensor* gamma = nil;
     MPSGraphTensor* beta = nil;
@@ -378,22 +376,16 @@ Tensor batch_norm_kernel(const Tensor& input,
         [NSMutableDictionary dictionaryWithObjectsAndKeys:outData, outT, nil];
 
     if (training) {
-      MPSGraphTensor* meanF32 = ([mean0 dataType] == f32)
-          ? mean0
-          : [graph castTensor:mean0 toType:f32 name:@"cast_mean"];
-      MPSGraphTensor* varF32 = ([var0 dataType] == f32)
-          ? var0
-          : [graph castTensor:var0 toType:f32 name:@"cast_var"];
       MPSGraphTensorData* meanData =
           [[[MPSGraphTensorData alloc] initWithMTLBuffer:mtlBufferOf(batch_mean)
-                                                  shape:cShape
-                                               dataType:f32] autorelease];
+                                                  shape:meanShape
+                                               dataType:dt] autorelease];
       MPSGraphTensorData* varData =
           [[[MPSGraphTensorData alloc] initWithMTLBuffer:mtlBufferOf(batch_var)
-                                                  shape:cShape
-                                               dataType:f32] autorelease];
-      results[meanF32] = meanData;
-      results[varF32] = varData;
+                                                  shape:meanShape
+                                               dataType:dt] autorelease];
+      feeds[mean0] = meanData;
+      feeds[var0] = varData;
     } else {
       Tensor rm_c = materializeForGraph(*running_mean_opt);
       Tensor rv_c = materializeForGraph(*running_var_opt);
@@ -431,21 +423,15 @@ Tensor batch_norm_kernel(const Tensor& input,
     const int64_t count = input.numel() / C;
     const double unbiased = count > 1.0 ? count / (count - 1.0) : 1.0;
     std::vector<double> mean(C), var(C);
-    if (batch_mean.dtype() == DType::Float32) {
-      const float* mp = batch_mean.data_ptr<float>();
-      const float* vp = batch_var.data_ptr<float>();
+    distribution::dispatch_dtype(input.dtype(), [&](auto tag) {
+      using scalar_t = typename decltype(tag)::type;
+      const scalar_t* mp = batch_mean.data_ptr<scalar_t>();
+      const scalar_t* vp = batch_var.data_ptr<scalar_t>();
       for (int64_t c = 0; c < C; ++c) {
-        mean[c] = mp[c];
-        var[c] = vp[c];
+        mean[c] = static_cast<double>(mp[c]);
+        var[c] = static_cast<double>(vp[c]);
       }
-    } else {
-      const double* mp = batch_mean.data_ptr<double>();
-      const double* vp = batch_var.data_ptr<double>();
-      for (int64_t c = 0; c < C; ++c) {
-        mean[c] = mp[c];
-        var[c] = vp[c];
-      }
-    }
+    });
     Tensor rm = *running_mean_opt;
     Tensor rv = *running_var_opt;
     if (rm.dtype() == DType::Float32) {
