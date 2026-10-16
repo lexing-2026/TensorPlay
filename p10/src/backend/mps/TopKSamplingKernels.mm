@@ -196,9 +196,13 @@ Tensor multinomial_kernel(const Tensor& self, int64_t num_samples,
   Tensor gumbel = ops::neg(ops::log(ops::neg(ops::log(u))));
   Tensor scores = ops::add(ops::log(probs), gumbel);
   auto top = ops::topk(scores, num_samples, -1, true, true);
-  // topk already returns 1D [num_samples] for 1D input and [rows, samples]
-  // for 2D input, matching the expected output shape in both cases.
-  return std::get<1>(top);
+  // topk returns [rows, num_samples]; flatten the leading singleton back to
+  // the 1-D [num_samples] shape expected for a 1-D input.
+  Tensor indices = std::get<1>(top);
+  if (is_1d) {
+    indices = ops::reshape(indices, {num_samples});
+  }
+  return indices;
 }
 
 TENSORPLAY_LIBRARY_IMPL(MPS, TopKSamplingKernels) {

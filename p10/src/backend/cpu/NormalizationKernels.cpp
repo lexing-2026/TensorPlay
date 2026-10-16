@@ -1560,11 +1560,122 @@ Tensor rms_norm_cpu(const Tensor& input, const std::vector<int64_t>& normalized_
     TP_THROW(NotImplementedError, "rms_norm_cpu: unsupported dtype");
 }
 
+// Fused RMS norm returning (output, rstd) in a single kernel, matching the
+// semantics of `rms_norm`: y = x * rsqrt(mean(x^2)+eps) * w, with rstd kept
+// at the broadcast shape (outer dims preserved, normalized dims collapsed
+// to 1).
+std::tuple<Tensor, Tensor> fused_rms_norm_cpu(
+    const Tensor& input, const std::vector<int64_t>& normalized_shape,
+    const std::optional<Tensor>& weight_opt, std::optional<double> eps_opt) {
+    const double eps = eps_opt.has_value() ? *eps_opt
+        : (input.dtype() == DType::Float64 ? std::numeric_limits<double>::epsilon()
+                                           : static_cast<double>(std::numeric_limits<float>::epsilon()));
+    const int64_t norm_ndim = (int64_t)normalized_shape.size();
+    const int64_t input_ndim = input.dim();
+    if (norm_ndim > input_ndim)
+        TP_THROW(RuntimeError, "rms_norm: normalized_shape dim larger than input dim");
+    int64_t inner_size = 1;
+    for (int64_t i = 0; i < norm_ndim; ++i) {
+        if (input.size(input_ndim - norm_ndim + i) != normalized_shape[i])
+            TP_THROW(RuntimeError, "rms_norm: Input shape mismatch with normalized_shape");
+        inner_size *= normalized_shape[i];
+    }
+    const int64_t outer_size = input.numel() / inner_size;
+    const bool has_w = weight_opt.has_value() && weight_opt->defined();
+
+    // rstd keeps the outer dims and collapses the normalized dims to 1.
+    std::vector<int64_t> stat_shape(static_cast<size_t>(input_ndim), 1);
+    for (int64_t i = 0; i < input_ndim - norm_ndim; ++i) stat_shape[i] = input.size(i);
+    Tensor rstd = Tensor::empty(stat_shape, DType::Float32, input.device());
+    Tensor out = Tensor::empty_like(input);
+    Tensor wc = has_w ? weight_opt->contiguous() : Tensor();
+
+    const DType dt = input.dtype();
+    if (dt == DType::Float32 || dt == DType::Float64) {
+        const bool is_f64 = dt == DType::Float64;
+        const auto* in = is_f64 ? static_cast<const void*>(input.data_ptr<double>())
+                                : static_cast<const void*>(input.data_ptr<float>());
+        auto* op = is_f64 ? static_cast<void*>(out.data_ptr<double>())
+                          : static_cast<void*>(out.data_ptr<float>());
+        auto* rp = static_cast<float*>(rstd.data_ptr<float>());
+        const auto* wp = has_w ? (is_f64 ? static_cast<const void*>(wc.data_ptr<double>())
+                                         : static_cast<const void*>(wc.data_ptr<float>()))
+                               : nullptr;
+        auto body = [&](int64_t b, int64_t e) {
+            for (int64_t i = b; i < e; ++i) {
+                const int64_t off = i * inner_size;
+                if (is_f64) {
+                    const double* r = static_cast<const double*>(in) + off;
+                    long double acc = 0.0L;
+                    for (int64_t j = 0; j < inner_size; ++j) acc += static_cast<long double>(r[j]) * r[j];
+                    const double inv = 1.0 / std::sqrt(double(acc) / inner_size + eps);
+                    rp[i] = static_cast<float>(inv);
+                    double* o = static_cast<double*>(op) + off;
+                    const double* w = static_cast<const double*>(wp);
+                    for (int64_t j = 0; j < inner_size; ++j) o[j] = r[j] * inv * (w ? w[j] : 1.0);
+                } else {
+                    const float* r = static_cast<const float*>(in) + off;
+                    float acc32 = 0.0f;
+                    for (int64_t j = 0; j < inner_size; ++j) acc32 += r[j] * r[j];
+                    const float inv = 1.0f / std::sqrt(acc32 / inner_size + (float)eps);
+                    rp[i] = inv;
+                    float* o = static_cast<float*>(op) + off;
+                    const float* w = static_cast<const float*>(wp);
+                    for (int64_t j = 0; j < inner_size; ++j) o[j] = r[j] * inv * (w ? w[j] : 1.0f);
+                }
+            }
+        };
+        if (outer_size > 1) {
+            const int64_t th = tensorplay::parallel::get_num_threads();
+            const int64_t grain = std::max<int64_t>(1, outer_size / (th * 4));
+            tensorplay::parallel::parallel_for(0, outer_size, grain, body);
+        } else body(0, outer_size);
+        return {out, rstd};
+    }
+    if (dt == DType::Float16 || dt == DType::BFloat16) {
+        const bool is_bf16 = dt == DType::BFloat16;
+        const auto readv = [&](const void* p, int64_t i) -> float {
+            return is_bf16 ? float(static_cast<const tensorplay::BFloat16*>(p)[i])
+                           : float(static_cast<const tensorplay::Half*>(p)[i]);
+        };
+        const auto writev = [&](void* p, int64_t i, float v) {
+            if (is_bf16) static_cast<tensorplay::BFloat16*>(p)[i] = tensorplay::BFloat16(v);
+            else static_cast<tensorplay::Half*>(p)[i] = tensorplay::Half(v);
+        };
+        const void* ip = input.data_ptr();
+        void* optr = out.data_ptr();
+        float* rp = static_cast<float*>(rstd.data_ptr<float>());
+        const void* wp = has_w ? wc.data_ptr() : nullptr;
+        const bool wb16 = has_w && wc.dtype() == DType::BFloat16;
+        const bool whalf = has_w && wc.dtype() == DType::Float16;
+        for (int64_t i = 0; i < outer_size; ++i) {
+            const int64_t off = i * inner_size;
+            float acc = 0.0f;
+            for (int64_t j = 0; j < inner_size; ++j) { float v = readv(ip, off + j); acc += v * v; }
+            const float inv = 1.0f / std::sqrt(acc / inner_size + (float)eps);
+            rp[i] = inv;
+            for (int64_t j = 0; j < inner_size; ++j) {
+                float v = readv(ip, off + j) * inv;
+                if (has_w) {
+                    float w = wb16 ? float(static_cast<const tensorplay::BFloat16*>(wp)[j])
+                             : whalf ? float(static_cast<const tensorplay::Half*>(wp)[j])
+                                     : static_cast<const float*>(wp)[j];
+                    v *= w;
+                }
+                writev(optr, off + j, v);
+            }
+        }
+        return {out, rstd};
+    }
+    TP_THROW(NotImplementedError, "rms_norm_cpu: unsupported dtype");
+}
+
 // Registration
 TENSORPLAY_LIBRARY_IMPL(CPU, NormalizationKernels) {
     m.impl("layer_norm", layer_norm_cpu);
     m.impl("group_norm", group_norm_cpu);
     m.impl("rms_norm", rms_norm_cpu);
+    m.impl("_fused_rms_norm", fused_rms_norm_cpu);
 
     m.impl("layer_norm_backward", layer_norm_backward_cpu);
     m.impl("group_norm_backward", group_norm_backward_cpu);

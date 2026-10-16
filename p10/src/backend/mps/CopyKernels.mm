@@ -122,9 +122,18 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src_in, bool non_blocking) {
     return copy_kernel(self_codes, src_codes, non_blocking);
   }
   // The source broadcasts to the destination's shape; a source that does
-  // not is refused rather than read past its own elements.
-  const Tensor src = src_in.shape() == self.shape()
-      ? src_in : src_in.expand(static_cast<std::vector<int64_t>>(self.shape()));
+  // not is refused rather than read past its own elements.  When the source
+  // holds the same number of elements but a different rank/shape (e.g. a
+  // 1-element tensor copied into a 0-d scalar), reshape instead of expand,
+  // which cannot add rank.
+  const Tensor src =
+      src_in.shape() == self.shape()
+          ? src_in
+          : (src_in.numel() == self.numel()
+                 ? src_in.reshape(
+                       static_cast<std::vector<int64_t>>(self.shape()))
+                 : src_in.expand(
+                       static_cast<std::vector<int64_t>>(self.shape())));
 
   if (!self.device().is_mps()) {
     TP_THROW(RuntimeError, "copy_kernel dispatched to MPS but dst is not MPS");

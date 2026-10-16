@@ -709,11 +709,19 @@ Tensor sparse_addmm_kernel(const Tensor& self, const Tensor& mat1,
     return binaryOp(scaled_self, scaled_prod, addBlock);
 }
 
+Tensor coalesce_sparse_mps(const Tensor& self) {
+    return coalesce_kernel(self);
+}
+
 TENSORPLAY_LIBRARY_IMPL(MPS, SparseKernels) {
     m.impl("sparse_coo_tensor", sparse_coo_tensor_kernel);
-    m.impl("to_dense", to_dense_kernel);
     m.impl("to_sparse", to_sparse_kernel);
     m.impl("to_sparse.sparse_dim", to_sparse_sparse_dim_kernel);
+    m.impl("_sparse_addmm", sparse_addmm_kernel);
+}
+
+TENSORPLAY_LIBRARY_IMPL(Sparse, SparseKernels) {
+    m.impl("to_dense", to_dense_kernel);
     m.impl("_nnz", nnz_kernel);
     m.impl("_coalesce", coalesce_kernel);
     m.impl("coalesce", coalesce_kernel);
@@ -725,7 +733,6 @@ TENSORPLAY_LIBRARY_IMPL(MPS, SparseKernels) {
     m.impl("_sparse_sum.dtype", _sparse_sum_dtype_kernel);
     m.impl("_sparse_sum.dim", _sparse_sum_dim_kernel);
     m.impl("_sparse_sum.dim_dtype", _sparse_sum_dim_dtype_kernel);
-    m.impl("_sparse_addmm", sparse_addmm_kernel);
 }
 
 } // namespace mps

@@ -2,6 +2,7 @@
 
 #include "backend/mps/MetalUtils.h"
 #include "Exception.h"
+#include "Profiler.h"
 
 #include <array>
 #include <atomic>
@@ -210,6 +211,13 @@ void MPSStream::executeMPSGraph(MPSGraph* mpsGraph,
         throw tensorplay::RuntimeError(
             {__FILE__, __func__, __LINE__},
             tensorplay::detail::format_msg("MPSGraph encode failed: ", reason));
+      }
+      // During a GPU-timing profile session the command buffer is left
+      // uncommitted here: GpuTimerPair::close() attaches its completion
+      // handler to the buffer holding this op's work and commits it, so the
+      // resolved GPU duration covers the op rather than an empty buffer.
+      if (tensorplay::prof::g_gpu_timing.load(std::memory_order_acquire)) {
+        return;
       }
       SyncType effective = syncType;
       if (!_enableCommitAndContinue && syncType != SyncType::COMMIT_AND_WAIT) {

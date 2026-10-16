@@ -232,6 +232,15 @@ MPSUnaryOpBlock bitwiseNotBlock = ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* 
   return [g subtractionWithPrimaryTensor:minusOne secondaryTensor:x name:nil];
 };
 
+MPSBinaryOpBlock bitwiseAndBlock = ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* a,
+                                                   MPSGraphTensor* b) {
+  return [g bitwiseAndWithPrimaryTensor:a secondaryTensor:b name:nil];
+};
+
+MPSUnaryOpBlock isfiniteBlock = ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* x) {
+  return [g isFiniteWithTensor:x name:nil];
+};
+
 // --- comparison blocks ---
 
 MPSBinaryOpBlock eqBlock = ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* a,
@@ -318,6 +327,14 @@ Tensor bitwise_not_kernel(const Tensor& self) {
              "bitwise_not on bool tensors is not implemented on MPS yet");
   }
   return unaryOp(self, bitwiseNotBlock);
+}
+
+Tensor bitwise_and_kernel(const Tensor& self, const Tensor& other) {
+  return binaryOp(self, other, bitwiseAndBlock);
+}
+
+Tensor isfinite_kernel(const Tensor& self) {
+  return unaryOp(self, isfiniteBlock, DType::Bool);
 }
 
 // ---------------------------------------------------------------------------
@@ -686,6 +703,8 @@ TENSORPLAY_LIBRARY_IMPL(MPS, ElementwiseKernels) {
   m.impl("trunc", trunc_kernel);
   m.impl("frac", frac_kernel);
   m.impl("bitwise_not", bitwise_not_kernel);
+  m.impl("bitwise_and.Tensor", bitwise_and_kernel);
+  m.impl("isfinite", isfinite_kernel);
 
   m.impl("sigmoid", sigmoid_kernel);
   m.impl("relu", relu_kernel);

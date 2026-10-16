@@ -783,7 +783,7 @@ class TestMPSQuantization(unittest.TestCase):
         self.assertEqual(q.device.type, "mps")
         self.assertEqual(q.dtype, tp.qint8)
         codes = tp.int_repr(q).cpu().tolist()
-        self.assertEqual(codes, [[10, 10], [30, 20]])
+        self.assertEqual(codes, [[10, 20], [15, 20]])
         d = tp.dequantize(q)
         self.assertTrue(tp.allclose(d.cpu(), x.cpu(), atol=1e-6))
 

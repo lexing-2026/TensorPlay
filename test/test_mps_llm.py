@@ -220,9 +220,9 @@ class TestMPSFactoryShaders(unittest.TestCase):
 
 @unittest.skipUnless(mps_available(), "MPS not available")
 class TestMPSFusedSGD(unittest.TestCase):
-    def _step(self, device, momentum, nesterov=False):
-        p = tp.randn(6, device=device)
-        g = tp.randn(6, device=device)
+    def _step(self, device, momentum, nesterov=False, p=None, g=None):
+        p = tp.randn(6, device=device) if p is None else p
+        g = tp.randn(6, device=device) if g is None else g
         bufs = [tp.zeros(6, device=device)] if momentum != 0 else []
         tp._fused_sgd_([p], [g], bufs, weight_decay=0.01, momentum=momentum,
                        lr=0.01, dampening=0.0, nesterov=nesterov,
@@ -230,16 +230,25 @@ class TestMPSFusedSGD(unittest.TestCase):
         return p.cpu()
 
     def test_sgd_no_momentum(self):
-        self.assertTrue(
-            close(self._step("mps", 0.0), self._step("cpu", 0.0), 1e-4))
+        p = tp.randn(6, device="mps")
+        g = tp.randn(6, device="mps")
+        p_mps = self._step("mps", 0.0, p=p, g=g)
+        p_cpu = self._step("cpu", 0.0, p=p.cpu(), g=g.cpu())
+        self.assertTrue(close(p_mps, p_cpu, 1e-4))
 
     def test_sgd_momentum(self):
-        self.assertTrue(
-            close(self._step("mps", 0.9), self._step("cpu", 0.9), 1e-4))
+        p = tp.randn(6, device="mps")
+        g = tp.randn(6, device="mps")
+        p_mps = self._step("mps", 0.9, p=p, g=g)
+        p_cpu = self._step("cpu", 0.9, p=p.cpu(), g=g.cpu())
+        self.assertTrue(close(p_mps, p_cpu, 1e-4))
 
     def test_sgd_nesterov(self):
-        self.assertTrue(close(self._step("mps", 0.9, True),
-                              self._step("cpu", 0.9, True), 1e-4))
+        p = tp.randn(6, device="mps")
+        g = tp.randn(6, device="mps")
+        p_mps = self._step("mps", 0.9, True, p=p, g=g)
+        p_cpu = self._step("cpu", 0.9, True, p=p.cpu(), g=g.cpu())
+        self.assertTrue(close(p_mps, p_cpu, 1e-4))
 
 
 @unittest.skipUnless(mps_available(), "MPS not available")
@@ -251,7 +260,9 @@ class TestMPSAmp(unittest.TestCase):
         inv_scale = tp.tensor(0.5, dtype=tp.float32, device="mps")
         tp._amp_foreach_non_finite_check_and_unscale_(grads, found, inv_scale)
         self.assertEqual(found.item(), 1.0)
-        self.assertTrue(close(grads[0].cpu(), tp.tensor([2.0, 4.0, 6.0]), 1e-5))
+        # Every element is scaled by inv_scale even when a non-finite value is
+        # found, matching the GPU semantics.
+        self.assertTrue(close(grads[0].cpu(), tp.tensor([0.5, 1.0, 1.5]), 1e-5))
 
     def test_non_finite_clean(self):
         grads = [tp.tensor([1.0, 2.0], device="mps")]
@@ -259,7 +270,7 @@ class TestMPSAmp(unittest.TestCase):
         inv_scale = tp.tensor(0.5, dtype=tp.float32, device="mps")
         tp._amp_foreach_non_finite_check_and_unscale_(grads, found, inv_scale)
         self.assertEqual(found.item(), 0.0)
-        self.assertTrue(close(grads[0].cpu(), tp.tensor([2.0, 4.0]), 1e-5))
+        self.assertTrue(close(grads[0].cpu(), tp.tensor([0.5, 1.0]), 1e-5))
 
     def test_update_scale_growth(self):
         scale = tp.tensor(1.0, dtype=tp.float32, device="mps")

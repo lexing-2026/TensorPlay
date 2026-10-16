@@ -157,7 +157,13 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> embedding_bag_kernel(
       bind_bag_args(computeEncoder, output, 4);
       bind_bag_args(computeEncoder, offset2bag, 5);
       bind_bag_args(computeEncoder, bag_size, 6);
-      bind_bag_args(computeEncoder, max_indices, 7);
+      if (mode == 2) {
+        bind_bag_args(computeEncoder, max_indices, 7);
+      } else {
+        // No max indices are produced for sum/mean modes; the empty tensor's
+        // storage is not a valid MTLBuffer to bind.
+        [computeEncoder setBuffer:nil offset:0 atIndex:7];
+      }
       [computeEncoder setBytes:&params length:sizeof(params) atIndex:8];
       [computeEncoder setBuffer:errorBuf offset:0 atIndex:9];
       mtl_dispatch1DJob(computeEncoder, PSO,

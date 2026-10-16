@@ -8,6 +8,9 @@ namespace ops = tensorplay::tpx::ops;
 #include "Storage.h"
 #include "Quantizer.h"
 #include "SparseKernels.h"
+#ifdef USE_MPS
+#include "backend/mps/SparseKernels.h"
+#endif
 #include "BatchingKernels.h"
 #include "Utils.h"
 #include "ErrorReporting.h"
@@ -629,6 +632,9 @@ Tensor Tensor::coalesce() const {
     if (device().is_cpu()) return cpu::coalesce_sparse_cpu(*this);
 #ifdef USE_CUDA
     if (device().is_cuda()) return cuda::coalesce_sparse_cuda(*this);
+#endif
+#ifdef USE_MPS
+    if (device().is_mps()) return mps::coalesce_sparse_mps(*this);
 #endif
     TP_THROW(NotImplementedError, "coalesce() is not implemented for this device");
 }

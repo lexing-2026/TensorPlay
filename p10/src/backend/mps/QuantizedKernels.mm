@@ -23,6 +23,9 @@
 namespace tensorplay {
 namespace mps {
 
+// Defined in BlasKernels.mm.
+Tensor mm_kernel(const Tensor& self, const Tensor& mat2);
+
 // The bundled Metal shader library (Quantized.metal).
 static auto& lib = MetalShaderLibrary::getBundledLibrary();
 
@@ -173,13 +176,18 @@ Tensor weight_int8pack_mm_kernel(const Tensor& self, const Tensor& mat2,
   const int64_t M = self.size(0);
   const int64_t N = mat2.size(0);
   const int64_t K = self.size(1);
-  if (N % 32 != 0 || K % 32 != 0) {
-    TP_THROW(RuntimeError,
-             "_weight_int8pack_mm(): N and K must be divisible by 32");
-  }
   Tensor output = Tensor({M, N}, input_dt, self.device());
   if (output.numel() == 0) {
     return output;
+  }
+  if (N % 32 != 0 || K % 32 != 0) {
+    // The packed shader only handles 32-aligned N/K; for other shapes compute
+    // the equivalent (A @ B.T) * scales on the GPU with MPSGraph instead.
+    Tensor B_f = mat2.to(input_dt).contiguous();
+    Tensor B_t = B_f.transpose(0, 1);
+    Tensor C = mm_kernel(self, B_t);
+    Tensor S = scales.to(input_dt).view({1, N});
+    return C * S;
   }
   Tensor A = materializeForGraph(self);
   Tensor B = materializeForGraph(mat2);
@@ -699,8 +707,14 @@ Tensor dequantize_self_kernel(const Tensor& self) {
   return out;
 }
 
+Tensor int_repr_kernel(const Tensor& self) {
+    quantized::require_quantized(self, "int_repr");
+    return quantized::strip_quantizer(self).clone();
+}
+
 TENSORPLAY_LIBRARY_IMPL(MPS, QuantizedKernels) {
   m.impl("_weight_int8pack_mm", weight_int8pack_mm_kernel);
+  m.impl("int_repr", int_repr_kernel);
   m.impl("_convert_weight_to_int4pack", convert_weight_to_int4pack_kernel);
   m.impl("_weight_int4pack_mm", weight_int4pack_mm_kernel);
   m.impl("quantize_per_tensor", quantize_per_tensor_kernel);
