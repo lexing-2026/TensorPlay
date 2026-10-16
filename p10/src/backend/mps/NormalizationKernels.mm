@@ -259,11 +259,7 @@ Tensor batch_norm_kernel(const Tensor& input,
              "evaluation mode");
   }
 
-  std::vector<int64_t> axes;
   std::vector<int64_t> mean_shape(static_cast<size_t>(input.dim()), 1);
-  for (int64_t i = 0; i < input.dim(); ++i) {
-    if (i != 1) axes.push_back(i);
-  }
   mean_shape[1] = C;
 
   std::vector<int64_t> out_shape =
@@ -302,17 +298,39 @@ Tensor batch_norm_kernel(const Tensor& input,
     MPSGraphTensor* x = [graph placeholderWithShape:inShape
                                           dataType:dt
                                                name:@"x"];
-    NSMutableArray<NSNumber*>* axesArr =
-        [NSMutableArray arrayWithCapacity:axes.size()];
-    for (int64_t a : axes) {
-      [axesArr addObject:@(a)];
-    }
 
     MPSGraphTensor* mean0 = nil;
     MPSGraphTensor* var0 = nil;
     if (training) {
-      mean0 = [graph meanOfTensor:x axes:axesArr name:nil];
-      var0 = [graph varianceOfTensor:x axes:axesArr name:nil];
+      // Compute per-channel batch statistics with single-axis reductions
+      // only (the multi-axis mean/variance selectors are unreliable on
+      // older SDKs).  The input is viewed as (C, N) and reduced along the
+      // last axis: mean = sum/N, var = sumsq/N - mean^2.
+      const int64_t count = input.numel() / C;
+      std::vector<int64_t> reduced_shape = {C, count};
+      MPSGraphTensor* xr = [graph reshapeTensor:x
+                                withShape:getMPSShape(reduced_shape)
+                                     name:nil];
+      MPSGraphTensor* sum = [graph reductionSumWithTensor:xr axis:1 name:nil];
+      MPSGraphTensor* sq = [graph multiplicationWithPrimaryTensor:xr
+                                                  secondaryTensor:xr
+                                                             name:nil];
+      MPSGraphTensor* sumsq = [graph reductionSumWithTensor:sq axis:1 name:nil];
+      MPSGraphTensor* countT = [graph constantWithScalar:(double)count
+                                                dataType:dt];
+      MPSGraphTensor* meanSum = [graph divisionWithPrimaryTensor:sum
+                                                 secondaryTensor:countT
+                                                            name:nil];
+      MPSGraphTensor* meanSq = [graph multiplicationWithPrimaryTensor:meanSum
+                                                      secondaryTensor:meanSum
+                                                                 name:nil];
+      MPSGraphTensor* varSum = [graph divisionWithPrimaryTensor:sumsq
+                                                secondaryTensor:countT
+                                                           name:nil];
+      mean0 = meanSum;
+      var0 = [graph subtractionWithPrimaryTensor:varSum
+                                 secondaryTensor:meanSq
+                                            name:nil];
     } else {
       mean0 = [graph placeholderWithShape:meanShape
                               dataType:dt

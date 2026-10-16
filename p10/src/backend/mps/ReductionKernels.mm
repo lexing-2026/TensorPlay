@@ -170,20 +170,40 @@ Tensor reductionOp(const Tensor& self, const std::vector<int64_t>& dims,
     const bool reduce_all = (static_cast<int64_t>(axes.size()) == self.dim());
     switch (kind) {
       case ReductionKind::SUM:
-        reduced = reduce_all
-            ? [graph reductionSumWithTensor:xc axes:nil name:nil]
-            : [graph reductionSumWithTensor:xc axes:axesArray name:nil];
-        break;
       case ReductionKind::PROD:
-        reduced = reduce_all
-            ? [graph reductionProductWithTensor:xc axes:nil name:nil]
-            : [graph reductionProductWithTensor:xc axes:axesArray name:nil];
+      case ReductionKind::MEAN: {
+        // Full reductions use the nil-axes form (reduce all), which avoids
+        // the explicit all-axes reduction bug on older SDKs.  Partial
+        // reductions remove one axis at a time (highest first) so only the
+        // single-axis reduction selectors are used.
+        if (reduce_all) {
+          if (kind == ReductionKind::SUM) {
+            reduced = [graph reductionSumWithTensor:xc axes:nil name:nil];
+          } else if (kind == ReductionKind::PROD) {
+            reduced = [graph reductionProductWithTensor:xc axes:nil name:nil];
+          } else {
+            reduced = [graph meanOfTensor:xc axes:nil name:nil];
+          }
+        } else {
+          reduced = xc;
+          for (NSNumber* axis in [axesArray reverseObjectEnumerator]) {
+            if (kind == ReductionKind::SUM) {
+              reduced = [graph reductionSumWithTensor:reduced
+                                           axis:[axis integerValue]
+                                          name:nil];
+            } else if (kind == ReductionKind::PROD) {
+              reduced = [graph reductionProductWithTensor:reduced
+                                                    axis:[axis integerValue]
+                                                   name:nil];
+            } else {
+              reduced = [graph meanOfTensor:reduced
+                                    axis:[axis integerValue]
+                                   name:nil];
+            }
+          }
+        }
         break;
-      case ReductionKind::MEAN:
-        reduced = reduce_all
-            ? [graph meanOfTensor:xc axes:nil name:nil]
-            : [graph meanOfTensor:xc axes:axesArray name:nil];
-        break;
+      }
       case ReductionKind::MAX:
       case ReductionKind::MIN: {
         // Reduce one axis at a time, highest axis first: removing a higher
@@ -456,12 +476,46 @@ Tensor varStdOp(const Tensor& self, const std::vector<int64_t>& dims,
       [axesArray addObject:@(a)];
     }
     // Full reductions use the nil-axes form to avoid the explicit all-axes
-    // reduction bug on older SDKs (same rationale as reductionOp).
+    // reduction bug on older SDKs.  Single-axis partial reductions use the
+    // variance selector directly; multi-axis partial reductions compute
+    // E[x^2]-E[x]^2 with per-axis sum reductions (the multi-axis variance
+    // selector is unreliable on older SDKs).
     const bool reduce_all = (static_cast<int64_t>(axes.size()) == self.dim());
-    MPSGraphTensor* variance =
-        reduce_all
-            ? [graph varianceOfTensor:x axes:nil name:nil]
-            : [graph varianceOfTensor:x axes:axesArray name:nil];
+    MPSGraphTensor* variance = nil;
+    if (reduce_all) {
+      variance = [graph varianceOfTensor:x axes:nil name:nil];
+    } else if (axes.size() == 1) {
+      variance = [graph varianceOfTensor:x axes:axesArray name:nil];
+    } else {
+      const int64_t count = correction_n;
+      MPSGraphTensor* sum = x;
+      MPSGraphTensor* sumsq = [graph multiplicationWithPrimaryTensor:x
+                                                     secondaryTensor:x
+                                                                name:nil];
+      for (NSNumber* axis in [axesArray reverseObjectEnumerator]) {
+        sum = [graph reductionSumWithTensor:sum
+                                      axis:[axis integerValue]
+                                     name:nil];
+        sumsq = [graph reductionSumWithTensor:sumsq
+                                        axis:[axis integerValue]
+                                       name:nil];
+      }
+      MPSGraphTensor* countT = [graph constantWithScalar:(double)count
+                                                dataType:dt];
+      MPSGraphTensor* mean = [graph divisionWithPrimaryTensor:sum
+                                              secondaryTensor:countT
+                                                         name:nil];
+      MPSGraphTensor* meanSq = [graph multiplicationWithPrimaryTensor:mean
+                                                       secondaryTensor:mean
+                                                                  name:nil];
+      MPSGraphTensor* meanSqTerm =
+          [graph divisionWithPrimaryTensor:sumsq
+                           secondaryTensor:countT
+                                      name:nil];
+      variance = [graph subtractionWithPrimaryTensor:meanSqTerm
+                                     secondaryTensor:meanSq
+                                                name:nil];
+    }
     MPSGraphTensor* corrected = variance;
     if (correction != 0) {
       MPSGraphTensor* besselTensor =
