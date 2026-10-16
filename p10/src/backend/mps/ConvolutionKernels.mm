@@ -254,6 +254,7 @@ Tensor conv2d_kernel(const Tensor& input, const Tensor& weight,
   }
 
   @autoreleasepool {
+    @try {
     MPSGraph* graph = [[MPSGraph new] autorelease];
     MPSShape* inShape = getMPSShape(static_cast<std::vector<int64_t>>(input.shape()));
     MPSShape* wShape = getMPSShape(static_cast<std::vector<int64_t>>(weight.shape()));
@@ -322,6 +323,14 @@ Tensor conv2d_kernel(const Tensor& input, const Tensor& weight,
 
     getCurrentMPSStream()->executeMPSGraph(graph, feeds, results,
                                           SyncType::COMMIT_AND_WAIT);
+    } @catch (NSException* e) {
+      std::string reason =
+          [e reason] ? std::string([[e reason] UTF8String])
+                     : std::string("unknown");
+      throw tensorplay::RuntimeError(
+          {__FILE__, __func__, __LINE__},
+          tensorplay::detail::format_msg("MPS conv2d failed: ", reason));
+    }
   }
   return output;
 }
