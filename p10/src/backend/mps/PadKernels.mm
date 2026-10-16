@@ -5,6 +5,7 @@
 #include "OperationUtils.h"
 
 #include "backend/mps/MPSDevice.h"
+#include "backend/mps/MPSStream.h"
 
 #include <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
 
