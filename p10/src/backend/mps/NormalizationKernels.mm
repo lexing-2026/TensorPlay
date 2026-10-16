@@ -296,7 +296,7 @@ Tensor batch_norm_kernel(const Tensor& input,
     std::vector<double> sum(static_cast<size_t>(C), 0.0);
     std::vector<double> sumsq(static_cast<size_t>(C), 0.0);
     distribution::dispatch_dtype(input.dtype(), [&](auto tag) {
-      using scalar_t = typename decltype(tag)::type;
+      using scalar_t = decltype(tag);
       const scalar_t* data = input_c.data_ptr<scalar_t>();
       for (int64_t i = 0; i < numel; ++i) {
         const int64_t c = (i / spatial) % C;
@@ -307,7 +307,7 @@ Tensor batch_norm_kernel(const Tensor& input,
     });
     const int64_t count = numel / C;
     distribution::dispatch_dtype(input.dtype(), [&](auto tag) {
-      using scalar_t = typename decltype(tag)::type;
+      using scalar_t = decltype(tag);
       scalar_t* mp = batch_mean.data_ptr<scalar_t>();
       scalar_t* vp = batch_var.data_ptr<scalar_t>();
       for (int64_t c = 0; c < C; ++c) {
@@ -424,7 +424,7 @@ Tensor batch_norm_kernel(const Tensor& input,
     const double unbiased = count > 1.0 ? count / (count - 1.0) : 1.0;
     std::vector<double> mean(C), var(C);
     distribution::dispatch_dtype(input.dtype(), [&](auto tag) {
-      using scalar_t = typename decltype(tag)::type;
+      using scalar_t = decltype(tag);
       const scalar_t* mp = batch_mean.data_ptr<scalar_t>();
       const scalar_t* vp = batch_var.data_ptr<scalar_t>();
       for (int64_t c = 0; c < C; ++c) {
