@@ -252,8 +252,10 @@ class TestMPSRandom(unittest.TestCase):
         self.assertTrue(tp.all(x.cpu() < 1).item())
 
     def test_randn(self):
-        x = tp.randn(100, device="mps")
-        self.assertEqual(x.shape, (100,))
+        # 100 samples make a mean assertion at places=1 inherently flaky
+        # (standard error ~0.1); 10000 samples pin it down tightly.
+        x = tp.randn(10000, device="mps")
+        self.assertEqual(x.shape, (10000,))
         self.assertAlmostEqual(x.cpu().mean().item(), 0.0, places=1)
 
     def test_randint(self):
