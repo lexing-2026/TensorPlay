@@ -92,17 +92,12 @@ void GpuTimerPair::close() {
 
     const size_t slot = rec_.slot_;
     const uint64_t epoch = g_epoch.load(std::memory_order_relaxed);
-    // Commit the op's command buffer through the stream's serial queue, the
-    // same context a regular dispatch commits in, so uncommitted work does
-    // not accumulate across a profiling session.  The GPU duration is
-    // reported as zero; the MPS command buffer does not expose usable GPU
-    // timestamps through this stream configuration.
+    // Commit the op's command buffer with the MPS-native commit-and-continue
+    // so the work is submitted and the stream is left with a fresh buffer.
+    // The GPU duration is reported as zero; the MPS command buffer does not
+    // expose usable GPU timestamps through this stream configuration.
     float ms = 0.0f;
-    dispatch_sync(stream->queue(), ^() {
-        @autoreleasepool {
-            stream->synchronize(mps::SyncType::COMMIT);
-        }
-    });
+    stream->synchronize(mps::SyncType::COMMIT_AND_CONTINUE);
     std::lock_guard<std::mutex> lock(g_mps_mutex);
     ensure_pending_locked();
     g_pending->push_back({slot, device, ms, epoch});
