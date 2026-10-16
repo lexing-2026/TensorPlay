@@ -705,6 +705,8 @@ jobs:
           python -m pytest . --import-mode=importlib -q -x --tb=short \
             --junitxml="$result_root/junit.xml" \
             2>&1 | tee "$result_root/pytest.log"
+          echo "=== TP_BN_TRACE FILE ===" || true
+          cat /tmp/tp_bn_trace.txt 2>/dev/null || true
 
       - name: Upload CPU test results
         if: ${{ always() && inputs.cuda == 'cpu' && inputs.rocm == '' }}
