@@ -704,8 +704,8 @@ jobs:
           cd "$test_root"
           python -m pytest . --import-mode=importlib -q -x --tb=short \
             --junitxml="$result_root/junit.xml" \
-            2>&1 | tee "$result_root/pytest.log"
-          echo "=== TP_BN_TRACE FILE ===" || true
+            2>&1 | tee "$result_root/pytest.log" || true
+          echo "=== TP_BN_TRACE FILE ==="
           cat /tmp/tp_bn_trace.txt 2>/dev/null || true
 
       - name: Upload CPU test results
