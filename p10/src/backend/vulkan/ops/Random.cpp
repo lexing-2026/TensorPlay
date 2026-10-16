@@ -18,10 +18,12 @@ namespace ops {
 
 using namespace api::utils;
 
-// Sibling Vulkan kernels used by the token sampler.
-Tensor softmax_kernel(const Tensor& self, int64_t dim, DType dtype);
+// Sibling Vulkan selection kernels used by the token sampler.
 std::tuple<Tensor, Tensor> sort_kernel(
     const Tensor& self, int64_t dim, bool descending);
+std::tuple<Tensor, Tensor> topk_kernel(
+    const Tensor& self, int64_t k, int64_t dim, bool largest, bool sorted,
+    int64_t impl);
 
 namespace {
 
@@ -398,12 +400,19 @@ Tensor sample_kernel(
     TP_THROW(RuntimeError, "sample: vocab size must be > 0");
   }
 
-  // Temperature scaling -> softmax -> descending sort with original
-  // indices.  The sampler shader applies top-k / top-p cutoffs on the
-  // sorted row and draws one token by inverse CDF.
-  Tensor scaled = input * (1.0 / temperature);
-  Tensor probs = softmax_kernel(scaled, -1, DType::Float32);
-  auto sorted = sort_kernel(probs, -1, true);
+  // Sort the raw logits directly: ordering is monotonic under softmax,
+  // so the sampler shader can apply temperature scaling, softmax, and the
+  // top-k / top-p cutoffs on the sorted row without a full-vocabulary
+  // softmax pass.  When top-k is requested the selection kernel sorts only
+  // the k best entries (much cheaper than a full vocabulary sort).
+  int64_t sorted_len = cols;
+  std::tuple<Tensor, Tensor> sorted;
+  if (top_k > 0 && top_k < cols) {
+    sorted = topk_kernel(input, top_k, -1, true, true, 0);
+    sorted_len = top_k;
+  } else {
+    sorted = sort_kernel(input, -1, true);
+  }
   const Tensor& values = std::get<0>(sorted);
   const Tensor& indices = std::get<1>(sorted);
 
@@ -424,16 +433,22 @@ Tensor sample_kernel(
   api::vTensor v_indices = convert(indices);
   api::vTensor v_noise = convert(noise);
 
+  // With the top-k selection kernel the row is already truncated, so the
+  // shader receives top_k=0 and works on every sorted entry; with a full
+  // sort it applies the cutoff itself.
+  const int64_t shader_top_k = (top_k > 0 && top_k < cols) ? 0 : top_k;
   const struct SampleBlock final {
     int k;
     int rows;
     int top_k;
     float top_p;
+    float temperature;
   } block{
-      static_cast<int32_t>(cols),
+      static_cast<int32_t>(sorted_len),
       static_cast<int32_t>(rows),
-      static_cast<int32_t>(top_k),
-      static_cast<float>(top_p)};
+      static_cast<int32_t>(shader_top_k),
+      static_cast<float>(top_p),
+      static_cast<float>(temperature)};
   api::UniformParamsBuffer params(context, block);
   api::PipelineBarrier barrier{};
   const api::utils::uvec3 grid{
