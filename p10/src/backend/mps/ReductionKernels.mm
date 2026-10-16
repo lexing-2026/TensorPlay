@@ -501,7 +501,8 @@ Tensor varStdOp(const Tensor& self, const std::vector<int64_t>& dims,
                                        name:nil];
       }
       MPSGraphTensor* countT = [graph constantWithScalar:(double)count
-                                                dataType:dt];
+                                                shape:@[ @1 ]
+                                             dataType:dt];
       MPSGraphTensor* mean = [graph divisionWithPrimaryTensor:sum
                                               secondaryTensor:countT
                                                          name:nil];
@@ -519,7 +520,9 @@ Tensor varStdOp(const Tensor& self, const std::vector<int64_t>& dims,
     MPSGraphTensor* corrected = variance;
     if (correction != 0) {
       MPSGraphTensor* besselTensor =
-          [graph constantWithScalar:bessel dataType:dt];
+          [graph constantWithScalar:bessel
+                              shape:@[ @1 ]
+                           dataType:dt];
       corrected = [graph multiplicationWithPrimaryTensor:variance
                                          secondaryTensor:besselTensor
                                                     name:nil];

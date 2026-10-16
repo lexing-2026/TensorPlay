@@ -111,7 +111,9 @@ std::tuple<Tensor, Tensor, Tensor> native_layer_norm_kernel(
 
     MPSGraphTensor* mean0 = [graph meanOfTensor:x axes:axes name:nil];
     MPSGraphTensor* var0 = [graph varianceOfTensor:x axes:axes name:nil];
-    MPSGraphTensor* epsT = [graph constantWithScalar:eps dataType:dt];
+    MPSGraphTensor* epsT = [graph constantWithScalar:eps
+                                                shape:@[ @1 ]
+                                             dataType:dt];
     MPSGraphTensor* varEps = [graph additionWithPrimaryTensor:var0
                                           secondaryTensor:epsT
                                                      name:nil];
@@ -317,7 +319,8 @@ Tensor batch_norm_kernel(const Tensor& input,
                                                              name:nil];
       MPSGraphTensor* sumsq = [graph reductionSumWithTensor:sq axis:1 name:nil];
       MPSGraphTensor* countT = [graph constantWithScalar:(double)count
-                                                dataType:dt];
+                                                shape:@[ @1 ]
+                                             dataType:dt];
       MPSGraphTensor* meanSum = [graph divisionWithPrimaryTensor:sum
                                                  secondaryTensor:countT
                                                             name:nil];
@@ -532,7 +535,9 @@ Tensor group_norm_kernel(const Tensor& input, int64_t num_groups,
     NSArray* lastAxis = @[ @2 ];
     MPSGraphTensor* mean0 = [graph meanOfTensor:xr axes:lastAxis name:nil];
     MPSGraphTensor* var0 = [graph varianceOfTensor:xr axes:lastAxis name:nil];
-    MPSGraphTensor* epsT = [graph constantWithScalar:eps dataType:dt];
+    MPSGraphTensor* epsT = [graph constantWithScalar:eps
+                                                shape:@[ @1 ]
+                                             dataType:dt];
     MPSGraphTensor* varEps = [graph additionWithPrimaryTensor:var0
                                           secondaryTensor:epsT
                                                      name:nil];
