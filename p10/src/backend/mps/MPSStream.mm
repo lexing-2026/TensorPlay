@@ -193,14 +193,22 @@ void MPSStream::executeMPSGraph(MPSGraph* mpsGraph,
                                 NSDictionary* feeds,
                                 NSDictionary* results,
                                 SyncType syncType) {
-  dispatch_sync(_serialQueue, ^() {
+  dispatch_sync_with_rethrow(_serialQueue, ^() {
     @autoreleasepool {
       endKernelCoalescing();
-      [mpsGraph encodeToCommandBuffer:commandBuffer()
-                                feeds:feeds
-                     targetOperations:nil
-                    resultsDictionary:results
-                  executionDescriptor:_executionDescriptor];
+      @try {
+        [mpsGraph encodeToCommandBuffer:commandBuffer()
+                                  feeds:feeds
+                       targetOperations:nil
+                      resultsDictionary:results
+                    executionDescriptor:_executionDescriptor];
+      } @catch (NSException* e) {
+        std::string reason =
+            [e reason] ? std::string([[e reason] UTF8String]) : std::string("unknown");
+        throw tensorplay::RuntimeError(
+            {__FILE__, __func__, __LINE__},
+            tensorplay::detail::format_msg("MPSGraph encode failed: ", reason));
+      }
       SyncType effective = syncType;
       if (!_enableCommitAndContinue && syncType != SyncType::COMMIT_AND_WAIT) {
         effective = SyncType::COMMIT;
