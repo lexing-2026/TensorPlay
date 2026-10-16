@@ -702,7 +702,7 @@ jobs:
             cp -r "$GITHUB_WORKSPACE/test/expect" "$test_root/"
           fi
           cd "$test_root"
-          python -m pytest . --import-mode=importlib -q \
+          python -m pytest . --import-mode=importlib -q -x --tb=short \
             --junitxml="$result_root/junit.xml" \
             2>&1 | tee "$result_root/pytest.log"
 
