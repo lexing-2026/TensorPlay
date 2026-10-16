@@ -53,7 +53,11 @@ MPSUnaryOpBlock sqrtBlock = ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* x) {
 };
 
 MPSUnaryOpBlock rsqrtBlock = ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* x) {
-  return [g reciprocalSquareRootWithTensor:x name:nil];
+  // 1 / sqrt(x): the dedicated rsqrt selector is unavailable on some SDKs.
+  MPSGraphTensor* one = [g constantWithScalar:1.0 dataType:x.dataType];
+  return [g divisionWithPrimaryTensor:one
+                      secondaryTensor:[g squareRootWithTensor:x name:nil]
+                                 name:nil];
 };
 
 MPSUnaryOpBlock reciprocalBlock = ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* x) {
