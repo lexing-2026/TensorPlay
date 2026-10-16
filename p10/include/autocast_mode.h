@@ -38,6 +38,8 @@ inline constexpr DispatchKey get_autocast_dispatch_key_from_device_type(
             return DispatchKey::AutocastCPU;
         case DeviceType::CUDA:
             return DispatchKey::AutocastCUDA;
+        case DeviceType::MPS:
+            return DispatchKey::AutocastMPS;
         case DeviceType::Vulkan:
             return DispatchKey::AutocastVulkan;
         case DeviceType::Meta:
@@ -54,6 +56,8 @@ inline constexpr DeviceType get_device_type_from_autocast_key(DispatchKey key) {
             return DeviceType::CPU;
         case DispatchKey::AutocastCUDA:
             return DeviceType::CUDA;
+        case DispatchKey::AutocastMPS:
+            return DeviceType::MPS;
         case DispatchKey::AutocastVulkan:
             return DeviceType::Vulkan;
         case DispatchKey::AutocastSparseCPU:
@@ -71,9 +75,10 @@ inline constexpr DeviceType get_device_type_from_autocast_key(DispatchKey key) {
     }
 }
 
-constexpr std::array<DeviceType, 2> _AUTOCAST_SUPPORTED_DEVICES{
+constexpr std::array<DeviceType, 3> _AUTOCAST_SUPPORTED_DEVICES{
     DeviceType::CPU,
-    DeviceType::CUDA};
+    DeviceType::CUDA,
+    DeviceType::MPS};
 
 inline bool is_autocast_available(DeviceType device_type) {
     for (const auto& supported : _AUTOCAST_SUPPORTED_DEVICES) {
