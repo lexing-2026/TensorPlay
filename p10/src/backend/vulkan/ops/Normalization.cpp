@@ -340,6 +340,38 @@ Tensor batch_norm_kernel(
   return convert(v_output);
 }
 
+Tensor rms_norm_kernel(
+    const Tensor& input,
+    const std::vector<int64_t>& normalized_shape,
+    const std::optional<Tensor>& weight_opt,
+    const std::optional<double>& eps_opt) {
+  TP_CHECK(
+      input.dtype() == DType::Float32,
+      "Vulkan rms_norm supports Float32 tensors only");
+  const double eps = eps_opt.has_value() ? eps_opt.value() : 1e-6;
+
+  const int64_t norm_ndim = static_cast<int64_t>(normalized_shape.size());
+  std::vector<int64_t> dims;
+  for (int64_t i = input.dim() - norm_ndim; i < input.dim(); ++i) {
+    dims.push_back(i);
+  }
+
+  // Root-mean-square normalization: y = x * rsqrt(mean(x^2) + eps) * w.
+  // The pooled moment comes from the same dimension-reduction path as
+  // layer_norm (mean of the element-wise square).
+  Tensor x2 = dispatch_vk<Tensor>("mul.Tensor", input, input);
+  Tensor mean_x2 =
+      dispatch_vk<Tensor>("mean.dim", x2, dims, true, DType::Float32);
+  Tensor rstd = dispatch_vk<Tensor>(
+      "rsqrt",
+      dispatch_vk<Tensor>("add.Scalar", mean_x2, Scalar(eps), Scalar(1)));
+  Tensor out = dispatch_vk<Tensor>("mul.Tensor", input, rstd);
+  if (weight_opt.has_value()) {
+    out = dispatch_vk<Tensor>("mul.Tensor", out, *weight_opt);
+  }
+  return out;
+}
+
 } // namespace ops
 } // namespace vulkan
 } // namespace tensorplay
@@ -348,6 +380,7 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, NormalizationKernels) {
   m.impl("layer_norm", &tensorplay::vulkan::ops::layer_norm_kernel);
   m.impl("native_layer_norm", &tensorplay::vulkan::ops::native_layer_norm_kernel);
   m.impl("batch_norm", &tensorplay::vulkan::ops::batch_norm_kernel);
+  m.impl("rms_norm", &tensorplay::vulkan::ops::rms_norm_kernel);
 }
 
 #endif /* USE_VULKAN */

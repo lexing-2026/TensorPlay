@@ -113,6 +113,10 @@ struct QuantizedLinearBlock final {
   int k;
   float input_scale;
   int input_zero_point;
+  float out_inv_scale;
+  int out_zero_point;
+  int quant_min;
+  int quant_max;
 };
 
 struct QuantizedConv2DBlock final {
@@ -561,7 +565,7 @@ Tensor quantized_max_pool2d_kernel(
   }
 
   // Window maximum preserves the code ordering, so the output inherits the
-  // input's quantizer; the CUDA path follows the same shape.
+  // input's quantizer.
   quantized::require_quantized(input, "quantized_max_pool2d");
   api::vTensor v_output{
       context,
@@ -677,30 +681,42 @@ Tensor quantized_linear_kernel(
 
   api::vTensor v_params{context, {3, out_features}, DType::Float32};
   {
-    Tensor params_nc4hw = utils::nchw_to_nc4hw(params_cpu.contiguous());
+    // The params texture is width-packed: texel (n/4, row) carries four
+    // consecutive output channels of row `row` (scale, zero point, bias).
+    // A plain row-major upload of the [3, out_features] host buffer lands
+    // exactly in that layout, so no channel repacking is needed here.
     utils::upload_host_bytes(
         v_params,
-        params_nc4hw.impl()->storage().data(),
-        params_nc4hw.numel() * params_nc4hw.itemsize());
+        params_cpu.contiguous().impl()->storage().data(),
+        params_cpu.numel() * params_cpu.itemsize());
   }
 
   const int64_t M = input.size(0);
   const int64_t N = weight.size(0);
-  api::vTensor v_output{context, {M, N}, DType::Float32};
+  api::vTensor v_output{context, {M, N}, DType::Int8};
 
   const struct QuantizedLinearBlock block{
       static_cast<int32_t>(M),
       static_cast<int32_t>(N),
       static_cast<int32_t>(input.size(1)),
       static_cast<float>(input_scale),
-      static_cast<int32_t>(input_zero_point)};
+      static_cast<int32_t>(input_zero_point),
+      static_cast<float>(1.0 / out_scale),
+      static_cast<int32_t>(out_zero_point),
+      -128,
+      127};
 
   api::UniformParamsBuffer params(context, block);
   api::PipelineBarrier pipeline_barrier{};
 
+  const api::utils::uvec3 grid{
+      api::utils::safe_downcast_to_u32((N + 3) / 4),
+      api::utils::safe_downcast_to_u32((M + 3) / 4),
+      1u};
+
   context->submit_compute_job(
-      VK_KERNEL(quantized_linear), pipeline_barrier, v_output.extents(),
-      adaptive_work_group_size(v_output.extents()), VK_NULL_HANDLE,
+      VK_KERNEL(quantized_linear), pipeline_barrier, grid,
+      adaptive_work_group_size(grid), VK_NULL_HANDLE,
       v_output.image(
           pipeline_barrier,
           api::PipelineStage::COMPUTE,
@@ -710,9 +726,13 @@ Tensor quantized_linear_kernel(
       v_params.image(pipeline_barrier, api::PipelineStage::COMPUTE),
       params.buffer());
 
-  // The float accumulation is requantized onto the output grid.
-  return quantize_per_tensor_qint8_kernel(
-      convert(v_output), out_scale, out_zero_point, -128, 127);
+  // The int32 accumulation is requantized onto the output grid inside the
+  // GEMM shader, so the returned tensor is already QInt8.
+  Tensor out_codes = convert(v_output);
+  return quantized::make_qtensor(
+      out_codes,
+      make_per_tensor_affine_quantizer(out_scale, out_zero_point, DType::QInt8),
+      DType::QInt8);
 }
 
 Tensor quantized_conv2d_kernel(
