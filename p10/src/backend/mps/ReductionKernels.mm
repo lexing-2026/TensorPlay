@@ -218,15 +218,21 @@ Tensor reductionOp(const Tensor& self, const std::vector<int64_t>& dims,
     }
 
     // The graph removes reduced axes. When keepdim is requested (or the
-    // result is a scalar) reshape the graph output so its shape matches the
-    // output buffer description exactly.
+    // result has non-scalar shape) reshape the graph output so its shape
+    // matches the output buffer description exactly. A fully-reduced scalar
+    // is left unreshaped (reshaping an unranked tensor is unsupported on
+    // older SDKs); its single-element buffer is described with shape [1].
     const std::vector<int64_t> graph_shape =
         out_shape.empty() ? std::vector<int64_t>{1} : out_shape;
-    MPSGraphTensor* reshaped =
-        [graph reshapeTensor:reduced withShape:getMPSShape(graph_shape) name:nil];
-    MPSGraphTensor* outTensor = ([reshaped dataType] == out_dt)
-        ? reshaped
-        : [graph castTensor:reshaped toType:out_dt name:@"cast_out"];
+    MPSGraphTensor* outTensor = reduced;
+    if (!out_shape.empty()) {
+      outTensor = [graph reshapeTensor:reduced
+                              withShape:getMPSShape(graph_shape)
+                                   name:nil];
+    }
+    outTensor = ([outTensor dataType] == out_dt)
+        ? outTensor
+        : [graph castTensor:outTensor toType:out_dt name:@"cast_out"];
 
     id<MTLBuffer> inBuf = mtlBufferOf(self_c);
     id<MTLBuffer> outBuf = mtlBufferOf(output);
@@ -454,8 +460,12 @@ Tensor varStdOp(const Tensor& self, const std::vector<int64_t>& dims,
 
     const std::vector<int64_t> graph_shape =
         out_shape.empty() ? std::vector<int64_t>{1} : out_shape;
-    MPSGraphTensor* reshaped =
-        [graph reshapeTensor:reduced withShape:getMPSShape(graph_shape) name:nil];
+    MPSGraphTensor* outTensor = reduced;
+    if (!out_shape.empty()) {
+      outTensor = [graph reshapeTensor:reduced
+                              withShape:getMPSShape(graph_shape)
+                                   name:nil];
+    }
 
     id<MTLBuffer> inBuf = mtlBufferOf(self_c);
     id<MTLBuffer> outBuf = mtlBufferOf(output);
@@ -468,7 +478,7 @@ Tensor varStdOp(const Tensor& self, const std::vector<int64_t>& dims,
                                                 shape:getMPSShape(graph_shape)
                                              dataType:dt] autorelease];
     NSDictionary* feeds = @{x : inData};
-    NSDictionary* results = @{reshaped : outData};
+    NSDictionary* results = @{outTensor : outData};
     getCurrentMPSStream()->executeMPSGraph(graph, feeds, results,
                                           SyncType::COMMIT_AND_WAIT);
   }

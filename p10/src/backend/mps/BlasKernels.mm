@@ -253,8 +253,6 @@ Tensor dot_kernel(const Tensor& self_in, const Tensor& other_in) {
                                                  secondaryTensor:bt
                                                             name:nil];
     MPSGraphTensor* sum = [graph reductionSumWithTensor:prod axes:nil name:nil];
-    MPSGraphTensor* reshaped =
-        [graph reshapeTensor:sum withShape:@[ @1 ] name:nil];
     id<MTLBuffer> aBuf = mtlBufferOf(a);
     id<MTLBuffer> bBuf = mtlBufferOf(b);
     id<MTLBuffer> outBuf = mtlBufferOf(output);
@@ -271,7 +269,7 @@ Tensor dot_kernel(const Tensor& self_in, const Tensor& other_in) {
                                                 shape:@[ @1 ]
                                              dataType:dt] autorelease];
     NSDictionary* feeds = @{at : aData, bt : bData};
-    NSDictionary* results = @{reshaped : outData};
+    NSDictionary* results = @{sum : outData};
     getCurrentMPSStream()->executeMPSGraph(graph, feeds, results,
                                           SyncType::COMMIT_AND_WAIT);
   }
