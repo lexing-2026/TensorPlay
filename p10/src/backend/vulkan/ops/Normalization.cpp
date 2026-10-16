@@ -372,6 +372,103 @@ Tensor rms_norm_kernel(
   return out;
 }
 
+Tensor silu_mul_kernel(const Tensor& gate, const Tensor& up) {
+  TP_CHECK(
+      gate.dtype() == DType::Float32 && up.dtype() == DType::Float32,
+      "Vulkan silu_mul supports Float32 tensors only");
+  Tensor gate_silu = dispatch_vk<Tensor>("silu", gate);
+  return dispatch_vk<Tensor>("mul.Tensor", gate_silu, up, Scalar(1));
+}
+
+Tensor silu_and_mul_kernel(const Tensor& input) {
+  TP_CHECK(
+      input.dtype() == DType::Float32,
+      "Vulkan silu_and_mul supports Float32 tensors only");
+  const int64_t packed_width = input.size(-1);
+  const int64_t half = packed_width / 2;
+  const int64_t dim = input.dim() - 1;
+  // Packed layout: the first half is the gate, the second half is the up
+  // projection; out = silu(gate) * up.
+  Tensor gate =
+      dispatch_vk<Tensor>("slice.Tensor", input, dim, 0, half, 1);
+  Tensor up = dispatch_vk<Tensor>(
+      "slice.Tensor", input, dim, half, packed_width, 1);
+  Tensor gate_silu = dispatch_vk<Tensor>("silu", gate);
+  return dispatch_vk<Tensor>("mul.Tensor", gate_silu, up, Scalar(1));
+}
+
+Tensor rotary_embedding_kernel(
+    const Tensor& input,
+    const Tensor& cos,
+    const Tensor& sin,
+    int64_t position_offset) {
+  TP_CHECK(
+      input.dtype() == DType::Float32 && cos.dtype() == DType::Float32 &&
+          sin.dtype() == DType::Float32,
+      "Vulkan rotary_embedding supports Float32 tensors only");
+  TP_CHECK(input.dim() >= 2, "Vulkan rotary_embedding needs ndim >= 2");
+
+  api::Context* const context = api::context();
+  api::vTensor v_input = convert(input);
+  api::vTensor v_cos = convert(cos);
+  api::vTensor v_sin = convert(sin);
+  if (v_input.storage_type() != api::StorageType::TEXTURE_3D ||
+      v_cos.storage_type() != api::StorageType::TEXTURE_3D ||
+      v_sin.storage_type() != api::StorageType::TEXTURE_3D) {
+    TP_THROW(
+        NotImplementedError,
+        "Vulkan rotary_embedding requires texture storage");
+  }
+
+  const int64_t head_dim = input.size(-1);
+  const int64_t half_dim = head_dim / 2;
+  const int64_t tokens = input.size(-2);
+  const int64_t table_rows = v_cos.extents()[1u];
+
+  api::vTensor v_output{context, input.sizes(), DType::Float32};
+
+  const struct RotaryBlock final {
+    ivec4 extents;
+    int32_t tokens;
+    int32_t half_dim;
+    int32_t table_rows;
+    int32_t position_offset;
+    int32_t fill0;
+  } block{
+      ivec4(
+          v_output.extents()[0u],
+          v_output.extents()[1u],
+          v_output.extents()[2u],
+          0),
+      static_cast<int32_t>(tokens),
+      static_cast<int32_t>(half_dim),
+      static_cast<int32_t>(table_rows),
+      static_cast<int32_t>(position_offset),
+      0};
+
+  api::UniformParamsBuffer params(context, block);
+  api::PipelineBarrier pipeline_barrier{};
+
+  const api::utils::uvec3 grid{
+      api::utils::safe_downcast_to_u32(half_dim / 4),
+      v_output.extents()[1u],
+      v_output.extents()[2u]};
+
+  context->submit_compute_job(
+      VK_KERNEL(rotary_embedding), pipeline_barrier, grid,
+      adaptive_work_group_size(grid), VK_NULL_HANDLE,
+      v_output.image(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::WRITE),
+      v_input.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+      v_cos.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+      v_sin.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+      params.buffer());
+
+  return convert(v_output);
+}
+
 } // namespace ops
 } // namespace vulkan
 } // namespace tensorplay
@@ -381,6 +478,12 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, NormalizationKernels) {
   m.impl("native_layer_norm", &tensorplay::vulkan::ops::native_layer_norm_kernel);
   m.impl("batch_norm", &tensorplay::vulkan::ops::batch_norm_kernel);
   m.impl("rms_norm", &tensorplay::vulkan::ops::rms_norm_kernel);
+}
+
+TENSORPLAY_LIBRARY_IMPL(Vulkan, LlmKernels) {
+  m.impl("silu_mul", &tensorplay::vulkan::ops::silu_mul_kernel);
+  m.impl("silu_and_mul", &tensorplay::vulkan::ops::silu_and_mul_kernel);
+  m.impl("rotary_embedding", &tensorplay::vulkan::ops::rotary_embedding_kernel);
 }
 
 #endif /* USE_VULKAN */
