@@ -17,9 +17,10 @@ namespace mps {
 // ---------------------------------------------------------------------------
 // constant_pad_nd
 //
-// Negative paddings crop the input with slice views (mirroring the CPU
-// behavior), then the remaining positive paddings are applied with the
-// confirmed padTensor selector using MPSGraphPaddingModeConstant.
+// The original (contiguous) input is padded with the confirmed padTensor
+// selector using MPSGraphPaddingModeConstant.  Padding counts are passed
+// through unchanged (negative values crop), matching the semantics of the
+// reference implementation, then the output is returned as a fresh tensor.
 // ---------------------------------------------------------------------------
 
 Tensor constant_pad_nd_kernel(const Tensor& self,
@@ -44,41 +45,16 @@ Tensor constant_pad_nd_kernel(const Tensor& self,
              pad.size(), " while the input has ", l_inp, " dimensions.");
   }
 
-  bool all_pads_non_positive = true;
-  Tensor c_input = self;
-  for (int64_t i = l_inp - l_pad; i < l_inp; ++i) {
-    const int64_t pad_idx = 2 * (l_inp - i - 1);
-    if (pad[pad_idx] < 0) {
-      c_input = c_input.slice(i, -pad[pad_idx], c_input.size(i));
-    } else if (pad[pad_idx] != 0) {
-      all_pads_non_positive = false;
-    }
-    if (pad[pad_idx + 1] < 0) {
-      c_input = c_input.slice(i, 0, c_input.size(i) + pad[pad_idx + 1]);
-    } else if (pad[pad_idx + 1] != 0) {
-      all_pads_non_positive = false;
-    }
-  }
-
-  if (all_pads_non_positive) {
-    return c_input.clone();
-  }
-
-  // Positive padding counts per padded dim, in the order of the cropped
-  // tensor's dimensions (last l_pad dims).
-  std::vector<int64_t> left_pad(l_inp, 0);
-  std::vector<int64_t> right_pad(l_inp, 0);
+  // Output shape: leading dims stay, the last l_pad dims get the (possibly
+  // negative) padding applied.
   std::vector<int64_t> new_shape;
   for (int64_t i = 0; i < l_inp - l_pad; ++i) {
-    new_shape.push_back(c_input.size(i));
+    new_shape.push_back(self.size(i));
   }
   for (int64_t i = 0; i < l_pad; ++i) {
     const int64_t dim = l_inp - l_pad + i;
     const int64_t pad_idx = 2 * (l_pad - i - 1);
-    left_pad[dim] = std::max<int64_t>(0, pad[pad_idx]);
-    right_pad[dim] = std::max<int64_t>(0, pad[pad_idx + 1]);
-    const int64_t new_dim =
-        c_input.size(dim) + left_pad[dim] + right_pad[dim];
+    const int64_t new_dim = self.size(dim) + pad[pad_idx] + pad[pad_idx + 1];
     if (new_dim < 0) {
       TP_THROW(ValueError, "The input size ", input_sizes[l_inp - l_pad + i],
                ", plus negative padding ", pad[pad_idx], " and ",
@@ -95,11 +71,26 @@ Tensor constant_pad_nd_kernel(const Tensor& self,
     return output;
   }
 
-  Tensor input_c = materializeForGraph(c_input);
+  // Padding counts per input dimension (zeros for unpadded leading dims).
+  std::vector<int64_t> left_pad(l_inp, 0);
+  std::vector<int64_t> right_pad(l_inp, 0);
+  for (int64_t i = 0; i < l_pad; ++i) {
+    const int64_t dim = l_inp - l_pad + i;
+    const int64_t pad_idx = 2 * (l_pad - i - 1);
+    left_pad[dim] = pad[pad_idx];
+    right_pad[dim] = pad[pad_idx + 1];
+  }
+
+  Tensor input_c = materializeForGraph(self);
+  if (input_c.numel() == 0) {
+    output.fill_(value);
+    return output;
+  }
   @autoreleasepool {
+    @try {
     MPSGraph* graph = [[MPSGraph new] autorelease];
     const std::vector<int64_t> in_shape =
-        static_cast<std::vector<int64_t>>(c_input.shape());
+        static_cast<std::vector<int64_t>>(input_c.shape());
     MPSShape* inShape = getMPSShape(in_shape);
     MPSShape* outShape = getMPSShape(new_shape);
     const MPSDataType dt = getMPSDataType(input_c.dtype());
@@ -137,6 +128,14 @@ Tensor constant_pad_nd_kernel(const Tensor& self,
     NSDictionary* results = @{padded : outData};
     getCurrentMPSStream()->executeMPSGraph(graph, feeds, results,
                                           SyncType::COMMIT_AND_WAIT);
+    } @catch (NSException* e) {
+      std::string reason =
+          [e reason] ? std::string([[e reason] UTF8String])
+                     : std::string("unknown");
+      throw tensorplay::RuntimeError(
+          {__FILE__, __func__, __LINE__},
+          tensorplay::detail::format_msg("MPS constant_pad_nd failed: ", reason));
+    }
   }
   return output;
 }
