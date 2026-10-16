@@ -713,14 +713,14 @@ Tensor coalesce_sparse_mps(const Tensor& self) {
     return coalesce_kernel(self);
 }
 
-TENSORPLAY_LIBRARY_IMPL(MPS, SparseKernels) {
+TENSORPLAY_LIBRARY_IMPL(MPS, SparseKernelsMPS) {
     m.impl("sparse_coo_tensor", sparse_coo_tensor_kernel);
     m.impl("to_sparse", to_sparse_kernel);
     m.impl("to_sparse.sparse_dim", to_sparse_sparse_dim_kernel);
     m.impl("_sparse_addmm", sparse_addmm_kernel);
 }
 
-TENSORPLAY_LIBRARY_IMPL(Sparse, SparseKernels) {
+TENSORPLAY_LIBRARY_IMPL(Sparse, SparseKernelsSparse) {
     m.impl("to_dense", to_dense_kernel);
     m.impl("_nnz", nnz_kernel);
     m.impl("_coalesce", coalesce_kernel);
