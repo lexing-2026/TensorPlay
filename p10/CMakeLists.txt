@@ -1120,6 +1120,7 @@ if(USE_MPS)
         "-framework Metal"
         "-framework MetalPerformanceShaders"
         "-framework MetalPerformanceShadersGraph"
+        "-framework IOKit"
         "-framework Foundation")
     target_compile_definitions(p10 PRIVATE USE_MPS)
     target_include_directories(p10 PRIVATE
