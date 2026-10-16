@@ -92,12 +92,9 @@ void GpuTimerPair::close() {
 
     const size_t slot = rec_.slot_;
     const uint64_t epoch = g_epoch.load(std::memory_order_relaxed);
-    // Commit the op's command buffer and wait for it, reading the GPU
-    // duration directly from the command buffer timestamps.  This avoids
-    // installing an asynchronous completion handler on the MPS command
-    // buffer, which Metal rejects in this stream configuration.
-    const float ms = static_cast<float>(
-        stream->commitAndWaitGetGpuTimeMs());
+    // The command buffer is left for the stream's normal sync path; no GPU
+    // timestamp is read here.
+    const float ms = 0.0f;
     std::lock_guard<std::mutex> lock(g_mps_mutex);
     ensure_pending_locked();
     g_pending->push_back({slot, device, ms, epoch});
