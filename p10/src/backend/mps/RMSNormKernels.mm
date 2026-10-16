@@ -69,7 +69,9 @@ std::tuple<Tensor, Tensor> rms_norm_forward(
   const double eps = eps_opt.has_value()
       ? *eps_opt
       : static_cast<double>(std::numeric_limits<float>::epsilon());
-  const auto [M, N] = split_normalized_shape(input, normalized_shape);
+  const auto norm_split = split_normalized_shape(input, normalized_shape);
+  const int64_t M = norm_split.first;
+  const int64_t N = norm_split.second;
 
   Tensor input_c = input.is_contiguous() ? input : input.contiguous();
   Tensor output = Tensor::empty(
