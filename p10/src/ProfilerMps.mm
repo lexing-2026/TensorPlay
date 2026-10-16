@@ -92,9 +92,16 @@ void GpuTimerPair::close() {
 
     const size_t slot = rec_.slot_;
     const uint64_t epoch = g_epoch.load(std::memory_order_relaxed);
-    // The command buffer is left for the stream's normal sync path; no GPU
-    // timestamp is read here.
-    const float ms = 0.0f;
+    // Commit the op's command buffer through the normal flush path so
+    // uncommitted work does not accumulate across a profiling session.  A
+    // Metal rejection here is swallowed and the GPU duration is reported as
+    // zero; the buffer is left for the stream's regular synchronization.
+    float ms = 0.0f;
+    @try {
+        stream->synchronize(mps::SyncType::COMMIT);
+    } @catch (NSException* e) {
+        ms = 0.0f;
+    }
     std::lock_guard<std::mutex> lock(g_mps_mutex);
     ensure_pending_locked();
     g_pending->push_back({slot, device, ms, epoch});
@@ -104,9 +111,10 @@ void GpuTimerPair::close() {
 TENSORPLAY_API void gpu_resolve_all(
         std::vector<Event>& events,
         const std::function<void(Event&, float ms)>& emit) {
-    const uint64_t epoch = g_epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
-    // MPS pairs are pushed synchronously by GpuTimerPair::close, so no wait
-    // is needed here; consume every pair created in this session's epoch.
+    // Pairs are pushed synchronously by GpuTimerPair::close with the current
+    // epoch, so consume that epoch here and then advance it so a pair that
+    // lands after this stop can never write into a later session.
+    const uint64_t epoch = g_epoch.load(std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(g_mps_mutex);
     if (!g_pending) return;
     for (const auto& p : *g_pending) {
@@ -119,6 +127,7 @@ TENSORPLAY_API void gpu_resolve_all(
         }
     }
     g_pending->clear();
+    g_epoch.fetch_add(1, std::memory_order_acq_rel);
 }
 
 TENSORPLAY_API void gpu_drain_pool() {
