@@ -1,6 +1,7 @@
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "Exception.h"
+#include "TypePromotion.h"
 
 #include "backend/mps/MPSAllocator.h"
 #include "backend/mps/MPSDevice.h"
@@ -31,9 +32,6 @@ void check_cat_inputs(const std::vector<Tensor>& tensors, int64_t dim) {
     if (!t.device().is_mps()) {
       TP_THROW(RuntimeError, "cat(): all tensors must be on the MPS device");
     }
-    if (t.dtype() != first.dtype()) {
-      TP_THROW(RuntimeError, "cat(): all tensors must have the same dtype");
-    }
     if (t.dim() != ndim) {
       TP_THROW(RuntimeError,
                "cat(): tensors must have the same number of dimensions");
@@ -46,6 +44,15 @@ void check_cat_inputs(const std::vector<Tensor>& tensors, int64_t dim) {
       }
     }
   }
+}
+
+// Promoted storage dtype for a list of tensors being joined.
+DType cat_promote_dtype(const std::vector<Tensor>& tensors) {
+  DType out = tensors[0].dtype();
+  for (size_t i = 1; i < tensors.size(); ++i) {
+    out = promoteTypes(out, tensors[i].dtype());
+  }
+  return out;
 }
 
 // Element count of one slice along `dim` (the product of all other dims).
@@ -73,10 +80,15 @@ Tensor cat_kernel(const std::vector<Tensor>& tensors, int64_t dim) {
   }
   out_shape[dim] = cat_size;
 
-  Tensor output = Tensor(out_shape, first.dtype(), first.device());
+  const DType out_dtype = cat_promote_dtype(tensors);
+  Tensor output = Tensor(out_shape, out_dtype, first.device());
   if (output.numel() == 0) {
     return output;
   }
+
+  // The factory fills below were committed without waiting; make them
+  // visible to the host mapping before the memcpy reads it.
+  getCurrentMPSStream()->synchronize(SyncType::COMMIT_AND_WAIT);
 
   const int64_t itemsize = output.itemsize();
   const int64_t slice = slice_numel(out_shape, dim);
@@ -84,10 +96,13 @@ Tensor cat_kernel(const std::vector<Tensor>& tensors, int64_t dim) {
   for (const Tensor& t : tensors) {
     if (t.size(dim) == 0) continue;
     Tensor tc = t.is_contiguous() ? t : t.contiguous();
+    if (tc.dtype() != out_dtype) {
+      tc = tc.to(out_dtype);
+    }
     const int64_t nbytes = tc.numel() * itemsize;
     std::memcpy(static_cast<char*>(output.data_ptr()) + offset * itemsize,
                 tc.data_ptr(), nbytes);
-    offset += tc.size(dim) * slice;
+    offset += t.size(dim) * slice;
   }
   return output;
 }
@@ -106,9 +121,6 @@ Tensor stack_kernel(const std::vector<Tensor>& tensors, int64_t dim) {
     if (!t.device().is_mps()) {
       TP_THROW(RuntimeError, "stack(): all tensors must be on the MPS device");
     }
-    if (t.dtype() != first.dtype()) {
-      TP_THROW(RuntimeError, "stack(): all tensors must have the same dtype");
-    }
     if (t.dim() != ndim ||
         static_cast<std::vector<int64_t>>(t.shape()) !=
             static_cast<std::vector<int64_t>>(first.shape())) {
@@ -121,15 +133,21 @@ Tensor stack_kernel(const std::vector<Tensor>& tensors, int64_t dim) {
       static_cast<std::vector<int64_t>>(first.shape());
   out_shape.insert(out_shape.begin() + dim, static_cast<int64_t>(tensors.size()));
 
-  Tensor output = Tensor(out_shape, first.dtype(), first.device());
+  const DType out_dtype = cat_promote_dtype(tensors);
+  Tensor output = Tensor(out_shape, out_dtype, first.device());
   if (output.numel() == 0) {
     return output;
   }
+
+  getCurrentMPSStream()->synchronize(SyncType::COMMIT_AND_WAIT);
 
   const int64_t itemsize = output.itemsize();
   int64_t offset = 0;
   for (const Tensor& t : tensors) {
     Tensor tc = t.is_contiguous() ? t : t.contiguous();
+    if (tc.dtype() != out_dtype) {
+      tc = tc.to(out_dtype);
+    }
     const int64_t nbytes = tc.numel() * itemsize;
     std::memcpy(static_cast<char*>(output.data_ptr()) + offset * itemsize,
                 tc.data_ptr(), nbytes);
