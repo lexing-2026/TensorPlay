@@ -716,7 +716,7 @@ Tensor randint_kernel(int64_t low, int64_t high,
   // Host fallback (large int64 ranges or unsupported dtypes).
   auto& gen = default_generator();
   distribution::dispatch_dtype(dtype, [&](auto tag) {
-    using scalar_t = typename decltype(tag)::type;
+    using scalar_t = decltype(tag);
     scalar_t* data = t.data_ptr<scalar_t>();
     uniform_int_from_to_distribution<scalar_t> dist(range, base);
     for (int64_t i = 0; i < n; ++i) {

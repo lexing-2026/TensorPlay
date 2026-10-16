@@ -78,9 +78,9 @@ void copy_via_host(Tensor& self, const Tensor& src) {
       static_cast<std::vector<int64_t>>(src.strides()) == rm_strides;
 
   distribution::dispatch_dtype(self.dtype(), [&](auto self_tag) {
-    using self_t = typename decltype(self_tag)::type;
+    using self_t = decltype(self_tag);
     distribution::dispatch_dtype(src.dtype(), [&](auto src_tag) {
-      using src_t = typename decltype(src_tag)::type;
+      using src_t = decltype(src_tag);
       if (self_rm && src_rm) {
         if (std::is_same_v<self_t, src_t>) {
           std::memcpy(self.data_ptr(), src.data_ptr(),

@@ -80,7 +80,7 @@ std::vector<int64_t> nonzero_positions(const Tensor& contiguous_self) {
     std::vector<int64_t> positions;
     const int64_t numel = contiguous_self.numel();
     distribution::dispatch_dtype(contiguous_self.dtype(), [&](auto tag) {
-        using scalar_t = typename decltype(tag)::type;
+        using scalar_t = decltype(tag);
         const scalar_t* data = contiguous_self.data_ptr<scalar_t>();
         for (int64_t i = 0; i < numel; ++i) {
             if (data[i] != scalar_t(0)) positions.push_back(i);
@@ -181,7 +181,7 @@ Tensor coalesce_kernel(const Tensor& self) {
     int64_t* output_index_data = output_indices.data_ptr<int64_t>();
 
     distribution::dispatch_dtype(self.dtype(), [&](auto tag) {
-        using scalar_t = typename decltype(tag)::type;
+        using scalar_t = decltype(tag);
         const scalar_t* source = values.data_ptr<scalar_t>();
         scalar_t* destination = output_values.data_ptr<scalar_t>();
         int64_t output_index = -1;
@@ -227,7 +227,7 @@ Tensor to_dense_kernel(const Tensor& self) {
     const std::vector<int64_t> out_strides = out.strides();
 
     distribution::dispatch_dtype(self.dtype(), [&](auto tag) {
-        using scalar_t = typename decltype(tag)::type;
+        using scalar_t = decltype(tag);
         const int64_t* index_data = indices.data_ptr<int64_t>();
         const scalar_t* source = values.data_ptr<scalar_t>();
         scalar_t* destination = out.data_ptr<scalar_t>();
@@ -282,7 +282,7 @@ Tensor dense_to_sparse_coo(const Tensor& self, int64_t sparse_dim) {
 
     std::vector<int64_t> block_positions;
     distribution::dispatch_dtype(contiguous_self.dtype(), [&](auto tag) {
-        using scalar_t = typename decltype(tag)::type;
+        using scalar_t = decltype(tag);
         const scalar_t* data = contiguous_self.data_ptr<scalar_t>();
         block_positions.reserve(static_cast<size_t>(outer_numel));
         for (int64_t block = 0; block < outer_numel; ++block) {
@@ -309,7 +309,7 @@ Tensor dense_to_sparse_coo(const Tensor& self, int64_t sparse_dim) {
     int64_t* index_data = indices.data_ptr<int64_t>();
 
     distribution::dispatch_dtype(contiguous_self.dtype(), [&](auto tag) {
-        using scalar_t = typename decltype(tag)::type;
+        using scalar_t = decltype(tag);
         const scalar_t* source = contiguous_self.data_ptr<scalar_t>();
         scalar_t* destination = values.data_ptr<scalar_t>();
         for (int64_t n = 0; n < nnz; ++n) {
@@ -389,7 +389,7 @@ Tensor sparse_mm_kernel(const Tensor& self, const Tensor& dense) {
     const int64_t* index_data = indices.data_ptr<int64_t>();
 
     distribution::dispatch_dtype(self.dtype(), [&](auto tag) {
-        using scalar_t = typename decltype(tag)::type;
+        using scalar_t = decltype(tag);
         const int64_t* row_indices = index_data;
         const int64_t* col_indices = index_data + nnz;
         const scalar_t* value_ptr = values.data_ptr<scalar_t>();
@@ -483,7 +483,7 @@ Tensor sparse_mul_kernel(const Tensor& self, const Tensor& other) {
 
     Tensor result_storage;
     distribution::dispatch_dtype(va.dtype(), [&](auto tag) {
-        using scalar_t = typename decltype(tag)::type;
+        using scalar_t = decltype(tag);
         std::vector<int64_t> out_coords;
         std::vector<scalar_t> out_values;
         std::vector<int64_t> ca(static_cast<size_t>(sparse_dim));
