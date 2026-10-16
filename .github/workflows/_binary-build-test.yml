@@ -127,6 +127,14 @@ on:
         type: string
         default: '[{"name":"core","test_files":"test/test_set_native.py test/test_compressed_sparse_constructors.py test/nn/test_nn_utils_norm.py"}]'
         description: JSON array of test shard names and space-separated test files
+      pytest_extra_args:
+        required: false
+        type: string
+        default: ""
+        description: >
+          Extra arguments appended to the pytest invocation in the CPU/MPS
+          regression step (e.g. "-k 'quantize or sparse' --tb=long"). Empty
+          keeps the default full-suite run.
       build_version:
         required: false
         type: string
@@ -685,6 +693,7 @@ jobs:
         shell: bash
         env:
           TEST_FILES: ${{ matrix.test_files }}
+          PYTEST_EXTRA_ARGS: ${{ inputs.pytest_extra_args }}
           TP_ENGINE_TRACE: ${{ runner.os == 'Windows' && matrix.name == 'autograd' && '3' || '0' }}
         run: |
           set -euo pipefail
@@ -703,6 +712,7 @@ jobs:
           fi
           cd "$test_root"
           python -m pytest . --import-mode=importlib -q \
+            $PYTEST_EXTRA_ARGS \
             --junitxml="$result_root/junit.xml" \
             2>&1 | tee "$result_root/pytest.log"
 

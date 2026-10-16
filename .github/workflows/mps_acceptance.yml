@@ -20,6 +20,14 @@ on:
       - ".github/workflows/mps_acceptance.yml"
       - ".github/workflows/_binary-build-test.yml"
   workflow_dispatch:
+    inputs:
+      pytest_extra_args:
+        description: >-
+          Extra pytest arguments for the MPS test run (e.g.
+          "-k 'quantize or sparse' --tb=long"). Empty runs the full suite.
+        required: false
+        default: ""
+        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref_name }}
@@ -42,5 +50,6 @@ jobs:
       runs_on: macos-15
       python_version: "3.12"
       test_matrix: '[{"name":"mps","test_files":"test/test_mps.py test/test_mps_llm.py"}]'
+      pytest_extra_args: ${{ inputs.pytest_extra_args || '' }}
       upload_release: false
     secrets: inherit
