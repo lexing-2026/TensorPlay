@@ -2,6 +2,7 @@
 
 import math
 
+import numpy as np
 import pytest
 
 import tensorplay as tp
@@ -116,3 +117,38 @@ def test_rand_like_and_randn_like():
     mean, std = _mean_std(tp.randn_like(base))
     assert abs(mean) < 0.06
     assert abs(std - 1.0) < 0.06
+
+
+def _vk_prob(values):
+    return tp.from_numpy(np.asarray(values, dtype=np.float32)).to("vulkan")
+
+
+def test_multinomial_deterministic_single_category():
+    prob = _vk_prob([1.0, 0.0, 0.0])
+    samples = tp.multinomial(prob, 1, replacement=True)
+    assert samples.dtype == tp.int64
+    assert samples.cpu().tolist() == [0]
+
+
+def test_multinomial_1d_shape_and_range():
+    prob = _vk_prob([0.2, 0.3, 0.5])
+    samples = tp.multinomial(prob, 64, replacement=True)
+    assert tuple(samples.shape) == (64,)
+    vals = samples.cpu().numpy()
+    assert vals.min() >= 0 and vals.max() <= 2
+
+
+def test_multinomial_2d_shape_and_rows():
+    prob = _vk_prob([[0.5, 0.5], [0.9, 0.1]])
+    samples = tp.multinomial(prob, 32, replacement=True)
+    assert tuple(samples.shape) == (2, 32)
+    row0 = samples.cpu().numpy()[0]
+    row1 = samples.cpu().numpy()[1]
+    assert (row0 == 0).sum() > 0 and (row0 == 1).sum() > 0
+    assert (row1 == 0).sum() > (row1 == 1).sum()
+
+
+def test_multinomial_distribution_unbiased():
+    prob = _vk_prob([0.5, 0.5])
+    samples = tp.multinomial(prob, 2000, replacement=True).cpu().numpy()
+    assert abs((samples == 0).sum() - 1000) < 120

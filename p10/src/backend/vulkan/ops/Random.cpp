@@ -302,6 +302,73 @@ Tensor rand_kernel(
   return out;
 }
 
+Tensor multinomial_kernel(
+    const Tensor& self,
+    int64_t num_samples,
+    bool replacement,
+    std::optional<Generator> generator) {
+  TP_CHECK(
+      num_samples >= 0, "multinomial: num_samples must be >= 0");
+  TP_CHECK(
+      self.dim() <= 2, "Vulkan multinomial: input must be 1D or 2D");
+  const bool is_1d = self.dim() == 1;
+  const int64_t rows = is_1d ? 1 : self.size(0);
+  const int64_t cols = is_1d ? self.numel() : self.size(1);
+  if (cols == 0 && num_samples > 0) {
+    TP_THROW(
+        RuntimeError, "multinomial: input must have at least one category");
+  }
+  TP_CHECK(
+      replacement,
+      "Vulkan multinomial currently supports replacement=True only");
+
+  const std::vector<int64_t> out_shape =
+      is_1d ? std::vector<int64_t>{num_samples}
+            : std::vector<int64_t>{rows, num_samples};
+  if (num_samples == 0) {
+    return empty_kernel(out_shape, DType::Int64, self.device(), false);
+  }
+
+  Tensor prob = self.dtype() == DType::Float32 ? self : self.to(DType::Float32);
+
+  // Draw uniform noise on the device through the same counter-based stream
+  // as uniform_, then run one inverse-CDF thread per row.
+  Tensor noise = empty_kernel(
+      {rows * num_samples}, DType::Float32, self.device(), false);
+  dispatch_random_fill(noise, VK_KERNEL(uniform_fill), 0.0f, 1.0f, 0.0f,
+                      generator);
+
+  api::Context* const context = api::context();
+  api::vTensor v_prob = convert(prob);
+  api::vTensor v_noise = convert(noise);
+  api::vTensor v_result{
+      context, out_shape, DType::Int64, api::StorageType::BUFFER,
+      api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+
+  const struct MultinomialBlock final {
+    int cols;
+    int num_samples;
+    int total;
+  } block{
+      static_cast<int32_t>(cols),
+      static_cast<int32_t>(num_samples),
+      static_cast<int32_t>(rows * num_samples)};
+  api::UniformParamsBuffer params(context, block);
+  api::PipelineBarrier barrier{};
+  const api::utils::uvec3 grid{
+      api::utils::safe_downcast_to_u32(rows), 1u, 1u};
+
+  context->submit_compute_job(
+      VK_KERNEL(multinomial), barrier, grid, {1u, 1u, 1u}, VK_NULL_HANDLE,
+      v_result.buffer(
+          barrier, api::PipelineStage::COMPUTE, api::MemoryAccessType::WRITE),
+      v_prob.image(barrier, api::PipelineStage::COMPUTE),
+      v_noise.image(barrier, api::PipelineStage::COMPUTE),
+      params.buffer());
+
+  return convert(v_result);
+}
+
 } // namespace ops
 } // namespace vulkan
 } // namespace tensorplay
@@ -315,6 +382,7 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, RandomKernels) {
   m.impl("rand", &tensorplay::vulkan::ops::rand_kernel);
   m.impl("rand_like", &tensorplay::vulkan::ops::rand_like_kernel);
   m.impl("randn_like", &tensorplay::vulkan::ops::randn_like_kernel);
+  m.impl("multinomial", &tensorplay::vulkan::ops::multinomial_kernel);
 }
 
 #endif /* USE_VULKAN */
