@@ -28,9 +28,10 @@ MPSStream::MPSStream(Stream stream) : _stream(stream) {
   _serialQueue = dispatch_queue_create("tensorplay mps stream", nullptr);
   _executionDescriptor = [MPSGraphExecutionDescriptor new];
   _compilationDescriptor = [MPSGraphCompilationDescriptor new];
-  // CommitAndContinue is enabled by default; the MPSCommandBuffer commits the
-  // underlying command buffer and continues on a fresh one transparently.
-  _enableCommitAndContinue = true;
+  // CommitAndContinue is disabled to match the reference backend; the
+  // command buffer is committed explicitly and the previous buffer is
+  // tracked for completion.
+  _enableCommitAndContinue = false;
   _executionDescriptor.enableCommitAndContinue = _enableCommitAndContinue;
   // Choose level which optimizes for GPU.
   _compilationDescriptor.optimizationLevel = MPSGraphOptimizationLevel0;
