@@ -114,8 +114,12 @@ double MPSStream::commitAndWaitGetGpuTimeMs() {
   if (_commandBuffer) {
     [_commandBuffer commit];
     [_commandBuffer waitUntilCompleted];
-    const CFTimeInterval start = [_commandBuffer GPUStartTime];
-    const CFTimeInterval end = [_commandBuffer GPUEndTime];
+    // MPSCommandBuffer forwards most MTLCommandBuffer messages to the
+    // wrapped buffer, but GPU timestamps are only exposed by the underlying
+    // root command buffer.
+    id<MTLCommandBuffer> root = [_commandBuffer rootCommandBuffer];
+    const CFTimeInterval start = [root GPUStartTime];
+    const CFTimeInterval end = [root GPUEndTime];
     if (end > start) {
       ms = (end - start) * 1000.0;
     }
