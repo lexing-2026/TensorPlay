@@ -287,7 +287,10 @@ Tensor batch_norm_kernel(const Tensor& input,
     batch_var = Tensor({C}, DType::Float32, input.device());
   }
 
+  fprintf(stderr, "TP_BN_TRACE: before graph, training=%d C=%lld\\n", (int)training, (long long)C);
+
   @autoreleasepool {
+    fprintf(stderr, "TP_BN_TRACE: graph start\\n");
     MPSGraph* graph = [[MPSGraph new] autorelease];
     MPSShape* inShape = getMPSShape(out_shape);
     MPSShape* meanShape = getMPSShape(mean_shape);
@@ -425,7 +428,10 @@ Tensor batch_norm_kernel(const Tensor& input,
 
     getCurrentMPSStream()->executeMPSGraph(graph, feeds, results,
                                           SyncType::COMMIT_AND_WAIT);
+    fprintf(stderr, "TP_BN_TRACE: graph executed\\n");
   }
+
+  fprintf(stderr, "TP_BN_TRACE: after graph, training=%d has_rm=%d\\n", (int)training, (int)has_running_mean);
 
   if (training && has_running_mean) {
     const int64_t count = input.numel() / C;
