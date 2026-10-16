@@ -384,7 +384,7 @@ class TestMPSLosses(unittest.TestCase):
         expected = -(0.5 * 0.5 * 0.0)  # mean of -[ln0.5, ln0.2]
         self.assertTrue(loss.item() > 0)
         self.assertAlmostEqual(tp.binary_cross_entropy(x, y, reduction=0).cpu().tolist()[0],
-                               -0.6931471805599453, places=5)
+                               0.6931471805599453, places=5)
 
     def test_nll_loss(self):
         log_probs = tp.tensor([[-0.5, -1.0, -2.0], [-1.5, -0.2, -0.8]],
