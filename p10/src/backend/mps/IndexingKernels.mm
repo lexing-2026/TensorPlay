@@ -122,7 +122,12 @@ Tensor masked_fill_tensor_kernel(const Tensor& self, const Tensor& mask,
   if (mask.dtype() != DType::Bool) {
     TP_THROW(TypeError, "masked_fill only supports boolean masks");
   }
-  return whereOp(mask, value, self);
+  if (value.dim() != 0) {
+    TP_THROW(RuntimeError,
+             "masked_fill only supports a 0-dimensional value tensor, but got tensor with ",
+             value.dim(), " dimension(s).");
+  }
+  return masked_fill_kernel(self, mask, value.item());
 }
 
 Tensor& masked_fill_tensor__kernel(Tensor& self, const Tensor& mask,
