@@ -702,44 +702,13 @@ Tensor scaled_dot_product_attention_kernel(
           : v_key.image(barrier, api::PipelineStage::COMPUTE),
       qk_params.buffer());
 
-  // Stage 2: softmax over the key axis.  The scores tensor reads as a
-  // [B, Hq, Sq, Skv] channel-packed image, so the key walk is the texel x
-  // axis; per-row statistics run in the accumulate dtype of the payload.
-  api::vTensor v_probs{
-      context,
-      v_scores.sizes(),
-      query.dtype(),
-      api::StorageType::TEXTURE_3D,
-      api::GPUMemoryLayout::TENSOR_CHANNELS_PACKED,
-  };
-
-  const struct SoftmaxBlock final {
-    ivec4 sizes;
-    int c_depth;
-    int axis;
-  } softmax_block{
-      make_whcn_ivec4(v_scores.sizes()),
-      sdpa_plane_div4(Hq),
-      0,
-  };
-
-  api::UniformParamsBuffer softmax_params(context, softmax_block);
-  api::PipelineBarrier softmax_barrier{};
-  context->submit_compute_job(
-      kernel_for("sdpa_softmax", query.dtype()),
-      softmax_barrier,
-      v_probs.extents(),
-      adaptive_work_group_size(v_probs.extents()),
-      VK_NULL_HANDLE,
-      v_probs.image(
-          softmax_barrier, api::PipelineStage::COMPUTE,
-          api::MemoryAccessType::WRITE),
-      v_scores.image(softmax_barrier, api::PipelineStage::COMPUTE),
-      softmax_params.buffer());
-
-  // Stage 3: output.  The probability lanes ride the query heads exactly
-  // as stage 1 laid them out, so the group mapping matches the value
-  // planes without an epilogue relayout.
+  // Stage 2: output.  Softmax over the key axis is fused into this walk:
+  // the shaders derive the per-row statistics from the scores of the row
+  // (the key walk is the texel x axis of a channel-packed [B, Hq, Sq, Skv]
+  // image) and accumulate the normalized weights against the value.
+  // The probability lanes ride the query heads exactly as stage 1 laid
+  // them out, so the group mapping matches the value planes without an
+  // epilogue relayout.
   api::vTensor v_output{
       context,
       {B, Hq, Sq, D},
@@ -781,7 +750,7 @@ Tensor scaled_dot_product_attention_kernel(
       v_output.image(
           pv_barrier, api::PipelineStage::COMPUTE,
           api::MemoryAccessType::WRITE),
-      v_probs.image(pv_barrier, api::PipelineStage::COMPUTE),
+      v_scores.image(pv_barrier, api::PipelineStage::COMPUTE),
       v_value.image(pv_barrier, api::PipelineStage::COMPUTE),
       pv_params.buffer());
 

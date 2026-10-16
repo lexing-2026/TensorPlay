@@ -65,6 +65,12 @@ void main() {
   const int sk = pos.x;
   const int sq = pos.y;
   const int plane = pos.z;
+  if (uBlock.is_causal != 0 && sk > sq) {
+    // Top-left aligned causal: query position t attends keys <= t.  The
+    // masked half stores the clamp sentinel and skips the walk over D.
+    imageStore(uScores, pos, vec4(-1.0e30f));
+    return;
+  }
   const int batch = plane / uBlock.q_c_depth;
   const int c4 = plane - batch * uBlock.q_c_depth;
 

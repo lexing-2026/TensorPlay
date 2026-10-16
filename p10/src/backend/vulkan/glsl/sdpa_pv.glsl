@@ -6,9 +6,9 @@
 
 layout(std430) buffer;
 
-// Second SDPA stage: O = P V.
+// Second SDPA stage: O = softmax(S) V, fused.
 //
-// The probabilities tensor [B, Hq, Sq, Skv] is channel-packed: extents
+// The score tensor [B, Hq, Sq, Skv] is channel-packed: extents
 // {Skv, Sq, B * ceil(Hq/4)} (x walks the memory sequence position, y the
 // query position, lanes hold four query heads).  The value tensor
 // [B, Hkv, Skv, D] is {D, Skv, B * ceil(Hkv/4)} (x walks the head
@@ -17,13 +17,17 @@ layout(std430) buffer;
 // the lanes instead.
 //
 // One invocation computes one output position (query row, head-dim element)
-// for all four query heads in its z group by summing over the memory
-// positions; each lane accumulates its own head's probability-weighted
-// value.  Group-query attention maps every query head lane onto its kv
-// head's value texel exactly like the first stage does; when all four
-// lanes land in one texel a single fetch serves the whole group.
+// for all four query heads in its z group.  The row statistics (max and
+// exponential sum) are derived by walking the score row first, the second
+// walk multiplies each normalized weight by its value texel.  A lane whose
+// sum is zero - every entry of the row was masked - emits zeros instead of
+// the 0/0 the plain formula would produce.
+//
+// Group-query attention maps every query head lane onto its kv head's
+// value texel exactly like the first stage does; when all four lanes land
+// in one texel a single fetch serves the whole group.
 layout(set = 0, binding = 0, FORMAT) uniform PRECISION restrict writeonly image3D uOutput;
-layout(set = 0, binding = 1) uniform PRECISION sampler3D uProbs;
+layout(set = 0, binding = 1) uniform PRECISION sampler3D uScores;
 layout(set = 0, binding = 2) uniform PRECISION sampler3D uValue;
 layout(set = 0, binding = 3) uniform PRECISION restrict Block {
   ivec4 extents;      // (D, Sq, B*ceil(Hq/4), unused) of the output image
@@ -42,6 +46,16 @@ layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
 
 float lane_of(const vec4 v, const int idx) {
   return idx == 0 ? v.x : (idx == 1 ? v.y : (idx == 2 ? v.z : v.w));
+}
+
+// Substitutes one for a zero sum so the division stays finite; the shifted
+// exponentials of such a row are all zero already.
+vec4 safe_denom(const vec4 s) {
+  return vec4(
+      s.x == 0.0f ? 1.0f : s.x,
+      s.y == 0.0f ? 1.0f : s.y,
+      s.z == 0.0f ? 1.0f : s.z,
+      s.w == 0.0f ? 1.0f : s.w);
 }
 
 void main() {
@@ -66,9 +80,21 @@ void main() {
     kv_planes[i] = batch * uBlock.kv_c_depth + kv_heads[i] / 4;
   }
 
+  // Row statistics per head lane over the Skv walk.
+  vec4 vmax = vec4(-3.0e38f);
+  for (int sk = 0; sk < uBlock.seq_len; ++sk) {
+    vmax = max(vmax, texelFetch(uScores, ivec3(sk, sq, plane), 0));
+  }
+  vec4 vsum = vec4(0.0f);
+  for (int sk = 0; sk < uBlock.seq_len; ++sk) {
+    vsum += exp(texelFetch(uScores, ivec3(sk, sq, plane), 0) - vmax);
+  }
+  const vec4 denom = safe_denom(vsum);
+
   vec4 acc = vec4(0.0f);
   for (int sk = 0; sk < uBlock.seq_len; ++sk) {
-    const vec4 p = texelFetch(uProbs, ivec3(sk, sq, plane), 0);
+    const vec4 p =
+        exp(texelFetch(uScores, ivec3(sk, sq, plane), 0) - vmax) / denom;
     if (kv_planes[0] == kv_planes[1] && kv_planes[0] == kv_planes[2] &&
         kv_planes[0] == kv_planes[3]) {
       const vec4 v = texelFetch(uValue, ivec3(d, sk, kv_planes[0]), 0);
