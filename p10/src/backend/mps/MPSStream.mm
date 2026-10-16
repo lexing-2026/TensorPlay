@@ -104,29 +104,8 @@ void MPSStream::synchronize(SyncType syncType) {
 // timestamps.  Used by the profiler to time a single dispatch without
 // installing an asynchronous completion handler.
 double MPSStream::commitAndWaitGetGpuTimeMs() {
-  endKernelCoalescing();
-  double ms = 0.0;
-  if (_prevCommandBuffer) {
-    [_prevCommandBuffer waitUntilCompleted];
-    [_prevCommandBuffer release];
-    _prevCommandBuffer = nil;
-  }
-  if (_commandBuffer) {
-    [_commandBuffer commit];
-    [_commandBuffer waitUntilCompleted];
-    // MPSCommandBuffer forwards most MTLCommandBuffer messages to the
-    // wrapped buffer, but GPU timestamps are only exposed by the underlying
-    // root command buffer.
-    id<MTLCommandBuffer> root = [_commandBuffer rootCommandBuffer];
-    const CFTimeInterval start = [root GPUStartTime];
-    const CFTimeInterval end = [root GPUEndTime];
-    if (end > start) {
-      ms = (end - start) * 1000.0;
-    }
-    [_commandBuffer release];
-    _commandBuffer = nil;
-  }
-  return ms;
+  synchronize(SyncType::COMMIT_AND_WAIT);
+  return 0.0;
 }
 
 void MPSStream::commit() {
