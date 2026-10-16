@@ -345,7 +345,7 @@ class TestMPSAllAny(unittest.TestCase):
         f = tp.zeros((2, 3), dtype=tp.bool, device="mps")
         self.assertTrue(tp.all(t).item())
         self.assertFalse(tp.all(f).item())
-        self.assertTrue(tp.any(f).item())
+        self.assertFalse(tp.any(f).item())
         self.assertTrue(tp.all(t, dim=1).cpu().all().item())
 
 
