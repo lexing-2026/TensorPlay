@@ -229,26 +229,25 @@ class TestMPSFusedSGD(unittest.TestCase):
                        maximize=False, is_first_step=False)
         return p.cpu()
 
-    def test_sgd_no_momentum(self):
+    def _mps_vs_cpu(self, momentum, nesterov=False):
+        # The fused op updates p in place, so the CPU reference must start
+        # from copies of the original parameters and gradients.
         p = tp.randn(6, device="mps")
         g = tp.randn(6, device="mps")
-        p_mps = self._step("mps", 0.0, p=p, g=g)
-        p_cpu = self._step("cpu", 0.0, p=p.cpu(), g=g.cpu())
-        self.assertTrue(close(p_mps, p_cpu, 1e-4))
+        p_ref = p.cpu().clone()
+        g_ref = g.cpu().clone()
+        p_mps = self._step("mps", momentum, nesterov, p=p, g=g)
+        p_cpu = self._step("cpu", momentum, nesterov, p=p_ref, g=g_ref)
+        return close(p_mps, p_cpu, 1e-4)
+
+    def test_sgd_no_momentum(self):
+        self.assertTrue(self._mps_vs_cpu(0.0))
 
     def test_sgd_momentum(self):
-        p = tp.randn(6, device="mps")
-        g = tp.randn(6, device="mps")
-        p_mps = self._step("mps", 0.9, p=p, g=g)
-        p_cpu = self._step("cpu", 0.9, p=p.cpu(), g=g.cpu())
-        self.assertTrue(close(p_mps, p_cpu, 1e-4))
+        self.assertTrue(self._mps_vs_cpu(0.9))
 
     def test_sgd_nesterov(self):
-        p = tp.randn(6, device="mps")
-        g = tp.randn(6, device="mps")
-        p_mps = self._step("mps", 0.9, True, p=p, g=g)
-        p_cpu = self._step("cpu", 0.9, True, p=p.cpu(), g=g.cpu())
-        self.assertTrue(close(p_mps, p_cpu, 1e-4))
+        self.assertTrue(self._mps_vs_cpu(0.9, True))
 
 
 @unittest.skipUnless(mps_available(), "MPS not available")

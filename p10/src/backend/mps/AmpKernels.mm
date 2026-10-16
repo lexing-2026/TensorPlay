@@ -171,6 +171,9 @@ void dispatch_amp_multi(const std::string& kernel_name,
                        threadsPerThreadgroup:threadGroupSize];
       }
       mpsStream->endKernelCoalescing();
+      // These AMP ops mutate tensors in place; the caller may read the
+      // results immediately, so flush and wait before returning.
+      mpsStream->synchronize(SyncType::COMMIT_AND_WAIT);
     }
   });
 }
@@ -212,6 +215,8 @@ void amp_non_finite_check_and_unscale_single_impl(const Tensor& scaled_grad,
       [computeEncoder dispatchThreads:gridSize
                  threadsPerThreadgroup:threadGroupSize];
       mpsStream->endKernelCoalescing();
+      // Flush and wait so the copy-back below reads updated data.
+      mpsStream->synchronize(SyncType::COMMIT_AND_WAIT);
     }
   });
 
