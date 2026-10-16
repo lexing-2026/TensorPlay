@@ -3,6 +3,7 @@
 #include "Exception.h"
 #include "TypePromotion.h"
 #include "OperationUtils.h"
+#include "DistributionDispatch.h"
 
 #include "backend/mps/MPSDevice.h"
 #include "backend/mps/MPSStream.h"
@@ -281,21 +282,11 @@ Tensor batch_norm_kernel(const Tensor& input,
     bias_c = materializeForGraph(*bias_opt);
   }
 
-  // Batch statistics buffers (float32) used to refresh running stats.
-  Tensor batch_mean;
-  Tensor batch_var;
-  if (training) {
-    batch_mean = Tensor({C}, DType::Float32, input.device());
-    batch_var = Tensor({C}, DType::Float32, input.device());
-  }
-
   @autoreleasepool {
     MPSGraph* graph = [[MPSGraph new] autorelease];
     MPSShape* inShape = getMPSShape(out_shape);
     MPSShape* meanShape = getMPSShape(mean_shape);
-    MPSShape* cShape = getMPSShape(std::vector<int64_t>{C});
     const MPSDataType dt = getMPSDataType(input_c.dtype());
-    const MPSDataType f32 = MPSDataTypeFloat32;
 
     MPSGraphTensor* x = [graph placeholderWithShape:inShape
                                           dataType:dt
@@ -380,24 +371,7 @@ Tensor batch_norm_kernel(const Tensor& input,
     NSMutableDictionary* results =
         [NSMutableDictionary dictionaryWithObjectsAndKeys:outData, outT, nil];
 
-    if (training) {
-      MPSGraphTensor* meanF32 = ([mean0 dataType] == f32)
-          ? mean0
-          : [graph castTensor:mean0 toType:f32 name:@"cast_mean"];
-      MPSGraphTensor* varF32 = ([var0 dataType] == f32)
-          ? var0
-          : [graph castTensor:var0 toType:f32 name:@"cast_var"];
-      MPSGraphTensorData* meanData =
-          [[[MPSGraphTensorData alloc] initWithMTLBuffer:mtlBufferOf(batch_mean)
-                                                  shape:cShape
-                                               dataType:f32] autorelease];
-      MPSGraphTensorData* varData =
-          [[[MPSGraphTensorData alloc] initWithMTLBuffer:mtlBufferOf(batch_var)
-                                                  shape:cShape
-                                               dataType:f32] autorelease];
-      results[meanF32] = meanData;
-      results[varF32] = varData;
-    } else {
+    if (!training) {
       Tensor rm_c = materializeForGraph(*running_mean_opt);
       Tensor rv_c = materializeForGraph(*running_var_opt);
       MPSGraphTensorData* rmData =
@@ -434,19 +408,30 @@ Tensor batch_norm_kernel(const Tensor& input,
     const int64_t count = input.numel() / C;
     const double unbiased = count > 1.0 ? count / (count - 1.0) : 1.0;
     std::vector<double> mean(C), var(C);
-    if (batch_mean.dtype() == DType::Float32) {
-      const float* mp = batch_mean.data_ptr<float>();
-      const float* vp = batch_var.data_ptr<float>();
+    // The graph has completed (COMMIT_AND_WAIT), so the per-channel batch
+    // statistics can be derived from the input through the unified-memory
+    // mapping to refresh the running statistics.
+    {
+      const int64_t n_batch = input.size(0);
+      const int64_t spatial =
+          (n_batch > 0) ? count / n_batch : 0;
+      std::vector<double> sum(static_cast<size_t>(C), 0.0);
+      std::vector<double> sumsq(static_cast<size_t>(C), 0.0);
+      distribution::dispatch_dtype(input.dtype(), [&](auto tag) {
+        using scalar_t = decltype(tag);
+        const scalar_t* data = input_c.data_ptr<scalar_t>();
+        const int64_t numel = input.numel();
+        for (int64_t i = 0; i < numel; ++i) {
+          const int64_t c = (i / spatial) % C;
+          const double v = static_cast<double>(data[i]);
+          sum[static_cast<size_t>(c)] += v;
+          sumsq[static_cast<size_t>(c)] += v * v;
+        }
+      });
       for (int64_t c = 0; c < C; ++c) {
-        mean[c] = mp[c];
-        var[c] = vp[c];
-      }
-    } else {
-      const double* mp = batch_mean.data_ptr<double>();
-      const double* vp = batch_var.data_ptr<double>();
-      for (int64_t c = 0; c < C; ++c) {
-        mean[c] = mp[c];
-        var[c] = vp[c];
+        mean[c] = sum[static_cast<size_t>(c)] / static_cast<double>(count);
+        var[c] = sumsq[static_cast<size_t>(c)] / static_cast<double>(count) -
+                mean[c] * mean[c];
       }
     }
     Tensor rm = *running_mean_opt;
