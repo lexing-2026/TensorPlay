@@ -92,6 +92,10 @@ class P10_API MPSStream {
                        SyncType syncType = SyncType::NONE);
   void addCompletedHandler(MTLCommandBufferHandler block);
 
+  // Commits the current command buffer, waits for completion, and returns
+  // the GPU duration in milliseconds from the command buffer timestamps.
+  double commitAndWaitGetGpuTimeMs();
+
   /// Get the MPS device index that this stream is associated with.
   int device_index() const {
     return _stream.device_index();

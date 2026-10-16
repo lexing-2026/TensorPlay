@@ -5,13 +5,13 @@
 // MPS exposes no cudaEvent-style stream markers with GPU timestamps, so the
 // per-op GPU window is read from the Metal command buffer boundary instead:
 // while g_gpu_timing is active, each profiled MPS dispatch commits its
-// MPSCommandBuffer (commit-and-continue) at close() and reads the committed
-// buffer's GPUStartTime/GPUEndTime in its completion handler.  This yields a
-// per-op GPU duration at the cost of one commit per op, which is paid only
-// inside an active gpu_timing session -- the dispatch hot path outside a
-// session costs the same single acquire-load of g_gpu_timing as the CUDA
-// lane.  The completion handler runs asynchronously; gpu_resolve_all waits
-// for every in-flight handler (bounded) before writing gpu_ms into events.
+// MPSCommandBuffer and waits for completion inside GpuTimerPair::close,
+// reading the committed buffer's GPUStartTime/GPUEndTime synchronously.
+// This yields a per-op GPU duration at the cost of one commit-and-wait per
+// op, which is paid only inside an active gpu_timing session -- the dispatch
+// hot path outside a session costs the same single acquire-load of
+// g_gpu_timing as the CUDA lane.  The resolved pairs are consumed by
+// gpu_resolve_all when the session stops.
 
 #include "Profiler.h"
 #include "Exception.h"
@@ -39,12 +39,10 @@ namespace prof {
 namespace {
 
 std::mutex g_mps_mutex;
-// Pairs collected by completion handlers, awaiting gpu_resolve_all.  Slots
-// are stable for the session (append-only event vector), so a handler can
+// Pairs collected by GpuTimerPair::close, consumed by gpu_resolve_all.
+// Slots are stable for the session (append-only event vector), so a pair can
 // safely record the slot it was created for.  Each pair carries the session
-// epoch it was created in; gpu_resolve_all only consumes its own epoch, so
-// a handler that lands after a timed-out stop can never write into a later
-// session's events.
+// epoch it was created in; gpu_resolve_all only consumes its own epoch.
 struct PendingPair {
     size_t slot;
     int device;
@@ -52,27 +50,11 @@ struct PendingPair {
     uint64_t epoch;
 };
 std::vector<PendingPair>* g_pending = nullptr;
-// Number of completion handlers that have not yet run.  gpu_resolve_all
-// waits on this reaching zero (with a timeout) so the events vector is only
-// touched after every in-flight command buffer has completed.
-std::atomic<int> g_pending_count{0};
-std::condition_variable g_pending_cv;
 // Monotonic session epoch; incremented by gpu_resolve_all.
 std::atomic<uint64_t> g_epoch{0};
 
 void ensure_pending_locked() {
     if (!g_pending) g_pending = new std::vector<PendingPair>();
-}
-
-uint64_t resolve_timeout_ms() {
-    // A bounded wait turns a hung Metal command buffer into a profile with
-    // missing GPU fields instead of an unkillable profiler stop.
-    const char* raw = std::getenv("TP_PROFILER_GPU_TIMEOUT_MS");
-    if (!raw || !*raw) return 5000;
-    char* end = nullptr;
-    const unsigned long long value = std::strtoull(raw, &end, 10);
-    if (end == raw || *end != '\0') return 5000;
-    return static_cast<uint64_t>(value);
 }
 
 } // namespace
@@ -110,43 +92,15 @@ void GpuTimerPair::close() {
 
     const size_t slot = rec_.slot_;
     const uint64_t epoch = g_epoch.load(std::memory_order_relaxed);
-    {
-        std::lock_guard<std::mutex> lock(g_mps_mutex);
-        ensure_pending_locked();
-    }
-    // Increment before installing the handler: Metal may invoke a completed
-    // command buffer's handler synchronously inside addCompletedHandler, and
-    // the decrement must always have a matching increment.
-    g_pending_count.fetch_add(1, std::memory_order_relaxed);
-    @try {
-        stream->addCompletedHandler(^(id<MTLCommandBuffer> cb) {
-            float ms = 0.f;
-            if (cb.GPUEndTime > cb.GPUStartTime) {
-                ms = static_cast<float>((cb.GPUEndTime - cb.GPUStartTime) * 1000.0);
-            }
-            std::lock_guard<std::mutex> lock(g_mps_mutex);
-            if (g_pending) g_pending->push_back({slot, device, ms, epoch});
-            if (g_pending_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                g_pending_cv.notify_all();
-            }
-        });
-        // Commit the command buffer so the completion handler above fires
-        // once this op's encoded work has executed, and wait for it here.
-        // The stream runs with commit-and-continue disabled; waiting in
-        // close() keeps the handler lifetime bounded to this op and avoids
-        // leaving committed buffers for the stop path to chase.
-        stream->synchronize(mps::SyncType::COMMIT_AND_WAIT);
-    } @catch (NSException* e) {
-        // A Metal failure here must surface as a normal runtime error
-        // rather than aborting the process from the profiler hot path.
-        g_pending_count.fetch_sub(1, std::memory_order_acq_rel);
-        std::string reason =
-            [e reason] ? std::string([[e reason] UTF8String])
-                       : std::string("unknown Metal exception");
-        throw tensorplay::RuntimeError(
-            {__FILE__, __func__, __LINE__},
-            tensorplay::detail::format_msg("MPS profiler close failed: ", reason));
-    }
+    // Commit the op's command buffer and wait for it, reading the GPU
+    // duration directly from the command buffer timestamps.  This avoids
+    // installing an asynchronous completion handler on the MPS command
+    // buffer, which Metal rejects in this stream configuration.
+    const float ms = static_cast<float>(
+        stream->commitAndWaitGetGpuTimeMs());
+    std::lock_guard<std::mutex> lock(g_mps_mutex);
+    ensure_pending_locked();
+    g_pending->push_back({slot, device, ms, epoch});
 }
 
 // Binding-layer resolution API.
@@ -154,13 +108,9 @@ TENSORPLAY_API void gpu_resolve_all(
         std::vector<Event>& events,
         const std::function<void(Event&, float ms)>& emit) {
     const uint64_t epoch = g_epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
-    const auto deadline = std::chrono::steady_clock::now() +
-                          std::chrono::milliseconds(resolve_timeout_ms());
-    std::unique_lock<std::mutex> lock(g_mps_mutex);
-    g_pending_cv.wait(lock, [&] {
-        return g_pending_count.load(std::memory_order_acquire) == 0 ||
-               std::chrono::steady_clock::now() >= deadline;
-    });
+    // MPS pairs are pushed synchronously by GpuTimerPair::close, so no wait
+    // is needed here; consume every pair created in this session's epoch.
+    std::lock_guard<std::mutex> lock(g_mps_mutex);
     if (!g_pending) return;
     for (const auto& p : *g_pending) {
         if (p.epoch != epoch) continue;  // stale from a timed-out session
@@ -177,7 +127,6 @@ TENSORPLAY_API void gpu_resolve_all(
 TENSORPLAY_API void gpu_drain_pool() {
     std::lock_guard<std::mutex> lock(g_mps_mutex);
     if (g_pending) g_pending->clear();
-    g_pending_cv.notify_all();
 }
 
 } // namespace prof
