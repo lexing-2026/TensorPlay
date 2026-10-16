@@ -469,6 +469,69 @@ Tensor rotary_embedding_kernel(
   return convert(v_output);
 }
 
+Tensor scaled_dot_product_attention_kernel(
+    const Tensor& query,
+    const Tensor& key,
+    const Tensor& value,
+    const std::optional<Tensor>& attn_mask_opt,
+    double dropout_p,
+    bool is_causal,
+    std::optional<double> scale_opt,
+    bool enable_gqa) {
+  TP_CHECK(
+      query.dtype() == DType::Float32 && key.dtype() == DType::Float32 &&
+          value.dtype() == DType::Float32,
+      "Vulkan sdpa supports Float32 tensors only");
+  TP_CHECK(
+      query.dim() == 4 && key.dim() == 4 && value.dim() == 4,
+      "Vulkan sdpa expects 4-D [B, H, S, D] tensors");
+  TP_CHECK(
+      query.size(2) == key.size(2) && query.size(3) == key.size(3),
+      "Vulkan sdpa: query/key shape mismatch");
+  TP_CHECK(
+      dropout_p == 0.0, "Vulkan sdpa does not support dropout yet");
+  TP_CHECK(
+      !enable_gqa, "Vulkan sdpa does not support GQA yet");
+  if (attn_mask_opt.has_value()) {
+    TP_CHECK(
+        attn_mask_opt->dtype() == DType::Float32,
+        "Vulkan sdpa supports Float32 attention masks only");
+  }
+
+  // Composite implementation reusing the validated Vulkan primitives:
+  //   out = softmax((Q @ K^T) * scale) @ V
+  // The batched-product path reads [B*H, S, D] tensors whose batch lane
+  // matches the head layout, so batch size 1 (the LLM decode case) works
+  // with any number of heads.
+  const int64_t B = query.size(0);
+  const int64_t H = query.size(1);
+  const int64_t S = query.size(2);
+  const int64_t D = query.size(3);
+  const double scale =
+      scale_opt.value_or(1.0 / std::sqrt(static_cast<double>(D)));
+
+  TP_CHECK(
+      B == 1, "Vulkan sdpa composite path supports batch size 1 only");
+  TP_CHECK(!is_causal, "Vulkan sdpa causal masking is not implemented yet");
+  TP_CHECK(
+      !attn_mask_opt.has_value(),
+      "Vulkan sdpa additive masks are not implemented yet");
+
+  Tensor q3 = query.reshape(std::vector<int64_t>{B * H, S, D});
+  Tensor k3 = key.reshape(std::vector<int64_t>{B * H, S, D});
+  Tensor v3 = value.reshape(std::vector<int64_t>{B * H, S, D});
+  Tensor kt = dispatch_vk<Tensor>(
+      "transpose", k3, int64_t(1), int64_t(2));
+  Tensor scores = dispatch_vk<Tensor>("bmm", q3, kt);
+  scores = dispatch_vk<Tensor>(
+      "mul.Scalar", scores, Scalar(scale), Scalar(1));
+  Tensor probs = dispatch_vk<Tensor>(
+      "softmax", scores, static_cast<int64_t>(-1), DType::Float32);
+  Tensor out3 = dispatch_vk<Tensor>("bmm", probs, v3);
+  return out3.reshape(std::vector<int64_t>{B, H, S, D});
+
+}
+
 } // namespace ops
 } // namespace vulkan
 } // namespace tensorplay
@@ -484,6 +547,9 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, LlmKernels) {
   m.impl("silu_mul", &tensorplay::vulkan::ops::silu_mul_kernel);
   m.impl("silu_and_mul", &tensorplay::vulkan::ops::silu_and_mul_kernel);
   m.impl("rotary_embedding", &tensorplay::vulkan::ops::rotary_embedding_kernel);
+  m.impl(
+      "scaled_dot_product_attention",
+      &tensorplay::vulkan::ops::scaled_dot_product_attention_kernel);
 }
 
 #endif /* USE_VULKAN */
