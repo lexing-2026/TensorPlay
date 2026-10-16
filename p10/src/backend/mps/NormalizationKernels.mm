@@ -282,8 +282,13 @@ Tensor batch_norm_kernel(const Tensor& input,
     bias_c = materializeForGraph(*bias_opt);
   }
 
+  // Retained instead of autoreleased: the graph must stay alive until after
+  // the command buffer fully completes, and the pool drains before the
+  // host-side running-stats update below.
+  MPSGraph* graph = nil;
+
   @autoreleasepool {
-    MPSGraph* graph = [[MPSGraph new] autorelease];
+    graph = [[MPSGraph new] retain];
     MPSShape* inShape = getMPSShape(out_shape);
     MPSShape* meanShape = getMPSShape(mean_shape);
     const MPSDataType dt = getMPSDataType(input_c.dtype());
@@ -435,6 +440,7 @@ Tensor batch_norm_kernel(const Tensor& input,
       }
     }
   }
+  [graph release];
   return output;
 }
 
