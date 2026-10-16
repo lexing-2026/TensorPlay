@@ -130,12 +130,12 @@ void GpuTimerPair::close() {
                 g_pending_cv.notify_all();
             }
         });
-        // Commit the command buffer so the completion handler above fires once
-        // this op's encoded work has executed.  The stream runs with
-        // commit-and-continue disabled, so a plain COMMIT (flush) is used: the
-        // handler was attached before the commit, and the stream is left
-        // with a nil command buffer ready for the next dispatch.
-        stream->synchronize(mps::SyncType::COMMIT);
+        // Commit the command buffer so the completion handler above fires
+        // once this op's encoded work has executed, and wait for it here.
+        // The stream runs with commit-and-continue disabled; waiting in
+        // close() keeps the handler lifetime bounded to this op and avoids
+        // leaving committed buffers for the stop path to chase.
+        stream->synchronize(mps::SyncType::COMMIT_AND_WAIT);
     } @catch (NSException* e) {
         // A Metal failure here must surface as a normal runtime error
         // rather than aborting the process from the profiler hot path.
