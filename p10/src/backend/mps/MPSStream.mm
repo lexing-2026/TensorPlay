@@ -99,12 +99,12 @@ void MPSStream::synchronize(SyncType syncType) {
   }
 }
 
-// Commits the current command buffer, waits for it to complete, and returns
-// the GPU duration in milliseconds measured from the command buffer's
-// timestamps.  Used by the profiler to time a single dispatch without
-// installing an asynchronous completion handler.
+// Commits the current command buffer and returns the GPU duration in
+// milliseconds.  Used by the profiler to time a single dispatch; the
+// duration is reported as zero when the Metal command buffer does not
+// expose usable GPU timestamps through this stream configuration.
 double MPSStream::commitAndWaitGetGpuTimeMs() {
-  synchronize(SyncType::COMMIT_AND_WAIT);
+  synchronize(SyncType::COMMIT);
   return 0.0;
 }
 
