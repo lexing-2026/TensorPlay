@@ -739,7 +739,9 @@ Tensor scaled_dot_product_attention_kernel(
                                        secondaryTensor:kT
                                                   name:@"scores"];
     MPSGraphTensor* scaleTensor =
-        [graph constantWithScalar:scale_factor dataType:mtl_dt];
+        [graph constantWithScalar:scale_factor
+                            shape:getMPSShape({1})
+                         dataType:mtl_dt];
     scores = [graph multiplicationWithPrimaryTensor:scores
                                      secondaryTensor:scaleTensor
                                                 name:@"scaled"];
