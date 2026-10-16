@@ -65,15 +65,24 @@ void fill_shader_impl(Tensor& self, T value) {
   MPSStream* mpsStream = getCurrentMPSStream();
   dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
     @autoreleasepool {
-      id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
-      const std::string kernel = "fill_" + scalarToMetalTypeString(self.dtype());
-      id<MTLComputePipelineState> PSO =
-          MetalShaderLibrary::getBundledLibrary().getPipelineStateForFunc(
-              kernel);
-      [computeEncoder setComputePipelineState:PSO];
-      mtl_setArgs(computeEncoder, self, value, numel);
-      mtl_dispatch1DJob(computeEncoder, PSO, static_cast<NSUInteger>(numel));
-      mpsStream->endKernelCoalescing();
+      @try {
+        id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
+        const std::string kernel = "fill_" + scalarToMetalTypeString(self.dtype());
+        id<MTLComputePipelineState> PSO =
+            MetalShaderLibrary::getBundledLibrary().getPipelineStateForFunc(
+                kernel);
+        [computeEncoder setComputePipelineState:PSO];
+        mtl_setArgs(computeEncoder, self, value, numel);
+        mtl_dispatch1DJob(computeEncoder, PSO, static_cast<NSUInteger>(numel));
+        mpsStream->endKernelCoalescing();
+      } @catch (NSException* e) {
+        std::string reason =
+            [e reason] ? std::string([[e reason] UTF8String])
+                       : std::string("unknown Metal exception");
+        throw tensorplay::RuntimeError(
+            {__FILE__, __func__, __LINE__},
+            tensorplay::detail::format_msg("MPS fill shader failed: ", reason));
+      }
     }
   });
 }

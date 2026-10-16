@@ -117,23 +117,35 @@ void GpuTimerPair::close() {
     // command buffer's handler synchronously inside addCompletedHandler, and
     // the decrement must always have a matching increment.
     g_pending_count.fetch_add(1, std::memory_order_relaxed);
-    stream->addCompletedHandler(^(id<MTLCommandBuffer> cb) {
-        float ms = 0.f;
-        if (cb.GPUEndTime > cb.GPUStartTime) {
-            ms = static_cast<float>((cb.GPUEndTime - cb.GPUStartTime) * 1000.0);
-        }
-        std::lock_guard<std::mutex> lock(g_mps_mutex);
-        if (g_pending) g_pending->push_back({slot, device, ms, epoch});
-        if (g_pending_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-            g_pending_cv.notify_all();
-        }
-    });
-    // Commit the command buffer so the completion handler above fires once
-    // this op's encoded work has executed.  The stream runs with
-    // commit-and-continue disabled, so a plain COMMIT (flush) is used: the
-    // handler was attached before the commit, and the stream is left with a
-    // nil command buffer ready for the next dispatch.
-    stream->synchronize(mps::SyncType::COMMIT);
+    @try {
+        stream->addCompletedHandler(^(id<MTLCommandBuffer> cb) {
+            float ms = 0.f;
+            if (cb.GPUEndTime > cb.GPUStartTime) {
+                ms = static_cast<float>((cb.GPUEndTime - cb.GPUStartTime) * 1000.0);
+            }
+            std::lock_guard<std::mutex> lock(g_mps_mutex);
+            if (g_pending) g_pending->push_back({slot, device, ms, epoch});
+            if (g_pending_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                g_pending_cv.notify_all();
+            }
+        });
+        // Commit the command buffer so the completion handler above fires once
+        // this op's encoded work has executed.  The stream runs with
+        // commit-and-continue disabled, so a plain COMMIT (flush) is used: the
+        // handler was attached before the commit, and the stream is left
+        // with a nil command buffer ready for the next dispatch.
+        stream->synchronize(mps::SyncType::COMMIT);
+    } @catch (NSException* e) {
+        // A Metal failure here must surface as a normal runtime error
+        // rather than aborting the process from the profiler hot path.
+        g_pending_count.fetch_sub(1, std::memory_order_acq_rel);
+        std::string reason =
+            [e reason] ? std::string([[e reason] UTF8String])
+                       : std::string("unknown Metal exception");
+        throw tensorplay::RuntimeError(
+            {__FILE__, __func__, __LINE__},
+            tensorplay::detail::format_msg("MPS profiler close failed: ", reason));
+    }
 }
 
 // Binding-layer resolution API.
