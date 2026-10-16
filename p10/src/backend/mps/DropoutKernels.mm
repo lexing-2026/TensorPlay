@@ -61,7 +61,7 @@ std::tuple<Tensor, Tensor> native_dropout_kernel(const Tensor& input, double p,
       mtl_setArgs(encoder, output, mask, input_c,
                   std::array<float, 2>{p_comp, scale},
                   std::array<long, 2>{seed, base_offset});
-      mtl_setBytes(encoder, numel_u32, 5);
+      mtl_setArgs<5>(encoder, numel_u32);
       mtl_dispatch1DJob(encoder, pso, (numel + 3) / 4);
       stream->synchronize(SyncType::COMMIT_AND_WAIT);
     }
