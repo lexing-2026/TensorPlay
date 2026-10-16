@@ -395,7 +395,7 @@ class TestMPSLosses(unittest.TestCase):
         self.assertAlmostEqual(total.item(), 2.0, places=5)
 
         loss0 = tp.nll_loss(log_probs, target, reduction=0)
-        self.assertEqual(loss0[0].cpu().tolist(), [0.5, 0.2])
+        self.assertTrue(tp.allclose(loss0[0].cpu(), tp.tensor([0.5, 0.2]), atol=1e-6).item())
 
         w = tp.tensor([2.0, 1.0, 1.0], dtype=tp.float32, device="mps")
         loss_w, total_w = tp.nll_loss(log_probs, target, weight=w)
