@@ -164,15 +164,25 @@ Tensor reductionOp(const Tensor& self, const std::vector<int64_t>& dims,
     for (int64_t a : axes) {
       [axesArray addObject:@(a)];
     }
+    // Reducing every axis with an explicit axes array trips an MPSGraph bug
+    // on older SDKs; use the nil-axes form (reduce all) for full reductions,
+    // matching the scalar-output reduction pattern used elsewhere.
+    const bool reduce_all = (static_cast<int64_t>(axes.size()) == self.dim());
     switch (kind) {
       case ReductionKind::SUM:
-        reduced = [graph reductionSumWithTensor:xc axes:axesArray name:nil];
+        reduced = reduce_all
+            ? [graph reductionSumWithTensor:xc axes:nil name:nil]
+            : [graph reductionSumWithTensor:xc axes:axesArray name:nil];
         break;
       case ReductionKind::PROD:
-        reduced = [graph reductionProductWithTensor:xc axes:axesArray name:nil];
+        reduced = reduce_all
+            ? [graph reductionProductWithTensor:xc axes:nil name:nil]
+            : [graph reductionProductWithTensor:xc axes:axesArray name:nil];
         break;
       case ReductionKind::MEAN:
-        reduced = [graph meanOfTensor:xc axes:axesArray name:nil];
+        reduced = reduce_all
+            ? [graph meanOfTensor:xc axes:nil name:nil]
+            : [graph meanOfTensor:xc axes:axesArray name:nil];
         break;
       case ReductionKind::MAX:
       case ReductionKind::MIN: {
@@ -445,8 +455,13 @@ Tensor varStdOp(const Tensor& self, const std::vector<int64_t>& dims,
     for (int64_t a : axes) {
       [axesArray addObject:@(a)];
     }
+    // Full reductions use the nil-axes form to avoid the explicit all-axes
+    // reduction bug on older SDKs (same rationale as reductionOp).
+    const bool reduce_all = (static_cast<int64_t>(axes.size()) == self.dim());
     MPSGraphTensor* variance =
-        [graph varianceOfTensor:x axes:axesArray name:nil];
+        reduce_all
+            ? [graph varianceOfTensor:x axes:nil name:nil]
+            : [graph varianceOfTensor:x axes:axesArray name:nil];
     MPSGraphTensor* corrected = variance;
     if (correction != 0) {
       MPSGraphTensor* besselTensor =
