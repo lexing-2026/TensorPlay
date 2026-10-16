@@ -104,11 +104,28 @@ bool equal_kernel(const Tensor& self, const Tensor& src) {
   return ops::item(ops::all(ops::eq(self, src))).to<bool>();
 }
 
+// ---------------------------------------------------------------------------
+// item
+//
+// Copies the single element to a CPU tensor through the unified-memory host
+// mapping (the CPU copy kernel handles MPS sources) and reads it back with
+// the CPU item kernel.
+// ---------------------------------------------------------------------------
+
+Scalar item_mps(const Tensor& self) {
+  if (self.numel() != 1) {
+    TP_THROW(ValueError, "item() only supported for 1-element tensors");
+  }
+  const Tensor host = self.to(Device(DeviceType::CPU));
+  return host.item();
+}
+
 TENSORPLAY_LIBRARY_IMPL(MPS, MiscKernels) {
   m.impl("logsumexp", logsumexp_kernel);
   m.impl("norm", norm_kernel);
   m.impl("norm.dim", norm_dim_kernel);
   m.impl("equal", equal_kernel);
+  m.impl("item", item_mps);
 }
 
 } // namespace mps
