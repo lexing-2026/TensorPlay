@@ -52,15 +52,6 @@ void main() {
   const int local_m = (pos.y % 8) * 4;
   const int local_n = (pos.x % 8) * 4;
 
-  // Per-channel zero points for this thread's four output columns.
-  int w_zp[4];
-  for (int c = 0; c < 4; ++c) {
-    const int n = wg_base_n + local_n + c;
-    w_zp[c] = n < uBlock.out_n
-        ? int(texelFetch(uParams, ivec3(n >> 2, 1, 0), 0)[n & 3])
-        : 0;
-  }
-
   int acc[4][4];
   for (int i = 0; i < 4; ++i) {
     for (int j = 0; j < 4; ++j) {
@@ -75,9 +66,16 @@ void main() {
       const int row = i / K_TEXELS;
       const int jtex = k_block + (i % K_TEXELS);
       const int g_row = wg_base_m + row;
-      const ivec4 v = (jtex < k_texels && g_row < uBlock.out_m)
+      ivec4 v = (jtex < k_texels && g_row < uBlock.out_m)
           ? texelFetch(uMat1, ivec3(jtex, g_row, 0), 0)
           : ivec4(0);
+      v -= ivec4(uBlock.input_zero_point);
+      // Center valid bytes once and make every padded lane neutral.
+      for (int lane = 0; lane < 4; ++lane) {
+        if (4 * jtex + lane >= uBlock.k || g_row >= uBlock.out_m) {
+          v[lane] = 0;
+        }
+      }
       const int kk = (i % K_TEXELS) * 4;
       sA[row][kk + 0] = v.x;
       sA[row][kk + 1] = v.y;
@@ -90,9 +88,12 @@ void main() {
       const int row = i / K_TEXELS;
       const int jtex = k_block + (i % K_TEXELS);
       const int g_col = wg_base_n + row;
-      const ivec4 v = (jtex < k_texels && g_col < uBlock.out_n)
+      const int w_zp = g_col < uBlock.out_n
+          ? int(texelFetch(uParams, ivec3(g_col >> 2, 1, 0), 0)[g_col & 3])
+          : 0;
+      const ivec4 v = ((jtex < k_texels && g_col < uBlock.out_n)
           ? texelFetch(uMat2, ivec3(g_col, jtex, 0), 0)
-          : ivec4(0);
+          : ivec4(0)) - ivec4(w_zp);
       const int kk = (i % K_TEXELS) * 4;
       sB[row][kk + 0] = v.x;
       sB[row][kk + 1] = v.y;
@@ -102,13 +103,11 @@ void main() {
 
     barrier();
 
-    // Padding bytes must not contribute after affine zero-point subtraction.
-    const int valid_k = min(TILE_K, uBlock.k - 4 * k_block);
-    for (int k = 0; k < valid_k; ++k) {
+    for (int k = 0; k < TILE_K; ++k) {
       for (int r = 0; r < 4; ++r) {
-        const int a = sA[local_m + r][k] - uBlock.input_zero_point;
+        const int a = sA[local_m + r][k];
         for (int c = 0; c < 4; ++c) {
-          acc[r][c] += a * (sB[local_n + c][k] - w_zp[c]);
+          acc[r][c] += a * sB[local_n + c][k];
         }
       }
     }

@@ -60,10 +60,45 @@ def test_quantized_linear_tiled(m, k, n, asymmetric, with_bias):
     out = tp._C.quantized_linear(
         xq, wq, x_scale, x_zp, scales, zero_points, bias, out_scale, out_zp
     )
+    assert out.dtype == tp.qint8
+    assert out.q_scale() == out_scale
+    assert out.q_zero_point() == out_zp
     acc = (x_codes - x_zp) @ (w_codes - w_zps[:, None]).T
     expected = np.clip(
         np.rint((acc * x_scale * w_scales + bias_values) / out_scale) + out_zp,
         -128,
         127,
     ).astype(np.int8)
+    np.testing.assert_array_equal(int_repr(out).cpu().numpy(), expected)
+
+
+@pytest.mark.parametrize("x_zp", [-128, 127])
+def test_quantized_linear_extreme_codes(x_zp):
+    x_codes = np.array(
+        [[-128, 127, 0, -1, 1], [127, -128, -1, 1, 0]], dtype=np.int32
+    )
+    w_codes = np.array(
+        [[127, -128, 1, 0, -1], [-128, 127, 0, -1, 1], [0, 1, -1, 127, -128]],
+        dtype=np.int32,
+    )
+    w_zps = np.array([-128, 127, 0], dtype=np.int32)
+    w_scales = np.array([1 / 256, 1 / 128, 1 / 64], dtype=np.float32)
+    x_scale = 0.125
+    x = tp.tensor((x_codes - x_zp) * x_scale, dtype=tp.float32).to("vulkan")
+    w = tp.tensor(w_codes, dtype=tp.float32).to("vulkan")
+    xq = tp._C.quantize_per_tensor(x, x_scale, x_zp, tp.qint8)
+    wq = tp._C.quantize_per_tensor(w, 1.0, 0, tp.qint8)
+    out = tp._C.quantized_linear(
+        xq,
+        wq,
+        x_scale,
+        x_zp,
+        tp.tensor(w_scales, dtype=tp.float32),
+        tp.tensor(w_zps, dtype=tp.int32),
+        None,
+        2.0,
+        0,
+    )
+    acc = (x_codes - x_zp) @ (w_codes - w_zps[:, None]).T
+    expected = np.clip(np.rint(acc * x_scale * w_scales / 2), -128, 127)
     np.testing.assert_array_equal(int_repr(out).cpu().numpy(), expected)
