@@ -53,8 +53,7 @@ class MPSCase(unittest.TestCase):
         if _is_exact(cpu_result.dtype):
             self.assertTrue(tp.all(got == cpu_result).item())
         else:
-            self.assertTrue(tp.allclose(got, cpu_result, rtol=1e-3,
-                                        atol=1e-4).item())
+            self.assertTrue(tp.allclose(got, cpu_result, rtol=1e-3, atol=1e-4))
 
     def assert_pair_op(self, lhs_shape, rhs_shape, fn, dtype=tp.float32):
         """`fn(a, b)` over a pair of reshaped ranges, MPS against CPU."""
