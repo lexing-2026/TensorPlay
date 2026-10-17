@@ -42,6 +42,7 @@ Tensor normalize_index(const Tensor& index, int64_t dim_size) {
   }
   idx = idx.contiguous();
   const int64_t n = idx.numel();
+  synchronizeHostAccess();
   const int64_t* p = idx.data_ptr<int64_t>();
   for (int64_t i = 0; i < n; ++i) {
     int64_t v = p[i];

@@ -110,6 +110,7 @@ Tensor& fill_kernel(Tensor& self, const Scalar& value) {
     const float v = static_cast<float>(value.toDouble());
     const float inverse = 1.0f / static_cast<float>(scale);
     const bool is_nan = std::isnan(v);
+    synchronizeHostAccess();
     void* data = self.data_ptr();
     switch (self.dtype()) {
       case DType::QInt8: {
@@ -189,6 +190,7 @@ Tensor& fill_kernel(Tensor& self, const Scalar& value) {
   }
   // Strided path: only contiguous tensors are expected in the skeleton
   // backend; non-contiguous views fall back to a flat walk over the storage.
+  synchronizeHostAccess();
   void* data = self.data_ptr();
   switch (self.dtype()) {
     case DType::Float32: {
@@ -252,6 +254,7 @@ Tensor& zero_inplace_kernel(Tensor& self) {
         break;
     }
   }
+  synchronizeHostAccess();
   void* data = self.data_ptr();
   if (self.is_contiguous()) {
     std::memset(data, 0, static_cast<size_t>(self.numel()) * self.itemsize());
@@ -288,6 +291,7 @@ Tensor zeros_kernel(const std::vector<int64_t>& size, DType dtype,
   }
   Tensor t(size, dtype, device);
   if (t.numel() > 0) {
+    synchronizeHostAccess();
     std::memset(t.data_ptr(), 0,
                 static_cast<size_t>(t.numel()) * t.itemsize());
   }
@@ -436,6 +440,7 @@ Tensor eye_kernel(int64_t n, int64_t m, DType dtype, Device device) {
   }
 
   // Host fallback for dtypes without a shader (double and complex).
+  synchronizeHostAccess();
   const int64_t min_dim = std::min(n, m);
   std::memset(t.data_ptr(), 0, static_cast<size_t>(n) * m * t.itemsize());
 #define EYE_CASE(ctype, name)                                            case DType::name: {                                                      ctype* data = t.data_ptr<ctype>();                                     for (int64_t i = 0; i < min_dim; ++i) data[i * m + i] = ctype(1);      break;                                                               }

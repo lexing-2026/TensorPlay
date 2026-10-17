@@ -266,6 +266,17 @@ void setCurrentMPSStream(MPSStream* stream) {
   tls_current_stream = stream;
 }
 
+void synchronizeHostAccess() {
+  MPSStream* stream = getCurrentMPSStream();
+  // Draining on the stream's own queue keeps the wait in step with the launches
+  // that are still being encoded.
+  dispatch_sync_with_rethrow(stream->queue(), ^() {
+    @autoreleasepool {
+      stream->synchronize(SyncType::COMMIT_AND_WAIT);
+    }
+  });
+}
+
 MPSStream* getStreamFromPool() {
   std::call_once(streamPoolOnce, initStreamPool);
   const uint32_t idx = streamPoolIndex.fetch_add(1, std::memory_order_relaxed);
