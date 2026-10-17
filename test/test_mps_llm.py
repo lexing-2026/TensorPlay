@@ -150,6 +150,24 @@ class TestMPSSDPA(unittest.TestCase):
         self.assertEqual(list(out.shape), [1, 2, 16, 64])
         self.assertTrue(close(out.cpu(), out_cpu, 1e-2))
 
+    def test_sdpa_causal_rectangular(self):
+        q = tp.randn(1, 2, 3, 8, device="mps")
+        k = tp.randn(1, 2, 5, 8, device="mps")
+        v = tp.randn(1, 2, 5, 8, device="mps")
+        out = tp.scaled_dot_product_attention(q, k, v, is_causal=True)
+        expected = tp.scaled_dot_product_attention(
+            q.cpu(), k.cpu(), v.cpu(), is_causal=True)
+        self.assertTrue(close(out.cpu(), expected, 1e-2))
+
+    def test_sdpa_gqa_graph(self):
+        q = tp.randn(1, 4, 4, 8, device="mps")
+        k = tp.randn(1, 2, 6, 8, device="mps")
+        v = tp.randn(1, 2, 6, 8, device="mps")
+        out = tp.scaled_dot_product_attention(q, k, v, enable_gqa=True)
+        expected = tp.scaled_dot_product_attention(
+            q.cpu(), k.cpu(), v.cpu(), enable_gqa=True)
+        self.assertTrue(close(out.cpu(), expected, 1e-2))
+
     def test_sdpa_2pass(self):
         q = tp.randn(1, 1, 4, 64, device="mps")
         k = tp.randn(1, 1, 1024, 64, device="mps")

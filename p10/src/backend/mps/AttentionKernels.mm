@@ -32,8 +32,7 @@ namespace {
 
 constexpr double kNegInf = -std::numeric_limits<double>::infinity();
 
-// Expands K/V heads to match Q heads for grouped-query attention by tiling
-// along the head dimension.
+// Repeats each K/V head for its group of query heads.
 Tensor expand_kv_heads(const Tensor& kv, int64_t q_heads) {
   const int64_t kv_heads = kv.size(1);
   if (kv_heads == q_heads) {
@@ -45,9 +44,7 @@ Tensor expand_kv_heads(const Tensor& kv, int64_t q_heads) {
              "== 0");
   }
   const int64_t factor = q_heads / kv_heads;
-  std::vector<int64_t> repeats(kv.dim(), 1);
-  repeats[1] = factor;
-  return ops::repeat(kv, repeats);
+  return ops::repeat_interleave(kv, factor, 1, std::nullopt);
 }
 
 // Builds an additive mask tensor for the attention scores.
@@ -63,7 +60,7 @@ Tensor build_attn_mask(const std::optional<Tensor>& attn_mask, bool is_causal,
     Tensor col = ops::arange(Scalar(S), DType::Int32, device);       // [S]
     Tensor col_v = ops::view(col, {1, S});
     Tensor row_v = ops::view(row, {L, 1});
-    Tensor causal = ops::ge(col_v, row_v);                    // [L, S]
+    Tensor causal = ops::le(col_v, row_v);                    // [L, S]
     mask = ops::where(causal, Tensor::full({}, 0.0, dtype, device),
                       Tensor::full({}, kNegInf, dtype, device));
   }
