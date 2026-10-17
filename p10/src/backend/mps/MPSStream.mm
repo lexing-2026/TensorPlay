@@ -234,6 +234,7 @@ void MPSStream::executeMPSGraph(MPSGraph* mpsGraph,
                                 SyncType syncType) {
   dispatch_sync_with_rethrow(_serialQueue, ^() {
     @autoreleasepool {
+      fprintf(stderr, "TP_PROF_DEBUG executeMPSGraph called\n");
       endKernelCoalescing();
       @try {
         [mpsGraph encodeToCommandBuffer:commandBuffer()

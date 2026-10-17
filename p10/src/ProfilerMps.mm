@@ -71,10 +71,12 @@ TENSORPLAY_API std::atomic<bool> g_gpu_timing{false};
 // kept so generated code and Profiler.h stay backend-agnostic.
 TENSORPLAY_API std::atomic<uint32_t> g_ext_warmup{0};
 
-// The GpuTimerPair whose op dispatch is currently running on this thread, if
-// any.  MPSStream::executeMPSGraph reads this to attach a completion handler
-// that records the graph op's GPU duration before committing its buffer.
-thread_local GpuTimerPair* tls_current_gpu_pair = nullptr;
+// The GpuTimerPair whose op dispatch is currently running.  MPS dispatches
+// are submitted serially from the calling thread, and MPSStream::executeMPSGraph
+// runs its encode block on the stream's serial queue (a different GCD
+// thread), so this must be a process-global rather than thread-local to be
+// visible to the graph encode path.
+GpuTimerPair* g_current_gpu_pair = nullptr;
 
 GpuTimerPair::~GpuTimerPair() {
     if (!armed_) return;
@@ -90,14 +92,14 @@ void GpuTimerPair::arm(const Device& device) {
     gpu_device_ = stream->device_index();
     gpu_epoch_ = g_epoch.load(std::memory_order_relaxed);
     armed_ = true;
-    tls_current_gpu_pair = this;
+    g_current_gpu_pair = this;
 }
 
 void GpuTimerPair::close() {
     if (!armed_) return;
     armed_ = false;
-    if (tls_current_gpu_pair == this) {
-        tls_current_gpu_pair = nullptr;
+    if (g_current_gpu_pair == this) {
+        g_current_gpu_pair = nullptr;
     }
     auto* stream = static_cast<mps::MPSStream*>(gpu_stream_);
     gpu_stream_ = nullptr;
@@ -131,9 +133,9 @@ void GpuTimerPair::close() {
     g_pending->push_back({slot, device, ms, epoch});
 }
 
-// Returns the active MPS GpuTimerPair on this thread, or nullptr.
+// Returns the active MPS GpuTimerPair, or nullptr.
 TENSORPLAY_API GpuTimerPair* mps_current_gpu_pair() {
-    return tls_current_gpu_pair;
+    return g_current_gpu_pair;
 }
 
 // Called by MPSStream::executeMPSGraph when it installs a graph-op completion
