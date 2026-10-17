@@ -71,7 +71,7 @@ void dispatch_indexing(const std::string& kernel, const Tensor& output,
       [encoder setComputePipelineState:pso];
       mtl_setArgs(encoder, output, input, index, inner, dim_size, idx_dim);
       mtl_dispatch1DJob(encoder, pso, static_cast<NSUInteger>(length));
-      stream->synchronize(SyncType::COMMIT_AND_WAIT);
+      stream->synchronize(SyncType::COMMIT);
     }
   });
 }
@@ -91,7 +91,7 @@ void dispatch_scatter_value(const std::string& kernel, const Tensor& output,
       [encoder setComputePipelineState:pso];
       mtl_setArgs(encoder, output, value, index, inner, out_dim, idx_dim);
       mtl_dispatch1DJob(encoder, pso, static_cast<NSUInteger>(index.numel()));
-      stream->synchronize(SyncType::COMMIT_AND_WAIT);
+      stream->synchronize(SyncType::COMMIT);
     }
   });
 }
