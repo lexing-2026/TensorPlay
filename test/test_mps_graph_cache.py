@@ -135,9 +135,10 @@ class TestMPSBroadcastOperands(MPSCase):
         # A scaled operand is a multiply the shader does not do.
         self.assert_same_result(tp.add(f_mps, g_mps, alpha=2),
                                 tp.add(f_cpu, g_cpu, alpha=2))
-        # A backwards view would need an offset base the shader has no slot for.
-        self.assert_same_result(tp.sub(tp.flip(f_mps, [0]), g_mps),
-                                tp.sub(tp.flip(f_cpu, [0]), g_cpu))
+        # Two operands that already have the shape the result has: a stride read
+        # would avoid no copy, so the call belongs with the graph.
+        e_cpu, e_mps = f_cpu * 2, f_mps * 2
+        self.assert_same_result(tp.sub(f_mps, e_mps), tp.sub(f_cpu, e_cpu))
 
     def test_inplace_keeps_the_arithmetic(self):
         rhs_cpu, rhs_mps = _range_on_both([1, 5])
