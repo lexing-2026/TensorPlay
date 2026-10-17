@@ -851,17 +851,19 @@ jobs:
           python benchmark/host_probe.py \
             --json-out benchmark-results/host-probe.json \
             | tee benchmark-results/host-probe.log
-          args=(--suite "$suite" --dtype f32 --reps 3
-                --json-out benchmark-results/mps-operator.json)
-          if [[ "$MPS_COMPARE_REFERENCE" == "true" ]]; then
-            # The second runtime runs on the same device, inside the same
-            # process and the same sampling loop, so both times of a case share
-            # the machine state that produced them.
-            python -m pip install -q "torch>=2.5"
-            args+=(--reference)
-          fi
-          python benchmark/bench_mps_operator.py "${args[@]}" \
+          python benchmark/bench_mps_operator.py --suite "$suite" --dtype f32 \
+            --reps 3 --json-out benchmark-results/mps-operator.json \
             | tee benchmark-results/mps-operator.log
+          if [[ "$MPS_COMPARE_REFERENCE" == "true" ]]; then
+            # The second pass runs the same inventory in its own process: each
+            # side then warms up and allocates on its own, and neither one's
+            # device memory pressure lands inside the other's samples.
+            python -m pip install -q "torch>=2.5"
+            python benchmark/bench_mps_operator.py --side reference \
+              --suite "$suite" --dtype f32 --reps 3 \
+              --json-out benchmark-results/mps-operator-reference.json \
+              | tee benchmark-results/mps-operator-reference.log
+          fi
 
       - name: Enforce MPS performance floor
         if: ${{ inputs.run_mps_benchmarks && runner.os == 'macOS' }}
@@ -907,6 +909,7 @@ jobs:
           set +e
           python benchmark/check_mps_reference_speedup.py \
             --operator-json benchmark-results/mps-operator.json \
+            --reference-json benchmark-results/mps-operator-reference.json \
             --min-geomean 1.0 \
             --min-win-rate 0.0 \
             --summary-out benchmark-results/mps-speedup-summary.md \

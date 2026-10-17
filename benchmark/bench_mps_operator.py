@@ -452,9 +452,11 @@ def main(argv=None):
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--rounds", type=int, default=3,
                         help="separate sampling passes over all cases")
-    parser.add_argument("--reference", action="store_true",
-                        help="also time every case through the comparison "
-                             "runtime on the same device")
+    parser.add_argument("--side", choices=("ours", "reference"),
+                        default="ours",
+                        help="which runtime to time; each side runs in its "
+                             "own process so the two passes do not compete "
+                             "for device memory")
     parser.add_argument("--json-out", type=Path, required=True)
     args = parser.parse_args(argv)
     if args.reps < 1:
@@ -465,30 +467,21 @@ def main(argv=None):
         parser.error("warmup must be positive")
     if args.rounds < 1:
         parser.error("rounds must be positive")
-    backend = _TreeBackend(_DEVICE)
+    backend = _TreeBackend(_DEVICE) if args.side == "ours" else \
+        _ReferenceBackend(_DEVICE)
     if not backend.available():
-        parser.error("MPS is not available on this machine")
-    reference = None
-    if args.reference:
-        reference = _ReferenceBackend(_DEVICE)
-        if not reference.available():
-            parser.error("the comparison runtime has no Metal device")
+        parser.error("MPS is not available on this machine"
+                     if args.side == "ours"
+                     else "the comparison runtime has no Metal device")
     suite = "long" if args.suite == "all" else args.suite
     measurements = {}
     samples_by_name = {}
-    reference_samples = {}
     skipped = set()
-    reference_errors = {}
     cases = build_cases(backend, suite, args.dtype)
-    # One inventory drives both sides: the reference cases are built from the
-    # same names, shapes and dtypes so a case is compared with itself.
-    reference_cases = {}
-    if reference is not None:
-        reference_cases = {case[0]: case
-                           for case in build_cases(reference, suite, args.dtype)}
-    print(f"suite={suite} dtype={args.dtype} cases={len(cases)}")
-    if reference is not None:
-        print(reference.describe())
+    print(f"side={args.side} suite={suite} dtype={args.dtype} "
+          f"cases={len(cases)}")
+    if args.side == "reference":
+        print(backend.describe())
     reps_per_round = math.ceil(args.reps / args.rounds)
     time_per_round = args.min_run_time / args.rounds
     for round_index in range(args.rounds):
@@ -500,17 +493,20 @@ def main(argv=None):
             if name in skipped:
                 continue
             print(f"running {name}")
-            fn = factory()
-            # Probe support on the first pass; later failures must abort.
+            # Probe support on the first pass, including tensor creation, so a
+            # case the device cannot run or provision is reported and skipped;
+            # later failures must abort.
             if round_index == 0:
                 try:
+                    fn = factory()
                     fn()
                     backend.synchronize()
                 except (NotImplementedError, RuntimeError) as exc:
                     print(f"{name:42} [skipped: {exc}]")
                     skipped.add(name)
-                    del fn
                     continue
+            else:
+                fn = factory()
             samples = samples_by_name.setdefault(name, [])
             samples.extend(_time(fn, reps_per_round, time_per_round,
                                  args.warmup, backend.synchronize))
@@ -529,35 +525,9 @@ def main(argv=None):
             if _moves_data(name):
                 entry["bytes_moved"] = _estimate_bytes(specs,
                                                        _ITEMSIZE[args.dtype])
-            if reference is not None and name not in reference_errors:
-                # Building the reference tensors can fail on a device the
-                # second runtime cannot provision; the case is then recorded
-                # without a pair instead of aborting the whole run.
-                ref_fn = None
-                try:
-                    ref_fn = reference_cases[name][2]()
-                    if round_index == 0:
-                        ref_fn()
-                        reference.synchronize()
-                except (NotImplementedError, RuntimeError) as exc:
-                    print(f"{name:42} [reference skipped: {exc}]")
-                    reference_errors[name] = str(exc)
-                    ref_fn = None
-                if ref_fn is not None:
-                    ref_samples = reference_samples.setdefault(name, [])
-                    ref_samples.extend(
-                        _time(ref_fn, reps_per_round, time_per_round,
-                              args.warmup, reference.synchronize))
-                    entry["reference_seconds"] = min(ref_samples)
-                    entry["speedup"] = entry["reference_seconds"] / seconds
-                    del ref_fn
-            if name in reference_errors:
-                entry["reference_skip"] = reference_errors[name]
             print(f"{name:42} {seconds * 1e3:10.3f} ms "
                   f"({len(samples)} samples, median "
-                  f"{statistics.median(samples) * 1e3:.3f} ms)"
-                  + (f"  speedup {entry['speedup']:.2f}x"
-                     if "speedup" in entry else ""))
+                  f"{statistics.median(samples) * 1e3:.3f} ms)")
             measurements[name] = entry
             del fn
 
@@ -567,17 +537,14 @@ def main(argv=None):
         "suite": suite,
         "dtype": args.dtype,
         "device": _DEVICE,
+        "side": args.side,
+        "runtime": {"name": backend.name, "version": backend.version(),
+                    "device": _DEVICE},
         "timing": {"statistic": "minimum", "min_reps": args.reps,
                    "min_run_time": args.min_run_time, "warmup": args.warmup,
                    "rounds": args.rounds},
         "measurements": list(measurements.values()),
     }
-    if reference is not None:
-        payload["reference"] = {
-            "runtime": reference.name,
-            "version": reference.version(),
-            "device": _DEVICE,
-        }
     args.json_out.parent.mkdir(parents=True, exist_ok=True)
     args.json_out.write_text(json.dumps(payload, indent=2) + "\n",
                              encoding="utf-8")

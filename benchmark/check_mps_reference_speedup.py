@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """MPS speedup gate.
 
-The MPS operator benchmark can time every case twice in one run: once through
-this tree's kernels and once through a second runtime on the same device. This
-gate turns the pair of times into a per-case speedup (theirs / ours), a
-geometric-mean overall speedup and a win rate, then fails when the overall
-number is below the required floor.
+The MPS operator benchmark times the same case inventory twice, once per
+runtime, in two separate processes: this tree's kernels in one, a second
+runtime on the same device in the other. Separate processes keep the two
+passes from competing for device memory and let each side warm up on its own.
 
-A run that was recorded without the second runtime has no ratios to gate on;
-it is reported as missing rather than silently passing.
+This gate joins the two result files by case name, turns the pair of times into
+a per-case speedup (theirs / ours), a geometric-mean overall speedup and a win
+rate, then fails when the overall number is below the required floor.
+
+A run whose second pass is missing or empty has no ratios to gate on; it is
+reported as missing rather than silently passing.
 
 Usage:
     check_mps_reference_speedup.py --operator-json mps-operator.json \
+        --reference-json mps-operator-reference.json \
         --min-geomean 1.0 --min-win-rate 0.0 \
         --summary-out mps-speedup-summary.md
 """
@@ -49,6 +53,33 @@ def _positive(value):
         and math.isfinite(value)
         and value > 0
     )
+
+
+def join(ours, reference):
+    """Pair each of our measurements with the reference's time for the case."""
+    for field in ("suite", "dtype", "device"):
+        if ours.get(field) != reference.get(field):
+            raise ValueError(f"{field} differs between the two runs")
+    if ours.get("side") != "ours":
+        raise ValueError("the operator run is not the 'ours' side")
+    if reference.get("side") != "reference":
+        raise ValueError("the reference run is not the 'reference' side")
+    theirs = {item["name"]: item.get("seconds")
+              for item in reference["measurements"]}
+    measurements = []
+    for item in ours["measurements"]:
+        paired = dict(item)
+        seconds = theirs.get(item["name"])
+        if _positive(seconds):
+            paired["reference_seconds"] = seconds
+        measurements.append(paired)
+    joined = dict(ours)
+    joined["measurements"] = measurements
+    joined["reference"] = reference.get("runtime") or {
+        "runtime": "reference", "version": "",
+        "device": reference.get("device"),
+    }
+    return joined
 
 
 def summarize(payload):
@@ -169,6 +200,8 @@ def write_summary(path, summary, violations, min_geomean, min_win_rate):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--operator-json", type=Path, required=True)
+    parser.add_argument("--reference-json", type=Path, default=None,
+                        help="second pass, timed by the comparison runtime")
     parser.add_argument("--min-geomean", type=float, default=1.0)
     parser.add_argument("--min-win-rate", type=float, default=0.0)
     parser.add_argument("--max-case-slowdown", type=float, default=None)
@@ -183,7 +216,10 @@ def main():
         if not math.isfinite(value) or value < 0 or (upper and value > upper):
             parser.error(f"{name} is out of range")
 
-    summary = summarize(load(args.operator_json))
+    payload = load(args.operator_json)
+    if args.reference_json is not None and args.reference_json.exists():
+        payload = join(payload, load(args.reference_json))
+    summary = summarize(payload)
     violations = evaluate(summary, args.min_geomean, args.min_win_rate,
                           args.max_case_slowdown)
     write_summary(args.summary_out, summary, violations, args.min_geomean,

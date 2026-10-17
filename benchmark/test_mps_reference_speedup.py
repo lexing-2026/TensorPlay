@@ -11,7 +11,7 @@ import numpy as np
 
 import bench_mps_operator
 from bench_mps_operator import _ReferenceBackend, _TreeBackend, build_cases
-from check_mps_reference_speedup import evaluate, summarize
+from check_mps_reference_speedup import evaluate, join, summarize
 
 # Cases above this footprint are skipped by the inventory check: the pair of
 # runtimes materializes both sides at once, which is more than a CI shell wants
@@ -152,12 +152,8 @@ class TestCaseInventory(unittest.TestCase):
 
 
 
-class TestPairedRun(unittest.TestCase):
-    """The whole script, on the host device, with the reference side enabled.
-
-    Only the device changes; argument handling, sampling, the JSON shape and
-    the gate all run exactly as they do for a Metal run.
-    """
+class TestTwoPassRun(unittest.TestCase):
+    """Both passes, each on the host device, joined the way the gate joins."""
 
     def setUp(self):
         self._device = bench_mps_operator._DEVICE
@@ -166,26 +162,42 @@ class TestPairedRun(unittest.TestCase):
     def tearDown(self):
         bench_mps_operator._DEVICE = self._device
 
-    def test_reference_run_records_paired_timings(self):
+    def _run(self, side, out):
+        with contextlib.redirect_stdout(io.StringIO()):
+            bench_mps_operator.main([
+                "--side", side,
+                "--suite", "short",
+                "--reps", "1",
+                "--min-run-time", "0",
+                "--warmup", "1",
+                "--rounds", "1",
+                "--json-out", str(out),
+            ])
+        return json.loads(out.read_text(encoding="utf-8"))
+
+    def test_two_passes_join_into_pairs(self):
         with tempfile.TemporaryDirectory() as tmp:
-            out = Path(tmp) / "mps-operator.json"
-            with contextlib.redirect_stdout(io.StringIO()):
-                bench_mps_operator.main([
-                    "--suite", "short",
-                    "--reps", "1",
-                    "--min-run-time", "0",
-                    "--warmup", "1",
-                    "--rounds", "1",
-                    "--reference",
-                    "--json-out", str(out),
-                ])
-            body = json.loads(out.read_text(encoding="utf-8"))
-            summary = summarize(body)
-            self.assertIn("reference", body)
-            self.assertEqual(body["device"], "cpu")
-            self.assertGreater(summary["compared"], 50)
-            self.assertGreater(summary["geomean"], 0.0)
-            self.assertTrue(all(row["speedup"] > 0 for row in summary["rows"]))
+            ours = self._run("ours", Path(tmp) / "ours.json")
+            theirs = self._run("reference", Path(tmp) / "ref.json")
+        self.assertEqual(ours["side"], "ours")
+        self.assertEqual(theirs["side"], "reference")
+        self.assertEqual([item["name"] for item in ours["measurements"]],
+                         [item["name"] for item in theirs["measurements"]])
+        summary = summarize(join(ours, theirs))
+        self.assertGreater(summary["compared"], 50)
+        self.assertGreater(summary["geomean"], 0.0)
+        self.assertLessEqual(summary["win_rate"], 1.0)
+
+    def test_mismatched_suites_are_rejected(self):
+        ours = {
+            "schema_version": 1, "benchmark": "mps-operator", "suite": "short",
+            "dtype": "f32", "device": "cpu", "side": "ours",
+            "measurements": [{"name": "a", "category": "binary",
+                              "input_shapes": [[2]], "seconds": 1.0}],
+        }
+        theirs = dict(ours, side="reference", suite="long")
+        with self.assertRaises(ValueError):
+            join(ours, theirs)
 
 
 class TestUnavailableReference(unittest.TestCase):
@@ -210,20 +222,17 @@ class TestUnavailableReference(unittest.TestCase):
             out = Path(tmp) / "mps-operator.json"
             with contextlib.redirect_stdout(io.StringIO()):
                 bench_mps_operator.main([
+                    "--side", "reference",
                     "--suite", "short",
                     "--reps", "1",
                     "--min-run-time", "0",
                     "--warmup", "1",
                     "--rounds", "1",
-                    "--reference",
                     "--json-out", str(out),
                 ])
             body = json.loads(out.read_text(encoding="utf-8"))
-        self.assertTrue(body["measurements"])
-        self.assertFalse(any("reference_seconds" in item
-                             for item in body["measurements"]))
-        self.assertTrue(all("reference_skip" in item
-                            for item in body["measurements"]))
+        self.assertEqual(body["side"], "reference")
+        self.assertEqual(body["measurements"], [])
         summary = summarize(body)
         self.assertEqual(summary["compared"], 0)
         self.assertEqual(len(evaluate(summary, 1.0, 0.0, None)), 1)
