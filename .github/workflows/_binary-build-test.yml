@@ -122,6 +122,21 @@ on:
         type: string
         default: short
         description: "MPS benchmark suite size: short, long, or all"
+      mps_compare_reference:
+        required: false
+        type: boolean
+        default: false
+        description: >
+          Time every MPS benchmark case through a second runtime on the same
+          device and publish the per-case speedup (macOS only).
+      mps_require_speedup_win:
+        required: false
+        type: boolean
+        default: false
+        description: >
+          Fail when the MPS benchmark is not faster than the second runtime
+          overall. Off by default so a recording run still publishes its
+          numbers. Only meaningful together with mps_compare_reference.
       test_matrix:
         required: false
         type: string
@@ -820,6 +835,7 @@ jobs:
         shell: bash
         env:
           MPS_BENCH_SUITE: ${{ inputs.mps_benchmark_suite }}
+          MPS_COMPARE_REFERENCE: ${{ inputs.mps_compare_reference }}
         run: |
           set -euo pipefail
           mkdir -p benchmark-results
@@ -830,8 +846,16 @@ jobs:
           python benchmark/host_probe.py \
             --json-out benchmark-results/host-probe.json \
             | tee benchmark-results/host-probe.log
-          python benchmark/bench_mps_operator.py --suite "$suite" --dtype f32 \
-            --reps 3 --json-out benchmark-results/mps-operator.json \
+          args=(--suite "$suite" --dtype f32 --reps 3
+                --json-out benchmark-results/mps-operator.json)
+          if [[ "$MPS_COMPARE_REFERENCE" == "true" ]]; then
+            # The second runtime runs on the same device, inside the same
+            # process and the same sampling loop, so both times of a case share
+            # the machine state that produced them.
+            python -m pip install -q "torch>=2.5"
+            args+=(--reference)
+          fi
+          python benchmark/bench_mps_operator.py "${args[@]}" \
             | tee benchmark-results/mps-operator.log
 
       - name: Enforce MPS performance floor
@@ -858,6 +882,7 @@ jobs:
               bench-data-history || true
           fi
           python benchmark/test_mps_performance_regression.py
+          python benchmark/test_mps_reference_speedup.py
           python benchmark/check_mps_performance_regression.py \
             --operator-json benchmark-results/mps-operator.json \
             --history bench-data-history/latest.json \
@@ -865,12 +890,41 @@ jobs:
             --operator-max-slowdown 0.30 \
             --summary-out benchmark-results/mps-regression-summary.md
 
+      - name: Enforce MPS speedup over the reference
+        if: ${{ inputs.run_mps_benchmarks && inputs.mps_compare_reference && runner.os == 'macOS' }}
+        shell: bash
+        env:
+          REQUIRE_SPEEDUP_WIN: ${{ inputs.mps_require_speedup_win }}
+        run: |
+          set -euo pipefail
+          # The run records whether the paired inventory was actually timed;
+          # a missing pair is a gate failure, not a pass.
+          set +e
+          python benchmark/check_mps_reference_speedup.py \
+            --operator-json benchmark-results/mps-operator.json \
+            --min-geomean 1.0 \
+            --min-win-rate 0.0 \
+            --summary-out benchmark-results/mps-speedup-summary.md \
+            | tee benchmark-results/mps-speedup.log
+          status=${PIPESTATUS[0]}
+          set -e
+          if [[ "$REQUIRE_SPEEDUP_WIN" == "true" && "$status" != "0" ]]; then
+            echo "::error::MPS speedup gate failed"
+            exit "$status"
+          fi
+          if [[ "$status" != "0" ]]; then
+            echo "::warning::MPS speedup gate reported a shortfall; the run is recording only"
+          fi
+
       - name: Publish MPS performance summary
         if: ${{ always() && inputs.run_mps_benchmarks && runner.os == 'macOS' }}
         shell: bash
         run: |
           if [[ -f benchmark-results/mps-regression-summary.md ]]; then
             cat benchmark-results/mps-regression-summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [[ -f benchmark-results/mps-speedup-summary.md ]]; then
+            cat benchmark-results/mps-speedup-summary.md >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Upload MPS performance logs

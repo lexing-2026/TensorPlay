@@ -15,12 +15,19 @@ on:
           - long
           - all
         default: short
+      require_speedup_win:
+        description: Fail when the benchmark is not faster than the reference runtime
+        required: false
+        type: boolean
+        default: false
   schedule:
     - cron: "0 5 * * 1"
   pull_request:
     paths:
       - "benchmark/bench_mps_operator.py"
       - "benchmark/check_mps_performance_regression.py"
+      - "benchmark/check_mps_reference_speedup.py"
+      - "benchmark/test_mps_reference_speedup.py"
       - ".github/workflows/mps_benchmark.yml"
       - ".github/workflows/_binary-build-test.yml"
 permissions: read-all
@@ -49,6 +56,11 @@ jobs:
       python_version: "3.12"
       run_mps_benchmarks: true
       mps_benchmark_suite: ${{ inputs.test_mode || 'short' }}
+      # Every run measures the reference runtime on the same runner, so a run
+      # either proves the speedup or records what is still missing. The
+      # scheduled run enforces the floor; dispatched runs do so on request.
+      mps_compare_reference: true
+      mps_require_speedup_win: ${{ github.event_name == 'schedule' || inputs.require_speedup_win }}
       upload_release: false
     secrets: inherit
 
@@ -56,12 +68,13 @@ jobs:
     name: publish-bench-data
     # Publishes the merged benchmark snapshot to the bench-data branch so the
     # website benchmark page can fetch it directly. Scheduled, tagged, and
-    # manually dispatched runs publish; pull requests never do.
+    # dispatched runs from the default branch publish; pull requests and
+    # branch experiments never do.
     needs: mps-operator-benchmark
     # Every completed benchmark run is recorded into the same-hardware
     # history, whether or not the performance gate passed, so new operators
     # and dtypes become part of the baseline from their first run onward.
-    if: ${{ github.event_name != 'pull_request' && always() && needs.mps-operator-benchmark.result != 'skipped' && needs.mps-operator-benchmark.result != 'cancelled' }}
+    if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && always() && needs.mps-operator-benchmark.result != 'skipped' && needs.mps-operator-benchmark.result != 'cancelled' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     # The workflow defaults to read-all; the forced push to the orphan
