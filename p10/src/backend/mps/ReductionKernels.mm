@@ -595,40 +595,14 @@ Tensor std_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim,
 // ---------------------------------------------------------------------------
 // argmax / argmin / max.dim / min.dim
 //
-// Values for max.dim/min.dim come from the GPU reduction selectors; the
-// index tensors are found with a host-side scan over the shared-memory
-// mapping (correct, and cheap enough for the index-only pass).
+// Values for max.dim/min.dim come from the value reduction selectors and the
+// index tensors from the graph's index reduction, each a single dispatch.
 // ---------------------------------------------------------------------------
 
 namespace {
 
-double read_element(const void* base, int64_t idx, DType dtype) {
-  switch (dtype) {
-    case DType::Float32:
-      return static_cast<const float*>(base)[idx];
-    case DType::Float64:
-      return static_cast<const double*>(base)[idx];
-    case DType::Float16:
-      return static_cast<float>(static_cast<const Half*>(base)[idx]);
-    case DType::BFloat16:
-      return static_cast<float>(static_cast<const BFloat16*>(base)[idx]);
-    case DType::Int64:
-      return static_cast<double>(static_cast<const int64_t*>(base)[idx]);
-    case DType::Int32:
-      return static_cast<double>(static_cast<const int32_t*>(base)[idx]);
-    case DType::Int16:
-      return static_cast<double>(static_cast<const int16_t*>(base)[idx]);
-    case DType::Int8:
-      return static_cast<double>(static_cast<const int8_t*>(base)[idx]);
-    case DType::UInt8:
-      return static_cast<double>(static_cast<const uint8_t*>(base)[idx]);
-    default:
-      TP_THROW(NotImplementedError,
-               "argmax/argmin: unsupported dtype on MPS");
-  }
-}
-
-// Host-side scan for the index of the first extremum along `dim`.
+// Index of the extremum along `dim`, produced by the graph's index
+// reduction and reshaped to the requested output shape.
 Tensor arg_reduce_impl(const Tensor& self, int64_t dim, bool keepdim,
                        bool is_max) {
   Tensor self_c = self.contiguous();
@@ -652,34 +626,68 @@ Tensor arg_reduce_impl(const Tensor& self, int64_t dim, bool keepdim,
   if (indices.numel() == 0) {
     return indices;
   }
-  int64_t outer = 1;
-  int64_t inner = 1;
-  for (int64_t i = 0; i < dim; ++i) outer *= in_shape[i];
-  for (int64_t i = dim + 1; i < ndim; ++i) inner *= in_shape[i];
-  const int64_t dim_size = in_shape[dim];
-  const DType dt = self_c.dtype();
-  const void* data = self_c.data_ptr();
-  int64_t* ip = indices.data_ptr<int64_t>();
-  const double init = is_max ? -std::numeric_limits<double>::infinity()
-                             : std::numeric_limits<double>::infinity();
-  for (int64_t o = 0; o < outer; ++o) {
-    const void* base = static_cast<const char*>(data) +
-                       (o * dim_size) * inner * self_c.itemsize();
-    int64_t* out_row = ip + o * inner;
-    for (int64_t i = 0; i < inner; ++i) {
-      double best = init;
-      int64_t best_idx = 0;
-      for (int64_t k = 0; k < dim_size; ++k) {
-        const double v = read_element(
-            static_cast<const char*>(base) + k * inner * self_c.itemsize(), i,
-            dt);
-        if (is_max ? (v > best) : (v < best)) {
-          best = v;
-          best_idx = k;
-        }
+  // The graph drops the reduced axis, so a fully-reduced result is described
+  // with a single-element shape and every other result is reshaped to the
+  // requested one (which is what carries `keepdim`).
+  const std::vector<int64_t> graph_shape =
+      out_shape.empty() ? std::vector<int64_t>{1} : out_shape;
+  const std::string key =
+      "argreduce|" + shapeKey(in_shape) + "|" + std::to_string(dim) + "|" +
+      shapeKey(out_shape) + "|" + dtypeKey(self_c.dtype()) + "|" +
+      (is_max ? "max" : "min");
+
+  @autoreleasepool {
+    MPSShape* inShape = getMPSShape(in_shape);
+    const MPSDataType in_dt = getMPSDataType(self_c.dtype());
+    const MPSDataType out_dt = MPSDataTypeInt64;
+
+    CachedGraph* entry = findCachedGraph(key);
+    if (entry == nullptr) {
+      MPSGraph* graph = [[MPSGraph alloc] init];
+      MPSGraphTensor* x = [graph placeholderWithShape:inShape
+                                            dataType:in_dt
+                                                 name:@"x"];
+      // The index reduction has no boolean form; a bool input carries the
+      // same 0/1 ordering once widened.
+      MPSGraphTensor* xc =
+          ([x dataType] == MPSDataTypeBool)
+          ? [graph castTensor:x toType:MPSDataTypeInt32 name:@"cast_bool"]
+          : x;
+      MPSGraphTensor* reduced =
+          is_max ? [graph reductionArgMaximumWithTensor:xc
+                                                   axis:dim
+                                                   name:nil]
+                 : [graph reductionArgMinimumWithTensor:xc
+                                                   axis:dim
+                                                   name:nil];
+      MPSGraphTensor* result = reduced;
+      if (!out_shape.empty()) {
+        result = [graph reshapeTensor:reduced
+                            withShape:getMPSShape(out_shape)
+                                 name:nil];
       }
-      out_row[i] = best_idx;
+      if ([result dataType] != out_dt) {
+        result = [graph castTensor:result toType:out_dt name:@"cast_out"];
+      }
+      entry = new CachedGraph{graph, [x retain], nil, nil, [result retain]};
+      storeCachedGraph(key, entry);
+      entry = findCachedGraph(key);
     }
+
+    id<MTLBuffer> inBuf = mtlBufferOf(self_c);
+    id<MTLBuffer> outBuf = mtlBufferOf(indices);
+    MPSGraphTensorData* inData =
+        [[[MPSGraphTensorData alloc] initWithMTLBuffer:inBuf
+                                                shape:inShape
+                                             dataType:in_dt] autorelease];
+    MPSGraphTensorData* outData =
+        [[[MPSGraphTensorData alloc] initWithMTLBuffer:outBuf
+                                                shape:getMPSShape(graph_shape)
+                                             dataType:out_dt] autorelease];
+    NSDictionary* feeds = @{entry->input0 : inData};
+    NSDictionary* results = @{entry->result : outData};
+    getCurrentMPSStream()->executeMPSGraph(entry->graph, feeds, results,
+                                          SyncType::COMMIT_AND_WAIT);
   }
   return indices;
 }
