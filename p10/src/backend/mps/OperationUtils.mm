@@ -5,10 +5,19 @@
 
 #include "backend/mps/MPSAllocator.h"
 #include "backend/mps/MPSStream.h"
+#include "backend/mps/MetalShaderLibrary.h"
+#include "backend/mps/MetalUtils.h"
 
+#include <Metal/Metal.h>
+
+#include <algorithm>
+#include <array>
+#include <cstdint>
 #include <cstring>
 #include <initializer_list>
+#include <limits>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -260,8 +269,9 @@ Tensor binaryOp(const Tensor& self, const Tensor& other, MPSBinaryOpBlock block,
       MPSGraphTensor* result = nil;
       if (has_alpha && !alpha_is_one) {
         // Scale `other` by alpha (including 0) before running the op block.
-        MPSGraphTensor* alphaConst = [graph constant:alpha->toDouble()
-                                           dataType:common_dt];
+        MPSGraphTensor* alphaConst =
+            [graph constantWithScalar:alpha->toDouble()
+                             dataType:common_dt];
         MPSGraphTensor* yScaled =
             [graph multiplicationWithPrimaryTensor:yc
                                        secondaryTensor:alphaConst
@@ -302,6 +312,261 @@ Tensor binaryOp(const Tensor& self, const Tensor& other, MPSBinaryOpBlock block,
     getCurrentMPSStream()->executeMPSGraph(entry->graph, feeds, results,
                                           SyncType::COMMIT_AND_WAIT);
   }
+  return output;
+}
+
+namespace {
+
+// The most dimensions the shader walks, and the element index width it uses.
+// BroadcastElementwise.metal reads a 32-bit thread index and forms 32-bit
+// offsets, so a call that needs more than this stays with the graph.
+constexpr size_t kShaderMaxNdims = 16;
+
+// The pipeline for a kernel of the bundled metallib, or nil when no function
+// carries that name. Whether a name resolves is answered once and kept: finding
+// a function in the metallib costs an object creation on every call, and the
+// callers ask on every operation.
+MTLComputePipelineState_t shaderPipelineNamed(const std::string& name) {
+  static std::mutex mutex;
+  static std::unordered_map<std::string, MTLComputePipelineState_t> resolved;
+  std::lock_guard<std::mutex> guard(mutex);
+  auto it = resolved.find(name);
+  if (it != resolved.end()) {
+    return it->second;
+  }
+  auto& lib = MetalShaderLibrary::getBundledLibrary();
+  MTLComputePipelineState_t pso =
+      lib.hasFunction(name) ? lib.getPipelineStateForFunc(name) : nil;
+  resolved.emplace(name, pso);
+  return pso;
+}
+
+// The pipeline for `op` over `dtype`, or nil when the shader is not built for
+// that combination. Half, bfloat and the narrow integers are absent from
+// BroadcastElementwise.metal because their operation math type is not the
+// storage type; a call with one of them belongs with the graph, which builds
+// the cast and the operation together. The list below and the instantiations at
+// the bottom of that file are checked in the same order: dtype first, so a
+// missing name is only possible if the two get out of step.
+MTLComputePipelineState_t broadcastShaderPipeline(const std::string& op,
+                                                  DType dtype) {
+  switch (dtype) {
+    case DType::Float32:
+    case DType::Int64:
+    case DType::Int32:
+      break;
+    default:
+      return nil;
+  }
+  return shaderPipelineNamed("broadcast_" + op + "_" +
+                             scalarToMetalTypeString(dtype));
+}
+
+// The stride array BroadcastElementwise.metal indexes `t` with, ordered
+// fastest-varying dimension first, along with the largest element offset it can
+// produce. A dimension of the output that `t` does not describe -- one it lacks
+// because `t` is shorter, or one of size 1 that the output stretches -- gets
+// stride 0, which re-reads the same element along that axis instead of stepping
+// to a distinct one. Returns nil for a negative stride (a view that walks
+// backwards through its storage would need an offset base the shader does not
+// take) or for a stride array whose addressing leaves the 32-bit range.
+std::optional<std::array<int32_t, kShaderMaxNdims>> broadcastShaderStrides(
+    const Tensor& t, const std::vector<int64_t>& out_shape) {
+  const std::vector<int64_t> shape =
+      static_cast<std::vector<int64_t>>(t.shape());
+  if (shape.size() > out_shape.size()) {
+    return std::nullopt;
+  }
+  const std::vector<int64_t> strides =
+      static_cast<std::vector<int64_t>>(t.strides());
+  const int64_t lead = static_cast<int64_t>(out_shape.size()) -
+                       static_cast<int64_t>(shape.size());
+  std::array<int32_t, kShaderMaxNdims> offsets{};
+  int64_t max_offset = 0;
+  for (int64_t o = 0; o < static_cast<int64_t>(out_shape.size()); ++o) {
+    const int64_t i = o - lead;
+    int64_t stride = 0;
+    if (i >= 0) {
+      if (shape[i] == out_shape[o]) {
+        if (strides[i] < 0) {
+          return std::nullopt;
+        }
+        stride = strides[i];
+      } else if (shape[i] != 1) {
+        return std::nullopt;
+      }
+    }
+    const int64_t extent = out_shape[o] > 1 ? out_shape[o] - 1 : 0;
+    if (stride > std::numeric_limits<int32_t>::max() ||
+        max_offset >
+            std::numeric_limits<int32_t>::max() - stride * extent) {
+      return std::nullopt;
+    }
+    max_offset += stride * extent;
+    offsets[out_shape.size() - 1 - o] = static_cast<int32_t>(stride);
+  }
+  return offsets;
+}
+
+// The pipeline for `op` over `dtype` in UnaryElementwise.metal, or nil when the
+// shader is not built for that combination. Float is the only storage type that
+// file instantiates for these operations, so a half, bfloat or integral input
+// belongs with the graph, which builds the cast around the operation.
+MTLComputePipelineState_t unaryShaderPipeline(const std::string& op,
+                                              DType dtype) {
+  if (dtype != DType::Float32) {
+    return nil;
+  }
+  return shaderPipelineNamed("unary_" + op + "_" +
+                             scalarToMetalTypeString(dtype));
+}
+
+} // namespace
+
+std::optional<Tensor> broadcastBinaryShader(
+    const std::string& op, const Tensor& self, const Tensor& other,
+    const std::optional<Scalar>& alpha) {
+  if (!self.device().is_mps() || !other.device().is_mps()) {
+    return std::nullopt;
+  }
+  // Scaling `other` is folded into the graph as a multiply; the shader adds the
+  // two operands as they are.
+  if (alpha.has_value() && (alpha->isComplex() || alpha->toDouble() != 1.0)) {
+    return std::nullopt;
+  }
+  // Different storage dtypes are promoted to a common one, which the graph
+  // builds as casts ahead of the operation.
+  if (self.dtype() != other.dtype()) {
+    return std::nullopt;
+  }
+  const std::vector<int64_t> self_shape =
+      static_cast<std::vector<int64_t>>(self.shape());
+  const std::vector<int64_t> other_shape =
+      static_cast<std::vector<int64_t>>(other.shape());
+  const std::vector<int64_t> out_shape =
+      broadcast_shapes(self_shape, other_shape);
+  // Where nothing expands, both paths are a single dispatch over the same
+  // buffers, so there is nothing for the shader to save.
+  if (self_shape == out_shape && other_shape == out_shape) {
+    return std::nullopt;
+  }
+  if (out_shape.empty() || out_shape.size() > kShaderMaxNdims) {
+    return std::nullopt;
+  }
+  int64_t numel = 1;
+  for (int64_t size : out_shape) {
+    numel *= size;
+  }
+  if (numel <= 0 || numel > std::numeric_limits<uint32_t>::max()) {
+    return std::nullopt;
+  }
+  // The shader addresses a buffer from its start; a view that begins inside one
+  // has no base-offset slot to say so.
+  if (self.storage_offset() != 0 || other.storage_offset() != 0) {
+    return std::nullopt;
+  }
+  MTLComputePipelineState_t pso = broadcastShaderPipeline(op, self.dtype());
+  if (!pso) {
+    return std::nullopt;
+  }
+  auto self_strides = broadcastShaderStrides(self, out_shape);
+  auto other_strides = broadcastShaderStrides(other, out_shape);
+  if (!self_strides.has_value() || !other_strides.has_value()) {
+    return std::nullopt;
+  }
+  void* self_buf = getMTLBufferFromPointer(self.data_ptr());
+  void* other_buf = getMTLBufferFromPointer(other.data_ptr());
+  if (!self_buf || !other_buf) {
+    return std::nullopt;
+  }
+
+  std::array<uint32_t, kShaderMaxNdims> sizes{};
+  for (size_t o = 0; o < out_shape.size(); ++o) {
+    sizes[out_shape.size() - 1 - o] = static_cast<uint32_t>(out_shape[o]);
+  }
+  const uint32_t ndim = static_cast<uint32_t>(out_shape.size());
+  const uint32_t total = static_cast<uint32_t>(numel);
+  const std::array<int32_t, kShaderMaxNdims> lhs_strides = *self_strides;
+  const std::array<int32_t, kShaderMaxNdims> rhs_strides = *other_strides;
+
+  Tensor output = emptyMPS(out_shape, self.dtype(), self.device());
+  void* out_buf = getMTLBufferFromPointer(output.data_ptr());
+  if (!out_buf) {
+    return std::nullopt;
+  }
+
+  MPSStream* stream = getCurrentMPSStream();
+  dispatch_sync_with_rethrow(stream->queue(), ^() {
+    @autoreleasepool {
+      stream->endKernelCoalescing();
+      auto encoder = stream->commandEncoder();
+      [encoder setComputePipelineState:pso];
+      [encoder setBuffer:(__bridge id<MTLBuffer>)out_buf offset:0 atIndex:0];
+      [encoder setBuffer:(__bridge id<MTLBuffer>)self_buf offset:0 atIndex:1];
+      [encoder setBuffer:(__bridge id<MTLBuffer>)other_buf offset:0 atIndex:2];
+      [encoder setBytes:&ndim length:sizeof(ndim) atIndex:3];
+      [encoder setBytes:sizes.data() length:sizeof(sizes) atIndex:4];
+      [encoder setBytes:lhs_strides.data() length:sizeof(lhs_strides)
+                atIndex:5];
+      [encoder setBytes:rhs_strides.data() length:sizeof(rhs_strides)
+                atIndex:6];
+      const uint32_t per_group =
+          std::min(total,
+                   static_cast<uint32_t>([pso maxTotalThreadsPerThreadgroup]));
+      [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(per_group, 1, 1)];
+      stream->synchronize(SyncType::COMMIT_AND_WAIT);
+    }
+  });
+  return output;
+}
+
+std::optional<Tensor> unaryShader(const std::string& op, const Tensor& self) {
+  if (!self.device().is_mps()) {
+    return std::nullopt;
+  }
+  // The thread index is the element index, so the input has to run through its
+  // storage in the order the output is written in and from the start of it.
+  if (!self.is_contiguous() || self.storage_offset() != 0) {
+    return std::nullopt;
+  }
+  const int64_t numel = self.numel();
+  if (numel <= 0 || numel > std::numeric_limits<uint32_t>::max()) {
+    return std::nullopt;
+  }
+  MTLComputePipelineState_t pso = unaryShaderPipeline(op, self.dtype());
+  if (!pso) {
+    return std::nullopt;
+  }
+  void* in_buf = getMTLBufferFromPointer(self.data_ptr());
+  if (!in_buf) {
+    return std::nullopt;
+  }
+  const std::vector<int64_t> shape =
+      static_cast<std::vector<int64_t>>(self.shape());
+  Tensor output = emptyMPS(shape, self.dtype(), self.device());
+  void* out_buf = getMTLBufferFromPointer(output.data_ptr());
+  if (!out_buf) {
+    return std::nullopt;
+  }
+
+  MPSStream* stream = getCurrentMPSStream();
+  dispatch_sync_with_rethrow(stream->queue(), ^() {
+    @autoreleasepool {
+      stream->endKernelCoalescing();
+      auto encoder = stream->commandEncoder();
+      [encoder setComputePipelineState:pso];
+      [encoder setBuffer:(__bridge id<MTLBuffer>)out_buf offset:0 atIndex:0];
+      [encoder setBuffer:(__bridge id<MTLBuffer>)in_buf offset:0 atIndex:1];
+      const uint32_t total = static_cast<uint32_t>(numel);
+      const uint32_t per_group =
+          std::min(total,
+                   static_cast<uint32_t>([pso maxTotalThreadsPerThreadgroup]));
+      [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(per_group, 1, 1)];
+      stream->synchronize(SyncType::COMMIT_AND_WAIT);
+    }
+  });
   return output;
 }
 

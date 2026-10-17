@@ -429,15 +429,16 @@ Tensor addmm_kernel(const Tensor& input, const Tensor& mat1,
           ? product
           : [graph castTensor:product toType:out_dt name:@"cast_product"];
       if (beta.toDouble() != 1.0) {
-        MPSGraphTensor* betaConst = [graph constant:beta.toDouble()
-                                           dataType:out_dt];
+        MPSGraphTensor* betaConst = [graph constantWithScalar:beta.toDouble()
+                                                     dataType:out_dt];
         scaled_input = [graph multiplicationWithPrimaryTensor:scaled_input
                                               secondaryTensor:betaConst
                                                          name:@"scale_beta"];
       }
       if (alpha.toDouble() != 1.0) {
-        MPSGraphTensor* alphaConst = [graph constant:alpha.toDouble()
-                                            dataType:out_dt];
+        MPSGraphTensor* alphaConst =
+            [graph constantWithScalar:alpha.toDouble()
+                             dataType:out_dt];
         scaled_prod = [graph multiplicationWithPrimaryTensor:scaled_prod
                                              secondaryTensor:alphaConst
                                                         name:@"scale_alpha"];
