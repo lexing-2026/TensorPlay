@@ -174,8 +174,7 @@ Tensor reductionOp(const Tensor& self, const std::vector<int64_t>& dims,
       case ReductionKind::MEAN: {
         // Full reductions use the nil-axes form (reduce all), which avoids
         // the explicit all-axes reduction bug on older SDKs.  Partial
-        // reductions remove one axis at a time (highest first) so only the
-        // single-axis reduction selectors are used.
+        // reductions process one axis at a time, highest first.
         if (reduce_all) {
           if (kind == ReductionKind::SUM) {
             reduced = [graph reductionSumWithTensor:xc axes:nil name:nil];
@@ -197,7 +196,7 @@ Tensor reductionOp(const Tensor& self, const std::vector<int64_t>& dims,
                                                    name:nil];
             } else {
               reduced = [graph meanOfTensor:reduced
-                                    axis:[axis integerValue]
+                                    axes:@[axis]
                                    name:nil];
             }
           }

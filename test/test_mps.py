@@ -224,6 +224,16 @@ class TestMPSSoftmaxReduction(unittest.TestCase):
         self.assertEqual(tp.amin(x).item(), 0)
         self.assertEqual(tp.sum(x, dim=1, keepdim=True).cpu().tolist(), [[3], [12]])
 
+    def test_mean_dims(self):
+        x = tp.arange(24, dtype=tp.float32, device="mps").reshape(2, 3, 4)
+        for dims in ((0,), (1,), (-1,), (0, 2)):
+            for keepdim in (False, True):
+                with self.subTest(dims=dims, keepdim=keepdim):
+                    result = tp.mean(x, dim=dims, keepdim=keepdim).cpu()
+                    expected = tp.mean(x.cpu(), dim=dims, keepdim=keepdim)
+                    self.assertEqual(result.shape, expected.shape)
+                    self.assertTrue(tp.allclose(result, expected))
+
 
 @unittest.skipUnless(mps_available(), "MPS not available")
 class TestMPSMemory(unittest.TestCase):
