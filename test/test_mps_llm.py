@@ -317,9 +317,10 @@ class TestMPSFusedSGD(unittest.TestCase):
     def test_sgd_nesterov(self):
         self.assertTrue(self._mps_vs_cpu(0.9, True))
 
-    def _foreach_step(self, device, sizes, momentum):
-        params = [tp.randn(s).to(device).clone() for s in sizes]
-        grads = [tp.randn(s).to(device).clone() for s in sizes]
+    def _foreach_step(self, device, params, grads, momentum):
+        params = [p.to(device).clone() for p in params]
+        grads = [g.to(device).clone() for g in grads]
+        sizes = [p.numel() for p in params]
         bufs = [tp.zeros(s, device=device) for s in sizes] if momentum else []
         tp._fused_sgd_(params, grads, bufs, weight_decay=0.01,
                        momentum=momentum, lr=0.01, dampening=0.1,
@@ -327,8 +328,10 @@ class TestMPSFusedSGD(unittest.TestCase):
         return [p.cpu() for p in params]
 
     def _foreach_mps_vs_cpu(self, sizes, momentum):
-        mps_out = self._foreach_step("mps", sizes, momentum)
-        cpu_out = self._foreach_step("cpu", sizes, momentum)
+        params = [tp.randn(s) for s in sizes]
+        grads = [tp.randn(s) for s in sizes]
+        mps_out = self._foreach_step("mps", params, grads, momentum)
+        cpu_out = self._foreach_step("cpu", params, grads, momentum)
         for a, b in zip(mps_out, cpu_out):
             if not close(a, b, 1e-4):
                 return False
