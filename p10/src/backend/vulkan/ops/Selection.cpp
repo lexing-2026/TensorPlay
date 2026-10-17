@@ -44,9 +44,18 @@ std::tuple<Tensor, Tensor> sort_impl(
   api::vTensor indices{context, out_sizes, DType::Int32};
   if (values.numel() == 0) return {convert(values), convert(indices)};
 
-  // Sort 256-element tiles in shared memory, then merge sorted runs.
-  // Scratch stays on the device; the final gather also truncates top-k.
-  const int32_t tiles = static_cast<int32_t>((length + 255) / 256);
+  // Sort 2048-element tiles in shared memory (one workgroup per tile, all
+  // 256 lanes active), then merge sorted runs.  Larger tiles cut the number of
+  // global merge passes; the final gather also truncates top-k.
+  // The shader drives every strided loop off 256 lanes, so the local work
+  // group must stay exactly 256 wide.  Dispatches convert their invocation
+  // domain to workgroup counts by dividing by the local size, hence tiles
+  // workgroups need tiles * 256 invocations on the x axis.
+  // Scratch keeps every (value, index) pair as one uint32 pair and must live
+  // in device-local memory: the merge passes binary-search it densely, and
+  // host-visible backing would turn every gather into a PCIe round trip.
+  constexpr uint32_t kSortLanes = 256u;
+  const int32_t tiles = static_cast<int32_t>((length + 2047) / 2048);
   const int32_t rows = static_cast<int32_t>(self.numel() / length);
   struct SortBlock final {
     ivec4 in_sizes;
@@ -62,47 +71,47 @@ std::tuple<Tensor, Tensor> sort_impl(
   } block{
       make_whcn_ivec4(sizes), make_whcn_ivec4(out_sizes),
       static_cast<int32_t>(length), static_cast<int32_t>(inner),
-      rows, tiles, descending ? 1 : 0, 256,
+      rows, tiles, descending ? 1 : 0, 2048,
       static_cast<int32_t>(count), static_cast<int32_t>(start)};
-  api::StorageBuffer scratch(context, DType::Int32, self.numel() * 2);
+  const std::vector<int64_t> scratch_sizes{self.numel() * 2};
+  api::vTensor scratch(
+      context, scratch_sizes, DType::Int32, api::StorageType::BUFFER,
+      api::GPUMemoryLayout::TENSOR_WIDTH_PACKED);
   api::UniformParamsBuffer params(context, block);
   api::PipelineBarrier barrier{};
   context->submit_compute_job(
       VK_KERNEL(sort), barrier,
-      {static_cast<uint32_t>(tiles) * 64u, static_cast<uint32_t>(rows), 1u},
-      {256u, 1u, 1u}, VK_NULL_HANDLE,
-      scratch.buffer(),
+      {static_cast<uint32_t>(tiles) * kSortLanes,
+       static_cast<uint32_t>(rows), 1u},
+      {kSortLanes, 1u, 1u}, VK_NULL_HANDLE,
+      scratch.buffer(barrier, api::PipelineStage::COMPUTE,
+                     api::MemoryAccessType::WRITE),
       input.image(barrier, api::PipelineStage::COMPUTE), params.buffer());
 
-  std::unique_ptr<api::StorageBuffer> alternate;
-  if (length > 256) {
-    alternate = std::make_unique<api::StorageBuffer>(
-        context, DType::Int32, self.numel() * 2);
+  std::unique_ptr<api::vTensor> alternate;
+  if (length > 2048) {
+    alternate = std::make_unique<api::vTensor>(
+        context, scratch_sizes, DType::Int32, api::StorageType::BUFFER,
+        api::GPUMemoryLayout::TENSOR_WIDTH_PACKED);
   }
-  api::VulkanBuffer* current = &scratch.buffer();
-  api::VulkanBuffer* next = alternate ? &alternate->buffer() : nullptr;
-  const auto dependency = [](api::PipelineBarrier& b, api::VulkanBuffer& buf) {
-    b.stage.src |= VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-    b.stage.dst |= VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-    b.buffers.emplace_back(
-        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, buf);
-  };
-  for (int64_t run = 256; run < length; run *= 2) {
+  api::vTensor* current = &scratch;
+  api::vTensor* next = alternate.get();
+  for (int64_t run = 2048; run < length; run *= 2) {
     block.run = static_cast<int32_t>(run);
     api::UniformParamsBuffer merge_params(context, block);
     api::PipelineBarrier merge_barrier{};
-    dependency(merge_barrier, *current);
-    dependency(merge_barrier, *next);
     context->submit_compute_job(
         VK_KERNEL(sort_merge), merge_barrier,
         {static_cast<uint32_t>(length), static_cast<uint32_t>(rows), 1u},
-        {256u, 1u, 1u}, VK_NULL_HANDLE,
-        *next, *current, merge_params.buffer());
+        {kSortLanes, 1u, 1u}, VK_NULL_HANDLE,
+        next->buffer(merge_barrier, api::PipelineStage::COMPUTE,
+                     api::MemoryAccessType::WRITE),
+        current->buffer(merge_barrier, api::PipelineStage::COMPUTE,
+                        api::MemoryAccessType::READ),
+        merge_params.buffer());
     std::swap(current, next);
   }
   api::PipelineBarrier output_barrier{};
-  dependency(output_barrier, *current);
   context->submit_compute_job(
       VK_KERNEL(sort_output), output_barrier, values.extents(),
       adaptive_work_group_size(values.extents()), VK_NULL_HANDLE,
@@ -110,7 +119,9 @@ std::tuple<Tensor, Tensor> sort_impl(
                    api::MemoryAccessType::WRITE),
       indices.image(output_barrier, api::PipelineStage::COMPUTE,
                     api::MemoryAccessType::WRITE),
-      *current, params.buffer());
+      current->buffer(output_barrier, api::PipelineStage::COMPUTE,
+                      api::MemoryAccessType::READ),
+      params.buffer());
   return {convert(values), convert(indices)};
 }
 

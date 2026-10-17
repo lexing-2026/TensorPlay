@@ -28,14 +28,14 @@ bool precedes(uvec2 a, uvec2 b) {
 }
 
 layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
-shared uvec2 entries[256];
+shared uvec2 entries[2048];
 
 void main() {
   int row = int(gl_WorkGroupID.y);
   int tile = int(gl_WorkGroupID.x);
   int lane = int(gl_LocalInvocationID.x);
-  int base = tile * 256;
-  for (int i = lane; i < 256; i += 64) {
+  int base = tile * 2048;
+  for (int i = lane; i < 2048; i += 256) {
     int index = base + i;
     uvec2 value = uvec2(0, 0xffffffffu);
     if (index < uBlock.axis_size) {
@@ -55,22 +55,25 @@ void main() {
   }
   barrier();
   int tile_size = 1;
-  while (tile_size < min(256, uBlock.axis_size - base)) tile_size *= 2;
+  while (tile_size < min(2048, uBlock.axis_size - base)) tile_size *= 2;
   for (int width = 2; width <= tile_size; width *= 2) {
     for (int stride = width / 2; stride > 0; stride /= 2) {
-      for (int i = lane; i < tile_size; i += 64) {
+      for (int i = lane; i < tile_size; i += 256) {
         int partner = i ^ stride;
         if (partner > i) {
           uvec2 a = entries[i];
           uvec2 b = entries[partner];
           bool swap_pair = (i & width) == 0 ? precedes(b, a) : precedes(a, b);
-          if (swap_pair) { entries[i] = b; entries[partner] = a; }
+          if (swap_pair) {
+            entries[i] = b;
+            entries[partner] = a;
+          }
         }
       }
       barrier();
     }
   }
-  for (int i = lane; i < 256 && base + i < uBlock.axis_size; i += 64) {
+  for (int i = lane; i < 2048 && base + i < uBlock.axis_size; i += 256) {
     dst.data[row * uBlock.axis_size + base + i] = entries[i];
   }
 }
