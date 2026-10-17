@@ -130,6 +130,7 @@ void releaseCachedGraph(CachedGraph* entry) {
   [entry->input1 release];
   [entry->input2 release];
   [entry->result release];
+  [entry->result2 release];
   delete entry;
 }
 

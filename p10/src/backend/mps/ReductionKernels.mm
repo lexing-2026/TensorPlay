@@ -595,8 +595,8 @@ Tensor std_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim,
 // ---------------------------------------------------------------------------
 // argmax / argmin / max.dim / min.dim
 //
-// Values for max.dim/min.dim come from the value reduction selectors and the
-// index tensors from the graph's index reduction, each a single dispatch.
+// argmax and argmin need only the graph's index reduction. max.dim and min.dim
+// take their values and indices from one graph, written by a single dispatch.
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -692,6 +692,132 @@ Tensor arg_reduce_impl(const Tensor& self, int64_t dim, bool keepdim,
   return indices;
 }
 
+// Values and indices of max.dim/min.dim out of one graph, so the pair costs a
+// single dispatch instead of a value reduction followed by an index reduction.
+// Both branches read the same placeholder, which also means an input only has
+// to be brought into graph-ready storage once.
+std::tuple<Tensor, Tensor> valueIndexReduce(const Tensor& self, int64_t dim,
+                                            bool keepdim, bool is_max) {
+  if (!self.device().is_mps()) {
+    TP_THROW(RuntimeError, "MPS reduction requires input on the MPS device");
+  }
+  const std::vector<int64_t> in_shape =
+      static_cast<std::vector<int64_t>>(self.shape());
+  // The same checks the value reduction applies to a requested axis, so an
+  // out-of-range dim is rejected the same way here.
+  const std::vector<int64_t> axes = normalize_dims({dim}, self.dim());
+  const int64_t axis = axes[0];
+  const std::vector<int64_t> out_shape =
+      compute_out_shape(in_shape, axes, keepdim);
+
+  if (self.numel() == 0) {
+    // An input with no elements has no extremum to locate, and the value
+    // reduction is the one that says so.
+    Tensor values = is_max ? amax_kernel(self, axes, keepdim)
+                           : amin_kernel(self, axes, keepdim);
+    Tensor indices = arg_reduce_impl(self, axis, keepdim, is_max);
+    return std::make_tuple(values, indices);
+  }
+
+  Tensor self_c = materializeForGraph(self);
+  const DType value_dtype = self_c.dtype();
+  Tensor values = Tensor::empty(out_shape, value_dtype, self.device());
+  Tensor indices = Tensor::empty(out_shape, DType::Int64, self.device());
+  // The graph drops the reduced axis, so a fully reduced result is described
+  // with a single-element shape and every other result is reshaped to the
+  // requested one (which is what carries `keepdim`).
+  const std::vector<int64_t> graph_shape =
+      out_shape.empty() ? std::vector<int64_t>{1} : out_shape;
+  const std::string key =
+      "valueindexreduce|" + shapeKey(in_shape) + "|" + std::to_string(axis) +
+      "|" + shapeKey(out_shape) + "|" + dtypeKey(value_dtype) + "|" +
+      (is_max ? "max" : "min");
+
+  @autoreleasepool {
+    // The values come out in the input dtype, so one data type describes both
+    // the placeholder and the value output.
+    const MPSDataType value_dt = getMPSDataType(value_dtype);
+    MPSShape* inShape = getMPSShape(in_shape);
+
+    CachedGraph* entry = findCachedGraph(key);
+    if (entry == nullptr) {
+      MPSGraph* graph = [[MPSGraph alloc] init];
+      MPSGraphTensor* x = [graph placeholderWithShape:inShape
+                                             dataType:value_dt
+                                                 name:@"x"];
+      // The index reduction has no boolean form. Widening once feeds both
+      // branches the same values and the extremum is narrowed again with the
+      // output cast, so a bool input keeps a bool result.
+      MPSGraphTensor* xc =
+          ([x dataType] == MPSDataTypeBool)
+          ? [graph castTensor:x toType:MPSDataTypeInt32 name:@"cast_bool"]
+          : x;
+      MPSGraphTensor* value_reduced = nil;
+      MPSGraphTensor* index_reduced = nil;
+      if (is_max) {
+        value_reduced =
+            [graph reductionMaximumWithTensor:xc axis:axis name:nil];
+        index_reduced =
+            [graph reductionArgMaximumWithTensor:xc axis:axis name:nil];
+      } else {
+        // MIN stays -MAX(-x), the same shape the value reductions use; the
+        // index reduction has its own minimum selector.
+        MPSGraphTensor* negated = [graph negativeWithTensor:xc name:nil];
+        MPSGraphTensor* largest =
+            [graph reductionMaximumWithTensor:negated axis:axis name:nil];
+        value_reduced = [graph negativeWithTensor:largest name:nil];
+        index_reduced =
+            [graph reductionArgMinimumWithTensor:xc axis:axis name:nil];
+      }
+      MPSGraphTensor* value_out = value_reduced;
+      MPSGraphTensor* index_out = index_reduced;
+      if (!out_shape.empty()) {
+        MPSShape* outMPSShape = getMPSShape(out_shape);
+        value_out =
+            [graph reshapeTensor:value_out withShape:outMPSShape name:nil];
+        index_out =
+            [graph reshapeTensor:index_out withShape:outMPSShape name:nil];
+      }
+      value_out = ([value_out dataType] == value_dt)
+          ? value_out
+          : [graph castTensor:value_out toType:value_dt name:@"cast_value"];
+      if ([index_out dataType] != MPSDataTypeInt64) {
+        index_out = [graph castTensor:index_out
+                               toType:MPSDataTypeInt64
+                                 name:@"cast_index"];
+      }
+      entry = new CachedGraph{graph, [x retain], nil, nil,
+                              [value_out retain], [index_out retain]};
+      storeCachedGraph(key, entry);
+      entry = findCachedGraph(key);
+    }
+
+    id<MTLBuffer> inBuf = mtlBufferOf(self_c);
+    id<MTLBuffer> valueBuf = mtlBufferOf(values);
+    id<MTLBuffer> indexBuf = mtlBufferOf(indices);
+    MPSShape* graphMPSShape = getMPSShape(graph_shape);
+    MPSGraphTensorData* inData =
+        [[[MPSGraphTensorData alloc] initWithMTLBuffer:inBuf
+                                                shape:inShape
+                                             dataType:value_dt] autorelease];
+    MPSGraphTensorData* valueData =
+        [[[MPSGraphTensorData alloc] initWithMTLBuffer:valueBuf
+                                                shape:graphMPSShape
+                                             dataType:value_dt] autorelease];
+    MPSGraphTensorData* indexData =
+        [[[MPSGraphTensorData alloc] initWithMTLBuffer:indexBuf
+                                                shape:graphMPSShape
+                                             dataType:MPSDataTypeInt64]
+            autorelease];
+    NSDictionary* feeds = @{entry->input0 : inData};
+    NSDictionary* results = @{entry->result : valueData,
+                              entry->result2 : indexData};
+    getCurrentMPSStream()->executeMPSGraph(entry->graph, feeds, results,
+                                          SyncType::COMMIT_AND_WAIT);
+  }
+  return std::make_tuple(values, indices);
+}
+
 } // namespace
 
 Tensor argmax_kernel(const Tensor& self, std::optional<int64_t> dim,
@@ -715,16 +841,12 @@ Tensor argmin_kernel(const Tensor& self, std::optional<int64_t> dim,
 
 std::tuple<Tensor, Tensor> max_dim_kernel(const Tensor& self, int64_t dim,
                                             bool keepdim) {
-  Tensor values = amax_kernel(self, std::vector<int64_t>{dim}, keepdim);
-  Tensor indices = arg_reduce_impl(self, dim, keepdim, true);
-  return std::make_tuple(values, indices);
+  return valueIndexReduce(self, dim, keepdim, true);
 }
 
 std::tuple<Tensor, Tensor> min_dim_kernel(const Tensor& self, int64_t dim,
                                             bool keepdim) {
-  Tensor values = amin_kernel(self, std::vector<int64_t>{dim}, keepdim);
-  Tensor indices = arg_reduce_impl(self, dim, keepdim, false);
-  return std::make_tuple(values, indices);
+  return valueIndexReduce(self, dim, keepdim, false);
 }
 
 TENSORPLAY_LIBRARY_IMPL(MPS, ReductionKernels) {
