@@ -679,6 +679,15 @@ Tensor binary_op_scalar_dispatch(
       shader_name, buffer_shader_name, self_arg, other, alpha, name);
 }
 
+// Copies a texture-stored payload into a dense buffer vTensor, for sibling
+// translation units that need every operand of a buffer path in linear
+// storage (concatenation mixes large buffer inputs with small texture ones).
+api::vTensor to_buffer_storage_dispatch(
+    api::Context* context,
+    const api::vTensor& src) {
+  return to_buffer_storage(context, src);
+}
+
 Tensor add_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha) {
   return binary_op_tensor("add", "buffer_add", self, other, alpha, "add");
 }

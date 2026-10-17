@@ -900,6 +900,8 @@ cat:
   parameter_names_with_default_values: {}
   shader_variants:
   - NAME: cat
+  - NAME: cat_buffer_to_buffer
+  - NAME: cat_int32_buffer_to_buffer
 pad2d:
   parameter_names_with_default_values:
     REPLICATE: false

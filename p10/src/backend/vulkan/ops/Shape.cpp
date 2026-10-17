@@ -23,6 +23,11 @@ Tensor materialize_view(
     const std::vector<int64_t>& out_strides,
     int64_t storage_offset);
 
+// Defined in BinaryOp.cpp; copies a texture payload into a dense buffer.
+api::vTensor to_buffer_storage_dispatch(
+    api::Context* context,
+    const api::vTensor& src);
+
 namespace {
 
 //
@@ -457,7 +462,95 @@ Tensor cat_kernel(const std::vector<Tensor>& tensors, int64_t dim) {
   api::vTensor v_output{context, new_sizes, tensors[0].dtype()};
 
   if (v_output.storage_type() == api::StorageType::BUFFER) {
-    TP_THROW(NotImplementedError, "Vulkan cat requires texture storage");
+    TP_CHECK(
+        tensors[0].dtype() == DType::Float32 ||
+            tensors[0].dtype() == DType::Int32,
+        "Vulkan cat over buffer storage supports Float32 and Int32 only");
+    TP_CHECK(
+        ndim >= 1 && ndim <= 4,
+        "Vulkan cat supports 1d to 4d tensors");
+    const bool is_int32 = tensors[0].dtype() == DType::Int32;
+    const api::ShaderInfo shader = is_int32
+        ? VK_KERNEL(cat_int32_buffer_to_buffer)
+        : kernel_for("cat_buffer_to_buffer", tensors[0].dtype());
+
+    const auto prepad = [](const std::vector<int64_t>& v) {
+      std::vector<int64_t> out(4, 1);
+      const int64_t offset_slots = 4 - static_cast<int64_t>(v.size());
+      for (size_t i = 0; i < v.size(); ++i) {
+        out[static_cast<size_t>(offset_slots + static_cast<int64_t>(i))] =
+            v[i];
+      }
+      return out;
+    };
+
+    const std::vector<int64_t> out_pre = prepad(
+        std::vector<int64_t>(v_output.sizes().begin(), v_output.sizes().end()));
+    const int32_t axis = static_cast<int32_t>(ndim - 1 - dim);
+    const int32_t out_c_depth =
+        static_cast<int32_t>((out_pre[1] + 3) / 4);
+
+    // One linear dispatch per input: the shader scatters each input's
+    // elements into the row-major output buffer, shifting only the
+    // concatenated axis by the running offset.  Passes reuse the barrier
+    // object and declare read/write on the output to serialize through the
+    // barrier system, mirroring the image path.
+    api::PipelineBarrier pipeline_barrier{};
+    int64_t offset = 0;
+    for (const Tensor& t : tensors) {
+      api::vTensor v_src = convert(t);
+      // A small texture input has no linear buffer backing; copy it into a
+      // dense buffer first so the linear cat shader can read it.
+      if (v_src.storage_type() == api::StorageType::TEXTURE_3D) {
+        v_src = to_buffer_storage_dispatch(context, v_src);
+      }
+      const std::vector<int64_t> in_pre = prepad(
+          std::vector<int64_t>(v_src.sizes().begin(), v_src.sizes().end()));
+      const std::vector<int64_t> in_strides =
+          SizesAndStrides::compute_contiguous_strides(in_pre);
+
+      const struct CatBufferBlock final {
+        ivec4 out_sizes;
+        ivec4 in_sizes;
+        ivec4 in_strides;
+        int32_t axis;
+        int32_t offset;
+        int32_t out_c_depth;
+        int32_t pad; // std140 rounds the uniform block up to 64 bytes
+      } block{
+          ivec4(out_pre[0], out_pre[1], out_pre[2], out_pre[3]),
+          ivec4(in_pre[0], in_pre[1], in_pre[2], in_pre[3]),
+          ivec4(in_strides[0], in_strides[1], in_strides[2], in_strides[3]),
+          axis,
+          static_cast<int32_t>(offset),
+          out_c_depth,
+          0,
+      };
+
+      api::UniformParamsBuffer params(context, block);
+
+      const api::utils::uvec3 grid{
+          static_cast<uint32_t>(out_pre[3]),
+          static_cast<uint32_t>(out_pre[2]),
+          static_cast<uint32_t>(out_pre[0]) *
+              static_cast<uint32_t>(out_c_depth),
+      };
+
+      context->submit_compute_job(
+          shader, pipeline_barrier, grid,
+          adaptive_work_group_size(grid), VK_NULL_HANDLE,
+          v_output.buffer(
+              pipeline_barrier,
+              api::PipelineStage::COMPUTE,
+              api::MemoryAccessType::READ | api::MemoryAccessType::WRITE),
+          v_src.buffer(
+              pipeline_barrier, api::PipelineStage::COMPUTE,
+              api::MemoryAccessType::READ),
+          params.buffer());
+
+      offset += t.size(dim);
+    }
+    return convert(v_output);
   }
 
   // One gather dispatch per input: the shader maps each output texel back
