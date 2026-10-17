@@ -469,14 +469,6 @@ Tensor sample_kernel(
   }
   const Tensor& values = std::get<0>(sorted);
   const Tensor& indices = std::get<1>(sorted);
-  // The sampler shader reads the sorted row through an image binding; a
-  // full-vocabulary sort of a buffer-stored row produces buffer outputs that
-  // cannot feed it.  Reject loudly instead of sampling garbage.
-  TP_CHECK(
-      convert(values).storage_type() != api::StorageType::BUFFER,
-      "sample: full-vocabulary sampling beyond the 3-D image axis limit is "
-      "not yet supported; pass a positive top_k to sample from the sorted "
-      "prefix");
 
   api::Context* const context = api::context();
   api::vTensor v_result{
@@ -486,15 +478,27 @@ Tensor sample_kernel(
     return convert(v_result);
   }
 
-  Tensor noise = empty_kernel({rows}, DType::Float32, input.device(), false);
+  api::vTensor v_values = convert(values);
+  api::vTensor v_indices = convert(indices);
+
+  // The sampler reads the sorted row through images for the top-k prefix;
+  // a full-vocabulary sort of a buffer-stored row reads linear buffers
+  // instead.  The noise row follows the same storage choice so the draw
+  // always lands in the selected payload layout.
+  const bool buffer_sorted =
+      v_values.storage_type() == api::StorageType::BUFFER;
+  api::vTensor v_noise =
+      buffer_sorted
+          ? api::vTensor{
+                context, {rows}, DType::Float32, api::StorageType::BUFFER,
+                api::GPUMemoryLayout::TENSOR_WIDTH_PACKED}
+          : api::vTensor{context, {rows}, DType::Float32};
+  Tensor noise = convert(v_noise);
   std::optional<Generator> no_generator;
   dispatch_random_fill(
       noise, VK_KERNEL(uniform_fill), VK_KERNEL(buffer_uniform_fill), 0.0f,
       1.0f, 0.0f, no_generator);
-
-  api::vTensor v_values = convert(values);
-  api::vTensor v_indices = convert(indices);
-  api::vTensor v_noise = convert(noise);
+  v_noise = convert(noise);
 
   // With the top-k selection kernel the row is already truncated, so the
   // shader receives top_k=0 and works on every sorted entry; with a full
@@ -516,6 +520,22 @@ Tensor sample_kernel(
   api::PipelineBarrier barrier{};
   const api::utils::uvec3 grid{
       api::utils::safe_downcast_to_u32(rows), 1u, 1u};
+
+  if (buffer_sorted) {
+    context->submit_compute_job(
+        VK_KERNEL(sample_from_sorted_buffer), barrier, grid, {1u, 1u, 1u},
+        VK_NULL_HANDLE,
+        v_result.buffer(
+            barrier, api::PipelineStage::COMPUTE, api::MemoryAccessType::WRITE),
+        v_values.buffer(barrier, api::PipelineStage::COMPUTE,
+                        api::MemoryAccessType::READ),
+        v_indices.buffer(barrier, api::PipelineStage::COMPUTE,
+                         api::MemoryAccessType::READ),
+        v_noise.buffer(barrier, api::PipelineStage::COMPUTE,
+                       api::MemoryAccessType::READ),
+        params.buffer());
+    return convert(v_result);
+  }
 
   context->submit_compute_job(
       VK_KERNEL(sample_from_sorted), barrier, grid, {1u, 1u, 1u},
