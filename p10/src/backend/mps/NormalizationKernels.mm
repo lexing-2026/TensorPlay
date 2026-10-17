@@ -477,9 +477,10 @@ Tensor batch_norm_kernel(const Tensor& input,
 // ---------------------------------------------------------------------------
 // group_norm
 //
-// The input is reshaped to (N, G, -1), normalized over the last axis with
-// meanOfTensor/varianceOfTensor, reshaped back, then per-channel weight/bias
-// are applied.
+// The input is read as the nested (N, G, C/G, spatial) layout of the same
+// elements, the two inner dimensions are reduced into the group statistics, and
+// the result is written back through that layout, which holds the elements in
+// the order the caller's shape has them.
 // ---------------------------------------------------------------------------
 
 Tensor group_norm_kernel(const Tensor& input, int64_t num_groups,
@@ -498,7 +499,6 @@ Tensor group_norm_kernel(const Tensor& input, int64_t num_groups,
   }
   const int64_t G = num_groups;
   const int64_t spatial = input.numel() / (N * C);
-  const int64_t per_group = (C / G) * spatial;
 
   std::vector<int64_t> out_shape =
       static_cast<std::vector<int64_t>>(input.shape());
@@ -507,11 +507,15 @@ Tensor group_norm_kernel(const Tensor& input, int64_t num_groups,
     return output;
   }
 
-  // Reshaped view: (N, G, C/G * spatial).
-  std::vector<int64_t> grouped_shape = {N, G, per_group};
-  std::vector<int64_t> bcast_shape = {N, G, 1};
-  std::vector<int64_t> affine_shape(static_cast<size_t>(input.dim()), 1);
-  affine_shape[1] = C;
+  // The four nested dimensions the graph works in.  Splitting a group into its
+  // own channels and the elements those channels repeat over keeps the flat
+  // order of the input intact and lets the per-channel weight and bias broadcast
+  // against the normalized values where they are, so the graph never has to
+  // change rank on the way to the write.
+  const int64_t channels_per_group = C / G;
+  std::vector<int64_t> grouped_shape = {N, G, channels_per_group, spatial};
+  std::vector<int64_t> bcast_shape = {N, G, 1, 1};
+  std::vector<int64_t> affine_shape = {1, G, channels_per_group, 1};
 
   Tensor input_c = materializeForGraph(input);
   Tensor weight_c;
@@ -527,16 +531,15 @@ Tensor group_norm_kernel(const Tensor& input, int64_t num_groups,
     MPSGraph* graph = [[MPSGraph new] autorelease];
     MPSShape* groupedShape = getMPSShape(grouped_shape);
     MPSShape* bcastShape = getMPSShape(bcast_shape);
-    MPSShape* outShape = getMPSShape(out_shape);
     MPSShape* affineShape = getMPSShape(affine_shape);
     const MPSDataType dt = getMPSDataType(input_c.dtype());
 
     MPSGraphTensor* xr = [graph placeholderWithShape:groupedShape
                                            dataType:dt
                                                 name:@"x"];
-    NSArray* lastAxis = @[ @2 ];
-    MPSGraphTensor* mean0 = [graph meanOfTensor:xr axes:lastAxis name:nil];
-    MPSGraphTensor* var0 = [graph varianceOfTensor:xr axes:lastAxis name:nil];
+    // A group is the pair of inner dimensions, reduced one axis at a time.
+    const auto stats = rankPreservingStats(graph, xr, {2, 3});
+    MPSGraphTensor* var0 = stats.second;
     MPSGraphTensor* epsT = [graph constantWithScalar:eps
                                                 shape:@[ @1 ]
                                              dataType:dt];
@@ -545,18 +548,19 @@ Tensor group_norm_kernel(const Tensor& input, int64_t num_groups,
                                                      name:nil];
     MPSGraphTensor* sqrtVar = [graph squareRootWithTensor:varEps name:nil];
     MPSGraphTensor* rstd0 = [graph reciprocalWithTensor:sqrtVar name:nil];
+    // The reductions leave the size-1 dimensions in place; the reshapes name
+    // them explicitly so the broadcast below does not depend on what a
+    // reduction does to the rank of its input.
     MPSGraphTensor* meanB =
-        [graph reshapeTensor:mean0 withShape:bcastShape name:nil];
+        [graph reshapeTensor:stats.first withShape:bcastShape name:nil];
     MPSGraphTensor* rstdB =
         [graph reshapeTensor:rstd0 withShape:bcastShape name:nil];
     MPSGraphTensor* centered = [graph subtractionWithPrimaryTensor:xr
                                                   secondaryTensor:meanB
                                                               name:nil];
-    MPSGraphTensor* normalized = [graph multiplicationWithPrimaryTensor:centered
-                                                       secondaryTensor:rstdB
-                                                                  name:nil];
-    MPSGraphTensor* result =
-        [graph reshapeTensor:normalized withShape:outShape name:nil];
+    MPSGraphTensor* result = [graph multiplicationWithPrimaryTensor:centered
+                                                  secondaryTensor:rstdB
+                                                             name:nil];
     MPSGraphTensor* wt = nil;
     MPSGraphTensor* bt = nil;
     if (weight_c.defined()) {
@@ -578,10 +582,12 @@ Tensor group_norm_kernel(const Tensor& input, int64_t num_groups,
         [[[MPSGraphTensorData alloc] initWithMTLBuffer:inBuf
                                             shape:groupedShape
                                          dataType:dt] autorelease];
+    // The nested shape holds the same elements in the same order as the input,
+    // which is why writing it fills the output the caller asked for.
     MPSGraphTensorData* outData =
         [[[MPSGraphTensorData alloc] initWithMTLBuffer:outBuf
-                                                 shape:outShape
-                                              dataType:dt] autorelease];
+                                                shape:groupedShape
+                                             dataType:dt] autorelease];
     NSMutableDictionary* feeds =
         [NSMutableDictionary dictionaryWithObjectsAndKeys:inData, xr, nil];
     NSMutableDictionary* results =
