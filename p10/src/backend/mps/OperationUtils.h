@@ -11,6 +11,8 @@
 #include <Metal/Metal.h>
 #include <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
 
+#include <source_location>
+
 namespace tensorplay {
 namespace mps {
 
@@ -48,15 +50,24 @@ using MPSUnaryOpBlock = MPSGraphTensor* (^)(MPSGraph*, MPSGraphTensor*);
 // `common_dtype` overrides the promoted input dtype (used by div to force
 // float output for integral inputs); `out_dtype` overrides the output dtype
 // (used by comparisons to produce bool).
+//
+// The graph built by the block is kept and reused by later calls with the same
+// shapes, dtypes and alpha, so the per-call cost is feed and encode rather than
+// graph construction and compilation. The call site identifies the operation,
+// which is why the location parameter is defaulted rather than passed.
 Tensor binaryOp(const Tensor& self, const Tensor& other, MPSBinaryOpBlock block,
                 const std::optional<Scalar>& alpha = std::nullopt,
                 std::optional<DType> common_dtype = std::nullopt,
-                std::optional<DType> out_dtype = std::nullopt);
+                std::optional<DType> out_dtype = std::nullopt,
+                std::source_location location =
+                    std::source_location::current());
 
 // Executes a unary operation on the MPS device, preserving the input dtype
-// unless `out_dtype` is given.
+// unless `out_dtype` is given. The graph is cached as in `binaryOp`.
 Tensor unaryOp(const Tensor& self, MPSUnaryOpBlock block,
-               std::optional<DType> out_dtype = std::nullopt);
+               std::optional<DType> out_dtype = std::nullopt,
+               std::source_location location =
+                   std::source_location::current());
 
 // Executes `where(condition, self, other)` with broadcasting and dtype
 // promotion of self/other.
