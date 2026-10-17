@@ -92,10 +92,17 @@ void GpuTimerPair::close() {
 
     const size_t slot = rec_.slot_;
     const uint64_t epoch = g_epoch.load(std::memory_order_relaxed);
-    // The profiled dispatch's command buffer is committed by the stream's
-    // normal synchronization path (the next committed dispatch or an
-    // explicit synchronize flushes it); no GPU timestamp is read here.
-    const float ms = 0.0f;
+    // Diagnostic: attempt to commit the op's buffer and read its GPU time.
+    float ms = 0.0f;
+    @try {
+        fprintf(stderr, "TP_PROF_DEBUG slot=%zu before commitAndWaitGetGpuTimeMs\n", slot);
+        ms = static_cast<float>(stream->commitAndWaitGetGpuTimeMs());
+        fprintf(stderr, "TP_PROF_DEBUG slot=%zu after commitAndWaitGetGpuTimeMs ms=%f\n", slot, ms);
+    } @catch (NSException* e) {
+        fprintf(stderr, "TP_PROF_DEBUG slot=%zu caught NSException: %s\n",
+                slot, [[e reason] UTF8String]);
+        ms = 0.0f;
+    }
     std::lock_guard<std::mutex> lock(g_mps_mutex);
     ensure_pending_locked();
     g_pending->push_back({slot, device, ms, epoch});

@@ -99,12 +99,36 @@ void MPSStream::synchronize(SyncType syncType) {
   }
 }
 
-// Commits the current command buffer and returns the GPU duration in
-// milliseconds.  Used by the profiler to time a single dispatch; the
-// duration is reported as zero when the Metal command buffer does not
-// expose usable GPU timestamps through this stream configuration.
+// Commits the current command buffer, waits for it to complete, and returns
+// the GPU duration in milliseconds measured from the root command buffer's
+// timestamps.  Used by the profiler to time a single dispatch.
 double MPSStream::commitAndWaitGetGpuTimeMs() {
-  synchronize(SyncType::COMMIT);
+  endKernelCoalescing();
+  double ms = 0.0;
+  if (_prevCommandBuffer) {
+    [_prevCommandBuffer waitUntilCompleted];
+    [_prevCommandBuffer release];
+    _prevCommandBuffer = nil;
+  }
+  if (_commandBuffer) {
+    [_commandBuffer commit];
+    [_commandBuffer waitUntilCompleted];
+    id<MTLCommandBuffer> root = [_commandBuffer rootCommandBuffer];
+    const CFTimeInterval start = [root GPUStartTime];
+    const CFTimeInterval end = [root GPUEndTime];
+    if (end > start) {
+      ms = (end - start) * 1000.0;
+    }
+    [_commandBuffer release];
+    _commandBuffer = nil;
+  }
+  return ms;
+}
+
+// Returns the GPU duration of the most recently committed command buffer, in
+// milliseconds.  Only valid immediately after a COMMIT_AND_WAIT synchronize;
+// used by the profiler diagnostic path.
+double MPSStream::lastCommittedGpuTimeMs() {
   return 0.0;
 }
 
