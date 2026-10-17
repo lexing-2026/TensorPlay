@@ -95,9 +95,10 @@ Tensor loss_reduce(const Tensor& x, int64_t reduction) {
 // Scales a gradient by 1/numel for mean reduction (reduction == 1).
 Tensor scale_grad(const Tensor& g, int64_t reduction, int64_t numel) {
   if (reduction == 1) {
-    return binaryOp(g, scalarToTensor(1.0 / static_cast<double>(numel),
-                                      g.dtype(), g.device()),
-                    mulBlock);
+    Tensor inv_numel =
+        scalarToTensor(1.0 / static_cast<double>(numel), g.dtype(),
+                       g.device());
+    return binaryOp("mul", g, inv_numel, mulBlock);
   }
   return g;
 }
@@ -108,21 +109,21 @@ Tensor scale_grad(const Tensor& g, int64_t reduction, int64_t numel) {
 
 Tensor mse_loss_kernel(const Tensor& input, const Tensor& target,
                        int64_t reduction) {
-  Tensor diff = binaryOp(input, target, subBlock);
-  Tensor sq = unaryOp(diff, squareBlock);
+  Tensor diff = binaryOp("sub", input, target, subBlock);
+  Tensor sq = unaryOp("square", diff, squareBlock);
   return loss_reduce(sq, reduction);
 }
 
 Tensor mse_loss_backward_kernel(const Tensor& grad_output, const Tensor& input,
                                 const Tensor& target, int64_t reduction) {
-  Tensor diff = binaryOp(input, target, subBlock);
+  Tensor diff = binaryOp("sub", input, target, subBlock);
   // dL/dx = 2 * (x - y) * grad_output (mean: /numel)
   const double norm = (reduction == 1)
       ? 2.0 / static_cast<double>(input.numel())
       : 2.0;
-  Tensor scaled = binaryOp(diff, scalarToTensor(norm, diff.dtype(),
-                                                 diff.device()), mulBlock);
-  return binaryOp(scaled, grad_output, mulBlock);
+  Tensor norm_t = scalarToTensor(norm, diff.dtype(), diff.device());
+  Tensor scaled = binaryOp("mul", diff, norm_t, mulBlock);
+  return binaryOp("mul", scaled, grad_output, mulBlock);
 }
 
 // ---------------------------------------------------------------------------
@@ -130,8 +131,8 @@ Tensor mse_loss_backward_kernel(const Tensor& grad_output, const Tensor& input,
 // ---------------------------------------------------------------------------
 
 Tensor l1_loss_kernel(const Tensor& input, const Tensor& target) {
-  Tensor diff = binaryOp(input, target, subBlock);
-  Tensor absd = unaryOp(diff, absBlock);
+  Tensor diff = binaryOp("sub", input, target, subBlock);
+  Tensor absd = unaryOp("abs", diff, absBlock);
   return mean_kernel(absd, DType::Undefined);
 }
 
@@ -145,16 +146,16 @@ Tensor smooth_l1_loss_kernel(const Tensor& input, const Tensor& target,
     TP_THROW(ValueError,
              "smooth_l1_loss does not support negative values for beta.");
   }
-  Tensor diff = binaryOp(input, target, subBlock);
-  Tensor absd = unaryOp(diff, absBlock);
+  Tensor diff = binaryOp("sub", input, target, subBlock);
+  Tensor absd = unaryOp("abs", diff, absBlock);
   Tensor beta_t = scalarToTensor(beta, diff.dtype(), diff.device());
   Tensor half_over_beta =
       scalarToTensor(0.5 / beta, diff.dtype(), diff.device());
   Tensor half_beta = scalarToTensor(0.5 * beta, diff.dtype(), diff.device());
-  Tensor quad = binaryOp(binaryOp(diff, diff, mulBlock), half_over_beta,
-                        mulBlock);
-  Tensor lin = binaryOp(absd, half_beta, subBlock);
-  Tensor cond = binaryOp(absd, beta_t, leBlock);
+  Tensor diff_sq = binaryOp("mul", diff, diff, mulBlock);
+  Tensor quad = binaryOp("mul", diff_sq, half_over_beta, mulBlock);
+  Tensor lin = binaryOp("sub", absd, half_beta, subBlock);
+  Tensor cond = binaryOp("le", absd, beta_t, leBlock);
   return loss_reduce(whereOp(cond, quad, lin), reduction);
 }
 
@@ -162,13 +163,14 @@ Tensor smooth_l1_loss_backward_kernel(const Tensor& grad_output,
                                       const Tensor& input,
                                       const Tensor& target, int64_t reduction,
                                       double beta) {
-  Tensor diff = binaryOp(input, target, subBlock);
-  Tensor absd = unaryOp(diff, absBlock);
+  Tensor diff = binaryOp("sub", input, target, subBlock);
+  Tensor absd = unaryOp("abs", diff, absBlock);
   Tensor beta_t = scalarToTensor(beta, diff.dtype(), diff.device());
-  Tensor cond = binaryOp(absd, beta_t, leBlock);
-  Tensor g_inner =
-      whereOp(cond, binaryOp(diff, beta_t, divBlock), unaryOp(diff, signBlock));
-  Tensor g = binaryOp(g_inner, grad_output, mulBlock);
+  Tensor cond = binaryOp("le", absd, beta_t, leBlock);
+  Tensor scaled_diff = binaryOp("div", diff, beta_t, divBlock);
+  Tensor g_sign = unaryOp("sign", diff, signBlock);
+  Tensor g_inner = whereOp(cond, scaled_diff, g_sign);
+  Tensor g = binaryOp("mul", g_inner, grad_output, mulBlock);
   return scale_grad(g, reduction, input.numel());
 }
 
@@ -182,28 +184,31 @@ Tensor huber_loss_kernel(const Tensor& input, const Tensor& target,
     TP_THROW(ValueError,
              "huber_loss does not support non-positive values for delta.");
   }
-  Tensor diff = binaryOp(input, target, subBlock);
-  Tensor absd = unaryOp(diff, absBlock);
+  Tensor diff = binaryOp("sub", input, target, subBlock);
+  Tensor absd = unaryOp("abs", diff, absBlock);
   Tensor delta_t = scalarToTensor(delta, diff.dtype(), diff.device());
   Tensor half_delta = scalarToTensor(0.5 * delta, diff.dtype(), diff.device());
-  Tensor quad = binaryOp(binaryOp(diff, diff, mulBlock),
+  Tensor diff_sq = binaryOp("mul", diff, diff, mulBlock);
+  Tensor quad = binaryOp("mul", diff_sq,
                          scalarToTensor(0.5, diff.dtype(), diff.device()),
                          mulBlock);
-  Tensor lin = binaryOp(delta_t, binaryOp(absd, half_delta, subBlock), mulBlock);
-  Tensor cond = binaryOp(absd, delta_t, leBlock);
+  Tensor abs_minus_half = binaryOp("sub", absd, half_delta, subBlock);
+  Tensor lin = binaryOp("mul", delta_t, abs_minus_half, mulBlock);
+  Tensor cond = binaryOp("le", absd, delta_t, leBlock);
   return loss_reduce(whereOp(cond, quad, lin), reduction);
 }
 
 Tensor huber_loss_backward_kernel(const Tensor& grad_output,
                                   const Tensor& input, const Tensor& target,
                                   int64_t reduction, double delta) {
-  Tensor diff = binaryOp(input, target, subBlock);
-  Tensor absd = unaryOp(diff, absBlock);
+  Tensor diff = binaryOp("sub", input, target, subBlock);
+  Tensor absd = unaryOp("abs", diff, absBlock);
   Tensor delta_t = scalarToTensor(delta, diff.dtype(), diff.device());
-  Tensor cond = binaryOp(absd, delta_t, leBlock);
-  Tensor scaled_sign = binaryOp(delta_t, unaryOp(diff, signBlock), mulBlock);
+  Tensor cond = binaryOp("le", absd, delta_t, leBlock);
+  Tensor g_sign = unaryOp("sign", diff, signBlock);
+  Tensor scaled_sign = binaryOp("mul", delta_t, g_sign, mulBlock);
   Tensor g_inner = whereOp(cond, diff, scaled_sign);
-  Tensor g = binaryOp(g_inner, grad_output, mulBlock);
+  Tensor g = binaryOp("mul", g_inner, grad_output, mulBlock);
   return scale_grad(g, reduction, input.numel());
 }
 
@@ -218,20 +223,20 @@ Tensor binary_cross_entropy_kernel(const Tensor& input, const Tensor& target,
   // -100 is the hard clamp limit used by the framework-wide BCE spec.
   Tensor neg100 = scalarToTensor(-100.0, input.dtype(), input.device());
 
-  Tensor logInput = unaryOp(input, logBlock);
-  Tensor clampedLogInput = binaryOp(logInput, neg100, maximumBlock);
-  Tensor oneMinusInput = binaryOp(one, input, subBlock);
-  Tensor log1Minus = unaryOp(oneMinusInput, logBlock);
-  Tensor clampedLog1 = binaryOp(log1Minus, neg100, maximumBlock);
+  Tensor logInput = unaryOp("log", input, logBlock);
+  Tensor clamped_log = binaryOp("maximum", logInput, neg100, maximumBlock);
+  Tensor oneMinusInput = binaryOp("sub", one, input, subBlock);
+  Tensor log1Minus = unaryOp("log", oneMinusInput, logBlock);
+  Tensor clampedLog1 = binaryOp("maximum", log1Minus, neg100, maximumBlock);
 
-  Tensor yLog = binaryOp(target, clampedLogInput, mulBlock);
-  Tensor oneMinusTarget = binaryOp(one, target, subBlock);
-  Tensor y1Log1 = binaryOp(oneMinusTarget, clampedLog1, mulBlock);
-  Tensor sum = binaryOp(y1Log1, yLog, addBlock);
-  Tensor loss = unaryOp(sum, negBlock);
+  Tensor yLog = binaryOp("mul", target, clamped_log, mulBlock);
+  Tensor oneMinusTarget = binaryOp("sub", one, target, subBlock);
+  Tensor y1Log1 = binaryOp("mul", oneMinusTarget, clampedLog1, mulBlock);
+  Tensor sum = binaryOp("add", y1Log1, yLog, addBlock);
+  Tensor loss = unaryOp("neg", sum, negBlock);
 
   if (weight.has_value() && weight->defined()) {
-    loss = binaryOp(loss, *weight, mulBlock);
+    loss = binaryOp("mul", loss, *weight, mulBlock);
   }
   return loss_reduce(loss, reduction);
 }
@@ -242,14 +247,14 @@ Tensor binary_cross_entropy_backward_kernel(
   // dL/dx = w * (x - y) / max(x * (1-x), eps)
   Tensor one = scalarToTensor(1.0, input.dtype(), input.device());
   Tensor epsilon = scalarToTensor(1e-12, input.dtype(), input.device());
-  Tensor oneMinusInput = binaryOp(one, input, subBlock);
-  Tensor xTimes1x = binaryOp(input, oneMinusInput, mulBlock);
-  Tensor denom = binaryOp(xTimes1x, epsilon, maximumBlock);
-  Tensor xMinusY = binaryOp(input, target, subBlock);
-  Tensor ratio = binaryOp(xMinusY, denom, divBlock);
-  Tensor g = binaryOp(ratio, grad_output, mulBlock);
+  Tensor oneMinusInput = binaryOp("sub", one, input, subBlock);
+  Tensor xTimes1x = binaryOp("mul", input, oneMinusInput, mulBlock);
+  Tensor denom = binaryOp("maximum", xTimes1x, epsilon, maximumBlock);
+  Tensor xMinusY = binaryOp("sub", input, target, subBlock);
+  Tensor ratio = binaryOp("div", xMinusY, denom, divBlock);
+  Tensor g = binaryOp("mul", ratio, grad_output, mulBlock);
   if (weight.has_value() && weight->defined()) {
-    g = binaryOp(g, *weight, mulBlock);
+    g = binaryOp("mul", g, *weight, mulBlock);
   }
   return scale_grad(g, reduction, input.numel());
 }

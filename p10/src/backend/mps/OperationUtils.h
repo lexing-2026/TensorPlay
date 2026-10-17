@@ -12,7 +12,6 @@
 #include <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
 
 #include <optional>
-#include <source_location>
 #include <string>
 #include <vector>
 
@@ -60,11 +59,11 @@ CachedGraph* findCachedGraph(const std::string& key);
 void storeCachedGraph(const std::string& key, CachedGraph* entry);
 
 // Key fragments: a shape, a dtype, a scalar's bit pattern, and a whole key
-// assembled from a call site plus fragments.
+// assembled from an operation name plus fragments.
 std::string shapeKey(const std::vector<int64_t>& shape);
 std::string dtypeKey(DType dtype);
 std::string scalarKey(const Scalar& value);
-std::string graphKey(const std::source_location& location,
+std::string graphKey(const std::string& op,
                      std::initializer_list<std::string> parts);
 
 // Block building the graph body of a binary operation. Receives the graph and
@@ -83,21 +82,22 @@ using MPSUnaryOpBlock = MPSGraphTensor* (^)(MPSGraph*, MPSGraphTensor*);
 //
 // The graph built by the block is kept and reused by later calls with the same
 // shapes, dtypes and alpha, so the per-call cost is feed and encode rather than
-// graph construction and compilation. The call site identifies the operation,
-// which is why the location parameter is defaulted rather than passed.
-Tensor binaryOp(const Tensor& self, const Tensor& other, MPSBinaryOpBlock block,
+// graph construction and compilation. `op` names the computation the block
+// performs and starts the cache key: two calls that share a name are read as
+// building the same graph, so a block whose body depends on caller values must
+// be given a name carrying them (graphKey appends them).
+Tensor binaryOp(const std::string& op, const Tensor& self,
+                const Tensor& other, MPSBinaryOpBlock block,
                 const std::optional<Scalar>& alpha = std::nullopt,
                 std::optional<DType> common_dtype = std::nullopt,
-                std::optional<DType> out_dtype = std::nullopt,
-                std::source_location location =
-                    std::source_location::current());
+                std::optional<DType> out_dtype = std::nullopt);
 
 // Executes a unary operation on the MPS device, preserving the input dtype
-// unless `out_dtype` is given. The graph is cached as in `binaryOp`.
-Tensor unaryOp(const Tensor& self, MPSUnaryOpBlock block,
-               std::optional<DType> out_dtype = std::nullopt,
-               std::source_location location =
-                   std::source_location::current());
+// unless `out_dtype` is given. The graph is cached as in `binaryOp`, so `op`
+// names the computation and carries any value baked into the block body.
+Tensor unaryOp(const std::string& op, const Tensor& self,
+               MPSUnaryOpBlock block,
+               std::optional<DType> out_dtype = std::nullopt);
 
 // Executes `where(condition, self, other)` with broadcasting and dtype
 // promotion of self/other.
