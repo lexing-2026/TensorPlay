@@ -12,6 +12,7 @@
 #include <Metal/Metal.h>
 
 #include <array>
+#include <cstring>
 #include <exception>
 #include <optional>
 #include <string>
@@ -149,10 +150,13 @@ class ForeachArguments {
   ForeachArguments(const ForeachArguments&) = delete;
   ForeachArguments& operator=(const ForeachArguments&) = delete;
 
-  // A fresh buffer for one launch's bindings.
+  // A fresh buffer for one launch's bindings.  An encoder leaves the slots it
+  // is not given alone, so they are nulled first; a launch reads only slots it
+  // bound, but the whole buffer is handed to the GPU as one resource.
   id<MTLBuffer> buffer() const {
     id<MTLBuffer> argument_buffer =
         [[device_ newBufferWithLength:bytes_ options:0] autorelease];
+    memset(argument_buffer.contents, 0, bytes_);
     [encoder_ setArgumentBuffer:argument_buffer offset:0];
     return argument_buffer;
   }

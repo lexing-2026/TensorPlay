@@ -367,7 +367,9 @@ class TestMPSAmp(unittest.TestCase):
         inv_scale = tp.tensor(0.5, dtype=tp.float32, device="mps")
         tp._amp_foreach_non_finite_check_and_unscale_(grads, found, inv_scale)
         self.assertEqual(found.item(), 0.0)
-        self.assertTrue(close(grads[0].cpu(), tp.tensor([0.5, 1.0]), 1e-5))
+        scaled = grads[0].cpu()
+        self.assertTrue(close(scaled, tp.tensor([0.5, 1.0]), 1e-5),
+                        f"unscaled: {scaled}")
 
     def test_non_finite_check_fills_the_tensor_list(self):
         # 33 gradients: a launch is closed as soon as the list is full, so the
@@ -378,9 +380,10 @@ class TestMPSAmp(unittest.TestCase):
         inv_scale = tp.tensor(0.5, dtype=tp.float32, device="mps")
         tp._amp_foreach_non_finite_check_and_unscale_(grads, found, inv_scale)
         self.assertEqual(found.item(), 0.0)
-        for g in grads:
-            self.assertTrue(close(g.cpu(), tp.tensor([1.0, 1.0, 1.0, 1.0]),
-                                  1e-5))
+        for i, g in enumerate(grads):
+            scaled = g.cpu()
+            self.assertTrue(close(scaled, tp.tensor([1.0, 1.0, 1.0, 1.0]),
+                                  1e-5), f"unscaled {i}: {scaled}")
 
     def test_update_scale_growth(self):
         scale = tp.tensor(1.0, dtype=tp.float32, device="mps")
