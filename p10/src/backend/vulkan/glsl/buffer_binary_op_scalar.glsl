@@ -31,7 +31,7 @@ $if DTYPE == "int":
       int data[];
     }
     uOutput;
-    layout(set = 0, binding = 2) uniform PRECISION Block {
+    layout(set = 0, binding = 1) uniform PRECISION Block {
       uint buf_length;
       uint fill0;
       int alpha;
@@ -59,7 +59,7 @@ $else:
       float data[];
     }
     uOutput;
-    layout(set = 0, binding = 2) uniform PRECISION Block {
+    layout(set = 0, binding = 1) uniform PRECISION Block {
       uint buf_length;
       uint fill0;
       float alpha;

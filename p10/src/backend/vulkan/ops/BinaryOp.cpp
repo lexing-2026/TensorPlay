@@ -1,7 +1,9 @@
 #ifdef USE_VULKAN
 
+#include "Blocks.h"
 #include "Common.h"
 #include "Convert.h"
+#include "SizesAndStrides.h"
 #include "../api/Context.h"
 #include "../api/ShaderRegistry.h"
 #include "../impl/Common.h"
@@ -19,13 +21,157 @@ struct BlockB final {
   uint32_t buf_length;
   uint32_t fill0;
   float alpha;
+  int32_t broadcast;
+  ivec4 out_strides;
+  ivec4 input_sizes;
+  ivec4 input_strides;
+  ivec4 other_sizes;
+  ivec4 other_strides;
 };
 
 struct BlockBi final {
   uint32_t buf_length;
   uint32_t fill0;
   int32_t alpha;
+  int32_t broadcast;
+  ivec4 out_strides;
+  ivec4 input_sizes;
+  ivec4 input_strides;
+  ivec4 other_sizes;
+  ivec4 other_strides;
 };
+
+// Contiguous row-major strides of a shape, outer dims first, zero-padded
+// to four entries.  The linear broadcast remap in the buffer shaders walks
+// the output index through these strides.
+ivec4 buffer_out_strides(const std::vector<int64_t>& out_sizes) {
+  ivec4 strides{0, 0, 0, 0};
+  int64_t acc = 1;
+  for (int d = static_cast<int>(out_sizes.size()) - 1; d >= 0; --d) {
+    strides[d] = static_cast<int32_t>(acc);
+    acc *= out_sizes[d];
+  }
+  return strides;
+}
+
+// Broadcast metadata for one operand of a linear binary op.  The operand
+// shape is right-aligned to the output rank (broadcasting aligns trailing
+// dimensions); singleton dims get stride 0 and are skipped by the remap.
+// Returns {sizes4, strides4}.
+std::pair<ivec4, ivec4> buffer_broadcast_meta(
+    const std::vector<int64_t>& out_sizes,
+    const std::vector<int64_t>& op_sizes) {
+  const int ndim_out = static_cast<int>(out_sizes.size());
+  const int ndim_op = static_cast<int>(op_sizes.size());
+  TP_CHECK(
+      ndim_out <= 4,
+      "Vulkan buffer-storage binary ops support up to 4 dims");
+  TP_CHECK(
+      ndim_op <= ndim_out,
+      "Vulkan buffer-storage binary ops: operand rank exceeds output rank");
+  const int leading = ndim_out - ndim_op;
+  ivec4 sizes{0, 0, 0, 0};
+  ivec4 strides{0, 0, 0, 0};
+  int64_t acc = 1;
+  for (int d = ndim_op - 1; d >= 0; --d) {
+    const int slot = leading + d;
+    sizes[slot] = static_cast<int32_t>(op_sizes[d]);
+    strides[slot] = static_cast<int32_t>(acc);
+    acc *= op_sizes[d];
+  }
+  return {sizes, strides};
+}
+
+// Prepads sizes to four slots in {N, C, H, W} order (leading 1s), matching
+// the texture gather convention the buffer-copy kernel reuses.
+std::vector<int64_t> prepadded(const std::vector<int64_t>& v) {
+  std::vector<int64_t> out(4, 1);
+  const int64_t offset = 4 - static_cast<int64_t>(v.size());
+  for (size_t i = 0; i < v.size(); ++i) {
+    out[static_cast<size_t>(offset + static_cast<int64_t>(i))] = v[i];
+  }
+  return out;
+}
+
+// Returns a buffer-stored view of a tensor for the linear binary path.
+// Buffer-stored sources are shared as-is; texture-stored sources are copied
+// into a fresh dense buffer through the gather kernel (identity strides), which
+// is how small broadcast operands (e.g. a bias loaded from host memory) can
+// participate in a buffer binary op.  Byte-packed dtypes have no buffer-copy
+// shader yet and stay loudly rejected.
+api::vTensor to_buffer_storage(
+    api::Context* context,
+    const api::vTensor& src) {
+  if (src.storage_type() == api::StorageType::BUFFER) {
+    return src;
+  }
+  TP_CHECK(
+      src.dtype() == DType::Float32 || src.dtype() == DType::Int32,
+      "Vulkan buffer-storage binary ops cannot convert this dtype from "
+      "texture storage yet");
+  api::vTensor dst{
+      context, src.sizes(), src.dtype(), api::StorageType::BUFFER,
+      api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+  const std::vector<int64_t> in_sizes = prepadded(
+      std::vector<int64_t>(src.sizes().begin(), src.sizes().end()));
+  const auto in_dense = SizesAndStrides::compute_contiguous_strides(in_sizes);
+  const std::vector<int64_t> out_padded = prepadded(
+      std::vector<int64_t>(src.sizes().begin(), src.sizes().end()));
+  const struct CopyBlock final {
+    ivec4 in_sizes;
+    ivec4 in_strides;
+    ivec4 out_sizes;
+    ivec4 out_strides;
+    int in_c_depth;
+    int out_c_depth;
+    int offset;
+  } block{
+      ivec4(
+          static_cast<int32_t>(in_sizes[0]),
+          static_cast<int32_t>(in_sizes[1]),
+          static_cast<int32_t>(in_sizes[2]),
+          static_cast<int32_t>(in_sizes[3])),
+      ivec4(
+          static_cast<int32_t>(in_dense[0]),
+          static_cast<int32_t>(in_dense[1]),
+          static_cast<int32_t>(in_dense[2]),
+          static_cast<int32_t>(in_dense[3])),
+      ivec4(
+          static_cast<int32_t>(out_padded[0]),
+          static_cast<int32_t>(out_padded[1]),
+          static_cast<int32_t>(out_padded[2]),
+          static_cast<int32_t>(out_padded[3])),
+      ivec4(
+          static_cast<int32_t>(in_dense[0]),
+          static_cast<int32_t>(in_dense[1]),
+          static_cast<int32_t>(in_dense[2]),
+          static_cast<int32_t>(in_dense[3])),
+      c_depth_of(in_sizes),
+      c_depth_of(out_padded),
+      0,
+  };
+  api::UniformParamsBuffer params(context, block);
+  api::PipelineBarrier pipeline_barrier{};
+  const api::utils::uvec3 grid{
+      static_cast<uint32_t>(out_padded[3]),
+      static_cast<uint32_t>(out_padded[2]),
+      static_cast<uint32_t>(out_padded[0]) *
+          static_cast<uint32_t>(c_depth_of(out_padded)),
+  };
+  const api::ShaderInfo shader = src.dtype() == DType::Int32
+      ? VK_KERNEL(view_gather_int32_buffer)
+      : VK_KERNEL(view_gather_buffer);
+  context->submit_compute_job(
+      shader, pipeline_barrier, grid,
+      adaptive_work_group_size(grid), VK_NULL_HANDLE,
+      dst.buffer(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::WRITE),
+      src.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+      params.buffer());
+  return dst;
+}
 
 // Element-width classes used by binary dispatch.
 enum class BinaryVocab { kFloat, kInt };
@@ -113,33 +259,40 @@ Tensor binary_op_tensor(
                 : api::GPUMemoryLayout::TENSOR_CHANNELS_PACKED};
 
   if (is_buffer) {
-    // The linear shader indexes both operands at the same flat position, so
-    // it is only valid when the shapes match exactly.  Reject broadcasts
-    // loudly instead of reading the smaller operand out of bounds.
-    const bool broadcast_needed =
-        out_sizes !=
-            static_cast<std::vector<int64_t>>(v_self.sizes()) ||
-        v_other.sizes() != v_self.sizes();
-    if (broadcast_needed) {
-      TP_THROW(
-          NotImplementedError,
-          "Vulkan buffer-storage binary ops do not support broadcasting yet");
-    }
+    // The linear path reads both operands through buffer bindings; a
+    // texture-stored operand (small broadcast bias, keepdim mean, etc.) is
+    // copied into a dense buffer first.
+    api::vTensor v_self_buf = to_buffer_storage(context, v_self);
+    api::vTensor v_other_buf = to_buffer_storage(context, v_other);
     const uint32_t n =
         safe_downcast_to_u32(static_cast<int64_t>(v_output.numel()));
+    const std::vector<int64_t> self_sizes = v_self.sizes();
+    const std::vector<int64_t> other_sizes = v_other.sizes();
+    const int32_t broadcast =
+        (self_sizes != out_sizes ? 1 : 0) |
+        (other_sizes != out_sizes ? 2 : 0);
+    const ivec4 out_strides = buffer_out_strides(out_sizes);
+    const auto input_meta = buffer_broadcast_meta(out_sizes, self_sizes);
+    const auto other_meta = buffer_broadcast_meta(out_sizes, other_sizes);
     api::UniformParamsBuffer params = (vocab == BinaryVocab::kInt)
         ? api::UniformParamsBuffer(
-              context, BlockBi{n, 0u, static_cast<int32_t>(alpha.to<int64_t>())})
+              context,
+              BlockBi{n, 0u, static_cast<int32_t>(alpha.to<int64_t>()),
+                      broadcast, out_strides, input_meta.first,
+                      input_meta.second, other_meta.first, other_meta.second})
         : api::UniformParamsBuffer(
-              context, BlockB{n, 0u, alpha.to<float>()});
+              context,
+              BlockB{n, 0u, alpha.to<float>(), broadcast, out_strides,
+                     input_meta.first, input_meta.second, other_meta.first,
+                     other_meta.second});
     api::PipelineBarrier pipeline_barrier{};
     context->submit_compute_job(
         VK_KERNEL_FROM_STR(buffer_variant.c_str()), pipeline_barrier,
         {(n + 3u) / 4u, 1u, 1u}, {256u, 1u, 1u}, VK_NULL_HANDLE,
         v_output.buffer(pipeline_barrier, api::PipelineStage::COMPUTE,
                         api::MemoryAccessType::WRITE),
-        v_self.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
-        v_other.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+        v_self_buf.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+        v_other_buf.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
         params.buffer());
     return convert(v_output);
   }
@@ -216,20 +369,32 @@ Tensor& binary_op_tensor_inplace(
   api::vTensor v_other = convert(other_arg);
 
   if (v_self.storage_type() == api::StorageType::BUFFER) {
+    api::vTensor v_other_buf = to_buffer_storage(context, v_other);
     const uint32_t n =
         safe_downcast_to_u32(static_cast<int64_t>(v_self.numel()));
+    const std::vector<int64_t> self_sizes = v_self.sizes();
+    const std::vector<int64_t> other_sizes = v_other.sizes();
+    const int32_t broadcast = (other_sizes != self_sizes) ? 2 : 0;
+    const ivec4 out_strides = buffer_out_strides(self_sizes);
+    const ivec4 zero{0, 0, 0, 0};
+    const auto other_meta = buffer_broadcast_meta(self_sizes, other_sizes);
     api::UniformParamsBuffer params = (vocab == BinaryVocab::kInt)
         ? api::UniformParamsBuffer(
-              context, BlockBi{n, 0u, static_cast<int32_t>(alpha.to<int64_t>())})
+              context,
+              BlockBi{n, 0u, static_cast<int32_t>(alpha.to<int64_t>()),
+                      broadcast, out_strides, zero, zero, other_meta.first,
+                      other_meta.second})
         : api::UniformParamsBuffer(
-              context, BlockB{n, 0u, alpha.to<float>()});
+              context,
+              BlockB{n, 0u, alpha.to<float>(), broadcast, out_strides,
+                     zero, zero, other_meta.first, other_meta.second});
     api::PipelineBarrier pipeline_barrier{};
     context->submit_compute_job(
         VK_KERNEL_FROM_STR(buffer_variant.c_str()), pipeline_barrier,
         {(n + 3u) / 4u, 1u, 1u}, {256u, 1u, 1u}, VK_NULL_HANDLE,
         v_self.buffer(pipeline_barrier, api::PipelineStage::COMPUTE,
                       api::MemoryAccessType::WRITE),
-        v_other.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+        v_other_buf.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
         params.buffer());
     return self_arg;
   }
@@ -359,7 +524,7 @@ Tensor binary_op_scalar(
     api::PipelineBarrier pipeline_barrier{};
     context->submit_compute_job(
         VK_KERNEL_FROM_STR(buffer_variant.c_str()), pipeline_barrier,
-        {(n + 3u) / 4u, 1u, 1u}, {256u, 1u, 1u}, VK_NULL_HANDLE,
+        {n, 1u, 1u}, {256u, 1u, 1u}, VK_NULL_HANDLE,
         v_output.buffer(pipeline_barrier, api::PipelineStage::COMPUTE,
                         api::MemoryAccessType::WRITE),
         v_self.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
@@ -425,7 +590,7 @@ Tensor& binary_op_scalar_inplace(
     api::PipelineBarrier pipeline_barrier{};
     context->submit_compute_job(
         VK_KERNEL_FROM_STR(buffer_variant.c_str()), pipeline_barrier,
-        {(n + 3u) / 4u, 1u, 1u}, {256u, 1u, 1u}, VK_NULL_HANDLE,
+        {n, 1u, 1u}, {256u, 1u, 1u}, VK_NULL_HANDLE,
         v_self.buffer(pipeline_barrier, api::PipelineStage::COMPUTE,
                       api::MemoryAccessType::WRITE),
         params.buffer());
