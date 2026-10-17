@@ -47,7 +47,7 @@ jobs:
     with:
       build_name: tensorplay-macos-arm64-py3_12-cpu
       build_environment: mps-acceptance-macos-arm64-py3_12
-      runs_on: macos-15
+      runs_on: macos-14
       python_version: "3.12"
       test_matrix: '[{"name":"mps","test_files":"test/test_mps.py test/test_mps_graph_cache.py test/test_mps_llm.py"}]'
       pytest_extra_args: ${{ inputs.pytest_extra_args || '' }}
