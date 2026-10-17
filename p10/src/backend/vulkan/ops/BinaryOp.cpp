@@ -97,17 +97,30 @@ Tensor binary_op_tensor(
   const std::vector<int64_t> out_sizes = tensorplay::broadcast_shapes(
       static_cast<std::vector<int64_t>>(self_arg.shape()),
       static_cast<std::vector<int64_t>>(other_arg.shape()));
-  const bool needs_broadcast =
-      out_sizes != static_cast<std::vector<int64_t>>(self_arg.shape());
 
+  // A buffer-stored operand keeps the whole op on the linear path even when
+  // the output shape is small enough for image storage; the image path has
+  // no buffer input binding.
+  const bool is_buffer =
+      v_self.storage_type() == api::StorageType::BUFFER ||
+      v_other.storage_type() == api::StorageType::BUFFER;
   api::vTensor v_output{
       context,
       out_sizes,
       v_self.dtype(),
-  };
+      is_buffer ? api::StorageType::BUFFER : api::StorageType::TEXTURE_3D,
+      is_buffer ? api::GPUMemoryLayout::TENSOR_WIDTH_PACKED
+                : api::GPUMemoryLayout::TENSOR_CHANNELS_PACKED};
 
-  if (v_output.storage_type() == api::StorageType::BUFFER) {
-    if (needs_broadcast) {
+  if (is_buffer) {
+    // The linear shader indexes both operands at the same flat position, so
+    // it is only valid when the shapes match exactly.  Reject broadcasts
+    // loudly instead of reading the smaller operand out of bounds.
+    const bool broadcast_needed =
+        out_sizes !=
+            static_cast<std::vector<int64_t>>(v_self.sizes()) ||
+        v_other.sizes() != v_self.sizes();
+    if (broadcast_needed) {
       TP_THROW(
           NotImplementedError,
           "Vulkan buffer-storage binary ops do not support broadcasting yet");
@@ -289,13 +302,18 @@ Tensor binary_op_scalar(
 
   api::vTensor v_self = convert(self_arg);
 
+  // A buffer-stored input keeps the whole op on the linear path even when
+  // the output shape is small enough for image storage; the image path has
+  // no buffer input binding.
+  const bool is_buffer =
+      v_self.storage_type() == api::StorageType::BUFFER;
   api::vTensor v_output{
       context,
       v_self.sizes(),
       v_self.dtype(),
-  };
-
-  const bool is_buffer = v_output.storage_type() == api::StorageType::BUFFER;
+      is_buffer ? api::StorageType::BUFFER : api::StorageType::TEXTURE_3D,
+      is_buffer ? api::GPUMemoryLayout::TENSOR_WIDTH_PACKED
+                : api::GPUMemoryLayout::TENSOR_CHANNELS_PACKED};
 
   // The shader bounds-checks against extents.xyz, so the block must carry
   // the actual three-dimensional image extents (width, height,
