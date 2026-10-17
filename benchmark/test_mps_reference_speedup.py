@@ -188,5 +188,46 @@ class TestPairedRun(unittest.TestCase):
             self.assertTrue(all(row["speedup"] > 0 for row in summary["rows"]))
 
 
+class TestUnavailableReference(unittest.TestCase):
+    """A device the second runtime cannot provision leaves the run alive."""
+
+    def setUp(self):
+        self._device = bench_mps_operator._DEVICE
+        self._tensor = bench_mps_operator._ReferenceBackend.tensor
+        bench_mps_operator._DEVICE = "cpu"
+
+        def refuse(self, array, dtype_key=None):
+            raise RuntimeError("device cannot provision the tensor")
+
+        bench_mps_operator._ReferenceBackend.tensor = refuse
+
+    def tearDown(self):
+        bench_mps_operator._DEVICE = self._device
+        bench_mps_operator._ReferenceBackend.tensor = self._tensor
+
+    def test_run_records_skips_instead_of_aborting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "mps-operator.json"
+            with contextlib.redirect_stdout(io.StringIO()):
+                bench_mps_operator.main([
+                    "--suite", "short",
+                    "--reps", "1",
+                    "--min-run-time", "0",
+                    "--warmup", "1",
+                    "--rounds", "1",
+                    "--reference",
+                    "--json-out", str(out),
+                ])
+            body = json.loads(out.read_text(encoding="utf-8"))
+        self.assertTrue(body["measurements"])
+        self.assertFalse(any("reference_seconds" in item
+                             for item in body["measurements"]))
+        self.assertTrue(all("reference_skip" in item
+                            for item in body["measurements"]))
+        summary = summarize(body)
+        self.assertEqual(summary["compared"], 0)
+        self.assertEqual(len(evaluate(summary, 1.0, 0.0, None)), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

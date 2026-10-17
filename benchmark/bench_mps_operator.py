@@ -115,6 +115,21 @@ class _ReferenceBackend:
     def version(self):
         return self._torch.__version__
 
+    def describe(self):
+        """Device figures for the run log: they explain the allocator's view of
+        the device when a case cannot be provisioned."""
+        torch = self._torch
+        parts = [f"runtime={self.name}", f"version={self.version()}"]
+        for label in ("driver_allocated_memory", "recommended_max_memory"):
+            query = getattr(torch.mps, label, None)
+            if query is None:
+                continue
+            try:
+                parts.append(f"{label}={query() / (1 << 20):.0f}MiB")
+            except RuntimeError:
+                continue
+        return " ".join(parts)
+
     def tensor(self, array, dtype_key=None):
         torch = self._torch
         if dtype_key is None:
@@ -471,8 +486,9 @@ def main(argv=None):
     if reference is not None:
         reference_cases = {case[0]: case
                            for case in build_cases(reference, suite, args.dtype)}
-    print(f"suite={suite} dtype={args.dtype} cases={len(cases)}"
-          + (f" reference={reference.version()}" if reference else ""))
+    print(f"suite={suite} dtype={args.dtype} cases={len(cases)}")
+    if reference is not None:
+        print(reference.describe())
     reps_per_round = math.ceil(args.reps / args.rounds)
     time_per_round = args.min_run_time / args.rounds
     for round_index in range(args.rounds):
@@ -514,15 +530,19 @@ def main(argv=None):
                 entry["bytes_moved"] = _estimate_bytes(specs,
                                                        _ITEMSIZE[args.dtype])
             if reference is not None and name not in reference_errors:
-                ref_fn = reference_cases[name][2]()
-                if round_index == 0:
-                    try:
+                # Building the reference tensors can fail on a device the
+                # second runtime cannot provision; the case is then recorded
+                # without a pair instead of aborting the whole run.
+                ref_fn = None
+                try:
+                    ref_fn = reference_cases[name][2]()
+                    if round_index == 0:
                         ref_fn()
                         reference.synchronize()
-                    except (NotImplementedError, RuntimeError) as exc:
-                        print(f"{name:42} [reference skipped: {exc}]")
-                        reference_errors[name] = str(exc)
-                        ref_fn = None
+                except (NotImplementedError, RuntimeError) as exc:
+                    print(f"{name:42} [reference skipped: {exc}]")
+                    reference_errors[name] = str(exc)
+                    ref_fn = None
                 if ref_fn is not None:
                     ref_samples = reference_samples.setdefault(name, [])
                     ref_samples.extend(

@@ -836,6 +836,11 @@ jobs:
         env:
           MPS_BENCH_SUITE: ${{ inputs.mps_benchmark_suite }}
           MPS_COMPARE_REFERENCE: ${{ inputs.mps_compare_reference }}
+          # The Metal device of a CI virtual machine reports its unified memory
+          # as almost fully allocated, so the second runtime's allocator
+          # refuses even 16 KiB requests. Disabling its watermark check is the
+          # documented way to run there.
+          PYTORCH_MPS_HIGH_WATERMARK_RATIO: "0.0"
         run: |
           set -euo pipefail
           mkdir -p benchmark-results
