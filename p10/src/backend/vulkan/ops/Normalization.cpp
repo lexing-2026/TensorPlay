@@ -340,6 +340,91 @@ Tensor batch_norm_kernel(
   return convert(v_output);
 }
 
+namespace {
+
+// Single-dispatch root-mean-square normalization over the trailing width
+// axis.  The fused shader computes per-lane row statistics (the mean of the
+// element-wise squares) and applies the optional affine weight in one pass,
+// replacing the multi-kernel composite for the common residual-block shape
+// where normalized_shape covers exactly the last axis.
+Tensor rms_norm_fused(
+    const Tensor& input_arg,
+    int64_t span,
+    const std::optional<Tensor>& weight_opt,
+    double eps) {
+  api::Context* const context = api::context();
+
+  api::vTensor v_input = convert(input_arg);
+  api::vTensor v_output{
+      context,
+      v_input.sizes(),
+      v_input.dtype(),
+  };
+  if (v_output.storage_type() == api::StorageType::BUFFER) {
+    TP_THROW(
+        NotImplementedError, "Vulkan rms_norm requires texture storage");
+  }
+
+  const bool has_weight = weight_opt.has_value();
+  const std::string name = std::string("rms_norm") +
+      (has_weight ? "w1" : "") +
+      (v_input.dtype() == DType::Float16 ? "_f16" : "");
+
+  // The span is exactly the texture width, so one invocation per texel
+  // position scans its whole row; the block only carries the normalized
+  // span, its reciprocal, and the epsilon.
+  const struct RmsNormBlock final {
+    ivec4 in_sizes;
+    int32_t span;
+    float inv_span;
+    float eps;
+    int32_t pad;
+  } block{
+      make_whcn_ivec4(v_input.sizes()),
+      static_cast<int32_t>(span),
+      static_cast<float>(1.0 / static_cast<double>(span)),
+      static_cast<float>(eps),
+      0,
+  };
+
+  api::UniformParamsBuffer params(context, block);
+  api::PipelineBarrier pipeline_barrier{};
+
+  // One workgroup normalizes one texel row: the grid spans the (H x depth)
+  // row space, with the 256 invocations of each workgroup striding over the
+  // row width in parallel.
+  const api::utils::uvec3 global = v_output.extents();
+  const api::utils::uvec3 rows{1u, global[1u], global[2u]};
+
+  context->submit_compute_job(
+      // shader descriptor
+      VK_KERNEL_FROM_STR(name.c_str()),
+      // pipeline barrier
+      pipeline_barrier,
+      // global work group size
+      rows,
+      // local work group size
+      api::utils::uvec3{256u, 1u, 1u},
+      // fence handle
+      VK_NULL_HANDLE,
+      // shader arguments
+      v_output.image(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::WRITE),
+      v_input.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+      has_weight
+          ? convert(weight_opt.value())
+                .image(pipeline_barrier, api::PipelineStage::COMPUTE)
+          : v_input.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+      // params buffer
+      params.buffer());
+
+  return convert(v_output);
+}
+
+} // namespace
+
 Tensor rms_norm_kernel(
     const Tensor& input,
     const std::vector<int64_t>& normalized_shape,
@@ -351,8 +436,22 @@ Tensor rms_norm_kernel(
   const double eps = eps_opt.has_value() ? eps_opt.value() : 1e-6;
 
   const int64_t norm_ndim = static_cast<int64_t>(normalized_shape.size());
+  const int64_t ndim = input.dim();
+
+  // Fused single-dispatch path: normalization covers only the trailing axis
+  // (the texture width) and any affine parameter is a rank-1 tensor along it.
+  const bool fused_ok =
+      norm_ndim == 1 && ndim >= 1 && ndim <= 4 &&
+      normalized_shape[0] == input.size(ndim - 1) &&
+      (!weight_opt.has_value() ||
+       (weight_opt->dim() == 1 &&
+        weight_opt->numel() == normalized_shape[0]));
+  if (fused_ok) {
+    return rms_norm_fused(input, normalized_shape[0], weight_opt, eps);
+  }
+
   std::vector<int64_t> dims;
-  for (int64_t i = input.dim() - norm_ndim; i < input.dim(); ++i) {
+  for (int64_t i = ndim - norm_ndim; i < ndim; ++i) {
     dims.push_back(i);
   }
 

@@ -592,5 +592,76 @@ class TestVulkanDecodeMatmul(unittest.TestCase):
                                  f"addmm 2d M={M} {dtype}")
 
 
+class TestVulkanRmsNorm(unittest.TestCase):
+    @staticmethod
+    def _relerr(got, want):
+        got = np.asarray(got, dtype=np.float32)
+        want = np.asarray(want, dtype=np.float32)
+        denom = max(float(np.abs(want).max()), 1.0)
+        return float(np.abs(got - want).max()) / denom
+
+    @staticmethod
+    def _rms_ref(x, w, eps, axes=-1):
+        # Root-mean-square normalization computed in fp32 over the given
+        # trailing axes: y = x * rsqrt(mean(x^2) + eps) * w.
+        x = np.asarray(x, dtype=np.float32)
+        sq = (x.astype(np.float32) ** 2).mean(axis=axes, keepdims=True)
+        rstd = 1.0 / np.sqrt(sq + eps)
+        out = x * rstd
+        if w is not None:
+            out = out * np.asarray(w, dtype=np.float32)
+        return out
+
+    def test_single_dispatch_trailing_axis(self):
+        # The fused single-dispatch kernel covers normalization over exactly
+        # the trailing (texture width) axis across dtypes and ranks.
+        import tensorplay as tp
+        tensorplay.manual_seed(1234)
+        cases = []
+        for shape in ((1024,), (8, 1024), (1, 1, 1024), (2, 3, 256),
+                      (1, 1, 1000)):
+            cases.append((shape, tensorplay.float32, 2.0e-5))
+            cases.append((shape, tensorplay.float16, 3.0e-3))
+        for shape, dtype, tol in cases:
+            x = tensorplay.randn(shape, device="cpu").to(dtype)
+            for use_w in (False, True):
+                w = (
+                    tensorplay.randn((shape[-1],), device="cpu").to(dtype)
+                    if use_w else None
+                )
+                got = tp._C.rms_norm(
+                    x.to("vulkan"),
+                    [shape[-1]],
+                    w.to("vulkan") if w is not None else None,
+                    1e-6,
+                ).cpu().numpy()
+                want = self._rms_ref(
+                    x.numpy(),
+                    w.numpy() if w is not None else None,
+                    1e-6,
+                )
+                self.assertLessEqual(
+                    self._relerr(got, want),
+                    tol,
+                    f"rms {shape} {dtype} w={int(use_w)}",
+                )
+
+    def test_composite_fallback_multi_axis(self):
+        # Normalized shapes covering more than the trailing axis keep the
+        # multi-kernel composite path; its numerics must stay intact.
+        import tensorplay as tp
+        tensorplay.manual_seed(1234)
+        for dtype, tol in ((tensorplay.float32, 2.0e-5),
+                           (tensorplay.float16, 3.0e-3)):
+            x = tensorplay.randn((4, 8, 16), device="cpu").to(dtype)
+            got = tp._C.rms_norm(
+                x.to("vulkan"), [8, 16], None, 1e-6
+            ).cpu().numpy()
+            want = self._rms_ref(x.numpy(), None, 1e-6, axes=(1, 2))
+            self.assertLessEqual(
+                self._relerr(got, want), tol,
+                f"rms multi-axis {dtype}")
+
+
 if __name__ == "__main__":
     unittest.main()

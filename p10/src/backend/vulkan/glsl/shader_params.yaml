@@ -629,6 +629,22 @@ layer_norm:
       SUFFIX: b1
   shader_variants:
   - NAME: layer_norm
+rms_norm:
+  parameter_names_with_default_values:
+    WEIGHT_MODE: 0
+  generate_variant_forall:
+    WEIGHT_MODE:
+    - VALUE: 0
+      SUFFIX: ''
+    - VALUE: 3
+      SUFFIX: w1
+    FORMAT:
+    - VALUE: rgba32f
+      SUFFIX: ''
+    - VALUE: rgba16f
+      SUFFIX: _f16
+  shader_variants:
+  - NAME: rms_norm
 batchnorm:
   parameter_names_with_default_values:
     HAS_WEIGHT: true
