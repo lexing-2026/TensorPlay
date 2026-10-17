@@ -40,11 +40,48 @@ Tensor softmax_impl(
       v_input.dtype(),
   };
 
-  const int64_t wrapped_dim = input_arg.dim() - 1 - dim;
-
+  // Buffer-stored payloads (any axis beyond the 3-D image limit) reduce
+  // through a linear row-walking variant.  Float16 buffer payloads are
+  // byte-packed with no buffer-writing softmax yet.
   if (v_output.storage_type() == api::StorageType::BUFFER) {
-    TP_THROW(NotImplementedError, "Vulkan softmax requires texture storage");
+    TP_CHECK(
+        v_input.dtype() == DType::Float32,
+        "Vulkan softmax over Float16 buffer storage is not supported yet");
+    const int64_t axis_size = input_arg.size(dim);
+    int64_t inner = 1;
+    for (int64_t d = dim + 1; d < ndim; ++d) {
+      inner *= input_arg.size(d);
+    }
+    const int64_t rows = input_arg.numel() / axis_size;
+    const struct SoftmaxBufferBlock final {
+      int32_t axis_size;
+      int32_t inner;
+      int32_t rows;
+    } block{
+        static_cast<int32_t>(axis_size), static_cast<int32_t>(inner),
+        static_cast<int32_t>(rows),
+    };
+    api::UniformParamsBuffer params(context, block);
+    api::PipelineBarrier pipeline_barrier{};
+    context->submit_compute_job(
+        log_mode ? VK_KERNEL(log_softmax_buffer)
+                 : VK_KERNEL(softmax_buffer),
+        pipeline_barrier,
+        {static_cast<uint32_t>(rows), 1u, 1u},
+        {256u, 1u, 1u}, VK_NULL_HANDLE,
+        v_output.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::WRITE),
+        v_input.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::READ),
+        params.buffer());
+    return convert(v_output);
   }
+
+  const int64_t wrapped_dim = input_arg.dim() - 1 - dim;
 
   const struct SoftmaxBlock final {
     ivec4 sizes;

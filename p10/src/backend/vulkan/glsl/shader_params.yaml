@@ -1230,6 +1230,14 @@ hardshrink_mask:
   parameter_names_with_default_values: {}
   shader_variants:
   - NAME: hardshrink_mask
+softmax_buffer:
+  parameter_names_with_default_values:
+    LOG_MODE: 0
+  shader_variants:
+  - NAME: softmax_buffer
+    LOG_MODE: 0
+  - NAME: log_softmax_buffer
+    LOG_MODE: 1
 one_minus:
   parameter_names_with_default_values:
     OPERATOR: 1.0f - X
