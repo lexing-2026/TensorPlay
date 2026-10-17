@@ -63,6 +63,15 @@ struct BernoulliTensorBlock final {
   uint32_t fill;
 };
 
+// Buffer-stored Bernoulli draws carry the element count instead of extents.
+struct BernoulliTensorBufferBlock final {
+  uint32_t buf_length;
+  uint32_t seed_lo;
+  uint32_t seed_hi;
+  uint32_t offset;
+  uint32_t fill;
+};
+
 // Buffer-stored fills carry the element count instead of image extents.
 struct RandomBufferFillBlock final {
   uint32_t buf_length;
@@ -248,16 +257,41 @@ Tensor& bernoulli_tensor_kernel(
   api::Context* const context = api::context();
   api::vTensor v = convert(self);
   api::vTensor v_prob = convert(p);
-  // The tensor-probability sampler reads both payloads through image
-  // bindings; buffer-stored shapes (beyond the 3-D image axis limit) have no
-  // images to read.
-  TP_CHECK(
-      v.storage_type() != api::StorageType::BUFFER &&
-          v_prob.storage_type() != api::StorageType::BUFFER,
-      "Vulkan bernoulli_ with a probability tensor requires texture-stored "
-      "payloads; shapes beyond the 3-D image axis limit are not supported "
-      "yet");
   const StreamKey key = next_stream_key(generator);
+
+  // Buffer-stored payloads (beyond the 3-D image axis limit) draw through
+  // a linear variant; mixed storage kinds have no matching shader yet.
+  if (v.storage_type() == api::StorageType::BUFFER ||
+      v_prob.storage_type() == api::StorageType::BUFFER) {
+    TP_CHECK(
+        v.storage_type() == api::StorageType::BUFFER &&
+            v_prob.storage_type() == api::StorageType::BUFFER,
+        "Vulkan bernoulli_ with mixed storage kinds is not supported yet");
+    const BernoulliTensorBufferBlock block{
+        static_cast<uint32_t>(self.numel()),
+        key.seed_lo, key.seed_hi, key.offset, 0u,
+    };
+    api::UniformParamsBuffer params(context, block);
+    api::PipelineBarrier pipeline_barrier{};
+    const uint32_t groups =
+        (static_cast<uint32_t>(self.numel()) + 3u) / 4u;
+    context->submit_compute_job(
+        VK_KERNEL(bernoulli_tensor_fill_buffer),
+        pipeline_barrier,
+        {groups, 1u, 1u},
+        {256u, 1u, 1u},
+        VK_NULL_HANDLE,
+        v.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::WRITE),
+        v_prob.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::READ),
+        params.buffer());
+    return self;
+  }
 
   const BernoulliTensorBlock block{
       v.extents(), 0u, key.seed_lo, key.seed_hi, key.offset, 0u,
