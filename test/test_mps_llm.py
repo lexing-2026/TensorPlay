@@ -369,6 +369,19 @@ class TestMPSAmp(unittest.TestCase):
         self.assertEqual(found.item(), 0.0)
         self.assertTrue(close(grads[0].cpu(), tp.tensor([0.5, 1.0]), 1e-5))
 
+    def test_non_finite_check_fills_the_tensor_list(self):
+        # 33 gradients: a launch is closed as soon as the list is full, so the
+        # last one has to be bound in a fresh argument buffer.
+        grads = [tp.tensor([2.0, 2.0, 2.0, 2.0], device="mps")
+                 for _ in range(33)]
+        found = tp.zeros((), dtype=tp.float32, device="mps")
+        inv_scale = tp.tensor(0.5, dtype=tp.float32, device="mps")
+        tp._amp_foreach_non_finite_check_and_unscale_(grads, found, inv_scale)
+        self.assertEqual(found.item(), 0.0)
+        for g in grads:
+            self.assertTrue(close(g.cpu(), tp.tensor([1.0, 1.0, 1.0, 1.0]),
+                                  1e-5))
+
     def test_update_scale_growth(self):
         scale = tp.tensor(1.0, dtype=tp.float32, device="mps")
         gt = tp.tensor(0, dtype=tp.int32, device="mps")
