@@ -536,5 +536,61 @@ class TestVulkanIndexCopy(unittest.TestCase):
         self.assertFalse(cache.key_cache[0].cpu().numpy()[:, :, 15:, :].any())
 
 
+class TestVulkanDecodeMatmul(unittest.TestCase):
+    @staticmethod
+    def _relerr(got, want):
+        got = np.asarray(got, dtype=np.float32)
+        want = np.asarray(want, dtype=np.float32)
+        denom = max(float(np.abs(want).max()), 1.0)
+        return float(np.abs(got - want).max()) / denom
+
+    def test_decode_matvec_and_matmat(self):
+        # Narrow-row products run the two-pass split reduction; pin its
+        # numerics across dtypes, non-multiple-of-four tails, and the
+        # tiled-path fallback for wider outputs.
+        import tensorplay as tp
+        tensorplay.manual_seed(1234)
+        cases = []
+        for K, N in ((1024, 2048), (4096, 1024), (517, 303)):
+            cases.append((1, K, N, tensorplay.float32, 2.0e-5))
+            cases.append((4, K, N, tensorplay.float16, 2.0e-3))
+        cases.append((8, 1024, 1024, tensorplay.float32, 2.0e-5))
+        for M, K, N, dtype, tol in cases:
+            a = tensorplay.randn((M, K), device="cpu").to(dtype)
+            b = tensorplay.randn((K, N), device="cpu").to(dtype)
+            got = (a.to("vulkan") @ b.to("vulkan")).cpu().numpy()
+            want = a.numpy().astype(np.float32) @ b.numpy().astype(np.float32)
+            self.assertLessEqual(self._relerr(got, want), tol,
+                                 f"mm M={M} K={K} N={N} {dtype}")
+
+    def test_decode_addmm_bias_broadcast(self):
+        import tensorplay as tp
+        tensorplay.manual_seed(1234)
+        K, N = 1024, 1030
+        for M, dtype, tol in (
+            (1, tensorplay.float32, 2.0e-5),
+            (4, tensorplay.float16, 2.0e-3),
+        ):
+            a = tensorplay.randn((M, K), device="cpu").to(dtype)
+            b = tensorplay.randn((K, N), device="cpu").to(dtype)
+            bias_vec = tensorplay.randn((N,), device="cpu").to(dtype)
+            got = tensorplay.addmm(
+                bias_vec.to("vulkan"), a.to("vulkan"), b.to("vulkan")
+            ).cpu().numpy()
+            want = (a.numpy().astype(np.float32) @
+                    b.numpy().astype(np.float32) +
+                    bias_vec.numpy().astype(np.float32))
+            self.assertLessEqual(self._relerr(got, want), tol,
+                                 f"addmm 1d M={M} {dtype}")
+            bias_mat = tensorplay.randn((M, N), device="cpu").to(dtype)
+            got = tensorplay.addmm(
+                bias_mat.to("vulkan"), a.to("vulkan"), b.to("vulkan")).cpu().numpy()
+            want = (a.numpy().astype(np.float32) @
+                    b.numpy().astype(np.float32) +
+                    bias_mat.numpy().astype(np.float32))
+            self.assertLessEqual(self._relerr(got, want), tol,
+                                 f"addmm 2d M={M} {dtype}")
+
+
 if __name__ == "__main__":
     unittest.main()
