@@ -1184,6 +1184,16 @@ bernoulli_tensor_fill:
   parameter_names_with_default_values: {}
   shader_variants:
   - NAME: bernoulli_tensor_fill
+random_fill_buffer:
+  parameter_names_with_default_values:
+    DIST: 0
+  shader_variants:
+  - NAME: buffer_uniform_fill
+    DIST: 0
+  - NAME: buffer_normal_fill
+    DIST: 1
+  - NAME: buffer_bernoulli_fill
+    DIST: 2
 hardshrink_mask:
   parameter_names_with_default_values: {}
   shader_variants:

@@ -63,6 +63,18 @@ struct BernoulliTensorBlock final {
   uint32_t fill;
 };
 
+// Buffer-stored fills carry the element count instead of image extents.
+struct RandomBufferFillBlock final {
+  uint32_t buf_length;
+  float from; // uniform lower bound / bernoulli probability
+  float to;   // uniform upper bound / normal mean
+  float std;  // normal standard deviation
+  uint32_t seed_lo;
+  uint32_t seed_hi;
+  uint32_t offset;
+  uint32_t fill;
+};
+
 struct StreamKey final {
   uint32_t seed_lo;
   uint32_t seed_hi;
@@ -94,10 +106,13 @@ void validate_random_target(const Tensor& t, const char* name) {
 }
 
 // Shared dispatch for the three nullary distributions; `from`, `to` and `std`
-// carry whichever parameters the selected variant reads.
+// carry whichever parameters the selected variant reads.  `shader` fills
+// texture-stored payloads and `buffer_shader` fills shapes whose extents fall
+// back to buffer storage.
 void dispatch_random_fill(
     Tensor& self,
     const api::ShaderInfo& shader,
+    const api::ShaderInfo& buffer_shader,
     float from,
     float to,
     float std,
@@ -105,13 +120,35 @@ void dispatch_random_fill(
   api::Context* const context = api::context();
   api::vTensor v = convert(self);
   const StreamKey key = next_stream_key(generator);
+  api::PipelineBarrier pipeline_barrier{};
+
+  if (v.storage_type() == api::StorageType::BUFFER) {
+    const uint32_t groups =
+        (static_cast<uint32_t>(self.numel()) + 3u) / 4u;
+    api::UniformParamsBuffer params(
+        context, RandomBufferFillBlock{
+            static_cast<uint32_t>(self.numel()), from, to, std,
+            key.seed_lo, key.seed_hi, key.offset, 0u,
+        });
+    context->submit_compute_job(
+        buffer_shader,
+        pipeline_barrier,
+        {groups, 1u, 1u},
+        {256u, 1u, 1u},
+        VK_NULL_HANDLE,
+        v.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::WRITE),
+        params.buffer());
+    return;
+  }
 
   const RandomFillBlock block{
       v.extents(), 0u, from, to, std,
       key.seed_lo, key.seed_hi, key.offset, 0u,
   };
   api::UniformParamsBuffer params(context, block);
-  api::PipelineBarrier pipeline_barrier{};
 
   context->submit_compute_job(
       shader,
@@ -143,8 +180,8 @@ Tensor& uniform_kernel(
     return self;
   }
   dispatch_random_fill(
-      self, VK_KERNEL(uniform_fill), static_cast<float>(from),
-      static_cast<float>(to), 0.0f, generator);
+      self, VK_KERNEL(uniform_fill), VK_KERNEL(buffer_uniform_fill),
+      static_cast<float>(from), static_cast<float>(to), 0.0f, generator);
   return self;
 }
 
@@ -163,8 +200,8 @@ Tensor& normal_kernel(
   }
   // The normal variant reads the mean from `to` and the spread from `std`.
   dispatch_random_fill(
-      self, VK_KERNEL(normal_fill), 0.0f, static_cast<float>(mean),
-      static_cast<float>(std), generator);
+      self, VK_KERNEL(normal_fill), VK_KERNEL(buffer_normal_fill), 0.0f,
+      static_cast<float>(mean), static_cast<float>(std), generator);
   return self;
 }
 
@@ -182,8 +219,8 @@ Tensor& bernoulli_scalar_kernel(
   }
   // The bernoulli variant reads its probability from `from`.
   dispatch_random_fill(
-      self, VK_KERNEL(bernoulli_fill), static_cast<float>(p), 0.0f, 0.0f,
-      generator);
+      self, VK_KERNEL(bernoulli_fill), VK_KERNEL(buffer_bernoulli_fill),
+      static_cast<float>(p), 0.0f, 0.0f, generator);
   return self;
 }
 
@@ -342,8 +379,9 @@ Tensor multinomial_kernel(
   // as uniform_, then run one inverse-CDF thread per row.
   Tensor noise = empty_kernel(
       {rows * num_samples}, DType::Float32, self.device(), false);
-  dispatch_random_fill(noise, VK_KERNEL(uniform_fill), 0.0f, 1.0f, 0.0f,
-                      generator);
+  dispatch_random_fill(
+      noise, VK_KERNEL(uniform_fill), VK_KERNEL(buffer_uniform_fill), 0.0f,
+      1.0f, 0.0f, generator);
 
   api::Context* const context = api::context();
   api::vTensor v_prob = convert(prob);
@@ -426,8 +464,9 @@ Tensor sample_kernel(
 
   Tensor noise = empty_kernel({rows}, DType::Float32, input.device(), false);
   std::optional<Generator> no_generator;
-  dispatch_random_fill(noise, VK_KERNEL(uniform_fill), 0.0f, 1.0f, 0.0f,
-                      no_generator);
+  dispatch_random_fill(
+      noise, VK_KERNEL(uniform_fill), VK_KERNEL(buffer_uniform_fill), 0.0f,
+      1.0f, 0.0f, no_generator);
 
   api::vTensor v_values = convert(values);
   api::vTensor v_indices = convert(indices);
