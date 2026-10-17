@@ -14,6 +14,9 @@ namespace tensorplay {
 namespace vulkan {
 namespace ops {
 
+template <typename Return, typename... Args>
+Return dispatch_vk(const char* op, Args... args);
+
 namespace {
 
 //
