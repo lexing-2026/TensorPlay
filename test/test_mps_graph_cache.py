@@ -401,8 +401,8 @@ class TestMPSUnaryOperandReads(MPSCase):
         self.assertEqual(tp.abs(-mps).cpu().tolist(), values)
         # A zero-dimensional operand is read by the same dispatch, and a scalar
         # tensor reads back as one number rather than a one-element list.
-        self.assertEqual(tp.rsqrt(tp.full((), 4.0, device="mps")).cpu().tolist(),
-                         0.5)
+        scalar = tp.full((), 4.0, device="mps")
+        self.assertEqual(tp.rsqrt(scalar).cpu().tolist(), 0.5)
         self.assertEqual(tp.exp(tp.zeros((2, 2), device="mps")).cpu().tolist(),
                          [[1.0, 1.0], [1.0, 1.0]])
         self.assertEqual(tp.relu(tp.tensor([-4.0, 0.0, 0.25, 4.0],
@@ -453,7 +453,7 @@ class TestMPSUnaryOperandReads(MPSCase):
         # A permuted view is not laid out in the order its result is written in.
         self.assert_same_result(tp.exp(tp.transpose(base_mps, 0, 1)),
                                 tp.exp(tp.transpose(base_cpu, 0, 1)))
-        # A slice that starts inside its storage has no base offset to hand over.
+        # A slice that starts inside its storage has no base offset to give.
         wide_cpu, wide_mps = _range_on_both([16, 8])
         self.assert_same_result(tp.abs(wide_mps[3:11] - 60.0),
                                 tp.abs(wide_cpu[3:11] - 60.0))

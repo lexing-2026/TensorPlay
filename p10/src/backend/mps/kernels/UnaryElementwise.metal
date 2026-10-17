@@ -55,10 +55,10 @@ kernel void unary_elementwise(device T* out [[buffer(0)]],
       device const DTYPE* src [[buffer(1)]],      \
       uint tid [[thread_position_in_grid]]);
 
-// Half, bfloat16 and the integer storage types are absent: an operation with one
-// of them runs its math in a wider type, which the graph path builds as a cast
-// around the operation. A call with such a dtype stays with the graph, which the
-// host reaches by failing to resolve the kernel name.
+// Half, bfloat16 and the integer storage types are absent: an operation with
+// one of them runs its math in a wider type, which the graph path builds as a
+// cast around the operation. A call with such a dtype stays with the graph,
+// which the host reaches by failing to resolve the kernel name.
 REGISTER_UNARY_ELEMENTWISE(exp, float)
 REGISTER_UNARY_ELEMENTWISE(sqrt, float)
 REGISTER_UNARY_ELEMENTWISE(rsqrt, float)
