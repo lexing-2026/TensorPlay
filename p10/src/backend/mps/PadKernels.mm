@@ -71,16 +71,16 @@ Tensor constant_pad_nd_kernel(const Tensor& self,
     const int64_t left = pad[pad_idx];
     const int64_t right = pad[pad_idx + 1];
     if (left < 0) {
-      cropped = cropped.narrow(dim, -left, cropped.size(dim) + left);
+      cropped = cropped.slice(dim, -left, cropped.size(dim));
     }
     if (right < 0) {
-      cropped = cropped.narrow(dim, 0, cropped.size(dim) + right);
+      cropped = cropped.slice(dim, 0, cropped.size(dim) + right);
     }
     if (left > 0) {
-      interior = interior.narrow(dim, left, interior.size(dim) - left);
+      interior = interior.slice(dim, left, interior.size(dim));
     }
     if (right > 0) {
-      interior = interior.narrow(dim, 0, interior.size(dim) - right);
+      interior = interior.slice(dim, 0, interior.size(dim) - right);
     }
   }
   output.fill_(value);
