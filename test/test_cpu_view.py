@@ -53,9 +53,13 @@ def test_cpu_view_rejects_incompatible_strides():
 
 
 def test_cpu_view_empty_and_scalar():
-    empty = tp.empty((0, 3), device="cpu").view(3, 0)
+    base = tp.empty((0, 3), device="cpu")
+    empty = base.view(3, 0)
     assert tuple(empty.shape) == (3, 0)
     assert empty.numel() == 0
+    assert tuple(base.view(3, -1).shape) == (3, 0)
+    with pytest.raises(RuntimeError, match="ambiguous|unspecified dimension"):
+        base.view(0, -1)
 
     scalar = tp.tensor(7, device="cpu")
     assert scalar.view(1).tolist() == [7]
@@ -64,7 +68,7 @@ def test_cpu_view_empty_and_scalar():
 
 @pytest.mark.parametrize("shape", [(4, 2), (-1, -1), (0, -1)])
 def test_cpu_view_rejects_invalid_shapes(shape):
-    with pytest.raises((RuntimeError, ValueError)):
+    with pytest.raises((RuntimeError, ValueError), match="shape|dimension|size"):
         tp.arange(6, device="cpu").view(shape)
 
 
