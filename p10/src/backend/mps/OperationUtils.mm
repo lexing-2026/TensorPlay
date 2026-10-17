@@ -269,8 +269,9 @@ Tensor binaryOp(const Tensor& self, const Tensor& other, MPSBinaryOpBlock block,
       MPSGraphTensor* result = nil;
       if (has_alpha && !alpha_is_one) {
         // Scale `other` by alpha (including 0) before running the op block.
-        MPSGraphTensor* alphaConst = [graph constant:alpha->toDouble()
-                                           dataType:common_dt];
+        MPSGraphTensor* alphaConst =
+            [graph constantWithScalar:alpha->toDouble()
+                             dataType:common_dt];
         MPSGraphTensor* yScaled =
             [graph multiplicationWithPrimaryTensor:yc
                                        secondaryTensor:alphaConst
