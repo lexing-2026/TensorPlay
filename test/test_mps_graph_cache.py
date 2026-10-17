@@ -399,8 +399,10 @@ class TestMPSUnaryOperandReads(MPSCase):
         self.assertEqual(tp.rsqrt(mps).cpu().tolist(),
                          [1.0, 0.5, 0.25, 0.125, 2.0])
         self.assertEqual(tp.abs(-mps).cpu().tolist(), values)
+        # A zero-dimensional operand is read by the same dispatch, and a scalar
+        # tensor reads back as one number rather than a one-element list.
         self.assertEqual(tp.rsqrt(tp.full((), 4.0, device="mps")).cpu().tolist(),
-                         [0.5])
+                         0.5)
         self.assertEqual(tp.exp(tp.zeros((2, 2), device="mps")).cpu().tolist(),
                          [[1.0, 1.0], [1.0, 1.0]])
         self.assertEqual(tp.relu(tp.tensor([-4.0, 0.0, 0.25, 4.0],
