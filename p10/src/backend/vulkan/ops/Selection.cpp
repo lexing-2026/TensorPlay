@@ -79,14 +79,33 @@ std::tuple<Tensor, Tensor> sort_impl(
       api::GPUMemoryLayout::TENSOR_WIDTH_PACKED);
   api::UniformParamsBuffer params(context, block);
   api::PipelineBarrier barrier{};
-  context->submit_compute_job(
-      VK_KERNEL(sort), barrier,
-      {static_cast<uint32_t>(tiles) * kSortLanes,
-       static_cast<uint32_t>(rows), 1u},
-      {kSortLanes, 1u, 1u}, VK_NULL_HANDLE,
-      scratch.buffer(barrier, api::PipelineStage::COMPUTE,
-                     api::MemoryAccessType::WRITE),
-      input.image(barrier, api::PipelineStage::COMPUTE), params.buffer());
+  // Shapes beyond the 3-D image axis limit fall back to buffer storage at
+  // allocation time; their tiles read the contiguous input buffer and their
+  // final gather writes contiguous output buffers through dedicated
+  // variants.  The merge passes already work on raw storage buffers.
+  const bool buffer_input =
+      input.storage_type() == api::StorageType::BUFFER;
+  if (buffer_input) {
+    context->submit_compute_job(
+        VK_KERNEL(sort_buffer), barrier,
+        {static_cast<uint32_t>(tiles) * kSortLanes,
+         static_cast<uint32_t>(rows), 1u},
+        {kSortLanes, 1u, 1u}, VK_NULL_HANDLE,
+        scratch.buffer(barrier, api::PipelineStage::COMPUTE,
+                       api::MemoryAccessType::WRITE),
+        input.buffer(barrier, api::PipelineStage::COMPUTE,
+                     api::MemoryAccessType::READ),
+        params.buffer());
+  } else {
+    context->submit_compute_job(
+        VK_KERNEL(sort), barrier,
+        {static_cast<uint32_t>(tiles) * kSortLanes,
+         static_cast<uint32_t>(rows), 1u},
+        {kSortLanes, 1u, 1u}, VK_NULL_HANDLE,
+        scratch.buffer(barrier, api::PipelineStage::COMPUTE,
+                       api::MemoryAccessType::WRITE),
+        input.image(barrier, api::PipelineStage::COMPUTE), params.buffer());
+  }
 
   std::unique_ptr<api::vTensor> alternate;
   if (length > 2048) {
@@ -112,6 +131,20 @@ std::tuple<Tensor, Tensor> sort_impl(
     std::swap(current, next);
   }
   api::PipelineBarrier output_barrier{};
+  if (values.storage_type() == api::StorageType::BUFFER) {
+    context->submit_compute_job(
+        VK_KERNEL(sort_output_buffer), output_barrier,
+        {static_cast<uint32_t>(values.numel()), 1u, 1u},
+        {kSortLanes, 1u, 1u}, VK_NULL_HANDLE,
+        values.buffer(output_barrier, api::PipelineStage::COMPUTE,
+                      api::MemoryAccessType::WRITE),
+        indices.buffer(output_barrier, api::PipelineStage::COMPUTE,
+                       api::MemoryAccessType::WRITE),
+        current->buffer(output_barrier, api::PipelineStage::COMPUTE,
+                        api::MemoryAccessType::READ),
+        params.buffer());
+    return {convert(values), convert(indices)};
+  }
   context->submit_compute_job(
       VK_KERNEL(sort_output), output_barrier, values.extents(),
       adaptive_work_group_size(values.extents()), VK_NULL_HANDLE,
