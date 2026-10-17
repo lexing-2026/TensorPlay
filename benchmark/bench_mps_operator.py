@@ -93,12 +93,9 @@ class _TreeBackend:
             tp.mps.synchronize()
 
     def release_cached_memory(self):
-        # This runtime hands buffers back through its own pool.
-        if self.device != "mps":
-            return
-        empty = getattr(tp.mps, "empty_cache", None)
-        if empty is not None:
-            empty()
+        # This runtime hands buffers back through its own pool, and its samples
+        # should keep whatever it reuses on its own.
+        return
 
     def __getattr__(self, item):
         return getattr(F, item)

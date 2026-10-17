@@ -145,11 +145,12 @@ Tensor reductionOp(const Tensor& self, const std::vector<int64_t>& dims,
   }
 
   // The graph depends only on the input shape, the axes actually reduced, the
-  // dtypes and the kind, so the same reduction on later batches reuses it.
+  // output shape the graph reshapes to, the dtypes and the kind, so the same
+  // reduction on later batches reuses it. The output shape carries keepdim.
   const std::string key =
       "reduce|" + shapeKey(in_shape) + "|" + shapeKey(axes) + "|" +
-      dtypeKey(self_c.dtype()) + "|" + dtypeKey(acc_dtype) + "|" +
-      dtypeKey(out_dtype) + "|" +
+      shapeKey(out_shape) + "|" + dtypeKey(self_c.dtype()) + "|" +
+      dtypeKey(acc_dtype) + "|" + dtypeKey(out_dtype) + "|" +
       std::to_string(static_cast<int>(kind));
 
   @autoreleasepool {

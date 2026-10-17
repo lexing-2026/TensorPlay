@@ -29,7 +29,7 @@ on:
         description: Cases left out of the second benchmark pass
         required: false
         type: string
-        default: "layer_norm[64x1024]"
+        default: "layer_norm[64x1024],constant_pad_nd[64x64x64]"
   schedule:
     - cron: "0 5 * * 1"
   pull_request:

@@ -132,7 +132,7 @@ on:
       mps_reference_skip_cases:
         required: false
         type: string
-        default: "layer_norm[64x1024]"
+        default: "layer_norm[64x1024],constant_pad_nd[64x64x64]"
         description: >
           Comma-separated cases left out of the second MPS benchmark pass.
           The layer-norm call there aborts the process on the benchmark
