@@ -245,6 +245,25 @@ Tensor reshape_kernel(const Tensor& self, const std::vector<int64_t>& shape) {
   if (stride.has_value()) {
     const int64_t offset =
         static_cast<int64_t>(self.unsafeGetTensorImpl()->storage_offset());
+    // Buffer payloads are plain row-major memory, so a stride-compatible
+    // reshape of a contiguous buffer tensor is a pure metadata view: the
+    // gather pipeline maps only texture-backed shapes.
+    api::vTensor v_self = convert(self);
+    if (v_self.storage_type() == api::StorageType::BUFFER) {
+      const auto self_sizes = static_cast<std::vector<int64_t>>(self.shape());
+      const auto dense_strides =
+          SizesAndStrides::compute_contiguous_strides(self_sizes);
+      if (self.is_contiguous() &&
+          self.strides() ==
+              std::vector<int64_t>(dense_strides.begin(), dense_strides.end())) {
+        Tensor result(
+            self.unsafeGetTensorImpl()->storage(), inferred, *stride,
+            self.dtype(), offset);
+        result.unsafeGetTensorImpl()->share_version_counter(
+            *self.unsafeGetTensorImpl());
+        return result;
+      }
+    }
     return materialize_view(self, inferred, *stride, offset);
   }
 
