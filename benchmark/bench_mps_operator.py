@@ -15,7 +15,9 @@ Usage: bench_mps_operator.py --suite short --reps 5 --json-out results.json
 """
 
 import argparse
+import faulthandler
 import json
+import sys
 import time
 from pathlib import Path
 
@@ -335,6 +337,8 @@ def build_cases(dtype, suite):
 
 
 def main():
+    faulthandler.enable()
+    sys.stdout.reconfigure(line_buffering=True)
     parser = argparse.ArgumentParser()
     parser.add_argument("--suite", choices=("short", "long", "all"),
                         default="short")
@@ -351,6 +355,7 @@ def main():
     cases = build_cases(args.dtype, suite)
     print(f"suite={suite} dtype={args.dtype} cases={len(cases)}")
     for name, category, factory, specs, flops in cases:
+        print(f"running {name}")
         fn = factory()
         # Probe once so an unsupported case is reported and skipped instead
         # of aborting the remaining measurements of the pass.
