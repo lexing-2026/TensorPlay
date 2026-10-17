@@ -129,6 +129,14 @@ on:
         description: >
           Time every MPS benchmark case through a second runtime on the same
           device and publish the per-case speedup (macOS only).
+      mps_reference_requirement:
+        required: false
+        type: string
+        default: "torch==2.7.1"
+        description: >
+          Package requirement installed for the second MPS benchmark pass.
+          Pinned because the newest release of that runtime refuses every
+          device allocation on the benchmark runner.
       mps_require_speedup_win:
         required: false
         type: boolean
@@ -836,6 +844,7 @@ jobs:
         env:
           MPS_BENCH_SUITE: ${{ inputs.mps_benchmark_suite }}
           MPS_COMPARE_REFERENCE: ${{ inputs.mps_compare_reference }}
+          MPS_REFERENCE_REQUIREMENT: ${{ inputs.mps_reference_requirement }}
           # The Metal device of a CI virtual machine reports its unified memory
           # as almost fully allocated, so the second runtime's allocator
           # refuses even 16 KiB requests. Disabling its watermark check is the
@@ -858,7 +867,7 @@ jobs:
             # The second pass runs the same inventory in its own process: each
             # side then warms up and allocates on its own, and neither one's
             # device memory pressure lands inside the other's samples.
-            python -m pip install -q "torch>=2.5"
+            python -m pip install -q "$MPS_REFERENCE_REQUIREMENT"
             python benchmark/bench_mps_operator.py --side reference \
               --suite "$suite" --dtype f32 --reps 3 \
               --json-out benchmark-results/mps-operator-reference.json \

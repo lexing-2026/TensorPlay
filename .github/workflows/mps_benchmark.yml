@@ -20,6 +20,11 @@ on:
         required: false
         type: boolean
         default: false
+      reference_requirement:
+        description: Package requirement for the second benchmark pass
+        required: false
+        type: string
+        default: "torch==2.7.1"
   schedule:
     - cron: "0 5 * * 1"
   pull_request:
@@ -61,6 +66,7 @@ jobs:
       # scheduled run enforces the floor; dispatched runs do so on request.
       mps_compare_reference: true
       mps_require_speedup_win: ${{ github.event_name == 'schedule' || inputs.require_speedup_win }}
+      mps_reference_requirement: ${{ inputs.reference_requirement || 'torch==2.7.1' }}
       upload_release: false
     secrets: inherit
 

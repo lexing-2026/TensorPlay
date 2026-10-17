@@ -31,7 +31,7 @@ TOP_LOSSES = 12
 TOP_WINS = 8
 
 
-def load(path):
+def load(path, require_measurements=True):
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     if payload.get("schema_version") != SCHEMA_VERSION:
         raise ValueError(
@@ -41,7 +41,9 @@ def load(path):
     if payload.get("benchmark") != "mps-operator":
         raise ValueError(f"{path} is not an mps-operator benchmark")
     measurements = payload.get("measurements")
-    if not isinstance(measurements, list) or not measurements:
+    if not isinstance(measurements, list):
+        raise ValueError(f"{path} has no measurements")
+    if require_measurements and not measurements:
         raise ValueError(f"{path} has no measurements")
     return payload
 
@@ -218,7 +220,10 @@ def main():
 
     payload = load(args.operator_json)
     if args.reference_json is not None and args.reference_json.exists():
-        payload = join(payload, load(args.reference_json))
+        # The second pass may legitimately record nothing when the device
+        # cannot provision it; the join then reports the missing pairs.
+        reference = load(args.reference_json, require_measurements=False)
+        payload = join(payload, reference)
     summary = summarize(payload)
     violations = evaluate(summary, args.min_geomean, args.min_win_rate,
                           args.max_case_slowdown)
