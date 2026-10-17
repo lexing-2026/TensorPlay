@@ -99,17 +99,14 @@ void MPSStream::synchronize(SyncType syncType) {
   }
 }
 
-// Commits the current command buffer, waits for it to complete, and returns
-// the GPU duration in milliseconds measured from the root command buffer's
-// timestamps.  Used by the profiler to time a single dispatch.
+// Commits the current command buffer (or waits on the already-committed
+// previous buffer), and returns the GPU duration in milliseconds measured
+// from the root command buffer's timestamps.  Used by the profiler to time
+// a single dispatch: shader-based ops leave the buffer uncommitted, while
+// graph ops are committed by MPSStream::executeMPSGraph's normal flush.
 double MPSStream::commitAndWaitGetGpuTimeMs() {
   endKernelCoalescing();
   double ms = 0.0;
-  if (_prevCommandBuffer) {
-    [_prevCommandBuffer waitUntilCompleted];
-    [_prevCommandBuffer release];
-    _prevCommandBuffer = nil;
-  }
   if (_commandBuffer) {
     [_commandBuffer commit];
     [_commandBuffer waitUntilCompleted];
@@ -121,6 +118,18 @@ double MPSStream::commitAndWaitGetGpuTimeMs() {
     }
     [_commandBuffer release];
     _commandBuffer = nil;
+  } else if (_prevCommandBuffer) {
+    // The op was committed by executeMPSGraph's synchronize; wait for it and
+    // read the timestamps before the buffer is released.
+    [_prevCommandBuffer waitUntilCompleted];
+    id<MTLCommandBuffer> root = [_prevCommandBuffer rootCommandBuffer];
+    const CFTimeInterval start = [root GPUStartTime];
+    const CFTimeInterval end = [root GPUEndTime];
+    if (end > start) {
+      ms = (end - start) * 1000.0;
+    }
+    [_prevCommandBuffer release];
+    _prevCommandBuffer = nil;
   }
   return ms;
 }
@@ -237,13 +246,6 @@ void MPSStream::executeMPSGraph(MPSGraph* mpsGraph,
         throw tensorplay::RuntimeError(
             {__FILE__, __func__, __LINE__},
             tensorplay::detail::format_msg("MPSGraph encode failed: ", reason));
-      }
-      // During a GPU-timing profile session the command buffer is left
-      // uncommitted here: GpuTimerPair::close() attaches its completion
-      // handler to the buffer holding this op's work and commits it, so the
-      // resolved GPU duration covers the op rather than an empty buffer.
-      if (tensorplay::prof::g_gpu_timing.load(std::memory_order_acquire)) {
-        return;
       }
       SyncType effective = syncType;
       if (!_enableCommitAndContinue && syncType != SyncType::COMMIT_AND_WAIT) {
