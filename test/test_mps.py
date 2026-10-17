@@ -234,6 +234,31 @@ class TestMPSSoftmaxReduction(unittest.TestCase):
                     self.assertEqual(result.shape, expected.shape)
                     self.assertTrue(tp.allclose(result, expected))
 
+    def test_multi_axis_reductions(self):
+        x = tp.arange(24, dtype=tp.float32, device="mps").reshape(2, 3, 4) + 1.0
+        # Every factor is a power of two, so a product of them stays exact
+        # whichever order the factors are combined in.
+        p = tp.tensor([[[1.0, 2.0, 4.0, 1.0],
+                        [2.0, 1.0, 1.0, 4.0],
+                        [4.0, 4.0, 2.0, 1.0]],
+                       [[2.0, 1.0, 4.0, 4.0],
+                        [1.0, 4.0, 2.0, 1.0],
+                        [4.0, 2.0, 1.0, 2.0]]],
+                      dtype=tp.float32, device="mps")
+        for dims in ((0, 2), (0, 1), (1, 2), (0, 1, 2)):
+            for keepdim in (False, True):
+                for name, op, operand in (
+                        ("sum", tp.sum, x),
+                        ("prod", tp.prod, p),
+                        ("amax", tp.amax, x),
+                        ("amin", tp.amin, x)):
+                    with self.subTest(dims=dims, keepdim=keepdim, op=name):
+                        result = op(operand, dim=dims, keepdim=keepdim).cpu()
+                        expected = op(operand.cpu(), dim=dims,
+                                      keepdim=keepdim)
+                        self.assertEqual(result.shape, expected.shape)
+                        self.assertTrue(tp.allclose(result, expected))
+
 
 @unittest.skipUnless(mps_available(), "MPS not available")
 class TestMPSMemory(unittest.TestCase):
@@ -440,6 +465,23 @@ class TestMPSVarStd(unittest.TestCase):
         s = tp.std(m, dim=[0], correction=0)
         self.assertAlmostEqual(s.cpu().tolist()[0], 1.0, places=5)
 
+    def test_var_std_multi_axis(self):
+        x = tp.arange(24, dtype=tp.float32, device="mps").reshape(2, 3, 4) + 1.0
+        for dims in ((0, 2), (0, 1, 2), (1, 2)):
+            for correction in (0, 1):
+                for keepdim in (False, True):
+                    for name, op in (("var", tp.var), ("std", tp.std)):
+                        with self.subTest(dims=dims, correction=correction,
+                                          keepdim=keepdim, op=name):
+                            result = op(x, dim=dims, correction=correction,
+                                        keepdim=keepdim).cpu()
+                            expected = op(x.cpu(), dim=dims,
+                                          correction=correction,
+                                          keepdim=keepdim)
+                            self.assertEqual(result.shape, expected.shape)
+                            self.assertTrue(
+                                tp.allclose(result, expected, atol=1e-4))
+
 
 @unittest.skipUnless(mps_available(), "MPS not available")
 class TestMPSMiscReductions(unittest.TestCase):
@@ -544,6 +586,16 @@ class TestMPSLayerNorm(unittest.TestCase):
         y = tp.layer_norm(x, [3])
         self.assertEqual(y.shape, (2, 3))
 
+    def test_layer_norm_multi_dim(self):
+        x = tp.arange(24, dtype=tp.float32, device="mps").reshape(2, 3, 4) + 1.0
+        y = tp.layer_norm(x, [3, 4])
+        xc = x.cpu()
+        mean = tp.mean(xc, dim=(1, 2), keepdim=True)
+        var = tp.var(xc, dim=(1, 2), correction=0, keepdim=True)
+        ref = (xc - mean) / (var + 1e-5).sqrt()
+        self.assertEqual(tuple(y.shape), (2, 3, 4))
+        self.assertTrue(tp.allclose(y.cpu(), ref, atol=1e-4))
+
 
 @unittest.skipUnless(mps_available(), "MPS not available")
 class TestMPSIndexing(unittest.TestCase):
@@ -612,6 +664,27 @@ class TestMPSBatchNorm(unittest.TestCase):
         # channel 1: mean 6.5
         self.assertAlmostEqual(rm.cpu().tolist()[1], 0.65, places=5)
 
+    def test_batch_norm_training_4d(self):
+        # Statistics over three axes: every axis but the channel one.
+        x = tp.arange(24, dtype=tp.float32,
+                      device="mps").reshape(2, 3, 2, 2) + 1.0
+        w = tp.tensor([1.0, 2.0, 0.5], dtype=tp.float32, device="mps")
+        b = tp.tensor([0.0, 1.0, -1.0], dtype=tp.float32, device="mps")
+        rm = tp.zeros(3, dtype=tp.float32, device="mps")
+        rv = tp.ones(3, dtype=tp.float32, device="mps")
+        y = tp.batch_norm(x, w, b, rm, rv, training=True, momentum=0.1,
+                          eps=1e-5)
+        xc = x.cpu()
+        mean = tp.reshape(tp.mean(xc, dim=(0, 2, 3)), [1, 3, 1, 1])
+        var = tp.reshape(tp.var(xc, dim=(0, 2, 3), correction=0), [1, 3, 1, 1])
+        ref = ((xc - mean) / (var + 1e-5).sqrt()) * tp.reshape(w, [1, 3, 1, 1]) \
+            + tp.reshape(b, [1, 3, 1, 1])
+        self.assertEqual(tuple(y.shape), (2, 3, 2, 2))
+        self.assertTrue(tp.allclose(y.cpu(), ref, atol=1e-4))
+        # Running statistics move towards the batch mean of channel 0,
+        # (1+2+3+4+13+14+15+16)/8 = 8.5.
+        self.assertAlmostEqual(rm.cpu().tolist()[0], 0.85, places=5)
+
 
 @unittest.skipUnless(mps_available(), "MPS not available")
 class TestMPSGroupNorm(unittest.TestCase):
@@ -663,6 +736,30 @@ class TestMPSArgExtrema(unittest.TestCase):
         vmin, imin = tp.min(x, dim=0)
         self.assertEqual(vmin.cpu().tolist(), [1.0, 2.0, 3.0])
         self.assertEqual(imin.cpu().tolist(), [0, 1, 0])
+
+    def test_arg_reductions_rank3(self):
+        x = tp.arange(24, dtype=tp.float32, device="mps").reshape(2, 3, 4)
+        for dim in (0, 1, 2):
+            for keepdim in (False, True):
+                for name, op in (("argmax", tp.argmax), ("argmin", tp.argmin)):
+                    with self.subTest(dim=dim, keepdim=keepdim, op=name):
+                        result = op(x, dim=dim, keepdim=keepdim).cpu()
+                        expected = op(x.cpu(), dim=dim, keepdim=keepdim)
+                        self.assertEqual(result.shape, expected.shape)
+                        self.assertEqual(result.tolist(), expected.tolist())
+
+    def test_rank1_extrema_and_indices(self):
+        v = tp.tensor([3.0, 7.0, 2.0, 9.0], dtype=tp.float32, device="mps")
+        self.assertEqual(tp.argmax(v, dim=0).item(), 3)
+        self.assertEqual(tp.argmin(v, dim=0).item(), 2)
+        self.assertEqual(tp.argmax(v, dim=0, keepdim=True).cpu().tolist(), [3])
+        self.assertEqual(tp.max(v, dim=0)[0].item(), 9.0)
+        self.assertEqual(tp.max(v, dim=0)[1].item(), 3)
+        self.assertEqual(tp.min(v, dim=0)[0].item(), 2.0)
+        self.assertEqual(tp.min(v, dim=0)[1].item(), 2)
+        kept = tp.max(v, dim=0, keepdim=True)
+        self.assertEqual(kept[0].cpu().tolist(), [9.0])
+        self.assertEqual(kept[1].cpu().tolist(), [3])
 
 
 @unittest.skipUnless(mps_available(), "MPS not available")
