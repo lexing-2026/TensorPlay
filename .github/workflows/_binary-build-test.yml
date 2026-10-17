@@ -122,6 +122,37 @@ on:
         type: string
         default: short
         description: "MPS benchmark suite size: short, long, or all"
+      mps_compare_reference:
+        required: false
+        type: boolean
+        default: false
+        description: >
+          Time every MPS benchmark case through a second runtime on the same
+          device and publish the per-case speedup (macOS only).
+      mps_reference_skip_cases:
+        required: false
+        type: string
+        default: "layer_norm[64x1024],constant_pad_nd[64x64x64]"
+        description: >
+          Comma-separated cases left out of the second MPS benchmark pass.
+          The layer-norm call there aborts the process on the benchmark
+          runner, which would otherwise lose every case after it.
+      mps_reference_requirement:
+        required: false
+        type: string
+        default: "torch==2.7.1"
+        description: >
+          Package requirement installed for the second MPS benchmark pass.
+          Pinned because the newest release of that runtime refuses every
+          device allocation on the benchmark runner.
+      mps_require_speedup_win:
+        required: false
+        type: boolean
+        default: false
+        description: >
+          Fail when the MPS benchmark is not faster than the second runtime
+          overall. Off by default so a recording run still publishes its
+          numbers. Only meaningful together with mps_compare_reference.
       test_matrix:
         required: false
         type: string
@@ -820,6 +851,14 @@ jobs:
         shell: bash
         env:
           MPS_BENCH_SUITE: ${{ inputs.mps_benchmark_suite }}
+          MPS_COMPARE_REFERENCE: ${{ inputs.mps_compare_reference }}
+          MPS_REFERENCE_REQUIREMENT: ${{ inputs.mps_reference_requirement }}
+          MPS_REFERENCE_SKIP_CASES: ${{ inputs.mps_reference_skip_cases }}
+          # The Metal device of a CI virtual machine reports its unified memory
+          # as almost fully allocated, so the second runtime's allocator
+          # refuses even 16 KiB requests. Disabling its watermark check is the
+          # documented way to run there.
+          PYTORCH_MPS_HIGH_WATERMARK_RATIO: "0.0"
         run: |
           set -euo pipefail
           mkdir -p benchmark-results
@@ -833,6 +872,26 @@ jobs:
           python benchmark/bench_mps_operator.py --suite "$suite" --dtype f32 \
             --reps 3 --json-out benchmark-results/mps-operator.json \
             | tee benchmark-results/mps-operator.log
+          if [[ "$MPS_COMPARE_REFERENCE" == "true" ]]; then
+            # The second pass runs the same inventory in its own process: each
+            # side then warms up and allocates on its own, and neither one's
+            # device memory pressure lands inside the other's samples.
+            python -m pip install -q "$MPS_REFERENCE_REQUIREMENT"
+            # A pass can abort mid-run on a device the other runtime does not
+            # handle well; the case list it did time is kept and the gate
+            # reports the rest as unpaired.
+            set +e
+            python benchmark/bench_mps_operator.py --side reference \
+              --suite "$suite" --dtype f32 --reps 3 \
+              --skip-cases "$MPS_REFERENCE_SKIP_CASES" \
+              --json-out benchmark-results/mps-operator-reference.json \
+              | tee benchmark-results/mps-operator-reference.log
+            status=${PIPESTATUS[0]}
+            set -e
+            if [[ "$status" != "0" ]]; then
+              echo "::warning::the second benchmark pass ended with status $status"
+            fi
+          fi
 
       - name: Enforce MPS performance floor
         if: ${{ inputs.run_mps_benchmarks && runner.os == 'macOS' }}
@@ -858,6 +917,7 @@ jobs:
               bench-data-history || true
           fi
           python benchmark/test_mps_performance_regression.py
+          python benchmark/test_mps_reference_speedup.py
           python benchmark/check_mps_performance_regression.py \
             --operator-json benchmark-results/mps-operator.json \
             --history bench-data-history/latest.json \
@@ -865,12 +925,42 @@ jobs:
             --operator-max-slowdown 0.30 \
             --summary-out benchmark-results/mps-regression-summary.md
 
+      - name: Enforce MPS speedup over the reference
+        if: ${{ inputs.run_mps_benchmarks && inputs.mps_compare_reference && runner.os == 'macOS' }}
+        shell: bash
+        env:
+          REQUIRE_SPEEDUP_WIN: ${{ inputs.mps_require_speedup_win }}
+        run: |
+          set -euo pipefail
+          # The run records whether the paired inventory was actually timed;
+          # a missing pair is a gate failure, not a pass.
+          set +e
+          python benchmark/check_mps_reference_speedup.py \
+            --operator-json benchmark-results/mps-operator.json \
+            --reference-json benchmark-results/mps-operator-reference.json \
+            --min-geomean 1.0 \
+            --min-win-rate 0.0 \
+            --summary-out benchmark-results/mps-speedup-summary.md \
+            | tee benchmark-results/mps-speedup.log
+          status=${PIPESTATUS[0]}
+          set -e
+          if [[ "$REQUIRE_SPEEDUP_WIN" == "true" && "$status" != "0" ]]; then
+            echo "::error::MPS speedup gate failed"
+            exit "$status"
+          fi
+          if [[ "$status" != "0" ]]; then
+            echo "::warning::MPS speedup gate reported a shortfall; the run is recording only"
+          fi
+
       - name: Publish MPS performance summary
         if: ${{ always() && inputs.run_mps_benchmarks && runner.os == 'macOS' }}
         shell: bash
         run: |
           if [[ -f benchmark-results/mps-regression-summary.md ]]; then
             cat benchmark-results/mps-regression-summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [[ -f benchmark-results/mps-speedup-summary.md ]]; then
+            cat benchmark-results/mps-speedup-summary.md >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Upload MPS performance logs

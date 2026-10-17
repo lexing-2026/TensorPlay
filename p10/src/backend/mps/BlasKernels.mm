@@ -27,22 +27,6 @@ Tensor& fill_kernel(Tensor& self, const Scalar& value);
 
 namespace {
 
-Tensor scalarToTensor(const Scalar& s, DType dtype, const Device& device) {
-  Tensor t = Tensor({1}, dtype, device);
-  fill_kernel(t, s);
-  return t;
-}
-
-MPSBinaryOpBlock mulBlock = ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* a,
-                                             MPSGraphTensor* b) {
-  return [g multiplicationWithPrimaryTensor:a secondaryTensor:b name:nil];
-};
-
-MPSBinaryOpBlock addBlock = ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* a,
-                                               MPSGraphTensor* b) {
-  return [g additionWithPrimaryTensor:a secondaryTensor:b name:nil];
-};
-
 // Attempts a cooperative-tensor GEMM (M5+, macOS 26.2+).  `a`/`b`/`output`
 // must be contiguous row-major tensors; `m/k/n` are the 2-D GEMM dimensions
 // (the batch dimension, if any, is carried by `batch`).  Returns false when
@@ -102,8 +86,14 @@ void runMatMul(const Tensor& a, const Tensor& b,
                const std::vector<int64_t>& a_shape,
                const std::vector<int64_t>& b_shape,
                const std::vector<int64_t>& out_data_shape, Tensor& output) {
+  // The product graph depends only on the three shapes and the dtypes, so a
+  // repeated multiply shape reuses it.
+  const std::string key =
+      "matmul|" + shapeKey(a_shape) + "|" + shapeKey(b_shape) + "|" +
+      shapeKey(out_data_shape) + "|" + dtypeKey(a.dtype()) + "|" +
+      dtypeKey(b.dtype()) + "|" + dtypeKey(output.dtype());
+
   @autoreleasepool {
-    MPSGraph* graph = [[MPSGraph new] autorelease];
     MPSShape* aShape = getMPSShape(a_shape);
     MPSShape* bShape = getMPSShape(b_shape);
     MPSShape* outShape = getMPSShape(out_data_shape);
@@ -111,19 +101,27 @@ void runMatMul(const Tensor& a, const Tensor& b,
     const MPSDataType b_dt = getMPSDataType(b.dtype());
     const MPSDataType out_dt = getMPSDataType(output.dtype());
 
-    MPSGraphTensor* at = [graph placeholderWithShape:aShape
-                                          dataType:a_dt
-                                               name:@"a"];
-    MPSGraphTensor* bt = [graph placeholderWithShape:bShape
-                                          dataType:b_dt
-                                               name:@"b"];
-    MPSGraphTensor* product =
-        [graph matrixMultiplicationWithPrimaryTensor:at
-                                     secondaryTensor:bt
-                                                name:nil];
-    MPSGraphTensor* result = ([product dataType] == out_dt)
-        ? product
-        : [graph castTensor:product toType:out_dt name:@"cast_out"];
+    CachedGraph* entry = findCachedGraph(key);
+    if (entry == nullptr) {
+      MPSGraph* graph = [[MPSGraph alloc] init];
+      MPSGraphTensor* at = [graph placeholderWithShape:aShape
+                                            dataType:a_dt
+                                                 name:@"a"];
+      MPSGraphTensor* bt = [graph placeholderWithShape:bShape
+                                            dataType:b_dt
+                                                 name:@"b"];
+      MPSGraphTensor* product =
+          [graph matrixMultiplicationWithPrimaryTensor:at
+                                       secondaryTensor:bt
+                                                  name:nil];
+      MPSGraphTensor* result = ([product dataType] == out_dt)
+          ? product
+          : [graph castTensor:product toType:out_dt name:@"cast_out"];
+      entry = new CachedGraph{graph, [at retain], [bt retain], nil,
+                              [result retain]};
+      storeCachedGraph(key, entry);
+      entry = findCachedGraph(key);
+    }
 
     id<MTLBuffer> aBuf = mtlBufferOf(a);
     id<MTLBuffer> bBuf = mtlBufferOf(b);
@@ -140,9 +138,9 @@ void runMatMul(const Tensor& a, const Tensor& b,
         [[[MPSGraphTensorData alloc] initWithMTLBuffer:outBuf
                                                 shape:outShape
                                              dataType:out_dt] autorelease];
-    NSDictionary* feeds = @{at : aData, bt : bData};
-    NSDictionary* results = @{result : outData};
-    getCurrentMPSStream()->executeMPSGraph(graph, feeds, results,
+    NSDictionary* feeds = @{entry->input0 : aData, entry->input1 : bData};
+    NSDictionary* results = @{entry->result : outData};
+    getCurrentMPSStream()->executeMPSGraph(entry->graph, feeds, results,
                                           SyncType::COMMIT_AND_WAIT);
   }
 }
@@ -348,13 +346,139 @@ Tensor matmul_kernel(const Tensor& self, const Tensor& other) {
 Tensor addmm_kernel(const Tensor& input, const Tensor& mat1,
                     const Tensor& mat2, const Scalar& beta,
                     const Scalar& alpha) {
-  Tensor prod = mm_kernel(mat1, mat2);
-  // result = beta * input + alpha * prod
-  Tensor beta_t = scalarToTensor(beta, input.dtype(), input.device());
-  Tensor alpha_t = scalarToTensor(alpha, prod.dtype(), prod.device());
-  Tensor scaled_input = binaryOp(input, beta_t, mulBlock);
-  Tensor scaled_prod = binaryOp(prod, alpha_t, mulBlock);
-  return binaryOp(scaled_input, scaled_prod, addBlock);
+  if (!input.device().is_mps() || !mat1.device().is_mps() ||
+      !mat2.device().is_mps()) {
+    TP_THROW(RuntimeError, "addmm(): tensors must be on the MPS device");
+  }
+  check_matmul_dtypes(mat1, mat2);
+  if (mat1.dim() != 2 || mat2.dim() != 2) {
+    TP_THROW(RuntimeError, "addmm(): expected both matrices to be 2-D");
+  }
+  const int64_t m = mat1.size(0);
+  const int64_t k = mat1.size(1);
+  const int64_t n = mat2.size(1);
+  if (mat2.size(0) != k) {
+    TP_THROW(RuntimeError, "addmm(): shapes cannot be multiplied");
+  }
+  const std::vector<int64_t> out_shape = {m, n};
+  const std::vector<int64_t> a_shape = {m, k};
+  const std::vector<int64_t> b_shape = {k, n};
+  const DType prod_dtype = mat1.dtype();
+  const DType out_dtype = promoteTypes(input.dtype(), prod_dtype);
+
+  Tensor mat1_c = materializeForGraph(mat1);
+  Tensor mat2_c = materializeForGraph(mat2);
+  Tensor input_c = materializeForGraph(input);
+  const std::vector<int64_t> input_shape =
+      static_cast<std::vector<int64_t>>(input_c.shape());
+  if (input_shape != out_shape) {
+    if (input_c.numel() == 1) {
+      // A scalar addend has a single element behind an empty or unit shape;
+      // describe it as a broadcastable one so the expansion is well-formed.
+      input_c = input_c.reshape(std::vector<int64_t>{1, 1});
+    }
+    input_c = materializeForGraph(input_c.expand(out_shape));
+  }
+  Tensor output = Tensor(out_shape, out_dtype, input.device());
+  if (output.numel() == 0) {
+    return output;
+  }
+
+  // One graph does the product and both scalings, so the whole expression is
+  // a single dispatch instead of a matrix multiply followed by three binary
+  // operations. Alpha and beta are constants of the graph, hence part of the
+  // key.
+  const std::string key =
+      "addmm|" + shapeKey(out_shape) + "|" + shapeKey(a_shape) + "|" +
+      shapeKey(b_shape) + "|" + dtypeKey(input_c.dtype()) + "|" +
+      dtypeKey(prod_dtype) + "|" + dtypeKey(out_dtype) + "|" +
+      scalarKey(beta) + "|" + scalarKey(alpha);
+
+  @autoreleasepool {
+    MPSShape* outMPSShape = getMPSShape(out_shape);
+    MPSShape* aMPSShape = getMPSShape(a_shape);
+    MPSShape* bMPSShape = getMPSShape(b_shape);
+    const MPSDataType in_dt = getMPSDataType(input_c.dtype());
+    const MPSDataType a_dt = getMPSDataType(mat1_c.dtype());
+    const MPSDataType b_dt = getMPSDataType(mat2_c.dtype());
+    const MPSDataType out_dt = getMPSDataType(out_dtype);
+
+    CachedGraph* entry = findCachedGraph(key);
+    if (entry == nullptr) {
+      MPSGraph* graph = [[MPSGraph alloc] init];
+      MPSGraphTensor* inp = [graph placeholderWithShape:outMPSShape
+                                               dataType:in_dt
+                                                    name:@"input"];
+      MPSGraphTensor* at = [graph placeholderWithShape:aMPSShape
+                                              dataType:a_dt
+                                                   name:@"a"];
+      MPSGraphTensor* bt = [graph placeholderWithShape:bMPSShape
+                                              dataType:b_dt
+                                                   name:@"b"];
+      MPSGraphTensor* product =
+          [graph matrixMultiplicationWithPrimaryTensor:at
+                                       secondaryTensor:bt
+                                                  name:@"product"];
+      MPSGraphTensor* scaled_input =
+          ([inp dataType] == out_dt) ? inp
+                                     : [graph castTensor:inp
+                                                  toType:out_dt
+                                                    name:@"cast_input"];
+      MPSGraphTensor* scaled_prod =
+          ([product dataType] == out_dt)
+          ? product
+          : [graph castTensor:product toType:out_dt name:@"cast_product"];
+      if (beta.toDouble() != 1.0) {
+        MPSGraphTensor* betaConst = [graph constant:beta.toDouble()
+                                           dataType:out_dt];
+        scaled_input = [graph multiplicationWithPrimaryTensor:scaled_input
+                                              secondaryTensor:betaConst
+                                                         name:@"scale_beta"];
+      }
+      if (alpha.toDouble() != 1.0) {
+        MPSGraphTensor* alphaConst = [graph constant:alpha.toDouble()
+                                            dataType:out_dt];
+        scaled_prod = [graph multiplicationWithPrimaryTensor:scaled_prod
+                                             secondaryTensor:alphaConst
+                                                        name:@"scale_alpha"];
+      }
+      MPSGraphTensor* result = [graph additionWithPrimaryTensor:scaled_input
+                                                secondaryTensor:scaled_prod
+                                                           name:@"sum"];
+      entry = new CachedGraph{graph, [inp retain], [at retain], [bt retain],
+                              [result retain]};
+      storeCachedGraph(key, entry);
+      entry = findCachedGraph(key);
+    }
+
+    id<MTLBuffer> inBuf = mtlBufferOf(input_c);
+    id<MTLBuffer> aBuf = mtlBufferOf(mat1_c);
+    id<MTLBuffer> bBuf = mtlBufferOf(mat2_c);
+    id<MTLBuffer> outBuf = mtlBufferOf(output);
+    MPSGraphTensorData* inData =
+        [[[MPSGraphTensorData alloc] initWithMTLBuffer:inBuf
+                                                shape:outMPSShape
+                                             dataType:in_dt] autorelease];
+    MPSGraphTensorData* aData =
+        [[[MPSGraphTensorData alloc] initWithMTLBuffer:aBuf
+                                                shape:aMPSShape
+                                             dataType:a_dt] autorelease];
+    MPSGraphTensorData* bData =
+        [[[MPSGraphTensorData alloc] initWithMTLBuffer:bBuf
+                                                shape:bMPSShape
+                                             dataType:b_dt] autorelease];
+    MPSGraphTensorData* outData =
+        [[[MPSGraphTensorData alloc] initWithMTLBuffer:outBuf
+                                                shape:outMPSShape
+                                             dataType:out_dt] autorelease];
+    NSDictionary* feeds =
+        @{entry->input0 : inData, entry->input1 : aData,
+          entry->input2 : bData};
+    NSDictionary* results = @{entry->result : outData};
+    getCurrentMPSStream()->executeMPSGraph(entry->graph, feeds, results,
+                                          SyncType::COMMIT_AND_WAIT);
+  }
+  return output;
 }
 
 TENSORPLAY_LIBRARY_IMPL(MPS, BlasKernels) {
