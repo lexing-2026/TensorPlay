@@ -15,6 +15,14 @@ namespace tensorplay {
 namespace vulkan {
 namespace ops {
 
+// Defined in View.cpp; materializes a strided view into a dense payload.
+// Buffer-stored inputs use the linear gather path.
+Tensor materialize_view(
+    const Tensor& self,
+    const std::vector<int64_t>& out_sizes,
+    const std::vector<int64_t>& out_strides,
+    int64_t storage_offset);
+
 namespace {
 
 //
@@ -281,8 +289,20 @@ Tensor slice_kernel(
   api::vTensor v_input = convert(self);
   api::vTensor v_output{context, new_sizes, self.dtype()};
 
-  if (v_output.storage_type() == api::StorageType::BUFFER) {
-    TP_THROW(NotImplementedError, "Vulkan slice requires texture storage");
+  if (v_input.storage_type() == api::StorageType::BUFFER) {
+    // A linear payload must be sliced through the strided-view gather,
+    // whether the dense result lands in buffer or image storage: the
+    // sliced axis keeps out_len elements and its stride is scaled by the
+    // step, while the storage offset advances by clamped_start elements along
+    // that axis.
+    const std::vector<int64_t> self_strides = self.strides();
+    std::vector<int64_t> out_strides(
+        self_strides.begin(), self_strides.end());
+    out_strides[static_cast<size_t>(dim)] *= step;
+    const int64_t offset =
+        self.unsafeGetTensorImpl()->storage_offset() +
+        clamped_start * self_strides[static_cast<size_t>(dim)];
+    return materialize_view(self, new_sizes, out_strides, offset);
   }
 
   const struct SliceBlock final {
@@ -350,8 +370,18 @@ Tensor select_kernel(const Tensor& self, int64_t dim, int64_t index) {
   api::vTensor v_input = convert(self);
   api::vTensor v_output{context, new_sizes, self.dtype()};
 
-  if (v_output.storage_type() == api::StorageType::BUFFER) {
-    TP_THROW(NotImplementedError, "Vulkan select requires texture storage");
+  if (v_input.storage_type() == api::StorageType::BUFFER) {
+    // Select over a linear payload is a strided view: the selected axis is
+    // dropped from the output strides and the storage offset advances by
+    // index elements along it.
+    const std::vector<int64_t> self_strides = self.strides();
+    std::vector<int64_t> out_strides(
+        self_strides.begin(), self_strides.end());
+    out_strides.erase(out_strides.begin() + dim);
+    const int64_t offset =
+        self.unsafeGetTensorImpl()->storage_offset() +
+        index * self_strides[static_cast<size_t>(dim)];
+    return materialize_view(self, new_sizes, out_strides, offset);
   }
 
   const struct SliceBlock final {

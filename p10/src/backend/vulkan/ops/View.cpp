@@ -120,15 +120,35 @@ Tensor gather_view(
             input.dtype() != DType::Bool,
         "Vulkan view materialization of this dtype into buffer storage is "
         "not supported yet");
-    const api::ShaderInfo shader = is_int32
-        ? VK_KERNEL(view_gather_int32_buffer)
-        : kernel_for("view_gather_buffer", input.dtype());
     const api::utils::uvec3 grid{
         static_cast<uint32_t>(out_padded[3]),
         static_cast<uint32_t>(out_padded[2]),
         static_cast<uint32_t>(out_padded[0]) *
             static_cast<uint32_t>(c_depth_of(out_padded)),
     };
+    // A buffer-stored input is already plain row-major memory, so the
+    // gather reads through the linear binding and writes the dense output
+    // in one pass.
+    if (v_input.storage_type() == api::StorageType::BUFFER) {
+      const api::ShaderInfo shader = is_int32
+          ? VK_KERNEL(view_gather_int32_buffer_to_buffer)
+          : kernel_for("view_gather_buffer_to_buffer", input.dtype());
+      context->submit_compute_job(
+          shader, pipeline_barrier, grid,
+          adaptive_work_group_size(grid), VK_NULL_HANDLE,
+          v_output.buffer(
+              pipeline_barrier,
+              api::PipelineStage::COMPUTE,
+              api::MemoryAccessType::WRITE),
+          v_input.buffer(
+              pipeline_barrier, api::PipelineStage::COMPUTE,
+              api::MemoryAccessType::READ),
+          params.buffer());
+      return convert(v_output);
+    }
+    const api::ShaderInfo shader = is_int32
+        ? VK_KERNEL(view_gather_int32_buffer)
+        : kernel_for("view_gather_buffer", input.dtype());
     context->submit_compute_job(
         shader, pipeline_barrier, grid,
         adaptive_work_group_size(grid), VK_NULL_HANDLE,
@@ -137,6 +157,33 @@ Tensor gather_view(
             api::PipelineStage::COMPUTE,
             api::MemoryAccessType::WRITE),
         v_input.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+        params.buffer());
+    return convert(v_output);
+  }
+
+  // A buffer-stored input is already plain row-major memory; the gather
+  // reads through the linear binding and writes the dense output in one
+  // pass, for both buffer and image destinations.
+  if (v_input.storage_type() == api::StorageType::BUFFER) {
+    // Float16, Int8 and Bool buffer payloads are byte-packed with no
+    // buffer-reading shader yet; reject loudly instead of misreading them.
+    TP_CHECK(
+        input.dtype() == DType::Float32 || input.dtype() == DType::Int32,
+        "Vulkan view materialization from buffer storage supports "
+        "Float32 and Int32 inputs only");
+    const api::ShaderInfo shader = is_int32
+        ? VK_KERNEL(view_gather_int32_buffer_to_texture)
+        : kernel_for("view_gather_buffer_to_texture", input.dtype());
+    context->submit_compute_job(
+        shader, pipeline_barrier, v_output.extents(),
+        adaptive_work_group_size(v_output.extents()), VK_NULL_HANDLE,
+        v_output.image(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::WRITE),
+        v_input.buffer(
+            pipeline_barrier, api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::READ),
         params.buffer());
     return convert(v_output);
   }

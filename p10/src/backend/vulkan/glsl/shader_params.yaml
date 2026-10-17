@@ -940,10 +940,14 @@ view_gather_buffer:
   parameter_names_with_default_values: {}
   shader_variants:
   - NAME: view_gather_buffer
+  - NAME: view_gather_buffer_to_buffer
+  - NAME: view_gather_buffer_to_texture
 view_gather_int32_buffer:
   parameter_names_with_default_values: {}
   shader_variants:
   - NAME: view_gather_int32_buffer
+  - NAME: view_gather_int32_buffer_to_buffer
+  - NAME: view_gather_int32_buffer_to_texture
 lerp:
   parameter_names_with_default_values:
     TENSOR_WEIGHT: false
