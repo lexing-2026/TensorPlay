@@ -1,12 +1,15 @@
-"""Correctness of the two ways the MPS backend reuses work between calls.
+"""Correctness of the three ways the MPS backend serves a call from what it
+already has.
 
 Binary ops and reductions build an MPSGraph once per call site, shape, dtype
 and scalar, then feed later calls through it; a broadcast add, sub or mul may
-instead address both operands straight out of the storage they already have.
-Both make one call behave differently depending on what ran before it, so these
-checks are about identity: a cached graph must never serve a call it was not
-built for, and a stride-addressed read must return what the copy it replaced
-would have.
+instead address both operands straight out of the storage they already have, and
+a contiguous float operand of a unary math op may be read by a single shader
+dispatch that builds no graph at all. Each of these makes one call behave
+differently depending on what ran before it and on how its input is laid out, so
+these checks are about identity: a cached graph must never serve a call it was
+not built for, and a stride-addressed or single-dispatch read must return what
+the copy or the graph it replaced would have.
 
 Most cases compare an MPS result against the same call on CPU tensors, which
 needs no second runtime. Where the backend does not fix a tie-break, the
@@ -365,6 +368,71 @@ class TestMPSValueIndexReduce(MPSCase):
                          ("max", tp.max), ("min", tp.min)):
             with self.subTest(op=name):
                 self.assert_same_result(fn(x_mps), fn(x_cpu))
+
+
+class TestMPSUnaryOperandReads(MPSCase):
+    """A unary float operand read by one shader dispatch, no graph built."""
+
+    def test_each_operation_matches_cpu(self):
+        base_cpu, base_mps = _range_on_both([3, 17])
+        pos_cpu, pos_mps = base_cpu + 1.0, base_mps + 1.0
+        mid_cpu, mid_mps = (base_cpu - 8.0) / 4.0, (base_mps - 8.0) / 4.0
+        for name, arg_cpu, arg_mps, fn in (
+                ("abs", base_cpu - 25.0, base_mps - 25.0, tp.abs),
+                ("exp", mid_cpu, mid_mps, tp.exp),
+                ("sqrt", pos_cpu, pos_mps, tp.sqrt),
+                ("rsqrt", pos_cpu, pos_mps, tp.rsqrt)):
+            with self.subTest(op=name):
+                self.assert_same_result(fn(arg_mps), fn(arg_cpu))
+
+    def test_powers_of_four_are_exact(self):
+        # These square roots and reciprocal square roots are representable in
+        # binary floating point, so a shader and a graph have to agree on every
+        # bit -- and a zero-dimensional operand is read by the same dispatch.
+        values = [1.0, 4.0, 16.0, 64.0, 0.25]
+        cpu = tp.tensor(values, dtype=tp.float32, device="cpu")
+        mps = tp.tensor(values, dtype=tp.float32, device="mps")
+        self.assertEqual(tp.sqrt(mps).cpu().tolist(),
+                         [1.0, 2.0, 4.0, 8.0, 0.5])
+        self.assertEqual(tp.rsqrt(mps).cpu().tolist(),
+                         [1.0, 0.5, 0.25, 0.125, 2.0])
+        self.assertEqual(tp.abs(-mps).cpu().tolist(), values)
+        self.assertEqual(tp.rsqrt(tp.full((), 4.0, device="mps")).cpu().tolist(),
+                         [0.5])
+        self.assertEqual(tp.exp(tp.zeros((2, 2), device="mps")).cpu().tolist(),
+                         [[1.0, 1.0], [1.0, 1.0]])
+
+    def test_alternating_shapes_at_one_call_site(self):
+        shapes = [[2, 3], [24], [1, 5, 11], [2, 2, 2, 3]]
+        for rep in range(2):
+            for shape in shapes:
+                with self.subTest(rep=rep, shape=shape):
+                    cpu, mps = _range_on_both(shape)
+                    self.assert_same_result(tp.exp(mps - 3.0),
+                                            tp.exp(cpu - 3.0))
+
+    def test_alternating_dtypes_at_one_call_site(self):
+        # Half and int32 reach the graph, which caches a different dtype beside
+        # the float it serves between them.
+        for rep in range(2):
+            for dtype in (tp.float32, tp.float16, tp.int32, tp.float32):
+                with self.subTest(rep=rep, dtype=dtype):
+                    cpu, mps = _range_on_both([5, 4], dtype)
+                    self.assert_same_result(tp.abs(mps - 6), tp.abs(cpu - 6))
+
+    def test_declined_inputs_agree_with_cpu(self):
+        """The reads a single dispatch declines, which a graph serves."""
+        base_cpu, base_mps = _range_on_both([4, 8])
+        # A permuted view is not laid out in the order its result is written in.
+        self.assert_same_result(tp.exp(tp.transpose(base_mps, 0, 1)),
+                                tp.exp(tp.transpose(base_cpu, 0, 1)))
+        # A slice that starts inside its storage has no base offset to hand over.
+        wide_cpu, wide_mps = _range_on_both([16, 8])
+        self.assert_same_result(tp.abs(wide_mps[3:11] - 60.0),
+                                tp.abs(wide_cpu[3:11] - 60.0))
+        # Nothing to read for an empty operand.
+        empty_cpu, empty_mps = _range_on_both([0, 3])
+        self.assert_same_result(tp.sqrt(empty_mps), tp.sqrt(empty_cpu))
 
 
 if __name__ == "__main__":
