@@ -16,6 +16,20 @@
 @end
 
 namespace tensorplay {
+namespace prof {
+
+// Defined in ProfilerMps.mm; installed here because the MPS stream owns the
+// command buffer commit path for graph ops.
+struct GpuTimerPair;
+GpuTimerPair* mps_current_gpu_pair();
+void mps_on_handler_installed();
+void mps_record_gpu_time(uint64_t slot, int device, uint64_t epoch,
+                         id<MTLCommandBuffer> cb);
+
+} // namespace prof
+} // namespace tensorplay
+
+namespace tensorplay {
 namespace mps {
 //-----------------------------------------------------------------
 //  MPSStream
@@ -99,11 +113,10 @@ void MPSStream::synchronize(SyncType syncType) {
   }
 }
 
-// Commits the current command buffer (or waits on the already-committed
-// previous buffer), and returns the GPU duration in milliseconds measured
-// from the root command buffer's timestamps.  Used by the profiler to time
-// a single dispatch: shader-based ops leave the buffer uncommitted, while
-// graph ops are committed by MPSStream::executeMPSGraph's normal flush.
+// Commits the current command buffer (left uncommitted by shader-based
+// ops), waits for it, and returns the GPU duration in milliseconds measured
+// from the root command buffer's timestamps.  Graph ops are timed by a
+// completion handler installed in executeMPSGraph instead.
 double MPSStream::commitAndWaitGetGpuTimeMs() {
   endKernelCoalescing();
   double ms = 0.0;
@@ -118,18 +131,6 @@ double MPSStream::commitAndWaitGetGpuTimeMs() {
     }
     [_commandBuffer release];
     _commandBuffer = nil;
-  } else if (_prevCommandBuffer) {
-    // The op was committed by executeMPSGraph's synchronize; wait for it and
-    // read the timestamps before the buffer is released.
-    [_prevCommandBuffer waitUntilCompleted];
-    id<MTLCommandBuffer> root = [_prevCommandBuffer rootCommandBuffer];
-    const CFTimeInterval start = [root GPUStartTime];
-    const CFTimeInterval end = [root GPUEndTime];
-    if (end > start) {
-      ms = (end - start) * 1000.0;
-    }
-    [_prevCommandBuffer release];
-    _prevCommandBuffer = nil;
   }
   return ms;
 }
@@ -246,6 +247,25 @@ void MPSStream::executeMPSGraph(MPSGraph* mpsGraph,
         throw tensorplay::RuntimeError(
             {__FILE__, __func__, __LINE__},
             tensorplay::detail::format_msg("MPSGraph encode failed: ", reason));
+      }
+      // During a GPU-timing profile session, attach a completion handler to
+      // this op's command buffer so the GPU duration is recorded when it
+      // completes.  The handler must be installed before the commit below;
+      // waiting on the committed buffer from the profiler hot path would
+      // race MPSGraph's deferred encoding.
+      if (tensorplay::prof::g_gpu_timing.load(std::memory_order_acquire)) {
+        tensorplay::prof::GpuTimerPair* pair =
+            tensorplay::prof::mps_current_gpu_pair();
+        if (pair != nullptr) {
+          const uint64_t slot = pair->slot();
+          const int device = pair->device();
+          const uint64_t epoch = pair->epoch();
+          pair->markGpuHandlerInstalled();
+          tensorplay::prof::mps_on_handler_installed();
+          [commandBuffer() addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+            tensorplay::prof::mps_record_gpu_time(slot, device, epoch, cb);
+          }];
+        }
       }
       SyncType effective = syncType;
       if (!_enableCommitAndContinue && syncType != SyncType::COMMIT_AND_WAIT) {

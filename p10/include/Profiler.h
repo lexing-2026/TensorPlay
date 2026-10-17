@@ -283,13 +283,24 @@ struct TENSORPLAY_API GpuTimerPair {
     void arm(const Device& device);  // records start on a CUDA op's stream
     void close();        // records the end event
 
+    // MPS profiler support: the active pair's span identity, used by
+    // MPSStream::executeMPSGraph to attach a completion handler that records
+    // the GPU duration before the graph's command buffer is committed.
+    uint64_t slot() const { return rec_.slot_; }
+    int device() const { return gpu_device_; }
+    uint64_t epoch() const { return gpu_epoch_; }
+    void markGpuHandlerInstalled() { gpu_handler_installed_ = true; }
+    bool gpuHandlerInstalled() const { return gpu_handler_installed_; }
+
 private:
     OpRecord& rec_;
     // Live cudaEvent handle for the armed span; recycled by stop-time drain.
     void* gpu_start_ = nullptr;
     void* gpu_stream_ = nullptr;
     int gpu_device_ = -1;
+    uint64_t gpu_epoch_ = 0;
     bool armed_ = false;
+    bool gpu_handler_installed_ = false;
 };
 TENSORPLAY_API extern std::atomic<bool> g_gpu_timing;
 // Resolves every recorded GPU pair through `emit`; waits only for the final
