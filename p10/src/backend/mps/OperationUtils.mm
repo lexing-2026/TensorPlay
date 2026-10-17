@@ -109,12 +109,11 @@ void runGraph(MPSGraph* graph, MPSShape* shape, MPSDataType inDataType,
 
 namespace {
 
-// Graphs are kept for the process lifetime: a workload with fixed shapes needs
-// a handful, and the limit only stops an unbounded set of shapes from growing
-// the cache. Hitting it drops everything, which costs one recompilation per
-// shape afterwards rather than tracking per-entry usage.
-constexpr size_t kCachedGraphLimit = 256;
-
+// One entry per distinct graph structure, for the process lifetime. Nothing is
+// evicted: a workload with fixed shapes needs a handful, a workload that varies
+// them still needs one per shape, and keeping every entry alive is what makes a
+// pointer handed out by findCachedGraph safe to use while another thread
+// populates the cache.
 std::mutex& graphCacheMutex() {
   static std::mutex mutex;
   return mutex;
@@ -144,15 +143,10 @@ CachedGraph* findCachedGraph(const std::string& key) {
 
 void storeCachedGraph(const std::string& key, CachedGraph* entry) {
   std::lock_guard<std::mutex> guard(graphCacheMutex());
-  if (graphCache().size() >= kCachedGraphLimit) {
-    for (auto& pair : graphCache()) {
-      releaseCachedGraph(pair.second);
-    }
-    graphCache().clear();
-  }
   auto inserted = graphCache().emplace(key, entry);
   if (!inserted.second) {
-    // Another thread built the same graph first; keep its entry.
+    // Another thread built the same graph first; keep its entry and drop the
+    // duplicate.
     releaseCachedGraph(entry);
   }
 }
