@@ -437,6 +437,57 @@ Tensor logspace_kernel(
       [&](int64_t i) { return std::pow(base, s + i * step); });
 }
 
+Tensor arange_start_step_kernel(
+    Scalar start,
+    Scalar end,
+    Scalar step,
+    DType dtype,
+    std::optional<Device> device) {
+  double s_d = start.toDouble();
+  double e_d = end.toDouble();
+  double st_d = step.toDouble();
+  int64_t len;
+  if (start.isIntegral() && end.isIntegral() && step.isIntegral()) {
+    const int64_t st = step.to<int64_t>();
+    if (st == 0) {
+      TP_THROW(RuntimeError, "step must be nonzero");
+    }
+    if ((st > 0 && s_d > e_d) || (st < 0 && s_d < e_d)) {
+      len = 0;
+    } else {
+      len = static_cast<int64_t>(std::ceil((e_d - s_d) / st_d));
+    }
+  } else {
+    len = static_cast<int64_t>(std::ceil((e_d - s_d) / st_d));
+  }
+  if (len < 0) {
+    len = 0;
+  }
+  if (dtype == DType::Undefined) {
+    dtype = DType::Float32;
+  } else if (dtype == DType::Int64) {
+    // The composite arange resolves integral inputs to Int64, which the
+    // Vulkan backend does not store; Int32 is the widest supported integer
+    // payload.
+    dtype = DType::Int32;
+  } else if (dtype == DType::Float64) {
+    dtype = DType::Float32;
+  } else if (dtype == DType::BFloat16) {
+    dtype = DType::Float16;
+  }
+  return host_filled_1d(
+      len, dtype, resolve_device(device),
+      [&](int64_t i) { return s_d + i * st_d; });
+}
+
+Tensor arange_kernel(
+    Scalar end,
+    DType dtype,
+    std::optional<Device> device) {
+  return arange_start_step_kernel(
+      Scalar(0), end, Scalar(1), dtype, device);
+}
+
 Tensor empty_like_kernel(
     const Tensor& self,
     DType dtype,
@@ -549,6 +600,8 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, FactoryKernels) {
   m.impl("eye", &tensorplay::vulkan::ops::eye_kernel);
   m.impl("linspace", &tensorplay::vulkan::ops::linspace_kernel);
   m.impl("logspace", &tensorplay::vulkan::ops::logspace_kernel);
+  m.impl("arange", &tensorplay::vulkan::ops::arange_start_step_kernel);
+  m.impl("arange.end", &tensorplay::vulkan::ops::arange_kernel);
 }
 
 #endif /* USE_VULKAN */
