@@ -109,6 +109,38 @@ Tensor gather_view(
   api::UniformParamsBuffer params(context, block);
   api::PipelineBarrier pipeline_barrier{};
 
+  // An output whose extents exceed the 3-D image axis limit falls back to
+  // buffer storage; the gather then writes plain row-major elements through
+  // a buffer-binding variant instead of an image store.
+  if (v_output.storage_type() == api::StorageType::BUFFER) {
+    // Float16, Int8 and Bool buffer payloads are byte-packed with no
+    // buffer-writing shader yet; reject loudly instead of corrupting them.
+    TP_CHECK(
+        input.dtype() != DType::Float16 && input.dtype() != DType::Int8 &&
+            input.dtype() != DType::Bool,
+        "Vulkan view materialization of this dtype into buffer storage is "
+        "not supported yet");
+    const api::ShaderInfo shader = is_int32
+        ? VK_KERNEL(view_gather_int32_buffer)
+        : kernel_for("view_gather_buffer", input.dtype());
+    const api::utils::uvec3 grid{
+        static_cast<uint32_t>(out_padded[3]),
+        static_cast<uint32_t>(out_padded[2]),
+        static_cast<uint32_t>(out_padded[0]) *
+            static_cast<uint32_t>(c_depth_of(out_padded)),
+    };
+    context->submit_compute_job(
+        shader, pipeline_barrier, grid,
+        adaptive_work_group_size(grid), VK_NULL_HANDLE,
+        v_output.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::WRITE),
+        v_input.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+        params.buffer());
+    return convert(v_output);
+  }
+
   const api::ShaderInfo shader = is_int8
       ? VK_KERNEL(view_gather_int8)
       : is_int32 ? VK_KERNEL(view_gather_int32)

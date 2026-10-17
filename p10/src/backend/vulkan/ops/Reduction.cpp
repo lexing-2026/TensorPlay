@@ -417,6 +417,45 @@ Tensor arg_one_axis(
   std::vector<int64_t> out_sizes = shape_vector(input);
   out_sizes[static_cast<size_t>(axis_from_left)] = 1;
 
+  // Buffer-stored inputs (any axis beyond the 3-D image limit) reduce
+  // through a linear variant; the reduced output is kept in buffer storage.
+  if (v_input.storage_type() == api::StorageType::BUFFER) {
+    const int64_t axis_size = input.size(axis_from_left);
+    int64_t inner = 1;
+    for (int64_t d = axis_from_left + 1; d < input.dim(); ++d) {
+      inner *= input.size(d);
+    }
+    const int64_t rows = input.numel() / axis_size;
+    api::vTensor v_output{
+        context, out_sizes, DType::Int32, api::StorageType::BUFFER,
+        api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+    const struct ArgBufferBlock final {
+      int32_t axis_size;
+      int32_t inner;
+      int32_t rows;
+      int32_t greater;
+    } block{
+        static_cast<int32_t>(axis_size), static_cast<int32_t>(inner),
+        static_cast<int32_t>(rows), greater ? 1 : 0,
+    };
+    api::UniformParamsBuffer params(context, block);
+    api::PipelineBarrier pipeline_barrier{};
+    context->submit_compute_job(
+        greater ? VK_KERNEL(reduce_argmax_buffer)
+                : VK_KERNEL(reduce_argmin_buffer),
+        pipeline_barrier,
+        {static_cast<uint32_t>(rows), 1u, 1u},
+        {256u, 1u, 1u}, VK_NULL_HANDLE,
+        v_output.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::WRITE),
+        v_input.buffer(pipeline_barrier, api::PipelineStage::COMPUTE,
+                       api::MemoryAccessType::READ),
+        params.buffer());
+    return convert(v_output);
+  }
+
   api::vTensor v_output{context, out_sizes, DType::Int32};
   TP_CHECK(
       v_input.storage_type() == api::StorageType::TEXTURE_3D &&
