@@ -681,6 +681,15 @@ class TestMPSTriangular(unittest.TestCase):
 
 @unittest.skipUnless(mps_available(), "MPS not available")
 class TestMPSPad(unittest.TestCase):
+    def test_constant_pad_nd_volume(self):
+        x = tp.arange(64 ** 3, dtype=tp.float32).reshape(64, 64, 64)
+        for padding in ([2, 2, 2, 2], [-2, 1, 1, -2], []):
+            with self.subTest(padding=padding):
+                result = tp.constant_pad_nd(x.mps(), padding, 1.5).cpu()
+                expected = tp.constant_pad_nd(x, padding, 1.5)
+                self.assertEqual(result.shape, expected.shape)
+                self.assertTrue(tp.equal(result, expected))
+
     def test_constant_pad_nd(self):
         x = tp.ones((1, 2, 2), dtype=tp.float32, device="mps")
         y = tp.constant_pad_nd(x, [1, 1, 0, 0], 0.0)

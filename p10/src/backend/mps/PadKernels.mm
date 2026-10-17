@@ -2,12 +2,6 @@
 #include "Dispatcher.h"
 #include "Scalar.h"
 #include "Exception.h"
-#include "OperationUtils.h"
-
-#include "backend/mps/MPSDevice.h"
-#include "backend/mps/MPSStream.h"
-
-#include <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
 
 #include <vector>
 
@@ -17,10 +11,8 @@ namespace mps {
 // ---------------------------------------------------------------------------
 // constant_pad_nd
 //
-// The original (contiguous) input is padded with the confirmed padTensor
-// selector using MPSGraphPaddingModeConstant.  Padding counts are passed
-// through unchanged (negative values crop), matching the semantics of the
-// reference implementation, then the output is returned as a fresh tensor.
+// Negative padding crops the input. Positive padding fills an output
+// canvas and copies the retained input into its interior.
 // ---------------------------------------------------------------------------
 
 Tensor constant_pad_nd_kernel(const Tensor& self,
@@ -71,72 +63,28 @@ Tensor constant_pad_nd_kernel(const Tensor& self,
     return output;
   }
 
-  // Padding counts per input dimension (zeros for unpadded leading dims).
-  std::vector<int64_t> left_pad(l_inp, 0);
-  std::vector<int64_t> right_pad(l_inp, 0);
+  Tensor cropped = self;
+  Tensor interior = output;
   for (int64_t i = 0; i < l_pad; ++i) {
     const int64_t dim = l_inp - l_pad + i;
     const int64_t pad_idx = 2 * (l_pad - i - 1);
-    left_pad[dim] = pad[pad_idx];
-    right_pad[dim] = pad[pad_idx + 1];
-  }
-
-  Tensor input_c = materializeForGraph(self);
-  if (input_c.numel() == 0) {
-    output.fill_(value);
-    return output;
-  }
-  @autoreleasepool {
-    @try {
-    MPSGraph* graph = [[MPSGraph new] autorelease];
-    const std::vector<int64_t> in_shape =
-        static_cast<std::vector<int64_t>>(input_c.shape());
-    MPSShape* inShape = getMPSShape(in_shape);
-    MPSShape* outShape = getMPSShape(new_shape);
-    const MPSDataType dt = getMPSDataType(input_c.dtype());
-
-    MPSGraphTensor* xt = [graph placeholderWithShape:inShape
-                                           dataType:dt
-                                                name:@"x"];
-    NSMutableArray<NSNumber*>* leftArr =
-        [NSMutableArray arrayWithCapacity:left_pad.size()];
-    NSMutableArray<NSNumber*>* rightArr =
-        [NSMutableArray arrayWithCapacity:right_pad.size()];
-    for (int64_t i = 0; i < l_inp; ++i) {
-      [leftArr addObject:@(left_pad[i])];
-      [rightArr addObject:@(right_pad[i])];
+    const int64_t left = pad[pad_idx];
+    const int64_t right = pad[pad_idx + 1];
+    if (left < 0) {
+      cropped = cropped.narrow(dim, -left, cropped.size(dim) + left);
     }
-    MPSGraphTensor* padded =
-        [graph padTensor:xt
-        withPaddingMode:MPSGraphPaddingModeConstant
-           leftPadding:leftArr
-          rightPadding:rightArr
-         constantValue:value.toDouble()
-                   name:nil];
-
-    id<MTLBuffer> inBuf = mtlBufferOf(input_c);
-    id<MTLBuffer> outBuf = mtlBufferOf(output);
-    MPSGraphTensorData* inData =
-        [[[MPSGraphTensorData alloc] initWithMTLBuffer:inBuf
-                                                shape:inShape
-                                             dataType:dt] autorelease];
-    MPSGraphTensorData* outData =
-        [[[MPSGraphTensorData alloc] initWithMTLBuffer:outBuf
-                                                shape:outShape
-                                             dataType:dt] autorelease];
-    NSDictionary* feeds = @{xt : inData};
-    NSDictionary* results = @{padded : outData};
-    getCurrentMPSStream()->executeMPSGraph(graph, feeds, results,
-                                          SyncType::COMMIT_AND_WAIT);
-    } @catch (NSException* e) {
-      std::string reason =
-          [e reason] ? std::string([[e reason] UTF8String])
-                     : std::string("unknown");
-      throw tensorplay::RuntimeError(
-          {__FILE__, __func__, __LINE__},
-          tensorplay::detail::format_msg("MPS constant_pad_nd failed: ", reason));
+    if (right < 0) {
+      cropped = cropped.narrow(dim, 0, cropped.size(dim) + right);
+    }
+    if (left > 0) {
+      interior = interior.narrow(dim, left, interior.size(dim) - left);
+    }
+    if (right > 0) {
+      interior = interior.narrow(dim, 0, interior.size(dim) - right);
     }
   }
+  output.fill_(value);
+  interior.copy_(cropped);
   return output;
 }
 
