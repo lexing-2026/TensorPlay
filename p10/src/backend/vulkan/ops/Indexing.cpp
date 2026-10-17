@@ -57,6 +57,21 @@ api::vTensor upload_index_payload(const Tensor& indices) {
 
 } // namespace
 
+namespace {
+
+// Leaves autograd off for the duration of an in-place row mutation; a local
+// copy of the completion-kernel guard, which the vulkan side has not needed
+// until the scatter family.
+struct NoGradGuard final {
+  const bool previous;
+  NoGradGuard() : previous(GradMode::is_enabled()) {
+    GradMode::set_enabled(false);
+  }
+  ~NoGradGuard() { GradMode::set_enabled(previous); }
+};
+
+} // namespace
+
 Tensor embedding_kernel(
     const Tensor& weight,
     const Tensor& indices,
@@ -116,6 +131,115 @@ Tensor embedding_kernel(
     out_sizes.push_back(features);
     out = out.reshape(out_sizes);
   }
+  return out;
+}
+
+//
+// In-place index_copy_: role as the vulkan write path for row updates along
+// the sequence axis, e.g. appending decode steps to a preallocated kv cache.
+// The destination rows arrive through an Int32 payload that the shader walks;
+// the host folds an Int64 payload, validates the range, and uploads it.
+//
+// Geometry note: a 4-D channel-packed [N, C, S, W] tensor keeps its rows on
+// the texture's y extent, so a dim == 2 scatter is texel aligned from row to
+// row whatever the channel lanes carry.  Other ranks and axes need a
+// channel-aware tile map and stay composite-side.
+Tensor& index_copy_rows_inplace(Tensor& self, int64_t dim, const Tensor& index, const Tensor& source) {
+  NoGradGuard no_grad;
+  TP_CHECK(
+      self.device().is_vulkan() && source.device().is_vulkan(),
+      "Vulkan index_copy_: both tensors must be on the device");
+  TP_CHECK(
+      self.dim() == 4 && source.dim() == 4,
+      "Vulkan index_copy_: 4-D tensors only");
+  TP_CHECK(
+      dim == 2 || dim == -2,
+      "Vulkan index_copy_: scatter runs along the sequence axis (dim 2)");
+  TP_CHECK(
+      self.dtype() == DType::Float32 || self.dtype() == DType::Float16,
+      "Vulkan index_copy_: Float32 and Float16 only");
+  TP_CHECK(
+      source.dtype() == self.dtype(),
+      "Vulkan index_copy_: source dtype must match the destination");
+  TP_CHECK(
+      index.dtype() == DType::Int64 || index.dtype() == DType::Int32,
+      "Vulkan index_copy_: index must be Int64 or Int32");
+
+  if (self.numel() == 0 || index.numel() == 0) {
+    return self;
+  }
+
+  const int64_t rows = self.size(2);
+  const int64_t n_idx = index.numel();
+  TP_CHECK(
+      source.size(2) == n_idx,
+      "Vulkan index_copy_: source rows must match the index length");
+  TP_CHECK(
+      self.size(0) == source.size(0) && self.size(1) == source.size(1) &&
+          self.size(3) == source.size(3),
+      "Vulkan index_copy_: source must match off-axis sizes");
+
+  Tensor idx_host = index.to(Device(DeviceType::CPU)).to(DType::Int64).contiguous();
+  const int64_t* ivals = idx_host.data_ptr<int64_t>();
+  for (int64_t i = 0; i < n_idx; ++i) {
+    TP_CHECK(
+        ivals[i] >= 0 && ivals[i] < rows,
+        "Vulkan index_copy_: index out of range");
+  }
+
+  api::Context* const context = api::context();
+  api::vTensor v_self = convert(self);
+  api::vTensor v_source = convert(source);
+  api::vTensor v_indices = upload_index_payload(idx_host);
+
+  const struct IndexCopyBlock final {
+    ivec4 extents; // (texel width, destination rows, texel planes, unused)
+    int n_idx;
+    int fill;
+    int fill2;
+    int fill3;
+  } block{
+      ivec4(
+          static_cast<int32_t>(v_self.extents()[0u]),
+          static_cast<int32_t>(v_self.extents()[1u]),
+          static_cast<int32_t>(v_self.extents()[2u]),
+          0),
+      static_cast<int32_t>(n_idx),
+      0,
+      0,
+      0,
+  };
+
+  api::UniformParamsBuffer params(context, block);
+  api::PipelineBarrier pipeline_barrier{};
+  const api::utils::uvec3 grid{
+      v_self.extents()[0u],
+      safe_downcast_to_u32(n_idx),
+      v_self.extents()[2u],
+  };
+  context->submit_compute_job(
+      kernel_for("index_copy", self.dtype()),
+      pipeline_barrier,
+      grid,
+      adaptive_work_group_size(grid),
+      VK_NULL_HANDLE,
+      v_self.image(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::WRITE),
+      v_source.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+      v_indices.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+      params.buffer());
+  return self;
+}
+
+Tensor& index_copy__kernel(Tensor& self, int64_t dim, const Tensor& index, const Tensor& source) {
+  return index_copy_rows_inplace(self, dim, index, source);
+}
+
+Tensor index_copy_kernel(const Tensor& self, int64_t dim, const Tensor& index, const Tensor& source) {
+  Tensor out = self.clone();
+  index_copy_rows_inplace(out, dim, index, source);
   return out;
 }
 
@@ -187,6 +311,8 @@ Tensor index_select_kernel(
 TENSORPLAY_LIBRARY_IMPL(Vulkan, IndexingKernels) {
   m.impl("embedding", &tensorplay::vulkan::ops::embedding_kernel);
   m.impl("index_select", &tensorplay::vulkan::ops::index_select_kernel);
+  m.impl("index_copy_", &tensorplay::vulkan::ops::index_copy__kernel);
+  m.impl("index_copy", &tensorplay::vulkan::ops::index_copy_kernel);
 }
 
 #endif /* USE_VULKAN */

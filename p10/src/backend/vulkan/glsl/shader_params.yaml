@@ -747,6 +747,10 @@ embedding:
   parameter_names_with_default_values: {}
   shader_variants:
   - NAME: embedding
+index_copy:
+  parameter_names_with_default_values: {}
+  shader_variants:
+  - NAME: index_copy
 index_select:
   parameter_names_with_default_values: {}
   shader_variants:
