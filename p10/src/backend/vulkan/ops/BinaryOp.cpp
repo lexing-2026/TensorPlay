@@ -654,6 +654,31 @@ Tensor& binary_op_scalar_inplace(
 
 } // namespace
 
+// External entry points to the anonymous-namespace binary op engines, for
+// sibling translation units that want the shared broadcast/buffer routing
+// (the pow kernels delegate here).
+Tensor binary_op_tensor_dispatch(
+    const char* shader_name,
+    const char* buffer_shader_name,
+    const Tensor& self_arg,
+    const Tensor& other_arg,
+    const Scalar& alpha,
+    const char* name) {
+  return binary_op_tensor(
+      shader_name, buffer_shader_name, self_arg, other_arg, alpha, name);
+}
+
+Tensor binary_op_scalar_dispatch(
+    const char* shader_name,
+    const char* buffer_shader_name,
+    const Tensor& self_arg,
+    const Scalar& other,
+    const Scalar& alpha,
+    const char* name) {
+  return binary_op_scalar(
+      shader_name, buffer_shader_name, self_arg, other, alpha, name);
+}
+
 Tensor add_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha) {
   return binary_op_tensor("add", "buffer_add", self, other, alpha, "add");
 }

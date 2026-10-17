@@ -161,13 +161,18 @@ void main() {
       const uint i = (nvec << 2u) + (idx - nvec);
       const uint j = i >> 2u;
       const uint k = i & 3u;
+      // The tail operands are scalars; wrap them in a vector so operators
+      // written in vector form (e.g. pow's integer-exponent branch) compile
+      // unchanged, then take the first lane.
       // clang-format off
       $if not INPLACE:
         uOutput.data[j][k] =
-            OP(uInput.data[j][k], uOther.data[j][k], uBlock.alpha);
+            (OP(VECTOR(uInput.data[j][k]), VECTOR(uOther.data[j][k]),
+                uBlock.alpha)).x;
       $else:
         uOutput.data[j][k] =
-            OP(uOutput.data[j][k], uOther.data[j][k], uBlock.alpha);
+            (OP(VECTOR(uOutput.data[j][k]), VECTOR(uOther.data[j][k]),
+                uBlock.alpha)).x;
       // clang-format on
     }
     return;
@@ -191,12 +196,12 @@ void main() {
     // clang-format off
     $if not INPLACE:
       uOutput.data[j][k] =
-          OP(uInput.data[a >> 2u][a & 3u], uOther.data[b >> 2u][b & 3u],
-             uBlock.alpha);
+          (OP(VECTOR(uInput.data[a >> 2u][a & 3u]),
+              VECTOR(uOther.data[b >> 2u][b & 3u]), uBlock.alpha)).x;
     $else:
       uOutput.data[j][k] =
-          OP(uOutput.data[a >> 2u][a & 3u], uOther.data[b >> 2u][b & 3u],
-             uBlock.alpha);
+          (OP(VECTOR(uOutput.data[a >> 2u][a & 3u]),
+              VECTOR(uOther.data[b >> 2u][b & 3u]), uBlock.alpha)).x;
     // clang-format on
   }
 }

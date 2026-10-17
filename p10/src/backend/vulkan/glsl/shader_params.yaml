@@ -415,6 +415,8 @@ buffer_binary_op_tensor:
   - NAME: buffer_div_i32
     DTYPE: int
     OPERATOR: X / Y
+  - NAME: buffer_pow
+    OPERATOR: '(fract(Y) == vec4(0.0)) ? (mod(Y, vec4(2.0)) == vec4(0.0) ? pow(abs(X), Y) : sign(X) * pow(abs(X), Y)) : pow(X, Y)'
   - NAME: buffer_floor_divide
     OPERATOR: floor(X / Y)
   - NAME: buffer_maximum
@@ -468,6 +470,8 @@ buffer_binary_op_scalar:
   - NAME: buffer_floor_mul_scalar_i32
     DTYPE: int
     OPERATOR: X * Y
+  - NAME: buffer_pow_scalar
+    OPERATOR: '(fract(Y) == 0.0) ? (mod(Y, 2.0) == 0.0 ? pow(abs(X), Y) : sign(X) * pow(abs(X), Y)) : pow(X, Y)'
   - NAME: buffer_rsub_scalar
     OPERATOR: Y - X
   - NAME: buffer_rsub_scalar_i32

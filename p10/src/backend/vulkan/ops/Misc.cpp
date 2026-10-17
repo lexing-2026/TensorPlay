@@ -27,6 +27,20 @@ Tensor& bernoulli_scalar_kernel(
     Tensor& self,
     double p,
     std::optional<Generator> generator);
+Tensor binary_op_tensor_dispatch(
+    const char* shader_name,
+    const char* buffer_shader_name,
+    const Tensor& self_arg,
+    const Tensor& other_arg,
+    const Scalar& alpha,
+    const char* name);
+Tensor binary_op_scalar_dispatch(
+    const char* shader_name,
+    const char* buffer_shader_name,
+    const Tensor& self_arg,
+    const Scalar& other,
+    const Scalar& alpha,
+    const char* name);
 
 namespace {
 
@@ -107,83 +121,22 @@ Tensor& addcmul__kernel(
 
 Tensor pow_scalar_kernel(const Tensor& self, const Scalar& exponent) {
   validate_elementwise_4d(self, "pow");
-  api::Context* const context = api::context();
-
-  api::vTensor v_self = convert(self);
-  if (v_self.storage_type() == api::StorageType::BUFFER) {
-    TP_THROW(NotImplementedError, "Vulkan pow requires texture storage");
-  }
-
-  api::vTensor v_output{context, v_self.sizes(), v_self.dtype()};
-
-  const struct Block final {
-    ivec4 extents;
-    float other;
-  } block{
-      ivec4(
-          v_self.extents()[0u],
-          v_self.extents()[1u],
-          v_self.extents()[2u],
-          0),
-      exponent.to<float>(),
-  };
-
-  api::UniformParamsBuffer params(context, block);
-  api::PipelineBarrier pipeline_barrier{};
-
-  context->submit_compute_job(
-      VK_KERNEL(pow_tensor_scalar), pipeline_barrier, v_output.extents(),
-      adaptive_work_group_size(v_output.extents()), VK_NULL_HANDLE,
-      v_output.image(
-          pipeline_barrier,
-          api::PipelineStage::COMPUTE,
-          api::MemoryAccessType::WRITE),
-      v_self.image(pipeline_barrier, api::PipelineStage::COMPUTE),
-      params.buffer());
-
-  return convert(v_output);
+  // Delegates to the shared binary op path so buffer-stored payloads use
+  // the linear scalar variant; the integer-exponent handling is part of the
+  // shader operator.
+  return binary_op_scalar_dispatch(
+      "pow_tensor_scalar", "buffer_pow_scalar", self, exponent,
+      Scalar(1.0), "pow");
 }
 
 Tensor pow_tensor_kernel(const Tensor& self, const Tensor& exponent) {
   validate_elementwise_4d(self, "pow");
   validate_elementwise_4d(exponent, "pow");
-  api::Context* const context = api::context();
-
-  api::vTensor v_self = convert(self);
-  api::vTensor v_other = convert(exponent);
-  if (v_self.storage_type() == api::StorageType::BUFFER) {
-    TP_THROW(NotImplementedError, "Vulkan pow requires texture storage");
-  }
-
-  api::vTensor v_output{context, v_self.sizes(), v_self.dtype()};
-
-  const struct Block final {
-    ivec4 output_sizes;
-    ivec4 input_sizes;
-    ivec4 other_sizes;
-    float alpha;
-  } block{
-      make_whcn_ivec4(v_output.sizes()),
-      make_whcn_ivec4(v_self.sizes()),
-      make_whcn_ivec4(v_other.sizes()),
-      1.0f,
-  };
-
-  api::UniformParamsBuffer params(context, block);
-  api::PipelineBarrier pipeline_barrier{};
-
-  context->submit_compute_job(
-      VK_KERNEL(pow), pipeline_barrier, v_output.extents(),
-      adaptive_work_group_size(v_output.extents()), VK_NULL_HANDLE,
-      v_output.image(
-          pipeline_barrier,
-          api::PipelineStage::COMPUTE,
-          api::MemoryAccessType::WRITE),
-      v_self.image(pipeline_barrier, api::PipelineStage::COMPUTE),
-      v_other.image(pipeline_barrier, api::PipelineStage::COMPUTE),
-      params.buffer());
-
-  return convert(v_output);
+  // Delegates to the shared binary op path: the tensor variant gets
+  // broadcast handling and the linear buffer twin for buffer-stored
+  // payloads.
+  return binary_op_tensor_dispatch(
+      "pow", "buffer_pow", self, exponent, Scalar(1.0), "pow");
 }
 
 Tensor lerp_scalar_kernel(const Tensor& self, const Tensor& end, const Scalar& weight) {
