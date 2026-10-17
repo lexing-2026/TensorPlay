@@ -15,10 +15,14 @@ then carries the second runtime's time and the ratio (theirs / ours), which is
 the number the speedup gate tracks.
 
 MPS dispatch is asynchronous, so every timed invocation synchronizes the
-command queue around the operation.
+command queue around the operation. --chain N queues N invocations inside one
+pair of synchronizes and reports their mean, which amortizes the host round
+trip and is what makes a launch-cost change visible: an isolated operator's
+sample is dominated by the wait itself.
 
 Usage: bench_mps_operator.py --suite short --reps 5 --json-out results.json
        bench_mps_operator.py --suite short --reference --json-out results.json
+       bench_mps_operator.py --suite short --chain 16 --json-out results.json
 """
 
 import argparse
@@ -184,20 +188,29 @@ def _factory(backend, operation, specs, dtype_key):
     return make
 
 
-def _time(fn, reps, min_run_time, warmup, synchronize):
-    """Collect synchronized samples for at least the requested time and count."""
+def _time(fn, reps, min_run_time, warmup, synchronize, chain=1):
+    """Collect synchronized samples for at least the requested time and count.
+
+    `chain` invocations are queued between the two synchronizes and the sample
+    is their mean, so the host round trip is paid once per chain instead of once
+    per invocation. With chain=1 the sample is a single call and the round trip
+    is part of it, which is what an isolated operator costs an interactive
+    program.
+    """
     for _ in range(warmup):
-        fn()
+        for _ in range(chain):
+            fn()
         synchronize()
     samples = []
     total_time = 0.0
     while len(samples) < reps or total_time < min_run_time:
         synchronize()
         started = time.perf_counter()
-        fn()
+        for _ in range(chain):
+            fn()
         synchronize()
         elapsed = time.perf_counter() - started
-        samples.append(elapsed)
+        samples.append(elapsed / chain)
         total_time += elapsed
     return samples
 
@@ -460,6 +473,9 @@ def main(argv=None):
     parser.add_argument("--min-run-time", type=float, default=1.0,
                         help="minimum timed seconds per case")
     parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument("--chain", type=int, default=1,
+                        help="invocations placed between the two synchronizes "
+                             "of one sample; the sample is their mean")
     parser.add_argument("--rounds", type=int, default=3,
                         help="separate sampling passes over all cases")
     parser.add_argument("--side", choices=("ours", "reference"),
@@ -478,6 +494,8 @@ def main(argv=None):
         parser.error("min-run-time must be finite and non-negative")
     if args.warmup < 1:
         parser.error("warmup must be positive")
+    if args.chain < 1:
+        parser.error("chain must be positive")
     if args.rounds < 1:
         parser.error("rounds must be positive")
     backend = _TreeBackend(_DEVICE) if args.side == "ours" else \
@@ -507,7 +525,8 @@ def main(argv=None):
                         "device": _DEVICE},
             "timing": {"statistic": "minimum", "min_reps": args.reps,
                        "min_run_time": args.min_run_time,
-                       "warmup": args.warmup, "rounds": args.rounds},
+                       "warmup": args.warmup, "rounds": args.rounds,
+                       "chain_reps": args.chain},
             "measurements": list(measurements.values()),
         }
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
@@ -516,7 +535,7 @@ def main(argv=None):
         return payload
 
     print(f"side={args.side} suite={suite} dtype={args.dtype} "
-          f"cases={len(cases)}")
+          f"chain={args.chain} cases={len(cases)}")
     if args.side == "reference":
         print(backend.describe())
     reps_per_round = math.ceil(args.reps / args.rounds)
@@ -546,7 +565,8 @@ def main(argv=None):
                 fn = factory()
             samples = samples_by_name.setdefault(name, [])
             samples.extend(_time(fn, reps_per_round, time_per_round,
-                                 args.warmup, backend.synchronize))
+                                 args.warmup, backend.synchronize,
+                                 args.chain))
             seconds = min(samples)
             entry = {
                 "name": name,

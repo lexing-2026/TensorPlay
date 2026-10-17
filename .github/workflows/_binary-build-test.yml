@@ -122,6 +122,16 @@ on:
         type: string
         default: short
         description: "MPS benchmark suite size: short, long, or all"
+      mps_benchmark_chain_reps:
+        required: false
+        type: string
+        default: "1"
+        description: >
+          Invocations placed between the two synchronizes of one MPS benchmark
+          sample.  Above 1 a sample is their mean, so the host round trip is
+          paid once per chain and the number measures launch cost rather than
+          wait cost.  Keep it at 1 for runs whose numbers join the recorded
+          history, which was built one call per sample.
       mps_compare_reference:
         required: false
         type: boolean
@@ -851,6 +861,7 @@ jobs:
         shell: bash
         env:
           MPS_BENCH_SUITE: ${{ inputs.mps_benchmark_suite }}
+          MPS_BENCH_CHAIN: ${{ inputs.mps_benchmark_chain_reps || '1' }}
           MPS_COMPARE_REFERENCE: ${{ inputs.mps_compare_reference }}
           MPS_REFERENCE_REQUIREMENT: ${{ inputs.mps_reference_requirement }}
           MPS_REFERENCE_SKIP_CASES: ${{ inputs.mps_reference_skip_cases }}
@@ -870,7 +881,8 @@ jobs:
             --json-out benchmark-results/host-probe.json \
             | tee benchmark-results/host-probe.log
           python benchmark/bench_mps_operator.py --suite "$suite" --dtype f32 \
-            --reps 3 --json-out benchmark-results/mps-operator.json \
+            --reps 3 --chain "$MPS_BENCH_CHAIN" \
+            --json-out benchmark-results/mps-operator.json \
             | tee benchmark-results/mps-operator.log
           if [[ "$MPS_COMPARE_REFERENCE" == "true" ]]; then
             # The second pass runs the same inventory in its own process: each
@@ -882,7 +894,7 @@ jobs:
             # reports the rest as unpaired.
             set +e
             python benchmark/bench_mps_operator.py --side reference \
-              --suite "$suite" --dtype f32 --reps 3 \
+              --suite "$suite" --dtype f32 --reps 3 --chain "$MPS_BENCH_CHAIN" \
               --skip-cases "$MPS_REFERENCE_SKIP_CASES" \
               --json-out benchmark-results/mps-operator-reference.json \
               | tee benchmark-results/mps-operator-reference.log
