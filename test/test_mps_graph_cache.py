@@ -377,11 +377,13 @@ class TestMPSUnaryOperandReads(MPSCase):
         base_cpu, base_mps = _range_on_both([3, 17])
         pos_cpu, pos_mps = base_cpu + 1.0, base_mps + 1.0
         mid_cpu, mid_mps = (base_cpu - 8.0) / 4.0, (base_mps - 8.0) / 4.0
+        signed_cpu, signed_mps = base_cpu - 25.0, base_mps - 25.0
         for name, arg_cpu, arg_mps, fn in (
-                ("abs", base_cpu - 25.0, base_mps - 25.0, tp.abs),
+                ("abs", signed_cpu, signed_mps, tp.abs),
                 ("exp", mid_cpu, mid_mps, tp.exp),
                 ("sqrt", pos_cpu, pos_mps, tp.sqrt),
-                ("rsqrt", pos_cpu, pos_mps, tp.rsqrt)):
+                ("rsqrt", pos_cpu, pos_mps, tp.rsqrt),
+                ("relu", signed_cpu, signed_mps, tp.relu)):
             with self.subTest(op=name):
                 self.assert_same_result(fn(arg_mps), fn(arg_cpu))
 
@@ -401,6 +403,10 @@ class TestMPSUnaryOperandReads(MPSCase):
                          [0.5])
         self.assertEqual(tp.exp(tp.zeros((2, 2), device="mps")).cpu().tolist(),
                          [[1.0, 1.0], [1.0, 1.0]])
+        self.assertEqual(tp.relu(tp.tensor([-4.0, 0.0, 0.25, 4.0],
+                                           dtype=tp.float32,
+                                           device="mps")).cpu().tolist(),
+                         [0.0, 0.0, 0.25, 4.0])
 
     def test_alternating_shapes_at_one_call_site(self):
         shapes = [[2, 3], [24], [1, 5, 11], [2, 2, 2, 3]]
