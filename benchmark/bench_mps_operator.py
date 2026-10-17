@@ -92,6 +92,14 @@ class _TreeBackend:
         if self.device == "mps":
             tp.mps.synchronize()
 
+    def release_cached_memory(self):
+        # This runtime hands buffers back through its own pool.
+        if self.device != "mps":
+            return
+        empty = getattr(tp.mps, "empty_cache", None)
+        if empty is not None:
+            empty()
+
     def __getattr__(self, item):
         return getattr(F, item)
 
@@ -145,6 +153,11 @@ class _ReferenceBackend:
     def synchronize(self):
         if self.device == "mps":
             self._torch.mps.synchronize()
+
+    def release_cached_memory(self):
+        if self.device != "mps":
+            return
+        self._torch.mps.empty_cache()
 
     def batch_norm(self, x, weight, bias, running_mean, running_var, *,
                    training, momentum, eps):
@@ -457,6 +470,9 @@ def main(argv=None):
                         help="which runtime to time; each side runs in its "
                              "own process so the two passes do not compete "
                              "for device memory")
+    parser.add_argument("--skip-cases", default="",
+                        help="comma-separated case names to leave out; used "
+                             "for cases a runtime aborts the process on")
     parser.add_argument("--json-out", type=Path, required=True)
     args = parser.parse_args(argv)
     if args.reps < 1:
@@ -476,8 +492,32 @@ def main(argv=None):
     suite = "long" if args.suite == "all" else args.suite
     measurements = {}
     samples_by_name = {}
-    skipped = set()
+    skipped = {name.strip() for name in args.skip_cases.split(",")
+               if name.strip()}
     cases = build_cases(backend, suite, args.dtype)
+    # A pass that aborts the process keeps the cases it already timed.
+    incremental = args.side == "reference"
+
+    def write_payload():
+        payload = {
+            "schema_version": 1,
+            "benchmark": "mps-operator",
+            "suite": suite,
+            "dtype": args.dtype,
+            "device": _DEVICE,
+            "side": args.side,
+            "runtime": {"name": backend.name, "version": backend.version(),
+                        "device": _DEVICE},
+            "timing": {"statistic": "minimum", "min_reps": args.reps,
+                       "min_run_time": args.min_run_time,
+                       "warmup": args.warmup, "rounds": args.rounds},
+            "measurements": list(measurements.values()),
+        }
+        args.json_out.parent.mkdir(parents=True, exist_ok=True)
+        args.json_out.write_text(json.dumps(payload, indent=2) + "\n",
+                                 encoding="utf-8")
+        return payload
+
     print(f"side={args.side} suite={suite} dtype={args.dtype} "
           f"cases={len(cases)}")
     if args.side == "reference":
@@ -529,25 +569,12 @@ def main(argv=None):
                   f"({len(samples)} samples, median "
                   f"{statistics.median(samples) * 1e3:.3f} ms)")
             measurements[name] = entry
+            backend.release_cached_memory()
+            if incremental:
+                write_payload()
             del fn
 
-    payload = {
-        "schema_version": 1,
-        "benchmark": "mps-operator",
-        "suite": suite,
-        "dtype": args.dtype,
-        "device": _DEVICE,
-        "side": args.side,
-        "runtime": {"name": backend.name, "version": backend.version(),
-                    "device": _DEVICE},
-        "timing": {"statistic": "minimum", "min_reps": args.reps,
-                   "min_run_time": args.min_run_time, "warmup": args.warmup,
-                   "rounds": args.rounds},
-        "measurements": list(measurements.values()),
-    }
-    args.json_out.parent.mkdir(parents=True, exist_ok=True)
-    args.json_out.write_text(json.dumps(payload, indent=2) + "\n",
-                             encoding="utf-8")
+    write_payload()
     print(f"wrote results: {args.json_out}")
 
 

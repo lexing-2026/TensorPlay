@@ -129,6 +129,14 @@ on:
         description: >
           Time every MPS benchmark case through a second runtime on the same
           device and publish the per-case speedup (macOS only).
+      mps_reference_skip_cases:
+        required: false
+        type: string
+        default: "layer_norm[64x1024]"
+        description: >
+          Comma-separated cases left out of the second MPS benchmark pass.
+          The layer-norm call there aborts the process on the benchmark
+          runner, which would otherwise lose every case after it.
       mps_reference_requirement:
         required: false
         type: string
@@ -845,6 +853,7 @@ jobs:
           MPS_BENCH_SUITE: ${{ inputs.mps_benchmark_suite }}
           MPS_COMPARE_REFERENCE: ${{ inputs.mps_compare_reference }}
           MPS_REFERENCE_REQUIREMENT: ${{ inputs.mps_reference_requirement }}
+          MPS_REFERENCE_SKIP_CASES: ${{ inputs.mps_reference_skip_cases }}
           # The Metal device of a CI virtual machine reports its unified memory
           # as almost fully allocated, so the second runtime's allocator
           # refuses even 16 KiB requests. Disabling its watermark check is the
@@ -868,10 +877,20 @@ jobs:
             # side then warms up and allocates on its own, and neither one's
             # device memory pressure lands inside the other's samples.
             python -m pip install -q "$MPS_REFERENCE_REQUIREMENT"
+            # A pass can abort mid-run on a device the other runtime does not
+            # handle well; the case list it did time is kept and the gate
+            # reports the rest as unpaired.
+            set +e
             python benchmark/bench_mps_operator.py --side reference \
               --suite "$suite" --dtype f32 --reps 3 \
+              --skip-cases "$MPS_REFERENCE_SKIP_CASES" \
               --json-out benchmark-results/mps-operator-reference.json \
               | tee benchmark-results/mps-operator-reference.log
+            status=${PIPESTATUS[0]}
+            set -e
+            if [[ "$status" != "0" ]]; then
+              echo "::warning::the second benchmark pass ended with status $status"
+            fi
           fi
 
       - name: Enforce MPS performance floor
