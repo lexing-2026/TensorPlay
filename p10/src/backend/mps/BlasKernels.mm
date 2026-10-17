@@ -369,7 +369,14 @@ Tensor addmm_kernel(const Tensor& input, const Tensor& mat1,
   Tensor mat1_c = materializeForGraph(mat1);
   Tensor mat2_c = materializeForGraph(mat2);
   Tensor input_c = materializeForGraph(input);
-  if (static_cast<std::vector<int64_t>>(input_c.shape()) != out_shape) {
+  const std::vector<int64_t> input_shape =
+      static_cast<std::vector<int64_t>>(input_c.shape());
+  if (input_shape != out_shape) {
+    if (input_c.numel() == 1) {
+      // A scalar addend has a single element behind an empty or unit shape;
+      // describe it as a broadcastable one so the expansion is well-formed.
+      input_c = input_c.reshape(std::vector<int64_t>{1, 1});
+    }
     input_c = materializeForGraph(input_c.expand(out_shape));
   }
   Tensor output = Tensor(out_shape, out_dtype, input.device());
