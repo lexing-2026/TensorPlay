@@ -368,6 +368,24 @@ class TestVulkanScaledDotProductAttention(unittest.TestCase):
             self, B=1, Hq=8, Hkv=8, Sq=4, Skv=517, D=16,
             dtype=tensorplay.float16)
 
+    def test_split_memory_scan_with_masks(self):
+        # Every mask mode reaching the scan + combine route.
+        _sdpa_check(
+            self, B=1, Hq=4, Hkv=4, Sq=1, Skv=300, D=16,
+            mask=tensorplay.tensor(np.tril(np.ones((1, 300))).astype(bool)))
+        _sdpa_check(
+            self, B=2, Hq=6, Hkv=6, Sq=2, Skv=300, D=8,
+            mask=tensorplay.tensor(
+                np.random.default_rng(14).random((6, 2, 300)) > 0.3))
+        _sdpa_check(
+            self, B=1, Hq=3, Hkv=3, Sq=2, Skv=300, D=8,
+            mask=tensorplay.tensor(
+                np.random.default_rng(15).random((1, 3, 2, 300)) > 0.3))
+        _sdpa_check(
+            self, B=1, Hq=8, Hkv=2, Sq=4, Skv=300, D=16, gqa=True,
+            mask=tensorplay.tensor(
+                np.random.default_rng(16).random((1, 1, 4, 300)) > 0.3))
+
     def test_fully_masked_rows_emit_zeros(self):
         B, H, Sq, Skv, D = 1, 4, 6, 10, 8
         m = np.ones((B, H, Sq, Skv), dtype=bool)
