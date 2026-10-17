@@ -287,91 +287,133 @@ Tensor abs_kernel(const Tensor& self) {
   if (auto result = unaryShader("abs", self)) {
     return *result;
   }
-  return unaryOp(self, absBlock);
+  return unaryOp("abs", self, absBlock);
 }
-Tensor neg_kernel(const Tensor& self) { return unaryOp(self, negBlock); }
-Tensor square_kernel(const Tensor& self) { return unaryOp(self, squareBlock); }
-Tensor sign_kernel(const Tensor& self) { return unaryOp(self, signBlock); }
+Tensor neg_kernel(const Tensor& self) { return unaryOp("neg", self, negBlock); }
+Tensor square_kernel(const Tensor& self) {
+  return unaryOp("square", self, squareBlock);
+}
+Tensor sign_kernel(const Tensor& self) {
+  return unaryOp("sign", self, signBlock);
+}
 Tensor exp_kernel(const Tensor& self) {
   if (auto result = unaryShader("exp", self)) {
     return *result;
   }
-  return unaryOp(self, expBlock);
+  return unaryOp("exp", self, expBlock);
 }
-Tensor expm1_kernel(const Tensor& self) { return unaryOp(self, expm1Block); }
-Tensor log_kernel(const Tensor& self) { return unaryOp(self, logBlock); }
+Tensor expm1_kernel(const Tensor& self) {
+  return unaryOp("expm1", self, expm1Block);
+}
+Tensor log_kernel(const Tensor& self) { return unaryOp("log", self, logBlock); }
 Tensor log10_kernel(const Tensor& self) {
-  return unaryOp(self, ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* x) {
+  return unaryOp("log10", self,
+                 ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* x) {
     return logWithBaseBlock(g, x, 10.0);
   });
 }
 Tensor log2_kernel(const Tensor& self) {
-  return unaryOp(self, ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* x) {
+  return unaryOp("log2", self,
+                 ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* x) {
     return logWithBaseBlock(g, x, 2.0);
   });
 }
-Tensor log1p_kernel(const Tensor& self) { return unaryOp(self, log1pBlock); }
+Tensor log1p_kernel(const Tensor& self) {
+  return unaryOp("log1p", self, log1pBlock);
+}
 Tensor sqrt_kernel(const Tensor& self) {
   if (auto result = unaryShader("sqrt", self)) {
     return *result;
   }
-  return unaryOp(self, sqrtBlock);
+  return unaryOp("sqrt", self, sqrtBlock);
 }
 Tensor rsqrt_kernel(const Tensor& self) {
   if (auto result = unaryShader("rsqrt", self)) {
     return *result;
   }
-  return unaryOp(self, rsqrtBlock);
+  return unaryOp("rsqrt", self, rsqrtBlock);
 }
 Tensor reciprocal_kernel(const Tensor& self) {
-  return unaryOp(self, reciprocalBlock);
+  return unaryOp("reciprocal", self, reciprocalBlock);
 }
-Tensor sin_kernel(const Tensor& self) { return unaryOp(self, sinBlock); }
-Tensor cos_kernel(const Tensor& self) { return unaryOp(self, cosBlock); }
-Tensor tan_kernel(const Tensor& self) { return unaryOp(self, tanBlock); }
-Tensor asin_kernel(const Tensor& self) { return unaryOp(self, asinBlock); }
-Tensor acos_kernel(const Tensor& self) { return unaryOp(self, acosBlock); }
-Tensor atan_kernel(const Tensor& self) { return unaryOp(self, atanBlock); }
-Tensor sinh_kernel(const Tensor& self) { return unaryOp(self, sinhBlock); }
-Tensor cosh_kernel(const Tensor& self) { return unaryOp(self, coshBlock); }
-Tensor tanh_kernel(const Tensor& self) { return unaryOp(self, tanhBlock); }
-Tensor asinh_kernel(const Tensor& self) { return unaryOp(self, asinhBlock); }
-Tensor acosh_kernel(const Tensor& self) { return unaryOp(self, acoshBlock); }
-Tensor atanh_kernel(const Tensor& self) { return unaryOp(self, atanhBlock); }
-Tensor erf_kernel(const Tensor& self) { return unaryOp(self, erfBlock); }
-Tensor erfc_kernel(const Tensor& self) { return unaryOp(self, erfcBlock); }
-Tensor floor_kernel(const Tensor& self) { return unaryOp(self, floorBlock); }
-Tensor ceil_kernel(const Tensor& self) { return unaryOp(self, ceilBlock); }
-Tensor round_kernel(const Tensor& self) { return unaryOp(self, roundBlock); }
-Tensor trunc_kernel(const Tensor& self) { return unaryOp(self, truncBlock); }
-Tensor frac_kernel(const Tensor& self) { return unaryOp(self, fracBlock); }
+Tensor sin_kernel(const Tensor& self) { return unaryOp("sin", self, sinBlock); }
+Tensor cos_kernel(const Tensor& self) { return unaryOp("cos", self, cosBlock); }
+Tensor tan_kernel(const Tensor& self) { return unaryOp("tan", self, tanBlock); }
+Tensor asin_kernel(const Tensor& self) {
+  return unaryOp("asin", self, asinBlock);
+}
+Tensor acos_kernel(const Tensor& self) {
+  return unaryOp("acos", self, acosBlock);
+}
+Tensor atan_kernel(const Tensor& self) {
+  return unaryOp("atan", self, atanBlock);
+}
+Tensor sinh_kernel(const Tensor& self) {
+  return unaryOp("sinh", self, sinhBlock);
+}
+Tensor cosh_kernel(const Tensor& self) {
+  return unaryOp("cosh", self, coshBlock);
+}
+Tensor tanh_kernel(const Tensor& self) {
+  return unaryOp("tanh", self, tanhBlock);
+}
+Tensor asinh_kernel(const Tensor& self) {
+  return unaryOp("asinh", self, asinhBlock);
+}
+Tensor acosh_kernel(const Tensor& self) {
+  return unaryOp("acosh", self, acoshBlock);
+}
+Tensor atanh_kernel(const Tensor& self) {
+  return unaryOp("atanh", self, atanhBlock);
+}
+Tensor erf_kernel(const Tensor& self) { return unaryOp("erf", self, erfBlock); }
+Tensor erfc_kernel(const Tensor& self) {
+  return unaryOp("erfc", self, erfcBlock);
+}
+Tensor floor_kernel(const Tensor& self) {
+  return unaryOp("floor", self, floorBlock);
+}
+Tensor ceil_kernel(const Tensor& self) {
+  return unaryOp("ceil", self, ceilBlock);
+}
+Tensor round_kernel(const Tensor& self) {
+  return unaryOp("round", self, roundBlock);
+}
+Tensor trunc_kernel(const Tensor& self) {
+  return unaryOp("trunc", self, truncBlock);
+}
+Tensor frac_kernel(const Tensor& self) {
+  return unaryOp("frac", self, fracBlock);
+}
 Tensor bitwise_not_kernel(const Tensor& self) {
   if (self.dtype() == DType::Bool) {
     TP_THROW(NotImplementedError,
              "bitwise_not on bool tensors is not implemented on MPS yet");
   }
-  return unaryOp(self, bitwiseNotBlock);
+  return unaryOp("bitwise_not", self, bitwiseNotBlock);
 }
 
 Tensor bitwise_and_kernel(const Tensor& self, const Tensor& other) {
-  return binaryOp(self, other, bitwiseAndBlock);
+  return binaryOp("bitwise_and", self, other, bitwiseAndBlock);
 }
 
 Tensor isfinite_kernel(const Tensor& self) {
-  return unaryOp(self, isfiniteBlock, DType::Bool);
+  return unaryOp("isfinite", self, isfiniteBlock, DType::Bool);
 }
 
 // ---------------------------------------------------------------------------
 // Activations
 // ---------------------------------------------------------------------------
 
-Tensor sigmoid_kernel(const Tensor& self) { return unaryOp(self, sigmoidBlock); }
+Tensor sigmoid_kernel(const Tensor& self) {
+  return unaryOp("sigmoid", self, sigmoidBlock);
+}
 
 Tensor relu_kernel(const Tensor& self) {
   if (auto result = unaryShader("relu", self)) {
     return *result;
   }
-  return unaryOp(self, reluBlock);
+  return unaryOp("relu", self, reluBlock);
 }
 
 Tensor& relu_inplace_kernel(Tensor& self) {
@@ -381,7 +423,8 @@ Tensor& relu_inplace_kernel(Tensor& self) {
 }
 
 Tensor gelu_kernel(const Tensor& self, const std::string& approximate) {
-  return unaryOp(self, ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* x) {
+  return unaryOp(graphKey("gelu", {approximate}), self,
+                 ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* x) {
     if (approximate == "tanh") {
       // 0.5*x*(1 + tanh(sqrt(2/pi)*(x + 0.044715*x^3)))
       const double kSqrt2OverPi = 0.7978845608028654;
@@ -428,11 +471,15 @@ Tensor gelu_kernel(const Tensor& self, const std::string& approximate) {
   });
 }
 
-Tensor silu_kernel(const Tensor& self) { return unaryOp(self, siluBlock); }
+Tensor silu_kernel(const Tensor& self) {
+  return unaryOp("silu", self, siluBlock);
+}
 
 Tensor hardtanh_kernel_impl(const Tensor& self, const Scalar& min_val,
                             const Scalar& max_val) {
-  return unaryOp(self, ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* x) {
+  return unaryOp(
+      graphKey("hardtanh", {scalarKey(min_val), scalarKey(max_val)}),
+      self, ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* x) {
     MPSGraphTensor* lo = [g constantWithScalar:min_val.to<double>()
                                      dataType:x.dataType];
     MPSGraphTensor* hi = [g constantWithScalar:max_val.to<double>()
@@ -442,7 +489,8 @@ Tensor hardtanh_kernel_impl(const Tensor& self, const Scalar& min_val,
 }
 
 Tensor hardsigmoid_kernel_impl(const Tensor& self) {
-  return unaryOp(self, ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* x) {
+  return unaryOp("hardsigmoid", self,
+                 ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* x) {
     MPSGraphTensor* zero = [g constantWithScalar:0.0 dataType:x.dataType];
     MPSGraphTensor* one = [g constantWithScalar:1.0 dataType:x.dataType];
     MPSGraphTensor* sixth = [g constantWithScalar:1.0 / 6.0 dataType:x.dataType];
@@ -457,12 +505,14 @@ Tensor hardsigmoid_kernel_impl(const Tensor& self) {
 }
 
 Tensor hardswish_kernel_impl(const Tensor& self) {
-  return unaryOp(self, hardswishBlock);
+  return unaryOp("hardswish", self, hardswishBlock);
 }
 
 Tensor leaky_relu_kernel_impl(const Tensor& self,
                               const Scalar& negative_slope) {
-  return unaryOp(self, ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* x) {
+  return unaryOp(
+      graphKey("leaky_relu", {scalarKey(negative_slope)}), self,
+      ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* x) {
     // leaky_relu(x) = x > 0 ? x : alpha * x
     MPSGraphTensor* alpha = [g constantWithScalar:negative_slope.to<double>()
                                           dataType:x.dataType];
@@ -482,7 +532,10 @@ Tensor leaky_relu_kernel_impl(const Tensor& self,
 
 Tensor elu_kernel_impl(const Tensor& self, const Scalar& alpha,
                        const Scalar& scale, const Scalar& input_scale) {
-  return unaryOp(self, ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* x) {
+  return unaryOp(
+      graphKey("elu", {scalarKey(alpha), scalarKey(scale),
+                       scalarKey(input_scale)}), self,
+      ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* x) {
     // elu(x) = x>0 ? x : alpha*(exp(x)-1), with scale/input_scale folded in.
     MPSGraphTensor* alphaC = [g constantWithScalar:alpha.to<double>()
                                             dataType:x.dataType];
@@ -514,15 +567,19 @@ Tensor elu_kernel_impl(const Tensor& self, const Scalar& alpha,
   });
 }
 
-Tensor mish_kernel_impl(const Tensor& self) { return unaryOp(self, mishBlock); }
+Tensor mish_kernel_impl(const Tensor& self) {
+  return unaryOp("mish", self, mishBlock);
+}
 
 Tensor tanhshrink_kernel_impl(const Tensor& self) {
-  return unaryOp(self, tanhshrinkBlock);
+  return unaryOp("tanhshrink", self, tanhshrinkBlock);
 }
 
 Tensor softplus_kernel_impl(const Tensor& self, const Scalar& beta,
                               const Scalar& threshold) {
-  return unaryOp(self, ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* x) {
+  return unaryOp(
+      graphKey("softplus", {scalarKey(beta), scalarKey(threshold)}), self,
+      ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* x) {
     // softplus(x) = (1/beta)*log(1+exp(beta*x)) when beta*x <= threshold,
     // else x.
     const double betaVal = beta.to<double>();
@@ -557,8 +614,8 @@ Tensor softplus_kernel_impl(const Tensor& self, const Scalar& beta,
 
 #define DEFINE_MPS_CMP_TENSOR_KERNEL(NAME, BLOCK)                    \
   Tensor NAME##_tensor_kernel(const Tensor& self, const Tensor& other) { \
-    return binaryOp(self, other, BLOCK, std::nullopt, std::nullopt,  \
-                    DType::Bool);                                    \
+    return binaryOp(#NAME, self, other, BLOCK, std::nullopt,        \
+                    std::nullopt, DType::Bool);                      \
   }
 
 DEFINE_MPS_CMP_TENSOR_KERNEL(eq, eqBlock)
@@ -597,7 +654,10 @@ Tensor where_kernel(const Tensor& condition, const Tensor& self,
 
 Tensor clamp_kernel(const Tensor& self, const std::optional<Scalar>& min,
                     const std::optional<Scalar>& max) {
-  return unaryOp(self, ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* x) {
+  return unaryOp(
+      graphKey("clamp", {min ? scalarKey(*min) : std::string("none"),
+                         max ? scalarKey(*max) : std::string("none")}), self,
+      ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* x) {
     if (min.has_value() && max.has_value()) {
       MPSGraphTensor* lo = [g constantWithScalar:min->to<double>()
                                          dataType:x.dataType];
@@ -620,7 +680,8 @@ Tensor clamp_kernel(const Tensor& self, const std::optional<Scalar>& min,
 }
 
 Tensor clamp_min_kernel(const Tensor& self, const Scalar& min) {
-  return unaryOp(self, ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* x) {
+  return unaryOp(graphKey("clamp_min", {scalarKey(min)}), self,
+                 ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* x) {
     MPSGraphTensor* lo = [g constantWithScalar:min.to<double>()
                                  dataType:x.dataType];
     return [g maximumWithPrimaryTensor:x secondaryTensor:lo name:nil];
@@ -628,7 +689,8 @@ Tensor clamp_min_kernel(const Tensor& self, const Scalar& min) {
 }
 
 Tensor clamp_max_kernel(const Tensor& self, const Scalar& max) {
-  return unaryOp(self, ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* x) {
+  return unaryOp(graphKey("clamp_max", {scalarKey(max)}), self,
+                 ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* x) {
     MPSGraphTensor* hi = [g constantWithScalar:max.to<double>()
                                      dataType:x.dataType];
     return [g minimumWithPrimaryTensor:x secondaryTensor:hi name:nil];
@@ -667,7 +729,8 @@ DType resolve_softmax_dtype(DType dtype, DType self_dtype) {
 Tensor softmax_kernel(const Tensor& self, int64_t dim, DType dtype) {
   const DType out_dtype = resolve_softmax_dtype(dtype, self.dtype());
   if (dim < 0) dim += self.dim();
-  return unaryOp(self, ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* x) {
+  return unaryOp(graphKey("softmax", {std::to_string(dim)}), self,
+                 ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* x) {
     MPSDataType dt = getMPSDataType(out_dtype);
     MPSGraphTensor* xc = ([x dataType] == dt)
         ? x
@@ -679,7 +742,8 @@ Tensor softmax_kernel(const Tensor& self, int64_t dim, DType dtype) {
 Tensor log_softmax_kernel(const Tensor& self, int64_t dim, DType dtype) {
   const DType out_dtype = resolve_softmax_dtype(dtype, self.dtype());
   if (dim < 0) dim += self.dim();
-  return unaryOp(self, ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* x) {
+  return unaryOp(graphKey("log_softmax", {std::to_string(dim)}), self,
+                 ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* x) {
     // log_softmax(x) = x - log(sum(exp(x), axis))
     MPSDataType dt = getMPSDataType(out_dtype);
     MPSGraphTensor* xc = ([x dataType] == dt)
