@@ -17,6 +17,8 @@ Usage: bench_mps_operator.py --suite short --reps 5 --json-out results.json
 import argparse
 import faulthandler
 import json
+import math
+import statistics
 import sys
 import time
 from pathlib import Path
@@ -70,19 +72,22 @@ def _factory(tp_dtype, operation, specs):
     return make
 
 
-def _time(fn, reps):
-    """Run once to warm up, then return the best (minimum) of `reps` timed
-    invocations. Each invocation is bracketed by a device synchronize."""
-    fn()
-    tp.mps.synchronize()
+def _time(fn, reps, min_run_time, warmup):
+    """Collect synchronized samples for at least the requested time and count."""
+    for _ in range(warmup):
+        fn()
+        tp.mps.synchronize()
     samples = []
-    for _ in range(reps):
+    total_time = 0.0
+    while len(samples) < reps or total_time < min_run_time:
         tp.mps.synchronize()
         started = time.perf_counter()
         fn()
         tp.mps.synchronize()
-        samples.append(time.perf_counter() - started)
-    return min(samples)
+        elapsed = time.perf_counter() - started
+        samples.append(elapsed)
+        total_time += elapsed
+    return samples
 
 
 def _moves_data(name):
@@ -344,10 +349,17 @@ def main():
                         default="short")
     parser.add_argument("--dtype", choices=("f32", "f16"), default="f32")
     parser.add_argument("--reps", type=int, default=5)
+    parser.add_argument("--min-run-time", type=float, default=1.0,
+                        help="minimum timed seconds per case")
+    parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--json-out", type=Path, required=True)
     args = parser.parse_args()
     if args.reps < 1:
         parser.error("reps must be positive")
+    if not math.isfinite(args.min_run_time) or args.min_run_time < 0:
+        parser.error("min-run-time must be finite and non-negative")
+    if args.warmup < 1:
+        parser.error("warmup must be positive")
     if not tp.mps.is_available():
         parser.error("MPS is not available on this machine")
     suite = "long" if args.suite == "all" else args.suite
@@ -366,18 +378,23 @@ def main():
             print(f"{name:42} [skipped: {exc}]")
             del fn
             continue
-        seconds = _time(fn, args.reps)
+        samples = _time(fn, args.reps, args.min_run_time, args.warmup)
+        seconds = min(samples)
         entry = {
             "name": name,
             "category": category,
             "input_shapes": [list(value[1]) for value in specs],
             "seconds": seconds,
+            "sample_count": len(samples),
+            "median_seconds": statistics.median(samples),
+            "max_seconds": max(samples),
         }
         if flops:
             entry["flops"] = flops
         if _moves_data(name):
             entry["bytes_moved"] = _estimate_bytes(specs, _ITEMSIZE[args.dtype])
-        print(f"{name:42} {seconds * 1e3:10.3f} ms")
+        print(f"{name:42} {seconds * 1e3:10.3f} ms "
+              f"({len(samples)} samples, median {statistics.median(samples) * 1e3:.3f} ms)")
         measurements.append(entry)
         del fn
 
@@ -387,6 +404,8 @@ def main():
         "suite": suite,
         "dtype": args.dtype,
         "device": "mps",
+        "timing": {"statistic": "minimum", "min_reps": args.reps,
+                   "min_run_time": args.min_run_time, "warmup": args.warmup},
         "measurements": measurements,
     }
     args.json_out.parent.mkdir(parents=True, exist_ok=True)
