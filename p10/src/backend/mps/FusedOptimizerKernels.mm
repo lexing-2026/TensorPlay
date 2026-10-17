@@ -77,10 +77,73 @@ struct MPSMetadataArguments {
   uint64_t threadgroup_to_chunk[32];
 };
 
+// One parameter per launch, with every tensor bound directly.  A GPU image
+// without argument encoders can only reach tensors this way, so a foreach call
+// made there runs one launch per parameter.
+void dispatch_fused_adam_single(
+    id<MTLComputeCommandEncoder> computeEncoder,
+    const std::string& dtype,
+    const Tensor& param,
+    const Tensor& grad,
+    const Tensor& exp_avg,
+    const Tensor& exp_avg_sq,
+    const Tensor& max_exp_avg_sq,
+    const Tensor& state_steps,
+    bool amsgrad,
+    bool adamw,
+    double lr,
+    double beta1,
+    double beta2,
+    double weight_decay,
+    double eps,
+    bool maximize,
+    const std::optional<Tensor>& grad_scale,
+    const std::optional<Tensor>& found_inf) {
+  if (param.numel() == 0) {
+    return;
+  }
+  const std::string kernel =
+      (amsgrad ? (adamw ? "fused_adamw_amsgrad_" : "fused_adam_amsgrad_")
+               : (adamw ? "fused_adamw_" : "fused_adam_")) +
+      dtype + "_float";
+  id<MTLComputePipelineState> PSO =
+      MetalShaderLibrary::getBundledLibrary().getPipelineStateForFunc(kernel);
+  [computeEncoder setComputePipelineState:PSO];
+  unsigned idx = 0;
+  [computeEncoder setBuffer:mtl_buffer_of(param) offset:0 atIndex:idx++];
+  [computeEncoder setBuffer:mtl_buffer_of(grad) offset:0 atIndex:idx++];
+  [computeEncoder setBuffer:mtl_buffer_of(exp_avg) offset:0 atIndex:idx++];
+  [computeEncoder setBuffer:mtl_buffer_of(exp_avg_sq) offset:0 atIndex:idx++];
+  if (amsgrad) {
+    [computeEncoder setBuffer:mtl_buffer_of(max_exp_avg_sq)
+                       offset:0
+                      atIndex:idx++];
+  }
+  [computeEncoder setBuffer:mtl_buffer_of(state_steps)
+                     offset:0
+                    atIndex:idx++];
+  const float lr_f = static_cast<float>(lr);
+  const float beta1_f = static_cast<float>(beta1);
+  const float beta2_f = static_cast<float>(beta2);
+  const float wd_f = static_cast<float>(weight_decay);
+  const float eps_f = static_cast<float>(eps);
+  const uint8_t max_f = maximize ? 1 : 0;
+  [computeEncoder setBytes:&lr_f length:sizeof(float) atIndex:idx++];
+  [computeEncoder setBytes:&beta1_f length:sizeof(float) atIndex:idx++];
+  [computeEncoder setBytes:&beta2_f length:sizeof(float) atIndex:idx++];
+  [computeEncoder setBytes:&wd_f length:sizeof(float) atIndex:idx++];
+  [computeEncoder setBytes:&eps_f length:sizeof(float) atIndex:idx++];
+  [computeEncoder setBytes:&max_f length:sizeof(uint8_t) atIndex:idx++];
+  set_optional_float_buffer(computeEncoder, grad_scale, idx++);
+  set_optional_float_buffer(computeEncoder, found_inf, idx++);
+  mtl_dispatch1DJob(computeEncoder, PSO,
+                    static_cast<NSUInteger>(param.numel()));
+}
+
 // Multi-tensor (foreach) fused optimizer dispatch.  A single kernel launch
 // updates up to 32 parameters; each parameter is processed in 64K-element
 // chunks mapped to threadgroups.  Buffer 0 (the argument struct with arrays
-// of device pointers) is encoded with an MTLArgumentEncoder.
+// of device pointers) is bound with ForeachArguments.
 void dispatch_fused_adam_multi(
     id<MTLComputeCommandEncoder> computeEncoder,
     const std::vector<Tensor>& params,
@@ -116,15 +179,25 @@ void dispatch_fused_adam_multi(
                     : "fused_adam_amsgrad_multi_")
            : (adamw ? "fused_adamw_multi_" : "fused_adam_multi_")) +
       dtype + "_float";
+  MTLFunction_t func =
+      MetalShaderLibrary::getBundledLibrary().getFunction(kernel);
+  if (!argumentEncodersAvailable(func)) {
+    [func release];
+    for (size_t i = 0; i < num_tensors; ++i) {
+      dispatch_fused_adam_single(
+          computeEncoder, dtype, params[i], grads[i], exp_avgs[i],
+          exp_avg_sqs[i], amsgrad ? max_exp_avg_sqs[i] : Tensor(),
+          state_steps[i], amsgrad, adamw, lr, beta1, beta2, weight_decay, eps,
+          maximize, grad_scale, found_inf);
+    }
+    return;
+  }
   id<MTLComputePipelineState> PSO =
       MetalShaderLibrary::getBundledLibrary().getPipelineStateForFunc(kernel);
   [computeEncoder setComputePipelineState:PSO];
-  MTLFunction_t func =
-      MetalShaderLibrary::getBundledLibrary().getFunction(kernel);
-  id<MTLArgumentEncoder> tensorArgumentEncoder =
-      [func newArgumentEncoderWithBufferIndex:0];
+  ForeachArguments arguments(computeEncoder, func,
+                             MPSDevice::getInstance()->device());
   [func release];
-  id<MTLDevice> device = MPSDevice::getInstance()->device();
 
   int64_t tensor_loc = 0;
   int64_t threadgroup_loc = 0;
@@ -138,10 +211,7 @@ void dispatch_fused_adam_multi(
       continue;
     }
     if (tensorArgumentBuffer == nil) {
-      tensorArgumentBuffer =
-          [[device newBufferWithLength:tensorArgumentEncoder.encodedLength
-                              options:0] autorelease];
-      [tensorArgumentEncoder setArgumentBuffer:tensorArgumentBuffer offset:0];
+      tensorArgumentBuffer = arguments.buffer();
     }
     for (int64_t d = 0; d < depth; ++d) {
       const Tensor* t = nullptr;
@@ -150,15 +220,11 @@ void dispatch_fused_adam_multi(
       else if (d == 2) t = &exp_avgs[tensor_index];
       else if (d == 3) t = &exp_avg_sqs[tensor_index];
       else t = &max_exp_avg_sqs[tensor_index];
-      [tensorArgumentEncoder setBuffer:mtl_buffer_of(*t)
-                                offset:0
-                               atIndex:static_cast<NSUInteger>(
-                                           d * kmaxTensors + tensor_loc)];
+      arguments.bind(static_cast<NSUInteger>(d * kmaxTensors + tensor_loc),
+                     mtl_buffer_of(*t));
     }
-    [tensorArgumentEncoder
-        setBuffer:mtl_buffer_of(state_steps[tensor_index])
-           offset:0
-          atIndex:static_cast<NSUInteger>(depth * kmaxTensors + tensor_loc)];
+    arguments.bind(static_cast<NSUInteger>(depth * kmaxTensors + tensor_loc),
+                   mtl_buffer_of(state_steps[tensor_index]));
     metadata_arguments.numels[tensor_loc] = static_cast<uint64_t>(numel);
     tensor_loc++;
 
@@ -206,20 +272,12 @@ void dispatch_fused_adam_multi(
         threadgroup_loc = 0;
         if (chunk == chunks - 1) {
           tensor_loc = 0;
-          tensorArgumentBuffer =
-              [[device newBufferWithLength:tensorArgumentEncoder.encodedLength
-                                  options:0] autorelease];
-          [tensorArgumentEncoder setArgumentBuffer:tensorArgumentBuffer
-                                            offset:0];
+          tensorArgumentBuffer = arguments.buffer();
         } else {
           // Reuse the current tensor for the remaining chunks.
           metadata_arguments.numels[0] =
               metadata_arguments.numels[tensor_loc - 1];
-          tensorArgumentBuffer =
-              [[device newBufferWithLength:tensorArgumentEncoder.encodedLength
-                                  options:0] autorelease];
-          [tensorArgumentEncoder setArgumentBuffer:tensorArgumentBuffer
-                                            offset:0];
+          tensorArgumentBuffer = arguments.buffer();
           for (int64_t d = 0; d < depth; ++d) {
             const Tensor* t = nullptr;
             if (d == 0) t = &params[tensor_index];
@@ -227,15 +285,11 @@ void dispatch_fused_adam_multi(
             else if (d == 2) t = &exp_avgs[tensor_index];
             else if (d == 3) t = &exp_avg_sqs[tensor_index];
             else t = &max_exp_avg_sqs[tensor_index];
-            [tensorArgumentEncoder
-                setBuffer:mtl_buffer_of(*t)
-                   offset:0
-                  atIndex:static_cast<NSUInteger>(d * kmaxTensors)];
+            arguments.bind(static_cast<NSUInteger>(d * kmaxTensors),
+                           mtl_buffer_of(*t));
           }
-          [tensorArgumentEncoder
-              setBuffer:mtl_buffer_of(state_steps[tensor_index])
-                 offset:0
-                atIndex:static_cast<NSUInteger>(depth * kmaxTensors)];
+          arguments.bind(static_cast<NSUInteger>(depth * kmaxTensors),
+                         mtl_buffer_of(state_steps[tensor_index]));
           tensor_loc = 1;
         }
       }
@@ -271,6 +325,75 @@ void dispatch_fused_adam_multi(
   }
 }
 
+// One parameter per launch, with every tensor bound directly.  SGD has no
+// foreach-free kernel of its own, so this form is also what a GPU image
+// without argument encoders uses for every parameter of a foreach call.
+void dispatch_fused_sgd_single(
+    id<MTLComputeCommandEncoder> computeEncoder,
+    const std::string& dtype,
+    const Tensor& param,
+    const Tensor& grad,
+    const Tensor& momentum_buffer,
+    bool has_momentum,
+    double weight_decay,
+    double lr,
+    const std::optional<Tensor>& lr_tensor,
+    double momentum_coeff,
+    double dampening,
+    bool nesterov,
+    bool maximize,
+    bool is_first_step,
+    const std::optional<Tensor>& grad_scale,
+    const std::optional<Tensor>& found_inf) {
+  if (param.numel() == 0) {
+    return;
+  }
+  const std::string kernel =
+      (has_momentum ? "fused_sgd_momentum_single_" : "fused_sgd_single_") +
+      dtype;
+  id<MTLComputePipelineState> PSO =
+      MetalShaderLibrary::getBundledLibrary().getPipelineStateForFunc(kernel);
+  [computeEncoder setComputePipelineState:PSO];
+  unsigned idx = 0;
+  [computeEncoder setBuffer:mtl_buffer_of(param) offset:0 atIndex:idx++];
+  [computeEncoder setBuffer:mtl_buffer_of(grad) offset:0 atIndex:idx++];
+  if (has_momentum) {
+    [computeEncoder setBuffer:mtl_buffer_of(momentum_buffer)
+                       offset:0
+                      atIndex:idx++];
+  }
+  const float wd_f = static_cast<float>(weight_decay);
+  [computeEncoder setBytes:&wd_f length:sizeof(float) atIndex:idx++];
+  if (has_momentum) {
+    const float mom_f = static_cast<float>(momentum_coeff);
+    [computeEncoder setBytes:&mom_f length:sizeof(float) atIndex:idx++];
+  }
+  if (lr_tensor.has_value() && lr_tensor->defined()) {
+    Tensor lr_c = shader_tensor(*lr_tensor);
+    [computeEncoder setBuffer:mtl_buffer_of(lr_c) offset:0 atIndex:idx++];
+  } else {
+    const float lr_f = static_cast<float>(lr);
+    [computeEncoder setBytes:&lr_f length:sizeof(float) atIndex:idx++];
+  }
+  if (has_momentum) {
+    const float damp_f = static_cast<float>(dampening);
+    const uint8_t nest_f = nesterov ? 1 : 0;
+    const uint8_t max_f = maximize ? 1 : 0;
+    const uint8_t first_f = is_first_step ? 1 : 0;
+    [computeEncoder setBytes:&damp_f length:sizeof(float) atIndex:idx++];
+    [computeEncoder setBytes:&nest_f length:sizeof(uint8_t) atIndex:idx++];
+    [computeEncoder setBytes:&max_f length:sizeof(uint8_t) atIndex:idx++];
+    [computeEncoder setBytes:&first_f length:sizeof(uint8_t) atIndex:idx++];
+  } else {
+    const uint8_t max_f = maximize ? 1 : 0;
+    [computeEncoder setBytes:&max_f length:sizeof(uint8_t) atIndex:idx++];
+  }
+  set_optional_float_buffer(computeEncoder, grad_scale, idx++);
+  set_optional_float_buffer(computeEncoder, found_inf, idx++);
+  mtl_dispatch1DJob(computeEncoder, PSO,
+                    static_cast<NSUInteger>(param.numel()));
+}
+
 // Multi-tensor (foreach) fused SGD dispatch.  Uses the same chunked
 // threadgroup scheme as the Adam path: up to 32 parameters per launch, each
 // split into 64K-element chunks.  With momentum the depth is 3 (params,
@@ -304,15 +427,25 @@ void dispatch_fused_sgd_multi(
   const std::string dtype = scalarToMetalTypeString(params[0].dtype());
   const std::string kernel =
       (momentum ? "fused_sgd_momentum_" : "fused_sgd_") + dtype;
+  MTLFunction_t func =
+      MetalShaderLibrary::getBundledLibrary().getFunction(kernel);
+  if (!argumentEncodersAvailable(func)) {
+    [func release];
+    for (size_t i = 0; i < num_tensors; ++i) {
+      dispatch_fused_sgd_single(
+          computeEncoder, dtype, params[i], grads[i],
+          momentum ? momentum_buffers[i] : Tensor(), momentum, weight_decay, lr,
+          lr_tensor, momentum_coeff, dampening, nesterov, maximize,
+          is_first_step, grad_scale, found_inf);
+    }
+    return;
+  }
   id<MTLComputePipelineState> PSO =
       MetalShaderLibrary::getBundledLibrary().getPipelineStateForFunc(kernel);
   [computeEncoder setComputePipelineState:PSO];
-  MTLFunction_t func =
-      MetalShaderLibrary::getBundledLibrary().getFunction(kernel);
-  id<MTLArgumentEncoder> tensorArgumentEncoder =
-      [func newArgumentEncoderWithBufferIndex:0];
+  ForeachArguments arguments(computeEncoder, func,
+                             MPSDevice::getInstance()->device());
   [func release];
-  id<MTLDevice> device = MPSDevice::getInstance()->device();
 
   int64_t tensor_loc = 0;
   int64_t threadgroup_loc = 0;
@@ -326,19 +459,14 @@ void dispatch_fused_sgd_multi(
       continue;
     }
     if (tensorArgumentBuffer == nil) {
-      tensorArgumentBuffer =
-          [[device newBufferWithLength:tensorArgumentEncoder.encodedLength
-                              options:0] autorelease];
-      [tensorArgumentEncoder setArgumentBuffer:tensorArgumentBuffer offset:0];
+      tensorArgumentBuffer = arguments.buffer();
     }
     for (int64_t d = 0; d < depth; ++d) {
       const Tensor* t = (d == 0)   ? &params[tensor_index]
                         : (d == 1) ? &grads[tensor_index]
                                    : &momentum_buffers[tensor_index];
-      [tensorArgumentEncoder setBuffer:mtl_buffer_of(*t)
-                                offset:0
-                               atIndex:static_cast<NSUInteger>(
-                                           d * kmaxTensors + tensor_loc)];
+      arguments.bind(static_cast<NSUInteger>(d * kmaxTensors + tensor_loc),
+                     mtl_buffer_of(*t));
     }
     metadata_arguments.numels[tensor_loc] = static_cast<uint64_t>(numel);
     tensor_loc++;
@@ -401,28 +529,18 @@ void dispatch_fused_sgd_multi(
         threadgroup_loc = 0;
         if (chunk == chunks - 1) {
           tensor_loc = 0;
-          tensorArgumentBuffer =
-              [[device newBufferWithLength:tensorArgumentEncoder.encodedLength
-                                  options:0] autorelease];
-          [tensorArgumentEncoder setArgumentBuffer:tensorArgumentBuffer
-                                            offset:0];
+          tensorArgumentBuffer = arguments.buffer();
         } else {
           // Reuse the current tensor for the remaining chunks.
           metadata_arguments.numels[0] =
               metadata_arguments.numels[tensor_loc - 1];
-          tensorArgumentBuffer =
-              [[device newBufferWithLength:tensorArgumentEncoder.encodedLength
-                                  options:0] autorelease];
-          [tensorArgumentEncoder setArgumentBuffer:tensorArgumentBuffer
-                                            offset:0];
+          tensorArgumentBuffer = arguments.buffer();
           for (int64_t d = 0; d < depth; ++d) {
             const Tensor* t = (d == 0)   ? &params[tensor_index]
                               : (d == 1) ? &grads[tensor_index]
                                          : &momentum_buffers[tensor_index];
-            [tensorArgumentEncoder
-                setBuffer:mtl_buffer_of(*t)
-                   offset:0
-                  atIndex:static_cast<NSUInteger>(d * kmaxTensors)];
+            arguments.bind(static_cast<NSUInteger>(d * kmaxTensors),
+                           mtl_buffer_of(*t));
           }
           tensor_loc = 1;
         }
@@ -546,40 +664,12 @@ void fused_adam_impl(std::vector<Tensor> params,
             adamw, lr, beta1, beta2, weight_decay, eps, maximize, grad_scale,
             found_inf);
       } else {
-        const std::string kernel =
-            (amsgrad
-                 ? (adamw ? "fused_adamw_amsgrad_" : "fused_adam_amsgrad_")
-                 : (adamw ? "fused_adamw_" : "fused_adam_")) +
-            dtype + "_float";
-        id<MTLComputePipelineState> PSO =
-            MetalShaderLibrary::getBundledLibrary().getPipelineStateForFunc(
-                kernel);
-        [computeEncoder setComputePipelineState:PSO];
-        unsigned idx = 0;
-        [computeEncoder setBuffer:mtl_buffer_of(p_nz[0]) offset:0 atIndex:idx++];
-        [computeEncoder setBuffer:mtl_buffer_of(g_nz[0]) offset:0 atIndex:idx++];
-        [computeEncoder setBuffer:mtl_buffer_of(ea_nz[0]) offset:0 atIndex:idx++];
-        [computeEncoder setBuffer:mtl_buffer_of(es_nz[0]) offset:0 atIndex:idx++];
-        if (amsgrad) {
-          [computeEncoder setBuffer:mtl_buffer_of(me_nz[0]) offset:0 atIndex:idx++];
-        }
-        [computeEncoder setBuffer:mtl_buffer_of(st_nz[0]) offset:0 atIndex:idx++];
-        const float lr_f = static_cast<float>(lr);
-        const float beta1_f = static_cast<float>(beta1);
-        const float beta2_f = static_cast<float>(beta2);
-        const float wd_f = static_cast<float>(weight_decay);
-        const float eps_f = static_cast<float>(eps);
-        const uint8_t max_f = maximize ? 1 : 0;
-        [computeEncoder setBytes:&lr_f length:sizeof(float) atIndex:idx++];
-        [computeEncoder setBytes:&beta1_f length:sizeof(float) atIndex:idx++];
-        [computeEncoder setBytes:&beta2_f length:sizeof(float) atIndex:idx++];
-        [computeEncoder setBytes:&wd_f length:sizeof(float) atIndex:idx++];
-        [computeEncoder setBytes:&eps_f length:sizeof(float) atIndex:idx++];
-        [computeEncoder setBytes:&max_f length:sizeof(uint8_t) atIndex:idx++];
-        set_optional_float_buffer(computeEncoder, grad_scale, idx++);
-        set_optional_float_buffer(computeEncoder, found_inf, idx++);
-        mtl_dispatch1DJob(computeEncoder, PSO,
-                          static_cast<NSUInteger>(p_nz[0].numel()));
+        dispatch_fused_adam_single(computeEncoder, dtype, p_nz[0], g_nz[0],
+                                   ea_nz[0], es_nz[0],
+                                   amsgrad ? me_nz[0] : Tensor(), st_nz[0],
+                                   amsgrad, adamw, lr, beta1, beta2,
+                                   weight_decay, eps, maximize, grad_scale,
+                                   found_inf);
       }
       mpsStream->endKernelCoalescing();
     }

@@ -61,9 +61,7 @@ void dispatch_amp_multi(const std::string& kernel_name,
   }
   constexpr int64_t kChunkSize = 65536;
   constexpr int64_t kmaxThreadGroups = 32;
-  constexpr int64_t kmaxTensors = 32;
 
-  id<MTLDevice> device = MPSDevice::getInstance()->device();
   MPSStream* mpsStream = getCurrentMPSStream();
   dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
     @autoreleasepool {
@@ -74,13 +72,11 @@ void dispatch_amp_multi(const std::string& kernel_name,
       [computeEncoder setComputePipelineState:PSO];
       MTLFunction_t func =
           MetalShaderLibrary::getBundledLibrary().getFunction(kernel_name);
-      id<MTLArgumentEncoder> argumentEncoder =
-          [func newArgumentEncoderWithBufferIndex:0];
+      // The kernel reads one pointer array of tensors from its argument buffer.
+      ForeachArguments arguments(computeEncoder, func,
+                                 MPSDevice::getInstance()->device());
       [func release];
-      id<MTLBuffer> tensorArgumentBuffer =
-          [[device newBufferWithLength:argumentEncoder.encodedLength
-                              options:0] autorelease];
-      [argumentEncoder setArgumentBuffer:tensorArgumentBuffer offset:0];
+      id<MTLBuffer> tensorArgumentBuffer = arguments.buffer();
 
       int tensor_loc = 0;
       int threadgroup_loc = 0;
@@ -91,10 +87,8 @@ void dispatch_amp_multi(const std::string& kernel_name,
         if (tensor_list[t].numel() == 0) {
           continue;
         }
-        [argumentEncoder
-            setBuffer:mtl_buffer_of(tensor_list[t])
-               offset:0
-              atIndex:static_cast<NSUInteger>(tensor_loc)];
+        arguments.bind(static_cast<NSUInteger>(tensor_loc),
+                       mtl_buffer_of(tensor_list[t]));
         metadata_arguments.numels[tensor_loc] =
             static_cast<uint64_t>(tensor_list[t].numel());
         const int64_t current_tensor_index = tensor_loc;
@@ -137,16 +131,10 @@ void dispatch_amp_multi(const std::string& kernel_name,
                            threadsPerThreadgroup:threadGroupSize];
 
             threadgroup_loc = 0;
-            tensorArgumentBuffer =
-                [[device newBufferWithLength:argumentEncoder.encodedLength
-                                    options:0] autorelease];
-            [argumentEncoder setArgumentBuffer:tensorArgumentBuffer offset:0];
+            tensorArgumentBuffer = arguments.buffer();
 
             if (partial) {
-              [argumentEncoder
-                  setBuffer:mtl_buffer_of(tensor_list[t])
-                     offset:0
-                    atIndex:0];
+              arguments.bind(0, mtl_buffer_of(tensor_list[t]));
               metadata_arguments.numels[0] = carried_numels;
               tensor_loc = 1;
             } else {
@@ -287,6 +275,19 @@ void amp_foreach_non_finite_check_and_unscale_mps(
 
   const std::string kernel_name = "ampNonFiniteCheckAndUnscale_" +
       scalarToMetalTypeString(fast[0].dtype());
+  MTLFunction_t func =
+      MetalShaderLibrary::getBundledLibrary().getFunction(kernel_name);
+  const bool vendsEncoders = argumentEncodersAvailable(func);
+  [func release];
+  if (!vendsEncoders) {
+    // The foreach kernel reads its tensors from an argument buffer, which only
+    // an encoder can fill.  Where the image vends none, every tensor gets its
+    // own launch with direct bindings.
+    for (const Tensor& t : fast) {
+      amp_non_finite_check_and_unscale_single_impl(t, found_inf, inv_scale);
+    }
+    return;
+  }
   dispatch_amp_multi(kernel_name, fast, found_inf, inv_scale);
 }
 
