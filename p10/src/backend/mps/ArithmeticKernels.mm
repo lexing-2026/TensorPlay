@@ -102,6 +102,7 @@ MPSBinaryOpBlock hypotBlock = ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* a,
 
 Tensor add_kernel(const Tensor& self, const Tensor& other,
                   const Scalar& alpha) {
+  fprintf(stderr, "TP_PROF_DEBUG add_kernel called\n");
   return binaryOp(self, other, addBlock, alpha);
 }
 
