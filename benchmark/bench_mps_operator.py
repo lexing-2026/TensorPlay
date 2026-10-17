@@ -18,7 +18,9 @@ MPS dispatch is asynchronous, so every timed invocation synchronizes the
 command queue around the operation. --chain N queues N invocations inside one
 pair of synchronizes and reports their mean, which amortizes the host round
 trip and is what makes a launch-cost change visible: an isolated operator's
-sample is dominated by the wait itself.
+sample is dominated by the wait itself. A chain keeps every output it produced
+in flight until its synchronize, so a case whose output is large gets a shorter
+chain, down to a single invocation.
 
 Usage: bench_mps_operator.py --suite short --reps 5 --json-out results.json
        bench_mps_operator.py --suite short --reference --json-out results.json
@@ -40,6 +42,10 @@ import tensorplay as tp
 import tensorplay.functional as F
 
 _ITEMSIZE = {"f32": 4, "f16": 2}
+# Device memory one chained case may hold.  The runner's allocator caps a
+# single request at a few tens of megabytes, and an in-flight chain keeps every
+# output it produced until its synchronize.
+_CHAIN_MEMORY_BUDGET = 8 << 20
 # The device every case runs on; tests drive the same code path on the host.
 _DEVICE = "mps"
 _VIEW_ONLY_PREFIXES = ("reshape", "split", "chunk", "diagonal", "unbind",
@@ -217,6 +223,26 @@ def _time(fn, reps, min_run_time, warmup, synchronize, chain=1):
 
 def _moves_data(name):
     return not name.startswith(_VIEW_ONLY_PREFIXES)
+
+
+def _output_bytes(specs, itemsize):
+    """Storage one invocation hands back, approximated as the largest-shaped
+    operand.  In a chain every one of these stays alive until the chain's
+    synchronize, because a committed command buffer retains the buffers it was
+    given until its work finishes."""
+    if not specs:
+        return 0
+    return int(max(int(np.prod(value[1])) for value in specs) * itemsize)
+
+
+def _chain_for(chain, specs, itemsize):
+    """The invocations to place in one chain of this case: the requested count
+    while the chained outputs fit the memory budget, fewer for a large case, and
+    one where a single output already fills the budget.  Chaining is about the
+    cost of queueing a launch, which is a fixed host-side price independent of
+    the case size, so shortening it for a large case loses nothing."""
+    per_call = max(_output_bytes(specs, itemsize), 1)
+    return max(1, min(chain, _CHAIN_MEMORY_BUDGET // per_call))
 
 
 def _estimate_bytes(specs, itemsize):
@@ -510,8 +536,10 @@ def main(argv=None):
     skipped = {name.strip() for name in args.skip_cases.split(",")
                if name.strip()}
     cases = build_cases(backend, suite, args.dtype)
-    # A pass that aborts the process keeps the cases it already timed.
-    incremental = args.side == "reference"
+    # A pass that aborts the process keeps the cases it already timed.  Either
+    # side can abort: the second runtime on a device it handles badly, this one
+    # on a chained case whose in-flight outputs exceed the device allocator.
+    incremental = True
 
     def write_payload():
         payload = {
@@ -564,15 +592,16 @@ def main(argv=None):
             else:
                 fn = factory()
             samples = samples_by_name.setdefault(name, [])
+            chain = _chain_for(args.chain, specs, _ITEMSIZE[args.dtype])
             samples.extend(_time(fn, reps_per_round, time_per_round,
-                                 args.warmup, backend.synchronize,
-                                 args.chain))
+                                 args.warmup, backend.synchronize, chain))
             seconds = min(samples)
             entry = {
                 "name": name,
                 "category": category,
                 "input_shapes": [list(value[1]) for value in specs],
                 "seconds": seconds,
+                "chain": chain,
                 "sample_count": len(samples),
                 "median_seconds": statistics.median(samples),
                 "max_seconds": max(samples),
@@ -583,7 +612,7 @@ def main(argv=None):
                 entry["bytes_moved"] = _estimate_bytes(specs,
                                                        _ITEMSIZE[args.dtype])
             print(f"{name:42} {seconds * 1e3:10.3f} ms "
-                  f"({len(samples)} samples, median "
+                  f"({len(samples)} samples of x{chain}, median "
                   f"{statistics.median(samples) * 1e3:.3f} ms)")
             measurements[name] = entry
             backend.release_cached_memory()
