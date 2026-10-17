@@ -67,6 +67,41 @@ Tensor layer_norm_impl(
 
   api::vTensor v_input = convert(input_arg);
 
+  const int64_t norm_ndim =
+      static_cast<int64_t>(normalized_shape.size());
+  const int64_t ndim = input_arg.dim();
+
+  // Buffer-stored payloads (any axis beyond the 3-D image limit) normalize
+  // through a linear composite: keepdim mean, broadcast subtract, mean of
+  // squares, rsqrt, then the affine terms.  Every step routes through a
+  // buffer-capable elementwise/reduction kernel.
+  if (v_input.storage_type() == api::StorageType::BUFFER) {
+    std::vector<int64_t> dims;
+    dims.reserve(static_cast<size_t>(norm_ndim));
+    for (int64_t i = ndim - norm_ndim; i < ndim; ++i) {
+      dims.push_back(i);
+    }
+    Tensor mean = dispatch_vk<Tensor>(
+        "mean.dim", input_arg, dims, true, DType::Float32);
+    Tensor centered =
+        dispatch_vk<Tensor>("sub.Tensor", input_arg, mean, Scalar(1.0));
+    Tensor centered_sq =
+        dispatch_vk<Tensor>("mul.Tensor", centered, centered);
+    Tensor var = dispatch_vk<Tensor>(
+        "mean.dim", centered_sq, dims, true, DType::Float32);
+    Tensor rstd = dispatch_vk<Tensor>(
+        "rsqrt",
+        dispatch_vk<Tensor>("add.Scalar", var, Scalar(eps), Scalar(1)));
+    Tensor out = dispatch_vk<Tensor>("mul.Tensor", centered, rstd);
+    if (weight_opt.has_value()) {
+      out = dispatch_vk<Tensor>("mul.Tensor", out, weight_opt.value());
+    }
+    if (bias_opt.has_value()) {
+      out = dispatch_vk<Tensor>("add.Tensor", out, bias_opt.value());
+    }
+    return out;
+  }
+
   api::vTensor v_output{
       context,
       v_input.sizes(),
@@ -77,10 +112,6 @@ Tensor layer_norm_impl(
     TP_THROW(
         NotImplementedError, "Vulkan layer_norm requires texture storage");
   }
-
-  const int64_t norm_ndim =
-      static_cast<int64_t>(normalized_shape.size());
-  const int64_t ndim = input_arg.dim();
 
   // Elements of the normalized span along the width and height slots: every
   // normalized axis except a possibly included channel axis maps onto the
@@ -441,9 +472,14 @@ Tensor rms_norm_kernel(
   const int64_t norm_ndim = static_cast<int64_t>(normalized_shape.size());
   const int64_t ndim = input.dim();
 
-  // Fused single-dispatch path: normalization covers only the trailing axis
-  // (the texture width) and any affine parameter is a rank-1 tensor along it.
+  // Fused single-dispatch path covers only texture-backed inputs: the
+  // shader scans a texel row, which buffer storage does not provide.
+  // Buffer-stored payloads fall through to the composite path, whose
+  // elementwise ops (mul, mean, scalar add, rsqrt) all have linear
+  // variants.
+  api::vTensor v_input = convert(input);
   const bool fused_ok =
+      v_input.storage_type() != api::StorageType::BUFFER &&
       norm_ndim == 1 && ndim >= 1 && ndim <= 4 &&
       normalized_shape[0] == input.size(ndim - 1) &&
       (!weight_opt.has_value() ||
