@@ -183,15 +183,11 @@ std::string scalarKey(const Scalar& value) {
   return std::to_string(bits);
 }
 
-std::string graphKey(const std::source_location& location,
+std::string graphKey(const std::string& op,
                      std::initializer_list<std::string> parts) {
-  // File, line and column: nested calls on one line are different call
-  // sites and must not share a graph.
-  std::string key = location.file_name();
-  key += ':';
-  key += std::to_string(location.line());
-  key += ':';
-  key += std::to_string(location.column());
+  // The name comes first: an entry is looked up by the computation it performs
+  // and the structure it was built for, never by where it was called from.
+  std::string key = op;
   for (const std::string& part : parts) {
     key += '|';
     key += part;
@@ -199,11 +195,11 @@ std::string graphKey(const std::source_location& location,
   return key;
 }
 
-Tensor binaryOp(const Tensor& self, const Tensor& other, MPSBinaryOpBlock block,
+Tensor binaryOp(const std::string& op, const Tensor& self,
+                const Tensor& other, MPSBinaryOpBlock block,
                 const std::optional<Scalar>& alpha,
                 std::optional<DType> common_dtype,
-                std::optional<DType> out_dtype,
-                std::source_location location) {
+                std::optional<DType> out_dtype) {
   if (!self.device().is_mps() || !other.device().is_mps()) {
     TP_THROW(RuntimeError, "MPS binary op requires both inputs on the MPS device");
   }
@@ -235,13 +231,13 @@ Tensor binaryOp(const Tensor& self, const Tensor& other, MPSBinaryOpBlock block,
       alpha.has_value() && !alpha->isComplex();
   const bool alpha_is_one =
       has_alpha && alpha->toDouble() == 1.0;
-  // The call site names the operation; shapes, dtypes and alpha complete the
-  // identity of the graph the block would build.
+  // `op` names the operation (and the constants its block bakes in); shapes,
+  // dtypes and alpha complete the identity of the graph the block would build.
   const std::string key = graphKey(
-      location, {shapeKey(out_shape), dtypeKey(self_c.dtype()),
-                 dtypeKey(other_c.dtype()), dtypeKey(common),
-                 dtypeKey(output_dtype),
-                 has_alpha ? scalarKey(*alpha) : std::string("none")});
+      op, {shapeKey(out_shape), dtypeKey(self_c.dtype()),
+           dtypeKey(other_c.dtype()), dtypeKey(common),
+           dtypeKey(output_dtype),
+           has_alpha ? scalarKey(*alpha) : std::string("none")});
 
   @autoreleasepool {
     MPSShape* shape = getMPSShape(out_shape);
@@ -570,9 +566,9 @@ std::optional<Tensor> unaryShader(const std::string& op, const Tensor& self) {
   return output;
 }
 
-Tensor unaryOp(const Tensor& self, MPSUnaryOpBlock block,
-               std::optional<DType> out_dtype,
-               std::source_location location) {
+Tensor unaryOp(const std::string& op, const Tensor& self,
+               MPSUnaryOpBlock block,
+               std::optional<DType> out_dtype) {
   if (!self.device().is_mps()) {
     TP_THROW(RuntimeError, "MPS unary op requires input on the MPS device");
   }
@@ -585,9 +581,9 @@ Tensor unaryOp(const Tensor& self, MPSUnaryOpBlock block,
     return output;
   }
 
-  const std::string key = graphKey(
-      location, {shapeKey(sizes), dtypeKey(self_c.dtype()),
-                 dtypeKey(output_dtype)});
+  const std::string key =
+      graphKey(op, {shapeKey(sizes), dtypeKey(self_c.dtype()),
+                    dtypeKey(output_dtype)});
 
   @autoreleasepool {
     MPSShape* shape = getMPSShape(sizes);
