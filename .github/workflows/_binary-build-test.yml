@@ -859,6 +859,7 @@ jobs:
               "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
               bench-data-history || true
           fi
+          python benchmark/test_mps_performance_regression.py
           python benchmark/check_mps_performance_regression.py \
             --operator-json benchmark-results/mps-operator.json \
             --history bench-data-history/latest.json \

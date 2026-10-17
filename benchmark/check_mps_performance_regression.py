@@ -117,7 +117,8 @@ def compare(current, baseline, max_slowdown):
     # A run can land on a faster or slower machine than the one that
     # produced the committed baseline.  Measure the run's own overall shift
     # against the baseline as the median ratio over every shared measurement,
-    # then treat only deviations beyond that shift as regressions.
+    # then treat only deviations beyond that shift as regressions. A faster
+    # overall run must not turn unchanged or improved cases into regressions.
     ratios = []
     for name in compared_names:
         actual = current_by_name[name].get("seconds")
@@ -129,7 +130,7 @@ def compare(current, baseline, max_slowdown):
             and actual > 0 and previous > 0
         ):
             ratios.append(actual / previous)
-    scale = statistics.median(ratios) if ratios else 1.0
+    scale = max(1.0, statistics.median(ratios)) if ratios else 1.0
 
     violations = []
     for name in compared_names:
