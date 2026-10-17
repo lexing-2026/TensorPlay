@@ -677,8 +677,8 @@ class TestMPSBatchNorm(unittest.TestCase):
         xc = x.cpu()
         mean = tp.reshape(tp.mean(xc, dim=(0, 2, 3)), [1, 3, 1, 1])
         var = tp.reshape(tp.var(xc, dim=(0, 2, 3), correction=0), [1, 3, 1, 1])
-        ref = ((xc - mean) / (var + 1e-5).sqrt()) * tp.reshape(w, [1, 3, 1, 1]) \
-            + tp.reshape(b, [1, 3, 1, 1])
+        ref = ((xc - mean) / (var + 1e-5).sqrt()) \
+            * tp.reshape(w.cpu(), [1, 3, 1, 1]) + tp.reshape(b.cpu(), [1, 3, 1, 1])
         self.assertEqual(tuple(y.shape), (2, 3, 2, 2))
         self.assertTrue(tp.allclose(y.cpu(), ref, atol=1e-4))
         # Running statistics move towards the batch mean of channel 0,
@@ -709,8 +709,8 @@ class TestMPSGroupNorm(unittest.TestCase):
         mean = tp.mean(g, dim=(2, 3), keepdim=True)
         var = tp.var(g, dim=(2, 3), correction=0, keepdim=True)
         normalized = (g - mean) / (var + 1e-5).sqrt()
-        ref = tp.reshape(normalized * tp.reshape(w, [1, 2, 2, 1])
-                         + tp.reshape(b, [1, 2, 2, 1]), [2, 4, 2, 3])
+        ref = tp.reshape(normalized * tp.reshape(w.cpu(), [1, 2, 2, 1])
+                         + tp.reshape(b.cpu(), [1, 2, 2, 1]), [2, 4, 2, 3])
         self.assertEqual(tuple(y.shape), (2, 4, 2, 3))
         self.assertTrue(tp.allclose(y.cpu(), ref, atol=1e-4))
 
