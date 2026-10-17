@@ -536,18 +536,7 @@ void fused_adam_impl(std::vector<Tensor> params,
   }
 
   MPSStream* mpsStream = getCurrentMPSStream();
-  // Increment the state-step counters on the GPU ahead of the optimizer
-  // kernel (submitted to the same serial stream, so ordering is preserved).
-  for (size_t i = 0; i < n; ++i) {
-    // A 0-d state step cannot be incremented in place by the scalar path
-    // (the broadcast result would be 1-D); operate on a 1-element view that
-    // aliases the same storage.
-    Tensor st = state_steps[i];
-    if (st.dim() == 0) {
-      st = ops::view(st, {1});
-    }
-    tpx::ops::add_(st, Scalar(1));
-  }
+  // The caller advances the state steps before invoking this update.
   dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
     @autoreleasepool {
       id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();

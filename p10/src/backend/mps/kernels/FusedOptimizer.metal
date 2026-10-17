@@ -1,7 +1,6 @@
 // Fused Adam / AdamW / AdamW-amsgrad optimizer kernels.  Each kernel handles
-// one parameter tensor (flattened over all elements); the caller increments
-// the 0-d state_step tensor inside the kernel so the bias correction uses
-// the new step count.
+// one parameter tensor (flattened over all elements). Bias correction uses
+// the state_step value supplied by the caller.
 
 #include <metal_stdlib>
 

@@ -98,16 +98,18 @@ class TestMPSTopKSample(unittest.TestCase):
 @unittest.skipUnless(mps_available(), "MPS not available")
 class TestMPSFusedOptimizer(unittest.TestCase):
     def _step(self, device, adamw):
-        p = tp.randn(6, device=device)
-        g = tp.randn(6, device=device)
+        p = tp.tensor([0.5, -1.0, 2.0, -0.25, 3.0, 0.75], device=device)
+        g = tp.tensor([0.1, -0.2, 0.3, 0.4, -0.5, 0.6], device=device)
         ea = tp.zeros(6, device=device)
         es = tp.zeros(6, device=device)
-        step = tp.tensor(0.0, dtype=tp.float32, device=device)
+        step = tp.tensor(1.0, dtype=tp.float32, device=device)
         fn = tp._fused_adamw_ if adamw else tp._fused_adam_
         # amsgrad is disabled, so the max-exp-avg-sqs list must be empty.
         fn([p], [g], [ea], [es], [], [step], lr=0.01, beta1=0.9,
            beta2=0.999, weight_decay=0.01, eps=1e-8, amsgrad=False,
            maximize=False)
+        self.assertEqual(step.item(), 1.0)
+        self.assertTrue(tp.all(tp.isfinite(p)).item())
         return p.cpu()
 
     def test_fused_adamw(self):
