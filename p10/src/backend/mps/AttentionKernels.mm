@@ -204,7 +204,7 @@ std::optional<Tensor> sdpa_decode_shader(const Tensor& q_in,
 
       MTLSize grid = MTLSizeMake(static_cast<NSUInteger>(B * H),
                                  static_cast<NSUInteger>(L), 1);
-      MTLSize threads = MTLSizeMake(32, 1, 1);
+      MTLSize threads = MTLSizeMake(1024, 1, 1);
       [computeEncoder dispatchThreadgroups:grid
                      threadsPerThreadgroup:threads];
       mpsStream->endKernelCoalescing();
@@ -593,7 +593,7 @@ std::optional<Tensor> sdpa_prefill_shader(const Tensor& q_in,
 Tensor scaled_dot_product_attention_kernel(
     const Tensor& query, const Tensor& key, const Tensor& value,
     const std::optional<Tensor>& attn_mask, double dropout_p, bool is_causal,
-    const std::optional<double>& scale, bool enable_gqa) {
+    std::optional<double> scale, bool enable_gqa) {
   if (!query.device().is_mps() || !key.device().is_mps() ||
       !value.device().is_mps()) {
     TP_THROW(RuntimeError,

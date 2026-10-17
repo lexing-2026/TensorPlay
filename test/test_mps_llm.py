@@ -158,6 +158,17 @@ class TestMPSSDPA(unittest.TestCase):
         out_cpu = tp.scaled_dot_product_attention(q.cpu(), k.cpu(), v.cpu())
         self.assertTrue(close(out.cpu(), out_cpu, 1e-2))
 
+    def test_sdpa_explicit_scale(self):
+        for query_length, key_length in ((4, 64), (4, 1024), (16, 32)):
+            with self.subTest(query_length=query_length, key_length=key_length):
+                q = tp.randn(1, 2, query_length, 64, device="mps")
+                k = tp.randn(1, 2, key_length, 64, device="mps")
+                v = tp.randn(1, 2, key_length, 64, device="mps")
+                out = tp.scaled_dot_product_attention(q, k, v, scale=0.25)
+                expected = tp.scaled_dot_product_attention(
+                    q.cpu(), k.cpu(), v.cpu(), scale=0.25)
+                self.assertTrue(close(out.cpu(), expected, 1e-2))
+
     def test_sdpa_bool_mask(self):
         q = tp.randn(1, 2, 4, 64, device="mps")
         k = tp.randn(1, 2, 6, 64, device="mps")
