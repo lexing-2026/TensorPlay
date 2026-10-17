@@ -61,6 +61,55 @@ Tensor reduce_one_axis(
   std::vector<int64_t> out_sizes = shape_vector(input);
   out_sizes[static_cast<size_t>(axis_from_left)] = 1;
 
+  // Buffer-stored inputs (any axis beyond the 3-D image limit) reduce
+  // through a linear row-walking variant; the reduced output is kept in
+  // buffer storage.  Float16 buffer payloads are byte-packed with no
+  // buffer-writing reduction yet.
+  if (v_input.storage_type() == api::StorageType::BUFFER) {
+    TP_CHECK(
+        input.dtype() == DType::Float32,
+        "Vulkan reductions over Float16 buffer storage are not supported "
+        "yet");
+    api::vTensor v_output{
+        context, out_sizes, input.dtype(), api::StorageType::BUFFER,
+        api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+    const int64_t axis_size = input.size(axis_from_left);
+    int64_t inner = 1;
+    for (int64_t d = axis_from_left + 1; d < ndim; ++d) {
+      inner *= input.size(d);
+    }
+    const int64_t rows = input.numel() / axis_size;
+    const struct ReduceAxisBufferBlock final {
+      int32_t axis_size;
+      int32_t inner;
+      int32_t rows;
+      int32_t correction;
+      float scale;
+    } block{
+        static_cast<int32_t>(axis_size), static_cast<int32_t>(inner),
+        static_cast<int32_t>(rows),
+        var_mode ? static_cast<int32_t>(correction_for_var) : 0,
+        mean_mode ? 1.0f / static_cast<float>(axis_size) : 1.0f,
+    };
+    api::UniformParamsBuffer params(context, block);
+    api::PipelineBarrier pipeline_barrier{};
+    context->submit_compute_job(
+        var_mode ? VK_KERNEL(var_axis_buffer) : VK_KERNEL(sum_axis_buffer),
+        pipeline_barrier,
+        {static_cast<uint32_t>(rows), 1u, 1u},
+        {256u, 1u, 1u}, VK_NULL_HANDLE,
+        v_output.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::WRITE),
+        v_input.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::READ),
+        params.buffer());
+    return convert(v_output);
+  }
+
   api::vTensor v_output{
       context,
       out_sizes,
@@ -1090,6 +1139,46 @@ Tensor square(const Tensor& a) {
 // entry uses (keepdim mean, broadcast subtract, square, sum), with the
 // reduced span covering every axis.
 //
+// Buffer-stored inputs use a one-pass composition instead: linear binary
+// ops reject broadcasts, so the keepdim mean cannot be expanded.  The
+// algebraically equivalent (E[x^2] - E[x]^2) form only needs same-shape
+// reductions and scalar arithmetic.
+Tensor var_buffer_one_pass(
+    const Tensor& self,
+    const std::vector<int64_t>& dims,
+    bool keepdim,
+    int64_t correction) {
+  int64_t count = 1;
+  for (const int64_t axis : dims) {
+    count *= self.size(axis);
+  }
+  Tensor sum = reduce_impl(self, dims, /*keepdim=*/true, false, false, 0);
+  // self.mul(self) routes through the buffer-capable square kernel; the
+  // local image-only square helper would read no buffer payload.
+  Tensor sum_sq =
+      reduce_impl(self.mul(self), dims, /*keepdim=*/true, false, false, 0);
+  const double denom =
+      static_cast<double>(std::max<int64_t>(count - correction, 1));
+  Tensor centered =
+      sum_sq.sub(sum.mul(sum).mul(Scalar(1.0 / count)));
+  Tensor result = centered.mul(Scalar(1.0 / denom));
+  if (keepdim) {
+    return result;
+  }
+  std::vector<int64_t> final_sizes;
+  final_sizes.reserve(static_cast<size_t>(self.dim()));
+  for (int64_t i = 0; i < self.dim(); ++i) {
+    const bool reduced = std::find(dims.begin(), dims.end(), i) != dims.end();
+    if (!reduced || result.size(i) != 1) {
+      final_sizes.push_back(result.size(i));
+    }
+  }
+  if (final_sizes.empty()) {
+    return repack_with_sizes(result, final_sizes);
+  }
+  return repack_with_sizes(result, std::move(final_sizes));
+}
+
 Tensor var_kernel(const Tensor& self, int64_t correction) {
   TP_CHECK(
       self.dtype() == DType::Float32,
@@ -1101,6 +1190,11 @@ Tensor var_kernel(const Tensor& self, int64_t correction) {
   dims.reserve(static_cast<size_t>(self.dim()));
   for (int64_t d = 0; d < self.dim(); ++d) {
     dims.push_back(d);
+  }
+
+  api::vTensor v_self = convert(self);
+  if (v_self.storage_type() == api::StorageType::BUFFER) {
+    return var_buffer_one_pass(self, dims, /*keepdim=*/false, correction);
   }
 
   const int64_t count = self.numel();
@@ -1140,6 +1234,11 @@ Tensor var_dim_kernel(
   int64_t count = 1;
   for (const int64_t axis : dims) {
     count *= self.size(axis);
+  }
+
+  api::vTensor v_self = convert(self);
+  if (v_self.storage_type() == api::StorageType::BUFFER) {
+    return var_buffer_one_pass(self, dims, keepdim, correction);
   }
 
   // Two-pass variance over the whole reduced span: a keepdim mean

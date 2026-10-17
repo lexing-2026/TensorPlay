@@ -68,13 +68,20 @@ Tensor unary_op(
 
   api::vTensor v_self = convert(self_arg);
 
+  // A buffer-stored input keeps the op on the linear path even when the
+  // output shape is small enough for image storage; the image path has no
+  // buffer input binding.
+  const bool is_buffer =
+      v_self.storage_type() == api::StorageType::BUFFER;
   api::vTensor v_output{
       context,
       v_self.sizes(),
       v_self.dtype(),
-  };
+      is_buffer ? api::StorageType::BUFFER : api::StorageType::TEXTURE_3D,
+      is_buffer ? api::GPUMemoryLayout::TENSOR_WIDTH_PACKED
+                : api::GPUMemoryLayout::TENSOR_CHANNELS_PACKED};
 
-  if (v_output.storage_type() == api::StorageType::BUFFER) {
+  if (is_buffer) {
     const struct BlockB final {
       uint32_t buf_length;
     } blockb{
