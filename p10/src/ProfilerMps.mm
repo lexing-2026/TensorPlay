@@ -92,15 +92,15 @@ void GpuTimerPair::close() {
 
     const size_t slot = rec_.slot_;
     const uint64_t epoch = g_epoch.load(std::memory_order_relaxed);
-    // Diagnostic: attempt to commit the op's buffer and read its GPU time.
+    // Commit the op's command buffer (shader ops) or wait on the already
+    // committed buffer (graph ops committed by executeMPSGraph), then read
+    // the GPU duration from the root command buffer's timestamps.
     float ms = 0.0f;
     @try {
-        fprintf(stderr, "TP_PROF_DEBUG slot=%zu before commitAndWaitGetGpuTimeMs\n", slot);
         ms = static_cast<float>(stream->commitAndWaitGetGpuTimeMs());
-        fprintf(stderr, "TP_PROF_DEBUG slot=%zu after commitAndWaitGetGpuTimeMs ms=%f\n", slot, ms);
     } @catch (NSException* e) {
-        fprintf(stderr, "TP_PROF_DEBUG slot=%zu caught NSException: %s\n",
-                slot, [[e reason] UTF8String]);
+        // A Metal rejection leaves the timing unset; report zero rather than
+        // aborting the profiling session.
         ms = 0.0f;
     }
     std::lock_guard<std::mutex> lock(g_mps_mutex);

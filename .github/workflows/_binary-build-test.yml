@@ -695,8 +695,6 @@ jobs:
           TEST_FILES: ${{ matrix.test_files }}
           PYTEST_EXTRA_ARGS: ${{ inputs.pytest_extra_args }}
           TP_ENGINE_TRACE: ${{ runner.os == 'Windows' && matrix.name == 'autograd' && '3' || '0' }}
-          MTL_DEBUG_LAYER: ${{ inputs.pytest_extra_args != '' && '1' || '' }}
-          MTL_SHADER_VALIDATION: ${{ inputs.pytest_extra_args != '' && '1' || '' }}
         run: |
           set -euo pipefail
           test_root="$GITHUB_WORKSPACE/.ci-test-tmp"
