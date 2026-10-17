@@ -106,7 +106,6 @@ Tensor binaryOp(const Tensor& self, const Tensor& other, MPSBinaryOpBlock block,
                 const std::optional<Scalar>& alpha,
                 std::optional<DType> common_dtype,
                 std::optional<DType> out_dtype) {
-  fprintf(stderr, "TP_PROF_DEBUG binaryOp called\n");
   if (!self.device().is_mps() || !other.device().is_mps()) {
     TP_THROW(RuntimeError, "MPS binary op requires both inputs on the MPS device");
   }
