@@ -27,14 +27,23 @@ import tensorplay as tp
 _CHILD_TIMEOUT = 300
 
 
+def _nest(flat, shape):
+    """Nest `flat` into `shape`, so a bool operand needs no sequence of bools."""
+    if len(shape) == 1:
+        return flat[:shape[0]]
+    step = math.prod(shape[1:])
+    return [_nest(flat[i * step:(i + 1) * step], shape[1:])
+            for i in range(shape[0])]
+
+
 def _source(shape, dtype_name, device):
     numel = math.prod(shape)
+    flags = _nest([i % 3 != 0 for i in range(numel)], shape)
     return (
         "import tensorplay as tp\n"
         f"x = tp.reshape(tp.arange({numel}, dtype=tp.{dtype_name}, "
         f"device='{device}'), {shape})\n"
-        f"b = tp.reshape(tp.arange({numel}, dtype=tp.bool, "
-        f"device='{device}'), {shape})\n"
+        f"b = tp.tensor({flags}, dtype=tp.bool, device='{device}')\n"
     )
 
 
@@ -126,6 +135,17 @@ CASES = [
      "tp.sum(x, dim=[0, 1, 2]).cpu().tolist()"),
     ("r3_sum_012_keep", [2, 3, 4], "float32",
      "tp.sum(x, dim=[0, 1, 2], keepdim=True).cpu().tolist()"),
+    # Variance and standard deviation: a different graph in the same file, whose
+    # single-axis case uses the variance selector with an axes array and whose
+    # multi-axis case reduces with per-axis sums instead.
+    ("r3_var_axis1", [2, 3, 4], "float32",
+     "tp.var(x, dim=1).cpu().tolist()"),
+    ("r3_std_axis1", [2, 3, 4], "float32",
+     "tp.std(x, dim=1).cpu().tolist()"),
+    ("r3_std_02", [2, 3, 4], "float32",
+     "tp.std(x, dim=[0, 2]).cpu().tolist()"),
+    ("r3_std_full", [2, 3, 4], "float32", "tp.std(x).cpu().tolist()"),
+    ("r2_std_axis1", [3, 4], "float32", "tp.std(x, dim=1).cpu().tolist()"),
 ]
 
 # Reductions that follow another reduction inside one process: the cache is what
@@ -153,6 +173,7 @@ class ProbeReduce(unittest.TestCase):
               flush=True)
 
     def test_02_cases(self):
+        dead = []
         for label, shape, dtype_name, expr in CASES:
             with self.subTest(case=label):
                 started = time.time()
@@ -171,8 +192,12 @@ class ProbeReduce(unittest.TestCase):
                       f"want={reference}", flush=True)
                 if status != 0:
                     print(f"{label}: stderr tail=\n{err}", flush=True)
+                    dead.append(f"{label} (exit {status})")
+        print("PROBE-CASES-DONE", flush=True)
+        self.assertFalse(dead, f"cases that did not return: {dead}")
 
     def test_03_same_process_pairs(self):
+        dead = []
         for label, exprs in SEQUENCES:
             with self.subTest(sequence=label):
                 code = _source([2, 3, 4], "float32", "mps")
@@ -182,3 +207,6 @@ class ProbeReduce(unittest.TestCase):
                 print(f"{label}: exit={status} out={out!r}", flush=True)
                 if status != 0:
                     print(f"{label}: stderr tail=\n{err}", flush=True)
+                    dead.append(f"{label} (exit {status})")
+        print("PROBE-SEQUENCES-DONE", flush=True)
+        self.assertFalse(dead, f"sequences that did not return: {dead}")
