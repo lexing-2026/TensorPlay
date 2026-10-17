@@ -12,6 +12,7 @@
 
 #include <cmath>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 namespace tensorplay {
@@ -25,14 +26,43 @@ DType normalization_stats_dtype(DType input_dtype) {
       : input_dtype;
 }
 
+// Mean and biased variance of `x` over `axes`.  An array of two or more axes
+// faults, so several axes are reduced one at a time; every step keeps the rank
+// of the tensor before it and leaves a size-1 dimension where the reduced axis
+// was, which is the shape the normalization selector broadcasts against.  With
+// more than one axis the variance is the mean of the squared deviation from the
+// mean of those same axes, the two-pass form of the same quantity.
+std::pair<MPSGraphTensor*, MPSGraphTensor*> rankPreservingStats(
+    MPSGraph* graph, MPSGraphTensor* x, const std::vector<int64_t>& axes) {
+  MPSGraphTensor* mean = x;
+  for (int64_t axis : axes) {
+    mean = [graph meanOfTensor:mean axes:@[ @(axis) ] name:nil];
+  }
+  MPSGraphTensor* variance = nil;
+  if (axes.size() == 1) {
+    variance = [graph varianceOfTensor:x axes:@[ @(axes[0]) ] name:nil];
+  } else {
+    MPSGraphTensor* centered = [graph subtractionWithPrimaryTensor:x
+                                                  secondaryTensor:mean
+                                                             name:nil];
+    MPSGraphTensor* squared = [graph multiplicationWithPrimaryTensor:centered
+                                                     secondaryTensor:centered
+                                                                name:nil];
+    variance = squared;
+    for (int64_t axis : axes) {
+      variance = [graph meanOfTensor:variance axes:@[ @(axis) ] name:nil];
+    }
+  }
+  return {mean, variance};
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
 // native_layer_norm / layer_norm
 //
 // mean and biased variance are computed over the trailing normalized_shape
-// dims with the confirmed meanOfTensor/varianceOfTensor selectors, then
-// broadcast back against the input and combined with weight/bias.
+// dims, then broadcast back against the input and combined with weight/bias.
 // ---------------------------------------------------------------------------
 
 std::tuple<Tensor, Tensor, Tensor> native_layer_norm_kernel(
@@ -104,14 +134,16 @@ std::tuple<Tensor, Tensor, Tensor> native_layer_norm_kernel(
     MPSGraphTensor* x = [graph placeholderWithShape:inShape
                                           dataType:dt
                                                name:@"x"];
-    NSMutableArray<NSNumber*>* axes =
-        [NSMutableArray arrayWithCapacity:normalized_shape.size()];
+    std::vector<int64_t> axes;
+    axes.reserve(normalized_shape.size());
     for (size_t i = 0; i < normalized_shape.size(); ++i) {
-      [axes addObject:@(input.dim() - normalized_shape.size() + i)];
+      axes.push_back(input.dim() - static_cast<int64_t>(normalized_shape.size()) +
+                     static_cast<int64_t>(i));
     }
 
-    MPSGraphTensor* mean0 = [graph meanOfTensor:x axes:axes name:nil];
-    MPSGraphTensor* var0 = [graph varianceOfTensor:x axes:axes name:nil];
+    const auto stats = rankPreservingStats(graph, x, axes);
+    MPSGraphTensor* mean0 = stats.first;
+    MPSGraphTensor* var0 = stats.second;
     MPSGraphTensor* epsT = [graph constantWithScalar:eps
                                                 shape:@[ @1 ]
                                              dataType:dt];
@@ -223,11 +255,10 @@ Tensor layer_norm_kernel(const Tensor& input,
 // ---------------------------------------------------------------------------
 // batch_norm
 //
-// Training mode computes batch statistics with meanOfTensor/varianceOfTensor
-// over all non-channel axes, normalizes with the confirmed
-// normalizationWithTensor selector, and updates running statistics on the
-// host (only C elements).  Evaluation mode normalizes directly with the
-// running statistics.
+// Training mode computes batch statistics over all non-channel axes,
+// normalizes the input against them together with weight/bias, and updates
+// running statistics on the host (only C elements).  Evaluation mode
+// normalizes directly with the running statistics.
 // ---------------------------------------------------------------------------
 
 Tensor batch_norm_kernel(const Tensor& input,
@@ -300,17 +331,20 @@ Tensor batch_norm_kernel(const Tensor& input,
     MPSGraphTensor* mean0 = nil;
     MPSGraphTensor* var0 = nil;
     if (training) {
-      // Batch statistics over all non-channel axes (upstream-aligned
-      // selectors).  The reduced mean/var are reshaped back to the
-      // per-channel broadcast shape before normalization.
-      NSMutableArray<NSNumber*>* axesArr = [NSMutableArray array];
+      // Batch statistics over every axis but the channel one.  Each step of
+      // the reduction keeps the input's rank and leaves a size-1 dimension
+      // behind, so the result already has the (1, C, 1, ...) shape that the
+      // normalization selector broadcasts against.
+      std::vector<int64_t> axes;
+      axes.reserve(static_cast<size_t>(input.dim()) - 1);
       for (int64_t i = 0; i < input.dim(); ++i) {
         if (i != 1) {
-          [axesArr addObject:@(i)];
+          axes.push_back(i);
         }
       }
-      mean0 = [graph meanOfTensor:x axes:axesArr name:nil];
-      var0 = [graph varianceOfTensor:x axes:axesArr name:nil];
+      const auto stats = rankPreservingStats(graph, x, axes);
+      mean0 = stats.first;
+      var0 = stats.second;
     } else {
       mean0 = [graph placeholderWithShape:meanShape
                               dataType:dt
