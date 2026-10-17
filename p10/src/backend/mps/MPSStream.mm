@@ -262,9 +262,13 @@ void MPSStream::executeMPSGraph(MPSGraph* mpsGraph,
           const uint64_t epoch = pair->epoch();
           pair->markGpuHandlerInstalled();
           tensorplay::prof::mps_on_handler_installed();
+          fprintf(stderr, "TP_PROF_DEBUG graph slot=%llu before addCompletedHandler\n",
+                  (unsigned long long)slot);
           [commandBuffer() addCompletedHandler:^(id<MTLCommandBuffer> cb) {
             tensorplay::prof::mps_record_gpu_time(slot, device, epoch, cb);
           }];
+          fprintf(stderr, "TP_PROF_DEBUG graph slot=%llu after addCompletedHandler\n",
+                  (unsigned long long)slot);
         }
       }
       SyncType effective = syncType;

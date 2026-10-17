@@ -118,10 +118,12 @@ void GpuTimerPair::close() {
     }
     float ms = 0.0f;
     @try {
+        fprintf(stderr, "TP_PROF_DEBUG close slot=%zu before commitAndWait\n", slot);
         ms = static_cast<float>(stream->commitAndWaitGetGpuTimeMs());
+        fprintf(stderr, "TP_PROF_DEBUG close slot=%zu after commitAndWait ms=%f\n", slot, ms);
     } @catch (NSException* e) {
-        // A Metal rejection leaves the timing unset; report zero rather than
-        // aborting the profiling session.
+        fprintf(stderr, "TP_PROF_DEBUG close slot=%zu caught NSException: %s\n",
+                slot, [[e reason] UTF8String]);
         ms = 0.0f;
     }
     std::lock_guard<std::mutex> lock(g_mps_mutex);
