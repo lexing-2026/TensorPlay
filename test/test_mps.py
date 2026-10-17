@@ -697,6 +697,23 @@ class TestMPSGroupNorm(unittest.TestCase):
         ref = (x.cpu() - mean) / (var + 1e-5) ** 0.5
         self.assertTrue(tp.allclose(y.cpu(), ref, atol=1e-4))
 
+    def test_group_norm_groups_and_affine(self):
+        x = tp.arange(48, dtype=tp.float32, device="mps").reshape(2, 4, 2, 3) + 1.0
+        w = tp.tensor([1.0, 2.0, 0.5, 1.5], dtype=tp.float32, device="mps")
+        b = tp.tensor([0.0, 1.0, -1.0, 2.0], dtype=tp.float32, device="mps")
+        y = tp.group_norm(x, 2, weight=w, bias=b, eps=1e-5)
+        # The group holds two channels of six elements each, so the statistics
+        # come from the inner two dimensions of that layout and the per-channel
+        # affine from the same layout with the elements of a channel merged.
+        g = tp.reshape(x.cpu(), [2, 2, 2, 6])
+        mean = tp.mean(g, dim=(2, 3), keepdim=True)
+        var = tp.var(g, dim=(2, 3), correction=0, keepdim=True)
+        normalized = (g - mean) / (var + 1e-5).sqrt()
+        ref = tp.reshape(normalized * tp.reshape(w, [1, 2, 2, 1])
+                         + tp.reshape(b, [1, 2, 2, 1]), [2, 4, 2, 3])
+        self.assertEqual(tuple(y.shape), (2, 4, 2, 3))
+        self.assertTrue(tp.allclose(y.cpu(), ref, atol=1e-4))
+
 
 @unittest.skipUnless(mps_available(), "MPS not available")
 class TestMPSConv2d(unittest.TestCase):
