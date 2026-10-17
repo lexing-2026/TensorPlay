@@ -73,7 +73,8 @@ void dispatch_amp_multi(const std::string& kernel_name,
       MTLFunction_t func =
           MetalShaderLibrary::getBundledLibrary().getFunction(kernel_name);
       // The kernel reads one pointer array of tensors from its argument buffer.
-      ForeachArguments arguments(func, MPSDevice::getInstance()->device());
+      ForeachArguments arguments(computeEncoder, func,
+                                 MPSDevice::getInstance()->device());
       [func release];
       id<MTLBuffer> tensorArgumentBuffer = arguments.buffer();
 

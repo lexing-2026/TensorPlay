@@ -195,7 +195,8 @@ void dispatch_fused_adam_multi(
   id<MTLComputePipelineState> PSO =
       MetalShaderLibrary::getBundledLibrary().getPipelineStateForFunc(kernel);
   [computeEncoder setComputePipelineState:PSO];
-  ForeachArguments arguments(func, MPSDevice::getInstance()->device());
+  ForeachArguments arguments(computeEncoder, func,
+                             MPSDevice::getInstance()->device());
   [func release];
 
   int64_t tensor_loc = 0;
@@ -442,7 +443,8 @@ void dispatch_fused_sgd_multi(
   id<MTLComputePipelineState> PSO =
       MetalShaderLibrary::getBundledLibrary().getPipelineStateForFunc(kernel);
   [computeEncoder setComputePipelineState:PSO];
-  ForeachArguments arguments(func, MPSDevice::getInstance()->device());
+  ForeachArguments arguments(computeEncoder, func,
+                             MPSDevice::getInstance()->device());
   [func release];
 
   int64_t tensor_loc = 0;

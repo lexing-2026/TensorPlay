@@ -139,9 +139,14 @@ inline bool argumentEncodersAvailable(id<MTLFunction> func) {
 // an encoder.
 class ForeachArguments {
  public:
-  // The accessor hands back an owned encoder.
-  ForeachArguments(id<MTLFunction> func, id<MTLDevice> device)
-      : device_(device), encoder_([func newArgumentEncoderWithBufferIndex:0]) {
+  // The accessor hands back an owned encoder.  `computeEncoder` is the encoder
+  // the launches are encoded on; it is borrowed for as long as this object.
+  ForeachArguments(id<MTLComputeCommandEncoder> computeEncoder,
+                   id<MTLFunction> func,
+                   id<MTLDevice> device)
+      : computeEncoder_(computeEncoder),
+        device_(device),
+        encoder_([func newArgumentEncoderWithBufferIndex:0]) {
     bytes_ = [encoder_ encodedLength];
   }
   ~ForeachArguments() {
@@ -150,9 +155,8 @@ class ForeachArguments {
   ForeachArguments(const ForeachArguments&) = delete;
   ForeachArguments& operator=(const ForeachArguments&) = delete;
 
-  // A fresh buffer for one launch's bindings.  An encoder leaves the slots it
-  // is not given alone, so they are nulled first; a launch reads only slots it
-  // bound, but the whole buffer is handed to the GPU as one resource.
+  // A fresh buffer for one launch's bindings, with the slots this launch leaves
+  // unbound reading as null pointers.
   id<MTLBuffer> buffer() const {
     id<MTLBuffer> argument_buffer =
         [[device_ newBufferWithLength:bytes_ options:0] autorelease];
@@ -161,12 +165,20 @@ class ForeachArguments {
     return argument_buffer;
   }
 
-  // Binds one tensor into the buffer most recently handed out.
+  // Binds one tensor into the buffer most recently handed out.  The launch
+  // reaches the tensor through a pointer that sits inside the argument buffer,
+  // where the command encoder cannot see it, so the storage has to be claimed
+  // as a resource by hand: unclaimed, its block may be recycled while the
+  // launch still reads it, and the tensors that land in a recycled block are
+  // updated somewhere else.
   void bind(NSUInteger index, id<MTLBuffer> storage) const {
     [encoder_ setBuffer:storage offset:0 atIndex:index];
+    [computeEncoder_ useResource:storage
+                           usage:MTLResourceUsageRead | MTLResourceUsageWrite];
   }
 
  private:
+  id<MTLComputeCommandEncoder> computeEncoder_ = nil;
   id<MTLDevice> device_ = nil;
   id<MTLArgumentEncoder> encoder_ = nil;
   NSUInteger bytes_ = 0;
