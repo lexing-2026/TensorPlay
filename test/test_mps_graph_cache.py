@@ -1,7 +1,7 @@
 """Correctness of the three ways the MPS backend serves a call from what it
 already has.
 
-Binary ops and reductions build an MPSGraph once per call site, shape, dtype
+Binary ops and reductions build an MPSGraph once per operation, shape, dtype
 and scalar, then feed later calls through it; a broadcast add, sub or mul may
 instead address both operands straight out of the storage they already have, and
 a contiguous float operand of a unary math op may be read by a single shader
@@ -460,6 +460,82 @@ class TestMPSUnaryOperandReads(MPSCase):
         # Nothing to read for an empty operand.
         empty_cpu, empty_mps = _range_on_both([0, 3])
         self.assert_same_result(tp.sqrt(empty_mps), tp.sqrt(empty_cpu))
+
+
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSGraphCacheParameters(MPSCase):
+    """Operations whose graph body is built from the numbers of the call.
+
+    A clamp bound, an activation slope or a softmax axis is a constant inside
+    the graph rather than a value fed through it, so calls that differ only
+    there must not be served the entry built for the first one.
+    """
+
+    def test_alternating_clamp_bounds(self):
+        cpu, mps = _range_on_both([3, 5])
+        for rep in range(2):
+            for lo, hi in ((-2.0, None), (None, 7.0), (-1.0, 6.0), (0.0, 4.0),
+                           (-2.0, None), (3.0, 3.5)):
+                with self.subTest(rep=rep, bounds=(lo, hi)):
+                    self.assert_same_result(tp.clamp(mps, lo, hi),
+                                            tp.clamp(cpu, lo, hi))
+
+    def test_alternating_clamp_min_and_max(self):
+        cpu, mps = _range_on_both([4, 5])
+        for rep in range(2):
+            for value in (0.0, 3.0, -1.0, 6.5):
+                with self.subTest(rep=rep, value=value):
+                    self.assert_same_result(tp.clamp_min(mps, value),
+                                            tp.clamp_min(cpu, value))
+                    self.assert_same_result(tp.clamp_max(mps, value),
+                                            tp.clamp_max(cpu, value))
+
+    def test_alternating_activation_parameters(self):
+        cpu, mps = _range_on_both([2, 9])
+        shifted_cpu, shifted_mps = cpu - 4.0, mps - 4.0
+        cases = (
+            ("leaky_relu",
+             lambda x, value: tp.leaky_relu(x, negative_slope=value),
+             (0.01, 0.5, 0.0, 1.0)),
+            ("elu", lambda x, value: tp.elu(x, alpha=value), (1.0, 0.5, 2.0)),
+            ("softplus", lambda x, value: tp.softplus(x, beta=value),
+             (1.0, 2.0, 0.5)),
+            ("softplus_threshold",
+             lambda x, value: tp.softplus(x, beta=1.0, threshold=value),
+             (1.0, 4.0, 20.0)),
+            ("hardtanh",
+             lambda x, value: tp.hardtanh(x, min_val=-value, max_val=value),
+             (1.0, 2.0, 0.5)),
+            ("gelu", lambda x, value: tp.gelu(x, approximate=value),
+             ("none", "tanh", "none")),
+        )
+        for name, fn, values in cases:
+            with self.subTest(op=name):
+                for value in values:
+                    self.assert_same_result(fn(shifted_mps, value),
+                                            fn(shifted_cpu, value))
+
+    def test_alternating_softmax_axis(self):
+        # A square operand keeps the result shape the same while the axis
+        # changes, so the axis has to be part of what names the graph.
+        for shape in ([4, 4], [3, 3, 3]):
+            count = math.prod(shape)
+            cpu = tp.reshape(tp.arange(count, dtype=tp.float32,
+                                       device="cpu"), list(shape))
+            mps = tp.reshape(tp.arange(count, dtype=tp.float32,
+                                       device="mps"), list(shape))
+            cpu = (cpu - count / 2) / 8.0
+            mps = (mps - count / 2) / 8.0
+            for rep in range(2):
+                for dim in range(len(shape)):
+                    order = [dim, (dim + 1) % len(shape)]
+                    for axis in order:
+                        with self.subTest(shape=shape, rep=rep, dim=axis):
+                            self.assert_same_result(tp.softmax(mps, axis),
+                                                    tp.softmax(cpu, axis))
+                            self.assert_same_result(
+                                tp.log_softmax(mps, axis),
+                                tp.log_softmax(cpu, axis))
 
 
 if __name__ == "__main__":

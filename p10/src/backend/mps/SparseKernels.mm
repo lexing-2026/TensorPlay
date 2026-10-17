@@ -704,9 +704,9 @@ Tensor sparse_addmm_kernel(const Tensor& self, const Tensor& mat1,
         return [g additionWithPrimaryTensor:a secondaryTensor:b name:nil];
     };
     // beta * self (broadcast) + alpha * (sparse @ dense)
-    Tensor scaled_self = binaryOp(self, beta_t, mulBlock);
-    Tensor scaled_prod = binaryOp(prod, alpha_t, mulBlock);
-    return binaryOp(scaled_self, scaled_prod, addBlock);
+    Tensor scaled_self = binaryOp("mul", self, beta_t, mulBlock);
+    Tensor scaled_prod = binaryOp("mul", prod, alpha_t, mulBlock);
+    return binaryOp("add", scaled_self, scaled_prod, addBlock);
 }
 
 Tensor coalesce_sparse_mps(const Tensor& self) {
