@@ -12,6 +12,7 @@
 #include <Metal/Metal.h>
 
 #include <array>
+#include <cstdint>
 #include <cstring>
 #include <exception>
 #include <optional>
@@ -112,18 +113,16 @@ inline void mtl_dispatch1DJob(id<MTLComputeCommandEncoder> encoder,
 
 // Binds the tensor pointers a foreach kernel reads out of an argument buffer.
 // Such a buffer holds one 8-byte device address per argument id, which is what
-// the pointer arrays in a kernel's argument struct resolve to.  Current GPU
+// the pointer arrays in a kernel's argument struct resolve to.  Recent GPU
 // images vend an encoder that writes those addresses; the image shipped with
 // macOS 14 has no argument encoders at all, so the same layout is written
 // directly there.
 class ForeachArguments {
  public:
-  ForeachArguments(MTLFunction_t func, id<MTLDevice> device, NSUInteger slots)
+  ForeachArguments(id<MTLFunction> func, id<MTLDevice> device, NSUInteger slots)
       : device_(device) {
-    if (encoders_available(func)) {
-      // The accessor hands back an owned encoder.
-      encoder_ = [func newArgumentEncoderWithBufferIndex:0];
-    }
+    // The accessor hands back an owned encoder.
+    encoder_ = vends_encoder(func);
     bytes_ = encoder_ ? [encoder_ encodedLength] : slots * sizeof(uintptr_t);
   }
   ~ForeachArguments() {
@@ -151,21 +150,15 @@ class ForeachArguments {
   }
 
  private:
-  // The capability belongs to the GPU device, so one probe covers every
-  // function; asking for an encoder is harmless where it is supported.
-  static bool encoders_available(MTLFunction_t func) {
-    static const bool available = [func]() {
-      @try {
-        id<MTLArgumentEncoder> encoder =
-            [func newArgumentEncoderWithBufferIndex:0];
-        const bool vends = (encoder != nil);
-        [encoder release];
-        return vends;
-      } @catch (NSException* exception) {
-        return false;
-      }
-    }();
-    return available;
+  // Asking a device without encoders raises rather than returning nil, so the
+  // request itself is the capability probe.  The answer belongs to the GPU
+  // device, not to the function.
+  static id<MTLArgumentEncoder> vends_encoder(id<MTLFunction> func) {
+    @try {
+      return [func newArgumentEncoderWithBufferIndex:0];
+    } @catch (NSException* exception) {
+      return nil;
+    }
   }
 
   id<MTLDevice> device_ = nil;
