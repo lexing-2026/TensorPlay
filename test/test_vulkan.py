@@ -473,5 +473,68 @@ class TestVulkanLlmKernels(unittest.TestCase):
                 got.astype(np.float64), want, rtol=0, atol=tol)
 
 
+class TestVulkanIndexCopy(unittest.TestCase):
+    def test_index_copy_rows_inplace(self):
+        tensorplay.manual_seed(1234)
+        for B, C, S, D, idx, dtype in (
+            (1, 2, 64, 64, [2, 5], tensorplay.float32),
+            (1, 1, 4, 8, [0, 0], tensorplay.float32),
+            (2, 4, 16, 4, [8, 9], tensorplay.float16),
+            (1, 1, 64, 8, [63], tensorplay.float32),
+        ):
+            buf = tensorplay.randn((B, C, S, D), device="cpu").to(dtype).to("vulkan")
+            before = buf.cpu().numpy()
+            src = tensorplay.randn((B, C, len(idx), D), device="cpu").to(dtype).to("vulkan")
+            positions = tensorplay.tensor(idx, dtype=tensorplay.int64)
+            tensorplay.index_copy_(buf, 2, positions, src)
+            got = buf.cpu().numpy()
+            want = before.copy()
+            want[:, :, idx, :] = src.cpu().numpy().astype(got.dtype)
+            np.testing.assert_array_equal(got, want)
+
+    def test_index_copy_rejects_out_of_range(self):
+        buf = tensorplay.randn((1, 2, 8, 4), device="cpu").to("vulkan")
+        src = tensorplay.randn((1, 2, 1, 4), device="cpu").to("vulkan")
+        with self.assertRaises(RuntimeError):
+            tensorplay.index_copy_(
+                buf, 2, tensorplay.tensor([8], dtype=tensorplay.int64), src)
+
+    def test_index_copy_out_of_place(self):
+        buf = tensorplay.randn((1, 2, 8, 4), device="cpu").to("vulkan")
+        snapshot = buf.cpu().numpy()
+        src = tensorplay.randn((1, 2, 2, 4), device="cpu").to("vulkan")
+        out = tensorplay.index_copy(
+            buf, 2, tensorplay.tensor([1, 3], dtype=tensorplay.int64), src)
+        got = out.cpu().numpy()
+        want = snapshot.copy()
+        want[:, :, [1, 3], :] = src.cpu().numpy()
+        np.testing.assert_array_equal(got, want)
+        # The functional form leaves the destination untouched.
+        np.testing.assert_array_equal(buf.cpu().numpy(), snapshot)
+
+    def test_static_cache_update_writes_rows(self):
+        # A slice-then-copy append materializes into an orphaned copy on
+        # vulkan, so the cache routes its rows through the in-place scatter;
+        # this pins both the write-through and the untouched tail.
+        from tensorplay.nn.cache import StaticCache
+        tensorplay.manual_seed(1234)
+        B, C, D = 1, 2, 8
+        cache = StaticCache(16)
+        chunks = []
+        for _ in range(5):
+            k = tensorplay.randn((B, C, 3, D), device="cpu").to("vulkan")
+            v = tensorplay.randn((B, C, 3, D), device="cpu").to("vulkan")
+            cache.update(k, v, 0)
+            chunks.append((k, v))
+        keys = np.concatenate([k.cpu().numpy() for k, _ in chunks], axis=2)
+        values = np.concatenate([v.cpu().numpy() for _, v in chunks], axis=2)
+        self.assertEqual(cache.get_seq_length(), 15)
+        np.testing.assert_array_equal(
+            cache.key_cache[0].cpu().numpy()[:, :, :15, :], keys)
+        np.testing.assert_array_equal(
+            cache.value_cache[0].cpu().numpy()[:, :, :15, :], values)
+        self.assertFalse(cache.key_cache[0].cpu().numpy()[:, :, 15:, :].any())
+
+
 if __name__ == "__main__":
     unittest.main()
