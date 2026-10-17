@@ -384,24 +384,26 @@ Tensor multinomial_kernel(
 
   Tensor prob = self.dtype() == DType::Float32 ? self : self.to(DType::Float32);
 
-  // Draw uniform noise on the device through the same counter-based stream
-  // as uniform_, then run one inverse-CDF thread per row.
-  Tensor noise = empty_kernel(
-      {rows * num_samples}, DType::Float32, self.device(), false);
+  api::Context* const context = api::context();
+  api::vTensor v_prob = convert(prob);
+
+  // The inverse-CDF scan reads the probability row and the uniform noise
+  // either from images or, for category counts beyond the 3-D image axis
+  // limit, from linear buffers.
+  const bool buffer_prob = v_prob.storage_type() == api::StorageType::BUFFER;
+  api::vTensor v_noise =
+      buffer_prob
+          ? api::vTensor{
+                context, {rows * num_samples}, DType::Float32,
+                api::StorageType::BUFFER,
+                api::GPUMemoryLayout::TENSOR_WIDTH_PACKED}
+          : api::vTensor{context, {rows * num_samples}, DType::Float32};
+  Tensor noise = convert(v_noise);
   dispatch_random_fill(
       noise, VK_KERNEL(uniform_fill), VK_KERNEL(buffer_uniform_fill), 0.0f,
       1.0f, 0.0f, generator);
+  v_noise = convert(noise);
 
-  api::Context* const context = api::context();
-  api::vTensor v_prob = convert(prob);
-  api::vTensor v_noise = convert(noise);
-  // The inverse-CDF scan reads the whole probability row through an image
-  // binding; buffer-stored rows (beyond the 3-D image axis limit) have no
-  // image to read.
-  TP_CHECK(
-      v_prob.storage_type() != api::StorageType::BUFFER,
-      "Vulkan multinomial requires texture-stored probabilities; shapes "
-      "beyond the 3-D image axis limit are not supported yet");
   api::vTensor v_result{
       context, out_shape, DType::Int64, api::StorageType::BUFFER,
       api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
@@ -418,6 +420,20 @@ Tensor multinomial_kernel(
   api::PipelineBarrier barrier{};
   const api::utils::uvec3 grid{
       api::utils::safe_downcast_to_u32(rows), 1u, 1u};
+
+  if (buffer_prob) {
+    context->submit_compute_job(
+        VK_KERNEL(multinomial_buffer), barrier, grid, {1u, 1u, 1u},
+        VK_NULL_HANDLE,
+        v_result.buffer(
+            barrier, api::PipelineStage::COMPUTE, api::MemoryAccessType::WRITE),
+        v_prob.buffer(barrier, api::PipelineStage::COMPUTE,
+                      api::MemoryAccessType::READ),
+        v_noise.buffer(barrier, api::PipelineStage::COMPUTE,
+                       api::MemoryAccessType::READ),
+        params.buffer());
+    return convert(v_result);
+  }
 
   context->submit_compute_job(
       VK_KERNEL(multinomial), barrier, grid, {1u, 1u, 1u}, VK_NULL_HANDLE,
