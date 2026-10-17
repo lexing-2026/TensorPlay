@@ -92,6 +92,24 @@ class P10_API MPSStream {
                        SyncType syncType = SyncType::NONE);
   void addCompletedHandler(MTLCommandBufferHandler block);
 
+  /// Snapshot of the stream's two command-buffer slots as plain pointers
+  /// (no retain).  The profiler compares arm-time and close-time snapshots
+  /// to tell an op that dispatched GPU work from one that only moved
+  /// metadata: every encode lands in, or commits onto, one of the slots.
+  struct BufferSlots {
+    const void* current;  // buffer open for encoding; nil once committed
+    const void* last;     // most recently committed buffer
+  };
+  BufferSlots bufferSlots();
+
+  /// Commits any buffer still open for encoding (the same commit the next
+  /// op's flush would perform) and returns a +1 retained reference to the
+  /// most recently committed buffer, or nil when none exists.  The caller
+  /// owns the reference.  Used by the profiler to pin one dispatch's
+  /// command buffer for a stop-time GPU timestamp read without waiting on
+  /// the dispatch hot path.
+  MPSCommandBuffer_t commitPendingAndTakeLastBuffer();
+
   /// Get the MPS device index that this stream is associated with.
   int device_index() const {
     return _stream.device_index();
