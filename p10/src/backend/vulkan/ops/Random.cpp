@@ -248,6 +248,15 @@ Tensor& bernoulli_tensor_kernel(
   api::Context* const context = api::context();
   api::vTensor v = convert(self);
   api::vTensor v_prob = convert(p);
+  // The tensor-probability sampler reads both payloads through image
+  // bindings; buffer-stored shapes (beyond the 3-D image axis limit) have no
+  // images to read.
+  TP_CHECK(
+      v.storage_type() != api::StorageType::BUFFER &&
+          v_prob.storage_type() != api::StorageType::BUFFER,
+      "Vulkan bernoulli_ with a probability tensor requires texture-stored "
+      "payloads; shapes beyond the 3-D image axis limit are not supported "
+      "yet");
   const StreamKey key = next_stream_key(generator);
 
   const BernoulliTensorBlock block{
@@ -386,6 +395,13 @@ Tensor multinomial_kernel(
   api::Context* const context = api::context();
   api::vTensor v_prob = convert(prob);
   api::vTensor v_noise = convert(noise);
+  // The inverse-CDF scan reads the whole probability row through an image
+  // binding; buffer-stored rows (beyond the 3-D image axis limit) have no
+  // image to read.
+  TP_CHECK(
+      v_prob.storage_type() != api::StorageType::BUFFER,
+      "Vulkan multinomial requires texture-stored probabilities; shapes "
+      "beyond the 3-D image axis limit are not supported yet");
   api::vTensor v_result{
       context, out_shape, DType::Int64, api::StorageType::BUFFER,
       api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
@@ -453,6 +469,14 @@ Tensor sample_kernel(
   }
   const Tensor& values = std::get<0>(sorted);
   const Tensor& indices = std::get<1>(sorted);
+  // The sampler shader reads the sorted row through an image binding; a
+  // full-vocabulary sort of a buffer-stored row produces buffer outputs that
+  // cannot feed it.  Reject loudly instead of sampling garbage.
+  TP_CHECK(
+      convert(values).storage_type() != api::StorageType::BUFFER,
+      "sample: full-vocabulary sampling beyond the 3-D image axis limit is "
+      "not yet supported; pass a positive top_k to sample from the sorted "
+      "prefix");
 
   api::Context* const context = api::context();
   api::vTensor v_result{
