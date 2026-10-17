@@ -304,6 +304,54 @@ void scatter_staging_values_1d(
   }
 }
 
+/*
+ * Host-computed factory values for buffer-stored payloads.  The buffer's
+ * logical layout is plain row-major memory, so the host tensor is a dense
+ * 1d array (no texel padding) and the bytes stream through the staging
+ * copy path directly.
+ */
+template <typename T>
+void scatter_staging_buffer_1d(
+    api::vTensor& v,
+    int64_t steps,
+    const std::function<double(int64_t)>& fill) {
+  Tensor host({steps}, v.dtype(), Device(DeviceType::CPU));
+  T* data = static_cast<T*>(host.impl()->storage().data());
+  for (int64_t i = 0; i < steps; ++i) {
+    data[i] = static_cast<T>(fill(i));
+  }
+  utils::upload_host_bytes(
+      v, host.impl()->storage().data(), steps * sizeof(T));
+}
+
+void scatter_staging_values_buffer_1d(
+    api::vTensor& v,
+    int64_t steps,
+    const std::function<double(int64_t)>& fill) {
+  switch (v.dtype()) {
+    case DType::Float32:
+      scatter_staging_buffer_1d<float>(v, steps, fill);
+      return;
+    case DType::Float16:
+      scatter_staging_buffer_1d<tensorplay::Half>(v, steps, fill);
+      return;
+    case DType::Int32:
+      scatter_staging_buffer_1d<int32_t>(v, steps, fill);
+      return;
+    case DType::Int8:
+    case DType::Bool:
+      scatter_staging_buffer_1d<int8_t>(v, steps, fill);
+      return;
+    case DType::UInt8:
+      scatter_staging_buffer_1d<uint8_t>(v, steps, fill);
+      return;
+    default:
+      TP_THROW(
+          NotImplementedError,
+          "Vulkan host-filled factory: unsupported buffer dtype");
+  }
+}
+
 Device resolve_device(std::optional<Device> device) {
   return device.value_or(Device(DeviceType::Vulkan));
 }
@@ -315,11 +363,14 @@ Tensor host_filled_1d(int64_t steps, DType dtype, Device device, Filler fill) {
     return t;
   }
   api::vTensor v = convert(t);
-  TP_CHECK(
-      v.storage_type() == api::StorageType::TEXTURE_3D,
-      "Vulkan host-filled factories require texture storage");
-  scatter_staging_values_1d(
-      v, steps, [fill](int64_t i) { return static_cast<double>(fill(i)); });
+  const auto host_fill = [fill](int64_t i) {
+    return static_cast<double>(fill(i));
+  };
+  if (v.storage_type() == api::StorageType::BUFFER) {
+    scatter_staging_values_buffer_1d(v, steps, host_fill);
+  } else {
+    scatter_staging_values_1d(v, steps, host_fill);
+  }
   return t;
 }
 
