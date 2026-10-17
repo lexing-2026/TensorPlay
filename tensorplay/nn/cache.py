@@ -157,8 +157,17 @@ class StaticCache(Cache):
             raise RuntimeError(
                 f"StaticCache overflow: cursor {start} + {seq} exceeds max_seq_len {self.max_seq_len}"
             )
-        self.key_cache[layer_idx][:, :, start : start + seq].copy_(key)
-        self.value_cache[layer_idx][:, :, start : start + seq].copy_(value)
+        # On vulkan a materializing slice cannot feed copy_: the write lands
+        # in an orphaned copy and the buffer stays untouched.  Route the row
+        # append through the in-place scatter instead, with a host-side index
+        # upload (no device readback).
+        if key.device.type == "vulkan" and key.dim() == 4:
+            positions = tensorplay.arange(start, start + seq, dtype=tensorplay.int64)
+            tensorplay.index_copy_(self.key_cache[layer_idx], 2, positions, key)
+            tensorplay.index_copy_(self.value_cache[layer_idx], 2, positions, value)
+        else:
+            self.key_cache[layer_idx][:, :, start : start + seq].copy_(key)
+            self.value_cache[layer_idx][:, :, start : start + seq].copy_(value)
         self._cursor[layer_idx] = start + seq
         return (
             self.key_cache[layer_idx][:, :, : start + seq],
