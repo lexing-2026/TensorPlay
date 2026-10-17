@@ -12,6 +12,7 @@
 #include <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
 
 #include <source_location>
+#include <string>
 
 namespace tensorplay {
 namespace mps {
@@ -36,6 +37,31 @@ id<MTLBuffer> mtlBufferOf(const Tensor& t);
 // Allocates an empty MPS tensor on `device`.
 Tensor emptyMPS(const std::vector<int64_t>& sizes, DType dtype,
                const Device& device);
+
+// A built graph and the tensors a caller feeds it with. The placeholders are
+// shape- and dtype-static, so every later call with the same key reuses them
+// and only swaps the buffers behind them.
+struct CachedGraph {
+  MPSGraph* graph = nil;
+  MPSGraphTensor* input0 = nil;
+  MPSGraphTensor* input1 = nil;
+  MPSGraphTensor* input2 = nil;
+  MPSGraphTensor* result = nil;
+};
+
+// Cache of built graphs, keyed by the structure a call would build. Callers
+// look the key up, build and store on a miss, then look the key up again so a
+// racing builder's entry wins.
+CachedGraph* findCachedGraph(const std::string& key);
+void storeCachedGraph(const std::string& key, CachedGraph* entry);
+
+// Key fragments: a shape, a dtype, a scalar's bit pattern, and a whole key
+// assembled from a call site plus fragments.
+std::string shapeKey(const std::vector<int64_t>& shape);
+std::string dtypeKey(DType dtype);
+std::string scalarKey(const Scalar& value);
+std::string graphKey(const std::source_location& location,
+                     std::initializer_list<std::string> parts);
 
 // Block building the graph body of a binary operation. Receives the graph and
 // both inputs already cast to the common dtype; returns the result tensor.

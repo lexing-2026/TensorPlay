@@ -144,124 +144,141 @@ Tensor reductionOp(const Tensor& self, const std::vector<int64_t>& dims,
     return output;
   }
 
+  // The graph depends only on the input shape, the axes actually reduced, the
+  // dtypes and the kind, so the same reduction on later batches reuses it.
+  const std::string key =
+      "reduce|" + shapeKey(in_shape) + "|" + shapeKey(axes) + "|" +
+      dtypeKey(self_c.dtype()) + "|" + dtypeKey(acc_dtype) + "|" +
+      dtypeKey(out_dtype) + "|" +
+      std::to_string(static_cast<int>(kind));
+
   @autoreleasepool {
-    MPSGraph* graph = [[MPSGraph new] autorelease];
     MPSShape* inShape = getMPSShape(in_shape);
     const MPSDataType in_dt = getMPSDataType(self_c.dtype());
     const MPSDataType acc_dt = getMPSDataType(acc_dtype);
     const MPSDataType out_dt = getMPSDataType(out_dtype);
-
-    MPSGraphTensor* x = [graph placeholderWithShape:inShape
-                                          dataType:in_dt
-                                               name:@"x"];
-    MPSGraphTensor* xc = (self_c.dtype() == acc_dtype)
-        ? x
-        : [graph castTensor:x toType:acc_dt name:@"cast_in"];
-
-    MPSGraphTensor* reduced = nil;
-    NSMutableArray<NSNumber*>* axesArray =
-        [NSMutableArray arrayWithCapacity:axes.size()];
-    for (int64_t a : axes) {
-      [axesArray addObject:@(a)];
-    }
-    // Reducing every axis with an explicit axes array trips an MPSGraph bug
-    // on older SDKs; use the nil-axes form (reduce all) for full reductions,
-    // matching the scalar-output reduction pattern used elsewhere.
-    const bool reduce_all = (static_cast<int64_t>(axes.size()) == self.dim());
-    switch (kind) {
-      case ReductionKind::SUM:
-      case ReductionKind::PROD:
-      case ReductionKind::MEAN: {
-        // Full reductions use the nil-axes form (reduce all), which avoids
-        // the explicit all-axes reduction bug on older SDKs.  Partial
-        // reductions process one axis at a time, highest first.
-        if (reduce_all) {
-          if (kind == ReductionKind::SUM) {
-            reduced = [graph reductionSumWithTensor:xc axes:nil name:nil];
-          } else if (kind == ReductionKind::PROD) {
-            reduced = [graph reductionProductWithTensor:xc axes:nil name:nil];
-          } else {
-            reduced = [graph meanOfTensor:xc axes:nil name:nil];
-          }
-        } else {
-          reduced = xc;
-          for (NSNumber* axis in [axesArray reverseObjectEnumerator]) {
-            if (kind == ReductionKind::SUM) {
-              reduced = [graph reductionSumWithTensor:reduced
-                                           axis:[axis integerValue]
-                                          name:nil];
-            } else if (kind == ReductionKind::PROD) {
-              reduced = [graph reductionProductWithTensor:reduced
-                                                    axis:[axis integerValue]
-                                                   name:nil];
-            } else {
-              reduced = [graph meanOfTensor:reduced
-                                    axes:@[axis]
-                                   name:nil];
-            }
-          }
-        }
-        break;
-      }
-      case ReductionKind::MAX:
-      case ReductionKind::MIN: {
-        // Reduce one axis at a time, highest axis first: removing a higher
-        // axis does not shift the indices of the lower remaining axes.
-        // MIN is computed as -MAX(-x) so only the confirmed
-        // reductionMaximumWithTensor selector is required.
-        reduced = xc;
-        if (kind == ReductionKind::MIN) {
-          reduced = [graph negativeWithTensor:reduced name:nil];
-        }
-        for (NSNumber* axis in [axesArray reverseObjectEnumerator]) {
-          reduced = [graph reductionMaximumWithTensor:reduced
-                                                 axis:[axis integerValue]
-                                                name:nil];
-        }
-        if (kind == ReductionKind::MIN) {
-          reduced = [graph negativeWithTensor:reduced name:nil];
-        }
-        break;
-      }
-      case ReductionKind::ALL:
-      case ReductionKind::ANY: {
-        // Cast to bool first, then reduce one axis at a time (highest
-        // first) with the logical reduction selectors.
-        const MPSDataType bool_dt = MPSDataTypeBool;
-        reduced = ([xc dataType] == bool_dt)
-            ? xc
-            : [graph castTensor:xc toType:bool_dt name:@"cast_bool"];
-        for (NSNumber* axis in [axesArray reverseObjectEnumerator]) {
-          if (kind == ReductionKind::ALL) {
-            reduced = [graph reductionAndWithTensor:reduced
-                                               axis:[axis integerValue]
-                                              name:nil];
-          } else {
-            reduced = [graph reductionOrWithTensor:reduced
-                                               axis:[axis integerValue]
-                                              name:nil];
-          }
-        }
-        break;
-      }
-    }
-
     // The graph removes reduced axes. When keepdim is requested (or the
-    // result has non-scalar shape) reshape the graph output so its shape
-    // matches the output buffer description exactly. A fully-reduced scalar
-    // is left unreshaped (reshaping an unranked tensor is unsupported on
-    // older SDKs); its single-element buffer is described with shape [1].
+    // result has non-scalar shape) its output is reshaped so the shape matches
+    // the output buffer description exactly. A fully-reduced scalar is left
+    // unreshaped (reshaping an unranked tensor is unsupported on older SDKs);
+    // its single-element buffer is described with shape [1].
     const std::vector<int64_t> graph_shape =
         out_shape.empty() ? std::vector<int64_t>{1} : out_shape;
-    MPSGraphTensor* outTensor = reduced;
-    if (!out_shape.empty()) {
-      outTensor = [graph reshapeTensor:reduced
-                              withShape:getMPSShape(graph_shape)
-                                   name:nil];
+
+    CachedGraph* entry = findCachedGraph(key);
+    if (entry == nullptr) {
+      MPSGraph* graph = [[MPSGraph alloc] init];
+
+      MPSGraphTensor* x = [graph placeholderWithShape:inShape
+                                            dataType:in_dt
+                                                 name:@"x"];
+      MPSGraphTensor* xc = (self_c.dtype() == acc_dtype)
+          ? x
+          : [graph castTensor:x toType:acc_dt name:@"cast_in"];
+
+      MPSGraphTensor* reduced = nil;
+      NSMutableArray<NSNumber*>* axesArray =
+          [NSMutableArray arrayWithCapacity:axes.size()];
+      for (int64_t a : axes) {
+        [axesArray addObject:@(a)];
+      }
+      // Reducing every axis with an explicit axes array trips an MPSGraph bug
+      // on older SDKs; use the nil-axes form (reduce all) for full reductions,
+      // matching the scalar-output reduction pattern used elsewhere.
+      const bool reduce_all = (static_cast<int64_t>(axes.size()) == self.dim());
+      switch (kind) {
+        case ReductionKind::SUM:
+        case ReductionKind::PROD:
+        case ReductionKind::MEAN: {
+          // Full reductions use the nil-axes form (reduce all), which avoids
+          // the explicit all-axes reduction bug on older SDKs.  Partial
+          // reductions process one axis at a time, highest first.
+          if (reduce_all) {
+            if (kind == ReductionKind::SUM) {
+              reduced = [graph reductionSumWithTensor:xc axes:nil name:nil];
+            } else if (kind == ReductionKind::PROD) {
+              reduced = [graph reductionProductWithTensor:xc axes:nil name:nil];
+            } else {
+              reduced = [graph meanOfTensor:xc axes:nil name:nil];
+            }
+          } else {
+            reduced = xc;
+            for (NSNumber* axis in [axesArray reverseObjectEnumerator]) {
+              if (kind == ReductionKind::SUM) {
+                reduced = [graph reductionSumWithTensor:reduced
+                                             axis:[axis integerValue]
+                                            name:nil];
+              } else if (kind == ReductionKind::PROD) {
+                reduced = [graph reductionProductWithTensor:reduced
+                                                      axis:[axis integerValue]
+                                                     name:nil];
+              } else {
+                reduced = [graph meanOfTensor:reduced
+                                      axes:@[axis]
+                                     name:nil];
+              }
+            }
+          }
+          break;
+        }
+        case ReductionKind::MAX:
+        case ReductionKind::MIN: {
+          // Reduce one axis at a time, highest axis first: removing a higher
+          // axis does not shift the indices of the lower remaining axes.
+          // MIN is computed as -MAX(-x) so only the confirmed
+          // reductionMaximumWithTensor selector is required.
+          reduced = xc;
+          if (kind == ReductionKind::MIN) {
+            reduced = [graph negativeWithTensor:reduced name:nil];
+          }
+          for (NSNumber* axis in [axesArray reverseObjectEnumerator]) {
+            reduced = [graph reductionMaximumWithTensor:reduced
+                                                   axis:[axis integerValue]
+                                                  name:nil];
+          }
+          if (kind == ReductionKind::MIN) {
+            reduced = [graph negativeWithTensor:reduced name:nil];
+          }
+          break;
+        }
+        case ReductionKind::ALL:
+        case ReductionKind::ANY: {
+          // Cast to bool first, then reduce one axis at a time (highest
+          // first) with the logical reduction selectors.
+          const MPSDataType bool_dt = MPSDataTypeBool;
+          reduced = ([xc dataType] == bool_dt)
+              ? xc
+              : [graph castTensor:xc toType:bool_dt name:@"cast_bool"];
+          for (NSNumber* axis in [axesArray reverseObjectEnumerator]) {
+            if (kind == ReductionKind::ALL) {
+              reduced = [graph reductionAndWithTensor:reduced
+                                                 axis:[axis integerValue]
+                                                name:nil];
+            } else {
+              reduced = [graph reductionOrWithTensor:reduced
+                                                 axis:[axis integerValue]
+                                                name:nil];
+            }
+          }
+          break;
+        }
+      }
+
+      MPSGraphTensor* outTensor = reduced;
+      if (!out_shape.empty()) {
+        outTensor = [graph reshapeTensor:reduced
+                                withShape:getMPSShape(graph_shape)
+                                     name:nil];
+      }
+      outTensor = ([outTensor dataType] == out_dt)
+          ? outTensor
+          : [graph castTensor:outTensor toType:out_dt name:@"cast_out"];
+
+      entry = new CachedGraph{graph, [x retain], nil, nil,
+                              [outTensor retain]};
+      storeCachedGraph(key, entry);
+      entry = findCachedGraph(key);
     }
-    outTensor = ([outTensor dataType] == out_dt)
-        ? outTensor
-        : [graph castTensor:outTensor toType:out_dt name:@"cast_out"];
 
     id<MTLBuffer> inBuf = mtlBufferOf(self_c);
     id<MTLBuffer> outBuf = mtlBufferOf(output);
@@ -273,9 +290,9 @@ Tensor reductionOp(const Tensor& self, const std::vector<int64_t>& dims,
         [[[MPSGraphTensorData alloc] initWithMTLBuffer:outBuf
                                                 shape:getMPSShape(graph_shape)
                                              dataType:out_dt] autorelease];
-    NSDictionary* feeds = @{x : inData};
-    NSDictionary* results = @{outTensor : outData};
-    getCurrentMPSStream()->executeMPSGraph(graph, feeds, results,
+    NSDictionary* feeds = @{entry->input0 : inData};
+    NSDictionary* results = @{entry->result : outData};
+    getCurrentMPSStream()->executeMPSGraph(entry->graph, feeds, results,
                                           SyncType::COMMIT_AND_WAIT);
   }
   return output;

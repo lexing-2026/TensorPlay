@@ -109,16 +109,6 @@ void runGraph(MPSGraph* graph, MPSShape* shape, MPSDataType inDataType,
 
 namespace {
 
-// One built graph and the tensors a caller feeds it with. The placeholders are
-// shape- and dtype-static, so every later call with the same key reuses them
-// and only swaps the buffers behind them.
-struct CachedGraph {
-  MPSGraph* graph = nil;
-  MPSGraphTensor* first = nil;
-  MPSGraphTensor* second = nil;
-  MPSGraphTensor* result = nil;
-};
-
 // Graphs are kept for the process lifetime: a workload with fixed shapes needs
 // a handful, and the limit only stops an unbounded set of shapes from growing
 // the cache. Hitting it drops everything, which costs one recompilation per
@@ -135,18 +125,21 @@ std::unordered_map<std::string, CachedGraph*>& graphCache() {
   return cache;
 }
 
+void releaseCachedGraph(CachedGraph* entry) {
+  [entry->graph release];
+  [entry->input0 release];
+  [entry->input1 release];
+  [entry->input2 release];
+  [entry->result release];
+  delete entry;
+}
+
+} // namespace
+
 CachedGraph* findCachedGraph(const std::string& key) {
   std::lock_guard<std::mutex> guard(graphCacheMutex());
   auto it = graphCache().find(key);
   return it == graphCache().end() ? nullptr : it->second;
-}
-
-void releaseCachedGraph(CachedGraph* entry) {
-  [entry->graph release];
-  [entry->first release];
-  [entry->second release];
-  [entry->result release];
-  delete entry;
 }
 
 void storeCachedGraph(const std::string& key, CachedGraph* entry) {
@@ -201,8 +194,6 @@ std::string graphKey(const std::source_location& location,
   }
   return key;
 }
-
-} // namespace
 
 Tensor binaryOp(const Tensor& self, const Tensor& other, MPSBinaryOpBlock block,
                 const std::optional<Scalar>& alpha,
@@ -288,7 +279,8 @@ Tensor binaryOp(const Tensor& self, const Tensor& other, MPSBinaryOpBlock block,
       if ([result dataType] != out_dt) {
         result = [graph castTensor:result toType:out_dt name:@"cast_out"];
       }
-      entry = new CachedGraph{graph, [x retain], [y retain], [result retain]};
+      entry = new CachedGraph{graph, [x retain], [y retain], nil,
+                              [result retain]};
       storeCachedGraph(key, entry);
       entry = findCachedGraph(key);
     }
@@ -310,7 +302,7 @@ Tensor binaryOp(const Tensor& self, const Tensor& other, MPSBinaryOpBlock block,
                                                 shape:shape
                                              dataType:out_dt] autorelease];
 
-    NSDictionary* feeds = @{entry->first : xData, entry->second : yData};
+    NSDictionary* feeds = @{entry->input0 : xData, entry->input1 : yData};
     NSDictionary* results = @{entry->result : outData};
     getCurrentMPSStream()->executeMPSGraph(entry->graph, feeds, results,
                                           SyncType::COMMIT_AND_WAIT);
@@ -352,15 +344,16 @@ Tensor unaryOp(const Tensor& self, MPSUnaryOpBlock block,
       if ([result dataType] != out_dt) {
         result = [graph castTensor:result toType:out_dt name:@"cast_out"];
       }
-      entry = new CachedGraph{graph, [x retain], nil, [result retain]};
+      entry = new CachedGraph{graph, [x retain], nil, nil,
+                              [result retain]};
       storeCachedGraph(key, entry);
       entry = findCachedGraph(key);
     }
 
     id<MTLBuffer> inBuf = mtlBufferOf(self_c);
     id<MTLBuffer> outBuf = mtlBufferOf(output);
-    runGraph(entry->graph, shape, in_dt, inBuf, entry->first, out_dt, outBuf,
-             entry->result);
+    runGraph(entry->graph, shape, in_dt, inBuf, entry->input0, out_dt,
+             outBuf, entry->result);
   }
   return output;
 }
