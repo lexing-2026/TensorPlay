@@ -122,6 +122,31 @@ class TestMPSFusedOptimizer(unittest.TestCase):
         p_cpu = self._step("cpu", adamw=False)
         self.assertTrue(close(p_mps, p_cpu, 1e-4))
 
+    def _foreach_step(self, device, params, grads):
+        params = [p.to(device).clone() for p in params]
+        grads = [g.to(device).clone() for g in grads]
+        sizes = [p.numel() for p in params]
+        exp_avgs = [tp.zeros(s, device=device) for s in sizes]
+        exp_avg_sqs = [tp.zeros(s, device=device) for s in sizes]
+        steps = [tp.tensor(2.0, dtype=tp.float32, device=device)
+                 for _ in sizes]
+        tp._fused_adamw_(params, grads, exp_avgs, exp_avg_sqs, [], steps,
+                         lr=0.01, beta1=0.9, beta2=0.999, weight_decay=0.01,
+                         eps=1e-8, amsgrad=False, maximize=False)
+        return [p.cpu() for p in params]
+
+    def test_fused_adamw_two_parameters(self):
+        # Two parameters share one launch, so every pointer array of the
+        # argument buffer has to carry both of them.  The longer one spans
+        # three chunks.
+        sizes = [6, 131080]
+        params = [tp.randn(s) for s in sizes]
+        grads = [tp.randn(s) for s in sizes]
+        mps_out = self._foreach_step("mps", params, grads)
+        cpu_out = self._foreach_step("cpu", params, grads)
+        for a, b in zip(mps_out, cpu_out):
+            self.assertTrue(close(a, b, 1e-4))
+
 
 @unittest.skipUnless(mps_available(), "MPS not available")
 class TestMPSSDPA(unittest.TestCase):
@@ -291,6 +316,33 @@ class TestMPSFusedSGD(unittest.TestCase):
 
     def test_sgd_nesterov(self):
         self.assertTrue(self._mps_vs_cpu(0.9, True))
+
+    def _foreach_step(self, device, sizes, momentum):
+        params = [tp.randn(s).to(device).clone() for s in sizes]
+        grads = [tp.randn(s).to(device).clone() for s in sizes]
+        bufs = [tp.zeros(s, device=device) for s in sizes] if momentum else []
+        tp._fused_sgd_(params, grads, bufs, weight_decay=0.01,
+                       momentum=momentum, lr=0.01, dampening=0.1,
+                       nesterov=False, maximize=False, is_first_step=False)
+        return [p.cpu() for p in params]
+
+    def _foreach_mps_vs_cpu(self, sizes, momentum):
+        mps_out = self._foreach_step("mps", sizes, momentum)
+        cpu_out = self._foreach_step("cpu", sizes, momentum)
+        for a, b in zip(mps_out, cpu_out):
+            if not close(a, b, 1e-4):
+                return False
+        return True
+
+    def test_sgd_spans_more_threadgroups_than_one_launch(self):
+        # One parameter needs 33 threadgroups, so a launch is closed in the
+        # middle of it and the parameter carries over to the next buffer.
+        self.assertTrue(self._foreach_mps_vs_cpu([65536 * 32 + 8, 6], 0.9))
+
+    def test_sgd_fills_the_parameter_list(self):
+        # 33 parameters: a launch is closed as soon as the list is full, so the
+        # last parameter has to be bound in a fresh one.
+        self.assertTrue(self._foreach_mps_vs_cpu([6] * 33, 0.9))
 
 
 @unittest.skipUnless(mps_available(), "MPS not available")
