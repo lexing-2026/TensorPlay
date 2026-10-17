@@ -614,8 +614,8 @@ Tensor softplus_kernel_impl(const Tensor& self, const Scalar& beta,
 
 #define DEFINE_MPS_CMP_TENSOR_KERNEL(NAME, BLOCK)                    \
   Tensor NAME##_tensor_kernel(const Tensor& self, const Tensor& other) { \
-    return binaryOp(#NAME, self, other, BLOCK, std::nullopt,       \
-                    DType::Bool);                                    \
+    return binaryOp(#NAME, self, other, BLOCK, std::nullopt,        \
+                    std::nullopt, DType::Bool);                      \
   }
 
 DEFINE_MPS_CMP_TENSOR_KERNEL(eq, eqBlock)
