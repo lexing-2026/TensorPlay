@@ -367,7 +367,12 @@ Tensor isfinite_kernel(const Tensor& self) {
 
 Tensor sigmoid_kernel(const Tensor& self) { return unaryOp(self, sigmoidBlock); }
 
-Tensor relu_kernel(const Tensor& self) { return unaryOp(self, reluBlock); }
+Tensor relu_kernel(const Tensor& self) {
+  if (auto result = unaryShader("relu", self)) {
+    return *result;
+  }
+  return unaryOp(self, reluBlock);
+}
 
 Tensor& relu_inplace_kernel(Tensor& self) {
   Tensor result = relu_kernel(self);

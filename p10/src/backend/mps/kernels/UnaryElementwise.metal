@@ -32,6 +32,13 @@ struct abs_op {
   static inline T apply(T x) { return ::abs(x); }
 };
 
+struct relu_op {
+  // The positive part, as a comparison: an operand not greater than zero, a NaN
+  // included, reads back as zero.
+  template <typename T>
+  static inline T apply(T x) { return x > T(0) ? x : T(0); }
+};
+
 template <typename T, typename Op>
 kernel void unary_elementwise(device T* out [[buffer(0)]],
                               device const T* src [[buffer(1)]],
@@ -44,7 +51,7 @@ kernel void unary_elementwise(device T* out [[buffer(0)]],
   kernel void unary_elementwise<DTYPE, OP##_op>(  \
       device DTYPE* out [[buffer(0)]],            \
       device const DTYPE* src [[buffer(1)]],      \
-      uint tid [[thread_position_in_grid]]);      
+      uint tid [[thread_position_in_grid]]);
 
 // Half, bfloat16 and the integer storage types are absent: an operation with one
 // of them runs its math in a wider type, which the graph path builds as a cast
@@ -54,3 +61,4 @@ REGISTER_UNARY_ELEMENTWISE(exp, float)
 REGISTER_UNARY_ELEMENTWISE(sqrt, float)
 REGISTER_UNARY_ELEMENTWISE(rsqrt, float)
 REGISTER_UNARY_ELEMENTWISE(abs, float)
+REGISTER_UNARY_ELEMENTWISE(relu, float)
