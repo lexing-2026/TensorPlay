@@ -698,6 +698,10 @@ cumsum:
   parameter_names_with_default_values: {}
   shader_variants:
   - NAME: cumsum
+cumsum_buffer:
+  parameter_names_with_default_values: {}
+  shader_variants:
+  - NAME: cumsum_buffer
 masked_fill:
   parameter_names_with_default_values:
     VALUE_FROM_TENSOR: false

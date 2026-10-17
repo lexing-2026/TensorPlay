@@ -50,6 +50,47 @@ Tensor cumsum_kernel(
   api::Context* const context = api::context();
 
   api::vTensor v_input = convert(self);
+
+  // Buffer-stored payloads (any axis beyond the 3-D image limit) scan
+  // through a linear row-walking variant: one invocation accumulates the
+  // running total along the axis and writes every prefix.
+  if (v_input.storage_type() == api::StorageType::BUFFER) {
+    const int64_t wrapped = dim < 0 ? dim + self.dim() : dim;
+    const int64_t axis_size = self.size(wrapped);
+    int64_t inner = 1;
+    for (int64_t d = wrapped + 1; d < self.dim(); ++d) {
+      inner *= self.size(d);
+    }
+    const int64_t rows = self.numel() / axis_size;
+    api::vTensor v_output{
+        context, v_input.sizes(), DType::Float32,
+        api::StorageType::BUFFER, api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+    const struct CumsumBufferBlock final {
+      int32_t axis_size;
+      int32_t inner;
+      int32_t rows;
+    } block{
+        static_cast<int32_t>(axis_size), static_cast<int32_t>(inner),
+        static_cast<int32_t>(rows),
+    };
+    api::UniformParamsBuffer params(context, block);
+    api::PipelineBarrier pipeline_barrier{};
+    context->submit_compute_job(
+        VK_KERNEL(cumsum_buffer), pipeline_barrier,
+        {static_cast<uint32_t>(rows), 1u, 1u}, {256u, 1u, 1u},
+        VK_NULL_HANDLE,
+        v_output.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::WRITE),
+        v_input.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::READ),
+        params.buffer());
+    return convert(v_output);
+  }
+
   if (v_input.storage_type() != api::StorageType::TEXTURE_3D) {
     TP_THROW(NotImplementedError, "Vulkan cumsum requires texture storage");
   }
