@@ -199,6 +199,18 @@ class TestMPSSDPA(unittest.TestCase):
                                                   attn_mask=mask.cpu())
         self.assertTrue(close(out.cpu(), out_cpu, 1e-2))
 
+    def test_sdpa_head_broadcast_mask(self):
+        # A mask that leaves the head axis at one still reaches the graph path,
+        # where it is spread over the heads before the scores are shifted.
+        q = tp.randn(2, 2, 4, 8, device="mps")
+        k = tp.randn(2, 2, 6, 8, device="mps")
+        v = tp.randn(2, 2, 6, 8, device="mps")
+        mask = tp.randn(2, 1, 4, 6, device="mps")
+        out = tp.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        expected = tp.scaled_dot_product_attention(
+            q.cpu(), k.cpu(), v.cpu(), attn_mask=mask.cpu())
+        self.assertTrue(close(out.cpu(), expected, 1e-2))
+
     def test_sdpa_gqa(self):
         q = tp.randn(1, 4, 4, 64, device="mps")
         k = tp.randn(1, 2, 6, 64, device="mps")
