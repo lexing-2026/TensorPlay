@@ -336,6 +336,148 @@ bool transpose_view_of_dense(const Tensor& t, Tensor* dense_out) {
 // texel z slot per (batch of four output lanes); the 2d kernels keep a
 // single slot.
 //
+
+/*
+ * Decode-shape products run as a two-pass split reduction instead of the
+ * tiled product.  The tiled kernel keeps a full 32x32 block per workgroup:
+ * with a few output rows most staging and most threads go unused while the
+ * reduction loop still walks every K texel serially per thread, which caps
+ * the memory stream far below device bandwidth.  Splitting K across
+ * invocations restores occupancy for the latency-bound fetch chain, and the
+ * fold pass replaces the epilogue.
+ *
+ * The split count bounds the per-invocation serial span and targets a fixed
+ * thread budget across the grid, whichever needs more splits; the fold read
+ * cost stays trivial since partials carry one float per texel lane.
+ */
+constexpr int64_t kGemvMaxRows = 4;
+constexpr int64_t kGemvSpanTexels = 32;
+constexpr int64_t kGemvSplitMax = 64;
+constexpr int64_t kGemvMinReduction = 512;
+constexpr int64_t kGemvThreadBudget = 8192;
+
+Tensor gemv_decode(
+    const api::vTensor& v_lhs,
+    const api::vTensor& v_rhs,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    const std::optional<Tensor>& bias,
+    Scalar beta,
+    Scalar alpha,
+    DType dtype) {
+  api::Context* const context = api::context();
+
+  const uint32_t k_texels =
+      api::utils::div_up(api::utils::safe_downcast_to_u32(K), 4u);
+  const uint32_t col_jobs = api::utils::div_up(
+      api::utils::safe_downcast_to_u32(N), 4u);
+  uint32_t splits = api::utils::div_up(k_texels, static_cast<uint32_t>(kGemvSpanTexels));
+  const uint32_t col_row_jobs = col_jobs * api::utils::safe_downcast_to_u32(M);
+  if (col_row_jobs > 0u) {
+    splits = std::max(splits, api::utils::div_up(
+        static_cast<uint32_t>(kGemvThreadBudget), col_row_jobs));
+  }
+  splits = std::max(splits, 1u);
+  splits = std::min(splits, static_cast<uint32_t>(kGemvSplitMax));
+  splits = std::min(splits, k_texels);
+  const uint32_t chunk = api::utils::div_up(k_texels, splits);
+
+  api::vTensor v_output{context, {M, N}, dtype};
+
+  api::vTensor v_partials{
+      context,
+      {splits * static_cast<int64_t>(M), N},
+      DType::Float32,
+      api::StorageType::TEXTURE_3D,
+      api::GPUMemoryLayout::TENSOR_WIDTH_PACKED,
+  };
+
+  const struct GemvSplitBlock final {
+    ivec4 out_sizes; // (W=N, H=M, C=1, N=1) logical sizes
+    int k_texels;
+    int chunk;
+    int splits;
+    int fill;
+  } split_block{
+      api::utils::make_whcn_ivec4({M, N}),
+      static_cast<int32_t>(k_texels),
+      static_cast<int32_t>(chunk),
+      static_cast<int32_t>(splits),
+      0,
+  };
+
+  api::UniformParamsBuffer split_params(context, split_block);
+  api::PipelineBarrier split_barrier{};
+
+  const api::utils::uvec3 split_grid{
+      col_jobs,
+      splits,
+      api::utils::safe_downcast_to_u32(M),
+  };
+
+  context->submit_compute_job(
+      VK_KERNEL(gemv_split),
+      split_barrier,
+      split_grid,
+      adaptive_work_group_size(split_grid),
+      VK_NULL_HANDLE,
+      v_partials.image(
+          split_barrier, api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::WRITE),
+      v_lhs.image(split_barrier, api::PipelineStage::COMPUTE),
+      v_rhs.image(split_barrier, api::PipelineStage::COMPUTE),
+      split_params.buffer());
+
+  // The addend broadcasts over singleton rows/columns; a bias-free product
+  // carries no addend term, expressed here as a zero beta alongside a
+  // stand-in binding the epilogue never fetches.
+  api::vTensor v_bias = bias.has_value() ? convert(*bias) : v_partials;
+  const float alpha_f = alpha.to<float>();
+  const float beta_f = bias.has_value() ? beta.to<float>() : 0.0f;
+  const std::vector<int64_t> bias_sizes = bias.has_value()
+      ? shape_of(*bias)
+      : std::vector<int64_t>({1, 1});
+
+  const struct GemvCombineBlock final {
+    ivec4 out_sizes;  // (W=N, H=M, C=1, N=1) logical sizes
+    ivec4 bias_sizes; // (W, H, C, N) logical sizes of the addend
+    int splits;
+    float alpha;
+    float beta;
+  } combine_block{
+      api::utils::make_whcn_ivec4(v_output.sizes()),
+      api::utils::make_whcn_ivec4(bias_sizes),
+      static_cast<int32_t>(splits),
+      alpha_f,
+      beta_f,
+  };
+
+  api::UniformParamsBuffer combine_params(context, combine_block);
+  api::PipelineBarrier combine_barrier{};
+
+  const api::utils::uvec3 combine_grid{
+      col_jobs,
+      api::utils::safe_downcast_to_u32(M),
+      1u,
+  };
+
+  context->submit_compute_job(
+      kernel_for("gemv_combine", dtype),
+      combine_barrier,
+      combine_grid,
+      adaptive_work_group_size(combine_grid),
+      VK_NULL_HANDLE,
+      v_output.image(
+          combine_barrier, api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::WRITE),
+      v_partials.image(combine_barrier, api::PipelineStage::COMPUTE),
+      v_bias.image(combine_barrier, api::PipelineStage::COMPUTE),
+      combine_params.buffer());
+
+  return convert(v_output);
+}
+
 Tensor product_dispatch(
     const api::vTensor& v_lhs,
     const api::vTensor& v_rhs,
@@ -347,6 +489,12 @@ Tensor product_dispatch(
     Scalar alpha,
     DType dtype) {
   api::Context* const context = api::context();
+
+  // Decode-shape products take the split-reduction path; see gemv_decode.
+  if (M <= kGemvMaxRows && K >= kGemvMinReduction) {
+    return gemv_decode(
+        v_lhs, v_rhs, M, N, K, bias, beta, alpha, dtype);
+  }
 
   api::vTensor v_output{context, {M, N}, dtype};
 

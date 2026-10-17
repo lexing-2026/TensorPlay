@@ -496,6 +496,16 @@ addmm:
       SUFFIX: _f16
   shader_variants:
   - NAME: addmm
+gemv_combine:
+  parameter_names_with_default_values: {}
+  generate_variant_forall:
+    FORMAT:
+    - VALUE: rgba32f
+      SUFFIX: ''
+    - VALUE: rgba16f
+      SUFFIX: _f16
+  shader_variants:
+  - NAME: gemv_combine
 bmm:
   parameter_names_with_default_values: {}
   generate_variant_forall:
