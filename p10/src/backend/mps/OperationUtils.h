@@ -116,5 +116,14 @@ std::optional<Tensor> broadcastBinaryShader(
     const std::string& op, const Tensor& self, const Tensor& other,
     const std::optional<Scalar>& alpha = std::nullopt);
 
+// Runs `op` -- "exp", "sqrt", "rsqrt" or "abs" -- over a contiguous float input
+// with a single shader dispatch, which is what the operation costs in storage
+// traffic and nothing more. Returns std::nullopt when a call cannot be expressed
+// that way: a dtype the shader is not instantiated for, a view that is not
+// contiguous or does not start at the beginning of its storage, an element count
+// beyond the 32-bit addressing the shader uses. The caller builds a graph in that
+// case.
+std::optional<Tensor> unaryShader(const std::string& op, const Tensor& self);
+
 } // namespace mps
 } // namespace tensorplay

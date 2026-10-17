@@ -322,29 +322,13 @@ namespace {
 // offsets, so a call that needs more than this stays with the graph.
 constexpr size_t kShaderMaxNdims = 16;
 
-// The pipeline for `op` over `dtype`, or nil when the shader is not built for
-// that combination. Half, bfloat and the narrow integers are absent from
-// BroadcastElementwise.metal because their operation math type is not the
-// storage type; a call with one of them belongs with the graph, which builds
-// the cast and the operation together. The list below and the instantiations at
-// the bottom of that file are checked in the same order: dtype first, so a
-// missing name is only possible if the two get out of step. Whether a name
-// resolves is answered once and kept, because finding a function in the
-// metallib costs an object creation on every call.
-MTLComputePipelineState_t broadcastShaderPipeline(const std::string& op,
-                                                  DType dtype) {
-  switch (dtype) {
-    case DType::Float32:
-    case DType::Int64:
-    case DType::Int32:
-      break;
-    default:
-      return nil;
-  }
+// The pipeline for a kernel of the bundled metallib, or nil when no function
+// carries that name. Whether a name resolves is answered once and kept: finding
+// a function in the metallib costs an object creation on every call, and the
+// callers ask on every operation.
+MTLComputePipelineState_t shaderPipelineNamed(const std::string& name) {
   static std::mutex mutex;
   static std::unordered_map<std::string, MTLComputePipelineState_t> resolved;
-  const std::string name =
-      "broadcast_" + op + "_" + scalarToMetalTypeString(dtype);
   std::lock_guard<std::mutex> guard(mutex);
   auto it = resolved.find(name);
   if (it != resolved.end()) {
@@ -355,6 +339,27 @@ MTLComputePipelineState_t broadcastShaderPipeline(const std::string& op,
       lib.hasFunction(name) ? lib.getPipelineStateForFunc(name) : nil;
   resolved.emplace(name, pso);
   return pso;
+}
+
+// The pipeline for `op` over `dtype`, or nil when the shader is not built for
+// that combination. Half, bfloat and the narrow integers are absent from
+// BroadcastElementwise.metal because their operation math type is not the
+// storage type; a call with one of them belongs with the graph, which builds
+// the cast and the operation together. The list below and the instantiations at
+// the bottom of that file are checked in the same order: dtype first, so a
+// missing name is only possible if the two get out of step.
+MTLComputePipelineState_t broadcastShaderPipeline(const std::string& op,
+                                                  DType dtype) {
+  switch (dtype) {
+    case DType::Float32:
+    case DType::Int64:
+    case DType::Int32:
+      break;
+    default:
+      return nil;
+  }
+  return shaderPipelineNamed("broadcast_" + op + "_" +
+                             scalarToMetalTypeString(dtype));
 }
 
 // The stride array BroadcastElementwise.metal indexes `t` with, ordered
@@ -401,6 +406,19 @@ std::optional<std::array<int32_t, kShaderMaxNdims>> broadcastShaderStrides(
     offsets[out_shape.size() - 1 - o] = static_cast<int32_t>(stride);
   }
   return offsets;
+}
+
+// The pipeline for `op` over `dtype` in UnaryElementwise.metal, or nil when the
+// shader is not built for that combination. Float is the only storage type that
+// file instantiates for these operations, so a half, bfloat or integral input
+// belongs with the graph, which builds the cast around the operation.
+MTLComputePipelineState_t unaryShaderPipeline(const std::string& op,
+                                              DType dtype) {
+  if (dtype != DType::Float32) {
+    return nil;
+  }
+  return shaderPipelineNamed("unary_" + op + "_" +
+                             scalarToMetalTypeString(dtype));
 }
 
 } // namespace
@@ -492,6 +510,55 @@ std::optional<Tensor> broadcastBinaryShader(
                 atIndex:5];
       [encoder setBytes:rhs_strides.data() length:sizeof(rhs_strides)
                 atIndex:6];
+      const uint32_t per_group =
+          std::min(total,
+                   static_cast<uint32_t>([pso maxTotalThreadsPerThreadgroup]));
+      [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(per_group, 1, 1)];
+      stream->synchronize(SyncType::COMMIT_AND_WAIT);
+    }
+  });
+  return output;
+}
+
+std::optional<Tensor> unaryShader(const std::string& op, const Tensor& self) {
+  if (!self.device().is_mps()) {
+    return std::nullopt;
+  }
+  // The thread index is the element index, so the input has to run through its
+  // storage in the order the output is written in and from the start of it.
+  if (!self.is_contiguous() || self.storage_offset() != 0) {
+    return std::nullopt;
+  }
+  const int64_t numel = self.numel();
+  if (numel <= 0 || numel > std::numeric_limits<uint32_t>::max()) {
+    return std::nullopt;
+  }
+  MTLComputePipelineState_t pso = unaryShaderPipeline(op, self.dtype());
+  if (!pso) {
+    return std::nullopt;
+  }
+  void* in_buf = getMTLBufferFromPointer(self.data_ptr());
+  if (!in_buf) {
+    return std::nullopt;
+  }
+  const std::vector<int64_t> shape =
+      static_cast<std::vector<int64_t>>(self.shape());
+  Tensor output = emptyMPS(shape, self.dtype(), self.device());
+  void* out_buf = getMTLBufferFromPointer(output.data_ptr());
+  if (!out_buf) {
+    return std::nullopt;
+  }
+
+  MPSStream* stream = getCurrentMPSStream();
+  dispatch_sync_with_rethrow(stream->queue(), ^() {
+    @autoreleasepool {
+      stream->endKernelCoalescing();
+      auto encoder = stream->commandEncoder();
+      [encoder setComputePipelineState:pso];
+      [encoder setBuffer:(__bridge id<MTLBuffer>)out_buf offset:0 atIndex:0];
+      [encoder setBuffer:(__bridge id<MTLBuffer>)in_buf offset:0 atIndex:1];
+      const uint32_t total = static_cast<uint32_t>(numel);
       const uint32_t per_group =
           std::min(total,
                    static_cast<uint32_t>([pso maxTotalThreadsPerThreadgroup]));

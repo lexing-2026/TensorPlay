@@ -283,11 +283,21 @@ MPSBinaryOpBlock geBlock = ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* a,
 // Unary pointwise ops
 // ---------------------------------------------------------------------------
 
-Tensor abs_kernel(const Tensor& self) { return unaryOp(self, absBlock); }
+Tensor abs_kernel(const Tensor& self) {
+  if (auto result = unaryShader("abs", self)) {
+    return *result;
+  }
+  return unaryOp(self, absBlock);
+}
 Tensor neg_kernel(const Tensor& self) { return unaryOp(self, negBlock); }
 Tensor square_kernel(const Tensor& self) { return unaryOp(self, squareBlock); }
 Tensor sign_kernel(const Tensor& self) { return unaryOp(self, signBlock); }
-Tensor exp_kernel(const Tensor& self) { return unaryOp(self, expBlock); }
+Tensor exp_kernel(const Tensor& self) {
+  if (auto result = unaryShader("exp", self)) {
+    return *result;
+  }
+  return unaryOp(self, expBlock);
+}
 Tensor expm1_kernel(const Tensor& self) { return unaryOp(self, expm1Block); }
 Tensor log_kernel(const Tensor& self) { return unaryOp(self, logBlock); }
 Tensor log10_kernel(const Tensor& self) {
@@ -301,8 +311,18 @@ Tensor log2_kernel(const Tensor& self) {
   });
 }
 Tensor log1p_kernel(const Tensor& self) { return unaryOp(self, log1pBlock); }
-Tensor sqrt_kernel(const Tensor& self) { return unaryOp(self, sqrtBlock); }
-Tensor rsqrt_kernel(const Tensor& self) { return unaryOp(self, rsqrtBlock); }
+Tensor sqrt_kernel(const Tensor& self) {
+  if (auto result = unaryShader("sqrt", self)) {
+    return *result;
+  }
+  return unaryOp(self, sqrtBlock);
+}
+Tensor rsqrt_kernel(const Tensor& self) {
+  if (auto result = unaryShader("rsqrt", self)) {
+    return *result;
+  }
+  return unaryOp(self, rsqrtBlock);
+}
 Tensor reciprocal_kernel(const Tensor& self) {
   return unaryOp(self, reciprocalBlock);
 }
