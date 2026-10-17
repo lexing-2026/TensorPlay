@@ -40,13 +40,15 @@ Tensor emptyMPS(const std::vector<int64_t>& sizes, DType dtype,
 
 // A built graph and the tensors a caller feeds it with. The placeholders are
 // shape- and dtype-static, so every later call with the same key reuses them
-// and only swaps the buffers behind them.
+// and only swaps the buffers behind them. `result` is the only output unless
+// the operation writes two tensors from one dispatch, which `result2` carries.
 struct CachedGraph {
   MPSGraph* graph = nil;
   MPSGraphTensor* input0 = nil;
   MPSGraphTensor* input1 = nil;
   MPSGraphTensor* input2 = nil;
   MPSGraphTensor* result = nil;
+  MPSGraphTensor* result2 = nil;
 };
 
 // Cache of built graphs, keyed by the structure a call would build. Callers
