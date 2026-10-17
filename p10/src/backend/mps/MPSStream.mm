@@ -125,13 +125,6 @@ double MPSStream::commitAndWaitGetGpuTimeMs() {
   return ms;
 }
 
-// Returns the GPU duration of the most recently committed command buffer, in
-// milliseconds.  Only valid immediately after a COMMIT_AND_WAIT synchronize;
-// used by the profiler diagnostic path.
-double MPSStream::lastCommittedGpuTimeMs() {
-  return 0.0;
-}
-
 void MPSStream::commit() {
   if (_enableCommitAndContinue) {
     [commandBuffer() commitAndContinue];
