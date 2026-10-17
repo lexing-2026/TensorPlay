@@ -563,7 +563,6 @@ softmax_channel:
 softmax_batch_height_width:
   parameter_names_with_default_values:
     LOG_SOFTMAX: false
-    SAFE_SOFTMAX: false
   generate_variant_forall:
     FORMAT:
     - VALUE: rgba32f
@@ -575,9 +574,6 @@ softmax_batch_height_width:
     LOG_SOFTMAX: false
   - NAME: log_softmax
     LOG_SOFTMAX: true
-  - NAME: sdpa_softmax
-    LOG_SOFTMAX: false
-    SAFE_SOFTMAX: true
 sum_axis:
   parameter_names_with_default_values: {}
   generate_variant_forall:
