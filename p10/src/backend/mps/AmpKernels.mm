@@ -63,7 +63,6 @@ void dispatch_amp_multi(const std::string& kernel_name,
   constexpr int64_t kmaxThreadGroups = 32;
   constexpr int64_t kmaxTensors = 32;
 
-  id<MTLDevice> device = MPSDevice::getInstance()->device();
   MPSStream* mpsStream = getCurrentMPSStream();
   dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
     @autoreleasepool {
@@ -74,13 +73,11 @@ void dispatch_amp_multi(const std::string& kernel_name,
       [computeEncoder setComputePipelineState:PSO];
       MTLFunction_t func =
           MetalShaderLibrary::getBundledLibrary().getFunction(kernel_name);
-      id<MTLArgumentEncoder> argumentEncoder =
-          [func newArgumentEncoderWithBufferIndex:0];
+      // The kernel reads one pointer array of tensors from its argument buffer.
+      ForeachArguments arguments(func, MPSDevice::getInstance()->device(),
+                                 static_cast<NSUInteger>(kmaxTensors));
       [func release];
-      id<MTLBuffer> tensorArgumentBuffer =
-          [[device newBufferWithLength:argumentEncoder.encodedLength
-                              options:0] autorelease];
-      [argumentEncoder setArgumentBuffer:tensorArgumentBuffer offset:0];
+      id<MTLBuffer> tensorArgumentBuffer = arguments.buffer();
 
       int tensor_loc = 0;
       int threadgroup_loc = 0;
@@ -91,10 +88,9 @@ void dispatch_amp_multi(const std::string& kernel_name,
         if (tensor_list[t].numel() == 0) {
           continue;
         }
-        [argumentEncoder
-            setBuffer:mtl_buffer_of(tensor_list[t])
-               offset:0
-              atIndex:static_cast<NSUInteger>(tensor_loc)];
+        arguments.bind(tensorArgumentBuffer,
+                       static_cast<NSUInteger>(tensor_loc),
+                       mtl_buffer_of(tensor_list[t]));
         metadata_arguments.numels[tensor_loc] =
             static_cast<uint64_t>(tensor_list[t].numel());
         const int64_t current_tensor_index = tensor_loc;
@@ -137,16 +133,11 @@ void dispatch_amp_multi(const std::string& kernel_name,
                            threadsPerThreadgroup:threadGroupSize];
 
             threadgroup_loc = 0;
-            tensorArgumentBuffer =
-                [[device newBufferWithLength:argumentEncoder.encodedLength
-                                    options:0] autorelease];
-            [argumentEncoder setArgumentBuffer:tensorArgumentBuffer offset:0];
+            tensorArgumentBuffer = arguments.buffer();
 
             if (partial) {
-              [argumentEncoder
-                  setBuffer:mtl_buffer_of(tensor_list[t])
-                     offset:0
-                    atIndex:0];
+              arguments.bind(tensorArgumentBuffer, 0,
+                             mtl_buffer_of(tensor_list[t]));
               metadata_arguments.numels[0] = carried_numels;
               tensor_loc = 1;
             } else {

@@ -12,6 +12,7 @@
 #include <Metal/Metal.h>
 
 #include <array>
+#include <cstring>
 #include <exception>
 #include <optional>
 #include <string>
@@ -108,6 +109,69 @@ inline void mtl_dispatch1DJob(id<MTLComputeCommandEncoder> encoder,
   [encoder dispatchThreads:MTLSizeMake(size, 1, 1)
       threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
 }
+
+// Binds the tensor pointers a foreach kernel reads out of an argument buffer.
+// Such a buffer holds one 8-byte device address per argument id, which is what
+// the pointer arrays in a kernel's argument struct resolve to.  Current GPU
+// images vend an encoder that writes those addresses; the image shipped with
+// macOS 14 has no argument encoders at all, so the same layout is written
+// directly there.
+class ForeachArguments {
+ public:
+  ForeachArguments(MTLFunction_t func, id<MTLDevice> device, NSUInteger slots)
+      : device_(device) {
+    if (encoders_available(func)) {
+      // The accessor hands back an owned encoder.
+      encoder_ = [func newArgumentEncoderWithBufferIndex:0];
+    }
+    bytes_ = encoder_ ? [encoder_ encodedLength] : slots * sizeof(uintptr_t);
+  }
+  ~ForeachArguments() {
+    [encoder_ release];
+  }
+  ForeachArguments(const ForeachArguments&) = delete;
+  ForeachArguments& operator=(const ForeachArguments&) = delete;
+
+  // A fresh buffer whose unbound slots read as null pointers.
+  id<MTLBuffer> buffer() const {
+    id<MTLBuffer> argument_buffer =
+        [[device_ newBufferWithLength:bytes_ options:0] autorelease];
+    memset(argument_buffer.contents, 0, bytes_);
+    [encoder_ setArgumentBuffer:argument_buffer offset:0];
+    return argument_buffer;
+  }
+
+  void bind(id<MTLBuffer> slot, NSUInteger index, id<MTLBuffer> storage) const {
+    if (encoder_) {
+      [encoder_ setBuffer:storage offset:0 atIndex:index];
+      return;
+    }
+    static_cast<uintptr_t*>(slot.contents)[index] =
+        reinterpret_cast<uintptr_t>(storage.contents);
+  }
+
+ private:
+  // The capability belongs to the GPU device, so one probe covers every
+  // function; asking for an encoder is harmless where it is supported.
+  static bool encoders_available(MTLFunction_t func) {
+    static const bool available = [func]() {
+      @try {
+        id<MTLArgumentEncoder> encoder =
+            [func newArgumentEncoderWithBufferIndex:0];
+        const bool vends = (encoder != nil);
+        [encoder release];
+        return vends;
+      } @catch (NSException* exception) {
+        return false;
+      }
+    }();
+    return available;
+  }
+
+  id<MTLDevice> device_ = nil;
+  id<MTLArgumentEncoder> encoder_ = nil;
+  NSUInteger bytes_ = 0;
+};
 
 // Runs a block on the MPS stream's serial queue, rethrowing C++ exceptions
 // across the dispatch boundary.

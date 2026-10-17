@@ -80,7 +80,7 @@ struct MPSMetadataArguments {
 // Multi-tensor (foreach) fused optimizer dispatch.  A single kernel launch
 // updates up to 32 parameters; each parameter is processed in 64K-element
 // chunks mapped to threadgroups.  Buffer 0 (the argument struct with arrays
-// of device pointers) is encoded with an MTLArgumentEncoder.
+// of device pointers) is bound with ForeachArguments.
 void dispatch_fused_adam_multi(
     id<MTLComputeCommandEncoder> computeEncoder,
     const std::vector<Tensor>& params,
@@ -121,10 +121,10 @@ void dispatch_fused_adam_multi(
   [computeEncoder setComputePipelineState:PSO];
   MTLFunction_t func =
       MetalShaderLibrary::getBundledLibrary().getFunction(kernel);
-  id<MTLArgumentEncoder> tensorArgumentEncoder =
-      [func newArgumentEncoderWithBufferIndex:0];
+  // The argument struct holds one pointer array per list plus the state steps.
+  ForeachArguments arguments(func, MPSDevice::getInstance()->device(),
+                             static_cast<NSUInteger>(depth + 1) * kmaxTensors);
   [func release];
-  id<MTLDevice> device = MPSDevice::getInstance()->device();
 
   int64_t tensor_loc = 0;
   int64_t threadgroup_loc = 0;
@@ -138,10 +138,7 @@ void dispatch_fused_adam_multi(
       continue;
     }
     if (tensorArgumentBuffer == nil) {
-      tensorArgumentBuffer =
-          [[device newBufferWithLength:tensorArgumentEncoder.encodedLength
-                              options:0] autorelease];
-      [tensorArgumentEncoder setArgumentBuffer:tensorArgumentBuffer offset:0];
+      tensorArgumentBuffer = arguments.buffer();
     }
     for (int64_t d = 0; d < depth; ++d) {
       const Tensor* t = nullptr;
@@ -150,15 +147,13 @@ void dispatch_fused_adam_multi(
       else if (d == 2) t = &exp_avgs[tensor_index];
       else if (d == 3) t = &exp_avg_sqs[tensor_index];
       else t = &max_exp_avg_sqs[tensor_index];
-      [tensorArgumentEncoder setBuffer:mtl_buffer_of(*t)
-                                offset:0
-                               atIndex:static_cast<NSUInteger>(
-                                           d * kmaxTensors + tensor_loc)];
+      arguments.bind(tensorArgumentBuffer,
+                     static_cast<NSUInteger>(d * kmaxTensors + tensor_loc),
+                     mtl_buffer_of(*t));
     }
-    [tensorArgumentEncoder
-        setBuffer:mtl_buffer_of(state_steps[tensor_index])
-           offset:0
-          atIndex:static_cast<NSUInteger>(depth * kmaxTensors + tensor_loc)];
+    arguments.bind(tensorArgumentBuffer,
+                   static_cast<NSUInteger>(depth * kmaxTensors + tensor_loc),
+                   mtl_buffer_of(state_steps[tensor_index]));
     metadata_arguments.numels[tensor_loc] = static_cast<uint64_t>(numel);
     tensor_loc++;
 
@@ -206,20 +201,12 @@ void dispatch_fused_adam_multi(
         threadgroup_loc = 0;
         if (chunk == chunks - 1) {
           tensor_loc = 0;
-          tensorArgumentBuffer =
-              [[device newBufferWithLength:tensorArgumentEncoder.encodedLength
-                                  options:0] autorelease];
-          [tensorArgumentEncoder setArgumentBuffer:tensorArgumentBuffer
-                                            offset:0];
+          tensorArgumentBuffer = arguments.buffer();
         } else {
           // Reuse the current tensor for the remaining chunks.
           metadata_arguments.numels[0] =
               metadata_arguments.numels[tensor_loc - 1];
-          tensorArgumentBuffer =
-              [[device newBufferWithLength:tensorArgumentEncoder.encodedLength
-                                  options:0] autorelease];
-          [tensorArgumentEncoder setArgumentBuffer:tensorArgumentBuffer
-                                            offset:0];
+          tensorArgumentBuffer = arguments.buffer();
           for (int64_t d = 0; d < depth; ++d) {
             const Tensor* t = nullptr;
             if (d == 0) t = &params[tensor_index];
@@ -227,15 +214,13 @@ void dispatch_fused_adam_multi(
             else if (d == 2) t = &exp_avgs[tensor_index];
             else if (d == 3) t = &exp_avg_sqs[tensor_index];
             else t = &max_exp_avg_sqs[tensor_index];
-            [tensorArgumentEncoder
-                setBuffer:mtl_buffer_of(*t)
-                   offset:0
-                  atIndex:static_cast<NSUInteger>(d * kmaxTensors)];
+            arguments.bind(tensorArgumentBuffer,
+                           static_cast<NSUInteger>(d * kmaxTensors),
+                           mtl_buffer_of(*t));
           }
-          [tensorArgumentEncoder
-              setBuffer:mtl_buffer_of(state_steps[tensor_index])
-                 offset:0
-                atIndex:static_cast<NSUInteger>(depth * kmaxTensors)];
+          arguments.bind(tensorArgumentBuffer,
+                         static_cast<NSUInteger>(depth * kmaxTensors),
+                         mtl_buffer_of(state_steps[tensor_index]));
           tensor_loc = 1;
         }
       }
@@ -309,10 +294,10 @@ void dispatch_fused_sgd_multi(
   [computeEncoder setComputePipelineState:PSO];
   MTLFunction_t func =
       MetalShaderLibrary::getBundledLibrary().getFunction(kernel);
-  id<MTLArgumentEncoder> tensorArgumentEncoder =
-      [func newArgumentEncoderWithBufferIndex:0];
+  // One pointer array per list: params and grads, plus momentum buffers.
+  ForeachArguments arguments(func, MPSDevice::getInstance()->device(),
+                             static_cast<NSUInteger>(depth) * kmaxTensors);
   [func release];
-  id<MTLDevice> device = MPSDevice::getInstance()->device();
 
   int64_t tensor_loc = 0;
   int64_t threadgroup_loc = 0;
@@ -326,19 +311,15 @@ void dispatch_fused_sgd_multi(
       continue;
     }
     if (tensorArgumentBuffer == nil) {
-      tensorArgumentBuffer =
-          [[device newBufferWithLength:tensorArgumentEncoder.encodedLength
-                              options:0] autorelease];
-      [tensorArgumentEncoder setArgumentBuffer:tensorArgumentBuffer offset:0];
+      tensorArgumentBuffer = arguments.buffer();
     }
     for (int64_t d = 0; d < depth; ++d) {
       const Tensor* t = (d == 0)   ? &params[tensor_index]
                         : (d == 1) ? &grads[tensor_index]
                                    : &momentum_buffers[tensor_index];
-      [tensorArgumentEncoder setBuffer:mtl_buffer_of(*t)
-                                offset:0
-                               atIndex:static_cast<NSUInteger>(
-                                           d * kmaxTensors + tensor_loc)];
+      arguments.bind(tensorArgumentBuffer,
+                     static_cast<NSUInteger>(d * kmaxTensors + tensor_loc),
+                     mtl_buffer_of(*t));
     }
     metadata_arguments.numels[tensor_loc] = static_cast<uint64_t>(numel);
     tensor_loc++;
@@ -401,28 +382,19 @@ void dispatch_fused_sgd_multi(
         threadgroup_loc = 0;
         if (chunk == chunks - 1) {
           tensor_loc = 0;
-          tensorArgumentBuffer =
-              [[device newBufferWithLength:tensorArgumentEncoder.encodedLength
-                                  options:0] autorelease];
-          [tensorArgumentEncoder setArgumentBuffer:tensorArgumentBuffer
-                                            offset:0];
+          tensorArgumentBuffer = arguments.buffer();
         } else {
           // Reuse the current tensor for the remaining chunks.
           metadata_arguments.numels[0] =
               metadata_arguments.numels[tensor_loc - 1];
-          tensorArgumentBuffer =
-              [[device newBufferWithLength:tensorArgumentEncoder.encodedLength
-                                  options:0] autorelease];
-          [tensorArgumentEncoder setArgumentBuffer:tensorArgumentBuffer
-                                            offset:0];
+          tensorArgumentBuffer = arguments.buffer();
           for (int64_t d = 0; d < depth; ++d) {
             const Tensor* t = (d == 0)   ? &params[tensor_index]
                               : (d == 1) ? &grads[tensor_index]
                                          : &momentum_buffers[tensor_index];
-            [tensorArgumentEncoder
-                setBuffer:mtl_buffer_of(*t)
-                   offset:0
-                  atIndex:static_cast<NSUInteger>(d * kmaxTensors)];
+            arguments.bind(tensorArgumentBuffer,
+                           static_cast<NSUInteger>(d * kmaxTensors),
+                           mtl_buffer_of(*t));
           }
           tensor_loc = 1;
         }
