@@ -10,21 +10,23 @@
 using namespace metal;
 
 struct exp_op {
+  // The precise spelling, not the plain one, which a shorter approximation may
+  // answer.
   template <typename T>
-  static inline T apply(T x) { return ::exp(x); }
+  static inline T apply(T x) { return ::precise::exp(x); }
 };
 
 struct sqrt_op {
   template <typename T>
-  static inline T apply(T x) { return ::sqrt(x); }
+  static inline T apply(T x) { return ::precise::sqrt(x); }
 };
 
 struct rsqrt_op {
-  // Written as a division rather than as the rsqrt builtin, whose result is
-  // implementation-defined: x == 0 must give +inf and x < 0 must give NaN, the
-  // way a reciprocal of the square root does.
+  // A reciprocal of the square root rather than the rsqrt builtin, whose result
+  // is implementation-defined: x == 0 must give +inf and x < 0 must give NaN,
+  // the way a division by the square root does.
   template <typename T>
-  static inline T apply(T x) { return T(1) / ::sqrt(x); }
+  static inline T apply(T x) { return T(1) / ::precise::sqrt(x); }
 };
 
 struct abs_op {
@@ -33,10 +35,10 @@ struct abs_op {
 };
 
 struct relu_op {
-  // The positive part, as a comparison: an operand not greater than zero, a NaN
-  // included, reads back as zero.
+  // Clamped below by a comparison against zero: only an operand less than zero
+  // becomes zero, so a NaN reads back as a NaN.
   template <typename T>
-  static inline T apply(T x) { return x > T(0) ? x : T(0); }
+  static inline T apply(T x) { return x < T(0) ? T(0) : x; }
 };
 
 template <typename T, typename Op>

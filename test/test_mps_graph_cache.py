@@ -410,6 +410,25 @@ class TestMPSUnaryOperandReads(MPSCase):
                                            device="mps")).cpu().tolist(),
                          [0.0, 0.0, 0.25, 4.0])
 
+    def test_special_values_match_cpu(self):
+        # Reading the operand as it lies means handing back the infinities and
+        # the NaNs that a graph hands back, rather than smoothing them over.
+        values = [float("nan"), float("inf"), float("-inf"),
+                  -4.0, -0.0, 0.0, 4.0]
+        cpu = tp.tensor(values, dtype=tp.float32, device="cpu")
+        mps = tp.tensor(values, dtype=tp.float32, device="mps")
+        for name, fn in (("abs", tp.abs), ("exp", tp.exp), ("relu", tp.relu),
+                         ("sqrt", tp.sqrt), ("rsqrt", tp.rsqrt)):
+            with self.subTest(op=name):
+                got, want = fn(mps).cpu().tolist(), fn(cpu).cpu().tolist()
+                self.assertEqual(len(got), len(want))
+                for index, (one, other) in enumerate(zip(got, want)):
+                    if math.isnan(other):
+                        self.assertTrue(math.isnan(one),
+                                        msg=f"{name}[{index}]: {one}, want NaN")
+                    else:
+                        self.assertEqual(one, other, msg=f"{name}[{index}]")
+
     def test_alternating_shapes_at_one_call_site(self):
         shapes = [[2, 3], [24], [1, 5, 11], [2, 2, 2, 3]]
         for rep in range(2):
