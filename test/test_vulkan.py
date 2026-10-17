@@ -401,5 +401,77 @@ class TestVulkanScaledDotProductAttention(unittest.TestCase):
         self.assertFalse(np.isnan(got).any())
 
 
+def _rope_tables(head_dim, rows):
+    half = head_dim // 2
+    positions = np.arange(rows)
+    inv = 1.0 / (half ** (2.0 * np.arange(half) / head_dim))
+    cos = np.cos(positions[:, None] * inv[None, :]).astype(np.float32)
+    sin = np.sin(positions[:, None] * inv[None, :]).astype(np.float32)
+    return cos, sin
+
+
+def _rope_reference(x, cos, sin, position_offset):
+    even = x[..., 0::2]
+    odd = x[..., 1::2]
+    seq = x.shape[-2]
+    c = cos[position_offset:position_offset + seq]
+    s = sin[position_offset:position_offset + seq]
+    out = np.empty_like(x)
+    out[..., 0::2] = even * c - odd * s
+    out[..., 1::2] = even * s + odd * c
+    return out
+
+
+class TestVulkanLlmKernels(unittest.TestCase):
+    def test_rotary_embedding(self):
+        tensorplay.manual_seed(1234)
+        for B, S, D, table_len, off, dtype, tol in (
+            (1, 64, 64, 64, 0, tensorplay.float32, 3.0e-4),
+            (2, 9, 32, 512, 0, tensorplay.float32, 3.0e-4),
+            (1, 1, 64, 600, 512, tensorplay.float32, 3.0e-4),
+            (1, 1, 128, 600, 300, tensorplay.float16, 3.0e-2),
+        ):
+            x = tensorplay.randn((B, S, D), device="cpu").to(dtype)
+            cos, sin = _rope_tables(D, table_len)
+            got = tensorplay.functional.rotary_embedding(
+                x.to("vulkan"),
+                tensorplay.tensor(cos, dtype=dtype).to("vulkan"),
+                tensorplay.tensor(sin, dtype=dtype).to("vulkan"),
+                position_offset=off).cpu().numpy()
+            want = _rope_reference(x.numpy().astype(np.float32), cos, sin, off)
+            np.testing.assert_allclose(got.astype(np.float32), want, rtol=0, atol=tol)
+
+    def test_silu_and_mul(self):
+        tensorplay.manual_seed(1234)
+        for B, S, W, dtype, tol in (
+            (1, 3, 8, tensorplay.float32, 1.0e-5),
+            (1, 1, 512, tensorplay.float16, 3.0e-2),
+            (2, 5, 4096, tensorplay.float32, 1.0e-5),
+        ):
+            x = (tensorplay.randn((B, S, 2 * W), device="cpu") * 1.5).to(dtype)
+            got = tensorplay.functional.silu_and_mul(x.to("vulkan")).cpu().numpy()
+            a = x.numpy()[..., :W].astype(np.float64)
+            b = x.numpy()[..., W:].astype(np.float64)
+            want = ((a / (1.0 + np.exp(-a))) * b).astype(np.float32)
+            np.testing.assert_allclose(got.astype(np.float64), want, rtol=0, atol=tol)
+
+    def test_rms_norm(self):
+        tensorplay.manual_seed(1234)
+        for B, S, H, eps, dtype, tol in (
+            (1, 64, 1024, 1.0e-5, tensorplay.float32, 1.0e-5),
+            (1, 1, 1024, 1.0e-5, tensorplay.float16, 3.0e-2),
+            (2, 3, 64, 1.0e-1, tensorplay.float32, 1.0e-5),
+        ):
+            x = (tensorplay.randn((B, S, H), device="cpu") * 2.0).to(dtype)
+            w = (tensorplay.randn((H,), device="cpu") * 0.7 + 1.0).to(dtype)
+            got = tensorplay.nn.functional.rms_norm(
+                x.to("vulkan"), [H], w.to("vulkan"), eps).cpu().numpy()
+            xn = x.numpy().astype(np.float64)
+            want = (xn / np.sqrt((xn ** 2).mean(-1, keepdims=True) + eps)) * \
+                w.numpy().astype(np.float64)
+            np.testing.assert_allclose(
+                got.astype(np.float64), want, rtol=0, atol=tol)
+
+
 if __name__ == "__main__":
     unittest.main()
