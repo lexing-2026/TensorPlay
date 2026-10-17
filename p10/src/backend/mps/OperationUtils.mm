@@ -188,9 +188,13 @@ std::string scalarKey(const Scalar& value) {
 
 std::string graphKey(const std::source_location& location,
                      std::initializer_list<std::string> parts) {
+  // File, line and column: nested calls on one line are different call
+  // sites and must not share a graph.
   std::string key = location.file_name();
   key += ':';
   key += std::to_string(location.line());
+  key += ':';
+  key += std::to_string(location.column());
   for (const std::string& part : parts) {
     key += '|';
     key += part;
