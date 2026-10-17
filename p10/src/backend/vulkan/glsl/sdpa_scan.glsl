@@ -34,9 +34,6 @@ layout(set = 0, binding = 4) uniform PRECISION restrict Block {
   int kv_c_depth;     // ceil(Hkv / 4)
   int gqa_group;      // query heads per kv head (1 = plain multi-head)
   int hq;             // query head count (lanes beyond it are padding)
-  int fill1;
-  int fill2;
-  int fill3;
 }
 uBlock;
 

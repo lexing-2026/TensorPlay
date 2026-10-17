@@ -65,10 +65,11 @@ void main() {
   vec4 gsum = vec4(0.0f);
   for (int c = 0; c < uBlock.chunks; ++c) {
     const vec4 w = exp(imageLoad(uStats, ivec3(2 * c, sq, plane)) - gmax);
-    const vec4 s = imageLoad(uStats, ivec3(2 * c + 1, sq, plane));
-    num += (w * s) *
+    // The chunk partial already carries exp(score - vmax) * value; only the
+    // exponential sums weight the merge.
+    num += w *
         imageLoad(uPartial, ivec3(c * uBlock.extents.x + d, sq, plane));
-    gsum += w * s;
+    gsum += w * imageLoad(uStats, ivec3(2 * c + 1, sq, plane));
   }
   imageStore(uOutput, pos, num / safe_denom(gsum));
 }

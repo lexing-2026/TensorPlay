@@ -352,6 +352,22 @@ class TestVulkanScaledDotProductAttention(unittest.TestCase):
         _sdpa_check(
             self, B=2, Hq=4, Hkv=1, Sq=16, Skv=16, D=32, causal=False)
 
+    def test_sparse_split_memory_scan(self):
+        # Short queries over long key ranges take the scan + combine route.
+        _sdpa_check(
+            self, B=1, Hq=4, Hkv=4, Sq=1, Skv=600, D=64, causal=False)
+        _sdpa_check(
+            self, B=1, Hq=4, Hkv=4, Sq=1, Skv=600, D=64, causal=True)
+        _sdpa_check(
+            self, B=1, Hq=8, Hkv=2, Sq=3, Skv=513, D=16, gqa=True)
+        _sdpa_check(
+            self, B=2, Hq=4, Hkv=4, Sq=8, Skv=600, D=8, causal=False)
+        _sdpa_check(
+            self, B=1, Hq=4, Hkv=1, Sq=2, Skv=600, D=32)
+        _sdpa_check(
+            self, B=1, Hq=8, Hkv=8, Sq=4, Skv=517, D=16,
+            dtype=tensorplay.float16)
+
     def test_fully_masked_rows_emit_zeros(self):
         B, H, Sq, Skv, D = 1, 4, 6, 10, 8
         m = np.ones((B, H, Sq, Skv), dtype=bool)

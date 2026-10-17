@@ -726,7 +726,7 @@ Tensor scaled_dot_product_attention_kernel(
 
   const int64_t scan_chunk_len = 128;
   const int64_t scan_chunks =
-      Sq <= 8 && Skv > 2 * scan_chunk_len
+      Sq <= 8 && Skv > scan_chunk_len
           ? (Skv + scan_chunk_len - 1) / scan_chunk_len
           : 0;
   if (scan_chunks > 1) {
@@ -771,8 +771,10 @@ Tensor scaled_dot_product_attention_kernel(
 
     api::UniformParamsBuffer scan_params(context, scan_block);
     api::PipelineBarrier scan_barrier{};
+    // x packs (chunk, head-dim element): each invocation reduces one
+    // chunk into one output texel for the head group.
     const api::utils::uvec3 scan_grid{
-        static_cast<uint32_t>(scan_chunks),
+        static_cast<uint32_t>(scan_chunks * D),
         static_cast<uint32_t>(Sq),
         static_cast<uint32_t>(sdpa_planes(Hq, B)),
     };
