@@ -603,9 +603,13 @@ Tensor scaled_dot_product_attention_kernel(
       key.size(2) == value.size(2) && key.size(1) == value.size(1),
       "Vulkan sdpa: key and value shapes must match");
 
-  const int64_t group = enable_gqa ? (Hq / Hkv) : 1;
-  // One kv head below Hq broadcasts through the group mapping; above Hq
-  // (packing several kv heads against fewer query heads) has no mapping.
+  // Head grouping: one kv head broadcasts across the query heads through
+  // the group mapping (also true for a single head without the flag);
+  // equal counts map heads one to one.  Above one kv head the flag is the
+  // only route, and it requires the counts divide.
+  const int64_t group = Hq == Hkv ? 1 : (Hq / Hkv);
+  // A kv count above one needs the flag with Hq a multiple of Hkv; a
+  // single kv head broadcasts regardless of it.
   TP_CHECK(
       Hkv == Hq || enable_gqa || Hkv == 1,
       "Vulkan sdpa: key and value head counts must match or be "

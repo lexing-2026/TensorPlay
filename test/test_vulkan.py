@@ -190,5 +190,182 @@ class TestVulkanOps(unittest.TestCase):
         )
 
 
+# Reference for vulkan scaled_dot_product_attention: the attention math
+# composite semantics with top-left aligned causal masking, group-query
+# expansion over contiguous head blocks, additive attention masks, and a
+# fully masked row normalizing to zeros.
+def _sdpa_reference(q, k, v, mask=None, causal=False, scale=None):
+    q = q.astype(np.float64)
+    k = k.astype(np.float64)
+    v = v.astype(np.float64)
+    hq = q.shape[1]
+    hkv = k.shape[1]
+    if hkv != hq:
+        g = hq // hkv
+        k = np.repeat(k, g, axis=1)
+        v = np.repeat(v, g, axis=1)
+    s = np.einsum("bhqd,bhkd->bhqk", q, k)
+    s = s * (1.0 / np.sqrt(q.shape[-1]) if scale is None else scale)
+    if causal:
+        s = s + np.triu(np.ones((q.shape[2], k.shape[2])), 1) * (-2.0 ** 31)
+    if mask is not None:
+        if mask.dtype == np.bool_:
+            m = np.where(mask, 0.0, -np.inf)
+        else:
+            m = mask.astype(np.float64)
+        s = s + m
+    s = s.astype(np.float32).astype(np.float64)
+    row = np.where(np.isneginf(s.max(-1, keepdims=True)), 0.0, s.max(-1, keepdims=True))
+    e = np.exp(s - row)
+    denom = e.sum(-1, keepdims=True)
+    p = np.divide(e, denom, out=np.zeros_like(e), where=(denom != 0))
+    return np.einsum("bhqk,bhkd->bhqd", p, v)
+
+
+def _sdpa_check(
+    self,
+    B,
+    Hq,
+    Hkv,
+    Sq,
+    Skv,
+    D,
+    dtype=tensorplay.float32,
+    causal=False,
+    mask=None,
+    scale=None,
+    gqa=False,
+    *_,
+):
+    tensorplay.manual_seed(1234)
+    q = tensorplay.randn((B, Hq, Sq, D), device="cpu")
+    k = tensorplay.randn((B, Hkv, Skv, D), device="cpu")
+    v = tensorplay.randn((B, Hkv, Skv, D), device="cpu")
+    if dtype == tensorplay.float16:
+        q, k, v = q.to(dtype), k.to(dtype), v.to(dtype)
+    got = tensorplay.nn.functional.scaled_dot_product_attention(
+        q.to("vulkan"),
+        k.to("vulkan"),
+        v.to("vulkan"),
+        attn_mask=(mask.to("vulkan") if mask is not None else None),
+        is_causal=causal,
+        scale=scale,
+        enable_gqa=gqa).cpu().numpy()
+    want = _sdpa_reference(
+        q.numpy(), k.numpy(), v.numpy(),
+        mask=(mask.numpy() if mask is not None else None),
+        causal=causal, scale=scale)
+    if dtype == tensorplay.float16:
+        atol = 2.0e-2
+    else:
+        atol = 4.0e-3
+    np.testing.assert_allclose(
+        got.astype(np.float64), want, rtol=1.0e-3, atol=atol)
+
+
+class TestVulkanScaledDotProductAttention(unittest.TestCase):
+    def test_plain_mha(self):
+        _sdpa_check(self, B=1, Hq=8, Hkv=8, Sq=16, Skv=16, D=32, causal=False)
+        _sdpa_check(self, B=2, Hq=4, Hkv=4, Sq=9, Skv=13, D=5, causal=False)
+        _sdpa_check(self, B=2, Hq=6, Hkv=6, Sq=2, Skv=5, D=48, causal=False)
+
+    def test_causal_mha(self):
+        _sdpa_check(self, B=1, Hq=12, Hkv=12, Sq=64, Skv=64, D=64, causal=True)
+        _sdpa_check(self, B=2, Hq=4, Hkv=4, Sq=9, Skv=13, D=5, causal=True)
+        _sdpa_check(self, B=1, Hq=3, Hkv=3, Sq=4, Skv=4, D=3, causal=True)
+
+    def test_decode_without_shifted_causal(self):
+        # Causal masking aligns top-left: a single query position attends
+        # the first key only.
+        _sdpa_check(self, B=1, Hq=4, Hkv=4, Sq=1, Skv=1, D=8, causal=True)
+        _sdpa_check(self, B=1, Hq=4, Hkv=4, Sq=1, Skv=7, D=16, causal=True)
+        _sdpa_check(self, B=1, Hq=4, Hkv=4, Sq=1, Skv=7, D=16, causal=False)
+
+    def test_gqa(self):
+        _sdpa_check(self, B=1, Hq=8, Hkv=2, Sq=1, Skv=31, D=64, gqa=True)
+        _sdpa_check(
+            self, B=1, Hq=12, Hkv=4, Sq=64, Skv=64, D=32, causal=True,
+            gqa=True)
+        _sdpa_check(
+            self, B=2, Hq=6, Hkv=3, Sq=5, Skv=5, D=16, causal=True, gqa=True)
+        _sdpa_check(
+            self, B=1, Hq=4, Hkv=2, Sq=3, Skv=9, D=8, gqa=True)
+
+    def test_bool_mask(self):
+        B, H, Sq, Skv, D = 2, 4, 6, 10, 8
+        shared = np.tril(np.ones((Sq, Skv)), k=Skv - Sq).astype(bool)
+        _sdpa_check(
+            self, B, H, H, Sq, Skv, D,
+            mask=tensorplay.tensor(shared))
+        per_head = np.random.default_rng(7).random((H, Sq, Skv)) > 0.4
+        per_head[:, 0, :] = True  # keep every head's rows visible
+        _sdpa_check(
+            self, B, H, H, Sq, Skv, D,
+            mask=tensorplay.tensor(per_head))
+        full = np.random.default_rng(8).random((B, H, Sq, Skv)) > 0.4
+        full[:, :, 0, :] = True
+        _sdpa_check(
+            self, B, H, H, Sq, Skv, D,
+            mask=tensorplay.tensor(full))
+
+    def test_float_mask(self):
+        B, H, Sq, Skv, D = 2, 4, 6, 10, 8
+        _sdpa_check(
+            self, B, H, H, Sq, Skv, D,
+            mask=tensorplay.tensor(
+                np.random.default_rng(9).standard_normal(
+                    (Sq, Skv)).astype(np.float32)))
+        _sdpa_check(
+            self, B, H, H, Sq, Skv, D,
+            mask=tensorplay.tensor(
+                np.random.default_rng(10).standard_normal(
+                    (1, 1, Sq, Skv)).astype(np.float32)))
+        _sdpa_check(
+            self, B, H, H, Sq, Skv, D,
+            mask=tensorplay.tensor(
+                np.random.default_rng(11).standard_normal(
+                    (B, 1, Sq, Skv)).astype(np.float32)))
+        _sdpa_check(
+            self, B, H, H, Sq, Skv, D,
+            mask=tensorplay.tensor(
+                np.random.default_rng(12).standard_normal(
+                    (H, Sq, Skv)).astype(np.float32)))
+
+    def test_scaled(self):
+        _sdpa_check(
+            self, B=2, Hq=4, Hkv=4, Sq=8, Skv=8, D=16, scale=0.37,
+            causal=True)
+
+    def test_float16(self):
+        _sdpa_check(
+            self, B=1, Hq=8, Hkv=2, Sq=1, Skv=64, D=64,
+            dtype=tensorplay.float16, gqa=True)
+        _sdpa_check(
+            self, B=1, Hq=8, Hkv=8, Sq=128, Skv=128, D=64,
+            dtype=tensorplay.float16, causal=True)
+        _sdpa_check(
+            self, B=2, Hq=4, Hkv=1, Sq=16, Skv=16, D=32,
+            dtype=tensorplay.float16)
+
+    def test_single_kv_head_broadcast(self):
+        _sdpa_check(self, B=2, Hq=4, Hkv=1, Sq=16, Skv=16, D=32, causal=True)
+        _sdpa_check(
+            self, B=2, Hq=4, Hkv=1, Sq=16, Skv=16, D=32, causal=False)
+
+    def test_fully_masked_rows_emit_zeros(self):
+        B, H, Sq, Skv, D = 1, 4, 6, 10, 8
+        m = np.ones((B, H, Sq, Skv), dtype=bool)
+        m[0, :, 0, :] = False  # every entry of row zero masked
+        got = tensorplay.nn.functional.scaled_dot_product_attention(
+            tensorplay.randn((B, H, Sq, D), device="cpu").to("vulkan"),
+            tensorplay.randn((B, H, Skv, D), device="cpu").to("vulkan"),
+            tensorplay.randn((B, H, Skv, D), device="cpu").to("vulkan"),
+            attn_mask=tensorplay.tensor(m).to("vulkan")).cpu().numpy()
+        # No entry survives the mask, so the whole row stays zero in every
+        # output component instead of dividing zero by zero.
+        np.testing.assert_array_equal(got[:, :, 0, :], 0.0)
+        self.assertFalse(np.isnan(got).any())
+
+
 if __name__ == "__main__":
     unittest.main()
