@@ -327,7 +327,9 @@ constexpr size_t kShaderMaxNdims = 16;
 // storage type; a call with one of them belongs with the graph, which builds
 // the cast and the operation together. The list below and the instantiations at
 // the bottom of that file are checked in the same order: dtype first, so a
-// missing name is only possible if the two get out of step.
+// missing name is only possible if the two get out of step. Whether a name
+// resolves is answered once and kept, because finding a function in the
+// metallib costs an object creation on every call.
 MTLComputePipelineState_t broadcastShaderPipeline(const std::string& op,
                                                   DType dtype) {
   switch (dtype) {
@@ -338,13 +340,20 @@ MTLComputePipelineState_t broadcastShaderPipeline(const std::string& op,
     default:
       return nil;
   }
-  auto& lib = MetalShaderLibrary::getBundledLibrary();
+  static std::mutex mutex;
+  static std::unordered_map<std::string, MTLComputePipelineState_t> resolved;
   const std::string name =
       "broadcast_" + op + "_" + scalarToMetalTypeString(dtype);
-  if (!lib.hasFunction(name)) {
-    return nil;
+  std::lock_guard<std::mutex> guard(mutex);
+  auto it = resolved.find(name);
+  if (it != resolved.end()) {
+    return it->second;
   }
-  return lib.getPipelineStateForFunc(name);
+  auto& lib = MetalShaderLibrary::getBundledLibrary();
+  MTLComputePipelineState_t pso =
+      lib.hasFunction(name) ? lib.getPipelineStateForFunc(name) : nil;
+  resolved.emplace(name, pso);
+  return pso;
 }
 
 // The stride array BroadcastElementwise.metal indexes `t` with, ordered

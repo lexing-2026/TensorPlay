@@ -77,7 +77,7 @@ class TestMPSBroadcastOperands(MPSCase):
     def test_operand_of_lower_rank(self):
         # A shorter operand lines up with the trailing dimensions, so the
         # leading output dimensions contribute nothing to its offset.
-        for shape in ([64], [16, 64], [4]):
+        for shape in ([64], [16, 64], [1]):
             with self.subTest(rhs=shape):
                 self.assert_pair_op([4, 16, 64], shape, tp.add)
         for shape in ([64], [16, 64]):
