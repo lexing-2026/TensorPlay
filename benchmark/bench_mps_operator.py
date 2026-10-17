@@ -352,6 +352,8 @@ def main():
     parser.add_argument("--min-run-time", type=float, default=1.0,
                         help="minimum timed seconds per case")
     parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument("--rounds", type=int, default=3,
+                        help="separate sampling passes over all cases")
     parser.add_argument("--json-out", type=Path, required=True)
     args = parser.parse_args()
     if args.reps < 1:
@@ -360,43 +362,57 @@ def main():
         parser.error("min-run-time must be finite and non-negative")
     if args.warmup < 1:
         parser.error("warmup must be positive")
+    if args.rounds < 1:
+        parser.error("rounds must be positive")
     if not tp.mps.is_available():
         parser.error("MPS is not available on this machine")
     suite = "long" if args.suite == "all" else args.suite
-    measurements = []
+    measurements = {}
+    samples_by_name = {}
+    skipped = set()
     cases = build_cases(args.dtype, suite)
     print(f"suite={suite} dtype={args.dtype} cases={len(cases)}")
-    for name, category, factory, specs, flops in cases:
-        print(f"running {name}")
-        fn = factory()
-        # Probe once so an unsupported case is reported and skipped instead
-        # of aborting the remaining measurements of the pass.
-        try:
-            fn()
-            tp.mps.synchronize()
-        except (NotImplementedError, RuntimeError) as exc:
-            print(f"{name:42} [skipped: {exc}]")
+    for round_index in range(args.rounds):
+        print(f"round {round_index + 1}/{args.rounds}")
+        # Rotate the starting case so each pass samples a different ordering.
+        offset = round_index * len(cases) // args.rounds
+        ordered_cases = cases[offset:] + cases[:offset]
+        for name, category, factory, specs, flops in ordered_cases:
+            if name in skipped:
+                continue
+            print(f"running {name}")
+            fn = factory()
+            # Probe support on the first pass; later failures must abort.
+            if round_index == 0:
+                try:
+                    fn()
+                    tp.mps.synchronize()
+                except (NotImplementedError, RuntimeError) as exc:
+                    print(f"{name:42} [skipped: {exc}]")
+                    skipped.add(name)
+                    del fn
+                    continue
+            samples = samples_by_name.setdefault(name, [])
+            samples.extend(_time(fn, math.ceil(args.reps / args.rounds),
+                                 args.min_run_time / args.rounds, args.warmup))
+            seconds = min(samples)
+            entry = {
+                "name": name,
+                "category": category,
+                "input_shapes": [list(value[1]) for value in specs],
+                "seconds": seconds,
+                "sample_count": len(samples),
+                "median_seconds": statistics.median(samples),
+                "max_seconds": max(samples),
+            }
+            if flops:
+                entry["flops"] = flops
+            if _moves_data(name):
+                entry["bytes_moved"] = _estimate_bytes(specs, _ITEMSIZE[args.dtype])
+            print(f"{name:42} {seconds * 1e3:10.3f} ms "
+                  f"({len(samples)} samples, median {statistics.median(samples) * 1e3:.3f} ms)")
+            measurements[name] = entry
             del fn
-            continue
-        samples = _time(fn, args.reps, args.min_run_time, args.warmup)
-        seconds = min(samples)
-        entry = {
-            "name": name,
-            "category": category,
-            "input_shapes": [list(value[1]) for value in specs],
-            "seconds": seconds,
-            "sample_count": len(samples),
-            "median_seconds": statistics.median(samples),
-            "max_seconds": max(samples),
-        }
-        if flops:
-            entry["flops"] = flops
-        if _moves_data(name):
-            entry["bytes_moved"] = _estimate_bytes(specs, _ITEMSIZE[args.dtype])
-        print(f"{name:42} {seconds * 1e3:10.3f} ms "
-              f"({len(samples)} samples, median {statistics.median(samples) * 1e3:.3f} ms)")
-        measurements.append(entry)
-        del fn
 
     payload = {
         "schema_version": 1,
@@ -405,8 +421,9 @@ def main():
         "dtype": args.dtype,
         "device": "mps",
         "timing": {"statistic": "minimum", "min_reps": args.reps,
-                   "min_run_time": args.min_run_time, "warmup": args.warmup},
-        "measurements": measurements,
+                   "min_run_time": args.min_run_time, "warmup": args.warmup,
+                   "rounds": args.rounds},
+        "measurements": list(measurements.values()),
     }
     args.json_out.parent.mkdir(parents=True, exist_ok=True)
     args.json_out.write_text(json.dumps(payload, indent=2) + "\n",
