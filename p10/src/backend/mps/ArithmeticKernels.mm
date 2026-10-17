@@ -102,6 +102,9 @@ MPSBinaryOpBlock hypotBlock = ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* a,
 
 Tensor add_kernel(const Tensor& self, const Tensor& other,
                   const Scalar& alpha) {
+  if (auto result = broadcastBinaryShader("add", self, other, alpha)) {
+    return *result;
+  }
   return binaryOp(self, other, addBlock, alpha);
 }
 
@@ -133,6 +136,9 @@ Tensor sub_kernel(const Tensor& self, const Tensor& other,
              "Subtraction, the `-` operator, with two bool tensors is not "
              "supported on the MPS backend");
   }
+  if (auto result = broadcastBinaryShader("sub", self, other, alpha)) {
+    return *result;
+  }
   return binaryOp(self, other, subBlock, alpha);
 }
 
@@ -158,6 +164,9 @@ Tensor& sub_scalar_inplace_kernel(Tensor& self, const Scalar& other,
 }
 
 Tensor mul_kernel(const Tensor& self, const Tensor& other) {
+  if (auto result = broadcastBinaryShader("mul", self, other)) {
+    return *result;
+  }
   return binaryOp(self, other, mulBlock);
 }
 

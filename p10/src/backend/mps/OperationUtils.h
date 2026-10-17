@@ -11,8 +11,10 @@
 #include <Metal/Metal.h>
 #include <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
 
+#include <optional>
 #include <source_location>
 #include <string>
+#include <vector>
 
 namespace tensorplay {
 namespace mps {
@@ -101,6 +103,18 @@ Tensor unaryOp(const Tensor& self, MPSUnaryOpBlock block,
 // promotion of self/other.
 Tensor whereOp(const Tensor& condition, const Tensor& self,
                const Tensor& other);
+
+// Runs `op` -- "add", "sub" or "mul" -- over broadcast operands with the
+// stride-addressed shader, which reads each operand out of the storage it
+// already has instead of materializing an expanded copy. Returns std::nullopt
+// when a call cannot be expressed that way: operands that need no expansion (a
+// graph is then one dispatch either way), a dtype or an alpha the shader is not
+// instantiated for, a non-zero storage offset, a negative stride, a rank or an
+// element index beyond the 32-bit addressing the shader uses. The caller builds
+// a graph in that case.
+std::optional<Tensor> broadcastBinaryShader(
+    const std::string& op, const Tensor& self, const Tensor& other,
+    const std::optional<Scalar>& alpha = std::nullopt);
 
 } // namespace mps
 } // namespace tensorplay
