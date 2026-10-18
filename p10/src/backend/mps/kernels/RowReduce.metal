@@ -116,8 +116,8 @@ struct Extremum {
 // held, so a tie keeps the position already stored and the first of a row's
 // equal elements is the one that answers.
 template <typename Op, typename T>
-inline void scan_row(constant T* values, uint n, uint lane, T& held,
-                     uint32_t& held_index) {
+inline void scan_row(constant T* values, uint n, uint lane, thread T& held,
+                     thread uint32_t& held_index) {
   held = Op::identity();
   held_index = 0;
   for (uint i = lane; i < n; i += simdgroup_size) {
@@ -136,7 +136,8 @@ inline void scan_row(constant T* values, uint n, uint lane, T& held,
 // lanes are paired the pair every lane ends with is the one the row answers
 // with, and it is the pair the scan would have produced over the row in order.
 template <typename Op, typename T>
-inline void fold_pair(T& held, uint32_t& held_index, uint rival_mask) {
+inline void fold_pair(thread T& held, thread uint32_t& held_index,
+                      uint rival_mask) {
   const T rival = simd_shuffle_xor(held, rival_mask);
   const uint32_t rival_index = simd_shuffle_xor(held_index, rival_mask);
   const bool tied =
