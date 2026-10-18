@@ -433,11 +433,15 @@ class TestVulkanLlmKernels(unittest.TestCase):
         ):
             x = tensorplay.randn((B, S, D), device="cpu").to(dtype)
             cos, sin = _rope_tables(D, table_len)
-            got = tensorplay.functional.rotary_embedding(
+            rotated = tensorplay.functional.rotary_embedding(
                 x.to("vulkan"),
                 tensorplay.tensor(cos, dtype=dtype).to("vulkan"),
                 tensorplay.tensor(sin, dtype=dtype).to("vulkan"),
-                position_offset=off).cpu().numpy()
+                position_offset=off)
+            # The rotation is elementwise, so the element type is carried
+            # through: a half-precision decode step must not widen itself.
+            self.assertEqual(rotated.dtype, dtype)
+            got = rotated.cpu().numpy()
             want = _rope_reference(x.numpy().astype(np.float32), cos, sin, off)
             np.testing.assert_allclose(got.astype(np.float32), want, rtol=0, atol=tol)
 

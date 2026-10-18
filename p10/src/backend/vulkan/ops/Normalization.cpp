@@ -567,7 +567,11 @@ Tensor rotary_embedding_kernel(
   const int64_t tokens = input.size(-2);
   const int64_t table_rows = v_cos.extents()[1u];
 
-  api::vTensor v_output{context, input.sizes(), DType::Float32};
+  // The rotation is elementwise in the head dimension, so the result keeps the
+  // input's element type; widening a Float16 activation here would both change
+  // the contract and double the bytes written per token.  The matching image
+  // format comes from the dtype-selected shader variant.
+  api::vTensor v_output{context, input.sizes(), input.dtype()};
 
   const struct RotaryBlock final {
     ivec4 extents;
