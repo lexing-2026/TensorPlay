@@ -3195,6 +3195,92 @@ class TestVulkanDeviceBuiltPayload(unittest.TestCase):
                     err_msg="batch_norm built=%s weight=%s bias=%s" % (
                         use_built, with_weight, with_bias))
 
+    @staticmethod
+    def _uses_dense_storage(payload):
+        # Only single precision has both a texture and a linear form of this
+        # kernel, so a lerp that reports the missing image marks a payload that
+        # keeps the elements in words.
+        import tensorplay.functional as F
+        try:
+            F.lerp(payload, payload, 0.5)
+            return False
+        except RuntimeError:
+            return True
+
+    def test_clone_keeps_the_storage_of_its_model(self):
+        host = self._grid((2, 3, 4, 5))
+        for name, source, want_dense in (
+                ("built",
+                 tensorplay.tensor(host.copy(), device="vulkan"), True),
+                ("uploaded", tensorplay.from_numpy(host.copy()).to("vulkan"),
+                 False)):
+            out = source.clone()
+            self.assertIs(
+                self._uses_dense_storage(out), want_dense,
+                f"clone of a {name} payload changed its storage class")
+            np.testing.assert_array_equal(
+                out.cpu().numpy(), host,
+                err_msg=f"clone of a {name} payload lost its values")
+
+        # An integer payload rounds nowhere, so a copy that lands in the wrong
+        # binding shows up as wrong numbers rather than as a rounding error.
+        ints = ((np.arange(40, dtype=np.int32) % 17) - 8).reshape(2, 5, 4)
+        built = tensorplay.tensor(ints.copy(), device="vulkan")
+        np.testing.assert_array_equal(
+            built.clone().cpu().numpy(), ints,
+            err_msg="clone of an integer payload lost its values")
+
+    def test_conversion_from_a_device_built_payload(self):
+        host = self._grid((2, 3, 4, 5))
+        half = host.astype(np.float16)
+        ints = ((np.arange(40, dtype=np.int32) % 17) - 8).reshape(2, 5, 4)
+        for name, source, half_source, int_source in (
+                ("built",
+                 tensorplay.tensor(host.copy(), device="vulkan"),
+                 tensorplay.tensor(half.copy(), device="vulkan"),
+                 tensorplay.tensor(ints.copy(), device="vulkan")),
+                ("uploaded", tensorplay.from_numpy(host.copy()).to("vulkan"),
+                 tensorplay.from_numpy(half.copy()).to("vulkan"),
+                 tensorplay.from_numpy(ints.copy()).to("vulkan"))):
+            np.testing.assert_array_equal(
+                source.to(tensorplay.float16).cpu().numpy(), half,
+                err_msg=f"single to half over a {name} payload")
+            np.testing.assert_array_equal(
+                half_source.to(tensorplay.float32).cpu().numpy(),
+                half.astype(np.float32),
+                err_msg=f"half to single over a {name} payload")
+            np.testing.assert_array_equal(
+                int_source.to(tensorplay.float32).cpu().numpy(),
+                ints.astype(np.float32),
+                err_msg=f"integer to single over a {name} payload")
+
+    def test_copy_between_storage_classes(self):
+        host = self._grid((2, 3, 4, 5))
+        built = tensorplay.tensor(host.copy(), device="vulkan")
+        uploaded = tensorplay.from_numpy(host.copy()).to("vulkan")
+        for name, destination, source, want_dense in (
+                ("dense destination", built, uploaded, True),
+                ("image destination", uploaded, built, False)):
+            out = tensorplay.empty_like(destination)
+            self.assertIs(
+                self._uses_dense_storage(out), want_dense,
+                f"empty_like did not follow the {name}")
+            out.copy_(source)
+            np.testing.assert_array_equal(
+                out.cpu().numpy(), host,
+                err_msg=f"copy_ into the {name} lost its values")
+
+    def test_copy_between_storages_needs_matching_shapes(self):
+        # The crossing builds its carrier from the source and the transfer that
+        # follows runs over the destination's extents, so payloads that only
+        # share an element count have to be refused rather than read past the
+        # payload just built.
+        host = self._grid((2, 3, 4, 5))
+        flat = tensorplay.tensor(host.reshape(-1).copy(), device="vulkan")
+        cube = tensorplay.from_numpy(host.copy()).to("vulkan")
+        with self.assertRaisesRegex(RuntimeError, "equal shapes"):
+            flat.copy_(cube)
+
 
 if __name__ == "__main__":
     unittest.main()
