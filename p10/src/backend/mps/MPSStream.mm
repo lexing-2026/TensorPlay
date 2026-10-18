@@ -6,10 +6,8 @@
 
 #include <array>
 #include <atomic>
-#include <chrono>
 #include <cstring>
 #include <mutex>
-#include <thread>
 
 // The public header exposes enableCommitAndContinue as readonly; the backend
 // needs to toggle it per-stream, so redeclare the property as readwrite in a
@@ -125,35 +123,6 @@ void MPSStream::commit() {
   }
 }
 
-namespace {
-
-// Watches a committed command buffer's status for a bounded stretch before
-// the blocking wait. The blocking wait returns through a completion
-// notification whose wake-up latency is large next to the work a short launch
-// does, while the status flag flips as soon as the work finishes; polling it
-// turns that wake-up into a memory read. The stretch is bounded so a long
-// launch pays a fixed amount of CPU time at most, and the blocking wait
-// follows either way, so completion, errors, and completion handlers keep
-// their usual path.
-void pollCompletion(id<MTLCommandBuffer> buffer) {
-  constexpr int kReadsPerCheck = 32;
-  constexpr auto kSpin = std::chrono::microseconds(500);
-  const auto deadline = std::chrono::steady_clock::now() + kSpin;
-  for (;;) {
-    for (int i = 0; i < kReadsPerCheck; ++i) {
-      if ([buffer status] >= MTLCommandBufferStatusCompleted) {
-        return;
-      }
-    }
-    if (std::chrono::steady_clock::now() >= deadline) {
-      return;
-    }
-    std::this_thread::yield();
-  }
-}
-
-} // namespace
-
 void MPSStream::commitAndWait() {
   if (_prevCommandBuffer) {
     // The previous command buffer (if exists) has already been committed,
@@ -165,7 +134,6 @@ void MPSStream::commitAndWait() {
 
   if (_commandBuffer) {
     [_commandBuffer commit];
-    pollCompletion(_commandBuffer);
     [_commandBuffer waitUntilCompleted];
     [_commandBuffer release];
     _commandBuffer = nil;
