@@ -432,6 +432,7 @@ kernel void extremum_chunk(device float* out [[buffer(0)]],
 // and the final scaling cost one global read and one global write. Each SIMD
 // group owns the cache region at its own offset, and every lane reads back only
 // the positions it wrote, so no barrier stands between the passes.
+[[host_name("softmax_row_float")]]
 kernel void softmax_row(device float* out [[buffer(0)]],
                         constant float* src [[buffer(1)]],
                         constant RowSizes& sizes [[buffer(2)]],
@@ -523,10 +524,6 @@ kernel void softmax_row(device float* out [[buffer(0)]],
                                    uint group);
 
 REGISTER_ROW_SUM(float)
-template [[host_name("softmax_row_float")]] kernel void
-    softmax_row(device float* out, constant float* src,
-                constant RowSizes& sizes, threadgroup float* cache,
-                uint tptg, uint tgid, uint lane, uint group);
 REGISTER_SUM_CHUNK(float)
 REGISTER_EXTREMUM_CHUNK(maxchunk, arg_max<float>)
 REGISTER_EXTREMUM_CHUNK(minchunk, arg_min<float>)
