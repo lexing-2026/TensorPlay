@@ -45,6 +45,14 @@ on:
         required: false
         type: string
         default: "layer_norm[64x1024],constant_pad_nd[64x64x64]"
+      runs_on:
+        description: Runner image used for the build and the measurements
+        required: false
+        type: choice
+        options:
+          - macos-14
+          - macos-15
+        default: macos-14
   schedule:
     - cron: "0 5 * * 1"
   pull_request:
@@ -77,7 +85,7 @@ jobs:
     with:
       build_name: tensorplay-mps-operator
       build_environment: mps-operator-benchmark
-      runs_on: macos-14
+      runs_on: ${{ inputs.runs_on || 'macos-14' }}
       python_version: "3.12"
       run_mps_benchmarks: true
       mps_benchmark_suite: ${{ inputs.test_mode || 'short' }}
