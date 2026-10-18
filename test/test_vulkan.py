@@ -400,6 +400,46 @@ class TestVulkanScaledDotProductAttention(unittest.TestCase):
         np.testing.assert_array_equal(got[:, :, 0, :], 0.0)
         self.assertFalse(np.isnan(got).any())
 
+    def test_sequences_past_the_image_axis_limit(self):
+        # A sequence longer than the device's 3-D image axis leaves the score
+        # matrix with no texture at all, so attention composes over linear
+        # storage: the two products are the batched kernels and the row
+        # reduction walks a score matrix in memory.
+        LONG = 20000
+        _sdpa_check(self, B=1, Hq=2, Hkv=2, Sq=4, Skv=LONG, D=8)
+        _sdpa_check(self, B=1, Hq=2, Hkv=2, Sq=4, Skv=LONG, D=8, causal=True)
+        _sdpa_check(
+            self, B=1, Hq=4, Hkv=2, Sq=4, Skv=LONG, D=8, gqa=True)
+        _sdpa_check(
+            self, B=1, Hq=2, Hkv=2, Sq=4, Skv=LONG, D=8, scale=0.125)
+        _sdpa_check(
+            self, B=1, Hq=2, Hkv=2, Sq=4, Skv=LONG, D=8,
+            dtype=tensorplay.float16, causal=True)
+        # The query range is the long axis instead: the same route, with the
+        # score rows spread past the limit.
+        _sdpa_check(self, B=1, Hq=1, Hkv=1, Sq=LONG, Skv=8, D=8, causal=True)
+
+    def test_linear_storage_masks(self):
+        LONG = 20000
+        rng = np.random.default_rng(21)
+        _sdpa_check(
+            self, B=1, Hq=2, Hkv=2, Sq=4, Skv=LONG, D=8,
+            mask=tensorplay.tensor(rng.random((4, LONG)) > 0.02))
+        _sdpa_check(
+            self, B=1, Hq=2, Hkv=2, Sq=4, Skv=LONG, D=8,
+            mask=tensorplay.tensor(
+                (rng.random((1, 2, 4, LONG)).astype(np.float32) * 0.5)))
+        # Grouped heads share a mask through the merged head and row axes.
+        _sdpa_check(
+            self, B=1, Hq=4, Hkv=2, Sq=4, Skv=LONG, D=8, gqa=True,
+            mask=tensorplay.tensor(rng.random((4, LONG)) > 0.02))
+        # A rejected row and a surviving one share the same key range.
+        dead = np.ones((4, LONG), dtype=bool)
+        dead[0] = False
+        _sdpa_check(
+            self, B=1, Hq=1, Hkv=1, Sq=4, Skv=LONG, D=8,
+            mask=tensorplay.tensor(dead))
+
 
 def _rope_tables(head_dim, rows):
     half = head_dim // 2
