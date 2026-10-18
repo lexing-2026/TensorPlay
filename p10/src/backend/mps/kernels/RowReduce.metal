@@ -337,6 +337,96 @@ kernel void logsumexp_row(device T* out [[buffer(0)]],
   }
 }
 
+// A row far longer than one group can walk would leave every group but one
+// idle in the per-row kernels above. The chunk kernels split such a row into
+// fixed-size chunks, one group per chunk, and write one partial per chunk; the
+// host folds the partials with a per-row kernel in a second pass. The
+// accumulation inside a chunk is the one row_sum_inner uses, so a chunk costs
+// the same per-element work a whole row does -- there are just enough groups
+// to fill the device.
+template <typename T>
+kernel void sum_chunk(device T* out [[buffer(0)]],
+                      constant T* src [[buffer(1)]],
+                      constant uint& numel [[buffer(2)]],
+                      constant uint& chunk [[buffer(3)]],
+                      uint tptg [[threads_per_threadgroup]],
+                      uint tgid [[threadgroup_position_in_grid]],
+                      uint lane [[thread_index_in_simdgroup]],
+                      uint group [[simdgroup_index_in_threadgroup]]) {
+  const uint gid = tgid * (tptg / simdgroup_size) + group;
+  const uint first = gid * chunk;
+  if (first >= numel) {
+    return;
+  }
+  const uint last = min(first + chunk, numel);
+  const uint count = last - first;
+
+  metal::array<T, kSumChains> acc;
+#pragma unroll
+  for (uint j = 0; j < kSumChains; ++j) {
+    acc[j] = T(0);
+  }
+  const uint stride = simdgroup_size * kSumChains;
+  const uint whole = (count / stride) * stride;
+  for (uint base = first + lane * kSumChains; base < first + whole;
+       base += stride) {
+#pragma unroll
+    for (uint j = 0; j < kSumChains; ++j) {
+      acc[j] += src[base + j];
+    }
+  }
+  for (uint i = first + whole + lane; i < last; i += simdgroup_size) {
+    acc[0] += src[i];
+  }
+  T total = acc[0];
+#pragma unroll
+  for (uint j = 1; j < kSumChains; ++j) {
+    total += acc[j];
+  }
+  total = simd_sum(total);
+  if (lane == 0) {
+    out[gid] = total;
+  }
+}
+
+// The extremum of one chunk, folded between the lanes with the same rule the
+// row scan uses, so a NaN anywhere in the row survives to the partial and the
+// later fold keeps it.
+template <typename Op>
+kernel void extremum_chunk(device float* out [[buffer(0)]],
+                           constant float* src [[buffer(1)]],
+                           constant uint& numel [[buffer(2)]],
+                           constant uint& chunk [[buffer(3)]],
+                           uint tptg [[threads_per_threadgroup]],
+                           uint tgid [[threadgroup_position_in_grid]],
+                           uint lane [[thread_index_in_simdgroup]],
+                           uint group [[simdgroup_index_in_threadgroup]]) {
+  const uint gid = tgid * (tptg / simdgroup_size) + group;
+  const uint first = gid * chunk;
+  if (first >= numel) {
+    return;
+  }
+  const uint last = min(first + chunk, numel);
+
+  float held = Op::identity();
+  for (uint i = first + lane; i < last; i += simdgroup_size) {
+    const float candidate = src[i];
+    if (Op::replace(candidate, held)) {
+      held = candidate;
+    }
+  }
+#pragma unroll
+  for (uint mask = 1; mask < simdgroup_size; mask <<= 1) {
+    const float rival = simd_shuffle_xor(held, mask);
+    if (Op::replace(rival, held)) {
+      held = rival;
+    }
+  }
+  if (lane == 0) {
+    out[gid] = held;
+  }
+}
+
 // Float is the only storage type the extrema read: an operand of another type
 // reduces in a type of its own, which the graph path builds around the
 // reduction. The predicates answer for float and for bool, the two the suite
@@ -347,6 +437,18 @@ kernel void logsumexp_row(device T* out [[buffer(0)]],
   row_sum_inner<DTYPE>(device DTYPE* out, constant DTYPE* src,          \
                        constant RowSizes& sizes, constant float& divisor,  \
                        uint tptg, uint tgid, uint lane, uint group);
+
+#define REGISTER_SUM_CHUNK(DTYPE)                                       \
+  template [[host_name("sumchunk_" #DTYPE)]] kernel void                \
+  sum_chunk<DTYPE>(device DTYPE* out, constant DTYPE* src,              \
+                   constant uint& numel, constant uint& chunk,          \
+                   uint tptg, uint tgid, uint lane, uint group);
+
+#define REGISTER_EXTREMUM_CHUNK(HOST_NAME, OP)                          \
+  template [[host_name(#HOST_NAME "_float")]] kernel void               \
+  extremum_chunk<OP>(device float* out, constant float* src,            \
+                     constant uint& numel, constant uint& chunk,        \
+                     uint tptg, uint tgid, uint lane, uint group);
 
 #define REGISTER_ARG_REDUCTION(HOST_NAME, OP)                           \
   template [[host_name(#HOST_NAME "_float")]] kernel void               \
@@ -377,6 +479,9 @@ kernel void logsumexp_row(device T* out [[buffer(0)]],
                                    uint group);
 
 REGISTER_ROW_SUM(float)
+REGISTER_SUM_CHUNK(float)
+REGISTER_EXTREMUM_CHUNK(maxchunk, arg_max<float>)
+REGISTER_EXTREMUM_CHUNK(minchunk, arg_min<float>)
 template [[host_name("logsumexp_row_float")]] kernel void
     logsumexp_row<float>(device float* out, constant float* src,
                          constant RowSizes& sizes, uint tptg, uint tgid,

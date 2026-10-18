@@ -278,6 +278,17 @@ class TestMPSSoftmaxReduction(unittest.TestCase):
         self.assertEqual(tp.amin(x).item(), 0)
         self.assertEqual(tp.sum(x, dim=1, keepdim=True).cpu().tolist(), [[3], [12]])
 
+    def test_reduce_all_long_operand(self):
+        # Past the chunk threshold, with a final chunk that is short: the call
+        # splits the run across groups and folds their partials into one value.
+        n = 100003
+        x = tp.arange(n, dtype=tp.float32, device="mps") % 17 - 8
+        xc = x.cpu()
+        self.assertEqual(tp.sum(x).item(), xc.sum().item())
+        self.assertEqual(tp.max(x).item(), xc.max().item())
+        self.assertEqual(tp.min(x).item(), xc.min().item())
+        self.assertAlmostEqual(tp.mean(x).item(), xc.mean().item(), places=5)
+
     def test_mean_dims(self):
         x = tp.arange(24, dtype=tp.float32, device="mps").reshape(2, 3, 4)
         for dims in ((0,), (1,), (-1,), (0, 2)):

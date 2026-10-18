@@ -180,6 +180,20 @@ std::optional<Tensor> rowSumShader(const Tensor& self,
                                    const std::vector<int64_t>& out_shape,
                                    float divisor);
 
+// The sum, or the extremum, of one long unit-stride float operand whose result
+// holds a single value. The operand is split into fixed-size chunks, one
+// SIMD group each, and the partials are folded by a second dispatch, so the
+// call fills the device instead of leaving every group but one idle as the
+// per-row kernels do on a single long row. `divisor` above zero divides the
+// final value, which is how an average costs no more than a sum. Returns
+// std::nullopt for an operand the shader cannot address or one short enough
+// that a single group already reads it at full speed; the caller then takes
+// the per-row path or the graph.
+std::optional<Tensor> chunkedRowSumShader(
+    const Tensor& self, const std::vector<int64_t>& out_shape, float divisor);
+std::optional<Tensor> chunkedRowExtremumShader(
+    const Tensor& self, const std::vector<int64_t>& out_shape, bool is_max);
+
 // log(sum(exp(x - max))) + max over the innermost axis of a contiguous float
 // operand, written in `out_shape` (one value per row). The maximum and the
 // shifted exponential sum are folded in one launch by the same SIMD group that

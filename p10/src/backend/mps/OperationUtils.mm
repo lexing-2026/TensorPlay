@@ -1180,6 +1180,141 @@ std::optional<Tensor> rowExtremumShader(const Tensor& self,
   return output;
 }
 
+namespace {
+
+// A reduce-everything call over one long row would occupy a single group in
+// the per-row kernels. Past this many elements the operand is split into
+// chunks, one group per chunk, and the partials are folded by a second
+// dispatch; below it one group already reads the row fast enough that the
+// extra launch would not pay.
+constexpr uint32_t kChunkedRowMin = 32768;
+constexpr uint32_t kChunkedRowChunk = 8192;
+
+// The span of a reduce-everything call: one unit-stride run of floats and a
+// result that holds one value.
+bool wholeRowSpan(const Tensor& self, DType in_dtype,
+                  const std::vector<int64_t>& out_shape, uint32_t& numel) {
+  if (!self.device().is_mps() || self.dtype() != in_dtype) {
+    return false;
+  }
+  if (!self.is_contiguous() || self.storage_offset() != 0) {
+    return false;
+  }
+  int64_t out_numel = 1;
+  for (int64_t size : out_shape) {
+    out_numel *= size;
+  }
+  const int64_t elements = self.numel();
+  if (out_numel != 1 || elements < kChunkedRowMin ||
+      elements > std::numeric_limits<uint32_t>::max() - kChunkedRowChunk) {
+    return false;
+  }
+  numel = static_cast<uint32_t>(elements);
+  return true;
+}
+
+// Encodes one group per chunk over `numel` consecutive elements, writing one
+// partial per chunk.
+void dispatchChunkReduce(MTLComputePipelineState_t pso, void* out_buf,
+                         void* in_buf, uint32_t numel, uint32_t chunk,
+                         uint32_t groups) {
+  const uint32_t threads =
+      std::min(kRowReduceThreads,
+               static_cast<uint32_t>([pso maxTotalThreadsPerThreadgroup]) /
+                   kRowReduceSimdgroup * kRowReduceSimdgroup);
+  const uint32_t groups_per_threadgroup = threads / kRowReduceSimdgroup;
+  const uint32_t threadgroups =
+      (groups + groups_per_threadgroup - 1) / groups_per_threadgroup;
+  MPSStream* stream = getCurrentMPSStream();
+  dispatch_sync_with_rethrow(stream->queue(), ^() {
+    @autoreleasepool {
+      auto encoder = stream->commandEncoder();
+      [encoder setComputePipelineState:pso];
+      [encoder setBuffer:(__bridge id<MTLBuffer>)out_buf offset:0 atIndex:0];
+      [encoder setBuffer:(__bridge id<MTLBuffer>)in_buf offset:0 atIndex:1];
+      [encoder setBytes:&numel length:sizeof(numel) atIndex:2];
+      [encoder setBytes:&chunk length:sizeof(chunk) atIndex:3];
+      [encoder dispatchThreads:MTLSizeMake(threadgroups * threads, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+    }
+  });
+}
+
+} // namespace
+
+std::optional<Tensor> chunkedRowSumShader(const Tensor& self,
+                                          const std::vector<int64_t>& out_shape,
+                                          float divisor) {
+  uint32_t numel = 0;
+  if (!wholeRowSpan(self, DType::Float32, out_shape, numel)) {
+    return std::nullopt;
+  }
+  const uint32_t groups =
+      p10::metal::ceil_div<uint32_t>(numel, kChunkedRowChunk);
+  MTLComputePipelineState_t chunk_pso = shaderPipelineNamed("sumchunk_float");
+  MTLComputePipelineState_t fold_pso = shaderPipelineNamed("rowsum_float");
+  if (!chunk_pso || !fold_pso) {
+    return std::nullopt;
+  }
+  void* in_buf = getMTLBufferFromPointer(self.data_ptr());
+  if (!in_buf) {
+    return std::nullopt;
+  }
+  // The partials live only until the two launches are encoded; the serial
+  // queue keeps any later reuse of their block behind both of them.
+  Tensor partials = emptyMPS({static_cast<int64_t>(groups)}, DType::Float32,
+                             self.device());
+  void* partial_buf = getMTLBufferFromPointer(partials.data_ptr());
+  if (!partial_buf) {
+    return std::nullopt;
+  }
+  Tensor output = emptyMPS(out_shape, DType::Float32, self.device());
+  void* out_buf = getMTLBufferFromPointer(output.data_ptr());
+  if (!out_buf) {
+    return std::nullopt;
+  }
+  dispatchChunkReduce(chunk_pso, partial_buf, in_buf, numel, kChunkedRowChunk,
+                      groups);
+  dispatchRowReduce(fold_pso, out_buf, partial_buf, 1, groups, divisor);
+  return output;
+}
+
+std::optional<Tensor> chunkedRowExtremumShader(
+    const Tensor& self, const std::vector<int64_t>& out_shape, bool is_max) {
+  uint32_t numel = 0;
+  if (!wholeRowSpan(self, DType::Float32, out_shape, numel)) {
+    return std::nullopt;
+  }
+  const uint32_t groups =
+      p10::metal::ceil_div<uint32_t>(numel, kChunkedRowChunk);
+  MTLComputePipelineState_t chunk_pso =
+      shaderPipelineNamed(is_max ? "maxchunk_float" : "minchunk_float");
+  MTLComputePipelineState_t fold_pso =
+      shaderPipelineNamed(is_max ? "rowmax_float" : "rowmin_float");
+  if (!chunk_pso || !fold_pso) {
+    return std::nullopt;
+  }
+  void* in_buf = getMTLBufferFromPointer(self.data_ptr());
+  if (!in_buf) {
+    return std::nullopt;
+  }
+  Tensor partials = emptyMPS({static_cast<int64_t>(groups)}, DType::Float32,
+                             self.device());
+  void* partial_buf = getMTLBufferFromPointer(partials.data_ptr());
+  if (!partial_buf) {
+    return std::nullopt;
+  }
+  Tensor output = emptyMPS(out_shape, DType::Float32, self.device());
+  void* out_buf = getMTLBufferFromPointer(output.data_ptr());
+  if (!out_buf) {
+    return std::nullopt;
+  }
+  dispatchChunkReduce(chunk_pso, partial_buf, in_buf, numel, kChunkedRowChunk,
+                      groups);
+  dispatchRowReduce(fold_pso, out_buf, partial_buf, 1, groups, std::nullopt);
+  return output;
+}
+
 std::optional<std::tuple<Tensor, Tensor>> rowValueIndexShader(
     const Tensor& self, const std::vector<int64_t>& out_shape, bool is_max) {
   uint32_t rows = 0;

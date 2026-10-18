@@ -138,6 +138,27 @@ Tensor reductionOp(const Tensor& self, const std::vector<int64_t>& dims,
     }
   }
 
+  // A reduction over every axis of one long contiguous float operand fills the
+  // device by splitting the run into chunks and folding the partials; the
+  // per-row kernels below would serve it with a single group.
+  if (static_cast<int64_t>(axes.size()) == self.dim() &&
+      self.dtype() == DType::Float32 && out_dtype == DType::Float32 &&
+      acc_dtype == DType::Float32) {
+    if (kind == ReductionKind::SUM || kind == ReductionKind::MEAN) {
+      const float divisor = kind == ReductionKind::MEAN
+                                ? static_cast<float>(self.numel())
+                                : 0.0f;
+      if (auto result = chunkedRowSumShader(self, out_shape, divisor)) {
+        return *result;
+      }
+    } else if (kind == ReductionKind::MAX || kind == ReductionKind::MIN) {
+      if (auto result = chunkedRowExtremumShader(
+              self, out_shape, kind == ReductionKind::MAX)) {
+        return *result;
+      }
+    }
+  }
+
   // A reduction over the last axis of a float operand is one row per SIMD
   // group, so the operand goes straight from the storage it is in and nothing
   // stands between the read and the write. A call the shader cannot address
