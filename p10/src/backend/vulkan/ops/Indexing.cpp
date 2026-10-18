@@ -55,10 +55,23 @@ api::vTensor upload_index_payload(const Tensor& indices) {
           .contiguous();
 
   api::vTensor v{context, {flat_cpu.numel()}, DType::Int32};
-  Tensor flat_packed = utils::nchw_to_nc4hw(flat_cpu);
-  utils::upload_host_bytes(
-      v, flat_packed.impl()->storage().data(),
-      flat_packed.numel() * flat_packed.itemsize());
+  // The payload layout follows the storage: a texel holds one index in its .x
+  // lane, so the packed host bytes are the texel-linear image, while a linear
+  // payload is one int per element in row order.  Uploading the packed bytes
+  // over a linear allocation would also write past it, since the host repack
+  // is four ints per index.
+  if (v.storage_type() == api::StorageType::BUFFER) {
+    utils::upload_host_bytes(
+        v,
+        flat_cpu.impl()->storage().data(),
+        flat_cpu.numel() * flat_cpu.itemsize());
+  } else {
+    Tensor flat_packed = utils::nchw_to_nc4hw(flat_cpu);
+    utils::upload_host_bytes(
+        v,
+        flat_packed.impl()->storage().data(),
+        flat_packed.numel() * flat_packed.itemsize());
+  }
   return v;
 }
 
