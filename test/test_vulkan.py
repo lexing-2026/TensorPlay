@@ -2426,6 +2426,182 @@ class TestVulkanHalfGather(unittest.TestCase):
             F.index_select(device, 0, sel)
 
 
+class TestVulkanHalfCat(unittest.TestCase):
+    # Concatenating half payloads shares a destination word between two lanes,
+    # so a join at an odd element count leaves one word owned by two passes.
+    # Whole numbers keep a lane taken from the wrong side of a join visible.
+
+    @staticmethod
+    def _flat(count):
+        return (np.arange(count, dtype=np.float32) % 2048 - 1024).astype(
+            np.float16)
+
+    @staticmethod
+    def _grid(rows, cols):
+        return (np.arange(rows * cols, dtype=np.float32) % 2048 - 1024).astype(
+            np.float16).reshape(rows, cols)
+
+    def _cat(self, parts, dim):
+        import tensorplay.functional as F
+        device = [tensorplay.from_numpy(p.copy()).to("vulkan") for p in parts]
+        return F.cat(device, dim).cpu().numpy()
+
+    def test_half_cat_over_linear_storage(self):
+        # A 1-d join longer than the image axis limit lands in linear storage,
+        # and the odd totals leave the last word half filled.
+        for lengths in ((20000, 19999), (10000, 10000, 10001)):
+            parts = [self._flat(n) for n in lengths]
+            np.testing.assert_array_equal(
+                self._cat(parts, 0).view(np.uint16),
+                np.concatenate(parts).view(np.uint16),
+                err_msg=f"half 1-d cat of {lengths}")
+
+    def test_half_cat_with_a_join_inside_a_word(self):
+        # 1001 rows of 37 columns ends at element 37037, so the word holding
+        # elements 37036 and 37037 is written by two different passes.
+        for lengths in ((1001, 999), (1001, 999, 1000)):
+            parts = [self._grid(n, 37) for n in lengths]
+            np.testing.assert_array_equal(
+                self._cat(parts, 0).view(np.uint16),
+                np.concatenate(parts, 0).view(np.uint16),
+                err_msg=f"half row cat of {lengths} rows x 37")
+
+    def test_half_cat_along_the_width_axis(self):
+        # Joining on the width axis puts the split inside every row, and a row
+        # of 17 halfs shifts which word the next row's join lands in.
+        a, b = self._grid(20000, 8), self._grid(20000, 9)
+        np.testing.assert_array_equal(
+            self._cat([a, b], 1).view(np.uint16),
+            np.concatenate([a, b], 1).view(np.uint16),
+            err_msg="half cat along the width axis")
+
+    def test_half_cat_over_texel_storage(self):
+        for dim, shapes in ((0, ((64, 33), (32, 33))),
+                            (1, ((64, 33), (64, 34)))):
+            parts = [self._grid(*shape) for shape in shapes]
+            np.testing.assert_array_equal(
+                self._cat(parts, dim).view(np.uint16),
+                np.concatenate(parts, dim).view(np.uint16),
+                err_msg=f"half cat of {shapes} along dim {dim}")
+
+    def test_half_glu_over_both_storages(self):
+        import tensorplay.functional as F
+        # The gate is a sigmoid, so the check is on values rather than bits; the
+        # split itself still has to land on the right half of every word.
+        for rows, cols, dim, label in (
+                (20000, 34, 0, "linear"),
+                (64, 68, 1, "texel")):
+            half_rows, half_cols = (rows, cols // 2) if dim else (rows // 2, cols)
+            parts = [self._grid(half_rows, half_cols) for _ in range(2)]
+            joined = np.concatenate(parts, dim)
+            device = F.glu(
+                tensorplay.from_numpy(joined.copy()).to("vulkan"),
+                dim).cpu().numpy()
+            span = joined.shape[dim] // 2
+            first = np.take(joined, np.arange(0, span), axis=dim).astype(
+                np.float32)
+            second = np.take(joined, np.arange(span, 2 * span), axis=dim).astype(
+                np.float32)
+            # A gate of -1024 saturates: the sigmoid is zero, which numpy
+            # reports as an overflow in the exponential.
+            with np.errstate(over="ignore"):
+                want = second / (1.0 + np.exp(-first))
+            self.assertEqual(device.shape, want.shape, msg=label)
+            np.testing.assert_allclose(
+                device.astype(np.float32), want, rtol=2e-3, atol=1e-3,
+                err_msg=f"half glu over {label} storage")
+
+
+class TestVulkanHalfLinearViews(unittest.TestCase):
+    # A strided view of a half payload has to gather 16-bit fields: a word
+    # holding two elements is read whole and split, and an odd start or step
+    # puts the two lanes a view needs in different words.
+
+    @staticmethod
+    def _flat(count):
+        return (np.arange(count, dtype=np.float32) % 2048 - 1024).astype(
+            np.float16)
+
+    @staticmethod
+    def _grid(rows, cols):
+        return (np.arange(rows * cols, dtype=np.float32) % 2048 - 1024).astype(
+            np.float16).reshape(rows, cols)
+
+    def test_half_slices_of_a_linear_payload(self):
+        # 70000 elements is past the image axis limit, so the source lies in
+        # linear storage and each slice gathers from there.
+        host = self._flat(70000)
+        device = tensorplay.from_numpy(host.copy()).to("vulkan")
+        for start, stop, step in ((0, 20001, 1), (1, 20001, 1), (3, 16385, 2),
+                                  (0, 70000, 3), (7, 7 + 16383, 4)):
+            np.testing.assert_array_equal(
+                device[start:stop:step].cpu().numpy().view(np.uint16),
+                host[start:stop:step].view(np.uint16),
+                err_msg=f"half slice [{start}:{stop}:{step}]")
+
+    def test_half_slice_into_a_texel_output(self):
+        # A short slice of a linear payload has an image form, so the gather
+        # writes four half lanes per texel instead of one word per invocation.
+        host = self._flat(70000)
+        device = tensorplay.from_numpy(host.copy()).to("vulkan")
+        np.testing.assert_array_equal(
+            device[10:4011].cpu().numpy().view(np.uint16),
+            host[10:4011].view(np.uint16),
+            err_msg="half slice gathered into an image")
+
+    def test_half_views_of_a_linear_grid(self):
+        # A 20000 x 37 table is linear through its height axis; the row slice
+        # stays contiguous while the column slice reads every other field of
+        # words shared with the neighbouring column.
+        host = self._grid(20000, 37)
+        device = tensorplay.from_numpy(host.copy()).to("vulkan")
+        np.testing.assert_array_equal(
+            device[1:17001].cpu().numpy().view(np.uint16),
+            host[1:17001].view(np.uint16),
+            err_msg="half row slice of a linear grid")
+        np.testing.assert_array_equal(
+            device[:, 3:34:2].cpu().numpy().view(np.uint16),
+            host[:, 3:34:2].view(np.uint16),
+            err_msg="half strided column slice of a linear grid")
+        np.testing.assert_array_equal(
+            device[9999].cpu().numpy().view(np.uint16),
+            host[9999].view(np.uint16),
+            err_msg="half row selection of a linear grid")
+
+    def test_half_transpose_of_a_linear_grid(self):
+        host = self._grid(20000, 37)
+        device = tensorplay.from_numpy(host.copy()).to("vulkan")
+        np.testing.assert_array_equal(
+            device.t().cpu().numpy().view(np.uint16),
+            host.T.view(np.uint16),
+            err_msg="half transpose of a linear grid")
+
+    def test_half_reshape_across_storages(self):
+        host = self._flat(70000)
+        device = tensorplay.from_numpy(host.copy()).to("vulkan")
+        np.testing.assert_array_equal(
+            device[:4004].reshape(28, 143).cpu().numpy().view(np.uint16),
+            host[:4004].reshape(28, 143).view(np.uint16),
+            err_msg="half reshape of a linear payload into an image")
+        grid = self._grid(20000, 37)
+        vk_grid = tensorplay.from_numpy(grid.copy()).to("vulkan")
+        np.testing.assert_array_equal(
+            vk_grid[:, 0].reshape(grid.shape[0]).cpu().numpy().view(np.uint16),
+            grid[:, 0].view(np.uint16),
+            err_msg="half strided column re-shaped flat")
+
+    def test_half_expand_from_texel_into_linear_storage(self):
+        # A broadcast whose extents pass the axis limit is materialized out of
+        # an image into a linear half payload; the re-read of one position per
+        # lane is what a zero stride means.
+        host = self._grid(1, 4)
+        device = tensorplay.from_numpy(host.copy()).to("vulkan")
+        np.testing.assert_array_equal(
+            device.expand(20000, 4).cpu().numpy().view(np.uint16),
+            np.repeat(host, 20000, axis=0).view(np.uint16),
+            err_msg="half broadcast into linear storage")
+
+
 if __name__ == "__main__":
     unittest.main()
 
