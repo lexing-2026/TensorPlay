@@ -256,6 +256,8 @@ const char* linear_cast_shader(const DType from, const DType to) {
     switch (from) {
       case DType::Int32:
         return "cast_i32_float_buffer";
+      case DType::Int64:
+        return "cast_i64_float_buffer";
       case DType::Float16:
         return "cast_float16_float_buffer";
       case DType::Int8:
@@ -282,14 +284,68 @@ const char* linear_cast_shader(const DType from, const DType to) {
         return nullptr;
     }
   }
+  // A 64-bit code shares an element with the word above it, so both directions
+  // between it and a 32-bit one move whole pairs.  Nothing converts into or out
+  // of a half payload: two lanes already share a word there, and a wide element
+  // would need three of them.
+  if (from == DType::Int64) {
+    switch (to) {
+      case DType::Int32:
+        return "cast_i64_i32_buffer";
+      default:
+        return nullptr;
+    }
+  }
+  if (to == DType::Int64) {
+    switch (from) {
+      case DType::Int32:
+        return "cast_i32_i64_buffer";
+      default:
+        return nullptr;
+    }
+  }
   return nullptr;
 }
 
 // Elements one invocation owns in a linear payload: a half-precision payload
-// packs two lanes per 32-bit word, every other element width fills a word with
-// four.  The narrower side of a pair decides.
+// packs two lanes per 32-bit word, a 64-bit code takes a pair of words but
+// still groups four to an invocation, and every other element width fills a
+// word with four.  The narrower side of a pair decides.
 uint32_t linear_payload_lanes(const DType dtype) {
   return dtype == DType::Float16 ? 2u : 4u;
+}
+
+//
+// Converts a payload into another element type over linear storage.  Both
+// operands have to be linear already: the storage names no texel format, so the
+// kernel reads and writes plain words and the element count guards the lanes
+// past the logical end.
+void submit_linear_cast(
+    api::Context* const context,
+    const api::vTensor& src,
+    api::vTensor& dst,
+    const char* const shader) {
+  const uint32_t elements = static_cast<uint32_t>(dst.numel());
+  const uint32_t source_lanes = linear_payload_lanes(src.dtype());
+  const uint32_t destination_lanes = linear_payload_lanes(dst.dtype());
+  const uint32_t lanes =
+      source_lanes < destination_lanes ? source_lanes : destination_lanes;
+  const struct CastBlock final {
+    uint32_t buf_length;
+    uint32_t fill0;
+    uint32_t fill1;
+    uint32_t fill2;
+  } block{elements, 0u, 0u, 0u};
+  api::UniformParamsBuffer params(context, block);
+  api::PipelineBarrier barrier{};
+  context->submit_compute_job(
+      VK_KERNEL_FROM_STR(shader), barrier,
+      {api::utils::div_up(elements, lanes), 1u, 1u}, {256u, 1u, 1u},
+      VK_NULL_HANDLE,
+      dst.buffer(
+          barrier, api::PipelineStage::COMPUTE, api::MemoryAccessType::WRITE),
+      src.buffer(barrier, api::PipelineStage::COMPUTE),
+      params.buffer());
 }
 
 } // namespace
@@ -321,7 +377,36 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
       // turns words into texels, the repack turns texels into words.  The
       // tensor that owns a gathered payload has to outlive the view of it,
       // because a view over an existing payload only points at the storage.
+      Tensor src_payload = src;
+      Tensor narrowed;
       Tensor gathered;
+
+      // A code wider than a word has no texel form, and the gather that carries
+      // a linear payload into an image reads one word per element, so such a
+      // payload converts while both sides are still linear.  The result is
+      // named by the destination's element type, which the gather does read.
+      if (!linear_destination &&
+          v_src.storage_type() == api::StorageType::BUFFER &&
+          v_src.dtype() != v_self.dtype()) {
+        TP_CHECK(src.shape() == self.shape(),
+                 "Vulkan dtype conversion requires equal shapes");
+        const char* const shader =
+            linear_cast_shader(v_src.dtype(), v_self.dtype());
+        TP_CHECK(
+            shader != nullptr,
+            "Unsupported Vulkan dtype conversion from a wide payload");
+        api::vTensor v_scratch{
+            context,
+            static_cast<std::vector<int64_t>>(self.shape()),
+            v_self.dtype(),
+            api::StorageType::BUFFER,
+            api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+        submit_linear_cast(context, v_src, v_scratch, shader);
+        narrowed = convert(v_scratch);
+        v_src = convert(narrowed);
+        src_payload = narrowed;
+      }
+
       if (linear_destination !=
           (v_src.storage_type() == api::StorageType::BUFFER)) {
         // The gathered payload is sized from the source, and the transfer that
@@ -336,7 +421,7 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
           const std::vector<int64_t> sizes(
               v_src.sizes().begin(), v_src.sizes().end());
           gathered = materialize_view(
-              src,
+              src_payload,
               sizes,
               SizesAndStrides::compute_contiguous_strides(sizes),
               0);
@@ -350,37 +435,14 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
 
         // A linear payload converts through its own kernels: the storage has
         // no texel format to name the element type, so a half payload keeps
-        // two lanes per 32-bit word and a byte-packed one four.
+        // two lanes per 32-bit word and a wide code takes a pair of them.
         if (linear_destination) {
           const char* buffer_shader =
               linear_cast_shader(v_src.dtype(), v_self.dtype());
           TP_CHECK(
               buffer_shader != nullptr,
               "Unsupported Vulkan dtype conversion over linear storage");
-          const uint32_t elements = static_cast<uint32_t>(v_self.numel());
-          const uint32_t source_lanes = linear_payload_lanes(v_src.dtype());
-          const uint32_t destination_lanes =
-              linear_payload_lanes(v_self.dtype());
-          const uint32_t lanes =
-              source_lanes < destination_lanes ? source_lanes
-                                               : destination_lanes;
-          const struct CastBlock final {
-            uint32_t buf_length;
-            uint32_t fill0;
-            uint32_t fill1;
-            uint32_t fill2;
-          } block{elements, 0u, 0u, 0u};
-          api::UniformParamsBuffer params(context, block);
-          api::PipelineBarrier barrier{};
-          context->submit_compute_job(
-              VK_KERNEL_FROM_STR(buffer_shader), barrier,
-              {api::utils::div_up(elements, lanes), 1u, 1u}, {256u, 1u, 1u},
-              VK_NULL_HANDLE,
-              v_self.buffer(
-                  barrier, api::PipelineStage::COMPUTE,
-                  api::MemoryAccessType::WRITE),
-              v_src.buffer(barrier, api::PipelineStage::COMPUTE),
-              params.buffer());
+          submit_linear_cast(context, v_src, v_self, buffer_shader);
           return self;
         }
 
