@@ -32,9 +32,11 @@ int64_t wrap_dim(int64_t dim, int64_t ndim) {
   return d;
 }
 
-// Returns a contiguous int64 copy of `index` with negative indices wrapped
-// and every entry checked against `dim_size`. The returned tensor is what the
-// gather/scatter shaders read, so they can assume all entries are in bounds.
+// Returns a contiguous int64 copy of `index` with every entry checked against
+// `dim_size`. Short indices are scanned on the host; longer ones are checked
+// by a kernel, whose result the host reads back before the gather/scatter
+// launch. The kernels wrap negative entries, so a passing check guarantees
+// every index addresses the dimension.
 Tensor normalize_index(const Tensor& index, int64_t dim_size) {
   Tensor idx = index;
   if (idx.dtype() != DType::Int64) {
@@ -42,26 +44,28 @@ Tensor normalize_index(const Tensor& index, int64_t dim_size) {
   }
   idx = idx.contiguous();
   const int64_t n = idx.numel();
-  synchronizeHostAccess();
-  const int64_t* p = idx.data_ptr<int64_t>();
-  for (int64_t i = 0; i < n; ++i) {
-    int64_t v = p[i];
-    if (v < 0) v += dim_size;
-    if (v < 0 || v >= dim_size) {
-      TP_THROW(IndexError, "index ", p[i], " is out of bounds for dimension ",
-               dim_size);
-    }
+  if (n == 0) {
+    return idx;
   }
-  return idx;
-}
+  constexpr int64_t kHostScanLimit = 4096;
+  if (n <= kHostScanLimit) {
+    synchronizeHostAccess();
+    const int64_t* p = idx.data_ptr<int64_t>();
+    for (int64_t i = 0; i < n; ++i) {
+      const int64_t v = p[i];
+      if (v < -dim_size || v >= dim_size) {
+        TP_THROW(IndexError, "index ", v, " is out of bounds for dimension ",
+                 dim_size);
+      }
+    }
+    return idx;
+  }
 
-// Dispatches a dense indexing kernel that reads one element of `input` per
-// output element. `length` is the number of threads (output numel for
-// index_select/gather, index numel for scatter).
-void dispatch_indexing(const std::string& kernel, const Tensor& output,
-                       const Tensor& input, const Tensor& index,
-                       int64_t inner, int64_t dim_size, int64_t idx_dim,
-                       int64_t length) {
+  // The flag tensor doubles as the readback: out[0] becomes nonzero and out[1]
+  // holds the first offending value a failing thread reports.
+  Tensor flags = Tensor::zeros({2}, DType::Int64, idx.device());
+  const std::string kernel =
+      "index_bounds_check_" + scalarToMetalTypeString(idx.dtype());
   auto pso = lib.getPipelineStateForFunc(kernel);
   MPSStream* stream = getCurrentMPSStream();
   dispatch_sync_with_rethrow(stream->queue(), ^() {
@@ -69,8 +73,39 @@ void dispatch_indexing(const std::string& kernel, const Tensor& output,
       stream->endKernelCoalescing();
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:pso];
+      mtl_setArgs(encoder, idx, dim_size, flags);
+      mtl_dispatch1DJob(encoder, pso, static_cast<NSUInteger>(n));
+      stream->synchronize(SyncType::COMMIT_AND_WAIT);
+    }
+  });
+  synchronizeHostAccess();
+  const int64_t* report = flags.data_ptr<int64_t>();
+  if (report[0] != 0) {
+    TP_THROW(IndexError, "index ", report[1],
+             " is out of bounds for dimension ", dim_size);
+  }
+  return idx;
+}
+
+// Dispatches a dense indexing kernel that reads one element of `input` per
+// output element. The grid is (inner, indexed dim, outer), the layout the
+// kernels address directly.
+void dispatch_indexing(const std::string& kernel, const Tensor& output,
+                       const Tensor& input, const Tensor& index,
+                       int64_t inner, int64_t dim_size, int64_t idx_dim,
+                       int64_t length) {
+  auto pso = lib.getPipelineStateForFunc(kernel);
+  const int64_t outer = length / (inner * idx_dim);
+  MPSStream* stream = getCurrentMPSStream();
+  dispatch_sync_with_rethrow(stream->queue(), ^() {
+    @autoreleasepool {
+      stream->endKernelCoalescing();
+      auto encoder = stream->commandEncoder();
+      [encoder setComputePipelineState:pso];
       mtl_setArgs(encoder, output, input, index, inner, dim_size, idx_dim);
-      mtl_dispatch1DJob(encoder, pso, static_cast<NSUInteger>(length));
+      mtl_dispatch3DJob(encoder, pso, static_cast<NSUInteger>(inner),
+                        static_cast<NSUInteger>(idx_dim),
+                        static_cast<NSUInteger>(outer));
       stream->synchronize(SyncType::COMMIT);
     }
   });
@@ -83,6 +118,7 @@ void dispatch_scatter_value(const std::string& kernel, const Tensor& output,
                             T value, const Tensor& index, int64_t inner,
                             int64_t out_dim, int64_t idx_dim) {
   auto pso = lib.getPipelineStateForFunc(kernel);
+  const int64_t outer = index.numel() / (inner * idx_dim);
   MPSStream* stream = getCurrentMPSStream();
   dispatch_sync_with_rethrow(stream->queue(), ^() {
     @autoreleasepool {
@@ -90,7 +126,28 @@ void dispatch_scatter_value(const std::string& kernel, const Tensor& output,
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:pso];
       mtl_setArgs(encoder, output, value, index, inner, out_dim, idx_dim);
-      mtl_dispatch1DJob(encoder, pso, static_cast<NSUInteger>(index.numel()));
+      mtl_dispatch3DJob(encoder, pso, static_cast<NSUInteger>(inner),
+                        static_cast<NSUInteger>(idx_dim),
+                        static_cast<NSUInteger>(outer));
+      stream->synchronize(SyncType::COMMIT);
+    }
+  });
+}
+
+// Dispatches the elementwise masked fill over two matching-shape tensors.
+template <typename T>
+void dispatch_masked_fill(const Tensor& out, const Tensor& mask,
+                          const Tensor& input, T value) {
+  auto pso = lib.getPipelineStateForFunc(
+      "masked_fill_scalar_" + scalarToMetalTypeString(out.dtype()));
+  MPSStream* stream = getCurrentMPSStream();
+  dispatch_sync_with_rethrow(stream->queue(), ^() {
+    @autoreleasepool {
+      stream->endKernelCoalescing();
+      auto encoder = stream->commandEncoder();
+      [encoder setComputePipelineState:pso];
+      mtl_setArgs(encoder, out, mask, input, value);
+      mtl_dispatch1DJob(encoder, pso, static_cast<NSUInteger>(out.numel()));
       stream->synchronize(SyncType::COMMIT);
     }
   });
@@ -106,6 +163,50 @@ Tensor masked_fill_kernel(const Tensor& self, const Tensor& mask,
                           const Scalar& value) {
   if (mask.dtype() != DType::Bool) {
     TP_THROW(TypeError, "masked_fill only supports boolean masks");
+  }
+  const std::vector<int64_t> self_shape =
+      static_cast<std::vector<int64_t>>(self.shape());
+  // A mask that already has the input's shape needs no broadcast: one thread
+  // selects one element.
+  if (self.device().is_mps() && mask.device().is_mps() &&
+      static_cast<std::vector<int64_t>>(mask.shape()) == self_shape) {
+    Tensor self_c = materializeForGraph(self);
+    Tensor mask_c = materializeForGraph(mask);
+    Tensor result = Tensor(self_shape, self.dtype(), self.device());
+    if (result.numel() == 0) {
+      return result;
+    }
+    switch (self.dtype()) {
+      case DType::Float32:
+        dispatch_masked_fill(result, mask_c, self_c, value.to<float>());
+        return result;
+      case DType::Float16:
+        dispatch_masked_fill(result, mask_c, self_c, value.to<Half>());
+        return result;
+      case DType::BFloat16:
+        dispatch_masked_fill(result, mask_c, self_c, value.to<BFloat16>());
+        return result;
+      case DType::Int64:
+        dispatch_masked_fill(result, mask_c, self_c, value.to<int64_t>());
+        return result;
+      case DType::Int32:
+        dispatch_masked_fill(result, mask_c, self_c, value.to<int32_t>());
+        return result;
+      case DType::Int16:
+        dispatch_masked_fill(result, mask_c, self_c, value.to<int16_t>());
+        return result;
+      case DType::Int8:
+        dispatch_masked_fill(result, mask_c, self_c, value.to<int8_t>());
+        return result;
+      case DType::UInt8:
+        dispatch_masked_fill(result, mask_c, self_c, value.to<uint8_t>());
+        return result;
+      case DType::Bool:
+        dispatch_masked_fill(result, mask_c, self_c, value.to<bool>());
+        return result;
+      default:
+        break;
+    }
   }
   Tensor value_t = Tensor::full({}, value, self.dtype(), self.device());
   return whereOp(mask, value_t, self);

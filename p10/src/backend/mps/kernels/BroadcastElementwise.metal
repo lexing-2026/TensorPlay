@@ -79,3 +79,40 @@ kernel void broadcast_binary(device T* out [[buffer(0)]],
 REGISTER_BROADCAST_DTYPES(add)
 REGISTER_BROADCAST_DTYPES(sub)
 REGISTER_BROADCAST_DTYPES(mul)
+
+// where: out = condition ? lhs : rhs. The condition is a byte per element and
+// each operand walks its own strides, so the mask broadcasts independently.
+template <typename T>
+kernel void broadcast_where(device T* out [[buffer(0)]],
+                            device const bool* cond [[buffer(1)]],
+                            device const T* lhs [[buffer(2)]],
+                            device const T* rhs [[buffer(3)]],
+                            constant uint& ndim [[buffer(4)]],
+                            constant uint* sizes [[buffer(5)]],
+                            constant int* cond_strides [[buffer(6)]],
+                            constant int* lhs_strides [[buffer(7)]],
+                            constant int* rhs_strides [[buffer(8)]],
+                            uint tid [[thread_position_in_grid]]) {
+  out[tid] =
+      cond[element_offset<int>(tid, sizes, cond_strides, ndim)]
+          ? lhs[element_offset<int>(tid, sizes, lhs_strides, ndim)]
+          : rhs[element_offset<int>(tid, sizes, rhs_strides, ndim)];
+}
+
+#define REGISTER_BROADCAST_WHERE(DTYPE)                             \
+  template [[host_name("broadcast_where_" #DTYPE)]] kernel void     \
+  broadcast_where<DTYPE>(                                           \
+      device DTYPE * out [[buffer(0)]],                             \
+      device const bool * cond [[buffer(1)]],                       \
+      device const DTYPE * lhs [[buffer(2)]],                       \
+      device const DTYPE * rhs [[buffer(3)]],                       \
+      constant uint & ndim [[buffer(4)]],                           \
+      constant uint * sizes [[buffer(5)]],                          \
+      constant int * cond_strides [[buffer(6)]],                    \
+      constant int * lhs_strides [[buffer(7)]],                     \
+      constant int * rhs_strides [[buffer(8)]],                     \
+      uint tid [[thread_position_in_grid]]);
+
+REGISTER_BROADCAST_WHERE(float)
+REGISTER_BROADCAST_WHERE(long)
+REGISTER_BROADCAST_WHERE(int)

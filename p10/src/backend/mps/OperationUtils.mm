@@ -961,6 +961,79 @@ Tensor whereOp(const Tensor& condition, const Tensor& self,
       broadcast_shapes(broadcast_shapes(cond_shape, self_shape), other_shape);
   const DType common = promoteTypes(self.dtype(), other.dtype());
 
+  // Selection over broadcast operands is one strided read per operand, which
+  // the shader does directly; a missing kernel or an address outside the
+  // shader's 32-bit range stays with the graph.
+  if (condition.dtype() == DType::Bool && self.dtype() == other.dtype() &&
+      out_shape.size() <= kShaderMaxNdims &&
+      condition.storage_offset() == 0 && self.storage_offset() == 0 &&
+      other.storage_offset() == 0) {
+    int64_t numel = 1;
+    for (int64_t size : out_shape) {
+      numel *= size;
+    }
+    if (numel > 0 && numel <= std::numeric_limits<uint32_t>::max()) {
+      MTLComputePipelineState_t pso = shaderPipelineNamed(
+          "broadcast_where_" + scalarToMetalTypeString(common));
+      auto cond_strides = broadcastShaderStrides(condition, out_shape);
+      auto self_strides = broadcastShaderStrides(self, out_shape);
+      auto other_strides = broadcastShaderStrides(other, out_shape);
+      void* cond_buf = getMTLBufferFromPointer(condition.data_ptr());
+      void* self_buf = getMTLBufferFromPointer(self.data_ptr());
+      void* other_buf = getMTLBufferFromPointer(other.data_ptr());
+      if (pso && cond_strides && self_strides && other_strides && cond_buf &&
+          self_buf && other_buf) {
+        std::array<uint32_t, kShaderMaxNdims> sizes{};
+        for (size_t o = 0; o < out_shape.size(); ++o) {
+          sizes[out_shape.size() - 1 - o] =
+              static_cast<uint32_t>(out_shape[o]);
+        }
+        const uint32_t ndim = static_cast<uint32_t>(out_shape.size());
+        const uint32_t total = static_cast<uint32_t>(numel);
+        Tensor output = emptyMPS(out_shape, common, self.device());
+        void* out_buf = getMTLBufferFromPointer(output.data_ptr());
+        if (out_buf) {
+          MPSStream* stream = getCurrentMPSStream();
+          dispatch_sync_with_rethrow(stream->queue(), ^() {
+            @autoreleasepool {
+              auto encoder = stream->commandEncoder();
+              [encoder setComputePipelineState:pso];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)out_buf
+                          offset:0
+                         atIndex:0];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)cond_buf
+                          offset:0
+                         atIndex:1];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)self_buf
+                          offset:0
+                         atIndex:2];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)other_buf
+                          offset:0
+                         atIndex:3];
+              [encoder setBytes:&ndim length:sizeof(ndim) atIndex:4];
+              [encoder setBytes:sizes.data() length:sizeof(sizes) atIndex:5];
+              [encoder setBytes:cond_strides->data()
+                         length:sizeof(*cond_strides)
+                        atIndex:6];
+              [encoder setBytes:self_strides->data()
+                         length:sizeof(*self_strides)
+                        atIndex:7];
+              [encoder setBytes:other_strides->data()
+                         length:sizeof(*other_strides)
+                        atIndex:8];
+              const uint32_t per_group = std::min(
+                  total, static_cast<uint32_t>(
+                             [pso maxTotalThreadsPerThreadgroup]));
+              [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
+                  threadsPerThreadgroup:MTLSizeMake(per_group, 1, 1)];
+            }
+          });
+          return output;
+        }
+      }
+    }
+  }
+
   Tensor cond_c = materializeForGraph(condition);
   Tensor self_c = materializeForGraph(self);
   Tensor other_c = materializeForGraph(other);
