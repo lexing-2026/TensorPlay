@@ -1045,6 +1045,65 @@ Tensor rot90_kernel(
   }
 }
 
+// diagonal extracts the offset diagonal of a 2-D slice; the result is a
+// strided view (offset elements apart along both axes) materialized through
+// the shared gather path.
+Tensor diagonal_kernel(
+    const Tensor& self,
+    int64_t offset,
+    int64_t dim1,
+    int64_t dim2) {
+  const int64_t ndim = self.dim();
+  TP_CHECK(
+      ndim >= 2,
+      "diagonal requires a tensor with at least 2 dimensions");
+  const int64_t dim1_arg = dim1;
+  const int64_t dim2_arg = dim2;
+  dim1 = wrap_dim_checked(dim1, ndim);
+  dim2 = wrap_dim_checked(dim2, ndim);
+  TP_CHECK(
+      dim1 != dim2,
+      "diagonal dimensions cannot be identical ", dim1_arg, ", ", dim2_arg);
+
+  const int64_t size1 = self.size(dim1);
+  const int64_t size2 = self.size(dim2);
+  const std::vector<int64_t> strides = self.strides();
+  const int64_t stride1 = strides[static_cast<size_t>(dim1)];
+  const int64_t stride2 = strides[static_cast<size_t>(dim2)];
+
+  // Every axis outside the rotated plane keeps its own extent and stride;
+  // the diagonal axis replaces the plane pair.
+  std::vector<int64_t> sizes;
+  std::vector<int64_t> out_strides;
+  sizes.reserve(static_cast<size_t>(ndim - 1));
+  out_strides.reserve(static_cast<size_t>(ndim - 1));
+  for (int64_t i = 0; i < ndim; ++i) {
+    if (i != dim1 && i != dim2) {
+      sizes.push_back(self.size(i));
+      out_strides.push_back(strides[static_cast<size_t>(i)]);
+    }
+  }
+
+  int64_t diag_size = 0;
+  int64_t storage_offset =
+      static_cast<int64_t>(self.unsafeGetTensorImpl()->storage_offset());
+  if (offset >= 0) {
+    if (offset < size2) {
+      diag_size = std::min(size1, size2 - offset);
+      storage_offset += offset * stride2;
+    }
+  } else if (offset != std::numeric_limits<int64_t>::min()) {
+    const int64_t offset_abs = -offset;
+    if (offset_abs < size1) {
+      diag_size = std::min(size1 - offset_abs, size2);
+      storage_offset += offset_abs * stride1;
+    }
+  }
+  sizes.push_back(diag_size);
+  out_strides.push_back(stride1 + stride2);
+  return materialize_view(self, sizes, out_strides, storage_offset);
+}
+
 } // namespace ops
 } // namespace vulkan
 } // namespace tensorplay
@@ -1063,6 +1122,7 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, ShapeKernels) {
   m.impl("tril_", &tensorplay::vulkan::ops::tril_inplace_kernel);
   m.impl("roll", &tensorplay::vulkan::ops::roll_kernel);
   m.impl("rot90", &tensorplay::vulkan::ops::rot90_kernel);
+  m.impl("diagonal", &tensorplay::vulkan::ops::diagonal_kernel);
   m.impl("select.int", &tensorplay::vulkan::ops::select_kernel);
   m.impl("cat", &tensorplay::vulkan::ops::cat_kernel);
   m.impl("stack", &tensorplay::vulkan::ops::stack_kernel);
