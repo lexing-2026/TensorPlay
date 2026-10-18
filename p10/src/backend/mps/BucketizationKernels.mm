@@ -69,7 +69,7 @@ Tensor searchsorted_impl(const Tensor& seq_in, const Tensor& self_in,
       }
       [encoder dispatchThreadgroups:MTLSizeMake(num_tg, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
-      stream->synchronize(SyncType::COMMIT_AND_WAIT);
+      stream->synchronize(SyncType::COMMIT);
     }
   });
   return result;

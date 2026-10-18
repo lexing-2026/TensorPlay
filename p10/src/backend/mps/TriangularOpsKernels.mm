@@ -69,7 +69,7 @@ void triu_tril_impl(const Tensor& self, int64_t k, const Tensor& out,
                 threadsPerThreadgroup:MTLSizeMake(
                                            std::min(max_threads_per_group, w),
                                            1, 1)];
-      stream->synchronize(SyncType::COMMIT_AND_WAIT);
+      stream->synchronize(SyncType::COMMIT);
     }
   });
 }

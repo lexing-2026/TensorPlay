@@ -328,7 +328,7 @@ Tensor reductionOp(const Tensor& self, const std::vector<int64_t>& dims,
     NSDictionary* feeds = @{entry->input0 : inData};
     NSDictionary* results = @{entry->result : outData};
     getCurrentMPSStream()->executeMPSGraph(entry->graph, feeds, results,
-                                          SyncType::COMMIT_AND_WAIT);
+                                          SyncType::COMMIT);
   }
   return output;
 }
@@ -735,7 +735,7 @@ Tensor arg_reduce_impl(const Tensor& self, int64_t dim, bool keepdim,
     NSDictionary* feeds = @{entry->input0 : inData};
     NSDictionary* results = @{entry->result : outData};
     getCurrentMPSStream()->executeMPSGraph(entry->graph, feeds, results,
-                                          SyncType::COMMIT_AND_WAIT);
+                                          SyncType::COMMIT);
   }
   return indices;
 }
@@ -871,7 +871,7 @@ std::tuple<Tensor, Tensor> valueIndexReduce(const Tensor& self, int64_t dim,
     NSDictionary* results = @{entry->result : valueData,
                               entry->result2 : indexData};
     getCurrentMPSStream()->executeMPSGraph(entry->graph, feeds, results,
-                                          SyncType::COMMIT_AND_WAIT);
+                                          SyncType::COMMIT);
   }
   return std::make_tuple(values, indices);
 }

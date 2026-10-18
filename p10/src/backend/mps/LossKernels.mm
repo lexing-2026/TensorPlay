@@ -7,6 +7,7 @@
 #include "OperationUtils.h"
 
 #include "backend/mps/MPSDevice.h"
+#include "backend/mps/MPSStream.h"
 
 #include <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
 
@@ -271,6 +272,7 @@ std::tuple<Tensor, Tensor> nll_loss_impl(const Tensor& input_arg,
                                          const std::optional<Tensor>& weight_arg,
                                          int64_t reduction,
                                          int64_t ignore_index) {
+  synchronizeHostAccess();
   const bool no_batch = input_arg.dim() == 1;
   const Tensor input = (no_batch ? input_arg.unsqueeze(0) : input_arg).contiguous();
   const Tensor target = (no_batch ? target_arg.reshape({1}) : target_arg)
@@ -356,6 +358,7 @@ Tensor nll_loss_backward_impl(const Tensor& grad_output, const Tensor& input,
                               const std::optional<Tensor>& weight,
                               int64_t reduction, int64_t ignore_index,
                               const Tensor& total_weight) {
+  synchronizeHostAccess();
   const int64_t n_batch = input.size(0);
   const int64_t n_classes = input.size(1);
 
@@ -430,6 +433,7 @@ std::tuple<Tensor, Tensor> nll_loss2d_impl(const Tensor& input,
                                            int64_t ignore_index) {
   if (input.dim() != 4) TP_THROW(RuntimeError, "nll_loss2d: Expected 4D input");
   if (target.dim() != 3) TP_THROW(RuntimeError, "nll_loss2d: Expected 3D target");
+  synchronizeHostAccess();
   const int64_t N = input.size(0), C = input.size(1);
   const int64_t H = input.size(2), W = input.size(3);
   if (target.size(0) != N || target.size(1) != H || target.size(2) != W) {
@@ -507,6 +511,7 @@ Tensor nll_loss2d_backward_impl(const Tensor& grad_output, const Tensor& input,
                                 const Tensor& total_weight) {
   if (input.dim() != 4) TP_THROW(RuntimeError, "nll_loss2d_backward: Expected 4D input");
   if (target.dim() != 3) TP_THROW(RuntimeError, "nll_loss2d_backward: Expected 3D target");
+  synchronizeHostAccess();
   const int64_t N = input.size(0), C = input.size(1);
   const int64_t H = input.size(2), W = input.size(3);
   const int64_t rows = N * H * W;

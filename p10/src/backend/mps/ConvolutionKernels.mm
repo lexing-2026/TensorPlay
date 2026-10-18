@@ -163,7 +163,7 @@ bool try_mpp_conv2d(const Tensor& input, const Tensor& weight,
       [encoder dispatchThreadgroups:MTLSizeMake(o_tiles, w_tiles,
                                               h_tiles * params.N)
           threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
-      stream->synchronize(SyncType::COMMIT_AND_WAIT);
+      stream->synchronize(SyncType::COMMIT);
     }
   });
   return true;

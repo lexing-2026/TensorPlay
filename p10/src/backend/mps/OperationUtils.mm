@@ -111,7 +111,7 @@ void runGraph(MPSGraph* graph, MPSShape* shape, MPSDataType inDataType,
   NSDictionary* feeds = @{inputTensor : inputData};
   NSDictionary* results = @{outputTensor : outputData};
   getCurrentMPSStream()->executeMPSGraph(graph, feeds, results,
-                                        SyncType::COMMIT_AND_WAIT);
+                                        SyncType::COMMIT);
 }
 
 } // namespace
@@ -306,7 +306,7 @@ Tensor binaryOp(const std::string& op, const Tensor& self,
     NSDictionary* feeds = @{entry->input0 : xData, entry->input1 : yData};
     NSDictionary* results = @{entry->result : outData};
     getCurrentMPSStream()->executeMPSGraph(entry->graph, feeds, results,
-                                          SyncType::COMMIT_AND_WAIT);
+                                          SyncType::COMMIT);
   }
   return output;
 }
@@ -511,7 +511,7 @@ std::optional<Tensor> broadcastBinaryShader(
                    static_cast<uint32_t>([pso maxTotalThreadsPerThreadgroup]));
       [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(per_group, 1, 1)];
-      stream->synchronize(SyncType::COMMIT_AND_WAIT);
+      stream->synchronize(SyncType::COMMIT);
     }
   });
   return output;
@@ -560,7 +560,7 @@ std::optional<Tensor> unaryShader(const std::string& op, const Tensor& self) {
                    static_cast<uint32_t>([pso maxTotalThreadsPerThreadgroup]));
       [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(per_group, 1, 1)];
-      stream->synchronize(SyncType::COMMIT_AND_WAIT);
+      stream->synchronize(SyncType::COMMIT);
     }
   });
   return output;
