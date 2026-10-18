@@ -2602,8 +2602,231 @@ class TestVulkanHalfLinearViews(unittest.TestCase):
             err_msg="half broadcast into linear storage")
 
 
-if __name__ == "__main__":
-    unittest.main()
+class TestVulkanHalfFlip(unittest.TestCase):
+    # A flip only moves lanes, so every field of a half payload has to land
+    # where the host reference puts it.  Over linear storage the two fields of
+    # a word name neighbouring positions, which a flipped axis can separate,
+    # so the variant unwinds the element index before it picks the word.
+
+    @staticmethod
+    def _flat(count):
+        return (np.arange(count, dtype=np.float32) % 97).astype(np.float16)
+
+    @staticmethod
+    def _grid(sizes):
+        count = int(np.prod(sizes))
+        return (np.arange(count, dtype=np.float32)
+                % 97).astype(np.float16).reshape(sizes)
+
+    def test_half_flip_of_an_image_payload(self):
+        import tensorplay.functional as F
+        host = self._grid((2, 3, 4, 5))
+        device = tensorplay.from_numpy(host.copy()).to("vulkan")
+        for dims in ([0], [1], [2], [3], [-1], [0, 3], [1, 2],
+                     [0, 1, 2, 3]):
+            np.testing.assert_array_equal(
+                F.flip(device, dims).cpu().numpy().view(np.uint16),
+                np.flip(host, axis=dims).view(np.uint16),
+                err_msg=f"half image flip at dims={dims}")
+
+    def test_half_flip_of_a_linear_payload(self):
+        import tensorplay.functional as F
+        # 70001 lanes leave a half word holding one live field, so the tail
+        # word of the destination is written from a single lane.
+        host = self._flat(70001)
+        device = tensorplay.from_numpy(host.copy()).to("vulkan")
+        for dims in ([0], [-1]):
+            np.testing.assert_array_equal(
+                F.flip(device, dims).cpu().numpy().view(np.uint16),
+                np.flip(host, axis=dims).view(np.uint16),
+                err_msg=f"half linear flip of a flat payload at dims={dims}")
+        for sizes in ((40000, 3), (40001, 3)):
+            grid = self._grid(sizes)
+            vk_grid = tensorplay.from_numpy(grid.copy()).to("vulkan")
+            for dims in ([0], [1], [0, 1]):
+                np.testing.assert_array_equal(
+                    F.flip(vk_grid, dims).cpu().numpy().view(np.uint16),
+                    np.flip(grid, axis=dims).view(np.uint16),
+                    err_msg=f"half linear flip of {sizes} at dims={dims}")
+
+    def test_half_flip_keeps_the_special_lanes(self):
+        import tensorplay.functional as F
+        # Infinities, both zeros and the smallest subnormal all survive the
+        # unpack/pack round trip exactly, so a reorder keeps their bits.
+        host = np.array(
+            [np.inf, -np.inf, 0.0, -0.0, 2.0 ** -24, 65504.0, -65504.0,
+             1.0, -1.0, 2.0 ** -14], dtype=np.float16)
+        device = tensorplay.from_numpy(host.copy()).to("vulkan")
+        for dims in ([0], [-1]):
+            np.testing.assert_array_equal(
+                F.flip(device, dims).cpu().numpy().view(np.uint16),
+                np.flip(host, axis=dims).view(np.uint16),
+                err_msg="half flip lost a special lane")
+        wide = np.tile(host, 7000).astype(np.float16)
+        vk_wide = tensorplay.from_numpy(wide.copy()).to("vulkan")
+        np.testing.assert_array_equal(
+            F.flip(vk_wide, [-1]).cpu().numpy().view(np.uint16),
+            np.flip(wide, axis=-1).view(np.uint16),
+            err_msg="half flip of a linear payload lost a special lane")
+
+
+class TestVulkanHalfLerp(unittest.TestCase):
+    # The mix runs in single precision and narrows on the way in, so a lane
+    # may sit one half unit of least precision from the host value.  A payload
+    # too wide for an image has no texel to name, and the texel-only variants
+    # refuse it instead of reading a buffer as one.
+
+    def _operands(self, count):
+        base = np.linspace(-3.0, 3.0, count)
+        end = np.linspace(5.0, -5.0, count)
+        weight = (np.arange(count, dtype=np.float32) % 17) / 16.0
+        # The device reads half lanes, so the host mix starts from the same
+        # rounded operands.
+        cast = lambda a: np.asarray(a, dtype=np.float16).astype(np.float32)
+        return cast(base), cast(end), cast(weight)
+
+    def test_half_lerp_with_a_scalar_weight(self):
+        import tensorplay.functional as F
+        shapes = (4, 5, 6)
+        base, end, _ = self._operands(4 * 5 * 6)
+        device = tensorplay.from_numpy(
+            base.reshape(shapes).astype(np.float16)).to("vulkan")
+        vk_end = tensorplay.from_numpy(
+            end.reshape(shapes).astype(np.float16)).to("vulkan")
+        for weight in (0.0, 0.25, 1.0, -0.5):
+            want = (base + weight * (end - base)).astype(
+                np.float16).astype(np.float32).reshape(shapes)
+            np.testing.assert_allclose(
+                F.lerp(device, vk_end, weight).cpu().numpy().astype(np.float32),
+                want, rtol=1e-2, atol=1e-2, err_msg=f"half lerp at weight={weight}")
+
+    def test_half_lerp_with_a_tensor_weight(self):
+        import tensorplay.functional as F
+        shapes = (4, 5, 6)
+        base, end, weight = self._operands(4 * 5 * 6)
+        start = tensorplay.from_numpy(
+            base.reshape(shapes).astype(np.float16)).to("vulkan")
+        vk_end = tensorplay.from_numpy(
+            end.reshape(shapes).astype(np.float16)).to("vulkan")
+        vk_weight = tensorplay.from_numpy(
+            weight.reshape(shapes).astype(np.float16)).to("vulkan")
+        want = (base + weight * (end - base)).astype(
+            np.float16).astype(np.float32).reshape(shapes)
+        np.testing.assert_allclose(
+            F.lerp(start, vk_end, vk_weight).cpu().numpy().astype(np.float32),
+            want, rtol=1e-2, atol=1e-2, err_msg="half lerp with a tensor weight")
+        out = F.lerp_(start, vk_end, vk_weight)
+        self.assertIs(out, start, "half lerp_ did not return the same tensor")
+        np.testing.assert_allclose(
+            out.cpu().numpy().astype(np.float32), want,
+            rtol=1e-2, atol=1e-2, err_msg="half lerp_ left the payload wrong")
+
+    def test_lerp_refuses_a_linear_payload(self):
+        import tensorplay.functional as F
+        for dtype in (np.float32, np.float16):
+            base = tensorplay.from_numpy(
+                np.linspace(-1.0, 1.0, 70001).astype(dtype)).to("vulkan")
+            end = tensorplay.from_numpy(
+                np.linspace(1.0, -1.0, 70001).astype(dtype)).to("vulkan")
+            weight = tensorplay.from_numpy(
+                np.zeros(70001, dtype=dtype)).to("vulkan")
+            with self.assertRaisesRegex(
+                    RuntimeError, "requires texture storage"):
+                F.lerp(base, end, weight)
+
+
+class TestVulkanCumsumStorages(unittest.TestCase):
+    # A scan keeps its running total in single precision and rounds once when
+    # the lane is stored, so a host reference that does the same matches bit for
+    # bit in either element type and over either storage.  Channels are the
+    # packed axis of an image: a prefix there has to carry the whole of every
+    # earlier texel and the lower lanes of its own, which a per-lane carry gets
+    # wrong.
+
+    @staticmethod
+    def _flat(count):
+        # A period of nine values that sum to zero keeps every prefix small.
+        return (np.arange(count, dtype=np.float32) % 9 - 4).astype(np.float16)
+
+    @staticmethod
+    def _grid(sizes):
+        count = int(np.prod(sizes))
+        return (np.arange(count, dtype=np.float32)
+                % 9 - 4).astype(np.float16).reshape(sizes)
+
+    def test_half_cumsum_of_an_image_payload(self):
+        import tensorplay.functional as F
+        host = self._grid((3, 5, 4, 2))
+        device = tensorplay.from_numpy(host.copy()).to("vulkan")
+        for dim in range(4):
+            np.testing.assert_array_equal(
+                F.cumsum(device, dim).cpu().numpy().view(np.uint16),
+                np.cumsum(
+                    host.astype(np.float32), axis=dim).astype(
+                        np.float16).view(np.uint16),
+                err_msg=f"half image scan at dim={dim}")
+
+    def test_cumsum_channel_axis_carries_the_whole_texel(self):
+        import tensorplay.functional as F
+        # Five channels need two texels, so the second texel depends on the
+        # total of the first one rather than on a per-lane carry.
+        host = (np.arange(2 * 5 * 3 * 4, dtype=np.float32)
+                % 9 - 4).astype(np.float32).reshape(2, 5, 3, 4)
+        device = tensorplay.from_numpy(host.copy()).to("vulkan")
+        np.testing.assert_array_equal(
+            F.cumsum(device, 1).cpu().numpy(),
+            np.cumsum(host, axis=1),
+            err_msg="float scan along the packed channel axis")
+
+    def test_half_cumsum_of_a_linear_payload(self):
+        import tensorplay.functional as F
+        host = self._flat(70001)
+        device = tensorplay.from_numpy(host.copy()).to("vulkan")
+        want = np.cumsum(host.astype(np.float32), axis=0).astype(
+            np.float16).view(np.uint16)
+        np.testing.assert_array_equal(
+            F.cumsum(device, 0).cpu().numpy().view(np.uint16), want,
+            err_msg="half flat scan over a payload with a tail word")
+        for sizes in ((40000, 3), (40001, 2)):
+            grid = self._grid(sizes)
+            vk_grid = tensorplay.from_numpy(grid.copy()).to("vulkan")
+            for dim in range(2):
+                np.testing.assert_array_equal(
+                    F.cumsum(vk_grid, dim).cpu().numpy().view(np.uint16),
+                    np.cumsum(
+                        grid.astype(np.float32), axis=dim).astype(
+                            np.float16).view(np.uint16),
+                    err_msg=f"half linear scan of {sizes} at dim={dim}")
+        # A row-count axis beyond the image limit while the width still
+        # fits one texel: the scan walks 20000 rows of 37 columns.
+        wide = (np.arange(20000 * 37, dtype=np.float32)
+                % 9 - 4).astype(np.float16).reshape(20000, 37)
+        vk_wide = tensorplay.from_numpy(wide.copy()).to("vulkan")
+        np.testing.assert_array_equal(
+            F.cumsum(vk_wide, 1).cpu().numpy().view(np.uint16),
+            np.cumsum(wide.astype(np.float32), axis=1).astype(
+                np.float16).view(np.uint16),
+            err_msg="half scan along the width of a linear grid")
+
+    def test_cumsum_widens_to_a_requested_type(self):
+        import tensorplay.functional as F
+        host = self._grid((40000, 3))
+        device = tensorplay.from_numpy(host.copy()).to("vulkan")
+        # The scan runs in the payload's own type and the result widens after
+        # it, so the totals round to half on the way out even when asked for a
+        # float result.
+        want = np.cumsum(host.astype(np.float32), axis=0).astype(
+            np.float16).astype(np.float32)
+        np.testing.assert_array_equal(
+            F.cumsum(device, 0, dtype=tensorplay.float32).cpu().numpy(), want,
+            err_msg="half payload scanned into a float result")
+
+    def test_cumsum_rejects_an_integer_payload(self):
+        import tensorplay.functional as F
+        device = tensorplay.from_numpy(
+            np.arange(24, dtype=np.int32).reshape(4, 6)).to("vulkan")
+        with self.assertRaisesRegex(RuntimeError, "cumsum"):
+            F.cumsum(device, 0)
 
 
 if __name__ == "__main__":
