@@ -497,13 +497,22 @@ Tensor rms_norm_buffer(
     int64_t span,
     const std::optional<Tensor>& weight_opt,
     double eps) {
+  const bool is_half = input_arg.dtype() == DType::Float16;
   TP_CHECK(
-      input_arg.dtype() == DType::Float32,
-      "Vulkan rms_norm over linear storage supports Float32 only");
+      input_arg.dtype() == DType::Float32 || is_half,
+      "Vulkan rms_norm over linear storage supports Float32 and Float16 "
+      "tensors only");
   TP_CHECK(
       span > 0 && input_arg.numel() % span == 0,
       "Vulkan rms_norm over linear storage needs a normalized axis that tiles "
       "the payload");
+  // Two adjacent half lanes share one 32-bit word, and each invocation writes
+  // the whole word it owns.  An odd axis would put the tail of one row and the
+  // head of the next in the same word.
+  TP_CHECK(
+      !is_half || span % 2 == 0,
+      "Vulkan rms_norm over linear storage needs an even normalized axis for a "
+      "Float16 payload");
 
   const int64_t rows = input_arg.numel() / span;
   const int64_t rows_axis =
@@ -524,10 +533,14 @@ Tensor rms_norm_buffer(
   if (weight_opt.has_value()) {
     v_weight = convert(*weight_opt);
     weight_linear = v_weight->storage_type() == api::StorageType::BUFFER;
+    // A flat weight is read as raw words of the payload's own width; an image
+    // weight is fetched as a texel and its storage format already carries the
+    // element type.
     TP_CHECK(
-        !weight_linear || v_weight->dtype() == DType::Float32,
-        "Vulkan rms_norm over linear storage needs a Float32 weight read as a "
-        "flat array");
+        !weight_linear || v_weight->dtype() == input_arg.dtype(),
+        std::string("Vulkan rms_norm over linear storage needs a weight of the "
+                    "same payload type as the ") +
+            (is_half ? "Float16" : "Float32") + " input");
   }
 
   const struct RmsNormBufferBlock final {
@@ -559,9 +572,14 @@ Tensor rms_norm_buffer(
   api::UniformParamsBuffer params(context, block);
   api::PipelineBarrier pipeline_barrier{};
 
+  // The half forms share the block layout and the dispatch shape; only the lane
+  // width of every buffer binding differs.
+  const std::string kernel_root =
+      is_half ? "rms_norm_buffer_half" : "rms_norm_buffer";
+
   if (!v_weight.has_value()) {
     context->submit_compute_job(
-        VK_KERNEL_FROM_STR("rms_norm_buffer"),
+        VK_KERNEL_FROM_STR(kernel_root.c_str()),
         pipeline_barrier,
         grid,
         local,
@@ -574,7 +592,7 @@ Tensor rms_norm_buffer(
         params.buffer());
   } else if (weight_linear) {
     context->submit_compute_job(
-        VK_KERNEL_FROM_STR("rms_norm_buffer_w"),
+        VK_KERNEL_FROM_STR((kernel_root + "_w").c_str()),
         pipeline_barrier,
         grid,
         local,
@@ -588,7 +606,7 @@ Tensor rms_norm_buffer(
         v_weight->buffer(pipeline_barrier, api::PipelineStage::COMPUTE));
   } else {
     context->submit_compute_job(
-        VK_KERNEL_FROM_STR("rms_norm_buffer_w_tex"),
+        VK_KERNEL_FROM_STR((kernel_root + "_w_tex").c_str()),
         pipeline_barrier,
         grid,
         local,

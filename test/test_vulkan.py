@@ -1459,6 +1459,53 @@ class TestVulkanLinearPayload(unittest.TestCase):
             narrowed(short + short), rtol=2e-3, atol=2e-3,
             err_msg="add over two half texture payloads")
 
+    def test_half_precision_rms_norm_over_linear_payload(self):
+        import tensorplay as tp
+        import tensorplay.nn.functional as F
+        # A half payload keeps the row stride in words, so the fused
+        # normalization owns one word per invocation: the two lanes it holds are
+        # written together and never by a neighbour.  The moment accumulates in
+        # single precision and only the store narrows.  An odd axis would put two
+        # rows inside one word, so it stays rejected rather than silently
+        # clobbering a lane.
+        def narrowed(a):
+            return np.asarray(a, dtype=np.float16).astype(np.float32)
+
+        tensorplay.manual_seed(83)
+        for shape, span, with_weight in (
+                ((20000, 512), 512, True),
+                ((20000, 512), 512, False),
+                ((3, 17000), 17000, True),
+                ((40000, 2), 2, False),
+                ((2, 3, 9000, 128), 128, True),
+                ((1000, 4096), 4096, True)):
+            x_cpu = (tp.randn(shape, device="cpu") * 0.8).numpy()
+            w_cpu = ((tp.randn((span,), device="cpu") + 1.2) * 0.5).numpy() \
+                if with_weight else None
+            x16 = narrowed(x_cpu)
+            w16 = narrowed(w_cpu) if with_weight else None
+            x = tensorplay.from_numpy(x16.astype(np.float16)).to("vulkan")
+            w = tensorplay.from_numpy(w16.astype(np.float16)).to("vulkan") \
+                if with_weight else None
+            got = F.rms_norm(x, [span], w, 1.0e-5)
+            self.assertEqual(got.dtype, tensorplay.float16,
+                             f"rms_norm widened a half payload at shape {shape}")
+            xf = x16.astype(np.float64)
+            want = xf / np.sqrt((xf ** 2).mean(-1, keepdims=True) + 1.0e-5)
+            if with_weight:
+                want = want * w16.astype(np.float64)
+            np.testing.assert_allclose(
+                got.cpu().numpy().astype(np.float32), narrowed(want),
+                rtol=2e-3, atol=2e-3,
+                err_msg=f"rms_norm over a half linear payload at shape {shape} "
+                        f"span {span} weight {with_weight}")
+
+        odd = tensorplay.from_numpy(narrowed(
+            tp.randn((20000, 33), device="cpu").numpy()).astype(
+                np.float16)).to("vulkan")
+        with self.assertRaisesRegex(RuntimeError, "even normalized axis"):
+            F.rms_norm(odd, [33], None, 1.0e-5)
+
 
 if __name__ == "__main__":
     unittest.main()
