@@ -91,12 +91,29 @@ Tensor permute_with_dims(const Tensor& self, const ivec4& perm) {
   api::Context* const context = api::context();
 
   api::vTensor v_input = convert(self);
+
+  // Permute over a linear payload is a stride-permuted view: output axis
+  // k reads input slot perm[base + k], whose logical dim is that slot
+  // minus the prepadded base.  Materializing through the strided gather
+  // reorders the elements into a dense buffer in one pass.
+  if (v_input.storage_type() == api::StorageType::BUFFER) {
+    const int64_t ndim = self.dim();
+    const int64_t base = 4 - ndim;
+    std::vector<int64_t> out_strides;
+    out_strides.reserve(static_cast<size_t>(ndim));
+    for (int64_t k = 0; k < ndim; ++k) {
+      const int64_t in_slot =
+          perm[static_cast<size_t>(base + static_cast<int64_t>(k))];
+      out_strides.push_back(
+          self.stride(static_cast<size_t>(in_slot - base)));
+    }
+    const int64_t offset = self.unsafeGetTensorImpl()->storage_offset();
+    return materialize_view(
+        self, permuted_sizes(self, perm), out_strides, offset);
+  }
+
   api::vTensor v_output{
       context, permuted_sizes(self, perm), self.dtype()};
-
-  if (v_output.storage_type() == api::StorageType::BUFFER) {
-    TP_THROW(NotImplementedError, "Vulkan permute requires texture storage");
-  }
 
   // Prepadded {d0, d1, d2, d3} logical sizes, d0 = batch, d1 = channel.
   auto prepadded = [](const std::vector<int64_t>& sizes) {

@@ -8,6 +8,16 @@ namespace tensorplay {
 namespace vulkan {
 namespace ops {
 
+// Kernels from sibling translation units used by the buffer composite path.
+Tensor slice_kernel(
+    const Tensor& self,
+    int64_t dim,
+    std::optional<int64_t> start,
+    std::optional<int64_t> end,
+    int64_t step);
+Tensor sigmoid_kernel(const Tensor& self);
+Tensor mul_kernel(const Tensor& self, const Tensor& other);
+
 namespace {
 
 void validate_float_1d_to_4d(const Tensor& t, const char* name) {
@@ -53,7 +63,16 @@ Tensor glu_kernel(const Tensor& self, int64_t dim) {
 
   api::vTensor v_input = convert(self);
   if (v_input.storage_type() != api::StorageType::TEXTURE_3D) {
-    TP_THROW(NotImplementedError, "Vulkan glu requires texture storage");
+    // Buffer composite: gate = sigmoid(lower half), output = upper half *
+    // gate.  Slicing a linear payload materializes dense halves through the
+    // strided gather; unary and binary elementwise kernels already route
+    // buffer storage through their linear variants.
+    const int64_t half = in_len / 2;
+    Tensor upper =
+        slice_kernel(self, wrapped, 0, half, 1);
+    Tensor lower =
+        slice_kernel(self, wrapped, half, in_len, 1);
+    return mul_kernel(upper, sigmoid_kernel(lower));
   }
 
   std::vector<int64_t> out_sizes(
