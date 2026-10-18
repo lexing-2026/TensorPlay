@@ -27,7 +27,10 @@ template <typename T, bool Affine>
 inline void group_norm_body(device T* y, constant T* x, constant T* gamma,
                             constant T* beta, constant GroupNormParams& p,
                             float eps, uint tgid, uint tid, uint tptg,
-                            uint lane, uint sgroup) {
+                            uint lane, uint sgroup,
+                            threadgroup float* partial_sum,
+                            threadgroup float* partial_sumsq,
+                            threadgroup float* statistics) {
   constexpr int kReads = 4;
   const uint base = tgid * p.elements_per_group;
   x += base;
@@ -45,10 +48,6 @@ inline void group_norm_body(device T* y, constant T* x, constant T* gamma,
       }
     }
   }
-
-  threadgroup float partial_sum[simdgroup_size];
-  threadgroup float partial_sumsq[simdgroup_size];
-  threadgroup float statistics[2];
 
   sum = simd_sum(sum);
   sumsq = simd_sum(sumsq);
@@ -108,8 +107,12 @@ kernel void group_norm_plain(
     uint tptg [[threads_per_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint sgroup [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float partial_sum[simdgroup_size];
+  threadgroup float partial_sumsq[simdgroup_size];
+  threadgroup float statistics[2];
   group_norm_body<T, false>(out, x, nullptr, nullptr, params, eps, tgid, tid,
-                            tptg, lane, sgroup);
+                            tptg, lane, sgroup, partial_sum, partial_sumsq,
+                            statistics);
 }
 
 template <typename T>
@@ -125,8 +128,12 @@ kernel void group_norm_affine(
     uint tptg [[threads_per_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint sgroup [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float partial_sum[simdgroup_size];
+  threadgroup float partial_sumsq[simdgroup_size];
+  threadgroup float statistics[2];
   group_norm_body<T, true>(out, x, gamma, beta, params, eps, tgid, tid, tptg,
-                           lane, sgroup);
+                           lane, sgroup, partial_sum, partial_sumsq,
+                           statistics);
 }
 
 // Evaluation-mode batch normalization: out = x * scale[c] + shift[c]. The host
