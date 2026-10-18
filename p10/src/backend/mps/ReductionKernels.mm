@@ -144,124 +144,142 @@ Tensor reductionOp(const Tensor& self, const std::vector<int64_t>& dims,
     return output;
   }
 
+  // The graph depends only on the input shape, the axes actually reduced, the
+  // output shape the graph reshapes to, the dtypes and the kind, so the same
+  // reduction on later batches reuses it. The output shape carries keepdim.
+  const std::string key =
+      "reduce|" + shapeKey(in_shape) + "|" + shapeKey(axes) + "|" +
+      shapeKey(out_shape) + "|" + dtypeKey(self_c.dtype()) + "|" +
+      dtypeKey(acc_dtype) + "|" + dtypeKey(out_dtype) + "|" +
+      std::to_string(static_cast<int>(kind));
+
   @autoreleasepool {
-    MPSGraph* graph = [[MPSGraph new] autorelease];
     MPSShape* inShape = getMPSShape(in_shape);
     const MPSDataType in_dt = getMPSDataType(self_c.dtype());
     const MPSDataType acc_dt = getMPSDataType(acc_dtype);
     const MPSDataType out_dt = getMPSDataType(out_dtype);
-
-    MPSGraphTensor* x = [graph placeholderWithShape:inShape
-                                          dataType:in_dt
-                                               name:@"x"];
-    MPSGraphTensor* xc = (self_c.dtype() == acc_dtype)
-        ? x
-        : [graph castTensor:x toType:acc_dt name:@"cast_in"];
-
-    MPSGraphTensor* reduced = nil;
-    NSMutableArray<NSNumber*>* axesArray =
-        [NSMutableArray arrayWithCapacity:axes.size()];
-    for (int64_t a : axes) {
-      [axesArray addObject:@(a)];
-    }
-    // Reducing every axis with an explicit axes array trips an MPSGraph bug
-    // on older SDKs; use the nil-axes form (reduce all) for full reductions,
-    // matching the scalar-output reduction pattern used elsewhere.
-    const bool reduce_all = (static_cast<int64_t>(axes.size()) == self.dim());
-    switch (kind) {
-      case ReductionKind::SUM:
-      case ReductionKind::PROD:
-      case ReductionKind::MEAN: {
-        // Full reductions use the nil-axes form (reduce all), which avoids
-        // the explicit all-axes reduction bug on older SDKs.  Partial
-        // reductions process one axis at a time, highest first.
-        if (reduce_all) {
-          if (kind == ReductionKind::SUM) {
-            reduced = [graph reductionSumWithTensor:xc axes:nil name:nil];
-          } else if (kind == ReductionKind::PROD) {
-            reduced = [graph reductionProductWithTensor:xc axes:nil name:nil];
-          } else {
-            reduced = [graph meanOfTensor:xc axes:nil name:nil];
-          }
-        } else {
-          reduced = xc;
-          for (NSNumber* axis in [axesArray reverseObjectEnumerator]) {
-            if (kind == ReductionKind::SUM) {
-              reduced = [graph reductionSumWithTensor:reduced
-                                           axis:[axis integerValue]
-                                          name:nil];
-            } else if (kind == ReductionKind::PROD) {
-              reduced = [graph reductionProductWithTensor:reduced
-                                                    axis:[axis integerValue]
-                                                   name:nil];
-            } else {
-              reduced = [graph meanOfTensor:reduced
-                                    axes:@[axis]
-                                   name:nil];
-            }
-          }
-        }
-        break;
-      }
-      case ReductionKind::MAX:
-      case ReductionKind::MIN: {
-        // Reduce one axis at a time, highest axis first: removing a higher
-        // axis does not shift the indices of the lower remaining axes.
-        // MIN is computed as -MAX(-x) so only the confirmed
-        // reductionMaximumWithTensor selector is required.
-        reduced = xc;
-        if (kind == ReductionKind::MIN) {
-          reduced = [graph negativeWithTensor:reduced name:nil];
-        }
-        for (NSNumber* axis in [axesArray reverseObjectEnumerator]) {
-          reduced = [graph reductionMaximumWithTensor:reduced
-                                                 axis:[axis integerValue]
-                                                name:nil];
-        }
-        if (kind == ReductionKind::MIN) {
-          reduced = [graph negativeWithTensor:reduced name:nil];
-        }
-        break;
-      }
-      case ReductionKind::ALL:
-      case ReductionKind::ANY: {
-        // Cast to bool first, then reduce one axis at a time (highest
-        // first) with the logical reduction selectors.
-        const MPSDataType bool_dt = MPSDataTypeBool;
-        reduced = ([xc dataType] == bool_dt)
-            ? xc
-            : [graph castTensor:xc toType:bool_dt name:@"cast_bool"];
-        for (NSNumber* axis in [axesArray reverseObjectEnumerator]) {
-          if (kind == ReductionKind::ALL) {
-            reduced = [graph reductionAndWithTensor:reduced
-                                               axis:[axis integerValue]
-                                              name:nil];
-          } else {
-            reduced = [graph reductionOrWithTensor:reduced
-                                               axis:[axis integerValue]
-                                              name:nil];
-          }
-        }
-        break;
-      }
-    }
-
     // The graph removes reduced axes. When keepdim is requested (or the
-    // result has non-scalar shape) reshape the graph output so its shape
-    // matches the output buffer description exactly. A fully-reduced scalar
-    // is left unreshaped (reshaping an unranked tensor is unsupported on
-    // older SDKs); its single-element buffer is described with shape [1].
+    // result has non-scalar shape) its output is reshaped so the shape matches
+    // the output buffer description exactly. A fully-reduced scalar is left
+    // unreshaped (reshaping an unranked tensor is unsupported on older SDKs);
+    // its single-element buffer is described with shape [1].
     const std::vector<int64_t> graph_shape =
         out_shape.empty() ? std::vector<int64_t>{1} : out_shape;
-    MPSGraphTensor* outTensor = reduced;
-    if (!out_shape.empty()) {
-      outTensor = [graph reshapeTensor:reduced
-                              withShape:getMPSShape(graph_shape)
-                                   name:nil];
+
+    CachedGraph* entry = findCachedGraph(key);
+    if (entry == nullptr) {
+      MPSGraph* graph = [[MPSGraph alloc] init];
+
+      MPSGraphTensor* x = [graph placeholderWithShape:inShape
+                                            dataType:in_dt
+                                                 name:@"x"];
+      MPSGraphTensor* xc = (self_c.dtype() == acc_dtype)
+          ? x
+          : [graph castTensor:x toType:acc_dt name:@"cast_in"];
+
+      MPSGraphTensor* reduced = nil;
+      NSMutableArray<NSNumber*>* axesArray =
+          [NSMutableArray arrayWithCapacity:axes.size()];
+      for (int64_t a : axes) {
+        [axesArray addObject:@(a)];
+      }
+      // Reducing every axis with an explicit axes array trips an MPSGraph bug
+      // on older SDKs; use the nil-axes form (reduce all) for full reductions,
+      // matching the scalar-output reduction pattern used elsewhere.
+      const bool reduce_all = (static_cast<int64_t>(axes.size()) == self.dim());
+      switch (kind) {
+        case ReductionKind::SUM:
+        case ReductionKind::PROD:
+        case ReductionKind::MEAN: {
+          // Full reductions use the nil-axes form (reduce all), which avoids
+          // the explicit all-axes reduction bug on older SDKs.  Partial
+          // reductions process one axis at a time, highest first.
+          if (reduce_all) {
+            if (kind == ReductionKind::SUM) {
+              reduced = [graph reductionSumWithTensor:xc axes:nil name:nil];
+            } else if (kind == ReductionKind::PROD) {
+              reduced = [graph reductionProductWithTensor:xc axes:nil name:nil];
+            } else {
+              reduced = [graph meanOfTensor:xc axes:nil name:nil];
+            }
+          } else {
+            reduced = xc;
+            for (NSNumber* axis in [axesArray reverseObjectEnumerator]) {
+              if (kind == ReductionKind::SUM) {
+                reduced = [graph reductionSumWithTensor:reduced
+                                             axis:[axis integerValue]
+                                            name:nil];
+              } else if (kind == ReductionKind::PROD) {
+                reduced = [graph reductionProductWithTensor:reduced
+                                                      axis:[axis integerValue]
+                                                     name:nil];
+              } else {
+                reduced = [graph meanOfTensor:reduced
+                                      axes:@[axis]
+                                     name:nil];
+              }
+            }
+          }
+          break;
+        }
+        case ReductionKind::MAX:
+        case ReductionKind::MIN: {
+          // Reduce one axis at a time, highest axis first: removing a higher
+          // axis does not shift the indices of the lower remaining axes.
+          // MIN is computed as -MAX(-x) so only the confirmed
+          // reductionMaximumWithTensor selector is required.
+          reduced = xc;
+          if (kind == ReductionKind::MIN) {
+            reduced = [graph negativeWithTensor:reduced name:nil];
+          }
+          for (NSNumber* axis in [axesArray reverseObjectEnumerator]) {
+            reduced = [graph reductionMaximumWithTensor:reduced
+                                                   axis:[axis integerValue]
+                                                  name:nil];
+          }
+          if (kind == ReductionKind::MIN) {
+            reduced = [graph negativeWithTensor:reduced name:nil];
+          }
+          break;
+        }
+        case ReductionKind::ALL:
+        case ReductionKind::ANY: {
+          // Cast to bool first, then reduce one axis at a time (highest
+          // first) with the logical reduction selectors.
+          const MPSDataType bool_dt = MPSDataTypeBool;
+          reduced = ([xc dataType] == bool_dt)
+              ? xc
+              : [graph castTensor:xc toType:bool_dt name:@"cast_bool"];
+          for (NSNumber* axis in [axesArray reverseObjectEnumerator]) {
+            if (kind == ReductionKind::ALL) {
+              reduced = [graph reductionAndWithTensor:reduced
+                                                 axis:[axis integerValue]
+                                                name:nil];
+            } else {
+              reduced = [graph reductionOrWithTensor:reduced
+                                                 axis:[axis integerValue]
+                                                name:nil];
+            }
+          }
+          break;
+        }
+      }
+
+      MPSGraphTensor* outTensor = reduced;
+      if (!out_shape.empty()) {
+        outTensor = [graph reshapeTensor:reduced
+                                withShape:getMPSShape(graph_shape)
+                                     name:nil];
+      }
+      outTensor = ([outTensor dataType] == out_dt)
+          ? outTensor
+          : [graph castTensor:outTensor toType:out_dt name:@"cast_out"];
+
+      entry = new CachedGraph{graph, [x retain], nil, nil,
+                              [outTensor retain]};
+      storeCachedGraph(key, entry);
+      entry = findCachedGraph(key);
     }
-    outTensor = ([outTensor dataType] == out_dt)
-        ? outTensor
-        : [graph castTensor:outTensor toType:out_dt name:@"cast_out"];
 
     id<MTLBuffer> inBuf = mtlBufferOf(self_c);
     id<MTLBuffer> outBuf = mtlBufferOf(output);
@@ -273,9 +291,9 @@ Tensor reductionOp(const Tensor& self, const std::vector<int64_t>& dims,
         [[[MPSGraphTensorData alloc] initWithMTLBuffer:outBuf
                                                 shape:getMPSShape(graph_shape)
                                              dataType:out_dt] autorelease];
-    NSDictionary* feeds = @{x : inData};
-    NSDictionary* results = @{outTensor : outData};
-    getCurrentMPSStream()->executeMPSGraph(graph, feeds, results,
+    NSDictionary* feeds = @{entry->input0 : inData};
+    NSDictionary* results = @{entry->result : outData};
+    getCurrentMPSStream()->executeMPSGraph(entry->graph, feeds, results,
                                           SyncType::COMMIT_AND_WAIT);
   }
   return output;
@@ -577,40 +595,14 @@ Tensor std_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim,
 // ---------------------------------------------------------------------------
 // argmax / argmin / max.dim / min.dim
 //
-// Values for max.dim/min.dim come from the GPU reduction selectors; the
-// index tensors are found with a host-side scan over the shared-memory
-// mapping (correct, and cheap enough for the index-only pass).
+// Values for max.dim/min.dim come from the value reduction selectors and the
+// index tensors from the graph's index reduction, each a single dispatch.
 // ---------------------------------------------------------------------------
 
 namespace {
 
-double read_element(const void* base, int64_t idx, DType dtype) {
-  switch (dtype) {
-    case DType::Float32:
-      return static_cast<const float*>(base)[idx];
-    case DType::Float64:
-      return static_cast<const double*>(base)[idx];
-    case DType::Float16:
-      return static_cast<float>(static_cast<const Half*>(base)[idx]);
-    case DType::BFloat16:
-      return static_cast<float>(static_cast<const BFloat16*>(base)[idx]);
-    case DType::Int64:
-      return static_cast<double>(static_cast<const int64_t*>(base)[idx]);
-    case DType::Int32:
-      return static_cast<double>(static_cast<const int32_t*>(base)[idx]);
-    case DType::Int16:
-      return static_cast<double>(static_cast<const int16_t*>(base)[idx]);
-    case DType::Int8:
-      return static_cast<double>(static_cast<const int8_t*>(base)[idx]);
-    case DType::UInt8:
-      return static_cast<double>(static_cast<const uint8_t*>(base)[idx]);
-    default:
-      TP_THROW(NotImplementedError,
-               "argmax/argmin: unsupported dtype on MPS");
-  }
-}
-
-// Host-side scan for the index of the first extremum along `dim`.
+// Index of the extremum along `dim`, produced by the graph's index
+// reduction and reshaped to the requested output shape.
 Tensor arg_reduce_impl(const Tensor& self, int64_t dim, bool keepdim,
                        bool is_max) {
   Tensor self_c = self.contiguous();
@@ -634,34 +626,68 @@ Tensor arg_reduce_impl(const Tensor& self, int64_t dim, bool keepdim,
   if (indices.numel() == 0) {
     return indices;
   }
-  int64_t outer = 1;
-  int64_t inner = 1;
-  for (int64_t i = 0; i < dim; ++i) outer *= in_shape[i];
-  for (int64_t i = dim + 1; i < ndim; ++i) inner *= in_shape[i];
-  const int64_t dim_size = in_shape[dim];
-  const DType dt = self_c.dtype();
-  const void* data = self_c.data_ptr();
-  int64_t* ip = indices.data_ptr<int64_t>();
-  const double init = is_max ? -std::numeric_limits<double>::infinity()
-                             : std::numeric_limits<double>::infinity();
-  for (int64_t o = 0; o < outer; ++o) {
-    const void* base = static_cast<const char*>(data) +
-                       (o * dim_size) * inner * self_c.itemsize();
-    int64_t* out_row = ip + o * inner;
-    for (int64_t i = 0; i < inner; ++i) {
-      double best = init;
-      int64_t best_idx = 0;
-      for (int64_t k = 0; k < dim_size; ++k) {
-        const double v = read_element(
-            static_cast<const char*>(base) + k * inner * self_c.itemsize(), i,
-            dt);
-        if (is_max ? (v > best) : (v < best)) {
-          best = v;
-          best_idx = k;
-        }
+  // The graph drops the reduced axis, so a fully-reduced result is described
+  // with a single-element shape and every other result is reshaped to the
+  // requested one (which is what carries `keepdim`).
+  const std::vector<int64_t> graph_shape =
+      out_shape.empty() ? std::vector<int64_t>{1} : out_shape;
+  const std::string key =
+      "argreduce|" + shapeKey(in_shape) + "|" + std::to_string(dim) + "|" +
+      shapeKey(out_shape) + "|" + dtypeKey(self_c.dtype()) + "|" +
+      (is_max ? "max" : "min");
+
+  @autoreleasepool {
+    MPSShape* inShape = getMPSShape(in_shape);
+    const MPSDataType in_dt = getMPSDataType(self_c.dtype());
+    const MPSDataType out_dt = MPSDataTypeInt64;
+
+    CachedGraph* entry = findCachedGraph(key);
+    if (entry == nullptr) {
+      MPSGraph* graph = [[MPSGraph alloc] init];
+      MPSGraphTensor* x = [graph placeholderWithShape:inShape
+                                            dataType:in_dt
+                                                 name:@"x"];
+      // The index reduction has no boolean form; a bool input carries the
+      // same 0/1 ordering once widened.
+      MPSGraphTensor* xc =
+          ([x dataType] == MPSDataTypeBool)
+          ? [graph castTensor:x toType:MPSDataTypeInt32 name:@"cast_bool"]
+          : x;
+      MPSGraphTensor* reduced =
+          is_max ? [graph reductionArgMaximumWithTensor:xc
+                                                   axis:dim
+                                                   name:nil]
+                 : [graph reductionArgMinimumWithTensor:xc
+                                                   axis:dim
+                                                   name:nil];
+      MPSGraphTensor* result = reduced;
+      if (!out_shape.empty()) {
+        result = [graph reshapeTensor:reduced
+                            withShape:getMPSShape(out_shape)
+                                 name:nil];
       }
-      out_row[i] = best_idx;
+      if ([result dataType] != out_dt) {
+        result = [graph castTensor:result toType:out_dt name:@"cast_out"];
+      }
+      entry = new CachedGraph{graph, [x retain], nil, nil, [result retain]};
+      storeCachedGraph(key, entry);
+      entry = findCachedGraph(key);
     }
+
+    id<MTLBuffer> inBuf = mtlBufferOf(self_c);
+    id<MTLBuffer> outBuf = mtlBufferOf(indices);
+    MPSGraphTensorData* inData =
+        [[[MPSGraphTensorData alloc] initWithMTLBuffer:inBuf
+                                                shape:inShape
+                                             dataType:in_dt] autorelease];
+    MPSGraphTensorData* outData =
+        [[[MPSGraphTensorData alloc] initWithMTLBuffer:outBuf
+                                                shape:getMPSShape(graph_shape)
+                                             dataType:out_dt] autorelease];
+    NSDictionary* feeds = @{entry->input0 : inData};
+    NSDictionary* results = @{entry->result : outData};
+    getCurrentMPSStream()->executeMPSGraph(entry->graph, feeds, results,
+                                          SyncType::COMMIT_AND_WAIT);
   }
   return indices;
 }
