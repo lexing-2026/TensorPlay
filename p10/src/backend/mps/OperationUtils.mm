@@ -359,6 +359,26 @@ MTLComputePipelineState_t broadcastShaderPipeline(const std::string& op,
                              scalarToMetalTypeString(dtype));
 }
 
+// The pipeline for a unit-stride form of `op` over `dtype`, or nil when the
+// shader is not built for that combination. The dense forms live in
+// BroadcastElementwise.metal next to the stride-addressed ones; the dtype list
+// matches theirs, and an operation without a dense form (integral div) is
+// answered by a missing kernel name, which resolves to nil.
+MTLComputePipelineState_t denseBinaryShaderPipeline(const std::string& op,
+                                                    DType dtype,
+                                                    bool scalar_rhs) {
+  switch (dtype) {
+    case DType::Float32:
+    case DType::Int64:
+    case DType::Int32:
+      break;
+    default:
+      return nil;
+  }
+  return shaderPipelineNamed("dense_" + op + (scalar_rhs ? "_scalar_" : "_") +
+                             scalarToMetalTypeString(dtype));
+}
+
 // The stride array BroadcastElementwise.metal indexes `t` with, ordered
 // fastest-varying dimension first, along with the largest element offset it can
 // produce. A dimension of the output that `t` does not describe -- one it lacks
@@ -534,6 +554,175 @@ std::optional<Tensor> broadcastBinaryShader(
                 atIndex:5];
       [encoder setBytes:rhs_strides.data() length:sizeof(rhs_strides)
                 atIndex:6];
+      const uint32_t per_group =
+          std::min(total,
+                   static_cast<uint32_t>([pso maxTotalThreadsPerThreadgroup]));
+      [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(per_group, 1, 1)];
+    }
+  });
+  return output;
+}
+
+namespace {
+
+// A dense call reads a thread's own index from each operand, so the operands
+// have to share a shape and each run through its storage in the order the
+// output is written, from the start of that storage.
+bool denseOperandPair(const Tensor& self, const Tensor& other) {
+  if (!self.device().is_mps() || !other.device().is_mps()) {
+    return false;
+  }
+  if (self.dtype() != other.dtype()) {
+    return false;
+  }
+  if (!self.is_contiguous() || !other.is_contiguous() ||
+      self.storage_offset() != 0 || other.storage_offset() != 0) {
+    return false;
+  }
+  return static_cast<std::vector<int64_t>>(self.shape()) ==
+         static_cast<std::vector<int64_t>>(other.shape());
+}
+
+// The dense kernels take no scale factor; a call that scales its second
+// operand is expressed by the stride-addressed form or the graph instead.
+bool denseScaleIsOne(const std::optional<Scalar>& alpha) {
+  return !alpha.has_value() ||
+         (!alpha->isComplex() && alpha->toDouble() == 1.0);
+}
+
+// A dense launch addresses `elements` consecutive values and hands each thread
+// a run of ILP_PER_THREAD of them.
+uint32_t denseGridSize(uint32_t elements) {
+  return static_cast<uint32_t>(
+      p10::metal::ceil_div<uint32_t>(elements, p10::metal::ILP_PER_THREAD));
+}
+
+} // namespace
+
+std::optional<Tensor> denseBinaryShader(const std::string& op,
+                                        const Tensor& self,
+                                        const Tensor& other,
+                                        const std::optional<Scalar>& alpha) {
+  if (!denseScaleIsOne(alpha) || !denseOperandPair(self, other)) {
+    return std::nullopt;
+  }
+  const int64_t numel = self.numel();
+  if (numel <= 0 || numel > std::numeric_limits<uint32_t>::max()) {
+    return std::nullopt;
+  }
+  MTLComputePipelineState_t pso =
+      denseBinaryShaderPipeline(op, self.dtype(), /*scalar_rhs=*/false);
+  if (!pso) {
+    return std::nullopt;
+  }
+  void* self_buf = getMTLBufferFromPointer(self.data_ptr());
+  void* other_buf = getMTLBufferFromPointer(other.data_ptr());
+  if (!self_buf || !other_buf) {
+    return std::nullopt;
+  }
+  const std::vector<int64_t> shape =
+      static_cast<std::vector<int64_t>>(self.shape());
+  Tensor output = emptyMPS(shape, self.dtype(), self.device());
+  void* out_buf = getMTLBufferFromPointer(output.data_ptr());
+  if (!out_buf) {
+    return std::nullopt;
+  }
+
+  const uint32_t elements = static_cast<uint32_t>(numel);
+  const uint32_t total = denseGridSize(elements);
+  MPSStream* stream = getCurrentMPSStream();
+  dispatch_sync_with_rethrow(stream->queue(), ^() {
+    @autoreleasepool {
+      auto encoder = stream->commandEncoder();
+      [encoder setComputePipelineState:pso];
+      [encoder setBuffer:(__bridge id<MTLBuffer>)out_buf offset:0 atIndex:0];
+      [encoder setBuffer:(__bridge id<MTLBuffer>)self_buf offset:0 atIndex:1];
+      [encoder setBuffer:(__bridge id<MTLBuffer>)other_buf offset:0 atIndex:2];
+      [encoder setBytes:&elements length:sizeof(elements) atIndex:3];
+      const uint32_t per_group =
+          std::min(total,
+                   static_cast<uint32_t>([pso maxTotalThreadsPerThreadgroup]));
+      [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(per_group, 1, 1)];
+    }
+  });
+  return output;
+}
+
+std::optional<Tensor> denseScalarBinaryShader(const std::string& op,
+                                              const Tensor& self,
+                                              const Scalar& other,
+                                              const std::optional<Scalar>& alpha) {
+  if (!denseScaleIsOne(alpha) || !self.device().is_mps()) {
+    return std::nullopt;
+  }
+  // The scalar has to land in the operand's own storage type. A call whose
+  // scalar promotes the result -- a real scalar against an integral tensor, or
+  // a bool against anything but bool -- goes to the graph, which builds the
+  // cast around the operation.
+  if (result_type(other, self.dtype()) != self.dtype()) {
+    return std::nullopt;
+  }
+  if (!self.is_contiguous() || self.storage_offset() != 0) {
+    return std::nullopt;
+  }
+  const int64_t numel = self.numel();
+  if (numel <= 0 || numel > std::numeric_limits<uint32_t>::max()) {
+    return std::nullopt;
+  }
+  MTLComputePipelineState_t pso =
+      denseBinaryShaderPipeline(op, self.dtype(), /*scalar_rhs=*/true);
+  if (!pso) {
+    return std::nullopt;
+  }
+  void* self_buf = getMTLBufferFromPointer(self.data_ptr());
+  if (!self_buf) {
+    return std::nullopt;
+  }
+  const std::vector<int64_t> shape =
+      static_cast<std::vector<int64_t>>(self.shape());
+  Tensor output = emptyMPS(shape, self.dtype(), self.device());
+  void* out_buf = getMTLBufferFromPointer(output.data_ptr());
+  if (!out_buf) {
+    return std::nullopt;
+  }
+
+  const uint32_t elements = static_cast<uint32_t>(numel);
+  const uint32_t total = denseGridSize(elements);
+  // The scalar is converted once, in the storage type the kernel reads.
+  float value_f = 0.0f;
+  int64_t value_l = 0;
+  int32_t value_i = 0;
+  const void* value = nullptr;
+  size_t value_size = 0;
+  switch (self.dtype()) {
+    case DType::Float32:
+      value_f = other.to<float>();
+      value = &value_f;
+      value_size = sizeof(value_f);
+      break;
+    case DType::Int64:
+      value_l = other.to<int64_t>();
+      value = &value_l;
+      value_size = sizeof(value_l);
+      break;
+    default:
+      value_i = other.to<int32_t>();
+      value = &value_i;
+      value_size = sizeof(value_i);
+      break;
+  }
+
+  MPSStream* stream = getCurrentMPSStream();
+  dispatch_sync_with_rethrow(stream->queue(), ^() {
+    @autoreleasepool {
+      auto encoder = stream->commandEncoder();
+      [encoder setComputePipelineState:pso];
+      [encoder setBuffer:(__bridge id<MTLBuffer>)out_buf offset:0 atIndex:0];
+      [encoder setBuffer:(__bridge id<MTLBuffer>)self_buf offset:0 atIndex:1];
+      [encoder setBytes:value length:value_size atIndex:2];
+      [encoder setBytes:&elements length:sizeof(elements) atIndex:3];
       const uint32_t per_group =
           std::min(total,
                    static_cast<uint32_t>([pso maxTotalThreadsPerThreadgroup]));

@@ -102,6 +102,9 @@ MPSBinaryOpBlock hypotBlock = ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* a,
 
 Tensor add_kernel(const Tensor& self, const Tensor& other,
                   const Scalar& alpha) {
+  if (auto result = denseBinaryShader("add", self, other, alpha)) {
+    return *result;
+  }
   if (auto result = broadcastBinaryShader("add", self, other, alpha)) {
     return *result;
   }
@@ -117,6 +120,9 @@ Tensor& add_inplace_kernel(Tensor& self, const Tensor& other,
 
 Tensor add_scalar_kernel(const Tensor& self, const Scalar& other,
                          const Scalar& alpha) {
+  if (auto result = denseScalarBinaryShader("add", self, other, alpha)) {
+    return *result;
+  }
   const DType common = result_type(other, self.dtype());
   Tensor other_t = scalarToMPS(other, common, self.device());
   return add_kernel(self, other_t, alpha);
@@ -136,6 +142,9 @@ Tensor sub_kernel(const Tensor& self, const Tensor& other,
              "Subtraction, the `-` operator, with two bool tensors is not "
              "supported on the MPS backend");
   }
+  if (auto result = denseBinaryShader("sub", self, other, alpha)) {
+    return *result;
+  }
   if (auto result = broadcastBinaryShader("sub", self, other, alpha)) {
     return *result;
   }
@@ -151,6 +160,9 @@ Tensor& sub_inplace_kernel(Tensor& self, const Tensor& other,
 
 Tensor sub_scalar_kernel(const Tensor& self, const Scalar& other,
                          const Scalar& alpha) {
+  if (auto result = denseScalarBinaryShader("sub", self, other, alpha)) {
+    return *result;
+  }
   const DType common = result_type(other, self.dtype());
   Tensor other_t = scalarToMPS(other, common, self.device());
   return sub_kernel(self, other_t, alpha);
@@ -164,6 +176,9 @@ Tensor& sub_scalar_inplace_kernel(Tensor& self, const Scalar& other,
 }
 
 Tensor mul_kernel(const Tensor& self, const Tensor& other) {
+  if (auto result = denseBinaryShader("mul", self, other)) {
+    return *result;
+  }
   if (auto result = broadcastBinaryShader("mul", self, other)) {
     return *result;
   }
@@ -177,6 +192,9 @@ Tensor& mul_inplace_kernel(Tensor& self, const Tensor& other) {
 }
 
 Tensor mul_scalar_kernel(const Tensor& self, const Scalar& other) {
+  if (auto result = denseScalarBinaryShader("mul", self, other)) {
+    return *result;
+  }
   const DType common = result_type(other, self.dtype());
   Tensor other_t = scalarToMPS(other, common, self.device());
   return mul_kernel(self, other_t);
@@ -200,6 +218,9 @@ Tensor div_kernel(const Tensor& self, const Tensor& other) {
   // operand expands; the graph's division is the slower of the two there.
   if (!common.has_value() && self.dtype() == DType::Float32 &&
       other.dtype() == DType::Float32) {
+    if (auto result = denseBinaryShader("div", self, other)) {
+      return *result;
+    }
     if (auto result = broadcastBinaryShader("div", self, other, std::nullopt,
                                             /*allow_unexpanded=*/true)) {
       return *result;
@@ -215,6 +236,9 @@ Tensor& div_inplace_kernel(Tensor& self, const Tensor& other) {
 }
 
 Tensor div_scalar_kernel(const Tensor& self, const Scalar& other) {
+  if (auto result = denseScalarBinaryShader("div", self, other)) {
+    return *result;
+  }
   const DType common = result_type(other, self.dtype());
   Tensor other_t = scalarToMPS(other, common, self.device());
   return div_kernel(self, other_t);
@@ -287,10 +311,16 @@ Tensor fmod_scalar_kernel(const Tensor& self, const Scalar& other) {
 // ---------------------------------------------------------------------------
 
 Tensor maximum_kernel(const Tensor& self, const Tensor& other) {
+  if (auto result = denseBinaryShader("maximum", self, other)) {
+    return *result;
+  }
   return binaryOp("maximum", self, other, maximumBlock);
 }
 
 Tensor minimum_kernel(const Tensor& self, const Tensor& other) {
+  if (auto result = denseBinaryShader("minimum", self, other)) {
+    return *result;
+  }
   return binaryOp("minimum", self, other, minimumBlock);
 }
 

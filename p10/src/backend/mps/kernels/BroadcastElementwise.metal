@@ -10,7 +10,10 @@
 
 #include <metal_stdlib>
 
+#include "common.h"
+
 using namespace metal;
+using p10::metal::ILP_PER_THREAD;
 
 // `sizes` and both stride arrays are ordered fastest-varying dimension first,
 // which is the order the host builds them in.
@@ -87,6 +90,135 @@ REGISTER_BROADCAST_DTYPES(mul)
 // Division reads integral operands as the float type they promote to before
 // this kernel would see them, so only the float form is instantiated.
 REGISTER_BROADCAST_BINARY(div, float)
+
+// Dense forms: both operands and the result already share a shape and each runs
+// unit-stride, so the element index is the buffer index and no stride
+// arithmetic is needed. One thread handles a run of ILP_PER_THREAD consecutive
+// elements, which keeps several loads in flight per thread while adjacent
+// threads still cover adjacent storage.
+template <typename T, typename Op>
+kernel void dense_binary(device T* out [[buffer(0)]],
+                         constant T* lhs [[buffer(1)]],
+                         constant T* rhs [[buffer(2)]],
+                         constant uint& numel [[buffer(3)]],
+                         uint tid [[thread_position_in_grid]]) {
+  const uint first = tid * ILP_PER_THREAD;
+  if (first + ILP_PER_THREAD <= numel) {
+    array<T, ILP_PER_THREAD> left;
+    array<T, ILP_PER_THREAD> right;
+#pragma unroll
+    for (uint j = 0; j < ILP_PER_THREAD; ++j) {
+      left[j] = lhs[first + j];
+      right[j] = rhs[first + j];
+    }
+#pragma unroll
+    for (uint j = 0; j < ILP_PER_THREAD; ++j) {
+      left[j] = Op::apply(left[j], right[j]);
+    }
+#pragma unroll
+    for (uint j = 0; j < ILP_PER_THREAD; ++j) {
+      out[first + j] = left[j];
+    }
+  } else {
+    // The last thread of the grid, and the whole grid, when the operand is
+    // shorter than one run.
+    for (uint i = first; i < numel; ++i) {
+      out[i] = Op::apply(lhs[i], rhs[i]);
+    }
+  }
+}
+
+// The scalar operand travels by value in the argument buffer, so the scalar
+// forms cost the same one dispatch as the tensor forms and allocate no
+// single-element tensor to hold it.
+template <typename T, typename Op>
+kernel void dense_scalar_binary(device T* out [[buffer(0)]],
+                                constant T* lhs [[buffer(1)]],
+                                constant T& rhs [[buffer(2)]],
+                                constant uint& numel [[buffer(3)]],
+                                uint tid [[thread_position_in_grid]]) {
+  const uint first = tid * ILP_PER_THREAD;
+  if (first + ILP_PER_THREAD <= numel) {
+    array<T, ILP_PER_THREAD> values;
+#pragma unroll
+    for (uint j = 0; j < ILP_PER_THREAD; ++j) {
+      values[j] = lhs[first + j];
+    }
+#pragma unroll
+    for (uint j = 0; j < ILP_PER_THREAD; ++j) {
+      values[j] = Op::apply(values[j], rhs);
+    }
+#pragma unroll
+    for (uint j = 0; j < ILP_PER_THREAD; ++j) {
+      out[first + j] = values[j];
+    }
+  } else {
+    for (uint i = first; i < numel; ++i) {
+      out[i] = Op::apply(lhs[i], rhs);
+    }
+  }
+}
+
+#define REGISTER_DENSE_BINARY(OP, DTYPE)                       \
+  template [[host_name("dense_" #OP "_" #DTYPE)]]              \
+  kernel void dense_binary<DTYPE, OP##_op>(                    \
+      device DTYPE * out [[buffer(0)]],                        \
+      constant DTYPE * lhs [[buffer(1)]],                      \
+      constant DTYPE * rhs [[buffer(2)]],                      \
+      constant uint & numel [[buffer(3)]],                     \
+      uint tid [[thread_position_in_grid]]);
+
+#define REGISTER_DENSE_SCALAR_BINARY(OP, DTYPE)                \
+  template [[host_name("dense_" #OP "_scalar_" #DTYPE)]]       \
+  kernel void dense_scalar_binary<DTYPE, OP##_op>(             \
+      device DTYPE * out [[buffer(0)]],                        \
+      constant DTYPE * lhs [[buffer(1)]],                      \
+      constant DTYPE & rhs [[buffer(2)]],                      \
+      constant uint & numel [[buffer(3)]],                     \
+      uint tid [[thread_position_in_grid]]);
+
+// Same dtype set as the stride-addressed forms: half, bfloat16 and the narrow
+// integers do their operation math in another type and stay with the graph,
+// which the host reaches by failing to resolve the kernel name.
+#define REGISTER_DENSE_DTYPES(OP)       \
+  REGISTER_DENSE_BINARY(OP, float)      \
+  REGISTER_DENSE_BINARY(OP, long)       \
+  REGISTER_DENSE_BINARY(OP, int)
+
+#define REGISTER_DENSE_SCALAR_DTYPES(OP)       \
+  REGISTER_DENSE_SCALAR_BINARY(OP, float)      \
+  REGISTER_DENSE_SCALAR_BINARY(OP, long)       \
+  REGISTER_DENSE_SCALAR_BINARY(OP, int)
+
+REGISTER_DENSE_DTYPES(add)
+REGISTER_DENSE_DTYPES(sub)
+REGISTER_DENSE_DTYPES(mul)
+REGISTER_DENSE_SCALAR_DTYPES(add)
+REGISTER_DENSE_SCALAR_DTYPES(sub)
+REGISTER_DENSE_SCALAR_DTYPES(mul)
+
+REGISTER_DENSE_BINARY(div, float)
+REGISTER_DENSE_SCALAR_BINARY(div, float)
+
+// maximum / minimum: a NaN on either side is the answer, and a tie takes the
+// second operand. Only float is instantiated; the integral forms stay with the
+// graph, whose maximum/minimum are the same ordered comparison on integers.
+struct maximum_op {
+  template <typename T>
+  static inline T apply(T lhs, T rhs) {
+    return (isnan(lhs) || lhs > rhs) ? lhs : rhs;
+  }
+};
+
+struct minimum_op {
+  template <typename T>
+  static inline T apply(T lhs, T rhs) {
+    return (isnan(lhs) || lhs < rhs) ? lhs : rhs;
+  }
+};
+
+REGISTER_DENSE_BINARY(maximum, float)
+REGISTER_DENSE_BINARY(minimum, float)
 
 // Ternary forms: out = self + value * lhs * rhs (addcmul) or
 // self + value * lhs / rhs (addcdiv). All three operands broadcast

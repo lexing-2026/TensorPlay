@@ -118,6 +118,29 @@ std::optional<Tensor> broadcastBinaryShader(
     const std::optional<Scalar>& alpha = std::nullopt,
     bool allow_unexpanded = false);
 
+// Runs `op` -- "add", "sub", "mul", "div", "maximum" or "minimum" -- over two
+// operands that already share a shape and run unit-stride, with a single shader
+// dispatch whose thread index is the element index. `alpha`, when present, must
+// be one: the dense kernels take no scale factor. Returns std::nullopt when a
+// call cannot be expressed that way -- different shapes, dtypes or storage
+// layouts, a dtype or an operation the shader is not instantiated for, a
+// non-unit alpha, an element count beyond the 32-bit addressing -- and the
+// caller reaches the stride-addressed form or the graph.
+std::optional<Tensor> denseBinaryShader(
+    const std::string& op, const Tensor& self, const Tensor& other,
+    const std::optional<Scalar>& alpha = std::nullopt);
+
+// Runs `op` -- "add", "sub", "mul" or "div" -- over a unit-stride operand and a
+// scalar that lands in the operand's own storage type. The scalar travels by
+// value, so the call costs one dispatch and allocates no single-element tensor
+// for it. Returns std::nullopt under the same conditions as
+// `denseBinaryShader`, and additionally when the scalar would promote the
+// result to another dtype; the caller materializes the scalar and reaches the
+// tensor form or the graph.
+std::optional<Tensor> denseScalarBinaryShader(
+    const std::string& op, const Tensor& self, const Scalar& other,
+    const std::optional<Scalar>& alpha = std::nullopt);
+
 // Runs `op` -- "addcmul" or "addcdiv" -- as `self + value * lhs * rhs` or
 // `self + value * lhs / rhs` over three independently broadcast operands, in
 // one shader dispatch. `value` is converted to the common storage type, which
