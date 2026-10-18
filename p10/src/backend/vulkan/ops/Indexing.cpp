@@ -20,10 +20,11 @@ api::vTensor to_buffer_storage_dispatch(
 
 namespace {
 
-void validate_float_operand(const Tensor& t, const char* name) {
+void validate_gather_operand(const Tensor& t, const char* name) {
   TP_CHECK(
-      t.dtype() == DType::Float32,
-      std::string("Vulkan ") + name + " supports Float32 tensors only");
+      t.dtype() == DType::Float32 || t.dtype() == DType::Float16,
+      std::string("Vulkan ") + name +
+          " supports Float32 and Float16 tensors only");
   TP_CHECK(
       t.dim() >= 1 && t.dim() <= 4,
       std::string("Vulkan ") + name + " supports 1d to 4d tensors");
@@ -102,8 +103,8 @@ Tensor embedding_kernel(
   (void)scale_grad_by_freq;
   (void)sparse;
   TP_CHECK(
-      weight.dtype() == DType::Float32,
-      "Vulkan embedding supports a Float32 weight only");
+      weight.dtype() == DType::Float32 || weight.dtype() == DType::Float16,
+      "Vulkan embedding supports a Float32 or Float16 weight only");
   TP_CHECK(
       indices.dtype() == DType::Int64 || indices.dtype() == DType::Int32,
       "Vulkan embedding: indices must be Int64 or Int32");
@@ -134,11 +135,13 @@ Tensor embedding_kernel(
     api::vTensor v_indices_buf =
         to_buffer_storage_dispatch(context, v_indices);
     api::vTensor v_output{
-        context, {index_count, features}, DType::Float32,
+        context, {index_count, features}, weight.dtype(),
         api::StorageType::BUFFER, api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
-    const uint32_t nf4 =
-        static_cast<uint32_t>((features + 3) / 4);
-    const uint32_t n = nf4 * static_cast<uint32_t>(index_count);
+    // Words of the output payload: single precision fills one with four lanes,
+    // half packs two.
+    const uint32_t lanes = weight.dtype() == DType::Float16 ? 2u : 4u;
+    const uint32_t n =
+        static_cast<uint32_t>(index_count) * static_cast<uint32_t>(features);
     const struct EmbeddingBufferBlock {
       int32_t rows;
       int32_t features;
@@ -152,8 +155,11 @@ Tensor embedding_kernel(
     api::UniformParamsBuffer params(context, block);
     api::PipelineBarrier pipeline_barrier{};
     context->submit_compute_job(
-        VK_KERNEL_FROM_STR("embedding_buffer"), pipeline_barrier,
-        {n, 1u, 1u}, {256u, 1u, 1u}, VK_NULL_HANDLE,
+        VK_KERNEL_FROM_STR(weight.dtype() == DType::Float16
+                               ? "embedding_buffer_half"
+                               : "embedding_buffer"),
+        pipeline_barrier,
+        {api::utils::div_up(n, lanes), 1u, 1u}, {256u, 1u, 1u}, VK_NULL_HANDLE,
         v_output.buffer(
             pipeline_barrier,
             api::PipelineStage::COMPUTE,
@@ -180,7 +186,7 @@ Tensor embedding_kernel(
   // Output {index_count, features}: the 2-D texture geometry puts feature
   // columns on x and the lookup row on y.  Non-1d index tensors are flattened
   // for the lookup and reshaped back to `index_shape + (features,)`.
-  api::vTensor v_output{context, {index_count, features}, DType::Float32};
+  api::vTensor v_output{context, {index_count, features}, weight.dtype()};
 
   const struct EmbeddingBlock block{
       static_cast<int32_t>(index_count),
@@ -372,7 +378,7 @@ Tensor index_copy_kernel(const Tensor& self, int64_t dim, const Tensor& index, c
 
 Tensor index_select_kernel(
     const Tensor& self, int64_t dim, const Tensor& index) {
-  validate_float_operand(self, "index_select");
+  validate_gather_operand(self, "index_select");
   TP_CHECK(
       index.dim() == 1,
       "Vulkan index_select: index should be a vector");
@@ -392,29 +398,33 @@ Tensor index_select_kernel(
 
   api::Context* const context = api::context();
 
-  // Flatten the dense payload into a 1-D texture.
-  Tensor flat = self.reshape({self.numel()});
-  api::vTensor v_input = convert(flat);
+  api::vTensor v_self = convert(self);
   api::vTensor v_indices = upload_index_payload(index);
 
   const int64_t index_count = index.numel();
   const int64_t out_count = index_count * inner;
 
-  // A gather runs flat as soon as one of the payloads it touches has no image
-  // form: the rows it reads, the index list (one texel per entry) or the rows
-  // it writes.  A texture-stored source is copied into dense linear storage
-  // so the flat shader can read it beside the index buffer.
-  const bool linear_gather =
-      v_input.storage_type() == api::StorageType::BUFFER ||
-      v_indices.storage_type() == api::StorageType::BUFFER ||
-      !image_storage_supported(context, {out_count});
-  if (linear_gather) {
-    api::vTensor v_input_buf = to_buffer_storage_dispatch(context, v_input);
+  // The texel route walks the payload as a flat 1-D texture, so the source seen
+  // whole and the gathered rows must both have an image form, and the index
+  // list must fit one texel per entry.  Otherwise the gather runs flat: a
+  // texture-stored source is copied into dense linear storage, whose row-major
+  // order is already the flattened one, so no 1-D view is materialized.
+  const bool texture_gather =
+      v_self.storage_type() != api::StorageType::BUFFER &&
+      v_indices.storage_type() != api::StorageType::BUFFER &&
+      image_storage_supported(context, {self.numel()}) &&
+      image_storage_supported(context, {out_count});
+  if (!texture_gather) {
+    api::vTensor v_input_buf =
+        v_self.storage_type() == api::StorageType::BUFFER
+        ? v_self
+        : to_buffer_storage_dispatch(context, v_self);
     api::vTensor v_indices_buf =
         to_buffer_storage_dispatch(context, v_indices);
     api::vTensor v_out_buf{
-        context, {out_count}, DType::Float32, api::StorageType::BUFFER,
+        context, {out_count}, self.dtype(), api::StorageType::BUFFER,
         api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+    const uint32_t lanes = self.dtype() == DType::Float16 ? 2u : 4u;
     const uint32_t n = static_cast<uint32_t>(out_count);
     const struct IndexSelectBufferBlock {
       int32_t inner;
@@ -430,8 +440,11 @@ Tensor index_select_kernel(
     api::UniformParamsBuffer params(context, block);
     api::PipelineBarrier pipeline_barrier{};
     context->submit_compute_job(
-        VK_KERNEL_FROM_STR("index_select_buffer"), pipeline_barrier,
-        {(n + 3u) / 4u, 1u, 1u}, {256u, 1u, 1u}, VK_NULL_HANDLE,
+        VK_KERNEL_FROM_STR(self.dtype() == DType::Float16
+                               ? "index_select_buffer_half"
+                               : "index_select_buffer"),
+        pipeline_barrier,
+        {api::utils::div_up(n, lanes), 1u, 1u}, {256u, 1u, 1u}, VK_NULL_HANDLE,
         v_out_buf.buffer(
             pipeline_barrier,
             api::PipelineStage::COMPUTE,
@@ -454,7 +467,9 @@ Tensor index_select_kernel(
 
   // Both operands have an image form, so the gather walks the flattened texture
   // with one texel per selected element.
-  api::vTensor v_output{context, {out_count}, DType::Float32};
+  Tensor flat = self.reshape({self.numel()});
+  api::vTensor v_input = convert(flat);
+  api::vTensor v_output{context, {out_count}, self.dtype()};
 
   const struct IndexSelectBlock block{
       static_cast<int32_t>(inner),

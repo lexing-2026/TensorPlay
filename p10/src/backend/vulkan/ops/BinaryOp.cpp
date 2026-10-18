@@ -93,6 +93,41 @@ std::vector<int64_t> prepadded(const std::vector<int64_t>& v) {
   return out;
 }
 
+// Dense single precision narrowed into a half-precision linear payload: a half
+// word holds two lanes, so one invocation owns the destination word it writes.
+api::vTensor narrow_linear_to_half(
+    api::Context* context,
+    const api::vTensor& src) {
+  api::vTensor dst{
+      context,
+      src.sizes(),
+      DType::Float16,
+      api::StorageType::BUFFER,
+      api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+  const uint32_t elements = static_cast<uint32_t>(src.numel());
+  const struct NarrowBlock final {
+    uint32_t buf_length;
+    uint32_t fill0;
+    uint32_t fill1;
+    uint32_t fill2;
+  } block{elements, 0u, 0u, 0u};
+  api::UniformParamsBuffer params(context, block);
+  api::PipelineBarrier pipeline_barrier{};
+  context->submit_compute_job(
+      VK_KERNEL_FROM_STR("cast_float_float16_buffer"),
+      pipeline_barrier,
+      {api::utils::div_up(elements, 2u), 1u, 1u},
+      {256u, 1u, 1u},
+      VK_NULL_HANDLE,
+      dst.buffer(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::WRITE),
+      src.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+      params.buffer());
+  return dst;
+}
+
 // Returns a buffer-stored view of a tensor for the linear binary path.
 // Buffer-stored sources are shared as-is; texture-stored sources are copied
 // into a fresh dense buffer through the gather kernel (identity strides), which
@@ -106,11 +141,19 @@ api::vTensor to_buffer_storage(
     return src;
   }
   TP_CHECK(
-      src.dtype() == DType::Float32 || src.dtype() == DType::Int32,
+      src.dtype() == DType::Float32 || src.dtype() == DType::Int32 ||
+          src.dtype() == DType::Float16,
       "Vulkan buffer-storage binary ops cannot convert this dtype from "
       "texture storage yet");
+  // A texel's four lanes are not adjacent in the dense order, so a half
+  // payload cannot be gathered straight into two-lanes-per-word packing: two
+  // invocations would have to write the same destination word.  Copying
+  // through single precision and narrowing the linear payload afterwards keeps
+  // one writer per word.
+  const DType staging_dtype =
+      src.dtype() == DType::Float16 ? DType::Float32 : src.dtype();
   api::vTensor dst{
-      context, src.sizes(), src.dtype(), api::StorageType::BUFFER,
+      context, src.sizes(), staging_dtype, api::StorageType::BUFFER,
       api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
   const std::vector<int64_t> in_sizes = prepadded(
       std::vector<int64_t>(src.sizes().begin(), src.sizes().end()));
@@ -170,7 +213,10 @@ api::vTensor to_buffer_storage(
           api::MemoryAccessType::WRITE),
       src.image(pipeline_barrier, api::PipelineStage::COMPUTE),
       params.buffer());
-  return dst;
+  if (staging_dtype == src.dtype()) {
+    return dst;
+  }
+  return narrow_linear_to_half(context, dst);
 }
 
 // Element-width classes used by binary dispatch.
