@@ -665,7 +665,6 @@ Tensor group_norm_kernel(const Tensor& input, int64_t num_groups,
                                         static_cast<NSUInteger>(group_count),
                                         1, 1)
                 threadsPerThreadgroup:MTLSizeMake(tptg, 1, 1)];
-            mpsStream->synchronize(SyncType::COMMIT);
           }
         });
         return output;
