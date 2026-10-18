@@ -163,7 +163,7 @@ bool try_mpp_conv2d(const Tensor& input, const Tensor& weight,
       [encoder dispatchThreadgroups:MTLSizeMake(o_tiles, w_tiles,
                                               h_tiles * params.N)
           threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
-      stream->synchronize(SyncType::COMMIT_AND_WAIT);
+      stream->synchronize(SyncType::COMMIT);
     }
   });
   return true;
@@ -324,7 +324,7 @@ Tensor conv2d_kernel(const Tensor& input, const Tensor& weight,
     }
 
     getCurrentMPSStream()->executeMPSGraph(graph, feeds, results,
-                                          SyncType::COMMIT_AND_WAIT);
+                                          SyncType::COMMIT_ADAPTIVE);
     } @catch (NSException* e) {
       std::string reason =
           [e reason] ? std::string([[e reason] UTF8String])

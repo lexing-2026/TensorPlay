@@ -19,9 +19,8 @@
 namespace tensorplay {
 namespace mps {
 
-// Public interface to the MPS caching allocator. The methods mirror the
-// buffer-pool bookkeeping used by the Metal backend: sizes, buffer ids and
-// pool state are queried by copy kernels and memory-accounting bindings.
+// Public interface to the MPS caching allocator. Sizes, buffer ids and pool
+// state are queried by copy kernels and memory-accounting bindings.
 // No Metal or Objective-C types appear here so the interface stays usable
 // from plain C++ translation units.
 class P10_API IMPSAllocator : public Allocator {
@@ -42,6 +41,9 @@ class P10_API IMPSAllocator : public Allocator {
   virtual size_t getDriverAllocatedMemory() const = 0;
   // Recommended maximum total allocation for the current device.
   virtual size_t getRecommendedMaxMemory() const = 0;
+  // How far, in megabytes, the live allocations still sit below the low
+  // watermark limit used to detect memory pressure. Zero is the limit itself.
+  virtual ssize_t getLowWatermarkValue() const = 0;
   // Returns a previously allocated block to the pool for reuse.
   virtual void freeBuffer(void* ptr) = 0;
   // Returns the MTLBuffer backing `ptr` as an opaque pointer (bit-castable

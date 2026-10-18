@@ -110,6 +110,7 @@ Tensor& fill_kernel(Tensor& self, const Scalar& value) {
     const float v = static_cast<float>(value.toDouble());
     const float inverse = 1.0f / static_cast<float>(scale);
     const bool is_nan = std::isnan(v);
+    synchronizeHostAccess();
     void* data = self.data_ptr();
     switch (self.dtype()) {
       case DType::QInt8: {
@@ -189,6 +190,7 @@ Tensor& fill_kernel(Tensor& self, const Scalar& value) {
   }
   // Strided path: only contiguous tensors are expected in the skeleton
   // backend; non-contiguous views fall back to a flat walk over the storage.
+  synchronizeHostAccess();
   void* data = self.data_ptr();
   switch (self.dtype()) {
     case DType::Float32: {
@@ -252,6 +254,7 @@ Tensor& zero_inplace_kernel(Tensor& self) {
         break;
     }
   }
+  synchronizeHostAccess();
   void* data = self.data_ptr();
   if (self.is_contiguous()) {
     std::memset(data, 0, static_cast<size_t>(self.numel()) * self.itemsize());
@@ -288,6 +291,7 @@ Tensor zeros_kernel(const std::vector<int64_t>& size, DType dtype,
   }
   Tensor t(size, dtype, device);
   if (t.numel() > 0) {
+    synchronizeHostAccess();
     std::memset(t.data_ptr(), 0,
                 static_cast<size_t>(t.numel()) * t.itemsize());
   }
@@ -436,6 +440,7 @@ Tensor eye_kernel(int64_t n, int64_t m, DType dtype, Device device) {
   }
 
   // Host fallback for dtypes without a shader (double and complex).
+  synchronizeHostAccess();
   const int64_t min_dim = std::min(n, m);
   std::memset(t.data_ptr(), 0, static_cast<size_t>(n) * m * t.itemsize());
 #define EYE_CASE(ctype, name)                                            case DType::name: {                                                      ctype* data = t.data_ptr<ctype>();                                     for (int64_t i = 0; i < min_dim; ++i) data[i * m + i] = ctype(1);      break;                                                               }
@@ -472,6 +477,7 @@ Tensor arange_start_step_kernel(Scalar start, Scalar end, Scalar step,
 
   // Float64 keeps the host path (the shaders do not target double).
   if (dtype == DType::Float64) {
+    synchronizeHostAccess();
     double* data = t.data_ptr<double>();
     for (int64_t i = 0; i < len; ++i) {
       data[i] = s_d + i * st_d;
@@ -525,6 +531,7 @@ Tensor linspace_kernel(Scalar start, Scalar end, int64_t steps, DType dtype,
 
   // Float64 keeps the host path (the shaders do not target double).
   if (dtype == DType::Float64) {
+    synchronizeHostAccess();
     double* data = t.data_ptr<double>();
     for (int64_t i = 0; i < steps; ++i) {
       data[i] = s + i * step;
@@ -570,6 +577,7 @@ Tensor logspace_kernel(Scalar start, Scalar end, int64_t steps, double base,
 
   // Float64 keeps the host path (the shaders do not target double).
   if (dtype == DType::Float64) {
+    synchronizeHostAccess();
     double* data = t.data_ptr<double>();
     for (int64_t i = 0; i < steps; ++i) {
       data[i] = std::pow(base, s + i * step);
@@ -615,6 +623,7 @@ Tensor rand_kernel(const std::vector<int64_t>& size, DType dtype,
     return t;
   }
   if (dtype == DType::Float64) {
+    synchronizeHostAccess();
     double* data = t.data_ptr<double>();
     auto& gen = default_generator();
     uniform_real_distribution<double> dist(0.0, 1.0);
@@ -653,6 +662,7 @@ Tensor randn_kernel(const std::vector<int64_t>& size, DType dtype,
     return t;
   }
   if (dtype == DType::Float64) {
+    synchronizeHostAccess();
     double* data = t.data_ptr<double>();
     auto& gen = default_generator();
     normal_distribution<double> dist(0.0, 1.0);
@@ -724,6 +734,7 @@ Tensor randint_kernel(int64_t low, int64_t high,
   }
   // Host fallback (large int64 ranges or unsupported dtypes).
   auto& gen = default_generator();
+  synchronizeHostAccess();
   distribution::dispatch_dtype(dtype, [&](auto tag) {
     using scalar_t = decltype(tag);
     scalar_t* data = t.data_ptr<scalar_t>();

@@ -102,7 +102,10 @@ MPSBinaryOpBlock hypotBlock = ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* a,
 
 Tensor add_kernel(const Tensor& self, const Tensor& other,
                   const Scalar& alpha) {
-  return binaryOp(self, other, addBlock, alpha);
+  if (auto result = broadcastBinaryShader("add", self, other, alpha)) {
+    return *result;
+  }
+  return binaryOp("add", self, other, addBlock, alpha);
 }
 
 Tensor& add_inplace_kernel(Tensor& self, const Tensor& other,
@@ -133,7 +136,10 @@ Tensor sub_kernel(const Tensor& self, const Tensor& other,
              "Subtraction, the `-` operator, with two bool tensors is not "
              "supported on the MPS backend");
   }
-  return binaryOp(self, other, subBlock, alpha);
+  if (auto result = broadcastBinaryShader("sub", self, other, alpha)) {
+    return *result;
+  }
+  return binaryOp("sub", self, other, subBlock, alpha);
 }
 
 Tensor& sub_inplace_kernel(Tensor& self, const Tensor& other,
@@ -158,7 +164,10 @@ Tensor& sub_scalar_inplace_kernel(Tensor& self, const Scalar& other,
 }
 
 Tensor mul_kernel(const Tensor& self, const Tensor& other) {
-  return binaryOp(self, other, mulBlock);
+  if (auto result = broadcastBinaryShader("mul", self, other)) {
+    return *result;
+  }
+  return binaryOp("mul", self, other, mulBlock);
 }
 
 Tensor& mul_inplace_kernel(Tensor& self, const Tensor& other) {
@@ -187,7 +196,7 @@ Tensor div_kernel(const Tensor& self, const Tensor& other) {
       isIntegralType(other.dtype(), true)) {
     common = DType::Float32;
   }
-  return binaryOp(self, other, divBlock, std::nullopt, common);
+  return binaryOp("div", self, other, divBlock, std::nullopt, common);
 }
 
 Tensor& div_inplace_kernel(Tensor& self, const Tensor& other) {
@@ -213,7 +222,7 @@ Tensor& div_scalar_inplace_kernel(Tensor& self, const Scalar& other) {
 // ---------------------------------------------------------------------------
 
 Tensor pow_tensor_tensor_kernel(const Tensor& self, const Tensor& exponent) {
-  return binaryOp(self, exponent, powBlock);
+  return binaryOp("pow", self, exponent, powBlock);
 }
 
 Tensor pow_scalar_kernel(const Tensor& self, const Scalar& exponent) {
@@ -245,7 +254,7 @@ Tensor& pow_scalar_inplace_kernel(Tensor& self, const Scalar& exponent) {
 // ---------------------------------------------------------------------------
 
 Tensor remainder_tensor_kernel(const Tensor& self, const Tensor& other) {
-  return binaryOp(self, other, remainderBlock);
+  return binaryOp("remainder", self, other, remainderBlock);
 }
 
 Tensor remainder_scalar_kernel(const Tensor& self, const Scalar& other) {
@@ -255,7 +264,7 @@ Tensor remainder_scalar_kernel(const Tensor& self, const Scalar& other) {
 }
 
 Tensor fmod_tensor_kernel(const Tensor& self, const Tensor& other) {
-  return binaryOp(self, other, fmodBlock);
+  return binaryOp("fmod", self, other, fmodBlock);
 }
 
 Tensor fmod_scalar_kernel(const Tensor& self, const Scalar& other) {
@@ -269,19 +278,19 @@ Tensor fmod_scalar_kernel(const Tensor& self, const Scalar& other) {
 // ---------------------------------------------------------------------------
 
 Tensor maximum_kernel(const Tensor& self, const Tensor& other) {
-  return binaryOp(self, other, maximumBlock);
+  return binaryOp("maximum", self, other, maximumBlock);
 }
 
 Tensor minimum_kernel(const Tensor& self, const Tensor& other) {
-  return binaryOp(self, other, minimumBlock);
+  return binaryOp("minimum", self, other, minimumBlock);
 }
 
 Tensor fmax_kernel(const Tensor& self, const Tensor& other) {
-  return binaryOp(self, other, maximumBlock);
+  return binaryOp("maximum", self, other, maximumBlock);
 }
 
 Tensor fmin_kernel(const Tensor& self, const Tensor& other) {
-  return binaryOp(self, other, minimumBlock);
+  return binaryOp("minimum", self, other, minimumBlock);
 }
 
 // ---------------------------------------------------------------------------
@@ -289,7 +298,7 @@ Tensor fmin_kernel(const Tensor& self, const Tensor& other) {
 // ---------------------------------------------------------------------------
 
 Tensor atan2_kernel(const Tensor& self, const Tensor& other) {
-  return binaryOp(self, other, atan2Block);
+  return binaryOp("atan2", self, other, atan2Block);
 }
 
 Tensor& atan2_inplace_kernel(Tensor& self, const Tensor& other) {
@@ -299,7 +308,7 @@ Tensor& atan2_inplace_kernel(Tensor& self, const Tensor& other) {
 }
 
 Tensor hypot_kernel(const Tensor& self, const Tensor& other) {
-  return binaryOp(self, other, hypotBlock);
+  return binaryOp("hypot", self, other, hypotBlock);
 }
 
 Tensor& hypot_inplace_kernel(Tensor& self, const Tensor& other) {
@@ -318,9 +327,9 @@ Tensor addcmul_kernel(const Tensor& self, const Tensor& tensor1,
   const DType common = promoteTypes(
       promoteTypes(self.dtype(), tensor1.dtype()), tensor2.dtype());
   Tensor v_t = scalarToMPS(value, common, self.device());
-  Tensor t1 = binaryOp(tensor1, tensor2, mulBlock);
-  Tensor t1v = binaryOp(t1, v_t, mulBlock);
-  return binaryOp(self, t1v, addBlock);
+  Tensor t1 = binaryOp("mul", tensor1, tensor2, mulBlock);
+  Tensor t1v = binaryOp("mul", t1, v_t, mulBlock);
+  return binaryOp("add", self, t1v, addBlock);
 }
 
 Tensor& addcmul_inplace_kernel(Tensor& self, const Tensor& tensor1,
@@ -340,9 +349,9 @@ Tensor addcdiv_kernel(const Tensor& self, const Tensor& tensor1,
   const DType common = promoteTypes(
       promoteTypes(self.dtype(), tensor1.dtype()), tensor2.dtype());
   Tensor v_t = scalarToMPS(value, common, self.device());
-  Tensor t1v = binaryOp(tensor1, v_t, mulBlock);
-  Tensor t12 = binaryOp(t1v, tensor2, divBlock);
-  return binaryOp(self, t12, addBlock);
+  Tensor t1v = binaryOp("mul", tensor1, v_t, mulBlock);
+  Tensor t12 = binaryOp("div", t1v, tensor2, divBlock);
+  return binaryOp("add", self, t12, addBlock);
 }
 
 Tensor& addcdiv_inplace_kernel(Tensor& self, const Tensor& tensor1,

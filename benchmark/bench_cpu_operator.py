@@ -757,18 +757,6 @@ def build_cases(dtype, suite):
     add("softmax2d[8x16x28x28]", "normalization",
         lambda a: F.softmax(a, dim=1),
         (_spec("normal", (8, 16, 28, 28), 992),))
-    add("conv3d-3[2x8x16x16x16]", "convolution",
-        lambda a, w: pF.conv3d(a, w, None, stride=1, padding=1),
-        (conv3d_input, conv3d_weight))
-    add("conv-transpose3d[2x16x16x16x16]", "convolution",
-        lambda a, w: pF.conv_transpose3d(a, w),
-        (convt3d_input, convt3d_weight))
-    add("max-pool3d[2x8x16x16x16]", "pool",
-        lambda a: pF.max_pool3d(a, 2), (conv3d_input,))
-    add("avg-pool3d[2x8x16x16x16]", "pool",
-        lambda a: pF.avg_pool3d(a, 2), (conv3d_input,))
-    add("adaptive-max-pool3d[2x8x16x16x16]", "pool",
-        lambda a: pF.adaptive_max_pool3d(a, (4, 4, 4)), (conv3d_input,))
 
     # In-place variants of the unary and binary families.  The factory
     # materialises fresh tensors per probe, so mutating them in place is

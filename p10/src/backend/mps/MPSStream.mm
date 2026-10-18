@@ -1,6 +1,7 @@
 #include "backend/mps/MPSStream.h"
 
 #include "backend/mps/MetalUtils.h"
+#include "backend/mps/MPSAllocator.h"
 #include "Exception.h"
 
 #include <array>
@@ -28,10 +29,10 @@ MPSStream::MPSStream(Stream stream) : _stream(stream) {
   _serialQueue = dispatch_queue_create("tensorplay mps stream", nullptr);
   _executionDescriptor = [MPSGraphExecutionDescriptor new];
   _compilationDescriptor = [MPSGraphCompilationDescriptor new];
-  // CommitAndContinue is disabled to match the reference backend; the
-  // command buffer is committed explicitly and the previous buffer is
-  // tracked for completion.
-  _enableCommitAndContinue = false;
+  // A launch commits the stream's command buffer as one stage and encoding
+  // carries on in the next, so queueing work costs no host round trip while a
+  // later wait still covers every stage encoded before it.
+  _enableCommitAndContinue = true;
   _executionDescriptor.enableCommitAndContinue = _enableCommitAndContinue;
   // Choose level which optimizes for GPU.
   _compilationDescriptor.optimizationLevel = MPSGraphOptimizationLevel0;
@@ -87,7 +88,13 @@ void MPSStream::synchronize(SyncType syncType) {
       commit();
       break;
     case SyncType::COMMIT_ADAPTIVE:
-      commit();
+      // Encoding stays inside the command buffer the stream is building, so a
+      // run of launches pays one commit. The buffer is only closed early once
+      // the pool has run up to its low watermark and holding more work there
+      // would add to the pressure.
+      if (getIMPSAllocator()->getLowWatermarkValue() <= 1) {
+        commit();
+      }
       break;
     case SyncType::COMMIT_AND_WAIT:
       commitAndWait();
@@ -299,6 +306,17 @@ MPSStream* getCurrentMPSStream() {
 
 void setCurrentMPSStream(MPSStream* stream) {
   tls_current_stream = stream;
+}
+
+void synchronizeHostAccess() {
+  MPSStream* stream = getCurrentMPSStream();
+  // Draining on the stream's own queue keeps the wait in step with the launches
+  // that are still being encoded.
+  dispatch_sync_with_rethrow(stream->queue(), ^() {
+    @autoreleasepool {
+      stream->synchronize(SyncType::COMMIT_AND_WAIT);
+    }
+  });
 }
 
 MPSStream* getStreamFromPool() {

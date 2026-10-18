@@ -12,6 +12,7 @@
 #include <Metal/Metal.h>
 
 #include <array>
+#include <cstring>
 #include <exception>
 #include <optional>
 #include <string>
@@ -108,6 +109,80 @@ inline void mtl_dispatch1DJob(id<MTLComputeCommandEncoder> encoder,
   [encoder dispatchThreads:MTLSizeMake(size, 1, 1)
       threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
 }
+
+// Whether this GPU vends the argument encoders that foreach kernels depend on.
+// Such a kernel reads the tensors it updates out of an argument buffer, and an
+// encoder is the only way to put a buffer's device address into one: the
+// addresses differ from the pointers the host uses, so the buffer cannot be
+// filled by hand.  The image shipped with macOS 14 has no encoders at all, and
+// asking for one raises rather than returning nil, so the request is the probe.
+inline bool vendsArgumentEncoder(id<MTLFunction> func) {
+  @try {
+    id<MTLArgumentEncoder> encoder = [func newArgumentEncoderWithBufferIndex:0];
+    const bool vends = encoder != nil;
+    [encoder release];
+    return vends;
+  } @catch (NSException* exception) {
+    return false;
+  }
+}
+
+// The capability belongs to the GPU device, so the first answer holds for the
+// whole process.
+inline bool argumentEncodersAvailable(id<MTLFunction> func) {
+  static const bool available = vendsArgumentEncoder(func);
+  return available;
+}
+
+// Binds the tensor pointers a foreach kernel reads out of an argument buffer.
+// Only usable once argumentEncodersAvailable() has reported a device that vends
+// an encoder.
+class ForeachArguments {
+ public:
+  // The accessor hands back an owned encoder.  `computeEncoder` is the encoder
+  // the launches are encoded on; it is borrowed for as long as this object.
+  ForeachArguments(id<MTLComputeCommandEncoder> computeEncoder,
+                   id<MTLFunction> func,
+                   id<MTLDevice> device)
+      : computeEncoder_(computeEncoder),
+        device_(device),
+        encoder_([func newArgumentEncoderWithBufferIndex:0]) {
+    bytes_ = [encoder_ encodedLength];
+  }
+  ~ForeachArguments() {
+    [encoder_ release];
+  }
+  ForeachArguments(const ForeachArguments&) = delete;
+  ForeachArguments& operator=(const ForeachArguments&) = delete;
+
+  // A fresh buffer for one launch's bindings, with the slots this launch leaves
+  // unbound reading as null pointers.
+  id<MTLBuffer> buffer() const {
+    id<MTLBuffer> argument_buffer =
+        [[device_ newBufferWithLength:bytes_ options:0] autorelease];
+    memset(argument_buffer.contents, 0, bytes_);
+    [encoder_ setArgumentBuffer:argument_buffer offset:0];
+    return argument_buffer;
+  }
+
+  // Binds one tensor into the buffer most recently handed out.  The launch
+  // reaches the tensor through a pointer that sits inside the argument buffer,
+  // where the command encoder cannot see it, so the storage has to be claimed
+  // as a resource by hand: unclaimed, its block may be recycled while the
+  // launch still reads it, and the tensors that land in a recycled block are
+  // updated somewhere else.
+  void bind(NSUInteger index, id<MTLBuffer> storage) const {
+    [encoder_ setBuffer:storage offset:0 atIndex:index];
+    [computeEncoder_ useResource:storage
+                           usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+  }
+
+ private:
+  id<MTLComputeCommandEncoder> computeEncoder_ = nil;
+  id<MTLDevice> device_ = nil;
+  id<MTLArgumentEncoder> encoder_ = nil;
+  NSUInteger bytes_ = 0;
+};
 
 // Runs a block on the MPS stream's serial queue, rethrowing C++ exceptions
 // across the dispatch boundary.

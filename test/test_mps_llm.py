@@ -122,6 +122,31 @@ class TestMPSFusedOptimizer(unittest.TestCase):
         p_cpu = self._step("cpu", adamw=False)
         self.assertTrue(close(p_mps, p_cpu, 1e-4))
 
+    def _foreach_step(self, device, params, grads):
+        params = [p.to(device).clone() for p in params]
+        grads = [g.to(device).clone() for g in grads]
+        sizes = [p.numel() for p in params]
+        exp_avgs = [tp.zeros(s, device=device) for s in sizes]
+        exp_avg_sqs = [tp.zeros(s, device=device) for s in sizes]
+        steps = [tp.tensor(2.0, dtype=tp.float32, device=device)
+                 for _ in sizes]
+        tp._fused_adamw_(params, grads, exp_avgs, exp_avg_sqs, [], steps,
+                         lr=0.01, beta1=0.9, beta2=0.999, weight_decay=0.01,
+                         eps=1e-8, amsgrad=False, maximize=False)
+        return [p.cpu() for p in params]
+
+    def test_fused_adamw_two_parameters(self):
+        # Two parameters share one launch, so every pointer array of the
+        # argument buffer has to carry both of them.  The longer one spans
+        # three chunks.
+        sizes = [6, 131080]
+        params = [tp.randn(s) for s in sizes]
+        grads = [tp.randn(s) for s in sizes]
+        mps_out = self._foreach_step("mps", params, grads)
+        cpu_out = self._foreach_step("cpu", params, grads)
+        for a, b in zip(mps_out, cpu_out):
+            self.assertTrue(close(a, b, 1e-4))
+
 
 @unittest.skipUnless(mps_available(), "MPS not available")
 class TestMPSSDPA(unittest.TestCase):
@@ -198,6 +223,18 @@ class TestMPSSDPA(unittest.TestCase):
         out_cpu = tp.scaled_dot_product_attention(q.cpu(), k.cpu(), v.cpu(),
                                                   attn_mask=mask.cpu())
         self.assertTrue(close(out.cpu(), out_cpu, 1e-2))
+
+    def test_sdpa_head_broadcast_mask(self):
+        # A mask that leaves the head axis at one still reaches the graph path,
+        # where it is spread over the heads before the scores are shifted.
+        q = tp.randn(2, 2, 4, 8, device="mps")
+        k = tp.randn(2, 2, 6, 8, device="mps")
+        v = tp.randn(2, 2, 6, 8, device="mps")
+        mask = tp.randn(2, 1, 4, 6, device="mps")
+        out = tp.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        expected = tp.scaled_dot_product_attention(
+            q.cpu(), k.cpu(), v.cpu(), attn_mask=mask.cpu())
+        self.assertTrue(close(out.cpu(), expected, 1e-2))
 
     def test_sdpa_gqa(self):
         q = tp.randn(1, 4, 4, 64, device="mps")
@@ -280,6 +317,36 @@ class TestMPSFusedSGD(unittest.TestCase):
     def test_sgd_nesterov(self):
         self.assertTrue(self._mps_vs_cpu(0.9, True))
 
+    def _foreach_step(self, device, params, grads, momentum):
+        params = [p.to(device).clone() for p in params]
+        grads = [g.to(device).clone() for g in grads]
+        sizes = [p.numel() for p in params]
+        bufs = [tp.zeros(s, device=device) for s in sizes] if momentum else []
+        tp._fused_sgd_(params, grads, bufs, weight_decay=0.01,
+                       momentum=momentum, lr=0.01, dampening=0.1,
+                       nesterov=False, maximize=False, is_first_step=False)
+        return [p.cpu() for p in params]
+
+    def _foreach_mps_vs_cpu(self, sizes, momentum):
+        params = [tp.randn(s) for s in sizes]
+        grads = [tp.randn(s) for s in sizes]
+        mps_out = self._foreach_step("mps", params, grads, momentum)
+        cpu_out = self._foreach_step("cpu", params, grads, momentum)
+        for a, b in zip(mps_out, cpu_out):
+            if not close(a, b, 1e-4):
+                return False
+        return True
+
+    def test_sgd_spans_more_threadgroups_than_one_launch(self):
+        # One parameter needs 33 threadgroups, so a launch is closed in the
+        # middle of it and the parameter carries over to the next buffer.
+        self.assertTrue(self._foreach_mps_vs_cpu([65536 * 32 + 8, 6], 0.9))
+
+    def test_sgd_fills_the_parameter_list(self):
+        # 33 parameters: a launch is closed as soon as the list is full, so the
+        # last parameter has to be bound in a fresh one.
+        self.assertTrue(self._foreach_mps_vs_cpu([6] * 33, 0.9))
+
 
 @unittest.skipUnless(mps_available(), "MPS not available")
 class TestMPSAmp(unittest.TestCase):
@@ -300,7 +367,23 @@ class TestMPSAmp(unittest.TestCase):
         inv_scale = tp.tensor(0.5, dtype=tp.float32, device="mps")
         tp._amp_foreach_non_finite_check_and_unscale_(grads, found, inv_scale)
         self.assertEqual(found.item(), 0.0)
-        self.assertTrue(close(grads[0].cpu(), tp.tensor([0.5, 1.0]), 1e-5))
+        scaled = grads[0].cpu()
+        self.assertTrue(close(scaled, tp.tensor([0.5, 1.0]), 1e-5),
+                        f"unscaled: {scaled}")
+
+    def test_non_finite_check_fills_the_tensor_list(self):
+        # 33 gradients: a launch is closed as soon as the list is full, so the
+        # last one has to be bound in a fresh argument buffer.
+        grads = [tp.tensor([2.0, 2.0, 2.0, 2.0], device="mps")
+                 for _ in range(33)]
+        found = tp.zeros((), dtype=tp.float32, device="mps")
+        inv_scale = tp.tensor(0.5, dtype=tp.float32, device="mps")
+        tp._amp_foreach_non_finite_check_and_unscale_(grads, found, inv_scale)
+        self.assertEqual(found.item(), 0.0)
+        for i, g in enumerate(grads):
+            scaled = g.cpu()
+            self.assertTrue(close(scaled, tp.tensor([1.0, 1.0, 1.0, 1.0]),
+                                  1e-5), f"unscaled {i}: {scaled}")
 
     def test_update_scale_growth(self):
         scale = tp.tensor(1.0, dtype=tp.float32, device="mps")

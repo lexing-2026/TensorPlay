@@ -63,7 +63,7 @@ std::tuple<Tensor, Tensor> native_dropout_kernel(const Tensor& input, double p,
                   std::array<long, 2>{seed, base_offset});
       mtl_setArgs<5>(encoder, numel_u32);
       mtl_dispatch1DJob(encoder, pso, (numel + 3) / 4);
-      stream->synchronize(SyncType::COMMIT_AND_WAIT);
+      stream->synchronize(SyncType::COMMIT);
     }
   });
   return std::make_tuple(output, mask);
@@ -86,7 +86,7 @@ Tensor native_dropout_backward_kernel(const Tensor& grad_output,
       [encoder setComputePipelineState:pso];
       mtl_setArgs(encoder, result, grad_output, mask, static_cast<float>(scale));
       mtl_dispatch1DJob(encoder, pso, grad_output.numel());
-      stream->synchronize(SyncType::COMMIT_AND_WAIT);
+      stream->synchronize(SyncType::COMMIT);
     }
   });
   return result;

@@ -704,6 +704,28 @@ Tensor scaled_dot_product_attention_kernel(
 
   std::vector<int64_t> probs_shape = {B, H, L, S};
   std::vector<int64_t> out_shape = {B, H, L, E};
+  // The two products are described with a single leading dimension: the runtime
+  // only compiles a batched matrix product over one batch axis, and merging the
+  // batch and head axes leaves the element order untouched.
+  const int64_t BH = B * H;
+  const std::vector<int64_t> q3_shape = {BH, L, E};
+  const std::vector<int64_t> kv3_shape = {BH, S, E};
+  const std::vector<int64_t> probs3_shape = {BH, L, S};
+  // A causal pattern is one (L, S) plane shared by every head, so it keeps a
+  // leading dimension of one. Any other mask is broadcast over the heads first
+  // so that its leading dimensions fold into the merged one.
+  std::vector<int64_t> mask3_shape;
+  Tensor mask_in;
+  if (mask.defined()) {
+    if (mask.dim() == 2) {
+      mask_in = materializeForGraph(mask);
+      mask3_shape = {1, L, S};
+    } else {
+      mask_in = materializeForGraph(mask.expand({B, H, L, S}));
+      mask3_shape = probs3_shape;
+    }
+  }
+
   Tensor output = Tensor::empty(out_shape, dt, q_c.device());
   if (output.numel() == 0) {
     if (unsqueezed) {
@@ -716,9 +738,9 @@ Tensor scaled_dot_product_attention_kernel(
   Tensor probs = Tensor::empty(probs_shape, dt, q_c.device());
   @autoreleasepool {
     MPSGraph* graph = [[MPSGraph new] autorelease];
-    MPSShape* qShape = getMPSShape(static_cast<std::vector<int64_t>>(q_c.shape()));
-    MPSShape* kShape = getMPSShape(static_cast<std::vector<int64_t>>(k_c.shape()));
-    MPSShape* probsShape = getMPSShape(probs_shape);
+    MPSShape* qShape = getMPSShape(q3_shape);
+    MPSShape* kShape = getMPSShape(kv3_shape);
+    MPSShape* probsShape = getMPSShape(probs3_shape);
     const MPSDataType mtl_dt = getMPSDataType(dt);
 
     MPSGraphTensor* qt = [graph placeholderWithShape:qShape
@@ -728,8 +750,8 @@ Tensor scaled_dot_product_attention_kernel(
                                             dataType:mtl_dt
                                                  name:@"k"];
     MPSGraphTensor* kT = [graph transposeTensor:kt
-                                      dimension:2
-                                   withDimension:3
+                                      dimension:1
+                                   withDimension:2
                                             name:@"kT"];
     MPSGraphTensor* scores =
         [graph matrixMultiplicationWithPrimaryTensor:qt
@@ -743,17 +765,16 @@ Tensor scaled_dot_product_attention_kernel(
                                      secondaryTensor:scaleTensor
                                                 name:@"scaled"];
     MPSGraphTensor* mt = nil;
-    if (mask.defined()) {
-      mt = [graph placeholderWithShape:getMPSShape(
-          static_cast<std::vector<int64_t>>(mask.shape()))
-                                             dataType:mtl_dt
-                                                  name:@"mask"];
+    if (mask_in.defined()) {
+      mt = [graph placeholderWithShape:getMPSShape(mask3_shape)
+                              dataType:mtl_dt
+                                  name:@"mask"];
       scores = [graph additionWithPrimaryTensor:scores
                                  secondaryTensor:mt
                                             name:@"masked"];
     }
     MPSGraphTensor* probsT = [graph softMaxWithTensor:scores
-                                                 axis:3
+                                                 axis:2
                                                  name:@"probs"];
 
     id<MTLBuffer> qBuf = mtlBufferOf(q_c);
@@ -777,18 +798,16 @@ Tensor scaled_dot_product_attention_kernel(
     feeds[kt] = kData;
     NSMutableDictionary* results = [NSMutableDictionary dictionary];
     results[probsT] = probsData;
-    if (mask.defined()) {
-      Tensor mask_c = mask.is_contiguous() ? mask : mask.contiguous();
-      id<MTLBuffer> maskBuf = mtlBufferOf(mask_c);
+    if (mask_in.defined()) {
+      id<MTLBuffer> maskBuf = mtlBufferOf(mask_in);
       MPSGraphTensorData* maskData =
           [[[MPSGraphTensorData alloc] initWithMTLBuffer:maskBuf
-                                                  shape:getMPSShape(
-                                                      static_cast<std::vector<int64_t>>(mask_c.shape()))
+                                                  shape:getMPSShape(mask3_shape)
                                                dataType:mtl_dt] autorelease];
       feeds[mt] = maskData;
     }
     getCurrentMPSStream()->executeMPSGraph(graph, feeds, results,
-                                      SyncType::COMMIT_AND_WAIT);
+                                      SyncType::COMMIT_ADAPTIVE);
   }
 
   Tensor probs_in = probs;
@@ -801,9 +820,9 @@ Tensor scaled_dot_product_attention_kernel(
   // Pass 2: output = probs @ V.
   @autoreleasepool {
     MPSGraph* graph = [[MPSGraph new] autorelease];
-    MPSShape* pShape = getMPSShape(static_cast<std::vector<int64_t>>(probs_in.shape()));
-    MPSShape* vShape = getMPSShape(static_cast<std::vector<int64_t>>(v_c.shape()));
-    MPSShape* outShape = getMPSShape(out_shape);
+    MPSShape* pShape = getMPSShape(probs3_shape);
+    MPSShape* vShape = getMPSShape(kv3_shape);
+    MPSShape* outShape = getMPSShape({BH, L, E});
     const MPSDataType mtl_dt = getMPSDataType(dt);
 
     MPSGraphTensor* pt = [graph placeholderWithShape:pShape
@@ -836,7 +855,7 @@ Tensor scaled_dot_product_attention_kernel(
     NSDictionary* feeds = @{pt : pData, vt : vData};
     NSDictionary* results = @{result : outData};
     getCurrentMPSStream()->executeMPSGraph(graph, feeds, results,
-                                      SyncType::COMMIT_AND_WAIT);
+                                      SyncType::COMMIT_ADAPTIVE);
   }
 
   if (unsqueezed) {

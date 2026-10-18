@@ -351,6 +351,8 @@ Tensor quantize_per_tensor_kernel(const Tensor& self, double scale,
   const int64_t numel = input.numel();
   const auto range = quantized_range(dtype);
   const DType storage_dt = underlying_storage(dtype);
+  // The loops below read and write the shared-memory mappings.
+  synchronizeHostAccess();
 
   switch (dtype) {
     case DType::QInt8: {
@@ -481,6 +483,9 @@ Tensor quantize_per_channel_kernel(const Tensor& self, const Tensor& scales,
     zpi_ptr = zpi.data_ptr<int64_t>();
   }
 
+  // The mappings taken here and below are only sound once the conversions that
+  // filled them have run.
+  synchronizeHostAccess();
   const float* in = input.data_ptr<float>();
   switch (dtype) {
     case DType::QInt8: {
@@ -612,6 +617,7 @@ Tensor dequantize_self_kernel(const Tensor& self) {
   if (numel == 0) {
     return out;
   }
+  synchronizeHostAccess();
 
   if (isPerTensorQScheme(q->qscheme())) {
     const double scale = q->scale();

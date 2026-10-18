@@ -602,6 +602,77 @@ kernel void fused_sgd(
   }
 }
 
+// One parameter per launch, bound directly rather than through an argument
+// struct.  These need no argument encoder, so they also run on a GPU image that
+// has none.
+template <typename T>
+kernel void fused_sgd_single(
+    device T* param [[buffer(0)]],
+    device T* grad [[buffer(1)]],
+    constant float& weight_decay [[buffer(2)]],
+    constant float& lr [[buffer(3)]],
+    constant uint8_t& maximize [[buffer(4)]],
+    device const float* grad_scale [[buffer(5)]],
+    device const float* found_inf [[buffer(6)]],
+    uint tid [[thread_position_in_grid]]) {
+  if (found_inf && *found_inf == 1) {
+    return;
+  }
+  sgd_math<T>(param[tid], grad[tid], weight_decay, lr, maximize, grad_scale);
+}
+
+template <typename T>
+kernel void fused_sgd_momentum_single(
+    device T* param [[buffer(0)]],
+    device T* grad [[buffer(1)]],
+    device T* momentum_buffer [[buffer(2)]],
+    constant float& weight_decay [[buffer(3)]],
+    constant float& momentum [[buffer(4)]],
+    constant float& lr [[buffer(5)]],
+    constant float& dampening [[buffer(6)]],
+    constant uint8_t& nesterov [[buffer(7)]],
+    constant uint8_t& maximize [[buffer(8)]],
+    constant uint8_t& is_first_step [[buffer(9)]],
+    device const float* grad_scale [[buffer(10)]],
+    device const float* found_inf [[buffer(11)]],
+    uint tid [[thread_position_in_grid]]) {
+  if (found_inf && *found_inf == 1) {
+    return;
+  }
+  sgd_momentum_math<T>(param[tid], grad[tid], momentum_buffer[tid], weight_decay,
+                       momentum, lr, dampening, nesterov, maximize,
+                       is_first_step, grad_scale);
+}
+
+#define REGISTER_FUSED_SGD_SINGLE_OP(DTYPE)                                 \
+  template [[host_name("fused_sgd_single_" #DTYPE)]] kernel void            \
+  fused_sgd_single<DTYPE>(                                                  \
+      device DTYPE* param [[buffer(0)]],                                    \
+      device DTYPE* grad [[buffer(1)]],                                     \
+      constant float& weight_decay [[buffer(2)]],                           \
+      constant float& lr [[buffer(3)]],                                     \
+      constant uint8_t& maximize [[buffer(4)]],                             \
+      device const float* grad_scale [[buffer(5)]],                         \
+      device const float* found_inf [[buffer(6)]],                          \
+      uint tid [[thread_position_in_grid]])
+
+#define REGISTER_FUSED_SGD_MOMENTUM_SINGLE_OP(DTYPE)                        \
+  template [[host_name("fused_sgd_momentum_single_" #DTYPE)]] kernel void    \
+  fused_sgd_momentum_single<DTYPE>(                                         \
+      device DTYPE* param [[buffer(0)]],                                    \
+      device DTYPE* grad [[buffer(1)]],                                     \
+      device DTYPE* momentum_buffer [[buffer(2)]],                          \
+      constant float& weight_decay [[buffer(3)]],                           \
+      constant float& momentum [[buffer(4)]],                               \
+      constant float& lr [[buffer(5)]],                                     \
+      constant float& dampening [[buffer(6)]],                              \
+      constant uint8_t& nesterov [[buffer(7)]],                             \
+      constant uint8_t& maximize [[buffer(8)]],                             \
+      constant uint8_t& is_first_step [[buffer(9)]],                        \
+      device const float* grad_scale [[buffer(10)]],                        \
+      device const float* found_inf [[buffer(11)]],                         \
+      uint tid [[thread_position_in_grid]])
+
 #define REGISTER_FUSED_SGD_OP(DTYPE)                                        \
   template [[host_name("fused_sgd_" #DTYPE)]] kernel void fused_sgd<DTYPE>(  \
       device SgdArguments<DTYPE>& args [[buffer(0)]],                       \
@@ -639,3 +710,9 @@ REGISTER_FUSED_SGD_OP(bfloat);
 REGISTER_FUSED_SGD_MOMENTUM_OP(float);
 REGISTER_FUSED_SGD_MOMENTUM_OP(half);
 REGISTER_FUSED_SGD_MOMENTUM_OP(bfloat);
+REGISTER_FUSED_SGD_SINGLE_OP(float);
+REGISTER_FUSED_SGD_SINGLE_OP(half);
+REGISTER_FUSED_SGD_SINGLE_OP(bfloat);
+REGISTER_FUSED_SGD_MOMENTUM_SINGLE_OP(float);
+REGISTER_FUSED_SGD_MOMENTUM_SINGLE_OP(half);
+REGISTER_FUSED_SGD_MOMENTUM_SINGLE_OP(bfloat);

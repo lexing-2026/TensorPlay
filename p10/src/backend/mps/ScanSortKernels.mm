@@ -67,7 +67,7 @@ void dispatch_scan(const std::string& kernel_name, const Tensor& src,
       const int tg = std::min(std::max(inner_i, 1), max_tptg);
       [encoder dispatchThreads:MTLSizeMake(inner_i, outer_i, 1)
           threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-      stream->synchronize(SyncType::COMMIT_AND_WAIT);
+      stream->synchronize(SyncType::COMMIT);
     }
   });
 }
@@ -263,7 +263,7 @@ std::tuple<Tensor, Tensor> sort_kernel(const Tensor& self, int64_t dim,
       [encoder setThreadgroupMemoryLength:idx_bytes atIndex:1];
       [encoder dispatchThreadgroups:MTLSizeMake(num_slices_i, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(P_i, 1, 1)];
-      stream->synchronize(SyncType::COMMIT_AND_WAIT);
+      stream->synchronize(SyncType::COMMIT);
     }
   });
   return std::make_tuple(values, indices);

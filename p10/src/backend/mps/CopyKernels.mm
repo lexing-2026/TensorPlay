@@ -170,6 +170,9 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src_in, bool non_blocking) {
   }
 
   if (src.device().is_cpu()) {
+    // The destination mapping may be recycled storage still being read by
+    // queued work.
+    synchronizeHostAccess();
     copy_via_host(self, src);
     return self;
   }

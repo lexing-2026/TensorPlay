@@ -73,7 +73,7 @@ bool try_mpp_gemm(const Tensor& a, const Tensor& b, Tensor& output,
       mtl_setArgs(encoder, a, b, output, strides, sizes, batch_u);
       [encoder dispatchThreadgroups:MTLSizeMake(grid_x, grid_y, batch_u)
               threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-      stream->synchronize(SyncType::COMMIT_AND_WAIT);
+      stream->synchronize(SyncType::COMMIT);
     }
   });
   return true;
@@ -141,7 +141,7 @@ void runMatMul(const Tensor& a, const Tensor& b,
     NSDictionary* feeds = @{entry->input0 : aData, entry->input1 : bData};
     NSDictionary* results = @{entry->result : outData};
     getCurrentMPSStream()->executeMPSGraph(entry->graph, feeds, results,
-                                          SyncType::COMMIT_AND_WAIT);
+                                          SyncType::COMMIT_ADAPTIVE);
   }
 }
 
@@ -269,7 +269,7 @@ Tensor dot_kernel(const Tensor& self_in, const Tensor& other_in) {
     NSDictionary* feeds = @{at : aData, bt : bData};
     NSDictionary* results = @{sum : outData};
     getCurrentMPSStream()->executeMPSGraph(graph, feeds, results,
-                                          SyncType::COMMIT_AND_WAIT);
+                                          SyncType::COMMIT_ADAPTIVE);
   }
   return output;
 }
@@ -369,7 +369,14 @@ Tensor addmm_kernel(const Tensor& input, const Tensor& mat1,
   Tensor mat1_c = materializeForGraph(mat1);
   Tensor mat2_c = materializeForGraph(mat2);
   Tensor input_c = materializeForGraph(input);
-  if (static_cast<std::vector<int64_t>>(input_c.shape()) != out_shape) {
+  const std::vector<int64_t> input_shape =
+      static_cast<std::vector<int64_t>>(input_c.shape());
+  if (input_shape != out_shape) {
+    if (input_c.numel() == 1) {
+      // A scalar addend has a single element behind an empty or unit shape;
+      // describe it as a broadcastable one so the expansion is well-formed.
+      input_c = input_c.reshape(std::vector<int64_t>{1, 1});
+    }
     input_c = materializeForGraph(input_c.expand(out_shape));
   }
   Tensor output = Tensor(out_shape, out_dtype, input.device());
@@ -422,15 +429,16 @@ Tensor addmm_kernel(const Tensor& input, const Tensor& mat1,
           ? product
           : [graph castTensor:product toType:out_dt name:@"cast_product"];
       if (beta.toDouble() != 1.0) {
-        MPSGraphTensor* betaConst = [graph constant:beta.toDouble()
-                                           dataType:out_dt];
+        MPSGraphTensor* betaConst = [graph constantWithScalar:beta.toDouble()
+                                                     dataType:out_dt];
         scaled_input = [graph multiplicationWithPrimaryTensor:scaled_input
                                               secondaryTensor:betaConst
                                                          name:@"scale_beta"];
       }
       if (alpha.toDouble() != 1.0) {
-        MPSGraphTensor* alphaConst = [graph constant:alpha.toDouble()
-                                            dataType:out_dt];
+        MPSGraphTensor* alphaConst =
+            [graph constantWithScalar:alpha.toDouble()
+                             dataType:out_dt];
         scaled_prod = [graph multiplicationWithPrimaryTensor:scaled_prod
                                              secondaryTensor:alphaConst
                                                         name:@"scale_alpha"];
@@ -469,7 +477,7 @@ Tensor addmm_kernel(const Tensor& input, const Tensor& mat1,
           entry->input2 : bData};
     NSDictionary* results = @{entry->result : outData};
     getCurrentMPSStream()->executeMPSGraph(entry->graph, feeds, results,
-                                          SyncType::COMMIT_AND_WAIT);
+                                          SyncType::COMMIT_ADAPTIVE);
   }
   return output;
 }

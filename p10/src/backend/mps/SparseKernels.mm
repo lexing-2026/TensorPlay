@@ -7,6 +7,7 @@
 #include "Utils.h"
 
 #include "backend/mps/MPSDevice.h"
+#include "backend/mps/MPSStream.h"
 
 #include <algorithm>
 #include <cstring>
@@ -112,6 +113,7 @@ Tensor sparse_coo_tensor_kernel(const Tensor& indices, const Tensor& values,
         const int64_t sparse_dim = canonical.size(0);
         const int64_t nnz = canonical.size(1);
         std::vector<int64_t> inferred(static_cast<size_t>(sparse_dim), 0);
+        synchronizeHostAccess();
         const int64_t* index_data = canonical.data_ptr<int64_t>();
         for (int64_t d = 0; d < sparse_dim; ++d) {
             int64_t max_coordinate = -1;
@@ -146,6 +148,7 @@ Tensor coalesce_kernel(const Tensor& self) {
 
     std::vector<Entry> entries;
     entries.reserve(static_cast<size_t>(nnz));
+    synchronizeHostAccess();
     const int64_t* index_data = indices.data_ptr<int64_t>();
     for (int64_t n = 0; n < nnz; ++n) {
         Entry entry;
@@ -225,6 +228,7 @@ Tensor to_dense_kernel(const Tensor& self) {
     std::vector<int64_t> dense_shape = dense_shape_for(canonical);
     const int64_t dense_numel = product(dense_shape);
     const std::vector<int64_t> out_strides = out.strides();
+    synchronizeHostAccess();
 
     distribution::dispatch_dtype(self.dtype(), [&](auto tag) {
         using scalar_t = decltype(tag);
@@ -281,6 +285,7 @@ Tensor dense_to_sparse_coo(const Tensor& self, int64_t sparse_dim) {
         product(std::vector<int64_t>(sizes.begin() + sparse_dim, sizes.end()));
 
     std::vector<int64_t> block_positions;
+    synchronizeHostAccess();
     distribution::dispatch_dtype(contiguous_self.dtype(), [&](auto tag) {
         using scalar_t = decltype(tag);
         const scalar_t* data = contiguous_self.data_ptr<scalar_t>();
@@ -386,6 +391,7 @@ Tensor sparse_mm_kernel(const Tensor& self, const Tensor& dense) {
         TP_THROW(RuntimeError, "sparse_mm(): hybrid COO tensors are not supported");
     }
     const int64_t nnz = indices.size(1);
+    synchronizeHostAccess();
     const int64_t* index_data = indices.data_ptr<int64_t>();
 
     distribution::dispatch_dtype(self.dtype(), [&](auto tag) {
@@ -472,6 +478,7 @@ Tensor sparse_mul_kernel(const Tensor& self, const Tensor& other) {
     Tensor vb = b._values().contiguous();
     const int64_t nnz_a = va.size(0);
     const int64_t nnz_b = vb.size(0);
+    synchronizeHostAccess();
 
     auto coord_at = [](const Tensor& idx, int64_t nnz, int64_t n,
                        std::vector<int64_t>* out) {
@@ -578,6 +585,7 @@ Tensor sparse_sum_kernel(const Tensor& self,
     Tensor indices = canonical._indices().contiguous();
     Tensor values = canonical._values().contiguous();
     const int64_t nnz = indices.size(1);
+    synchronizeHostAccess();
     Tensor new_indices = Tensor::empty(
         {static_cast<int64_t>(kept_dims.size()), nnz}, DType::Int64,
         indices.device());
@@ -704,9 +712,9 @@ Tensor sparse_addmm_kernel(const Tensor& self, const Tensor& mat1,
         return [g additionWithPrimaryTensor:a secondaryTensor:b name:nil];
     };
     // beta * self (broadcast) + alpha * (sparse @ dense)
-    Tensor scaled_self = binaryOp(self, beta_t, mulBlock);
-    Tensor scaled_prod = binaryOp(prod, alpha_t, mulBlock);
-    return binaryOp(scaled_self, scaled_prod, addBlock);
+    Tensor scaled_self = binaryOp("mul", self, beta_t, mulBlock);
+    Tensor scaled_prod = binaryOp("mul", prod, alpha_t, mulBlock);
+    return binaryOp("add", scaled_self, scaled_prod, addBlock);
 }
 
 Tensor coalesce_sparse_mps(const Tensor& self) {
