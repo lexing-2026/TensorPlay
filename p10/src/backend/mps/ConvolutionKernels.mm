@@ -324,7 +324,7 @@ Tensor conv2d_kernel(const Tensor& input, const Tensor& weight,
     }
 
     getCurrentMPSStream()->executeMPSGraph(graph, feeds, results,
-                                          SyncType::COMMIT_AND_WAIT);
+                                          SyncType::COMMIT_ADAPTIVE);
     } @catch (NSException* e) {
       std::string reason =
           [e reason] ? std::string([[e reason] UTF8String])

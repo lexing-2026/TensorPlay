@@ -68,7 +68,10 @@ class MPSAllocatorImpl final : public IMPSAllocator {
         m_alignment(
             [m_device heapBufferSizeAndAlignWithLength:1
                                               options:MTLResourceStorageModeShared]
-                .align) {}
+                .align),
+        m_low_watermark_limit(static_cast<size_t>(
+            kLowWatermarkRatio *
+            static_cast<double>([m_device recommendedMaxWorkingSetSize]))) {}
 
   ~MPSAllocatorImpl() override {
     emptyCache();
@@ -189,6 +192,15 @@ class MPSAllocatorImpl final : public IMPSAllocator {
     return [m_device recommendedMaxWorkingSetSize];
   }
 
+  // How far, in megabytes, the live allocations still sit below the low
+  // watermark. Zero is the limit itself: the device is under memory pressure
+  // and work queued in the current command buffer should be committed.
+  ssize_t getLowWatermarkValue() const override {
+    const ssize_t headroom = static_cast<ssize_t>(m_low_watermark_limit) -
+                             static_cast<ssize_t>(getCurrentAllocatedMemory());
+    return std::max<ssize_t>(0, headroom / static_cast<ssize_t>(MB(1)));
+  }
+
   // Returns the owning MTLBuffer for a host-visible pointer, or nil.
   id<MTLBuffer> mtlBufferForPointer(const void* ptr) const {
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -203,6 +215,10 @@ class MPSAllocatorImpl final : public IMPSAllocator {
  private:
   static constexpr size_t kSmallAllocation = MB(1);
   static constexpr size_t kSmallRound = 512;
+  // The low watermark sits this multiple above the device's recommended maximum
+  // working set, so that a run only reads as pressurised once it has outgrown
+  // the device by a wide margin.
+  static constexpr double kLowWatermarkRatio = 1.4;
 
   size_t alignUp(size_t nbytes) const {
     if (nbytes == 0) {
@@ -243,6 +259,7 @@ class MPSAllocatorImpl final : public IMPSAllocator {
 
   MTLDevice_t m_device;
   const size_t m_alignment;
+  const size_t m_low_watermark_limit;
   mutable std::mutex m_mutex;
   std::set<BufferBlock*, decltype(&BufferBlock::Comparator)> m_available_buffers{
       &BufferBlock::Comparator};

@@ -141,7 +141,7 @@ void runMatMul(const Tensor& a, const Tensor& b,
     NSDictionary* feeds = @{entry->input0 : aData, entry->input1 : bData};
     NSDictionary* results = @{entry->result : outData};
     getCurrentMPSStream()->executeMPSGraph(entry->graph, feeds, results,
-                                          SyncType::COMMIT);
+                                          SyncType::COMMIT_ADAPTIVE);
   }
 }
 
@@ -269,7 +269,7 @@ Tensor dot_kernel(const Tensor& self_in, const Tensor& other_in) {
     NSDictionary* feeds = @{at : aData, bt : bData};
     NSDictionary* results = @{sum : outData};
     getCurrentMPSStream()->executeMPSGraph(graph, feeds, results,
-                                          SyncType::COMMIT_AND_WAIT);
+                                          SyncType::COMMIT_ADAPTIVE);
   }
   return output;
 }
@@ -477,7 +477,7 @@ Tensor addmm_kernel(const Tensor& input, const Tensor& mat1,
           entry->input2 : bData};
     NSDictionary* results = @{entry->result : outData};
     getCurrentMPSStream()->executeMPSGraph(entry->graph, feeds, results,
-                                          SyncType::COMMIT);
+                                          SyncType::COMMIT_ADAPTIVE);
   }
   return output;
 }

@@ -807,7 +807,7 @@ Tensor scaled_dot_product_attention_kernel(
       feeds[mt] = maskData;
     }
     getCurrentMPSStream()->executeMPSGraph(graph, feeds, results,
-                                      SyncType::COMMIT_AND_WAIT);
+                                      SyncType::COMMIT_ADAPTIVE);
   }
 
   Tensor probs_in = probs;
@@ -855,7 +855,7 @@ Tensor scaled_dot_product_attention_kernel(
     NSDictionary* feeds = @{pt : pData, vt : vData};
     NSDictionary* results = @{result : outData};
     getCurrentMPSStream()->executeMPSGraph(graph, feeds, results,
-                                      SyncType::COMMIT_AND_WAIT);
+                                      SyncType::COMMIT_ADAPTIVE);
   }
 
   if (unsqueezed) {

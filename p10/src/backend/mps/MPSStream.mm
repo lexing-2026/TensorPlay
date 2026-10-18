@@ -1,6 +1,7 @@
 #include "backend/mps/MPSStream.h"
 
 #include "backend/mps/MetalUtils.h"
+#include "backend/mps/MPSAllocator.h"
 #include "Exception.h"
 
 #include <array>
@@ -87,7 +88,13 @@ void MPSStream::synchronize(SyncType syncType) {
       commit();
       break;
     case SyncType::COMMIT_ADAPTIVE:
-      commit();
+      // Encoding stays inside the command buffer the stream is building, so a
+      // run of launches pays one commit. The buffer is only closed early once
+      // the pool has run up to its low watermark and holding more work there
+      // would add to the pressure.
+      if (getIMPSAllocator()->getLowWatermarkValue() <= 1) {
+        commit();
+      }
       break;
     case SyncType::COMMIT_AND_WAIT:
       commitAndWait();
