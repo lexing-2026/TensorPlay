@@ -338,6 +338,45 @@ MTLComputePipelineState_t shaderPipelineNamed(const std::string& name) {
   return pso;
 }
 
+// A shader and the four-wide form beside it. The wide form is absent for some
+// storage types, which the caller sees as a nil entry.
+struct PipelinePair {
+  void* plain = nullptr;
+  void* vec = nullptr;
+};
+
+// The last operation and storage type this thread resolved. A loop calls the
+// same operation on the same storage type on every iteration, and a hit skips
+// both kernel-name builds and the library lock behind them, which is most of
+// the host cost of a small launch.
+struct PipelineMemo {
+  std::string op;
+  DType dtype = DType::Float32;
+  PipelinePair pair;
+  bool valid = false;
+};
+
+// The name builders run only on a miss, so a hit pays neither the string
+// construction nor the lookup.
+template <typename PlainFn, typename VecFn>
+PipelinePair resolvePipelines(PipelineMemo& memo, const std::string& op,
+                              DType dtype, PlainFn plain_fn, VecFn vec_fn) {
+  if (memo.valid && memo.dtype == dtype && memo.op == op) {
+    return memo.pair;
+  }
+  PipelinePair resolved{((__bridge void*)plain_fn()),
+                        ((__bridge void*)vec_fn())};
+  memo.op = op;
+  memo.dtype = dtype;
+  memo.pair = resolved;
+  memo.valid = true;
+  return resolved;
+}
+
+MTLComputePipelineState_t pipelineFromMemo(void* pipeline) {
+  return (__bridge MTLComputePipelineState_t)pipeline;
+}
+
 // The pipeline for `op` over `dtype`, or nil when the shader is not built for
 // that combination. Half, bfloat and the narrow integers are absent from
 // BroadcastElementwise.metal because their operation math type is not the
@@ -595,8 +634,7 @@ bool denseOperandPair(const Tensor& self, const Tensor& other) {
       self.storage_offset() != 0 || other.storage_offset() != 0) {
     return false;
   }
-  return static_cast<std::vector<int64_t>>(self.shape()) ==
-         static_cast<std::vector<int64_t>>(other.shape());
+  return self.sizes() == other.sizes();
 }
 
 // The dense kernels take no scale factor; a call that scales its second
@@ -660,8 +698,16 @@ std::optional<Tensor> denseBinaryShader(const std::string& op,
   if (numel <= 0 || numel > std::numeric_limits<uint32_t>::max()) {
     return std::nullopt;
   }
-  MTLComputePipelineState_t pso =
-      denseBinaryShaderPipeline(op, self.dtype(), /*scalar_rhs=*/false);
+  static thread_local PipelineMemo memo;
+  const PipelinePair pipelines = resolvePipelines(
+      memo, op, self.dtype(),
+      [&] { return denseBinaryShaderPipeline(op, self.dtype(), false); },
+      [&] {
+        return self.dtype() == DType::Float32
+                   ? shaderPipelineNamed("dense_vec_" + op + "_float")
+                   : nil;
+      });
+  MTLComputePipelineState_t pso = pipelineFromMemo(pipelines.plain);
   if (!pso) {
     return std::nullopt;
   }
@@ -682,7 +728,7 @@ std::optional<Tensor> denseBinaryShader(const std::string& op,
   MTLComputePipelineState_t vec_pso =
       wholeFloatVectors(self.dtype(), elements,
                         {self.data_ptr(), other.data_ptr(), output.data_ptr()})
-          ? shaderPipelineNamed("dense_vec_" + op + "_float")
+          ? pipelineFromMemo(pipelines.vec)
           : nil;
   MTLComputePipelineState_t active_pso = vec_pso ? vec_pso : pso;
   // The vector form counts 16-byte vectors, the scalar form elements.
@@ -728,8 +774,16 @@ std::optional<Tensor> denseScalarBinaryShader(const std::string& op,
   if (numel <= 0 || numel > std::numeric_limits<uint32_t>::max()) {
     return std::nullopt;
   }
-  MTLComputePipelineState_t pso =
-      denseBinaryShaderPipeline(op, self.dtype(), /*scalar_rhs=*/true);
+  static thread_local PipelineMemo memo;
+  const PipelinePair pipelines = resolvePipelines(
+      memo, op, self.dtype(),
+      [&] { return denseBinaryShaderPipeline(op, self.dtype(), true); },
+      [&] {
+        return self.dtype() == DType::Float32
+                   ? shaderPipelineNamed("dense_vec_" + op + "_scalar_float")
+                   : nil;
+      });
+  MTLComputePipelineState_t pso = pipelineFromMemo(pipelines.plain);
   if (!pso) {
     return std::nullopt;
   }
@@ -749,7 +803,7 @@ std::optional<Tensor> denseScalarBinaryShader(const std::string& op,
   MTLComputePipelineState_t vec_pso =
       wholeFloatVectors(self.dtype(), elements,
                         {self.data_ptr(), output.data_ptr()})
-          ? shaderPipelineNamed("dense_vec_" + op + "_scalar_float")
+          ? pipelineFromMemo(pipelines.vec)
           : nil;
   MTLComputePipelineState_t active_pso = vec_pso ? vec_pso : pso;
   // The vector form counts 16-byte vectors, the scalar form elements.
@@ -928,7 +982,16 @@ std::optional<Tensor> unaryShader(const std::string& op, const Tensor& self) {
   if (numel <= 0 || numel > std::numeric_limits<uint32_t>::max()) {
     return std::nullopt;
   }
-  MTLComputePipelineState_t pso = unaryShaderPipeline(op, self.dtype());
+  static thread_local PipelineMemo memo;
+  const PipelinePair pipelines = resolvePipelines(
+      memo, op, self.dtype(),
+      [&] { return unaryShaderPipeline(op, self.dtype()); },
+      [&] {
+        return self.dtype() == DType::Float32
+                   ? shaderPipelineNamed("unary_vec_" + op + "_float")
+                   : nil;
+      });
+  MTLComputePipelineState_t pso = pipelineFromMemo(pipelines.plain);
   if (!pso) {
     return std::nullopt;
   }
@@ -948,7 +1011,7 @@ std::optional<Tensor> unaryShader(const std::string& op, const Tensor& self) {
   MTLComputePipelineState_t vec_pso =
       wholeFloatVectors(self.dtype(), elements,
                         {self.data_ptr(), output.data_ptr()})
-          ? shaderPipelineNamed("unary_vec_" + op + "_float")
+          ? pipelineFromMemo(pipelines.vec)
           : nil;
   MTLComputePipelineState_t active_pso = vec_pso ? vec_pso : pso;
   // The vector form counts 16-byte vectors, the scalar form elements.
@@ -1564,10 +1627,7 @@ std::optional<Tensor> compareShader(const std::string& op, const Tensor& self,
   // through its storage in the order the output is written in, from its start.
   // A single-element `other` applies to every element of `self`, so it stays on
   // the same path with the scalar read once per thread.
-  const std::vector<int64_t> shape =
-      static_cast<std::vector<int64_t>>(self.shape());
-  const bool same_shape =
-      shape == static_cast<std::vector<int64_t>>(other.shape());
+  const bool same_shape = self.sizes() == other.sizes();
   const bool scalar_rhs = !same_shape && other.numel() == 1;
   if (self.dtype() != other.dtype() || !self.is_contiguous() ||
       !other.is_contiguous() || self.storage_offset() != 0 ||
@@ -1578,8 +1638,18 @@ std::optional<Tensor> compareShader(const std::string& op, const Tensor& self,
   if (numel <= 0 || numel > std::numeric_limits<uint32_t>::max()) {
     return std::nullopt;
   }
-  MTLComputePipelineState_t pso =
-      compareShaderPipeline(op, self.dtype(), scalar_rhs);
+  static thread_local PipelineMemo memos[2];
+  const PipelinePair pipelines = resolvePipelines(
+      memos[scalar_rhs ? 1 : 0], op, self.dtype(),
+      [&] { return compareShaderPipeline(op, self.dtype(), scalar_rhs); },
+      [&] {
+        return self.dtype() == DType::Float32
+                   ? shaderPipelineNamed(std::string("compare_vec_") + op +
+                                         (scalar_rhs ? "_scalar_float"
+                                                     : "_float"))
+                   : nil;
+      });
+  MTLComputePipelineState_t pso = pipelineFromMemo(pipelines.plain);
   if (!pso) {
     return std::nullopt;
   }
@@ -1590,7 +1660,8 @@ std::optional<Tensor> compareShader(const std::string& op, const Tensor& self,
   }
   // A comparison answers one byte per element whatever the operands hold, which
   // is the width the boolean storage uses.
-  Tensor output = emptyMPS(shape, DType::Bool, self.device());
+  Tensor output = emptyMPS(static_cast<std::vector<int64_t>>(self.shape()),
+                           DType::Bool, self.device());
   void* out_buf = getMTLBufferFromPointer(output.data_ptr());
   if (!out_buf) {
     return std::nullopt;
@@ -1610,9 +1681,7 @@ std::optional<Tensor> compareShader(const std::string& op, const Tensor& self,
                                       output.data_ptr()});
   }
   MTLComputePipelineState_t vec_pso =
-      vec_ok ? shaderPipelineNamed(std::string("compare_vec_") + op +
-                                   (scalar_rhs ? "_scalar_float" : "_float"))
-             : nil;
+      vec_ok ? pipelineFromMemo(pipelines.vec) : nil;
   MTLComputePipelineState_t active_pso = vec_pso ? vec_pso : pso;
   // The vector form counts 16-byte vectors, the scalar form elements.
   const uint32_t span = vec_pso ? elements / 4 : elements;
