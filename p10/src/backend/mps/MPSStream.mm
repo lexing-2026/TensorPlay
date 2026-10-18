@@ -252,12 +252,18 @@ constexpr int kStreamsPerPool = 32;
 std::array<MPSStream*, kStreamsPerPool> streamPool{};
 std::atomic<uint32_t> streamPoolIndex{0};
 std::once_flag streamPoolOnce;
+// Set once the pool's streams exist. A synchronize that arrives before then
+// must not run the one-time setup just to drain streams nobody asked for, and
+// must not consume the once flag either: the flag belongs to the first caller
+// that actually needs a stream.
+std::atomic<bool> streamPoolInitialized{false};
 
 void initStreamPool() {
   for (int i = 0; i < kStreamsPerPool; ++i) {
     streamPool[i] = new MPSStream(
         Stream(Stream::UNSAFE, Device(DeviceType::MPS, 0), i + 1));
   }
+  streamPoolInitialized.store(true, std::memory_order_release);
 }
 
 } // namespace
@@ -306,11 +312,17 @@ MPSStream* getStreamFromStream(const Stream& stream) {
 }
 
 void synchronizeAllMPSStreams(SyncType syncType) {
-  getDefaultMPSStream()->synchronize(syncType);
-  std::call_once(streamPoolOnce, []() {});
-  for (int i = 0; i < kStreamsPerPool; ++i) {
-    if (streamPool[i]) {
-      streamPool[i]->synchronize(syncType);
+  // Each stream is drained on its own serial queue, so the wait is ordered
+  // after the launches this thread or any other has already encoded there.
+  auto sync = [syncType](MPSStream* stream) {
+    dispatch_sync_with_rethrow(stream->queue(), ^() {
+      stream->synchronize(syncType);
+    });
+  };
+  sync(getDefaultMPSStream());
+  if (streamPoolInitialized.load(std::memory_order_acquire)) {
+    for (int i = 0; i < kStreamsPerPool; ++i) {
+      sync(streamPool[i]);
     }
   }
 }
