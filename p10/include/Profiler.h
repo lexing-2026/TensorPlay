@@ -14,9 +14,8 @@
 //     tracing (USE_ROCM builds): kernel/memcpy/memset activity records plus
 //     GPU runtime API rows, with op->runtime->kernel correlation via external
 //     correlation ids (see ProfilerCupti.cpp / ProfilerCuptiStub.cpp);
-//   * MPS GPU durations (USE_MPS builds) come from the pinned per-op Metal
-//     command buffer's GPU timestamps, read at session stop (see
-//     ProfilerMps.mm);
+//   * MPS GPU durations (USE_MPS builds) are the host dispatch latency
+//     measured around the op (see ProfilerMps.mm);
 //   * Python stack sampling runs binding-side (tensorplay/profiler.py);
 //
 // Performance contract: when inactive the only hot-path cost is one
@@ -35,7 +34,6 @@
 #include <functional>
 #include <memory>
 #include <string>
-#include <utility>
 #include <vector>
 
 #include "Device.h"
@@ -277,7 +275,7 @@ TENSORPLAY_API std::vector<MemEvent> mem_take();
 // arm(device) before the kernel launch, close() after; elapsed times are
 // resolved at session stop by the binding layer.  CPU-device and inactive
 // calls are no-ops.  MPS builds implement the same symbols in ProfilerMps.mm
-// using Metal command-buffer boundaries.
+// using host dispatch latency.
 struct TENSORPLAY_API GpuTimerPair {
     explicit GpuTimerPair(OpRecord& rec) : rec_(rec) {}
     ~GpuTimerPair();
@@ -291,12 +289,6 @@ private:
     void* gpu_stream_ = nullptr;
     int gpu_device_ = -1;
     uint64_t arm_ns_ = 0;
-    // MPS lane: command-buffer slot pointers at arm time; close() re-reads
-    // them and pins the buffer only when the dispatch left a mark there
-    // (metadata-only ops dispatch no GPU work and must not inherit the
-    // previous op's buffer).
-    void* arm_buf_cur_ = nullptr;
-    void* arm_buf_last_ = nullptr;
     bool armed_ = false;
 };
 TENSORPLAY_API extern std::atomic<bool> g_gpu_timing;
@@ -307,12 +299,6 @@ TENSORPLAY_API void gpu_resolve_all(
         std::vector<Event>& events,
         const std::function<void(Event&, float ms)>& emit);
 TENSORPLAY_API void gpu_drain_pool();
-// MPS timing-mode counters (USE_MPS builds; other builds report zeros):
-// how many resolved pairs drew their duration from command-buffer GPU
-// timestamps (first) versus the host dispatch-latency fallback (second).
-// Read-and-reset semantics keep each check scoped to the sessions between
-// two calls.
-TENSORPLAY_API std::pair<uint64_t, uint64_t> mps_timing_take_counters();
 
 // ---- CUPTI / rocTracer kernel-level tracing (USE_CUDA / USE_ROCM builds)
 // -----

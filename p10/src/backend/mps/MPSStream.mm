@@ -165,41 +165,6 @@ void MPSStream::addCompletedHandler(MTLCommandBufferHandler block) {
   });
 }
 
-MPSStream::BufferSlots MPSStream::bufferSlots() {
-  __block BufferSlots slots{nullptr, nullptr};
-  dispatch_sync(_serialQueue, ^() {
-    slots.current = (const void*)_commandBuffer;
-    slots.last = (const void*)_prevCommandBuffer;
-  });
-  return slots;
-}
-
-MPSCommandBuffer_t MPSStream::commitPendingAndTakeLastBuffer() {
-  __block MPSCommandBuffer_t taken = nil;
-  dispatch_sync(_serialQueue, ^() {
-    @autoreleasepool {
-      endKernelCoalescing();
-      // Only the flush-style commit runs here: the stream is constructed
-      // with CommitAndContinue disabled, and continuing on a buffer the
-      // caller has pinned would recycle that object for later work.  A
-      // commit rejection is reported as no buffer; the caller falls back
-      // instead of failing the dispatch.
-      @try {
-        if (_commandBuffer) {
-          [_commandBuffer commit];
-          _prevCommandBuffer = _commandBuffer;
-          _commandBuffer = nil;
-        }
-        if (_prevCommandBuffer) taken = [_prevCommandBuffer retain];
-      } @catch (NSException* e) {
-        (void)e;
-        taken = nil;
-      }
-    }
-  });
-  return taken;
-}
-
 void MPSStream::copy(MTLBuffer_t srcBuffer,
                      MTLBuffer_t dstBuffer,
                      size_t length,

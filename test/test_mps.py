@@ -1049,9 +1049,8 @@ class TestMPSProfiler(unittest.TestCase):
 
     The shared profiler frontend (tensorplay.profiler) is backend-agnostic and
     is covered by test/profiler/test_profiler.py; these tests only pin the
-    MPS-specific pieces: the activity flag, the automatic event-pair timing
-    request, and the resolution of per-op GPU time from the Metal command
-    buffer.
+    MPS-specific pieces: the activity flag and the automatic event-pair timing
+    request that records each op's host dispatch span.
 
     The MPS profiler support is gated on the ProfilerActivity.MPS enum member
     being present, so these tests skip on builds where the MPS profiler has
@@ -1098,8 +1097,9 @@ class TestMPSProfiler(unittest.TestCase):
         tp.mps.synchronize()
         timed = [ev for ev in prof.events if ev[0].startswith(("add", "mul"))]
         self.assertTrue(timed)
-        # Event field 8 is the per-op GPU time in milliseconds; MPS fills it
-        # from the committed command buffer's GPUStartTime/GPUEndTime.
+        # Event field 8 carries the op's host dispatch span in milliseconds;
+        # every profiled MPS dispatch records one and the value is
+        # non-negative.
         self.assertTrue(all(ev[8] >= 0 for ev in timed))
 
     def test_cpu_only_profile_keeps_negative_gpu_time(self):

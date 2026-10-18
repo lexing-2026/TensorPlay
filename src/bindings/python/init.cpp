@@ -1602,16 +1602,6 @@ PYBIND11_MODULE(_C, m) {
         return py::make_tuple(std::move(out_ops), std::move(out_gpu),
                               std::move(out_mem));
     });
-    // MPS per-op GPU timing sources since the previous call: (native,
-    // fallback) resolved-pair counts.  Native means the duration came from
-    // the pinned command buffer's GPU timestamps; fallback means the driver
-    // reported none and the host dispatch latency stood in (or the dispatch
-    // never reached the stream).  Read-and-reset keeps each check scoped to
-    // the sessions in between.
-    m.def("_profiler_mps_timing_mode", []() {
-        const auto counts = tensorplay::prof::mps_timing_take_counters();
-        return std::make_pair(counts.first, counts.second);
-    });
     m.def("_profiler_is_active", []() {
         // One relaxed-enough atomic load; gates Python-side span emission
         // (custom-op wrappers) at zero cost when no session runs.

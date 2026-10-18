@@ -308,11 +308,6 @@ TENSORPLAY_API void gpu_drain_pool() {
         (void)cudaSetDevice(original_device);
 }
 
-// MPS-only counters; the CUDA lane never pins MPS buffers.
-TENSORPLAY_API std::pair<uint64_t, uint64_t> mps_timing_take_counters() {
-    return {0, 0};
-}
-
 } // namespace prof
 } // namespace tensorplay
 
@@ -335,9 +330,6 @@ TENSORPLAY_API void gpu_resolve_all(
         std::vector<Event>&,
         const std::function<void(Event&, float)>&) {}
 TENSORPLAY_API void gpu_drain_pool() {}
-TENSORPLAY_API std::pair<uint64_t, uint64_t> mps_timing_take_counters() {
-    return {0, 0};
-}
 } // namespace prof
 } // namespace tensorplay
 
