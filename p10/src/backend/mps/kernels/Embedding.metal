@@ -122,10 +122,12 @@ REGISTER_EMBEDDING_DENSE_BACKWARD(bfloat, long, ulong, 64);
 // Embedding forward: gathers `weight[indices[i]]` rows into the output.
 // One thread moves up to 16 bytes of a row, so neighboring lanes of a
 // threadgroup touch consecutive addresses on both sides. The row is treated as
-// raw bytes, which lets a single kernel serve every storage type.
+// raw bytes, which lets a single kernel serve every storage type. The weight is
+// streamed through the device address space: it is far larger than the constant
+// cache and is read once, so it does not benefit from the constant path.
 template <typename I>
 kernel void embedding_forward(
-    constant uchar* weight [[buffer(0)]],
+    const device uchar* weight [[buffer(0)]],
     constant I* indices [[buffer(1)]],
     device uchar* out [[buffer(2)]],
     constant uint& num_embeddings [[buffer(3)]],
@@ -135,17 +137,33 @@ kernel void embedding_forward(
   if (pos >= row_bytes) {
     return;
   }
+  // The range check runs as a separate kernel and reports through the stream's
+  // error buffer; clamping keeps an entry that is still in flight while the
+  // report is pending inside the weight.
   const long ix_raw = static_cast<long>(indices[tid.y]);
-  const long ix = ix_raw < 0 ? ix_raw + long(num_embeddings) : ix_raw;
+  const long ix_wrapped =
+      ix_raw < 0 ? ix_raw + long(num_embeddings) : ix_raw;
+  const long ix = ix_wrapped < 0
+      ? 0
+      : (ix_wrapped >= long(num_embeddings) ? long(num_embeddings) - 1
+                                            : ix_wrapped);
   const ulong src = static_cast<ulong>(ix) * row_bytes + pos;
   const ulong dst = static_cast<ulong>(tid.y) * row_bytes + pos;
-  copy_bytes_aligned(out + dst, weight + src, min(16u, row_bytes - pos));
+  const uint remaining = min(16u, row_bytes - pos);
+  if (remaining == 16u && ((dst | src) & 15ul) == 0ul) {
+    *reinterpret_cast<device uint4*>(out + dst) =
+        *reinterpret_cast<const device uint4*>(weight + src);
+    return;
+  }
+  for (uint i = 0; i < remaining; ++i) {
+    out[dst + i] = weight[src + i];
+  }
 }
 
 #define REGISTER_EMBEDDING_FORWARD(I)                                  \
   template [[host_name("embedding_forward_" #I)]] kernel void          \
   embedding_forward<I>(                                                \
-      constant uchar * weight [[buffer(0)]],                           \
+      const device uchar * weight [[buffer(0)]],                       \
       constant I * indices [[buffer(1)]],                              \
       device uchar * out [[buffer(2)]],                                \
       constant uint& num_embeddings [[buffer(3)]],                     \

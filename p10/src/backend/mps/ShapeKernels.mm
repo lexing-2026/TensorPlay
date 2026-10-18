@@ -140,7 +140,6 @@ Tensor cat_kernel(const std::vector<Tensor>& tensors, int64_t dim) {
   MPSStream* stream = getCurrentMPSStream();
   dispatch_sync_with_rethrow(stream->queue(), ^() {
     @autoreleasepool {
-      stream->endKernelCoalescing();
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:pso];
       int64_t offset = 0;
@@ -150,7 +149,6 @@ Tensor cat_kernel(const std::vector<Tensor>& tensors, int64_t dim) {
                           out_stride_bytes, offset * inner_bytes);
         offset += tc.size(dim);
       }
-      stream->synchronize(SyncType::COMMIT);
     }
   });
   return output;
@@ -214,7 +212,6 @@ Tensor stack_kernel(const std::vector<Tensor>& tensors, int64_t dim) {
   MPSStream* stream = getCurrentMPSStream();
   dispatch_sync_with_rethrow(stream->queue(), ^() {
     @autoreleasepool {
-      stream->endKernelCoalescing();
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:pso];
       int64_t off_bytes = 0;
@@ -223,7 +220,6 @@ Tensor stack_kernel(const std::vector<Tensor>& tensors, int64_t dim) {
                           out_stride_bytes, off_bytes);
         off_bytes += inner_bytes;
       }
-      stream->synchronize(SyncType::COMMIT);
     }
   });
   return output;
@@ -259,27 +255,37 @@ Tensor embedding_kernel(const Tensor& weight, const Tensor& indices,
   const int64_t num_embeddings = weight.size(0);
   const int64_t n = indices_c.numel();
 
-  // Range-check the indices on the host (unified memory makes the buffer
-  // host-readable); the shader assumes valid indices afterwards. The stream
-  // only has to be drained when it still holds work that may write the bytes.
-  if (getCurrentMPSStream()->hasPendingWork()) {
-    synchronizeHostAccess();
+  if (num_embeddings == 0) {
+    TP_THROW(IndexError, "embedding(): index out of range in self");
   }
-  if (indices_c.dtype() == DType::Int64) {
-    const int64_t* idx = indices_c.data_ptr<int64_t>();
-    for (int64_t i = 0; i < n; ++i) {
-      const int64_t ix = idx[i] < 0 ? idx[i] + num_embeddings : idx[i];
-      if (ix < 0 || ix >= num_embeddings) {
-        TP_THROW(IndexError, "embedding(): index out of range in self");
-      }
+
+  // Short index lists are range-checked on the host, which answers before the
+  // call returns; longer ones are checked by a kernel on the stream, so the
+  // scan does not sit in the hot path. Either way the copy kernel clamps, so
+  // an entry that is still in flight while the report is pending stays inside
+  // the weight. The stream only has to be drained when it still holds work
+  // that may write the bytes the host scan reads.
+  constexpr int64_t kHostIndexScanLimit = 4096;
+  if (n <= kHostIndexScanLimit) {
+    if (getCurrentMPSStream()->hasPendingWork()) {
+      synchronizeHostAccess();
     }
-  } else {
-    const int32_t* idx = indices_c.data_ptr<int32_t>();
-    for (int64_t i = 0; i < n; ++i) {
-      const int64_t ix = idx[i] < 0 ? static_cast<int64_t>(idx[i]) + num_embeddings
-                                    : static_cast<int64_t>(idx[i]);
-      if (ix < 0 || ix >= num_embeddings) {
-        TP_THROW(IndexError, "embedding(): index out of range in self");
+    if (indices_c.dtype() == DType::Int64) {
+      const int64_t* idx = indices_c.data_ptr<int64_t>();
+      for (int64_t i = 0; i < n; ++i) {
+        const int64_t ix = idx[i] < 0 ? idx[i] + num_embeddings : idx[i];
+        if (ix < 0 || ix >= num_embeddings) {
+          TP_THROW(IndexError, "embedding(): index out of range in self");
+        }
+      }
+    } else {
+      const int32_t* idx = indices_c.data_ptr<int32_t>();
+      for (int64_t i = 0; i < n; ++i) {
+        const int64_t ix = idx[i] < 0 ? static_cast<int64_t>(idx[i]) + num_embeddings
+                                      : static_cast<int64_t>(idx[i]);
+        if (ix < 0 || ix >= num_embeddings) {
+          TP_THROW(IndexError, "embedding(): index out of range in self");
+        }
       }
     }
   }
@@ -294,6 +300,18 @@ Tensor embedding_kernel(const Tensor& weight, const Tensor& indices,
   dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
     @autoreleasepool {
       id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
+      if (n > kHostIndexScanLimit) {
+        const std::string check_kernel = "index_bounds_check_" +
+            scalarToMetalTypeString(indices_c.dtype());
+        auto check_pso =
+            MetalShaderLibrary::getBundledLibrary().getPipelineStateForFunc(
+                check_kernel);
+        [computeEncoder setComputePipelineState:check_pso];
+        mtl_setArgs(computeEncoder, indices_c, num_embeddings,
+                    mpsStream->errorBuffer());
+        mtl_dispatch1DJob(computeEncoder, check_pso,
+                          static_cast<NSUInteger>(n));
+      }
       [computeEncoder setComputePipelineState:pso];
       mtl_setArgs(computeEncoder, weight_c, indices_c, output,
                   static_cast<uint32_t>(num_embeddings),
