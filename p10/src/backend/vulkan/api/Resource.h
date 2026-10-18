@@ -200,8 +200,8 @@ class MemoryMap final {
     return static_cast<size_t>(data_len_);
   }
 
-  // Flushes HOST_COHERENT-less writes so the device observes them; a no-op
-  // for coherent memory.
+  // Drops stale cache lines so the host observes device writes; a no-op for
+  // coherent memory and for mappings that are not read.
   void invalidate();
 };
 

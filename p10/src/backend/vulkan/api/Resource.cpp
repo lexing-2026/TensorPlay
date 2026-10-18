@@ -252,7 +252,9 @@ MemoryMap::~MemoryMap() {
   }
 
   if (access_ & MemoryAccessType::WRITE) {
-    invalidate();
+    // Host writes must be visible before the next submission reads this
+    // allocation.  The call is ignored for HOST_COHERENT memory types.
+    vmaFlushAllocation(allocator_, allocation_, 0u, VK_WHOLE_SIZE);
   }
 
   // Only unmap when we acquired our own mapping; persistent mappings are
@@ -271,11 +273,16 @@ void MemoryMap::invalidate() {
     return;
   }
 
-  // Buffers are allocated with HOST_VISIBLE memory; when the host has
-  // written them the writes must be flushed before device access unless the
-  // memory type is HOST_COHERENT.  Asking VMA to flush is a no-op for
-  // coherent memory.
-  vmaFlushAllocation(allocator_, allocation_, 0u, VK_WHOLE_SIZE);
+  // Only a read mapping can serve stale data: the device may have written
+  // this range since the host last looked at it.  Cache lines must be
+  // dropped before reading whenever the memory type lacks HOST_COHERENT,
+  // which is the usual case for host-visible allocations on mobile SoC GPUs.
+  if (!(access_ & MemoryAccessType::READ)) {
+    return;
+  }
+
+  VK_CHECK(vmaInvalidateAllocation(
+      allocator_, allocation_, 0u, VK_WHOLE_SIZE));
 }
 
 //
