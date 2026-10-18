@@ -62,7 +62,11 @@ void transfer_cpu_to_vulkan(const Tensor& src, api::vTensor& v_dst) {
     return;
   }
 
-  // Buffer payloads hold a plain linear layout.
+  // Buffer payloads hold a plain linear layout.  The move is recorded as a
+  // compute dispatch instead of a transfer command: payloads are consumed by
+  // compute dispatches, and reaching the device through the same stage keeps
+  // the producer/consumer dependency that a transfer-then-compute handoff
+  // would have to spell out for every first read of a fresh upload.
   if (v_dst.storage_type() == api::StorageType::BUFFER) {
     Tensor src_lin = prepare_source(src, v_dst.dtype());
 
@@ -77,18 +81,12 @@ void transfer_cpu_to_vulkan(const Tensor& src, api::vTensor& v_dst) {
           staging.nbytes());
     }
 
-    api::PipelineBarrier pipeline_barrier{};
-    context->submit_copy<api::VulkanBuffer, api::VulkanBuffer>(
-        pipeline_barrier,
-        staging.buffer(),
-        v_dst.buffer(
-            pipeline_barrier,
-            api::PipelineStage::TRANSFER,
-            api::MemoryAccessType::WRITE),
-        {static_cast<uint32_t>(staging.nbytes()), 0u, 0u},
-        {0u, 0u, 0u},
-        {0u, 0u, 0u},
-        VK_NULL_HANDLE);
+    if (staging.nbytes() == 0u) {
+      return;
+    }
+
+    utils::upload_staging_to_buffer(
+        staging.buffer(), v_dst, staging.nbytes());
     return;
   }
 

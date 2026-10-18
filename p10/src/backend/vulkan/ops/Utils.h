@@ -41,6 +41,16 @@ bool pack_vtensor_to_staging(api::vTensor&, api::VulkanBuffer&, VkFence);
 // or staging -> buffer (vkCopyBuffer).  Valid for every supported VkFormat.
 void copy_staging_to_vtensor(api::StorageBuffer&, api::vTensor&);
 
+// Linear payload upload recorded as a compute dispatch: nbytes of a
+// host-written staging block move into v_dst's buffer payload as 16-byte
+// groups.  Payload consumers are compute dispatches, so moving through the
+// compute stage keeps the producer/consumer ordering that every later read
+// then inherits.
+void upload_staging_to_buffer(
+    api::VulkanBuffer& staging,
+    api::vTensor& v_dst,
+    size_t nbytes);
+
 void upload_host_bytes(api::vTensor&, const void*, size_t);
 
 } // namespace utils

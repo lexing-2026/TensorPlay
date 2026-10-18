@@ -265,24 +265,47 @@ bool pack_vtensor_to_staging(
   }
 }
 
+void upload_staging_to_buffer(
+    api::VulkanBuffer& staging,
+    api::vTensor& v_dst,
+    const size_t nbytes) {
+  if (nbytes == 0u) {
+    return;
+  }
+  api::Context* const context = api::context();
+
+  // The payload allocation is 16-byte rounded and staging blocks are
+  // 256-byte rounded, so whole groups are in bounds at both ends.
+  const struct UploadBlock {
+    uint32_t group_count;
+    uint32_t fill0;
+    int32_t fill;
+  } block{static_cast<uint32_t>((nbytes + 15u) / 16u), 0u, 0};
+
+  api::UniformParamsBuffer params(context, block);
+  api::PipelineBarrier pipeline_barrier{};
+
+  context->submit_compute_job(
+      VK_KERNEL_FROM_STR("upload_buffer"),
+      pipeline_barrier,
+      {block.group_count, 1u, 1u},
+      {256u, 1u, 1u},
+      VK_NULL_HANDLE,
+      v_dst.buffer(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::WRITE),
+      staging,
+      params.buffer());
+}
+
 void copy_staging_to_vtensor(
     api::StorageBuffer& staging,
     api::vTensor& v_dst) {
   api::Context* const context = api::context();
 
   if (v_dst.storage_type() == api::StorageType::BUFFER) {
-    api::PipelineBarrier pipeline_barrier{};
-    context->submit_copy<api::VulkanBuffer, api::VulkanBuffer>(
-        pipeline_barrier,
-        staging.buffer(),
-        v_dst.buffer(
-            pipeline_barrier,
-            api::PipelineStage::TRANSFER,
-            api::MemoryAccessType::WRITE),
-        {static_cast<uint32_t>(staging.nbytes()), 0u, 0u},
-        {0u, 0u, 0u},
-        {0u, 0u, 0u},
-        VK_NULL_HANDLE);
+    upload_staging_to_buffer(staging.buffer(), v_dst, staging.nbytes());
   } else {
     api::PipelineBarrier pipeline_barrier{};
     copy_buffer_to_vtensor(staging.buffer(), v_dst, pipeline_barrier);

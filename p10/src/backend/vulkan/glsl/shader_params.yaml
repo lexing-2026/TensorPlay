@@ -383,6 +383,10 @@ buffer_unary_op:
   - NAME: buffer_sigmoid_i32
     DTYPE: int
     OPERATOR: int(1.0f / (1.0f + exp(-float(X))))
+upload_buffer:
+  parameter_names_with_default_values: {}
+  shader_variants:
+  - NAME: upload_buffer
 buffer_clamp:
   parameter_names_with_default_values:
     DTYPE: float
