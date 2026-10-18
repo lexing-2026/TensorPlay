@@ -1560,6 +1560,146 @@ class TestVulkanLinearPayload(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "even normalized axis"):
             F.rms_norm(odd, [33], None, 1.0e-5)
 
+    def test_half_precision_reductions_over_linear_payload(self):
+        import tensorplay as tp
+        import tensorplay.functional as F
+        # A reduced half result stores two rows in one 32-bit word, so the row
+        # grid becomes a word grid: the invocation that owns a word writes both
+        # lanes at once and no neighbour can read-modify-write it.  An odd row
+        # count puts the tail alone in its word, and an odd reduction length
+        # leaves a partial last word in the input, so both are exercised here.
+        # Every accumulator is held in single precision and only the store
+        # narrows, which is what keeps a long-axis variance finite.
+        def narrowed(a):
+            return np.asarray(a, dtype=np.float16).astype(np.float32)
+
+        def upload(a):
+            return tensorplay.from_numpy(np.asarray(a, dtype=np.float16)
+                                         ).to("vulkan")
+
+        def softmax_ref(a, axis):
+            m = a.max(axis=axis, keepdims=True)
+            e = np.exp(a - m)
+            return e / e.sum(axis=axis, keepdims=True)
+
+        def log_softmax_ref(a, axis):
+            m = a.max(axis=axis, keepdims=True)
+            return a - m - np.log(np.exp(a - m).sum(axis=axis, keepdims=True))
+
+        tensorplay.manual_seed(97)
+        flat_cpu = narrowed((tp.randn((self.WIDTH,), device="cpu")
+                             * 3.0).numpy())
+        flat = upload(flat_cpu)
+        np.testing.assert_array_equal(
+            F.argmax(flat).cpu().numpy(), np.argmax(flat_cpu),
+            err_msg="argmax over an odd-length half payload")
+        np.testing.assert_array_equal(
+            F.argmin(flat).cpu().numpy(), np.argmin(flat_cpu),
+            err_msg="argmin over an odd-length half payload")
+        np.testing.assert_allclose(
+            flat.max().cpu().numpy().astype(np.float32), flat_cpu.max(),
+            atol=1e-3, err_msg="maximum over an odd-length half payload")
+        np.testing.assert_allclose(
+            flat.mean().cpu().numpy().astype(np.float32), flat_cpu.mean(),
+            rtol=1e-3, atol=1e-3, err_msg="mean over a half payload")
+        np.testing.assert_allclose(
+            F.softmax(flat, 0).cpu().numpy().astype(np.float32),
+            narrowed(softmax_ref(flat_cpu, 0)),
+            rtol=2e-3, atol=2e-3, err_msg="softmax over a half payload")
+        np.testing.assert_allclose(
+            F.log_softmax(flat, 0).cpu().numpy().astype(np.float32),
+            narrowed(log_softmax_ref(flat_cpu, 0)),
+            rtol=2e-3, atol=2e-3, err_msg="log_softmax over a half payload")
+
+        # An axis long enough that its raw sums leave the finite range of the
+        # format: the walk must keep the moments wider than the payload.
+        rows_cpu = narrowed((tp.randn((3, 80000), device="cpu")
+                             * 2.0).numpy())
+        rows = upload(rows_cpu)
+        np.testing.assert_array_equal(
+            F.argmax(rows, dim=1).cpu().numpy(), rows_cpu.argmax(axis=1),
+            err_msg="row argmax over a half linear payload")
+        np.testing.assert_array_equal(
+            F.argmin(rows, dim=0).cpu().numpy(), rows_cpu.argmin(axis=0),
+            err_msg="column argmin over an odd half output row count")
+        self.assertEqual(F.argmax(rows, dim=1).dtype, tensorplay.int32,
+                         "half argmax changed its index dtype")
+        np.testing.assert_allclose(
+            rows.sum(dim=[1]).cpu().numpy().astype(np.float32),
+            narrowed(rows_cpu.sum(axis=1)),
+            rtol=1e-3, atol=1e-2, err_msg="long row sums over a half payload")
+        np.testing.assert_allclose(
+            F.var(rows, dim=[1]).cpu().numpy().astype(np.float32),
+            narrowed(rows_cpu.var(axis=1, ddof=1)),
+            rtol=2e-3, atol=2e-3,
+            err_msg="variance over a long half axis")
+        np.testing.assert_allclose(
+            F.std(rows, dim=[1]).cpu().numpy().astype(np.float32),
+            narrowed(rows_cpu.std(axis=1, ddof=1)),
+            rtol=5e-3, atol=5e-3, err_msg="std over a long half axis")
+        np.testing.assert_allclose(
+            F.var(rows, dim=[0, 1]).cpu().numpy().astype(np.float32),
+            narrowed(rows_cpu.var()), rtol=5e-3, atol=5e-3,
+            err_msg="variance over several half axes")
+        self.assertEqual(F.var(rows, dim=[1]).dtype, tensorplay.float16,
+                         "half variance widened to single precision")
+        self.assertEqual(F.softmax(rows, 1).dtype, tensorplay.float16,
+                         "half softmax widened to single precision")
+        got_max = F.max(rows, dim=1)
+        np.testing.assert_allclose(
+            got_max[0].cpu().numpy().astype(np.float32),
+            narrowed(rows_cpu.max(axis=1)), atol=1e-3,
+            err_msg="row maximum values over a half linear payload")
+        np.testing.assert_array_equal(
+            got_max[1].cpu().numpy(), rows_cpu.argmax(axis=1),
+            err_msg="row maximum indices over a half linear payload")
+
+        # Walking along the strided axis keeps the same word rule for the
+        # output, whose length here is odd.
+        np.testing.assert_allclose(
+            rows.amax(dim=[0]).cpu().numpy().astype(np.float32),
+            narrowed(rows_cpu.max(axis=0)), atol=1e-3,
+            err_msg="column amax over a half linear payload")
+        np.testing.assert_allclose(
+            F.log_softmax(rows, 0).cpu().numpy().astype(np.float32),
+            narrowed(log_softmax_ref(rows_cpu, 0)),
+            rtol=2e-3, atol=2e-3,
+            err_msg="log_softmax along the strided half axis")
+
+        # A short payload stays in a texture, where the reductions reach the
+        # half twins of the image kernels instead.
+        small_cpu = narrowed((tp.randn((640, 128), device="cpu")
+                              * 1.5).numpy())
+        small = upload(small_cpu)
+        np.testing.assert_array_equal(
+            F.argmax(small, dim=1).cpu().numpy(), small_cpu.argmax(axis=1),
+            err_msg="argmax over a half texture payload")
+        np.testing.assert_allclose(
+            F.var(small, dim=[1]).cpu().numpy().astype(np.float32),
+            narrowed(small_cpu.var(axis=1, ddof=1)),
+            rtol=2e-3, atol=2e-3, err_msg="variance over a half texture axis")
+        np.testing.assert_allclose(
+            F.softmax(small, 1).cpu().numpy().astype(np.float32),
+            narrowed(softmax_ref(small_cpu, 1)),
+            rtol=2e-3, atol=2e-3, err_msg="softmax over a half texture axis")
+
+        # The single-precision kernels must be untouched on the same shapes.
+        flat32 = tensorplay.from_numpy(
+            (tp.randn((self.WIDTH,), device="cpu") * 3.0).numpy()
+        ).to("vulkan")
+        np.testing.assert_array_equal(
+            F.argmax(flat32).cpu().numpy(),
+            flat32.cpu().numpy().argmax(),
+            err_msg="argmax over a single-precision linear payload")
+        rows32 = tensorplay.from_numpy(
+            (tp.randn((3, 80000), device="cpu") * 2.0).numpy()
+        ).to("vulkan")
+        np.testing.assert_allclose(
+            F.var(rows32, dim=[1]).cpu().numpy(),
+            rows32.cpu().numpy().var(axis=1, ddof=1),
+            rtol=1e-4, atol=1e-4,
+            err_msg="variance over a single-precision long axis")
+
 
 if __name__ == "__main__":
     unittest.main()
