@@ -796,5 +796,59 @@ class TestVulkanPackedParameterCache(unittest.TestCase):
             "repeated pass over a cached operand changed the result")
 
 
+class TestVulkanLinearPayload(unittest.TestCase):
+    # A row wider than the device's image-axis limit is held in a storage
+    # buffer instead of a texture.  That is the shape of a large-vocabulary
+    # logit vector, so the decode-time elementwise ops must have a linear form.
+    WIDTH = 200000
+
+    def test_inplace_pointwise_over_linear_payload(self):
+        import tensorplay as tp
+        import tensorplay.functional as F
+        tensorplay.manual_seed(17)
+        x_cpu = (tp.randn((self.WIDTH,), device="cpu") * 3.0).numpy()
+        sig = 1.0 / (1.0 + np.exp(-x_cpu))
+        cases = [
+            ("abs_", (), np.abs(x_cpu)),
+            ("neg_", (), -x_cpu),
+            ("sigmoid_", (), sig),
+            ("silu_", (), x_cpu * sig),
+            ("relu6_", (), np.clip(x_cpu, 0.0, 6.0)),
+            ("hardsigmoid_", (), np.clip(x_cpu / 6.0 + 0.5, 0.0, 1.0)),
+            ("hardswish_", (), x_cpu * np.clip(x_cpu / 6.0 + 0.5, 0.0, 1.0)),
+            ("mish_", (), x_cpu * np.tanh(np.log1p(np.exp(x_cpu)))),
+            ("exp_", (), np.exp(x_cpu)),
+            ("threshold_", (0.0, -1.0), np.where(x_cpu > 0.0, x_cpu, -1.0)),
+            ("leaky_relu_", (0.1,), np.where(x_cpu > 0.0, x_cpu, 0.1 * x_cpu)),
+            ("mul_", (2.0,), 2.0 * x_cpu),
+            ("add_", (1.5,), x_cpu + 1.5),
+        ]
+        for name, args, want in cases:
+            y = tensorplay.from_numpy(x_cpu.copy()).to("vulkan")
+            out = getattr(F, name)(y, *args)
+            got = out.cpu().numpy()
+            self.assertIs(out, y, f"{name} did not return the same tensor")
+            np.testing.assert_allclose(
+                got, want, rtol=1e-4, atol=1e-4, err_msg=f"{name} left the payload untouched or wrong")
+
+    def test_factory_fill_over_linear_payload(self):
+        import tensorplay as tp
+        # A payload too wide for image storage is cleared and offset by the
+        # linear fill kernels; an uninitialized allocation would not read as
+        # the requested constant.
+        np.testing.assert_array_equal(
+            tensorplay.zeros((self.WIDTH,), device="vulkan").cpu().numpy(),
+            np.zeros(self.WIDTH, dtype=np.float32))
+        np.testing.assert_array_equal(
+            tensorplay.ones((self.WIDTH,), device="vulkan").cpu().numpy(),
+            np.ones(self.WIDTH, dtype=np.float32))
+        np.testing.assert_array_equal(
+            tensorplay.full((self.WIDTH,), 3.25, device="vulkan").cpu().numpy(),
+            np.full(self.WIDTH, 3.25, dtype=np.float32))
+        np.testing.assert_array_equal(
+            tensorplay.full(
+                (self.WIDTH,), -7, dtype=tp.int32, device="vulkan").cpu().numpy(),
+            np.full(self.WIDTH, -7, dtype=np.int32))
+
 if __name__ == "__main__":
     unittest.main()

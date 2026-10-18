@@ -12,8 +12,13 @@ uOutput;
 
 /*
  * Params Buffer
+ *
+ * The descriptor set layout is rebuilt from the ordered binding list, so the
+ * arguments a dispatch passes map onto consecutive binding numbers.  This
+ * kernel has no second buffer, hence the params block sits at one rather than
+ * reusing the slot the two-buffer kernels reserve for their input.
  */
-layout(set = 0, binding = 2) uniform Block {
+layout(set = 0, binding = 1) uniform Block {
   uint buf_length;
 }
 uBlock;

@@ -31,7 +31,11 @@ $if DTYPE == "int":
       VECTOR data[];
     }
     uOutput;
-    layout(set = 0, binding = 2) uniform PRECISION Block {
+    // Every variant's bindings must be numbered contiguously from zero: the
+    // descriptor set layout is rebuilt from the ordered binding list, so a
+    // reserved slot for the absent input buffer would shift the uniform block
+    // out of the position the arguments are bound to.
+    layout(set = 0, binding = 1) uniform PRECISION Block {
       uint buf_length;
     }
     uBlock;
@@ -56,7 +60,9 @@ $else:
       VECTOR data[];
     }
     uOutput;
-    layout(set = 0, binding = 2) uniform PRECISION Block {
+    // See the integer branch: the uniform block takes the first free binding
+    // of this variant, since no input buffer is bound in place.
+    layout(set = 0, binding = 1) uniform PRECISION Block {
       uint buf_length;
     }
     uBlock;

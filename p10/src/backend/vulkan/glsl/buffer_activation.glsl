@@ -29,7 +29,10 @@ $else:
     float data[];
   }
   uOutput;
-  layout(set = 0, binding = 2) uniform PRECISION Block {
+  // Bindings are numbered per variant: the descriptor set layout is rebuilt
+  // from the ordered binding list, so the params block must take the first
+  // free number rather than the slot reserved for the absent input buffer.
+  layout(set = 0, binding = 1) uniform PRECISION Block {
     uint buf_length;
   }
   uBlock;

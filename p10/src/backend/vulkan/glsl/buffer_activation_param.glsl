@@ -29,7 +29,8 @@ $else:
     float data[];
   }
   uOutput;
-  layout(set = 0, binding = 2) uniform PRECISION Block {
+  // Numbered per variant; see buffer_activation for the layout rule.
+  layout(set = 0, binding = 1) uniform PRECISION Block {
     uint buf_length;
     float p0;
     float p1;
