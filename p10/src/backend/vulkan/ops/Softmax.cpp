@@ -35,11 +35,11 @@ Tensor softmax_impl(
 
   api::vTensor v_input = convert(input_arg);
 
-  api::vTensor v_output{
-      context,
-      v_input.sizes(),
-      v_input.dtype(),
-  };
+  // The result is released in the operand's storage class: the row-walking
+  // variant below reads and writes words, so a dense input needs a dense
+  // result even when the shape would also fit an image.
+  api::vTensor v_output =
+      allocate_output_like(context, v_input, v_input.sizes(), v_input.dtype());
 
   // Buffer-stored payloads (any axis beyond the 3-D image limit) reduce
   // through a linear row-walking variant.  A half payload normalizes two

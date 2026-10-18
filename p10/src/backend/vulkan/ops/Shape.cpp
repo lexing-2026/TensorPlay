@@ -502,7 +502,18 @@ Tensor cat_kernel(const std::vector<Tensor>& tensors, int64_t dim) {
 
   api::Context* const context = api::context();
 
-  api::vTensor v_output{context, new_sizes, tensors[0].dtype()};
+  // One dense input makes the whole result dense: the linear route pulls a
+  // texel operand into words, but nothing turns a word operand into a texel
+  // for the image route to sample.
+  api::StorageType storage = api::StorageType::TEXTURE_3D;
+  for (const Tensor& t : tensors) {
+    if (convert(t).storage_type() == api::StorageType::BUFFER) {
+      storage = api::StorageType::BUFFER;
+      break;
+    }
+  }
+  api::vTensor v_output =
+      allocate_output(context, storage, new_sizes, tensors[0].dtype());
 
   if (v_output.storage_type() == api::StorageType::BUFFER) {
     TP_CHECK(

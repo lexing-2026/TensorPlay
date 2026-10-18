@@ -313,13 +313,10 @@ Tensor batch_norm_kernel(
 
   api::vTensor v_input = convert(input);
 
-  api::vTensor v_output{
-      context,
-      v_input.sizes(),
-      v_input.dtype(),
-  };
-
-  if (v_output.storage_type() == api::StorageType::BUFFER) {
+  // The choice belongs to the operand, not to the result: this branch never
+  // releases an allocation of its own, and an input already stored as words
+  // cannot be sampled by the fused image kernel below.
+  if (v_input.storage_type() == api::StorageType::BUFFER) {
     // Linear composite: (x - mean) / sqrt(var + eps) * weight + bias with
     // per-channel statistics reshaped to broadcast over the spatial axes.
     // Every step routes through a buffer-capable elementwise kernel.
@@ -348,6 +345,8 @@ Tensor batch_norm_kernel(
     }
     return out;
   }
+
+  api::vTensor v_output{context, v_input.sizes(), v_input.dtype()};
 
   const bool has_weight = weight_opt.has_value();
   const bool has_bias = bias_opt.has_value();

@@ -164,7 +164,8 @@ Tensor activation_out(
   api::Context* const context = api::context();
   api::vTensor v_self = convert(self);
 
-  api::vTensor v_output{context, v_self.sizes(), v_self.dtype()};
+  api::vTensor v_output =
+      allocate_output_like(context, v_self, v_self.sizes(), v_self.dtype());
   Tensor out = convert(v_output);
   activation_dispatch(
       activation_variant(shader, self),

@@ -138,6 +138,42 @@ inline bool image_storage_supported(
   return width <= limit && height <= limit && depth <= limit;
 }
 
+//
+// The storage a result has to live in.  Kernel variants are written per
+// storage class: an image payload is read by sampling texels, a dense one by
+// indexing 32-bit words, and no variant crosses that line.  Releasing an
+// allocation picks an image whenever the shape fits one, so pairing it with a
+// dense operand of the same shape selects the texel variant, which then fails
+// on the operand's missing image -- or, when the kernel skips that check,
+// leaves the image holding whatever the allocator recycled into it while the
+// real result sat in a buffer no read-back samples.  Naming the class the
+// operands use keeps the write in the storage the read uses.
+//
+inline api::vTensor allocate_output(
+    api::Context* const context,
+    api::StorageType storage_type,
+    const std::vector<int64_t>& sizes,
+    DType dtype) {
+  if (storage_type == api::StorageType::BUFFER) {
+    return api::vTensor{
+        context,
+        sizes,
+        dtype,
+        api::StorageType::BUFFER,
+        api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+  }
+  return api::vTensor{context, sizes, dtype};
+}
+
+inline api::vTensor allocate_output_like(
+    api::Context* const context,
+    const api::vTensor& operand,
+    const std::vector<int64_t>& sizes,
+    DType dtype) {
+  return allocate_output(
+      context, operand.storage_type(), sizes, dtype);
+}
+
 // Elementwise linear-buffer kernels address whole 4-byte words per lane: a
 // Float32 element fills one word, a Float16 pair shares one.  Byte-packed and
 // Bool payloads have no such shader yet; rejecting them here keeps a missing

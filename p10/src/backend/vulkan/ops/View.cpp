@@ -63,6 +63,10 @@ Tensor gather_view(
 
   api::Context* const context = api::context();
   api::vTensor v_input = convert(input);
+  // The destination class is decided by the shape alone: every pairing of a
+  // texel or word source with a texel or word destination has its own gather
+  // below, and a caller that wants a dense result kept image-shaped repacks
+  // it here rather than passing its own storage class through.
   api::vTensor v_output{context, out_sizes, input.dtype()};
 
   const std::vector<int64_t> in_sizes = prepadded(
