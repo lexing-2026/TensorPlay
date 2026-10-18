@@ -541,6 +541,123 @@ std::optional<Tensor> broadcastBinaryShader(
   return output;
 }
 
+std::optional<Tensor> broadcastTernaryShader(
+    const std::string& op, const Tensor& self, const Tensor& lhs,
+    const Tensor& rhs, const Scalar& value) {
+  if (!self.device().is_mps() || !lhs.device().is_mps() ||
+      !rhs.device().is_mps()) {
+    return std::nullopt;
+  }
+  // Different storage dtypes are promoted to a common one, which the graph
+  // builds as casts ahead of the operation.
+  if (self.dtype() != lhs.dtype() || self.dtype() != rhs.dtype()) {
+    return std::nullopt;
+  }
+  switch (self.dtype()) {
+    case DType::Float32:
+    case DType::Int64:
+    case DType::Int32:
+      break;
+    default:
+      return std::nullopt;
+  }
+  const std::vector<int64_t> self_shape =
+      static_cast<std::vector<int64_t>>(self.shape());
+  const std::vector<int64_t> lhs_shape =
+      static_cast<std::vector<int64_t>>(lhs.shape());
+  const std::vector<int64_t> rhs_shape =
+      static_cast<std::vector<int64_t>>(rhs.shape());
+  const std::vector<int64_t> out_shape = broadcast_shapes(
+      broadcast_shapes(self_shape, lhs_shape), rhs_shape);
+  if (out_shape.empty() || out_shape.size() > kShaderMaxNdims) {
+    return std::nullopt;
+  }
+  int64_t numel = 1;
+  for (int64_t size : out_shape) {
+    numel *= size;
+  }
+  if (numel <= 0 || numel > std::numeric_limits<uint32_t>::max()) {
+    return std::nullopt;
+  }
+  if (self.storage_offset() != 0 || lhs.storage_offset() != 0 ||
+      rhs.storage_offset() != 0) {
+    return std::nullopt;
+  }
+  MTLComputePipelineState_t pso = shaderPipelineNamed(
+      "broadcast_" + op + "_" + scalarToMetalTypeString(self.dtype()));
+  if (!pso) {
+    return std::nullopt;
+  }
+  auto self_strides = broadcastShaderStrides(self, out_shape);
+  auto lhs_strides = broadcastShaderStrides(lhs, out_shape);
+  auto rhs_strides = broadcastShaderStrides(rhs, out_shape);
+  if (!self_strides.has_value() || !lhs_strides.has_value() ||
+      !rhs_strides.has_value()) {
+    return std::nullopt;
+  }
+  void* self_buf = getMTLBufferFromPointer(self.data_ptr());
+  void* lhs_buf = getMTLBufferFromPointer(lhs.data_ptr());
+  void* rhs_buf = getMTLBufferFromPointer(rhs.data_ptr());
+  if (!self_buf || !lhs_buf || !rhs_buf) {
+    return std::nullopt;
+  }
+
+  std::array<uint32_t, kShaderMaxNdims> sizes{};
+  for (size_t o = 0; o < out_shape.size(); ++o) {
+    sizes[out_shape.size() - 1 - o] = static_cast<uint32_t>(out_shape[o]);
+  }
+  const uint32_t ndim = static_cast<uint32_t>(out_shape.size());
+  const uint32_t total = static_cast<uint32_t>(numel);
+  const std::array<int32_t, kShaderMaxNdims> self_stride_array = *self_strides;
+  const std::array<int32_t, kShaderMaxNdims> lhs_stride_array = *lhs_strides;
+  const std::array<int32_t, kShaderMaxNdims> rhs_stride_array = *rhs_strides;
+
+  Tensor output = emptyMPS(out_shape, self.dtype(), self.device());
+  void* out_buf = getMTLBufferFromPointer(output.data_ptr());
+  if (!out_buf) {
+    return std::nullopt;
+  }
+
+  MPSStream* stream = getCurrentMPSStream();
+  dispatch_sync_with_rethrow(stream->queue(), ^() {
+    @autoreleasepool {
+      auto encoder = stream->commandEncoder();
+      [encoder setComputePipelineState:pso];
+      [encoder setBuffer:(__bridge id<MTLBuffer>)out_buf offset:0 atIndex:0];
+      [encoder setBuffer:(__bridge id<MTLBuffer>)self_buf offset:0 atIndex:1];
+      [encoder setBuffer:(__bridge id<MTLBuffer>)lhs_buf offset:0 atIndex:2];
+      [encoder setBuffer:(__bridge id<MTLBuffer>)rhs_buf offset:0 atIndex:3];
+      if (self.dtype() == DType::Float32) {
+        const float factor = value.to<float>();
+        [encoder setBytes:&factor length:sizeof(factor) atIndex:4];
+      } else if (self.dtype() == DType::Int64) {
+        const int64_t factor = value.to<int64_t>();
+        [encoder setBytes:&factor length:sizeof(factor) atIndex:4];
+      } else {
+        const int32_t factor = value.to<int32_t>();
+        [encoder setBytes:&factor length:sizeof(factor) atIndex:4];
+      }
+      [encoder setBytes:&ndim length:sizeof(ndim) atIndex:5];
+      [encoder setBytes:sizes.data() length:sizeof(sizes) atIndex:6];
+      [encoder setBytes:self_stride_array.data()
+                 length:sizeof(self_stride_array)
+                atIndex:7];
+      [encoder setBytes:lhs_stride_array.data()
+                 length:sizeof(lhs_stride_array)
+                atIndex:8];
+      [encoder setBytes:rhs_stride_array.data()
+                 length:sizeof(rhs_stride_array)
+                atIndex:9];
+      const uint32_t per_group =
+          std::min(total,
+                   static_cast<uint32_t>([pso maxTotalThreadsPerThreadgroup]));
+      [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(per_group, 1, 1)];
+    }
+  });
+  return output;
+}
+
 std::optional<Tensor> unaryShader(const std::string& op, const Tensor& self) {
   if (!self.device().is_mps()) {
     return std::nullopt;

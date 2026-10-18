@@ -324,6 +324,10 @@ Tensor& hypot_inplace_kernel(Tensor& self, const Tensor& other) {
 Tensor addcmul_kernel(const Tensor& self, const Tensor& tensor1,
                       const Tensor& tensor2, const Scalar& value) {
   // self + value * tensor1 * tensor2
+  if (auto result =
+          broadcastTernaryShader("addcmul", self, tensor1, tensor2, value)) {
+    return *result;
+  }
   const DType common = promoteTypes(
       promoteTypes(self.dtype(), tensor1.dtype()), tensor2.dtype());
   Tensor v_t = scalarToMPS(value, common, self.device());
@@ -346,6 +350,10 @@ Tensor addcdiv_kernel(const Tensor& self, const Tensor& tensor1,
     TP_THROW(RuntimeError, "Integer division with addcdiv is not supported");
   }
   // self + value * tensor1 / tensor2
+  if (auto result =
+          broadcastTernaryShader("addcdiv", self, tensor1, tensor2, value)) {
+    return *result;
+  }
   const DType common = promoteTypes(
       promoteTypes(self.dtype(), tensor1.dtype()), tensor2.dtype());
   Tensor v_t = scalarToMPS(value, common, self.device());

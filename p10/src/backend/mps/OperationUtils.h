@@ -117,6 +117,16 @@ std::optional<Tensor> broadcastBinaryShader(
     const std::string& op, const Tensor& self, const Tensor& other,
     const std::optional<Scalar>& alpha = std::nullopt);
 
+// Runs `op` -- "addcmul" or "addcdiv" -- as `self + value * lhs * rhs` or
+// `self + value * lhs / rhs` over three independently broadcast operands, in
+// one shader dispatch. `value` is converted to the common storage type, which
+// is how an integral call treats a fractional factor. Returns std::nullopt when
+// a call cannot be expressed that way, under the same conditions as
+// `broadcastBinaryShader`; the caller builds a graph in that case.
+std::optional<Tensor> broadcastTernaryShader(
+    const std::string& op, const Tensor& self, const Tensor& lhs,
+    const Tensor& rhs, const Scalar& value);
+
 // Runs `op` -- "exp", "sqrt", "rsqrt", "abs" or "relu" -- over a contiguous
 // float input with a single shader dispatch, which is what the operation costs
 // in storage traffic and nothing more. Returns std::nullopt when a call cannot

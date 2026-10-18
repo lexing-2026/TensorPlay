@@ -7,10 +7,15 @@
 
 #include "backend/mps/MPSDevice.h"
 #include "backend/mps/MPSStream.h"
+#include "backend/mps/MetalShaderLibrary.h"
+#include "backend/mps/MetalUtils.h"
+#include "backend/mps/kernels/Normalization.h"
 
 #include <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
 
+#include <algorithm>
 #include <cmath>
+#include <limits>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -313,6 +318,86 @@ Tensor batch_norm_kernel(const Tensor& input,
     bias_c = materializeForGraph(*bias_opt);
   }
 
+  // Evaluation mode is a per-channel affine transform of the input, which a
+  // single elementwise pass applies after the host folds the running
+  // statistics into scale and shift arrays. The graph below stays for the
+  // training path and for mixed storage dtypes.
+  const DType bn_dtype = input.dtype();
+  if (!training && has_running_mean &&
+      (bn_dtype == DType::Float32 || bn_dtype == DType::Float16 ||
+       bn_dtype == DType::BFloat16)) {
+    Tensor rm_c = materializeForGraph(*running_mean_opt);
+    Tensor rv_c = materializeForGraph(*running_var_opt);
+    const int64_t batch = input.size(0);
+    const int64_t spatial = batch > 0 ? input.numel() / (batch * C) : 0;
+    bool shader_ok =
+        rm_c.dtype() == bn_dtype && rv_c.dtype() == bn_dtype &&
+        rm_c.numel() == C && rv_c.numel() == C &&
+        (!weight_c.defined() ||
+         (weight_c.dtype() == bn_dtype && weight_c.numel() == C)) &&
+        (!bias_c.defined() ||
+         (bias_c.dtype() == bn_dtype && bias_c.numel() == C)) &&
+        batch > 0 && spatial > 0 &&
+        spatial <= std::numeric_limits<uint32_t>::max() &&
+        C <= std::numeric_limits<uint32_t>::max() &&
+        batch <= std::numeric_limits<uint32_t>::max();
+    if (shader_ok) {
+      synchronizeHostAccess();
+      Tensor scale_shift =
+          Tensor::empty({2 * C}, DType::Float32, input.device());
+      float* folded = scale_shift.data_ptr<float>();
+      distribution::dispatch_dtype(bn_dtype, [&](auto tag) {
+        using scalar_t = decltype(tag);
+        const scalar_t* rm = rm_c.data_ptr<scalar_t>();
+        const scalar_t* rv = rv_c.data_ptr<scalar_t>();
+        const scalar_t* w =
+            weight_c.defined() ? weight_c.data_ptr<scalar_t>() : nullptr;
+        const scalar_t* b =
+            bias_c.defined() ? bias_c.data_ptr<scalar_t>() : nullptr;
+        for (int64_t c = 0; c < C; ++c) {
+          const double scale =
+              (w ? static_cast<double>(w[c]) : 1.0) /
+              std::sqrt(static_cast<double>(rv[c]) + eps);
+          const double shift =
+              (b ? static_cast<double>(b[c]) : 0.0) -
+              static_cast<double>(rm[c]) * scale;
+          folded[c] = static_cast<float>(scale);
+          folded[C + c] = static_cast<float>(shift);
+        }
+      });
+
+      auto pso = MetalShaderLibrary::getBundledLibrary()
+                     .getPipelineStateForFunc(
+                         "batch_norm_eval_" +
+                         scalarToMetalTypeString(bn_dtype));
+      const uint32_t spatial_u = static_cast<uint32_t>(spatial);
+      const uint32_t channels_u = static_cast<uint32_t>(C);
+      const uint32_t batch_u = static_cast<uint32_t>(batch);
+      MPSStream* mpsStream = getCurrentMPSStream();
+      dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+        @autoreleasepool {
+          id<MTLComputeCommandEncoder> encoder = mpsStream->commandEncoder();
+          [encoder setComputePipelineState:pso];
+          set_shader_arg(encoder, output, 0);
+          set_shader_arg(encoder, input_c, 1);
+          id<MTLBuffer> folded_buf = (__bridge id<MTLBuffer>)
+              getMTLBufferFromPointer(scale_shift.data_ptr());
+          [encoder setBuffer:folded_buf offset:0 atIndex:2];
+          [encoder setBuffer:folded_buf
+                      offset:static_cast<NSUInteger>(sizeof(float) * C)
+                     atIndex:3];
+          set_shader_arg(encoder, spatial_u, 4);
+          set_shader_arg(encoder, channels_u, 5);
+          mtl_dispatch3DJob(encoder, pso, static_cast<NSUInteger>(spatial_u),
+                            static_cast<NSUInteger>(channels_u),
+                            static_cast<NSUInteger>(batch_u));
+          mpsStream->synchronize(SyncType::COMMIT);
+        }
+      });
+      return output;
+    }
+  }
+
   // Retained instead of autoreleased: the graph must stay alive until after
   // the command buffer fully completes, and the pool drains before the
   // host-side running-stats update below.
@@ -505,6 +590,81 @@ Tensor group_norm_kernel(const Tensor& input, int64_t num_groups,
   Tensor output = Tensor(out_shape, input.dtype(), input.device());
   if (output.numel() == 0) {
     return output;
+  }
+
+  // One threadgroup reduces and normalizes each (batch, group) pair when the
+  // storage is a floating-point type and the affine operands either both
+  // exist or both are absent. Anything else keeps the graph path, which
+  // builds the casts and broadcasts it needs.
+  const DType gn_dtype = input.dtype();
+  if (gn_dtype == DType::Float32 || gn_dtype == DType::Float16 ||
+      gn_dtype == DType::BFloat16) {
+    const bool has_weight =
+        weight_opt.has_value() && weight_opt->defined();
+    const bool has_bias = bias_opt.has_value() && bias_opt->defined();
+    if (has_weight == has_bias) {
+      const int64_t channels_per_group = C / G;
+      const int64_t elements_per_group = channels_per_group * spatial;
+      const int64_t group_count = N * G;
+      bool shader_ok =
+          elements_per_group > 0 &&
+          elements_per_group <= std::numeric_limits<uint32_t>::max() &&
+          group_count <= std::numeric_limits<uint32_t>::max() &&
+          spatial <= std::numeric_limits<uint32_t>::max() &&
+          channels_per_group <= std::numeric_limits<uint32_t>::max() &&
+          G <= std::numeric_limits<uint32_t>::max();
+      Tensor input_c = materializeForGraph(input);
+      Tensor weight_c;
+      Tensor bias_c;
+      if (shader_ok && has_weight) {
+        weight_c = materializeForGraph(*weight_opt);
+        bias_c = materializeForGraph(*bias_opt);
+        shader_ok = weight_c.dtype() == gn_dtype &&
+                    bias_c.dtype() == gn_dtype &&
+                    weight_c.numel() == C && bias_c.numel() == C;
+      }
+      if (shader_ok) {
+        GroupNormParams params{
+            static_cast<uint32_t>(spatial),
+            static_cast<uint32_t>(channels_per_group),
+            static_cast<uint32_t>(elements_per_group),
+            static_cast<uint32_t>(G)};
+        auto pso = MetalShaderLibrary::getBundledLibrary()
+                       .getPipelineStateForFunc(
+                           "group_norm_" + scalarToMetalTypeString(gn_dtype) +
+                           (has_weight ? "_affine" : ""));
+        const uint64_t blocks =
+            static_cast<uint64_t>(elements_per_group + 3) / 4;
+        uint32_t tptg = static_cast<uint32_t>(
+            std::min<uint64_t>(32 * ((blocks + 31) / 32), 1024));
+        tptg = std::min<uint32_t>(
+            tptg, static_cast<uint32_t>(
+                      [pso maxTotalThreadsPerThreadgroup]));
+        tptg = std::max<uint32_t>(tptg, 32);
+        const float eps_f = static_cast<float>(eps);
+        MPSStream* mpsStream = getCurrentMPSStream();
+        dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+          @autoreleasepool {
+            id<MTLComputeCommandEncoder> encoder =
+                mpsStream->commandEncoder();
+            [encoder setComputePipelineState:pso];
+            if (has_weight) {
+              mtl_setArgs(encoder, output, input_c, weight_c, bias_c, params,
+                          eps_f);
+            } else {
+              mtl_setArgs(encoder, output, input_c, params, eps_f);
+            }
+            [encoder
+                dispatchThreadgroups:MTLSizeMake(
+                                        static_cast<NSUInteger>(group_count),
+                                        1, 1)
+                threadsPerThreadgroup:MTLSizeMake(tptg, 1, 1)];
+            mpsStream->synchronize(SyncType::COMMIT);
+          }
+        });
+        return output;
+      }
+    }
   }
 
   // The four nested dimensions the graph works in.  Splitting a group into its
