@@ -802,6 +802,43 @@ class TestVulkanLinearPayload(unittest.TestCase):
     # logit vector, so the decode-time elementwise ops must have a linear form.
     WIDTH = 200000
 
+    def test_clamp_bounds_over_linear_payload(self):
+        import tensorplay as tp
+        import tensorplay.functional as F
+        tensorplay.manual_seed(7)
+        x_cpu = (tp.randn((self.WIDTH,), device="cpu") * 8.0).numpy()
+        x = tensorplay.from_numpy(x_cpu.astype(np.float32)).to("vulkan")
+        for lo, hi in ((-1.5, 2.5), (0.0, None), (None, 1.0), (-1e9, 1e9)):
+            want = np.clip(x_cpu, lo, hi)
+            got = F.clamp(x, min=lo, max=hi).cpu().numpy()
+            np.testing.assert_allclose(got, want, rtol=0, atol=1e-6)
+
+    def test_clamp_inplace_over_linear_payload(self):
+        import tensorplay as tp
+        import tensorplay.functional as F
+        tensorplay.manual_seed(11)
+        x_cpu = (tp.randn((self.WIDTH,), device="cpu") * 8.0).numpy()
+        y = tensorplay.from_numpy(x_cpu.copy()).to("vulkan")
+        out = F.clamp_(y, min=-1.0, max=1.0)
+        np.testing.assert_allclose(
+            out.cpu().numpy(), np.clip(x_cpu, -1.0, 1.0), rtol=0, atol=1e-6)
+        # In place means the same payload: a second read-back must show the
+        # clip already applied, not the original values.
+        np.testing.assert_allclose(
+            y.cpu().numpy(), np.clip(x_cpu, -1.0, 1.0), rtol=0, atol=1e-6)
+
+    def test_clamp_int32_over_linear_payload(self):
+        import tensorplay as tp
+        import tensorplay.functional as F
+        tensorplay.manual_seed(13)
+        x_cpu = np.floor(tp.randn((self.WIDTH,), device="cpu")
+                          * 300.0).numpy().astype(np.int32)
+        x = tensorplay.from_numpy(x_cpu.copy()).to("vulkan")
+        for lo, hi in ((-100, 100), (0, None), (None, -500)):
+            want = np.clip(x_cpu, lo, hi)
+            got = F.clamp(x, min=lo, max=hi).cpu().numpy()
+            np.testing.assert_array_equal(got, want)
+
     def test_inplace_pointwise_over_linear_payload(self):
         import tensorplay as tp
         import tensorplay.functional as F
@@ -849,6 +886,7 @@ class TestVulkanLinearPayload(unittest.TestCase):
             tensorplay.full(
                 (self.WIDTH,), -7, dtype=tp.int32, device="vulkan").cpu().numpy(),
             np.full(self.WIDTH, -7, dtype=np.int32))
+
 
 if __name__ == "__main__":
     unittest.main()

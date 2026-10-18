@@ -383,6 +383,20 @@ buffer_unary_op:
   - NAME: buffer_sigmoid_i32
     DTYPE: int
     OPERATOR: int(1.0f / (1.0f + exp(-float(X))))
+buffer_clamp:
+  parameter_names_with_default_values:
+    DTYPE: float
+    INPLACE: false
+  generate_variant_forall:
+    INPLACE:
+    - VALUE: false
+      SUFFIX: ''
+    - VALUE: true
+      SUFFIX: inplace
+  shader_variants:
+  - NAME: buffer_clamp
+  - NAME: buffer_clamp_i32
+    DTYPE: int
 buffer_binary_op_tensor:
   parameter_names_with_default_values:
     OPERATOR: X + A * Y
