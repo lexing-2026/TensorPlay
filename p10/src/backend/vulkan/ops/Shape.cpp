@@ -3,6 +3,7 @@
 #include "Blocks.h"
 #include "Common.h"
 #include "Convert.h"
+#include "Factory.h"
 #include "Utils.h"
 
 #include <algorithm>
@@ -22,6 +23,27 @@ Tensor materialize_view(
     const std::vector<int64_t>& out_sizes,
     const std::vector<int64_t>& out_strides,
     int64_t storage_offset);
+
+// Defined in Factory.cpp; materializes a host-filled 1-D payload.  The
+// triangular masks below use Int32 index tensors, the widest integer dtype
+// the linear path stores.
+Tensor arange_start_step_kernel(
+    Scalar start,
+    Scalar end,
+    Scalar step,
+    DType dtype,
+    std::optional<Device> device);
+
+// Defined in BinaryOp.cpp / Comparison.cpp / Where.cpp.  The triangular mask
+// is a broadcast difference compared against the diagonal offset, then
+// selects through the three-operand where kernel.
+Tensor sub_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha);
+Tensor ge_scalar_kernel(const Tensor& self, const Scalar& other);
+Tensor le_scalar_kernel(const Tensor& self, const Scalar& other);
+Tensor where_kernel(
+    const Tensor& condition,
+    const Tensor& self,
+    const Tensor& other);
 
 // Defined in BinaryOp.cpp; copies a texture payload into a dense buffer.
 api::vTensor to_buffer_storage_dispatch(
@@ -851,6 +873,92 @@ Tensor narrow_kernel(const Tensor& self, int64_t dim, int64_t start,
   return slice_kernel(self, dim, start, start + length, 1);
 }
 
+namespace {
+
+// Batch sizes of a triangular op: every axis before the last two repeats the
+// same rows x cols mask.  The function also returns the matrix extents.
+std::vector<int64_t> triangular_batch_sizes(
+    const Tensor& self,
+    int64_t& rows,
+    int64_t& cols) {
+  TP_CHECK(
+      self.dim() >= 2,
+      "triangular ops require a tensor with at least 2 dimensions");
+  const std::vector<int64_t> sizes = shape_vector(self);
+  rows = sizes[sizes.size() - 2];
+  cols = sizes[sizes.size() - 1];
+  return std::vector<int64_t>(sizes.begin(), sizes.end() - 2);
+}
+
+// Materializes a Bool triangular mask and selects the kept triangle with
+// where.  The mask is a broadcast difference between Int32 column and row
+// index tensors, so both buffer and texture payloads take the same
+// elementwise path already implemented by the backend.
+Tensor triangular_mask_kernel(
+    const Tensor& self,
+    int64_t diagonal,
+    bool keep_upper) {
+  int64_t rows = 0;
+  int64_t cols = 0;
+  const std::vector<int64_t> batch = triangular_batch_sizes(self, rows, cols);
+  const size_t batch_rank = batch.size();
+
+  // Row indices: (batch..., rows, 1).  Column indices: (batch..., 1, cols).
+  Tensor row_indices = arange_start_step_kernel(
+      Scalar(0), Scalar(rows), Scalar(1), DType::Int32, std::nullopt);
+  for (size_t i = 0; i < batch_rank; ++i) {
+    row_indices = unsqueeze_kernel(row_indices, 0);
+  }
+  row_indices = unsqueeze_kernel(row_indices, -1);
+  std::vector<int64_t> row_sizes = batch;
+  row_sizes.push_back(rows);
+  row_sizes.push_back(1);
+  row_indices = row_indices.expand(row_sizes);
+
+  Tensor col_indices = arange_start_step_kernel(
+      Scalar(0), Scalar(cols), Scalar(1), DType::Int32, std::nullopt);
+  for (size_t i = 0; i < batch_rank; ++i) {
+    col_indices = unsqueeze_kernel(col_indices, 0);
+  }
+  col_indices = unsqueeze_kernel(
+      col_indices, static_cast<int64_t>(batch_rank));
+  std::vector<int64_t> col_sizes = batch;
+  col_sizes.push_back(1);
+  col_sizes.push_back(cols);
+  col_indices = col_indices.expand(col_sizes);
+
+  // col - row >= diagonal keeps the upper triangle; <= keeps the lower one.
+  const Tensor diff = sub_kernel(col_indices, row_indices, Scalar(1));
+  const Tensor mask = keep_upper
+      ? ge_scalar_kernel(diff, Scalar(diagonal))
+      : le_scalar_kernel(diff, Scalar(diagonal));
+
+  return where_kernel(
+      mask,
+      self,
+      zeros_like_kernel(self, DType::Undefined, std::nullopt));
+}
+
+} // namespace
+
+Tensor triu_kernel(const Tensor& self, int64_t diagonal) {
+  return triangular_mask_kernel(self, diagonal, true);
+}
+
+Tensor tril_kernel(const Tensor& self, int64_t diagonal) {
+  return triangular_mask_kernel(self, diagonal, false);
+}
+
+Tensor& triu_inplace_kernel(Tensor& self, int64_t diagonal) {
+  self.copy_(triu_kernel(self, diagonal));
+  return self;
+}
+
+Tensor& tril_inplace_kernel(Tensor& self, int64_t diagonal) {
+  self.copy_(tril_kernel(self, diagonal));
+  return self;
+}
+
 } // namespace ops
 } // namespace vulkan
 } // namespace tensorplay
@@ -863,6 +971,10 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, ShapeKernels) {
   m.impl("unsqueeze", &tensorplay::vulkan::ops::unsqueeze_kernel);
   m.impl("slice.Tensor", &tensorplay::vulkan::ops::slice_kernel);
   m.impl("narrow", &tensorplay::vulkan::ops::narrow_kernel);
+  m.impl("triu", &tensorplay::vulkan::ops::triu_kernel);
+  m.impl("tril", &tensorplay::vulkan::ops::tril_kernel);
+  m.impl("triu_", &tensorplay::vulkan::ops::triu_inplace_kernel);
+  m.impl("tril_", &tensorplay::vulkan::ops::tril_inplace_kernel);
   m.impl("select.int", &tensorplay::vulkan::ops::select_kernel);
   m.impl("cat", &tensorplay::vulkan::ops::cat_kernel);
   m.impl("stack", &tensorplay::vulkan::ops::stack_kernel);
