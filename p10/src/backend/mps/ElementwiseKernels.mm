@@ -617,10 +617,16 @@ Tensor softplus_kernel_impl(const Tensor& self, const Scalar& beta,
 // Comparison ops
 // ---------------------------------------------------------------------------
 
-#define DEFINE_MPS_CMP_TENSOR_KERNEL(NAME, BLOCK)                    \
+// The shader answers a call over two operands that already share a shape; the
+// graph is reached by every other call, including the ones that need an
+// expansion or a promotion first.
+#define DEFINE_MPS_CMP_TENSOR_KERNEL(NAME, BLOCK)                        \
   Tensor NAME##_tensor_kernel(const Tensor& self, const Tensor& other) { \
-    return binaryOp(#NAME, self, other, BLOCK, std::nullopt,        \
-                    std::nullopt, DType::Bool);                      \
+    if (auto result = compareShader(#NAME, self, other)) {               \
+      return *result;                                                    \
+    }                                                                    \
+    return binaryOp(#NAME, self, other, BLOCK, std::nullopt,             \
+                    std::nullopt, DType::Bool);                          \
   }
 
 DEFINE_MPS_CMP_TENSOR_KERNEL(eq, eqBlock)

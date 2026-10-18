@@ -144,5 +144,16 @@ std::optional<Tensor> rowArgReduceShader(const Tensor& self,
                                          const std::vector<int64_t>& out_shape,
                                          bool is_max);
 
+// Compares `self` and `other` -- "eq", "ne", "lt", "le", "gt" or "ge" -- with a
+// single shader dispatch that writes one boolean byte per element. The operands
+// are read where they stand, so nothing is materialized for the comparison.
+// Returns std::nullopt when a call cannot be expressed that way: operands of
+// different shapes or storage types, a view that is not contiguous or does not
+// start at the beginning of its storage, a dtype the shader is not instantiated
+// for, an element count beyond the 32-bit addressing the shader uses. The caller
+// builds a graph in that case.
+std::optional<Tensor> compareShader(const std::string& op, const Tensor& self,
+                                    const Tensor& other);
+
 } // namespace mps
 } // namespace tensorplay

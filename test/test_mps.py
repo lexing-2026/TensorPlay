@@ -188,6 +188,54 @@ class TestMPSComparison(unittest.TestCase):
         self.assertTrue((a == 2).cpu().all().item())
         self.assertTrue((a != 3).cpu().all().item())
 
+    def test_unit_stride_comparisons(self):
+        # The dtypes a comparison kernel reads where the operands stand.
+        for dtype in (tp.float32, tp.int64, tp.int32):
+            a = tp.tensor([0, 1, 2, 3], dtype=dtype, device="mps")
+            b = tp.tensor([3, 1, 2, 0], dtype=dtype, device="mps")
+            for op, expected in (
+                (tp.eq, [False, True, True, False]),
+                (tp.ne, [True, False, False, True]),
+                (tp.lt, [True, False, False, False]),
+                (tp.le, [True, True, True, False]),
+                (tp.gt, [False, False, False, True]),
+                (tp.ge, [False, True, True, True]),
+            ):
+                self.assertEqual(op(a, b).cpu().tolist(), expected,
+                                 "%s over %s" % (op.__name__, dtype))
+
+    def test_comparison_with_nan(self):
+        # A NaN is equal to nothing, not even to itself, and every ordered
+        # comparison against one is false.
+        x = tp.tensor([float("nan"), 1.0], dtype=tp.float32, device="mps")
+        self.assertEqual(tp.eq(x, x).cpu().tolist(), [False, True])
+        self.assertEqual(tp.ne(x, x).cpu().tolist(), [True, False])
+        for op in (tp.lt, tp.le, tp.gt, tp.ge):
+            self.assertEqual(op(x, x).cpu().tolist(), [False, False])
+
+    def test_comparisons_needing_a_graph(self):
+        # The operands a single dispatch cannot address: one that has to be
+        # expanded, a view that starts partway through its storage, a view that
+        # does not run through it in order, and a pair of different types.
+        values = [0, 1, 2, 3]
+        a = tp.tensor(values, dtype=tp.float32, device="mps")
+        row = tp.tensor([values], dtype=tp.float32, device="mps")
+        self.assertEqual(
+            tp.eq(tp.unsqueeze(a, 1), row).cpu().tolist(),
+            [[x == y for y in values] for x in values])
+        self.assertEqual(
+            tp.eq(a[1:], tp.tensor(values[1:], dtype=tp.float32,
+                                   device="mps")).cpu().tolist(),
+            [True, True, True])
+        grid = tp.tensor([[0, 1], [2, 3]], dtype=tp.float32, device="mps")
+        self.assertEqual(
+            tp.eq(tp.transpose(grid, 0, 1), grid).cpu().tolist(),
+            [[True, False], [False, True]])
+        self.assertEqual(
+            tp.eq(a, tp.tensor(values, dtype=tp.int64, device="mps"))
+              .cpu().tolist(),
+            [True, True, True, True])
+
     def test_where(self):
         cond = tp.full((2, 3), 1, device="mps", dtype=tp.float32) > 0
         a = tp.full((2, 3), 1, device="mps", dtype=tp.float32)
