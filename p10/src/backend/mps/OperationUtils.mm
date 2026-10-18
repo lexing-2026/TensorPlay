@@ -843,6 +843,30 @@ std::optional<Tensor> rowSumShader(const Tensor& self,
   return output;
 }
 
+std::optional<Tensor> logsumexpRowShader(const Tensor& self,
+                                         const std::vector<int64_t>& out_shape) {
+  uint32_t rows = 0;
+  uint32_t length = 0;
+  if (!rowReduceSpan(self, DType::Float32, out_shape, rows, length)) {
+    return std::nullopt;
+  }
+  MTLComputePipelineState_t pso = shaderPipelineNamed("logsumexp_row_float");
+  if (!pso) {
+    return std::nullopt;
+  }
+  void* in_buf = getMTLBufferFromPointer(self.data_ptr());
+  if (!in_buf) {
+    return std::nullopt;
+  }
+  Tensor output = emptyMPS(out_shape, DType::Float32, self.device());
+  void* out_buf = getMTLBufferFromPointer(output.data_ptr());
+  if (!out_buf) {
+    return std::nullopt;
+  }
+  dispatchRowReduce(pso, out_buf, in_buf, rows, length, std::nullopt);
+  return output;
+}
+
 std::optional<Tensor> rowArgReduceShader(const Tensor& self,
                                          const std::vector<int64_t>& out_shape,
                                          bool is_max) {

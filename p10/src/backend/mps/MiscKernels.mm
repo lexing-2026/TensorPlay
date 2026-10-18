@@ -7,6 +7,7 @@
 #include "DTypeNames.h"
 
 #include "backend/mps/MPSDevice.h"
+#include "backend/mps/OperationUtils.h"
 
 #include <cmath>
 #include <limits>
@@ -22,9 +23,9 @@ namespace ops = tpx::ops;
 // ---------------------------------------------------------------------------
 // logsumexp
 //
-// Computed as max + log(sum(exp(x - max))) over the given dims.  When a whole
-// reduced slice is -inf, max is -inf and the shifted exponentials would be
-// NaN; those slices are replaced with -inf through a where on the max.
+// Computed as max + log(sum(exp(x - max))) over the given dims.  A slice whose
+// maximum is infinite has no finite shift to work from, so it answers with that
+// maximum through a where.
 // ---------------------------------------------------------------------------
 
 Tensor logsumexp_kernel(const Tensor& self, const std::vector<int64_t>& dim,
@@ -40,6 +41,32 @@ Tensor logsumexp_kernel(const Tensor& self, const std::vector<int64_t>& dim,
   // exponential step requires a floating-point type.
   Tensor x = integral ? self.to(out_dtype) : self;
 
+  // Reducing the innermost axis alone is one pass down each row, which the row
+  // shader answers in one launch: a maximum pass and a shifted-exponential sum
+  // pass walk the same row without materializing the shifted intermediate.
+  std::vector<int64_t> reduced_dims = dim;
+  if (reduced_dims.empty()) {
+    for (int64_t i = 0; i < self.dim(); ++i) {
+      reduced_dims.push_back(i);
+    }
+  }
+  const int64_t nd = self.dim();
+  for (int64_t& d : reduced_dims) {
+    if (d < 0) d += nd;
+  }
+  if (reduced_dims.size() == 1 && reduced_dims[0] == nd - 1) {
+    std::vector<int64_t> out_shape =
+        static_cast<std::vector<int64_t>>(x.shape());
+    if (keepdim) {
+      out_shape.back() = 1;
+    } else {
+      out_shape.pop_back();
+    }
+    if (auto fused = logsumexpRowShader(x, out_shape)) {
+      return *fused;
+    }
+  }
+
   Tensor m = Tensor::amax(x, dim, true);
   Tensor shifted = x - m;
   Tensor s = shifted.exp().sum(dim, true);
@@ -47,20 +74,11 @@ Tensor logsumexp_kernel(const Tensor& self, const std::vector<int64_t>& dim,
   if (out_dtype != result.dtype()) {
     result = result.to(out_dtype);
   }
-  const double neg_inf = -std::numeric_limits<double>::infinity();
-  Tensor neg_inf_mask = m.eq(Scalar(neg_inf));
-  result = Tensor::where(neg_inf_mask, m, result);
+  const double inf = std::numeric_limits<double>::infinity();
+  Tensor inf_mask = m.abs().eq(Scalar(inf));
+  result = Tensor::where(inf_mask, m, result);
   if (!keepdim) {
     // squeeze the reduced dims out of the result (m kept them as size 1).
-    std::vector<int64_t> reduced_dims = dim;
-    if (reduced_dims.empty()) {
-      for (int64_t i = 0; i < self.dim(); ++i) {
-        reduced_dims.push_back(i);
-      }
-    }
-    for (int64_t& d : reduced_dims) {
-      if (d < 0) d += self.dim();
-    }
     result = result.squeeze(reduced_dims);
   }
   return result;

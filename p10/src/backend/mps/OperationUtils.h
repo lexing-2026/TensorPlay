@@ -147,6 +147,14 @@ std::optional<Tensor> rowSumShader(const Tensor& self,
                                    const std::vector<int64_t>& out_shape,
                                    float divisor);
 
+// log(sum(exp(x - max))) + max over the innermost axis of a contiguous float
+// operand, written in `out_shape` (one value per row). The maximum and the
+// shifted exponential sum are folded in one launch by the same SIMD group that
+// walks the row. Returns std::nullopt for an operand the shader cannot address,
+// as above.
+std::optional<Tensor> logsumexpRowShader(const Tensor& self,
+                                         const std::vector<int64_t>& out_shape);
+
 // The position along the innermost axis at which `self` holds its extremum --
 // the first such position when several hold it, and a NaN counts as holding the
 // extremum of its row -- written as Int64 in `out_shape`. Returns std::nullopt

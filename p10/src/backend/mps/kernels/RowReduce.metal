@@ -298,6 +298,45 @@ kernel void row_pred_inner(device bool* out [[buffer(0)]],
   }
 }
 
+// log(sum(exp(x - max))) + max over one row. One SIMD group walks the row
+// twice: the first pass keeps the maximum, the second accumulates the shifted
+// exponentials. A row whose maximum is infinite holds no finite value to shift
+// towards -- exp(inf - inf) would be a NaN -- so that row answers with its
+// maximum directly, an infinity of the same sign.
+template <typename T>
+kernel void logsumexp_row(device T* out [[buffer(0)]],
+                          constant T* src [[buffer(1)]],
+                          constant RowSizes& sizes [[buffer(2)]],
+                          uint tptg [[threads_per_threadgroup]],
+                          uint tgid [[threadgroup_position_in_grid]],
+                          uint lane [[thread_index_in_simdgroup]],
+                          uint group [[simdgroup_index_in_threadgroup]]) {
+  const uint row = tgid * (tptg / simdgroup_size) + group;
+  if (row >= sizes[0]) {
+    return;
+  }
+  const uint n = sizes[1];
+  constant T* values = src + (uint64_t)row * (uint64_t)n;
+
+  T maximum = T(-INFINITY);
+  for (uint i = lane; i < n; i += simdgroup_size) {
+    maximum = max(maximum, values[i]);
+  }
+  maximum = simd_max(maximum);
+
+  float total = 0.0f;
+  for (uint i = lane; i < n; i += simdgroup_size) {
+    total += exp(static_cast<float>(values[i]) - static_cast<float>(maximum));
+  }
+  total = simd_sum(total);
+
+  if (lane == 0) {
+    out[row] = (maximum == T(-INFINITY) || maximum == T(INFINITY))
+        ? maximum
+        : static_cast<T>(log(total) + static_cast<float>(maximum));
+  }
+}
+
 // Float is the only storage type the extrema read: an operand of another type
 // reduces in a type of its own, which the graph path builds around the
 // reduction. The predicates answer for float and for bool, the two the suite
@@ -338,6 +377,10 @@ kernel void row_pred_inner(device bool* out [[buffer(0)]],
                                    uint group);
 
 REGISTER_ROW_SUM(float)
+template [[host_name("logsumexp_row_float")]] kernel void
+    logsumexp_row<float>(device float* out, constant float* src,
+                         constant RowSizes& sizes, uint tptg, uint tgid,
+                         uint lane, uint group);
 REGISTER_ARG_REDUCTION(argmax, arg_max)
 REGISTER_ARG_REDUCTION(argmin, arg_min)
 REGISTER_VALUE_REDUCTION(rowmax, arg_max)
