@@ -32,6 +32,46 @@ inline const api::ShaderInfo& kernel_for(const char* base_name, const Tensor& t)
 }
 
 /*
+ * Linear payloads carry their element type in the kernel name: a storage
+ * buffer has no texel format to select, so the fp16 builds are a separate
+ * family that reads two half lanes per 32-bit word.  The tag goes before the
+ * in-place suffix, which the op registrations already spell into the name.
+ */
+inline std::string buffer_shader_for_dtype(
+    const std::string& name,
+    DType dtype) {
+  if (dtype != DType::Float16) {
+    return name;
+  }
+  constexpr std::string_view in_place_suffix = "inplace";
+  if (name.size() >= in_place_suffix.size() &&
+      name.compare(
+          name.size() - in_place_suffix.size(),
+          in_place_suffix.size(),
+          in_place_suffix) == 0) {
+    return name.substr(0, name.size() - in_place_suffix.size()) +
+        "_halfinplace";
+  }
+  return name + "_half";
+}
+
+/*
+ * Global invocation count for an elementwise linear dispatch.  The Float32
+ * builds were authored to move a 16-byte vector (four elements) per
+ * invocation, the Float16 ones a single word holding two lanes.  Dispatch
+ * rounds up to whole workgroups, which is what covers a tail element whose
+ * owning index falls past the exact quotient.
+ */
+inline uint32_t buffer_dispatch_count(
+    uint32_t elements,
+    DType dtype,
+    uint32_t float_elements_per_invocation) {
+  const uint32_t per =
+      dtype == DType::Float16 ? 2u : float_elements_per_invocation;
+  return (elements + per - 1u) / per;
+}
+
+/*
  * The functions below safely return the size of the dimension at the N-th
  * innermost index. If the dimensionality of the size array is not sufficient
  * then 1 will be returned.
@@ -72,19 +112,22 @@ struct Dim4D final {
   static constexpr uint32_t Width = 1u;
 };
 
-// Elementwise linear-buffer kernels read and write whole 4-byte words per
-// lane.  Half-precision, integer-byte and Bool payloads have no such shader
-// yet; rejecting them here keeps a missing buffer variant visible instead of
-// silently reinterpreting 2-byte (or 1-byte) elements as Float32 words.
+// Elementwise linear-buffer kernels address whole 4-byte words per lane: a
+// Float32 element fills one word, a Float16 pair shares one.  Byte-packed and
+// Bool payloads have no such shader yet; rejecting them here keeps a missing
+// buffer variant visible instead of silently reinterpreting 1-byte (or 2-byte)
+// elements as Float32 words.
 inline void validate_buffer_elementwise_dtype(
     const api::vTensor& v,
     const char* name) {
   if (v.storage_type() == api::StorageType::BUFFER &&
-      v.dtype() != DType::Float32 && v.dtype() != DType::Int32) {
+      v.dtype() != DType::Float32 && v.dtype() != DType::Float16 &&
+      v.dtype() != DType::Int32) {
     TP_THROW(
         NotImplementedError,
         std::string("Vulkan ") + name +
-            " over buffer storage supports Float32 and Int32 tensors only");
+            " over buffer storage supports Float32, Float16 and Int32 tensors "
+            "only");
   }
 }
 

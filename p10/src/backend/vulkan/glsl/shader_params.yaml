@@ -1568,3 +1568,376 @@ sdpa_pv:
       SUFFIX: _f16
   shader_variants:
   - NAME: sdpa_pv
+
+buffer_half_unary_op:
+  parameter_names_with_default_values:
+    OPERATOR: X
+    INPLACE: false
+  shader_variants:
+  - NAME: buffer_abs_half
+    OPERATOR: 'abs(X)'
+    INPLACE: false
+  - NAME: buffer_abs_halfinplace
+    OPERATOR: 'abs(X)'
+    INPLACE: true
+  - NAME: buffer_acos_half
+    OPERATOR: 'acos(X)'
+    INPLACE: false
+  - NAME: buffer_acos_halfinplace
+    OPERATOR: 'acos(X)'
+    INPLACE: true
+  - NAME: buffer_asin_half
+    OPERATOR: 'asin(X)'
+    INPLACE: false
+  - NAME: buffer_asin_halfinplace
+    OPERATOR: 'asin(X)'
+    INPLACE: true
+  - NAME: buffer_atan_half
+    OPERATOR: 'atan(X)'
+    INPLACE: false
+  - NAME: buffer_atan_halfinplace
+    OPERATOR: 'atan(X)'
+    INPLACE: true
+  - NAME: buffer_ceil_half
+    OPERATOR: 'ceil(X)'
+    INPLACE: false
+  - NAME: buffer_ceil_halfinplace
+    OPERATOR: 'ceil(X)'
+    INPLACE: true
+  - NAME: buffer_cos_half
+    OPERATOR: 'cos(X)'
+    INPLACE: false
+  - NAME: buffer_cos_halfinplace
+    OPERATOR: 'cos(X)'
+    INPLACE: true
+  - NAME: buffer_cosh_half
+    OPERATOR: 'cosh(X)'
+    INPLACE: false
+  - NAME: buffer_cosh_halfinplace
+    OPERATOR: 'cosh(X)'
+    INPLACE: true
+  - NAME: buffer_erf_half
+    OPERATOR: 'sign(X) * (1.0f - ((((1.061405429f * (1.0f / (1.0f + 0.3275911f * abs(X))) - 1.453152027f) * (1.0f / (1.0f + 0.3275911f * abs(X))) + 1.421413741f) * (1.0f / (1.0f + 0.3275911f * abs(X))) - 0.284496736f) * (1.0f / (1.0f + 0.3275911f * abs(X))) + 0.254829592f) * (1.0f / (1.0f + 0.3275911f * abs(X))) * exp(-X * X))'
+    INPLACE: false
+  - NAME: buffer_erf_halfinplace
+    OPERATOR: 'sign(X) * (1.0f - ((((1.061405429f * (1.0f / (1.0f + 0.3275911f * abs(X))) - 1.453152027f) * (1.0f / (1.0f + 0.3275911f * abs(X))) + 1.421413741f) * (1.0f / (1.0f + 0.3275911f * abs(X))) - 0.284496736f) * (1.0f / (1.0f + 0.3275911f * abs(X))) + 0.254829592f) * (1.0f / (1.0f + 0.3275911f * abs(X))) * exp(-X * X))'
+    INPLACE: true
+  - NAME: buffer_exp_half
+    OPERATOR: 'exp(X)'
+    INPLACE: false
+  - NAME: buffer_exp_halfinplace
+    OPERATOR: 'exp(X)'
+    INPLACE: true
+  - NAME: buffer_exp2_half
+    OPERATOR: 'exp2(X)'
+    INPLACE: false
+  - NAME: buffer_exp2_halfinplace
+    OPERATOR: 'exp2(X)'
+    INPLACE: true
+  - NAME: buffer_expm1_half
+    OPERATOR: 'exp(X) - 1.0f'
+    INPLACE: false
+  - NAME: buffer_expm1_halfinplace
+    OPERATOR: 'exp(X) - 1.0f'
+    INPLACE: true
+  - NAME: buffer_floor_half
+    OPERATOR: 'floor(X)'
+    INPLACE: false
+  - NAME: buffer_floor_halfinplace
+    OPERATOR: 'floor(X)'
+    INPLACE: true
+  - NAME: buffer_gelu_half
+    OPERATOR: '0.5f * X * (1.0f + erf_approx(X * 0.70710678118654752f))'
+    INPLACE: false
+  - NAME: buffer_gelu_halfinplace
+    OPERATOR: '0.5f * X * (1.0f + erf_approx(X * 0.70710678118654752f))'
+    INPLACE: true
+  - NAME: buffer_gelu_tanh_half
+    OPERATOR: '0.5f * X * (1.0f + tanh(0.7978845608028654f * (X + 0.044715f * X * X * X)))'
+    INPLACE: false
+  - NAME: buffer_gelu_tanh_halfinplace
+    OPERATOR: '0.5f * X * (1.0f + tanh(0.7978845608028654f * (X + 0.044715f * X * X * X)))'
+    INPLACE: true
+  - NAME: buffer_hardsigmoid_half
+    OPERATOR: 'clamp(X + 3.0f, 0.0f, 6.0f) / 6.0f'
+    INPLACE: false
+  - NAME: buffer_hardsigmoid_halfinplace
+    OPERATOR: 'clamp(X + 3.0f, 0.0f, 6.0f) / 6.0f'
+    INPLACE: true
+  - NAME: buffer_hardswish_half
+    OPERATOR: 'X * clamp(X + 3.0f, 0.0f, 6.0f) / 6.0f'
+    INPLACE: false
+  - NAME: buffer_hardswish_halfinplace
+    OPERATOR: 'X * clamp(X + 3.0f, 0.0f, 6.0f) / 6.0f'
+    INPLACE: true
+  - NAME: buffer_log_half
+    OPERATOR: 'log(X)'
+    INPLACE: false
+  - NAME: buffer_log_halfinplace
+    OPERATOR: 'log(X)'
+    INPLACE: true
+  - NAME: buffer_log10_half
+    OPERATOR: 'log2(X) * 0.3010299956639812f'
+    INPLACE: false
+  - NAME: buffer_log10_halfinplace
+    OPERATOR: 'log2(X) * 0.3010299956639812f'
+    INPLACE: true
+  - NAME: buffer_log1p_half
+    OPERATOR: 'log(1.0f + X)'
+    INPLACE: false
+  - NAME: buffer_log1p_halfinplace
+    OPERATOR: 'log(1.0f + X)'
+    INPLACE: true
+  - NAME: buffer_log2_half
+    OPERATOR: 'log2(X)'
+    INPLACE: false
+  - NAME: buffer_log2_halfinplace
+    OPERATOR: 'log2(X)'
+    INPLACE: true
+  - NAME: buffer_mish_half
+    OPERATOR: 'X * tanh(log1p_approx(exp(X)))'
+    INPLACE: false
+  - NAME: buffer_mish_halfinplace
+    OPERATOR: 'X * tanh(log1p_approx(exp(X)))'
+    INPLACE: true
+  - NAME: buffer_neg_half
+    OPERATOR: '-X'
+    INPLACE: false
+  - NAME: buffer_neg_halfinplace
+    OPERATOR: '-X'
+    INPLACE: true
+  - NAME: buffer_reciprocal_half
+    OPERATOR: '1.0f / X'
+    INPLACE: false
+  - NAME: buffer_reciprocal_halfinplace
+    OPERATOR: '1.0f / X'
+    INPLACE: true
+  - NAME: buffer_relu_half
+    OPERATOR: 'max(X, 0.0f)'
+    INPLACE: false
+  - NAME: buffer_relu_halfinplace
+    OPERATOR: 'max(X, 0.0f)'
+    INPLACE: true
+  - NAME: buffer_relu6_half
+    OPERATOR: 'clamp(X, 0.0f, 6.0f)'
+    INPLACE: false
+  - NAME: buffer_relu6_halfinplace
+    OPERATOR: 'clamp(X, 0.0f, 6.0f)'
+    INPLACE: true
+  - NAME: buffer_round_half
+    OPERATOR: 'round(X)'
+    INPLACE: false
+  - NAME: buffer_round_halfinplace
+    OPERATOR: 'round(X)'
+    INPLACE: true
+  - NAME: buffer_rsqrt_half
+    OPERATOR: 'inversesqrt(X)'
+    INPLACE: false
+  - NAME: buffer_rsqrt_halfinplace
+    OPERATOR: 'inversesqrt(X)'
+    INPLACE: true
+  - NAME: buffer_sigmoid_half
+    OPERATOR: '1.0f / (1.0f + exp(-X))'
+    INPLACE: false
+  - NAME: buffer_sigmoid_halfinplace
+    OPERATOR: '1.0f / (1.0f + exp(-X))'
+    INPLACE: true
+  - NAME: buffer_sign_half
+    OPERATOR: 'sign(X)'
+    INPLACE: false
+  - NAME: buffer_sign_halfinplace
+    OPERATOR: 'sign(X)'
+    INPLACE: true
+  - NAME: buffer_silu_half
+    OPERATOR: 'X / (1.0f + exp(-X))'
+    INPLACE: false
+  - NAME: buffer_silu_halfinplace
+    OPERATOR: 'X / (1.0f + exp(-X))'
+    INPLACE: true
+  - NAME: buffer_sin_half
+    OPERATOR: 'sin(X)'
+    INPLACE: false
+  - NAME: buffer_sin_halfinplace
+    OPERATOR: 'sin(X)'
+    INPLACE: true
+  - NAME: buffer_sinh_half
+    OPERATOR: 'sinh(X)'
+    INPLACE: false
+  - NAME: buffer_sinh_halfinplace
+    OPERATOR: 'sinh(X)'
+    INPLACE: true
+  - NAME: buffer_sqrt_half
+    OPERATOR: 'sqrt(X)'
+    INPLACE: false
+  - NAME: buffer_sqrt_halfinplace
+    OPERATOR: 'sqrt(X)'
+    INPLACE: true
+  - NAME: buffer_square_half
+    OPERATOR: 'X * X'
+    INPLACE: false
+  - NAME: buffer_square_halfinplace
+    OPERATOR: 'X * X'
+    INPLACE: true
+  - NAME: buffer_tan_half
+    OPERATOR: 'tan(X)'
+    INPLACE: false
+  - NAME: buffer_tan_halfinplace
+    OPERATOR: 'tan(X)'
+    INPLACE: true
+  - NAME: buffer_tanh_half
+    OPERATOR: 'tanh(X)'
+    INPLACE: false
+  - NAME: buffer_tanh_halfinplace
+    OPERATOR: 'tanh(X)'
+    INPLACE: true
+  - NAME: buffer_trunc_half
+    OPERATOR: 'trunc(X)'
+    INPLACE: false
+  - NAME: buffer_trunc_halfinplace
+    OPERATOR: 'trunc(X)'
+    INPLACE: true
+
+buffer_half_param_op:
+  parameter_names_with_default_values:
+    OPERATOR: X
+    INPLACE: false
+  shader_variants:
+  - NAME: buffer_clamp_half
+    OPERATOR: 'min(max(X, P0), P1)'
+    INPLACE: false
+  - NAME: buffer_clamp_halfinplace
+    OPERATOR: 'min(max(X, P0), P1)'
+    INPLACE: true
+  - NAME: buffer_hardshrink_half
+    OPERATOR: '((X >= -P0) && (X <= P0)) ? 0.0f : X'
+    INPLACE: false
+  - NAME: buffer_hardshrink_halfinplace
+    OPERATOR: '((X >= -P0) && (X <= P0)) ? 0.0f : X'
+    INPLACE: true
+  - NAME: buffer_leaky_relu_half
+    OPERATOR: 'mix((X * P0), X, step(0.0f, X))'
+    INPLACE: false
+  - NAME: buffer_leaky_relu_halfinplace
+    OPERATOR: 'mix((X * P0), X, step(0.0f, X))'
+    INPLACE: true
+  - NAME: buffer_threshold_half
+    OPERATOR: '(X <= P0) ? P1 : X'
+    INPLACE: false
+  - NAME: buffer_threshold_halfinplace
+    OPERATOR: '(X <= P0) ? P1 : X'
+    INPLACE: true
+
+buffer_half_binary_op_tensor:
+  parameter_names_with_default_values:
+    OPERATOR: X
+    INPLACE: false
+  shader_variants:
+  - NAME: buffer_add_half
+    OPERATOR: 'X + A * Y'
+    INPLACE: false
+  - NAME: buffer_add_halfinplace
+    OPERATOR: 'X + A * Y'
+    INPLACE: true
+  - NAME: buffer_atan2_half
+    OPERATOR: 'atan(X, Y)'
+    INPLACE: false
+  - NAME: buffer_atan2_halfinplace
+    OPERATOR: 'atan(X, Y)'
+    INPLACE: true
+  - NAME: buffer_div_half
+    OPERATOR: 'X / Y'
+    INPLACE: false
+  - NAME: buffer_div_halfinplace
+    OPERATOR: 'X / Y'
+    INPLACE: true
+  - NAME: buffer_floor_divide_half
+    OPERATOR: 'floor(X / Y)'
+    INPLACE: false
+  - NAME: buffer_floor_divide_halfinplace
+    OPERATOR: 'floor(X / Y)'
+    INPLACE: true
+  - NAME: buffer_fmod_half
+    OPERATOR: 'X - Y * trunc(X / Y)'
+    INPLACE: false
+  - NAME: buffer_fmod_halfinplace
+    OPERATOR: 'X - Y * trunc(X / Y)'
+    INPLACE: true
+  - NAME: buffer_logaddexp_half
+    OPERATOR: 'max(X, Y) + log(1.0f + exp(-abs(X - Y)))'
+    INPLACE: false
+  - NAME: buffer_logaddexp_halfinplace
+    OPERATOR: 'max(X, Y) + log(1.0f + exp(-abs(X - Y)))'
+    INPLACE: true
+  - NAME: buffer_maximum_half
+    OPERATOR: 'max(X, Y)'
+    INPLACE: false
+  - NAME: buffer_maximum_halfinplace
+    OPERATOR: 'max(X, Y)'
+    INPLACE: true
+  - NAME: buffer_minimum_half
+    OPERATOR: 'min(X, Y)'
+    INPLACE: false
+  - NAME: buffer_minimum_halfinplace
+    OPERATOR: 'min(X, Y)'
+    INPLACE: true
+  - NAME: buffer_mul_half
+    OPERATOR: 'X * Y'
+    INPLACE: false
+  - NAME: buffer_mul_halfinplace
+    OPERATOR: 'X * Y'
+    INPLACE: true
+  - NAME: buffer_pow_half
+    OPERATOR: '(fract(Y) == 0.0) ? (mod(Y, 2.0) == 0.0 ? pow(abs(X), Y) : sign(X) * pow(abs(X), Y)) : pow(X, Y)'
+    INPLACE: false
+  - NAME: buffer_pow_halfinplace
+    OPERATOR: '(fract(Y) == 0.0) ? (mod(Y, 2.0) == 0.0 ? pow(abs(X), Y) : sign(X) * pow(abs(X), Y)) : pow(X, Y)'
+    INPLACE: true
+  - NAME: buffer_remainder_half
+    OPERATOR: 'X - Y * floor(X / Y)'
+    INPLACE: false
+  - NAME: buffer_remainder_halfinplace
+    OPERATOR: 'X - Y * floor(X / Y)'
+    INPLACE: true
+  - NAME: buffer_sub_half
+    OPERATOR: 'X - A * Y'
+    INPLACE: false
+  - NAME: buffer_sub_halfinplace
+    OPERATOR: 'X - A * Y'
+    INPLACE: true
+
+buffer_half_binary_op_scalar:
+  parameter_names_with_default_values:
+    OPERATOR: X
+    INPLACE: false
+  shader_variants:
+  - NAME: buffer_add_scalar_half
+    OPERATOR: 'X + A * Y'
+    INPLACE: false
+  - NAME: buffer_add_scalar_halfinplace
+    OPERATOR: 'X + A * Y'
+    INPLACE: true
+  - NAME: buffer_floor_mul_scalar_half
+    OPERATOR: 'floor(X * Y)'
+    INPLACE: false
+  - NAME: buffer_floor_mul_scalar_halfinplace
+    OPERATOR: 'floor(X * Y)'
+    INPLACE: true
+  - NAME: buffer_mul_scalar_half
+    OPERATOR: 'X * Y'
+    INPLACE: false
+  - NAME: buffer_mul_scalar_halfinplace
+    OPERATOR: 'X * Y'
+    INPLACE: true
+  - NAME: buffer_pow_scalar_half
+    OPERATOR: '(fract(Y) == 0.0) ? (mod(Y, 2.0) == 0.0 ? pow(abs(X), Y) : sign(X) * pow(abs(X), Y)) : pow(X, Y)'
+    INPLACE: false
+  - NAME: buffer_pow_scalar_halfinplace
+    OPERATOR: '(fract(Y) == 0.0) ? (mod(Y, 2.0) == 0.0 ? pow(abs(X), Y) : sign(X) * pow(abs(X), Y)) : pow(X, Y)'
+    INPLACE: true
+  - NAME: buffer_rsub_scalar_half
+    OPERATOR: 'Y - X'
+    INPLACE: false
+  - NAME: buffer_rsub_scalar_halfinplace
+    OPERATOR: 'Y - X'
+    INPLACE: true
+

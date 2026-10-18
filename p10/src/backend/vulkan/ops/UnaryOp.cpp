@@ -83,20 +83,21 @@ Tensor unary_op(
 
   if (is_buffer) {
     validate_buffer_elementwise_dtype(v_self, buffer_shader_name);
+    const uint32_t elements =
+        safe_downcast_to_u32(static_cast<int64_t>(v_output.numel()));
+    const std::string shader =
+        buffer_shader_for_dtype(buffer_shader_name, v_self.dtype());
     const struct BlockB final {
       uint32_t buf_length;
     } blockb{
-        safe_downcast_to_u32(static_cast<int64_t>(v_output.numel())),
+        elements,
     };
     api::UniformParamsBuffer params(context, blockb);
     api::PipelineBarrier pipeline_barrier{};
     context->submit_compute_job(
-        VK_KERNEL_FROM_STR(buffer_shader_name),
+        VK_KERNEL_FROM_STR(shader.c_str()),
         pipeline_barrier,
-        {safe_downcast_to_u32(
-             static_cast<int64_t>((v_output.numel() + 3u) / 4u)),
-         1u,
-         1u},
+        {buffer_dispatch_count(elements, v_self.dtype(), 4u), 1u, 1u},
         {256u, 1u, 1u},
         VK_NULL_HANDLE,
         v_output.buffer(pipeline_barrier, api::PipelineStage::COMPUTE,
@@ -149,20 +150,22 @@ Tensor& unary_op_(
   api::vTensor v_self = convert(self_arg);
 
   if (v_self.storage_type() == api::StorageType::BUFFER) {
+    validate_buffer_elementwise_dtype(v_self, buffer_shader_name);
+    const uint32_t elements =
+        safe_downcast_to_u32(static_cast<int64_t>(v_self.numel()));
+    const std::string shader =
+        buffer_shader_for_dtype(buffer_shader_name, v_self.dtype());
     const struct BlockB final {
       uint32_t buf_length;
     } blockb{
-        safe_downcast_to_u32(static_cast<int64_t>(v_self.numel())),
+        elements,
     };
     api::UniformParamsBuffer params(context, blockb);
     api::PipelineBarrier pipeline_barrier{};
     context->submit_compute_job(
-        VK_KERNEL_FROM_STR(buffer_shader_name),
+        VK_KERNEL_FROM_STR(shader.c_str()),
         pipeline_barrier,
-        {safe_downcast_to_u32(
-             static_cast<int64_t>((v_self.numel() + 3u) / 4u)),
-         1u,
-         1u},
+        {buffer_dispatch_count(elements, v_self.dtype(), 4u), 1u, 1u},
         {256u, 1u, 1u},
         VK_NULL_HANDLE,
         v_self.buffer(pipeline_barrier, api::PipelineStage::COMPUTE,

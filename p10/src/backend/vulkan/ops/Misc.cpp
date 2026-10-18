@@ -53,6 +53,19 @@ void validate_elementwise_4d(const Tensor& t, const char* name) {
       std::string("Vulkan ") + name + " supports 1d to 4d tensors");
 }
 
+// A half payload is allowed here: the arithmetic is single precision inside
+// the shader and only the store narrows, so an exponent operand keeps the
+// element width of the base.
+void validate_power_operand_4d(const Tensor& t, const char* name) {
+  TP_CHECK(
+      t.dtype() == DType::Float32 || t.dtype() == DType::Float16,
+      std::string("Vulkan ") + name +
+          " supports Float32 and Float16 tensors only");
+  TP_CHECK(
+      t.dim() >= 1 && t.dim() <= 4,
+      std::string("Vulkan ") + name + " supports 1d to 4d tensors");
+}
+
 } // namespace
 
 std::tuple<Tensor, Tensor> native_dropout_kernel(
@@ -120,7 +133,7 @@ Tensor& addcmul__kernel(
 }
 
 Tensor pow_scalar_kernel(const Tensor& self, const Scalar& exponent) {
-  validate_elementwise_4d(self, "pow");
+  validate_power_operand_4d(self, "pow");
   // Delegates to the shared binary op path so buffer-stored payloads use
   // the linear scalar variant; the integer-exponent handling is part of the
   // shader operator.
@@ -130,8 +143,8 @@ Tensor pow_scalar_kernel(const Tensor& self, const Scalar& exponent) {
 }
 
 Tensor pow_tensor_kernel(const Tensor& self, const Tensor& exponent) {
-  validate_elementwise_4d(self, "pow");
-  validate_elementwise_4d(exponent, "pow");
+  validate_power_operand_4d(self, "pow");
+  validate_power_operand_4d(exponent, "pow");
   // Delegates to the shared binary op path: the tensor variant gets
   // broadcast handling and the linear buffer twin for buffer-stored
   // payloads.

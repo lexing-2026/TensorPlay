@@ -69,15 +69,34 @@ Tensor clamp(
                 : std::numeric_limits<int32_t>::max(),
     };
 
+    // The half build takes its bounds in the two parameter slots of the
+    // shared linear template, so it needs its own block layout.
+    const struct BlockH final {
+      uint32_t buf_length;
+      float lo;
+      float hi;
+    } blockh{
+        elements,
+        min_arg ? min_arg->to<float>() : -std::numeric_limits<float>::infinity(),
+        max_arg ? max_arg->to<float>() : std::numeric_limits<float>::infinity(),
+    };
+
+    const bool is_half = self_arg.dtype() == DType::Float16;
+
     api::UniformParamsBuffer linear_params =
         is_int ? api::UniformParamsBuffer(context, blocki)
-               : api::UniformParamsBuffer(context, blockf);
+        : is_half ? api::UniformParamsBuffer(context, blockh)
+                  : api::UniformParamsBuffer(context, blockf);
     api::PipelineBarrier linear_barrier{};
 
+    const std::string half_shader = buffer_shader_for_dtype(
+        "buffer_clamp", self_arg.dtype());
+
     context->submit_compute_job(
-        is_int ? VK_KERNEL(buffer_clamp_i32) : VK_KERNEL(buffer_clamp),
+        is_int ? VK_KERNEL(buffer_clamp_i32)
+               : VK_KERNEL_FROM_STR(half_shader.c_str()),
         linear_barrier,
-        {(elements + 3u) / 4u, 1u, 1u},
+        {buffer_dispatch_count(elements, self_arg.dtype(), 4u), 1u, 1u},
         api::utils::uvec3{256u, 1u, 1u},
         VK_NULL_HANDLE,
         v_linear_output.buffer(
@@ -200,16 +219,34 @@ Tensor& clamp_(
                 : std::numeric_limits<int32_t>::max(),
     };
 
+    // The half build takes its bounds in the two parameter slots of the
+    // shared linear template, so it needs its own block layout.
+    const struct BlockH final {
+      uint32_t buf_length;
+      float lo;
+      float hi;
+    } blockh{
+        elements,
+        min_arg ? min_arg->to<float>() : -std::numeric_limits<float>::infinity(),
+        max_arg ? max_arg->to<float>() : std::numeric_limits<float>::infinity(),
+    };
+
+    const bool is_half = self_arg.dtype() == DType::Float16;
+
     api::UniformParamsBuffer linear_params =
         is_int ? api::UniformParamsBuffer(context, blocki)
-               : api::UniformParamsBuffer(context, blockf);
+        : is_half ? api::UniformParamsBuffer(context, blockh)
+                  : api::UniformParamsBuffer(context, blockf);
     api::PipelineBarrier linear_barrier{};
+
+    const std::string half_shader = buffer_shader_for_dtype(
+        "buffer_clampinplace", self_arg.dtype());
 
     context->submit_compute_job(
         is_int ? VK_KERNEL(buffer_clamp_i32inplace)
-               : VK_KERNEL(buffer_clampinplace),
+               : VK_KERNEL_FROM_STR(half_shader.c_str()),
         linear_barrier,
-        {(elements + 3u) / 4u, 1u, 1u},
+        {buffer_dispatch_count(elements, self_arg.dtype(), 4u), 1u, 1u},
         api::utils::uvec3{256u, 1u, 1u},
         VK_NULL_HANDLE,
         v_self.buffer(

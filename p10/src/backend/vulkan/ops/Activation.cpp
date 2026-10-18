@@ -67,6 +67,10 @@ Tensor& activation_dispatch(
     validate_buffer_elementwise_dtype(v_input, shader.c_str());
     const uint32_t n =
         safe_downcast_to_u32(static_cast<int64_t>(v_output.numel()));
+    const std::string buffer_name =
+        in_place ? buffer_shader + "inplace" : buffer_shader;
+    const std::string linear_shader =
+        buffer_shader_for_dtype(buffer_name, v_output.dtype());
 
     if (in_place) {
       const struct Block final {
@@ -77,8 +81,10 @@ Tensor& activation_dispatch(
       api::UniformParamsBuffer params(context, block);
       api::PipelineBarrier pipeline_barrier{};
       context->submit_compute_job(
-          VK_KERNEL_FROM_STR((buffer_shader + "inplace").c_str()),
-          pipeline_barrier, {n, 1u, 1u}, {256u, 1u, 1u}, VK_NULL_HANDLE,
+          VK_KERNEL_FROM_STR(linear_shader.c_str()),
+          pipeline_barrier,
+          {buffer_dispatch_count(n, v_output.dtype(), 1u), 1u, 1u},
+          {256u, 1u, 1u}, VK_NULL_HANDLE,
           v_output.buffer(
               pipeline_barrier,
               api::PipelineStage::COMPUTE,
@@ -95,8 +101,9 @@ Tensor& activation_dispatch(
     api::UniformParamsBuffer params(context, block);
     api::PipelineBarrier pipeline_barrier{};
     context->submit_compute_job(
-        VK_KERNEL_FROM_STR(buffer_shader.c_str()), pipeline_barrier,
-        {n, 1u, 1u}, {256u, 1u, 1u}, VK_NULL_HANDLE,
+        VK_KERNEL_FROM_STR(linear_shader.c_str()), pipeline_barrier,
+        {buffer_dispatch_count(n, v_output.dtype(), 1u), 1u, 1u},
+        {256u, 1u, 1u}, VK_NULL_HANDLE,
         v_output.buffer(
             pipeline_barrier,
             api::PipelineStage::COMPUTE,

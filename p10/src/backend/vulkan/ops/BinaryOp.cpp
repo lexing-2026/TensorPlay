@@ -266,8 +266,14 @@ Tensor binary_op_tensor(
     validate_buffer_elementwise_dtype(v_other, name);
     api::vTensor v_self_buf = to_buffer_storage(context, v_self);
     api::vTensor v_other_buf = to_buffer_storage(context, v_other);
+    TP_CHECK(
+        v_self_buf.dtype() == v_other_buf.dtype(),
+        std::string("Vulkan ") + name +
+            " over buffer storage needs operands of one payload dtype");
     const uint32_t n =
         safe_downcast_to_u32(static_cast<int64_t>(v_output.numel()));
+    const std::string linear_shader =
+        buffer_shader_for_dtype(buffer_variant, v_self_buf.dtype());
     const std::vector<int64_t> self_sizes = v_self.sizes();
     const std::vector<int64_t> other_sizes = v_other.sizes();
     const int32_t broadcast =
@@ -289,8 +295,9 @@ Tensor binary_op_tensor(
                      other_meta.second});
     api::PipelineBarrier pipeline_barrier{};
     context->submit_compute_job(
-        VK_KERNEL_FROM_STR(buffer_variant.c_str()), pipeline_barrier,
-        {(n + 3u) / 4u, 1u, 1u}, {256u, 1u, 1u}, VK_NULL_HANDLE,
+        VK_KERNEL_FROM_STR(linear_shader.c_str()), pipeline_barrier,
+        {buffer_dispatch_count(n, v_self_buf.dtype(), 4u), 1u, 1u},
+        {256u, 1u, 1u}, VK_NULL_HANDLE,
         v_output.buffer(pipeline_barrier, api::PipelineStage::COMPUTE,
                         api::MemoryAccessType::WRITE),
         v_self_buf.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
@@ -371,9 +378,17 @@ Tensor& binary_op_tensor_inplace(
   api::vTensor v_other = convert(other_arg);
 
   if (v_self.storage_type() == api::StorageType::BUFFER) {
+    validate_buffer_elementwise_dtype(v_self, name);
+    validate_buffer_elementwise_dtype(v_other, name);
     api::vTensor v_other_buf = to_buffer_storage(context, v_other);
+    TP_CHECK(
+        v_self.dtype() == v_other_buf.dtype(),
+        std::string("Vulkan ") + name +
+            " over buffer storage needs operands of one payload dtype");
     const uint32_t n =
         safe_downcast_to_u32(static_cast<int64_t>(v_self.numel()));
+    const std::string linear_shader =
+        buffer_shader_for_dtype(buffer_variant, v_self.dtype());
     const std::vector<int64_t> self_sizes = v_self.sizes();
     const std::vector<int64_t> other_sizes = v_other.sizes();
     const int32_t broadcast = (other_sizes != self_sizes) ? 2 : 0;
@@ -392,10 +407,14 @@ Tensor& binary_op_tensor_inplace(
                      zero, zero, other_meta.first, other_meta.second});
     api::PipelineBarrier pipeline_barrier{};
     context->submit_compute_job(
-        VK_KERNEL_FROM_STR(buffer_variant.c_str()), pipeline_barrier,
-        {(n + 3u) / 4u, 1u, 1u}, {256u, 1u, 1u}, VK_NULL_HANDLE,
+        VK_KERNEL_FROM_STR(linear_shader.c_str()), pipeline_barrier,
+        {buffer_dispatch_count(n, v_self.dtype(), 4u), 1u, 1u},
+        {256u, 1u, 1u}, VK_NULL_HANDLE,
+        // The in-place shaders read the payload they also write, so the
+        // barrier has to cover both directions.
         v_self.buffer(pipeline_barrier, api::PipelineStage::COMPUTE,
-                      api::MemoryAccessType::WRITE),
+                      api::MemoryAccessType::READ |
+                          api::MemoryAccessType::WRITE),
         v_other_buf.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
         params.buffer());
     return self_arg;
@@ -514,8 +533,12 @@ Tensor binary_op_scalar(
   };
 
   if (is_buffer) {
+    validate_buffer_elementwise_dtype(v_output, name);
+    validate_buffer_elementwise_dtype(v_self, name);
     const uint32_t n =
         safe_downcast_to_u32(static_cast<int64_t>(v_output.numel()));
+    const std::string linear_shader =
+        buffer_shader_for_dtype(buffer_variant, v_output.dtype());
     api::UniformParamsBuffer paramsb = (vocab == BinaryVocab::kInt)
         ? api::UniformParamsBuffer(
               context,
@@ -525,8 +548,9 @@ Tensor binary_op_scalar(
               context, BlockB{n, 0u, other.to<float>() * alpha.to<float>()});
     api::PipelineBarrier pipeline_barrier{};
     context->submit_compute_job(
-        VK_KERNEL_FROM_STR(buffer_variant.c_str()), pipeline_barrier,
-        {n, 1u, 1u}, {256u, 1u, 1u}, VK_NULL_HANDLE,
+        VK_KERNEL_FROM_STR(linear_shader.c_str()), pipeline_barrier,
+        {buffer_dispatch_count(n, v_output.dtype(), 1u), 1u, 1u},
+        {256u, 1u, 1u}, VK_NULL_HANDLE,
         v_output.buffer(pipeline_barrier, api::PipelineStage::COMPUTE,
                         api::MemoryAccessType::WRITE),
         v_self.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
@@ -580,8 +604,11 @@ Tensor& binary_op_scalar_inplace(
   api::vTensor v_self = convert(self_arg);
 
   if (v_self.storage_type() == api::StorageType::BUFFER) {
+    validate_buffer_elementwise_dtype(v_self, name);
     const uint32_t n =
         safe_downcast_to_u32(static_cast<int64_t>(v_self.numel()));
+    const std::string linear_shader =
+        buffer_shader_for_dtype(buffer_variant, v_self.dtype());
     api::UniformParamsBuffer params = (vocab == BinaryVocab::kInt)
         ? api::UniformParamsBuffer(
               context,
@@ -591,10 +618,14 @@ Tensor& binary_op_scalar_inplace(
               context, BlockB{n, 0u, other.to<float>() * alpha.to<float>()});
     api::PipelineBarrier pipeline_barrier{};
     context->submit_compute_job(
-        VK_KERNEL_FROM_STR(buffer_variant.c_str()), pipeline_barrier,
-        {n, 1u, 1u}, {256u, 1u, 1u}, VK_NULL_HANDLE,
+        VK_KERNEL_FROM_STR(linear_shader.c_str()), pipeline_barrier,
+        {buffer_dispatch_count(n, v_self.dtype(), 1u), 1u, 1u},
+        {256u, 1u, 1u}, VK_NULL_HANDLE,
+        // The in-place shaders read the payload they also write, so the
+        // barrier has to cover both directions.
         v_self.buffer(pipeline_barrier, api::PipelineStage::COMPUTE,
-                      api::MemoryAccessType::WRITE),
+                      api::MemoryAccessType::READ |
+                          api::MemoryAccessType::WRITE),
         params.buffer());
     return self_arg;
   }
