@@ -283,11 +283,11 @@ def build_cases(dev, dtype):
     C.append(("unique.1M200k", lambda tu=tu: F.unique(tu),
               lambda u=u: torch.unique(u)))
     x = r(4096, 128)
-    reps = torch.randint(1, 3, (4096, 128), generator=g, device=dev)
+    reps = torch.randint(1, 3, (4096,), generator=g, device=dev)
     tx, treps = T(x), T(reps)
     C.append(("repeat_interleave.tensor",
-              lambda tx=tx, treps=treps: F.repeat_interleave(tx, treps),
-              lambda x=x, reps=reps: torch.repeat_interleave(x, reps)))
+              lambda tx=tx, treps=treps: F.repeat_interleave(tx, treps, 0),
+              lambda x=x, reps=reps: torch.repeat_interleave(x, reps, 0)))
     # ---- 卷积 / 池化 ----
     x = r(32, 64, 56, 56)
     w = r(64, 64, 3, 3)
