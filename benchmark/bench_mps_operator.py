@@ -235,13 +235,28 @@ def _output_bytes(specs, itemsize):
     return int(max(int(np.prod(value[1])) for value in specs) * itemsize)
 
 
-def _chain_for(chain, specs, itemsize):
+def _storage_bytes(value):
+    """Device storage one invocation's result holds, summed over every tensor
+    it hands back.  A case whose result is larger than its inputs keeps the
+    results alive in a chain, so it is the result that has to fit the budget;
+    a result that cannot be inspected falls back to the input approximation."""
+    if isinstance(value, (tuple, list)):
+        return sum(_storage_bytes(item) for item in value)
+    numel = getattr(value, "numel", None)
+    element_size = getattr(value, "element_size", None)
+    if numel is None or element_size is None:
+        return 0
+    return int(numel()) * int(element_size())
+
+
+def _chain_for(chain, specs, itemsize, output_bytes=None):
     """The invocations to place in one chain of this case: the requested count
     while the chained outputs fit the memory budget, fewer for a large case, and
     one where a single output already fills the budget.  Chaining is about the
     cost of queueing a launch, which is a fixed host-side price independent of
     the case size, so shortening it for a large case loses nothing."""
-    per_call = max(_output_bytes(specs, itemsize), 1)
+    per_call = output_bytes or _output_bytes(specs, itemsize)
+    per_call = max(per_call, 1)
     return max(1, min(chain, _CHAIN_MEMORY_BUDGET // per_call))
 
 
@@ -537,6 +552,7 @@ def main(argv=None):
     suite = "long" if args.suite == "all" else args.suite
     measurements = {}
     samples_by_name = {}
+    chains_by_name = {}
     requested_skips = {name.strip() for name in args.skip_cases.split(",")
                        if name.strip()}
     unavailable = {}
@@ -602,8 +618,10 @@ def main(argv=None):
             if round_index == 0:
                 try:
                     fn = factory()
-                    fn()
+                    result = fn()
                     backend.synchronize()
+                    output_bytes = _storage_bytes(result)
+                    del result
                 except (NotImplementedError, RuntimeError) as exc:
                     message = str(exc)
                     print(f"{name:42} [skipped: {message}]")
@@ -612,10 +630,13 @@ def main(argv=None):
                         out_of_memory.add(name)
                     write_payload()
                     continue
+                chain = _chain_for(args.chain, specs, _ITEMSIZE[args.dtype],
+                                   output_bytes)
+                chains_by_name[name] = chain
             else:
                 fn = factory()
+                chain = chains_by_name[name]
             samples = samples_by_name.setdefault(name, [])
-            chain = _chain_for(args.chain, specs, _ITEMSIZE[args.dtype])
             samples.extend(_time(fn, reps_per_round, time_per_round,
                                  args.warmup, backend.synchronize, chain))
             seconds = min(samples)
