@@ -2103,6 +2103,101 @@ class TestVulkanLinearPayload(unittest.TestCase):
              @ upload((tp.randn((2, 4, 6), device="cpu").numpy()), np.float32))
 
 
+class TestVulkanDtypeConversion(unittest.TestCase):
+    # Single precision is the hub of the conversion table: each payload type
+    # the backend stores has a kernel to and from it, over a texture as well as
+    # over a linear payload.  A byte-packed payload keeps one byte per element,
+    # so a length that is not a multiple of four leaves lanes in the last word
+    # that no read-back reaches.
+    LENGTHS = (128, 200003)
+
+    def _payload_cases(self, count):
+        import tensorplay as tp
+        rng = np.random.default_rng(31)
+        return [
+            ("bool", np.bool_, tp.bool, rng.random(count) > 0.35),
+            ("int8", np.int8, tp.int8,
+             rng.integers(-128, 128, count).astype(np.int8)),
+            ("uint8", np.uint8, tp.uint8,
+             rng.integers(0, 256, count).astype(np.uint8)),
+            ("int32", np.int32, tp.int32,
+             rng.integers(-100000, 100000, count).astype(np.int32)),
+            ("float16", np.float16, tp.float16,
+             (rng.standard_normal(count) * 3.0).astype(np.float16)),
+        ]
+
+    def test_narrow_payloads_convert_to_single_precision(self):
+        import tensorplay as tp
+        for count in self.LENGTHS:
+            for name, _, _, values in self._payload_cases(count):
+                device = tensorplay.from_numpy(values.copy()).to("vulkan")
+                np.testing.assert_array_equal(
+                    device.to(tp.float32).cpu().numpy(),
+                    values.astype(np.float32),
+                    err_msg=f"{name} -> float32 at {count} elements")
+
+    def test_single_precision_converts_to_narrow_payloads(self):
+        import tensorplay as tp
+        rng = np.random.default_rng(37)
+        for count in self.LENGTHS:
+            x_cpu = (rng.standard_normal(count) * 5.0).astype(np.float32)
+            device = tensorplay.from_numpy(x_cpu.copy()).to("vulkan")
+            for name, np_dtype, dtype, _ in self._payload_cases(count):
+                if name == "float16":
+                    continue
+                got = device.to(dtype).cpu().numpy()
+                want = x_cpu.astype(np_dtype)
+                # A Bool read-back may arrive as bytes or as a numpy bool; the
+                # lanes are what matters, so compare them as integers.
+                np.testing.assert_array_equal(
+                    np.asarray(got).astype(np.int8 if name == "bool" else got.dtype),
+                    np.asarray(want).astype(np.int8 if name == "bool" else want.dtype),
+                    err_msg=f"float32 -> {name} at {count} elements")
+
+    def test_byte_conversion_wraps_out_of_range_values(self):
+        import tensorplay as tp
+        # A value beyond the byte range truncates toward zero, then wraps into
+        # the 256 byte patterns, which is what a host cast of the same value
+        # gives.
+        x_cpu = np.array(
+            [300.7, -300.7, 255.5, -1.2, 127.9, -128.9, 2.5, -2.5, 0.0],
+            dtype=np.float32)
+        device = tensorplay.from_numpy(x_cpu.copy()).to("vulkan")
+        np.testing.assert_array_equal(
+            device.to(tp.int8).cpu().numpy(), x_cpu.astype(np.int8),
+            err_msg="float32 -> int8 wrap")
+        np.testing.assert_array_equal(
+            device.to(tp.uint8).cpu().numpy(), x_cpu.astype(np.uint8),
+            err_msg="float32 -> uint8 wrap")
+
+    def test_single_precision_to_half_rounds_to_nearest_even(self):
+        import tensorplay as tp
+        # The value a half lane holds is decided here, not by the store into a
+        # 16-bit image: those bits are rebuilt so the number handed to the
+        # image already has an exact half form.  The samples below cover a tie,
+        # the subnormal range and the overflow that becomes an infinity.
+        x_cpu = np.array(
+            [1.00048828125, 1.0009765625, -0.0001234, 5.96e-08, 2.0 ** -25,
+             3.0 * 2.0 ** -24, 65504.0, 65520.0, -70000.0, 0.0],
+            dtype=np.float32)
+        for count in (128, 200003):
+            values = np.resize(x_cpu, count).astype(np.float32)
+            device = tensorplay.from_numpy(values.copy()).to("vulkan")
+            np.testing.assert_array_equal(
+                device.to(tp.float16).cpu().numpy(), values.astype(np.float16),
+                err_msg=f"float32 -> float16 rounding at {count} elements")
+
+    def test_conversion_rejects_pairs_without_a_kernel(self):
+        import tensorplay as tp
+        # Two narrow types share no kernel: a conversion between them has to be
+        # refused instead of reading a byte lane as something else.
+        device = tensorplay.from_numpy(
+            np.arange(64, dtype=np.int8)).to("vulkan")
+        with self.assertRaisesRegex(
+                RuntimeError, "Unsupported Vulkan dtype conversion"):
+            device.to(tp.float16)
+
+
 if __name__ == "__main__":
     unittest.main()
 
