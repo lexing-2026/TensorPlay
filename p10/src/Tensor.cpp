@@ -89,8 +89,9 @@ int64_t storage_offset_i64(size_t offset, const char* op) {
 
 // Helper for Device output
 std::ostream& operator<<(std::ostream& os, const Device& d) {
-    os << (d.type() == DeviceType::CPU ? "cpu" : "cuda");
-    if (d.index() != -1) os << ":" << d.index();
+    // Each accelerator spells its own type, so a payload on the Vulkan or the
+    // shared-memory backend reads back as the device it sits on.
+    os << d.toString();
     return os;
 }
 
