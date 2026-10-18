@@ -153,6 +153,28 @@ Tensor reductionOp(const Tensor& self, const std::vector<int64_t>& dims,
     }
   }
 
+  // The extremum of a row and the answer to "is every one of these nonzero" are
+  // read the same way, each by the group that takes its row: the first writes
+  // the value the row holds, the second one byte per row. A reduction that
+  // arrives with a type no kernel of these is instantiated for falls through to
+  // the graph below, which reduces in a type of its own.
+  if (axes.size() == 1 && axes.front() == self.dim() - 1) {
+    if ((kind == ReductionKind::MAX || kind == ReductionKind::MIN) &&
+        out_dtype == DType::Float32 && acc_dtype == DType::Float32) {
+      if (auto result = rowExtremumShader(
+              self, out_shape, kind == ReductionKind::MAX)) {
+        return *result;
+      }
+    }
+    if ((kind == ReductionKind::ALL || kind == ReductionKind::ANY) &&
+        out_dtype == DType::Bool) {
+      if (auto result = rowPredicateShader(
+              self, out_shape, kind == ReductionKind::ALL)) {
+        return *result;
+      }
+    }
+  }
+
   Tensor self_c = materializeForGraph(self);
   Tensor output = Tensor(out_shape, out_dtype, self.device());
   if (output.numel() == 0) {
@@ -788,6 +810,15 @@ std::tuple<Tensor, Tensor> valueIndexReduce(const Tensor& self, int64_t dim,
                            : amin_kernel(self, axes, keepdim);
     Tensor indices = arg_reduce_impl(self, axis, keepdim, is_max);
     return std::make_tuple(values, indices);
+  }
+
+  // Over the last axis of a float operand one pass answers both halves of the
+  // pair, so the value is not reduced once and the position of that value a
+  // second time, and the two cannot disagree about which element answered.
+  if (axis == self.dim() - 1) {
+    if (auto result = rowValueIndexShader(self, out_shape, is_max)) {
+      return *result;
+    }
   }
 
   Tensor self_c = materializeForGraph(self);

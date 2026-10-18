@@ -634,13 +634,45 @@ void dispatchRowReduce(MTLComputePipelineState_t pso, void* out_buf,
   });
 }
 
+// Encodes a reduction that answers twice per row: with the extremum and with the
+// position it came from, which the kernel writes to two buffers.
+void dispatchRowValueIndex(MTLComputePipelineState_t pso, void* value_buf,
+                           void* index_buf, void* in_buf, uint32_t rows,
+                           uint32_t length) {
+  const uint32_t threads =
+      std::min(kRowReduceThreads,
+               static_cast<uint32_t>([pso maxTotalThreadsPerThreadgroup]) /
+                   kRowReduceSimdgroup * kRowReduceSimdgroup);
+  const uint32_t rows_per_group = threads / kRowReduceSimdgroup;
+  const uint32_t groups = (rows + rows_per_group - 1) / rows_per_group;
+  const std::array<uint32_t, 2> sizes = {rows, length};
+  MPSStream* stream = getCurrentMPSStream();
+  dispatch_sync_with_rethrow(stream->queue(), ^() {
+    @autoreleasepool {
+      auto encoder = stream->commandEncoder();
+      [encoder setComputePipelineState:pso];
+      [encoder setBuffer:(__bridge id<MTLBuffer>)value_buf offset:0
+                atIndex:0];
+      [encoder setBuffer:(__bridge id<MTLBuffer>)index_buf offset:0
+                atIndex:1];
+      [encoder setBuffer:(__bridge id<MTLBuffer>)in_buf offset:0 atIndex:2];
+      [encoder setBytes:sizes.data() length:sizeof(sizes) atIndex:3];
+      [encoder dispatchThreads:MTLSizeMake(groups * threads, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+    }
+  });
+}
+
 // The rows of an operand reduced over its last axis and the length of one of
 // them. A reduction whose result does not hold one value per row is not this
 // kernel's to answer, and neither is a rank-1 one: its result has no shape for
-// the write to be described with.
-bool rowReduceSpan(const Tensor& self, const std::vector<int64_t>& out_shape,
+// the write to be described with. `in_dtype` is the storage type the kernel the
+// rows are headed for reads, so an operand of another type is declined rather
+// than addressed as though it were that type.
+bool rowReduceSpan(const Tensor& self, DType in_dtype,
+                   const std::vector<int64_t>& out_shape,
                    uint32_t& rows, uint32_t& length) {
-  if (!self.device().is_mps() || self.dtype() != DType::Float32 ||
+  if (!self.device().is_mps() || self.dtype() != in_dtype ||
       out_shape.empty()) {
     return false;
   }
@@ -674,7 +706,7 @@ std::optional<Tensor> rowSumShader(const Tensor& self,
                                    float divisor) {
   uint32_t rows = 0;
   uint32_t length = 0;
-  if (!rowReduceSpan(self, out_shape, rows, length)) {
+  if (!rowReduceSpan(self, DType::Float32, out_shape, rows, length)) {
     return std::nullopt;
   }
   MTLComputePipelineState_t pso = shaderPipelineNamed("rowsum_float");
@@ -699,7 +731,7 @@ std::optional<Tensor> rowArgReduceShader(const Tensor& self,
                                          bool is_max) {
   uint32_t rows = 0;
   uint32_t length = 0;
-  if (!rowReduceSpan(self, out_shape, rows, length)) {
+  if (!rowReduceSpan(self, DType::Float32, out_shape, rows, length)) {
     return std::nullopt;
   }
   MTLComputePipelineState_t pso = shaderPipelineNamed(
@@ -712,6 +744,95 @@ std::optional<Tensor> rowArgReduceShader(const Tensor& self,
     return std::nullopt;
   }
   Tensor output = emptyMPS(out_shape, DType::Int64, self.device());
+  void* out_buf = getMTLBufferFromPointer(output.data_ptr());
+  if (!out_buf) {
+    return std::nullopt;
+  }
+  dispatchRowReduce(pso, out_buf, in_buf, rows, length, std::nullopt);
+  return output;
+}
+
+std::optional<Tensor> rowExtremumShader(const Tensor& self,
+                                        const std::vector<int64_t>& out_shape,
+                                        bool is_max) {
+  uint32_t rows = 0;
+  uint32_t length = 0;
+  if (!rowReduceSpan(self, DType::Float32, out_shape, rows, length)) {
+    return std::nullopt;
+  }
+  MTLComputePipelineState_t pso = shaderPipelineNamed(
+      is_max ? "rowmax_float" : "rowmin_float");
+  if (!pso) {
+    return std::nullopt;
+  }
+  void* in_buf = getMTLBufferFromPointer(self.data_ptr());
+  if (!in_buf) {
+    return std::nullopt;
+  }
+  Tensor output = emptyMPS(out_shape, DType::Float32, self.device());
+  void* out_buf = getMTLBufferFromPointer(output.data_ptr());
+  if (!out_buf) {
+    return std::nullopt;
+  }
+  dispatchRowReduce(pso, out_buf, in_buf, rows, length, std::nullopt);
+  return output;
+}
+
+std::optional<std::tuple<Tensor, Tensor>> rowValueIndexShader(
+    const Tensor& self, const std::vector<int64_t>& out_shape, bool is_max) {
+  uint32_t rows = 0;
+  uint32_t length = 0;
+  if (!rowReduceSpan(self, DType::Float32, out_shape, rows, length)) {
+    return std::nullopt;
+  }
+  MTLComputePipelineState_t pso = shaderPipelineNamed(
+      is_max ? "rowmaxidx_float" : "rowminidx_float");
+  if (!pso) {
+    return std::nullopt;
+  }
+  void* in_buf = getMTLBufferFromPointer(self.data_ptr());
+  if (!in_buf) {
+    return std::nullopt;
+  }
+  Tensor values = emptyMPS(out_shape, DType::Float32, self.device());
+  Tensor indices = emptyMPS(out_shape, DType::Int64, self.device());
+  void* value_buf = getMTLBufferFromPointer(values.data_ptr());
+  void* index_buf = getMTLBufferFromPointer(indices.data_ptr());
+  if (!value_buf || !index_buf) {
+    return std::nullopt;
+  }
+  dispatchRowValueIndex(pso, value_buf, index_buf, in_buf, rows, length);
+  return std::make_tuple(values, indices);
+}
+
+std::optional<Tensor> rowPredicateShader(
+    const Tensor& self, const std::vector<int64_t>& out_shape, bool is_all) {
+  // A row of either type is read as so many nonzero elements, which is what a
+  // test against zero of the operand's own type answers.
+  const char* type_name = nullptr;
+  if (self.dtype() == DType::Float32) {
+    type_name = "float";
+  } else if (self.dtype() == DType::Bool) {
+    type_name = "bool";
+  } else {
+    return std::nullopt;
+  }
+  uint32_t rows = 0;
+  uint32_t length = 0;
+  if (!rowReduceSpan(self, self.dtype(), out_shape, rows, length)) {
+    return std::nullopt;
+  }
+  const std::string name =
+      std::string(is_all ? "rowall_" : "rowany_") + type_name;
+  MTLComputePipelineState_t pso = shaderPipelineNamed(name);
+  if (!pso) {
+    return std::nullopt;
+  }
+  void* in_buf = getMTLBufferFromPointer(self.data_ptr());
+  if (!in_buf) {
+    return std::nullopt;
+  }
+  Tensor output = emptyMPS(out_shape, DType::Bool, self.device());
   void* out_buf = getMTLBufferFromPointer(output.data_ptr());
   if (!out_buf) {
     return std::nullopt;

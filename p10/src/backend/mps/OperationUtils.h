@@ -13,6 +13,7 @@
 
 #include <optional>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace tensorplay {
@@ -143,6 +144,26 @@ std::optional<Tensor> rowSumShader(const Tensor& self,
 std::optional<Tensor> rowArgReduceShader(const Tensor& self,
                                          const std::vector<int64_t>& out_shape,
                                          bool is_max);
+
+// The extremum along the innermost axis of a contiguous float operand, written
+// in `out_shape`: the value alone where a reduction asks for one, and the value
+// with the first position holding it where a reduction asks for both. One pass
+// answers a paired reduction, so the position an extremum names and the
+// extremum a position came from describe the same element. Returns
+// std::nullopt for an operand the shader cannot address, as above.
+std::optional<Tensor> rowExtremumShader(const Tensor& self,
+                                        const std::vector<int64_t>& out_shape,
+                                        bool is_max);
+std::optional<std::tuple<Tensor, Tensor>> rowValueIndexShader(
+    const Tensor& self, const std::vector<int64_t>& out_shape, bool is_max);
+
+// Whether every element of the innermost axis of `self`, or at least one of
+// them, is nonzero, written as one boolean byte per row. Float and bool
+// operands are both read where they stand. Returns std::nullopt for an operand
+// the shader cannot address, as above.
+std::optional<Tensor> rowPredicateShader(const Tensor& self,
+                                         const std::vector<int64_t>& out_shape,
+                                         bool is_all);
 
 // Compares `self` and `other` -- "eq", "ne", "lt", "le", "gt" or "ge" -- with a
 // single shader dispatch that writes one boolean byte per element. The operands
