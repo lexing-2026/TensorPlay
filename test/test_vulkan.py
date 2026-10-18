@@ -903,5 +903,55 @@ class TestVulkanLinearPayload(unittest.TestCase):
             np.full(self.WIDTH, -7, dtype=np.int32))
 
 
+    def test_compare_scalar_over_linear_payload(self):
+        import tensorplay as tp
+        import tensorplay.functional as F
+        tensorplay.manual_seed(23)
+        x_cpu = (tp.randn((self.WIDTH,), device="cpu") * 3.0).numpy()
+        x = tensorplay.from_numpy(x_cpu.copy()).to("vulkan")
+        cases = (
+            ("gt", lambda: x > 0.5, x_cpu > 0.5),
+            ("ge", lambda: x >= -1.25, x_cpu >= -1.25),
+            ("lt", lambda: x < 0.0, x_cpu < 0.0),
+            ("le", lambda: x <= 2.0, x_cpu <= 2.0),
+            ("eq", lambda: x == 0.0, x_cpu == 0.0),
+            ("ne", lambda: x != 0.0, x_cpu != 0.0),
+        )
+        for name, apply_op, want in cases:
+            got = apply_op()
+            self.assertEqual(got.dtype, tensorplay.bool)
+            np.testing.assert_array_equal(
+                got.cpu().numpy(), want, err_msg=name)
+
+    def test_compare_tensor_and_select_over_linear_payload(self):
+        import tensorplay as tp
+        import tensorplay.functional as F
+        tensorplay.manual_seed(29)
+        x_cpu = (tp.randn((self.WIDTH,), device="cpu") * 3.0).numpy()
+        y_cpu = (tp.randn((self.WIDTH,), device="cpu") * 3.0).numpy()
+        x = tensorplay.from_numpy(x_cpu.copy()).to("vulkan")
+        y = tensorplay.from_numpy(y_cpu.copy()).to("vulkan")
+
+        mask = x < y
+        self.assertEqual(mask.dtype, tensorplay.bool)
+        np.testing.assert_array_equal(mask.cpu().numpy(), x_cpu < y_cpu)
+
+        selected = F.where(mask, x, y).cpu().numpy()
+        np.testing.assert_array_equal(selected, np.where(x_cpu < y_cpu, x_cpu, y_cpu))
+
+        filled = F.masked_fill(x, mask, -1000.0).cpu().numpy()
+        np.testing.assert_array_equal(
+            filled, np.where(x_cpu < y_cpu, -1000.0, x_cpu))
+
+    def test_compare_int32_over_linear_payload(self):
+        import tensorplay as tp
+        tensorplay.manual_seed(31)
+        x_cpu = np.floor(tp.randn((self.WIDTH,), device="cpu")
+                          * 100.0).numpy().astype(np.int32)
+        x = tensorplay.from_numpy(x_cpu.copy()).to("vulkan")
+        np.testing.assert_array_equal((x >= 0).cpu().numpy(), x_cpu >= 0)
+        np.testing.assert_array_equal((x != 7).cpu().numpy(), x_cpu != 7)
+
+
 if __name__ == "__main__":
     unittest.main()

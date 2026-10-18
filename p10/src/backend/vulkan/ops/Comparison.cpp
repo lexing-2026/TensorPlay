@@ -31,6 +31,33 @@ struct CompareBlock final {
   int fill;
 };
 
+// Linear form: the Bool result packs one byte per element, four lanes to a
+// word, and the operands move as 16-byte vectors, so a dispatch covers four
+// elements per invocation.
+struct CompareBufferBlock final {
+  uint32_t buf_length;
+  uint32_t fill0;
+  uint32_t fill1;
+  uint32_t fill2;
+};
+
+struct CompareScalarBufferBlock final {
+  uint32_t buf_length;
+  float value_float;
+  int32_t value_int;
+  uint32_t fill0;
+};
+
+// A payload wider than the device's image axis lives in a storage buffer;
+// the texel kernels have nothing to read or write there, so comparisons need
+// a linear variant of their own.
+void validate_linear_compare_dtype(DType dtype, const char* name) {
+  TP_CHECK(
+      dtype == DType::Float32 || dtype == DType::Int32,
+      std::string("Vulkan ") + name +
+          " over buffer storage supports Float32 and Int32 only");
+}
+
 // Elementwise comparison driver for equal-shaped tensor operands.
 Tensor compare_impl(
     const Tensor& self,
@@ -54,6 +81,45 @@ Tensor compare_impl(
 
   api::vTensor v_input = convert(self);
   api::vTensor v_other = convert(other);
+
+  if (v_input.storage_type() == api::StorageType::BUFFER) {
+    validate_linear_compare_dtype(self.dtype(), name);
+    TP_CHECK(
+        v_other.storage_type() == api::StorageType::BUFFER,
+        std::string("Vulkan ") + name +
+            " cannot mix a buffer operand with a texture operand");
+    api::vTensor v_output{
+        context,
+        v_input.sizes(),
+        DType::Bool,
+        api::StorageType::BUFFER,
+        api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+
+    const uint32_t n = safe_downcast_to_u32(static_cast<int64_t>(v_input.numel()));
+    const CompareBufferBlock block{n, 0u, 0u, 0u};
+    const std::string linear_shader =
+        std::string(kernel_name) + "_buffer" +
+        (self.dtype() == DType::Int32 ? "_i32" : "");
+
+    api::UniformParamsBuffer params(context, block);
+    api::PipelineBarrier pipeline_barrier{};
+    context->submit_compute_job(
+        VK_KERNEL_FROM_STR(linear_shader.c_str()),
+        pipeline_barrier,
+        {(n + 3u) / 4u, 1u, 1u},
+        {256u, 1u, 1u},
+        VK_NULL_HANDLE,
+        v_output.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::WRITE),
+        v_input.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+        v_other.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+        params.buffer());
+
+    return convert(v_output);
+  }
+
   api::vTensor v_output{context, v_input.sizes(), DType::Bool};
 
   const struct CompareBlock block{
@@ -86,6 +152,41 @@ Tensor compare_scalar(const Tensor& self, Scalar other, const char* name) {
   const std::string shader = std::string(name) + "_scalar" + suffix;
   api::Context* context = api::context();
   api::vTensor input = convert(self);
+
+  if (input.storage_type() == api::StorageType::BUFFER) {
+    validate_linear_compare_dtype(self.dtype(), name);
+    api::vTensor output{
+        context,
+        input.sizes(),
+        DType::Bool,
+        api::StorageType::BUFFER,
+        api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+    const uint32_t n = safe_downcast_to_u32(static_cast<int64_t>(input.numel()));
+    const bool is_float = self.dtype() == DType::Float32;
+    const CompareScalarBufferBlock block{
+        n,
+        is_float ? other.to<float>() : 0.0f,
+        is_float ? 0 : other.to<int32_t>(),
+        0u};
+    const std::string linear_shader =
+        std::string(name) + "_scalar_buffer" + (is_float ? "" : "_i32");
+    api::UniformParamsBuffer params(context, block);
+    api::PipelineBarrier barrier{};
+    context->submit_compute_job(
+        VK_KERNEL_FROM_STR(linear_shader.c_str()),
+        barrier,
+        {(n + 3u) / 4u, 1u, 1u},
+        {256u, 1u, 1u},
+        VK_NULL_HANDLE,
+        output.buffer(
+            barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::WRITE),
+        input.buffer(barrier, api::PipelineStage::COMPUTE),
+        params.buffer());
+    return convert(output);
+  }
+
   api::vTensor output{context, input.sizes(), DType::Bool};
   const struct Block final {
     float value_float;

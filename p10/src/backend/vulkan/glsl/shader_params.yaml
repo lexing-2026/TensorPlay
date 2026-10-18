@@ -769,6 +769,29 @@ compare:
     OPERATOR: greaterThan(X, Y)
   - NAME: ge
     OPERATOR: greaterThanEqual(X, Y)
+compare_buffer:
+  parameter_names_with_default_values:
+    DTYPE: float
+    OPERATOR: lessThan(X, Y)
+  generate_variant_forall:
+    DTYPE:
+    - VALUE: float
+      SUFFIX: ''
+    - VALUE: int
+      SUFFIX: _i32
+  shader_variants:
+  - NAME: eq_buffer
+    OPERATOR: equal(X, Y)
+  - NAME: ne_buffer
+    OPERATOR: notEqual(X, Y)
+  - NAME: lt_buffer
+    OPERATOR: lessThan(X, Y)
+  - NAME: le_buffer
+    OPERATOR: lessThanEqual(X, Y)
+  - NAME: gt_buffer
+    OPERATOR: greaterThan(X, Y)
+  - NAME: ge_buffer
+    OPERATOR: greaterThanEqual(X, Y)
 compare_scalar:
   parameter_names_with_default_values:
     DTYPE: float
@@ -793,6 +816,29 @@ compare_scalar:
   - NAME: gt_scalar
     OPERATOR: greaterThan(X, Y)
   - NAME: ge_scalar
+    OPERATOR: greaterThanEqual(X, Y)
+compare_scalar_buffer:
+  parameter_names_with_default_values:
+    DTYPE: float
+    OPERATOR: lessThan(X, Y)
+  generate_variant_forall:
+    DTYPE:
+    - VALUE: float
+      SUFFIX: ''
+    - VALUE: int
+      SUFFIX: _i32
+  shader_variants:
+  - NAME: eq_scalar_buffer
+    OPERATOR: equal(X, Y)
+  - NAME: ne_scalar_buffer
+    OPERATOR: notEqual(X, Y)
+  - NAME: lt_scalar_buffer
+    OPERATOR: lessThan(X, Y)
+  - NAME: le_scalar_buffer
+    OPERATOR: lessThanEqual(X, Y)
+  - NAME: gt_scalar_buffer
+    OPERATOR: greaterThan(X, Y)
+  - NAME: ge_scalar_buffer
     OPERATOR: greaterThanEqual(X, Y)
 where:
   parameter_names_with_default_values:
