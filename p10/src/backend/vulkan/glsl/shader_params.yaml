@@ -524,6 +524,49 @@ gemv_combine:
       SUFFIX: _f16
   shader_variants:
   - NAME: gemv_combine
+gemv_linear_split:
+  parameter_names_with_default_values:
+    LHS_BUFFER: 0
+    RHS_NK: 0
+    RHS_VEC4: 0
+  shader_variants:
+  - NAME: gemv_linear_split
+    LHS_BUFFER: 0
+    RHS_NK: 0
+  - NAME: gemv_linear_split_buffer
+    LHS_BUFFER: 1
+    RHS_NK: 0
+  - NAME: gemv_linear_split_nk
+    LHS_BUFFER: 0
+    RHS_NK: 1
+  - NAME: gemv_linear_split_buffer_nk
+    LHS_BUFFER: 1
+    RHS_NK: 1
+  - NAME: gemv_linear_split_nk_vec4
+    LHS_BUFFER: 0
+    RHS_NK: 1
+    RHS_VEC4: 1
+  - NAME: gemv_linear_split_buffer_nk_vec4
+    LHS_BUFFER: 1
+    RHS_NK: 1
+    RHS_VEC4: 1
+gemv_linear_combine:
+  parameter_names_with_default_values:
+    OUTPUT_BUFFER: 1
+    HAS_BIAS: 1
+  shader_variants:
+  - NAME: gemv_linear_combine
+    OUTPUT_BUFFER: 0
+    HAS_BIAS: 1
+  - NAME: gemv_linear_combine_nobias
+    OUTPUT_BUFFER: 0
+    HAS_BIAS: 0
+  - NAME: gemv_linear_combine_buffer
+    OUTPUT_BUFFER: 1
+    HAS_BIAS: 1
+  - NAME: gemv_linear_combine_buffer_nobias
+    OUTPUT_BUFFER: 1
+    HAS_BIAS: 0
 bmm:
   parameter_names_with_default_values: {}
   generate_variant_forall:

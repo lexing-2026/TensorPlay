@@ -1078,6 +1078,88 @@ class TestVulkanLinearPayload(unittest.TestCase):
                 np.where(x_cpu < y_cpu, -7.0, x_cpu),
                 err_msg="masked_fill at odd width")
 
+    def test_decode_product_over_linear_weight(self):
+        import tensorplay as tp
+        # A weight matrix wider than the image axis limit cannot be relayed
+        # into a texture at all, so a decode-shaped product reads it as a
+        # linear payload.  The reduction length is deliberately not a multiple
+        # of four to cover the lanes a packed texel leaves over.
+        tensorplay.manual_seed(47)
+        for m, k, n in ((1, 520, 20000), (3, 1000, 17000), (2, 521, 20003)):
+            a_cpu = (tp.randn((m, k), device="cpu") * 0.5).numpy()
+            b_cpu = (tp.randn((k, n), device="cpu") * 0.02).numpy()
+            a = tensorplay.from_numpy(a_cpu.copy()).to("vulkan")
+            b = tensorplay.from_numpy(b_cpu.copy()).to("vulkan")
+
+            out = tp.mm(a, b)
+            self.assertTrue(out.device.is_vulkan())
+            np.testing.assert_allclose(
+                out.cpu().numpy(), a_cpu @ b_cpu,
+                rtol=1e-3, atol=1e-3, err_msg=f"mm m={m} k={k} n={n}")
+
+            bias_cpu = (tp.randn((n,), device="cpu") * 0.25).numpy()
+            bias = tensorplay.from_numpy(bias_cpu.copy()).to("vulkan")
+            shifted = tp.addmm(bias, a, b)
+            np.testing.assert_allclose(
+                shifted.cpu().numpy(), a_cpu @ b_cpu + bias_cpu,
+                rtol=1e-3, atol=1e-3, err_msg=f"addmm m={m} k={k} n={n}")
+
+    def test_decode_product_with_linear_activation(self):
+        import tensorplay as tp
+        # A reduction axis longer than four times the image axis limit leaves
+        # the activation in a buffer too, and a narrow result still fits an
+        # image, so the fold pass writes texels while the reads stay linear.
+        tensorplay.manual_seed(53)
+        for n in (200, 197):
+            m, k = 1, 70000
+            a_cpu = (tp.randn((m, k), device="cpu") * 0.5).numpy()
+            b_cpu = (tp.randn((k, n), device="cpu") * 0.005).numpy()
+            a = tensorplay.from_numpy(a_cpu.copy()).to("vulkan")
+            b = tensorplay.from_numpy(b_cpu.copy()).to("vulkan")
+
+            out = tp.mm(a, b)
+            np.testing.assert_allclose(
+                out.cpu().numpy(), a_cpu @ b_cpu,
+                rtol=1e-3, atol=1e-3, err_msg=f"linear operands at n={n}")
+
+            bias_cpu = (tp.randn((n,), device="cpu") * 0.25).numpy()
+            bias = tensorplay.from_numpy(bias_cpu.copy()).to("vulkan")
+            shifted = tp.addmm(bias, a, b)
+            np.testing.assert_allclose(
+                shifted.cpu().numpy(), a_cpu @ b_cpu + bias_cpu,
+                rtol=1e-3, atol=1e-3,
+                err_msg=f"addmm with linear operands at n={n}")
+
+    def test_decode_product_over_layer_layout_weight(self):
+        import tensorplay as tp
+        import tensorplay.functional as F
+        # A linear layer keeps its weights in (out_features, in_features) order,
+        # so the reduction axis runs along memory and every output column
+        # streams a row of its own.  Reduction lengths that divide by four let a
+        # row open on a vector boundary and are walked four words per fetch;
+        # lengths that do not stay element-wise.  The narrow shapes keep the
+        # result inside an image while the reads stay linear.
+        tensorplay.manual_seed(59)
+        for m, k, n in ((1, 512, 20000), (2, 516, 17000), (1, 517, 20003),
+                        (3, 1001, 19000), (1, 70000, 200), (1, 66003, 197)):
+            x_cpu = (tp.randn((m, k), device="cpu") * 0.5).numpy()
+            w_cpu = (tp.randn((n, k), device="cpu") * 0.02).numpy()
+            bias_cpu = (tp.randn((n,), device="cpu") * 0.25).numpy()
+            x = tensorplay.from_numpy(x_cpu.copy()).to("vulkan")
+            weight = tensorplay.from_numpy(w_cpu.copy()).to("vulkan")
+            bias = tensorplay.from_numpy(bias_cpu.copy()).to("vulkan")
+
+            expect = x_cpu @ w_cpu.T
+            out = F.linear(x, weight)
+            self.assertTrue(out.device.is_vulkan())
+            np.testing.assert_allclose(
+                out.cpu().numpy(), expect, rtol=1e-3, atol=1e-3,
+                err_msg=f"linear m={m} k={k} n={n}")
+            np.testing.assert_allclose(
+                F.linear(x, weight, bias).cpu().numpy(), expect + bias_cpu,
+                rtol=1e-3, atol=1e-3,
+                err_msg=f"linear with bias m={m} k={k} n={n}")
+
 
 if __name__ == "__main__":
     unittest.main()
