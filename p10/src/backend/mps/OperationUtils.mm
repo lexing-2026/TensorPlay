@@ -7,6 +7,7 @@
 #include "backend/mps/MPSStream.h"
 #include "backend/mps/MetalShaderLibrary.h"
 #include "backend/mps/MetalUtils.h"
+#include "backend/mps/kernels/common.h"
 
 #include <Metal/Metal.h>
 
@@ -554,7 +555,12 @@ std::optional<Tensor> unaryShader(const std::string& op, const Tensor& self) {
       [encoder setComputePipelineState:pso];
       [encoder setBuffer:(__bridge id<MTLBuffer>)out_buf offset:0 atIndex:0];
       [encoder setBuffer:(__bridge id<MTLBuffer>)in_buf offset:0 atIndex:1];
-      const uint32_t total = static_cast<uint32_t>(numel);
+      const uint32_t elements = static_cast<uint32_t>(numel);
+      // A thread serves one run of ILP_PER_THREAD elements, which is how much
+      // shorter than the operand the grid has to be.
+      const uint32_t total = static_cast<uint32_t>(
+          p10::metal::ceil_div<uint32_t>(elements, p10::metal::ILP_PER_THREAD));
+      [encoder setBytes:&elements length:sizeof(elements) atIndex:2];
       const uint32_t per_group =
           std::min(total,
                    static_cast<uint32_t>([pso maxTotalThreadsPerThreadgroup]));
