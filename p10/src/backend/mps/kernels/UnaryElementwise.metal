@@ -44,6 +44,45 @@ struct relu_op {
   static inline T apply(T x) { return x < T(0) ? T(0) : x; }
 };
 
+struct neg_op {
+  // Multiplied by minus one rather than subtracted from zero, so that a zero
+  // comes back with its sign reversed the way the operation asks.
+  template <typename T>
+  static inline T apply(T x) { return T(-1) * x; }
+};
+
+struct square_op {
+  template <typename T>
+  static inline T apply(T x) { return x * x; }
+};
+
+struct reciprocal_op {
+  // A division by the operand, so an operand of zero answers with an infinity
+  // of that zero's sign.
+  template <typename T>
+  static inline T apply(T x) { return T(1) / x; }
+};
+
+struct log_op {
+  template <typename T>
+  static inline T apply(T x) { return ::precise::log(x); }
+};
+
+struct sin_op {
+  template <typename T>
+  static inline T apply(T x) { return ::precise::sin(x); }
+};
+
+struct cos_op {
+  template <typename T>
+  static inline T apply(T x) { return ::precise::cos(x); }
+};
+
+struct tanh_op {
+  template <typename T>
+  static inline T apply(T x) { return ::precise::tanh(x); }
+};
+
 template <typename T, typename Op>
 kernel void unary_elementwise(device T* out [[buffer(0)]],
                               constant T* src [[buffer(1)]],
@@ -90,3 +129,10 @@ REGISTER_UNARY_ELEMENTWISE(sqrt, float)
 REGISTER_UNARY_ELEMENTWISE(rsqrt, float)
 REGISTER_UNARY_ELEMENTWISE(abs, float)
 REGISTER_UNARY_ELEMENTWISE(relu, float)
+REGISTER_UNARY_ELEMENTWISE(neg, float)
+REGISTER_UNARY_ELEMENTWISE(square, float)
+REGISTER_UNARY_ELEMENTWISE(reciprocal, float)
+REGISTER_UNARY_ELEMENTWISE(log, float)
+REGISTER_UNARY_ELEMENTWISE(sin, float)
+REGISTER_UNARY_ELEMENTWISE(cos, float)
+REGISTER_UNARY_ELEMENTWISE(tanh, float)
