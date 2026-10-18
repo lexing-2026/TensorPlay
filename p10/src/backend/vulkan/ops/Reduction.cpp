@@ -42,6 +42,54 @@ struct ReduceStep final {
   std::vector<int64_t> out_sizes;
 };
 
+// One linear reduce pass: `rows` sort rows of `tile` elements each, where
+// consecutive elements of a row stride by `inner`.  Sums and means write the
+// scaled row sum; variances write the corrected variance built from the row's
+// raw moments.
+void reduce_axis_buffer_pass(
+    api::Context* const context,
+    api::vTensor& output,
+    api::vTensor& input,
+    int64_t tile,
+    int64_t inner,
+    int64_t rows,
+    int32_t correction,
+    float scale,
+    bool var_mode) {
+  const struct ReduceAxisBufferBlock final {
+    int32_t axis_size;
+    int32_t inner;
+    int32_t rows;
+    int32_t total;
+    int32_t correction;
+    float scale;
+  } block{
+      static_cast<int32_t>(tile),
+      static_cast<int32_t>(inner),
+      static_cast<int32_t>(rows),
+      static_cast<int32_t>(input.numel()),
+      correction,
+      scale,
+  };
+
+  api::UniformParamsBuffer params(context, block);
+  api::PipelineBarrier pipeline_barrier{};
+  context->submit_compute_job(
+      var_mode ? VK_KERNEL(var_axis_buffer) : VK_KERNEL(sum_axis_buffer),
+      pipeline_barrier,
+      {static_cast<uint32_t>(rows), 1u, 1u},
+      {256u, 1u, 1u},
+      VK_NULL_HANDLE,
+      output.buffer(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::WRITE),
+      input.buffer(
+          pipeline_barrier, api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::READ),
+      params.buffer());
+}
+
 // One single-axis reduce pass.  The output keeps every axis, with the
 // reduced axis collapsed to length one; squeezing (when the public call
 // asked for it) happens as a layout repack after all axes are reduced.
@@ -61,7 +109,7 @@ Tensor reduce_one_axis(
   std::vector<int64_t> out_sizes = shape_vector(input);
   out_sizes[static_cast<size_t>(axis_from_left)] = 1;
 
-  // Buffer-stored inputs (any axis beyond the 3-D image limit) reduce
+// Buffer-stored inputs (any axis beyond the 3-D image limit) reduce
   // through a linear row-walking variant; the reduced output is kept in
   // buffer storage.  Float16 buffer payloads are byte-packed with no
   // buffer-writing reduction yet.
@@ -79,34 +127,35 @@ Tensor reduce_one_axis(
       inner *= input.size(d);
     }
     const int64_t rows = input.numel() / axis_size;
-    const struct ReduceAxisBufferBlock final {
-      int32_t axis_size;
-      int32_t inner;
-      int32_t rows;
-      int32_t correction;
-      float scale;
-    } block{
-        static_cast<int32_t>(axis_size), static_cast<int32_t>(inner),
-        static_cast<int32_t>(rows),
-        var_mode ? static_cast<int32_t>(correction_for_var) : 0,
-        mean_mode ? 1.0f / static_cast<float>(axis_size) : 1.0f,
-    };
-    api::UniformParamsBuffer params(context, block);
-    api::PipelineBarrier pipeline_barrier{};
-    context->submit_compute_job(
-        var_mode ? VK_KERNEL(var_axis_buffer) : VK_KERNEL(sum_axis_buffer),
-        pipeline_barrier,
-        {static_cast<uint32_t>(rows), 1u, 1u},
-        {256u, 1u, 1u}, VK_NULL_HANDLE,
-        v_output.buffer(
-            pipeline_barrier,
-            api::PipelineStage::COMPUTE,
-            api::MemoryAccessType::WRITE),
-        v_input.buffer(
-            pipeline_barrier,
-            api::PipelineStage::COMPUTE,
-            api::MemoryAccessType::READ),
-        params.buffer());
+    const int32_t correction =
+        var_mode ? static_cast<int32_t>(correction_for_var) : 0;
+    const float scale =
+        mean_mode ? 1.0f / static_cast<float>(axis_size) : 1.0f;
+
+    // A reduce that collapses the whole payload into one row would hand every
+    // element to a single thread, so split it into fixed tiles, sum each tile,
+    // and add the tile results in a second pass.  Variance keeps its raw
+    // moments inside the row walk and stays on the single pass.
+    constexpr int64_t kTileElements = 256;
+    if (!var_mode && rows == 1 && axis_size > kTileElements) {
+      const int64_t tiles =
+          (axis_size + kTileElements - 1) / kTileElements;
+      api::vTensor v_tiles{
+          context,
+          std::vector<int64_t>{tiles},
+          input.dtype(),
+          api::StorageType::BUFFER,
+          api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+      reduce_axis_buffer_pass(
+          context, v_tiles, v_input, kTileElements, 1, tiles, 0, 1.0f, false);
+      reduce_axis_buffer_pass(
+          context, v_output, v_tiles, tiles, 1, 1, 0, scale, false);
+      return convert(v_output);
+    }
+
+    reduce_axis_buffer_pass(
+        context, v_output, v_input, axis_size, inner, rows, correction, scale,
+        var_mode);
     return convert(v_output);
   }
 
@@ -273,6 +322,50 @@ const char* extremum_shader_name(ExtremumKind kind) {
   return "reduce_max";
 }
 
+// One extremum pass over a linear payload: `rows` sort rows of `tile`
+// elements each, where consecutive elements of a row stride by `inner`.
+void extremum_buffer_pass(
+    api::Context* const context,
+    api::vTensor& output,
+    api::vTensor& input,
+    int64_t tile,
+    int64_t inner,
+    int64_t rows,
+    const char* shader) {
+  const struct ExtremumBufferBlock final {
+    int32_t axis_size;
+    int32_t inner;
+    int32_t rows;
+    int32_t total;
+    int32_t fill;
+    int32_t fill1;
+  } block{
+      static_cast<int32_t>(tile),
+      static_cast<int32_t>(inner),
+      static_cast<int32_t>(rows),
+      static_cast<int32_t>(input.numel()),
+      0,
+      0,
+  };
+
+  api::UniformParamsBuffer params(context, block);
+  api::PipelineBarrier pipeline_barrier{};
+  context->submit_compute_job(
+      VK_KERNEL_FROM_STR(shader),
+      pipeline_barrier,
+      {static_cast<uint32_t>(rows), 1u, 1u},
+      {256u, 1u, 1u},
+      VK_NULL_HANDLE,
+      output.buffer(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::WRITE),
+      input.buffer(
+          pipeline_barrier, api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::READ),
+      params.buffer());
+}
+
 Tensor extremum_one_axis(
     const Tensor& input,
     int64_t axis_from_left,
@@ -284,6 +377,54 @@ Tensor extremum_one_axis(
       static_cast<int>(input.dim() - 1 - axis_from_left);
   std::vector<int64_t> out_sizes = shape_vector(input);
   out_sizes[static_cast<size_t>(axis_from_left)] = 1;
+
+  // Buffer payloads reduce through the linear variant; only the extremum
+  // kinds have one, so a product over buffer storage still reports the
+  // texture requirement below.
+  const char* buffer_shader = kind == ExtremumKind::kMax
+      ? "reduce_max_buffer"
+      : kind == ExtremumKind::kMin ? "reduce_min_buffer" : nullptr;
+  if (v_input.storage_type() == api::StorageType::BUFFER &&
+      buffer_shader != nullptr) {
+    api::vTensor v_output{
+        context,
+        out_sizes,
+        DType::Float32,
+        api::StorageType::BUFFER,
+        api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+
+    const int64_t axis_size = input.size(axis_from_left);
+    int64_t inner = 1;
+    for (int64_t d = axis_from_left + 1; d < input.dim(); ++d) {
+      inner *= input.size(d);
+    }
+    const int64_t rows = input.numel() / axis_size;
+
+    // A row per invocation is already parallel when the reduce leaves many
+    // rows behind.  One that collapses the whole payload into a single row
+    // would hand every element to one thread, so split it into fixed tiles,
+    // reduce each tile in place, and reduce the tile results afterwards.
+    constexpr int64_t kTileElements = 256;
+    if (rows == 1 && axis_size > kTileElements) {
+      const int64_t tiles =
+          (axis_size + kTileElements - 1) / kTileElements;
+      api::vTensor v_tiles{
+          context,
+          std::vector<int64_t>{tiles},
+          DType::Float32,
+          api::StorageType::BUFFER,
+          api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+      extremum_buffer_pass(
+          context, v_tiles, v_input, kTileElements, 1, tiles, buffer_shader);
+      extremum_buffer_pass(
+          context, v_output, v_tiles, tiles, 1, 1, buffer_shader);
+      return convert(v_output);
+    }
+
+    extremum_buffer_pass(
+        context, v_output, v_input, axis_size, inner, rows, buffer_shader);
+    return convert(v_output);
+  }
 
   api::vTensor v_output{context, out_sizes, DType::Float32};
   TP_CHECK(

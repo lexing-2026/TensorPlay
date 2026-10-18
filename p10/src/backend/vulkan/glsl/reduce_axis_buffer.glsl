@@ -25,6 +25,7 @@ layout(set = 0, binding = 2) uniform PRECISION restrict Block {
   int axis_size;
   int inner;
   int rows;
+  int total;
   int correction;
   float scale;
 }
@@ -40,10 +41,14 @@ void main() {
   const int outer = row / uBlock.inner;
   const int inner_pos = row - outer * uBlock.inner;
   const int base = outer * (uBlock.axis_size * uBlock.inner);
+  // A row grid that tiles the payload in fixed chunks can end past its last
+  // element, so the walk stops at the element count instead of at the tile
+  // size.  Row grids that split the payload evenly are unaffected.
+  const int count = min(uBlock.axis_size, uBlock.total - base);
 
   float acc = 0.0;
   float sq = 0.0;
-  for (int i = 0; i < uBlock.axis_size; ++i) {
+  for (int i = 0; i < count; ++i) {
     const float v = uInput.data[base + i * uBlock.inner + inner_pos];
     acc += v;
     sq += v * v;

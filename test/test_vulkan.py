@@ -952,6 +952,91 @@ class TestVulkanLinearPayload(unittest.TestCase):
         np.testing.assert_array_equal((x >= 0).cpu().numpy(), x_cpu >= 0)
         np.testing.assert_array_equal((x != 7).cpu().numpy(), x_cpu != 7)
 
+    def test_extremum_over_linear_payload(self):
+        import tensorplay as tp
+        tensorplay.manual_seed(41)
+        # A whole-payload extremum has no row to spread work over, so it
+        # reduces fixed tiles and then the tile results.  Pick a length that
+        # leaves a partial tile so the tail clamp is covered too.
+        width = self.WIDTH + 37
+        x_cpu = (tp.randn((width,), device="cpu") * 3.0).numpy()
+        x = tensorplay.from_numpy(x_cpu.copy()).to("vulkan")
+
+        np.testing.assert_array_equal(
+            x.max().cpu().numpy(), np.max(x_cpu), err_msg="max over tiles")
+        np.testing.assert_array_equal(
+            x.min().cpu().numpy(), np.min(x_cpu), err_msg="min over tiles")
+        np.testing.assert_array_equal(
+            tp.amax(x).cpu().numpy(), np.max(x_cpu), err_msg="amax global")
+        np.testing.assert_array_equal(
+            tp.amin(x).cpu().numpy(), np.min(x_cpu), err_msg="amin global")
+
+        # Few rows, long axis: one pass with one invocation per row.
+        rows_cpu = (tp.randn((3, 80000), device="cpu") * 3.0).numpy()
+        rows_v = tensorplay.from_numpy(rows_cpu.copy()).to("vulkan")
+        np.testing.assert_array_equal(
+            tp.amax(rows_v, dim=[1]).cpu().numpy(),
+            rows_cpu.max(axis=1),
+            err_msg="amax along the long axis")
+        np.testing.assert_array_equal(
+            tp.amin(rows_v, dim=[1]).cpu().numpy(),
+            rows_cpu.min(axis=1),
+            err_msg="amin along the long axis")
+
+        # Many rows, short axis: the walk strides by the trailing extent.
+        np.testing.assert_array_equal(
+            tp.amax(rows_v, dim=[0]).cpu().numpy(),
+            rows_cpu.max(axis=0),
+            err_msg="amax across rows")
+        np.testing.assert_array_equal(
+            tp.amin(rows_v, dim=[0]).cpu().numpy(),
+            rows_cpu.min(axis=0),
+            err_msg="amin across rows")
+        np.testing.assert_array_equal(
+            tp.amax(rows_v, dim=[0], keepdim=True).cpu().numpy(),
+            rows_cpu.max(axis=0, keepdims=True),
+            err_msg="amax keepdim")
+
+    def test_tiled_sum_over_linear_payload(self):
+        import tensorplay as tp
+        tensorplay.manual_seed(43)
+        # A whole-payload sum has no row to spread over either, so it tiles the
+        # payload and adds the tile results.  The order changes, so compare
+        # with a tolerance rather than bit for bit.
+        width = self.WIDTH + 37
+        x_cpu = tp.randn((width,), device="cpu").numpy()
+        x = tensorplay.from_numpy(x_cpu.copy()).to("vulkan")
+
+        np.testing.assert_allclose(
+            float(x.sum().cpu().numpy()),
+            float(x_cpu.sum()),
+            rtol=1e-3,
+            atol=1e-3,
+            err_msg="sum over tiles")
+        np.testing.assert_allclose(
+            float(x.mean().cpu().numpy()),
+            float(x_cpu.mean()),
+            rtol=1e-3,
+            atol=1e-3,
+            err_msg="mean over tiles")
+
+        # Many-row reduces keep the single pass, including variance, whose
+        # raw moments stay inside one row walk.
+        rows_cpu = tp.randn((4, 50000), device="cpu").numpy()
+        rows_v = tensorplay.from_numpy(rows_cpu.copy()).to("vulkan")
+        np.testing.assert_allclose(
+            rows_v.sum(dim=[1]).cpu().numpy(),
+            rows_cpu.sum(axis=1),
+            rtol=1e-3,
+            atol=1e-3,
+            err_msg="row sums")
+        np.testing.assert_allclose(
+            tp.var(rows_v, dim=[1]).cpu().numpy(),
+            rows_cpu.var(axis=1),
+            rtol=1e-3,
+            atol=1e-3,
+            err_msg="row variances")
+
 
     def test_unaligned_widths_over_linear_payload(self):
         import tensorplay as tp

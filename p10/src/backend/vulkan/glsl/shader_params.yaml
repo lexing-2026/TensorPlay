@@ -1341,6 +1341,14 @@ reduce_axis_buffer:
     MODE: 0
   - NAME: var_axis_buffer
     MODE: 1
+reduce_extremum_buffer:
+  parameter_names_with_default_values:
+    GREATER: 1
+  shader_variants:
+  - NAME: reduce_max_buffer
+    GREATER: 1
+  - NAME: reduce_min_buffer
+    GREATER: 0
 hardshrink_mask:
   parameter_names_with_default_values: {}
   shader_variants:
