@@ -470,6 +470,26 @@ def _probe_info(f, variant: str):
     return {"arity": len(pos), "required": required, "kinds": kinds}
 
 
+def _first_of_each_probe_shape(user_args, probes) -> list:
+    """Mark the first spelling of every distinct probe shape.
+
+    A candidate whose probe shape -- its parameter names, positional kinds
+    and accepted count -- repeats an earlier one reads every call the way
+    that earlier candidate does.  Letting both count would report an
+    ambiguity that is not there and send each matching call down the
+    candidate-by-candidate path, so only the first spelling keeps its probe.
+    The twins remain in the dispatch order below, where the first candidate
+    that serves the call still wins.
+    """
+    first: dict = {}
+    marks = []
+    for k, (args_k, p) in enumerate(zip(user_args, probes)):
+        shape = (tuple(a.name for a in args_k), tuple(p["kinds"]),
+                 len(args_k), p["arity"], p["required"])
+        marks.append(first.setdefault(shape, k) == k)
+    return marks
+
+
 def _arity_max(f, variant: str) -> int | None:
     """Delivered-argument ceiling for one group candidate, or None.
 
@@ -1147,7 +1167,10 @@ def _gen_python_capi(ctx: CodegenContext) -> None:
                      if not (is_method and a.name == "self")]
                     for f in fs
                 ]
+                counting = _first_of_each_probe_shape(user_args, probes)
                 for k, args_k in enumerate(user_args):
+                    if not counting[k]:
+                        continue
                     names = ", ".join(f'"{a.name}"' for a in args_k)
                     # Receiver excluded, matching the kwlist each candidate's
                     # own parser is handed, so a probe slot and a parser slot
@@ -1163,6 +1186,8 @@ def _gen_python_capi(ctx: CodegenContext) -> None:
                 out.append("        int pick = -1;")
                 out.append("        int matches = 0;")
                 for k, p in enumerate(probes):
+                    if not counting[k]:
+                        continue
                     kinds_c = ", ".join(str(kc) for kc in p["kinds"])
                     if not kinds_c:
                         kinds_c = "0"
@@ -1170,12 +1195,16 @@ def _gen_python_capi(ctx: CodegenContext) -> None:
                         f'        static const unsigned char tpx_kinds_{k}[] '
                         f"= {{{kinds_c}}};")
                 for k, p in enumerate(probes):
+                    if not counting[k]:
+                        continue
                     out.append(
                         f"        const int tpx_probe_{k} = "
                         f"tpx_py_probe_match(args, nargs, "
                         f"kwnames, tpx_kwlist_{k}, {len(user_args[k])}, "
                         f"tpx_kinds_{k}, {p['arity']});")
                 for k, p in enumerate(probes):
+                    if not counting[k]:
+                        continue
                     conds = [f"tpx_probe_{k} >= {p['required']}",
                              f"tpx_probe_{k} <= {p['arity']}"]
                     out.append(f"        if ({' && '.join(conds)})"
