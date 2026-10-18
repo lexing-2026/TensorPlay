@@ -21,20 +21,23 @@ using namespace p10::metal;
 // next; several keep a whole group of loads in flight.
 P10_METAL_CONSTEXPR unsigned kSumChains = 8;
 
+// The row count and the length of one row, which the host passes as one pair.
+using RowSizes = metal::array<uint32_t, 2>;
+
 template <typename T>
 kernel void row_sum_inner(device T* out [[buffer(0)]],
                           constant T* src [[buffer(1)]],
-                          constant uint2& sizes [[buffer(2)]],
+                          constant RowSizes& sizes [[buffer(2)]],
                           constant float& divisor [[buffer(3)]],
                           uint tptg [[threads_per_threadgroup]],
                           uint tgid [[threadgroup_position_in_grid]],
                           uint lane [[thread_index_in_simdgroup]],
                           uint group [[simdgroup_index_in_threadgroup]]) {
   const uint row = tgid * (tptg / simdgroup_size) + group;
-  if (row >= sizes.x) {
+  if (row >= sizes[0]) {
     return;
   }
-  const uint n = sizes.y;
+  const uint n = sizes[1];
   constant T* values = src + (uint64_t)row * (uint64_t)n;
 
   metal::array<T, kSumChains> acc;
@@ -117,16 +120,16 @@ inline uint32_t arg_position(T value, uint32_t index) {
 template <typename Op>
 kernel void row_arg_inner(device long* out [[buffer(0)]],
                           constant float* src [[buffer(1)]],
-                          constant uint2& sizes [[buffer(2)]],
+                          constant RowSizes& sizes [[buffer(2)]],
                           uint tptg [[threads_per_threadgroup]],
                           uint tgid [[threadgroup_position_in_grid]],
                           uint lane [[thread_index_in_simdgroup]],
                           uint group [[simdgroup_index_in_threadgroup]]) {
   const uint row = tgid * (tptg / simdgroup_size) + group;
-  if (row >= sizes.x) {
+  if (row >= sizes[0]) {
     return;
   }
-  const uint n = sizes.y;
+  const uint n = sizes[1];
   constant float* values = src + (uint64_t)row * (uint64_t)n;
 
   float best = Op::identity();
@@ -153,13 +156,13 @@ kernel void row_arg_inner(device long* out [[buffer(0)]],
 #define REGISTER_ROW_SUM(DTYPE)                                         \
   template [[host_name("rowsum_" #DTYPE)]] kernel void                  \
   row_sum_inner<DTYPE>(device DTYPE* out, constant DTYPE* src,          \
-                       constant uint2& sizes, constant float& divisor,  \
+                       constant RowSizes& sizes, constant float& divisor,  \
                        uint tptg, uint tgid, uint lane, uint group);
 
 #define REGISTER_ARG_REDUCTION(HOST_NAME, OP)                           \
   template [[host_name(#HOST_NAME "_float")]] kernel void               \
   row_arg_inner<OP<float>>(device long* out, constant float* src,       \
-                           constant uint2& sizes,                       \
+                           constant RowSizes& sizes,                       \
                            uint tptg, uint tgid, uint lane, uint group);
 
 REGISTER_ROW_SUM(float)

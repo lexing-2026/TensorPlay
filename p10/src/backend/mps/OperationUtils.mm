@@ -591,10 +591,11 @@ void dispatchRowReduce(MTLComputePipelineState_t pso, void* out_buf,
                    kRowReduceSimdgroup * kRowReduceSimdgroup);
   const uint32_t rows_per_group = threads / kRowReduceSimdgroup;
   const uint32_t groups = (rows + rows_per_group - 1) / rows_per_group;
-  // The shader reads the pair as one uint2, which the argument table expects at
-  // an eight-byte boundary.
-  alignas(8) uint32_t sizes[2] = {rows, length};
-  float division = divisor.value_or(0.0f);
+  // The shader reads the two as one pair, so they travel as one argument. A
+  // block copies what it captures, which an object of class type survives and a
+  // raw array does not.
+  const std::array<uint32_t, 2> sizes = {rows, length};
+  const float division = divisor.value_or(0.0f);
   MPSStream* stream = getCurrentMPSStream();
   dispatch_sync_with_rethrow(stream->queue(), ^() {
     @autoreleasepool {
@@ -603,7 +604,7 @@ void dispatchRowReduce(MTLComputePipelineState_t pso, void* out_buf,
       [encoder setComputePipelineState:pso];
       [encoder setBuffer:(__bridge id<MTLBuffer>)out_buf offset:0 atIndex:0];
       [encoder setBuffer:(__bridge id<MTLBuffer>)in_buf offset:0 atIndex:1];
-      [encoder setBytes:sizes length:sizeof(sizes) atIndex:2];
+      [encoder setBytes:sizes.data() length:sizeof(sizes) atIndex:2];
       if (divisor.has_value()) {
         [encoder setBytes:&division length:sizeof(division) atIndex:3];
       }
