@@ -157,22 +157,25 @@ void main() {
         uOutput.data[idx] =
             OP(uOutput.data[idx], uOther.data[idx], uBlock.alpha);
       // clang-format on
-    } else if (idx < nvec + rem) {
-      const uint i = (nvec << 2u) + (idx - nvec);
-      const uint j = i >> 2u;
-      const uint k = i & 3u;
+    } else if (idx == nvec) {
+      const uint j = nvec;
       // The tail operands are scalars; wrap them in a vector so operators
       // written in vector form (e.g. pow's integer-exponent branch) compile
-      // unchanged, then take the first lane.
+      // unchanged, then take the lane being written.  One invocation owns the
+      // whole partial word, so the dispatch stays at div_up(n, 4) groups.
       // clang-format off
       $if not INPLACE:
-        uOutput.data[j][k] =
-            (OP(VECTOR(uInput.data[j][k]), VECTOR(uOther.data[j][k]),
-                uBlock.alpha)).x;
+        for (uint i = 0u; i < rem; ++i) {
+          uOutput.data[j][i] =
+              (OP(VECTOR(uInput.data[j][i]), VECTOR(uOther.data[j][i]),
+                  uBlock.alpha)).x;
+        }
       $else:
-        uOutput.data[j][k] =
-            (OP(VECTOR(uOutput.data[j][k]), VECTOR(uOther.data[j][k]),
-                uBlock.alpha)).x;
+        for (uint i = 0u; i < rem; ++i) {
+          uOutput.data[j][i] =
+              (OP(VECTOR(uOutput.data[j][i]), VECTOR(uOther.data[j][i]),
+                  uBlock.alpha)).x;
+        }
       // clang-format on
     }
     return;

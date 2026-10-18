@@ -93,15 +93,20 @@ void main() {
     $else:
       uOutput.data[idx] = VECTOR(OP(uOutput.data[idx].x), OP(uOutput.data[idx].y), OP(uOutput.data[idx].z), OP(uOutput.data[idx].w));
     // clang-format on
-  } else if (idx < nvec + rem) {
-    const uint i = (nvec << 2u) + (idx - nvec);
-    const uint j = i >> 2u;
-    const uint k = i & 3u;
+  } else if (idx == nvec) {
+    // One invocation owns the whole partial word, so the dispatch stays at
+    // div_up(n, 4) groups and tail coverage does not depend on how far the
+    // workgroup count is rounded up.
+    const uint j = nvec;
     // clang-format off
     $if not INPLACE:
-      uOutput.data[j][k] = OP(uInput.data[j][k]);
+      for (uint i = 0u; i < rem; ++i) {
+        uOutput.data[j][i] = OP(uInput.data[j][i]);
+      }
     $else:
-      uOutput.data[j][k] = OP(uOutput.data[j][k]);
+      for (uint i = 0u; i < rem; ++i) {
+        uOutput.data[j][i] = OP(uOutput.data[j][i]);
+      }
     // clang-format on
   }
 }

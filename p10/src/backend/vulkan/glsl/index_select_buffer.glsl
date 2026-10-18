@@ -55,18 +55,22 @@ void main() {
       res[i] = uInput.data[uint(src) >> 2u][uint(src) & 3u];
     }
     uOutput.data[idx] = res;
-  } else if (idx < nvec + rem) {
-    const uint o = (nvec << 2u) + (idx - nvec);
-    const uint row = o / uint(uBlock.inner);
-    const uint col = o % uint(uBlock.inner);
-    const int row_id = uIndices.data[row];
-    const uint j = o >> 2u;
-    const uint k = o & 3u;
-    if (row_id < 0 || row_id >= uBlock.rows) {
-      uOutput.data[j][k] = 0.0f;
-      return;
+  } else if (idx == nvec) {
+    // One invocation owns the whole partial word, so the dispatch stays at
+    // div_up(n, 4) groups and tail coverage does not depend on how far the
+    // workgroup count is rounded up.
+    const uint j = nvec;
+    for (uint i = 0u; i < rem; ++i) {
+      const uint o = (nvec << 2u) + i;
+      const uint row = o / uint(uBlock.inner);
+      const uint col = o % uint(uBlock.inner);
+      const int row_id = uIndices.data[row];
+      if (row_id < 0 || row_id >= uBlock.rows) {
+        uOutput.data[j][i] = 0.0f;
+        continue;
+      }
+      const int src = row_id * uBlock.row_stride + int(col);
+      uOutput.data[j][i] = uInput.data[uint(src) >> 2u][uint(src) & 3u];
     }
-    const int src = row_id * uBlock.row_stride + int(col);
-    uOutput.data[j][k] = uInput.data[uint(src) >> 2u][uint(src) & 3u];
   }
 }

@@ -51,11 +51,14 @@ void main() {
     res.z = ((m >> 16u) & 0xffu) != 0u ? a.z : b.z;
     res.w = ((m >> 24u) & 0xffu) != 0u ? a.w : b.w;
     uOutput.data[j] = res;
-  } else if (idx < nvec + rem) {
-    const uint i = (nvec << 2u) + (idx - nvec);
-    const uint j = i >> 2u;
-    const uint k = i & 3u;
-    const uint byte = (uCond.data[j] >> (8u * k)) & 0xffu;
-    uOutput.data[j][k] = byte != 0u ? uInput.data[j][k] : uOther.data[j][k];
+  } else if (idx == nvec) {
+    // One invocation owns the whole partial word, so the dispatch stays at
+    // div_up(n, 4) groups and tail coverage does not depend on how far the
+    // workgroup count is rounded up.
+    const uint j = nvec;
+    for (uint i = 0u; i < rem; ++i) {
+      const uint byte = (uCond.data[j] >> (8u * i)) & 0xffu;
+      uOutput.data[j][i] = byte != 0u ? uInput.data[j][i] : uOther.data[j][i];
+    }
   }
 }

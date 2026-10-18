@@ -81,10 +81,13 @@ void main() {
         min(max(x.y, uBlock.lo), uBlock.hi),
         min(max(x.z, uBlock.lo), uBlock.hi),
         min(max(x.w, uBlock.lo), uBlock.hi));
-  } else if (idx < nvec + rem) {
-    const uint i = (nvec << 2u) + (idx - nvec);
-    const uint j = i >> 2u;
-    const uint k = i & 3u;
-    uOutput.data[j][k] = min(max(SRC.data[j][k], uBlock.lo), uBlock.hi);
+  } else if (idx == nvec) {
+    // One invocation owns the whole partial word, so the dispatch stays at
+    // div_up(n, 4) groups and tail coverage does not depend on how far the
+    // workgroup count is rounded up.
+    const uint j = nvec;
+    for (uint i = 0u; i < rem; ++i) {
+      uOutput.data[j][i] = min(max(SRC.data[j][i], uBlock.lo), uBlock.hi);
+    }
   }
 }

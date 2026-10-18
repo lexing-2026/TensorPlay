@@ -58,9 +58,10 @@ inline std::string buffer_shader_for_dtype(
 /*
  * Global invocation count for an elementwise linear dispatch.  The Float32
  * builds were authored to move a 16-byte vector (four elements) per
- * invocation, the Float16 ones a single word holding two lanes.  Dispatch
- * rounds up to whole workgroups, which is what covers a tail element whose
- * owning index falls past the exact quotient.
+ * invocation, the Float16 ones a single word holding two lanes.  Rounding up
+ * to a whole element gives the last invocation an index that the kernels use
+ * to own the leftover lanes, so coverage never depends on how far the launch
+ * is padded to whole workgroups.
  */
 inline uint32_t buffer_dispatch_count(
     uint32_t elements,
