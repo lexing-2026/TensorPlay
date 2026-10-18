@@ -1246,6 +1246,50 @@ class TestVulkanLinearPayload(unittest.TestCase):
             np.testing.assert_array_equal(
                 out, table[:count], err_msg=f"identity select at {count}")
 
+    def test_gather_over_texture_table_with_long_index_list(self):
+        import tensorplay as tp
+        import tensorplay.functional as F
+        # An index list carries one index per texel, so a list longer than the
+        # device's image-axis limit has no texture form even when the table it
+        # selects rows from does.  The gather then copies the texture into
+        # dense row-major storage and runs the linear shader, rather than
+        # refusing the pair of shapes.  The lengths below straddle that limit
+        # so both routes are checked against one table.
+        rng = np.random.default_rng(23)
+        table = rng.standard_normal((1000, 8), dtype=np.float32)
+        vk_table = tp.from_numpy(table.copy()).to("vulkan")
+        for count in (512, 16383, 16384, 16385, 20000):
+            sel = rng.integers(0, table.shape[0], count).astype(np.int32)
+            vk_sel = tp.from_numpy(sel.copy()).to("vulkan")
+            np.testing.assert_array_equal(
+                F.index_select(vk_table, 0, vk_sel).cpu().numpy(),
+                table[sel], err_msg=f"index_select at {count} indices")
+            np.testing.assert_array_equal(
+                F.embedding(vk_table, vk_sel).cpu().numpy(),
+                table[sel], err_msg=f"embedding at {count} indices")
+
+    def test_gather_writes_every_slot_of_a_wide_row(self):
+        import tensorplay as tp
+        import tensorplay.functional as F
+        # A gathered row spans more than one RGBA texel once the table is
+        # wider than four columns, so the texture route must be launched over
+        # (slot inside the row, index) instead of over the flat element count
+        # of the output it allocates -- otherwise only the first lookup is
+        # written and the rest of the output stays zero.  The widths below
+        # include one that is not a multiple of four.
+        rng = np.random.default_rng(29)
+        for rows, width in ((1000, 8), (17, 5), (64, 64)):
+            table = rng.standard_normal((rows, width), dtype=np.float32)
+            sel = rng.integers(0, rows, 40).astype(np.int32)
+            vk_table = tp.from_numpy(table.copy()).to("vulkan")
+            vk_sel = tp.from_numpy(sel.copy()).to("vulkan")
+            np.testing.assert_array_equal(
+                F.index_select(vk_table, 0, vk_sel).cpu().numpy(),
+                table[sel], err_msg=f"index_select over {rows}x{width}")
+            np.testing.assert_array_equal(
+                F.embedding(vk_table, vk_sel).cpu().numpy(),
+                table[sel], err_msg=f"embedding over {rows}x{width}")
+
     def test_decode_product_over_linear_weight(self):
         import tensorplay as tp
         # A weight matrix wider than the image axis limit cannot be relayed
