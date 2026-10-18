@@ -148,6 +148,12 @@ kernel void scan_rows_inner(
             scan_combine<AccT, Product>(within_pass, carried));
       }
     }
+    // A row that the pass above covered whole has no later pass to hand a
+    // carry to, so the row is done once the stores land and the three
+    // threadgroup-wide exchanges can be skipped.
+    if (base + tptg * kScanReads >= len) {
+      return;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     // The last thread holds the largest prefix of this pass; it becomes the
     // carry of the next one.
