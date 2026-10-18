@@ -865,10 +865,10 @@ jobs:
           MPS_COMPARE_REFERENCE: ${{ inputs.mps_compare_reference }}
           MPS_REFERENCE_REQUIREMENT: ${{ inputs.mps_reference_requirement }}
           MPS_REFERENCE_SKIP_CASES: ${{ inputs.mps_reference_skip_cases }}
-          # The Metal device of a CI virtual machine reports its unified memory
-          # as almost fully allocated, so the second runtime's allocator
-          # refuses even 16 KiB requests. Disabling its watermark check is the
-          # documented way to run there.
+          # The CI virtual machine reports its unified memory as almost fully
+          # allocated, so the second runtime's allocator would refuse device
+          # buffers. Disabling its watermark check is the documented way to
+          # run there.
           PYTORCH_MPS_HIGH_WATERMARK_RATIO: "0.0"
         run: |
           set -euo pipefail
@@ -880,29 +880,34 @@ jobs:
           python benchmark/host_probe.py \
             --json-out benchmark-results/host-probe.json \
             | tee benchmark-results/host-probe.log
-          python benchmark/bench_mps_operator.py --suite "$suite" --dtype f32 \
-            --reps 3 --chain "$MPS_BENCH_CHAIN" \
-            --json-out benchmark-results/mps-operator.json \
-            | tee benchmark-results/mps-operator.log
           if [[ "$MPS_COMPARE_REFERENCE" == "true" ]]; then
-            # The second pass runs the same inventory in its own process: each
-            # side then warms up and allocates on its own, and neither one's
-            # device memory pressure lands inside the other's samples.
+            # One process times both runtimes: the samples of a case alternate
+            # between the two sides, so each pair shares the host window that
+            # produced it instead of depending on when its pass happened to
+            # run.  The macOS 15 image creates the heaps the second runtime
+            # allocates from, and the watermark override above keeps it from
+            # refusing device buffers.
             python -m pip install -q "$MPS_REFERENCE_REQUIREMENT"
-            # A pass can abort mid-run on a device the other runtime does not
-            # handle well; the case list it did time is kept and the gate
+            # A pass can abort mid-run on a device the second runtime does not
+            # handle well; the cases it already timed are kept and the gate
             # reports the rest as unpaired.
             set +e
-            python benchmark/bench_mps_operator.py --side reference \
+            python benchmark/bench_mps_operator.py --paired \
               --suite "$suite" --dtype f32 --reps 3 --chain "$MPS_BENCH_CHAIN" \
               --skip-cases "$MPS_REFERENCE_SKIP_CASES" \
-              --json-out benchmark-results/mps-operator-reference.json \
-              | tee benchmark-results/mps-operator-reference.log
+              --json-out benchmark-results/mps-operator.json \
+              --reference-json-out benchmark-results/mps-operator-reference.json \
+              | tee benchmark-results/mps-operator.log
             status=${PIPESTATUS[0]}
             set -e
             if [[ "$status" != "0" ]]; then
-              echo "::warning::the second benchmark pass ended with status $status"
+              echo "::warning::the paired benchmark pass ended with status $status"
             fi
+          else
+            python benchmark/bench_mps_operator.py --suite "$suite" \
+              --dtype f32 --reps 3 --chain "$MPS_BENCH_CHAIN" \
+              --json-out benchmark-results/mps-operator.json \
+              | tee benchmark-results/mps-operator.log
           fi
 
       - name: Enforce MPS performance floor

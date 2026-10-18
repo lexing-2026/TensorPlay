@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """MPS speedup gate.
 
-The MPS operator benchmark times the same case inventory twice, once per
-runtime, in two separate processes: this tree's kernels in one, a second
-runtime on the same device in the other. Separate processes keep the two
-passes from competing for device memory and let each side warm up on its own.
+The MPS operator benchmark times the same case inventory through two runtimes
+on the same device.  A paired run alternates the two sides' samples inside one
+process, so both times of a case share the host windows that produced them;
+the separate-process mode remains available for a device that cannot provision
+both allocators at once.
 
 This gate joins the two result files by case name, turns the pair of times into
 a per-case speedup (theirs / ours), a geometric-mean overall speedup and a win
@@ -72,6 +73,10 @@ def join(ours, reference):
         raise ValueError("the operator run is not the 'ours' side")
     if reference.get("side") != "reference":
         raise ValueError("the reference run is not the 'reference' side")
+    # A paired run alternates the two sides inside one sampling loop; mixing it
+    # with a separate-process pass would compare samples from different windows.
+    if bool(ours.get("paired")) != bool(reference.get("paired")):
+        raise ValueError("the two runs used different sampling modes")
     theirs = {item["name"]: item.get("seconds")
               for item in reference["measurements"]}
     measurements = []
@@ -122,6 +127,7 @@ def summarize(payload):
             "ours": ours,
             "theirs": theirs,
             "speedup": theirs / ours,
+            "paired_speedup": item.get("paired_speedup"),
         })
     unpaired = list(payload.get("unpaired") or [])
     # A reference case that recorded why it did not run -- declared up front or
@@ -143,15 +149,24 @@ def summarize(payload):
               "reference": payload.get("reference", {})}
     if not rows:
         return {"rows": [], "geomean": 0.0, "win_rate": 0.0,
-                "wins": 0, "compared": 0, **common}
+                "wins": 0, "compared": 0,
+                "paired_geomean": None, "paired_win_rate": None, **common}
     speedups = [row["speedup"] for row in rows]
     wins = sum(1 for value in speedups if value >= 1.0)
+    paired = [row["paired_speedup"] for row in rows
+              if _positive(row["paired_speedup"])]
     return {
         "rows": rows,
         "geomean": math.exp(statistics.mean(map(math.log, speedups))),
         "win_rate": wins / len(rows),
         "wins": wins,
         "compared": len(rows),
+        "paired_geomean": (
+            math.exp(statistics.mean(map(math.log, paired)))
+            if paired else None),
+        "paired_win_rate": (
+            sum(1 for value in paired if value >= 1.0) / len(paired)
+            if paired else None),
         **common,
     }
 
@@ -222,6 +237,12 @@ def write_summary(path, summary, violations, min_geomean, min_win_rate):
         f"({summary['wins']}/{summary['compared']}, floor "
         f"{min_win_rate * 100:.0f}%)"
     )
+    if summary.get("paired_win_rate") is not None:
+        lines.append(
+            f"- paired samples: **{summary['paired_geomean']:.2f}x**, "
+            f"win rate {summary['paired_win_rate'] * 100:.0f}% "
+            f"(median of back-to-back sample ratios)"
+        )
     lines.append("")
     losses = sorted(summary["rows"], key=lambda row: row["speedup"])[:TOP_LOSSES]
     wins = sorted(summary["rows"], key=lambda row: -row["speedup"])[:TOP_WINS]
@@ -314,6 +335,10 @@ def main():
         print(f"cases compared: {summary['compared']}")
         print(f"overall speedup: {summary['geomean']:.2f}x")
         print(f"win rate: {summary['win_rate'] * 100:.0f}%")
+        if summary.get("paired_win_rate") is not None:
+            print(f"paired samples: {summary['paired_geomean']:.2f}x "
+                  f"({summary['paired_win_rate'] * 100:.0f}% back-to-back "
+                  f"pairs)")
     if summary.get("unpaired"):
         unexpected = summary.get("unexpected_unpaired") or []
         print(f"cases without a reference timing: {len(summary['unpaired'])} "

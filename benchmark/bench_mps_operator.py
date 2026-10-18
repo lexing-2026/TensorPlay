@@ -8,11 +8,15 @@ Operators that are not (yet) supported on the device are probed once and
 skipped, so a partially implemented backend still produces a complete,
 comparable measurement set.
 
-With --reference the same case inventory also runs through a second runtime on
-the same device, inside the same process and the same sampling loop, so the two
-numbers of a case share the machine state that produced them. Each measurement
-then carries the second runtime's time and the ratio (theirs / ours), which is
-the number the speedup gate tracks.
+With --paired the same case inventory also runs through a second runtime on
+the same device, inside the same process and the same sampling loop: the two
+sides take alternating samples of each case, so both numbers of a case share
+the machine state that produced them. Each measurement then carries the second
+runtime's time and the ratio (theirs / ours), which is the number the speedup
+gate tracks.
+
+Without --paired, --side chooses which runtime one process times; two runs of
+the script then provide the two halves of the comparison.
 
 MPS dispatch is asynchronous, so every timed invocation synchronizes the
 command queue around the operation. --chain N queues N invocations inside one
@@ -23,7 +27,9 @@ in flight until its synchronize, so a case whose output is large gets a shorter
 chain, down to a single invocation.
 
 Usage: bench_mps_operator.py --suite short --reps 5 --json-out results.json
-       bench_mps_operator.py --suite short --reference --json-out results.json
+       bench_mps_operator.py --suite short --paired --json-out ours.json \
+           --reference-json-out reference.json
+       bench_mps_operator.py --suite short --side reference --json-out results.json
        bench_mps_operator.py --suite short --chain 16 --json-out results.json
 """
 
@@ -219,6 +225,49 @@ def _time(fn, reps, min_run_time, warmup, synchronize, chain=1):
         samples.append(elapsed / chain)
         total_time += elapsed
     return samples
+
+
+def _sample(fn, synchronize, chain):
+    """One synchronized sample: `chain` invocations between two drains, divided
+    by the chain so a sample is the mean cost of one invocation."""
+    synchronize()
+    started = time.perf_counter()
+    for _ in range(chain):
+        fn()
+    synchronize()
+    return (time.perf_counter() - started) / chain
+
+
+def _paired_time(fn_ours, fn_reference, reps, min_run_time, warmup,
+                 sync_ours, sync_reference, chain_ours, chain_reference):
+    """Alternating samples from both runtimes, in one process.
+
+    Each pair measures one sample of each side back to back and swaps the order
+    between pairs, so both sides sample the same host windows and neither keeps
+    a fixed position inside one.  The loop gives each side the sample count and
+    sampling time `_time` would give it alone.
+    """
+    for _ in range(warmup):
+        for _ in range(chain_ours):
+            fn_ours()
+        sync_ours()
+        for _ in range(chain_reference):
+            fn_reference()
+        sync_reference()
+    ours = []
+    theirs = []
+    total = 0.0
+    while len(ours) < reps or total < 2 * min_run_time:
+        if len(ours) % 2 == 0:
+            first = _sample(fn_ours, sync_ours, chain_ours)
+            second = _sample(fn_reference, sync_reference, chain_reference)
+        else:
+            second = _sample(fn_reference, sync_reference, chain_reference)
+            first = _sample(fn_ours, sync_ours, chain_ours)
+        ours.append(first)
+        theirs.append(second)
+        total += first + second
+    return ours, theirs
 
 
 def _moves_data(name):
@@ -525,9 +574,16 @@ def main(argv=None):
                         help="separate sampling passes over all cases")
     parser.add_argument("--side", choices=("ours", "reference"),
                         default="ours",
-                        help="which runtime to time; each side runs in its "
-                             "own process so the two passes do not compete "
-                             "for device memory")
+                        help="which runtime one process times; each side "
+                             "usually runs in its own process so the two "
+                             "passes do not compete for device memory")
+    parser.add_argument("--paired", action="store_true",
+                        help="time both runtimes in this process, alternating "
+                             "their samples case by case, and write one result "
+                             "file per side")
+    parser.add_argument("--reference-json-out", type=Path, default=None,
+                        help="where the reference side's results go with "
+                             "--paired")
     parser.add_argument("--skip-cases", default="",
                         help="comma-separated case names to leave out; used "
                              "for cases a runtime aborts the process on")
@@ -543,21 +599,41 @@ def main(argv=None):
         parser.error("chain must be positive")
     if args.rounds < 1:
         parser.error("rounds must be positive")
+    paired = args.paired
+    if paired and args.side != "ours":
+        parser.error("--paired times both sides; leave --side at its default")
+    if paired and args.reference_json_out is None:
+        parser.error("--paired requires --reference-json-out")
     backend = _TreeBackend(_DEVICE) if args.side == "ours" else \
         _ReferenceBackend(_DEVICE)
+    reference_backend = _ReferenceBackend(_DEVICE) if paired else None
     if not backend.available():
         parser.error("MPS is not available on this machine"
                      if args.side == "ours"
                      else "the comparison runtime has no Metal device")
+    if paired and not reference_backend.available():
+        parser.error("the comparison runtime has no Metal device")
     suite = "long" if args.suite == "all" else args.suite
     measurements = {}
     samples_by_name = {}
     chains_by_name = {}
+    reference_measurements = {}
+    reference_samples_by_name = {}
+    reference_chains_by_name = {}
+    paired_speedups = {}
     requested_skips = {name.strip() for name in args.skip_cases.split(",")
                        if name.strip()}
     unavailable = {}
     out_of_memory = set()
+    reference_unavailable = {}
+    reference_out_of_memory = set()
     cases = build_cases(backend, suite, args.dtype)
+    reference_factories = None
+    if paired:
+        reference_factories = {
+            case[0]: case[2]
+            for case in build_cases(reference_backend, suite, args.dtype)
+        }
     unknown_skips = sorted(requested_skips -
                            {case[0] for case in cases})
     if unknown_skips:
@@ -569,49 +645,90 @@ def main(argv=None):
     # on a chained case whose in-flight outputs exceed the device allocator.
     incremental = True
 
-    def write_payload():
-        payload = {
+    def payload_for(side, side_backend, side_measurements, side_unavailable,
+                    side_out_of_memory, side_requested):
+        return {
             "schema_version": 1,
             "benchmark": "mps-operator",
             "suite": suite,
             "dtype": args.dtype,
             "device": _DEVICE,
-            "side": args.side,
-            "runtime": {"name": backend.name, "version": backend.version(),
+            "side": side,
+            "paired": paired,
+            "runtime": {"name": side_backend.name,
+                        "version": side_backend.version(),
                         "device": _DEVICE},
             "timing": {"statistic": "minimum", "min_reps": args.reps,
                        "min_run_time": args.min_run_time,
                        "warmup": args.warmup, "rounds": args.rounds,
                        "chain_reps": args.chain},
-            "skipped": {"requested": sorted(requested_skips),
-                        "unavailable": dict(unavailable),
-                        "out_of_memory": sorted(out_of_memory)},
-            "measurements": list(measurements.values()),
+            "skipped": {"requested": sorted(side_requested),
+                        "unavailable": dict(side_unavailable),
+                        "out_of_memory": sorted(side_out_of_memory)},
+            "measurements": list(side_measurements.values()),
         }
+
+    def write_payload():
+        # In a paired run our side never requests skips: a case named there
+        # still runs here, it just cannot be paired with the other runtime.
+        payload = payload_for(args.side, backend, measurements, unavailable,
+                              out_of_memory, () if paired else requested_skips)
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
         args.json_out.write_text(json.dumps(payload, indent=2) + "\n",
                                  encoding="utf-8")
+        if paired:
+            reference_payload = payload_for(
+                "reference", reference_backend, reference_measurements,
+                reference_unavailable, reference_out_of_memory,
+                requested_skips)
+            args.reference_json_out.parent.mkdir(parents=True, exist_ok=True)
+            args.reference_json_out.write_text(
+                json.dumps(reference_payload, indent=2) + "\n",
+                encoding="utf-8")
         return payload
 
-    print(f"side={args.side} suite={suite} dtype={args.dtype} "
-          f"chain={args.chain} cases={len(cases)}")
-    if args.side == "reference":
-        print(backend.describe())
+    def measurement_entry(name, category, specs, flops, samples, chain):
+        entry = {
+            "name": name,
+            "category": category,
+            "input_shapes": [list(value[1]) for value in specs],
+            "seconds": min(samples),
+            "chain": chain,
+            "sample_count": len(samples),
+            "median_seconds": statistics.median(samples),
+            "max_seconds": max(samples),
+        }
+        if flops:
+            entry["flops"] = flops
+        if _moves_data(name):
+            entry["bytes_moved"] = _estimate_bytes(specs,
+                                                   _ITEMSIZE[args.dtype])
+        return entry
+
+    print(f"side={'paired' if paired else args.side} suite={suite} "
+          f"dtype={args.dtype} chain={args.chain} cases={len(cases)}")
+    if paired or args.side == "reference":
+        print((reference_backend if paired else backend).describe())
     reps_per_round = math.ceil(args.reps / args.rounds)
     time_per_round = args.min_run_time / args.rounds
     # Each side keeps whatever its allocator reuses for the rest of the pass;
     # flushing between cases would time allocator setup instead of the
     # operation and would compare the two sides under different rules.
     backend.release_cached_memory()
+    if paired:
+        reference_backend.release_cached_memory()
     for round_index in range(args.rounds):
         print(f"round {round_index + 1}/{args.rounds}")
         # Rotate the starting case so each pass samples a different ordering.
         offset = round_index * len(cases) // args.rounds
         ordered_cases = cases[offset:] + cases[:offset]
         for name, category, factory, specs, flops in ordered_cases:
-            if name in requested_skips or name in unavailable:
+            if name in unavailable:
+                continue
+            if not paired and name in requested_skips:
                 continue
             print(f"running {name}")
+            ref_fn = None
             # Probe support on the first pass, including tensor creation, so a
             # case the device cannot run or provision is reported and skipped;
             # later failures must abort.
@@ -633,38 +750,73 @@ def main(argv=None):
                 chain = _chain_for(args.chain, specs, _ITEMSIZE[args.dtype],
                                    output_bytes)
                 chains_by_name[name] = chain
+                if paired and name not in requested_skips:
+                    try:
+                        ref_fn = reference_factories[name]()
+                        ref_result = ref_fn()
+                        reference_backend.synchronize()
+                        reference_bytes = _storage_bytes(ref_result)
+                        del ref_result
+                    except (NotImplementedError, RuntimeError) as exc:
+                        message = str(exc)
+                        print(f"{name:42} [reference skipped: {message}]")
+                        reference_unavailable[name] = message
+                        if "out of memory" in message.lower():
+                            reference_out_of_memory.add(name)
+                        ref_fn = None
+                    else:
+                        reference_chains_by_name[name] = _chain_for(
+                            args.chain, specs, _ITEMSIZE[args.dtype],
+                            reference_bytes)
             else:
                 fn = factory()
                 chain = chains_by_name[name]
+                if paired and name not in requested_skips and \
+                        name not in reference_unavailable:
+                    ref_fn = reference_factories[name]()
             samples = samples_by_name.setdefault(name, [])
-            samples.extend(_time(fn, reps_per_round, time_per_round,
-                                 args.warmup, backend.synchronize, chain))
-            seconds = min(samples)
-            entry = {
-                "name": name,
-                "category": category,
-                "input_shapes": [list(value[1]) for value in specs],
-                "seconds": seconds,
-                "chain": chain,
-                "sample_count": len(samples),
-                "median_seconds": statistics.median(samples),
-                "max_seconds": max(samples),
-            }
-            if flops:
-                entry["flops"] = flops
-            if _moves_data(name):
-                entry["bytes_moved"] = _estimate_bytes(specs,
-                                                       _ITEMSIZE[args.dtype])
-            print(f"{name:42} {seconds * 1e3:10.3f} ms "
-                  f"({len(samples)} samples of x{chain}, median "
-                  f"{statistics.median(samples) * 1e3:.3f} ms)")
+            if paired and ref_fn is not None:
+                ref_chain = reference_chains_by_name[name]
+                our_samples, ref_samples = _paired_time(
+                    fn, ref_fn, reps_per_round, time_per_round, args.warmup,
+                    backend.synchronize, reference_backend.synchronize,
+                    chain, ref_chain)
+                samples.extend(our_samples)
+                reference_samples_by_name.setdefault(name, []).extend(
+                    ref_samples)
+                paired_speedups.setdefault(name, []).extend(
+                    theirs / ours
+                    for ours, theirs in zip(our_samples, ref_samples))
+            else:
+                samples.extend(_time(fn, reps_per_round, time_per_round,
+                                     args.warmup, backend.synchronize, chain))
+            entry = measurement_entry(name, category, specs, flops, samples,
+                                      chain)
+            if name in paired_speedups:
+                entry["paired_speedup"] = statistics.median(
+                    paired_speedups[name])
+            print(f"{name:42} {entry['seconds'] * 1e3:10.3f} ms "
+                  f"({entry['sample_count']} samples of x{chain}, median "
+                  f"{entry['median_seconds'] * 1e3:.3f} ms)")
             measurements[name] = entry
+            if ref_fn is not None:
+                ref_entry = measurement_entry(
+                    name, category, specs, flops,
+                    reference_samples_by_name[name], ref_chain)
+                print(f"{'  reference ' + name:42} "
+                      f"{ref_entry['seconds'] * 1e3:10.3f} ms "
+                      f"({ref_entry['sample_count']} samples of x{ref_chain}, "
+                      f"median {ref_entry['median_seconds'] * 1e3:.3f} ms)")
+                reference_measurements[name] = ref_entry
+                del ref_fn
             if incremental:
                 write_payload()
             del fn
 
     write_payload()
     print(f"wrote results: {args.json_out}")
+    if paired:
+        print(f"wrote reference results: {args.reference_json_out}")
 
 
 if __name__ == "__main__":

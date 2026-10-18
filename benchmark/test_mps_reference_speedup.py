@@ -256,6 +256,51 @@ class TestTwoPassRun(unittest.TestCase):
             ])
         return json.loads(out.read_text(encoding="utf-8"))
 
+    def _run_paired(self, out, reference_out, skips=""):
+        argv = ["--paired",
+                "--suite", "short", "--reps", "1", "--min-run-time", "0",
+                "--warmup", "1", "--rounds", "1",
+                "--json-out", str(out),
+                "--reference-json-out", str(reference_out)]
+        if skips:
+            argv.extend(["--skip-cases", skips])
+        with contextlib.redirect_stdout(io.StringIO()):
+            bench_mps_operator.main(argv)
+        return (json.loads(out.read_text(encoding="utf-8")),
+                json.loads(reference_out.read_text(encoding="utf-8")))
+
+    def test_paired_run_writes_both_sides(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ours, theirs = self._run_paired(Path(tmp) / "ours.json",
+                                            Path(tmp) / "ref.json")
+        self.assertTrue(ours["paired"])
+        self.assertTrue(theirs["paired"])
+        self.assertEqual(ours["side"], "ours")
+        self.assertEqual(theirs["side"], "reference")
+        names = [item["name"] for item in ours["measurements"]]
+        self.assertEqual(names, [item["name"]
+                                 for item in theirs["measurements"]])
+        self.assertGreater(len(names), 50)
+        self.assertTrue(all("paired_speedup" in item
+                            for item in ours["measurements"]))
+        summary = summarize(join(ours, theirs))
+        self.assertGreater(summary["compared"], 50)
+        self.assertIsNotNone(summary["paired_win_rate"])
+
+    def test_paired_run_keeps_a_declared_skip_unpaired(self):
+        skipped = "layer_norm[64x1024]"
+        with tempfile.TemporaryDirectory() as tmp:
+            ours, theirs = self._run_paired(Path(tmp) / "ours.json",
+                                            Path(tmp) / "ref.json",
+                                            skips=skipped)
+        self.assertIn(skipped, [item["name"]
+                                for item in ours["measurements"]])
+        self.assertNotIn(skipped, [item["name"]
+                                   for item in theirs["measurements"]])
+        summary = summarize(join(ours, theirs))
+        self.assertIn(skipped, summary["unpaired"])
+        self.assertEqual(evaluate(summary, 0.0, 0.0, None), [])
+
     def test_two_passes_join_into_pairs(self):
         with tempfile.TemporaryDirectory() as tmp:
             ours = self._run("ours", Path(tmp) / "ours.json")
