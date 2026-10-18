@@ -34,9 +34,10 @@ int64_t wrap_dim(int64_t dim, int64_t ndim) {
 
 // Returns a contiguous int64 copy of `index` with every entry checked against
 // `dim_size`. Short indices are scanned on the host; longer ones are checked
-// by a kernel, whose result the host reads back before the gather/scatter
-// launch. The kernels wrap negative entries, so a passing check guarantees
-// every index addresses the dimension.
+// by a kernel encoded on the stream just before the gather/scatter, which
+// reports a bad entry into the stream's error buffer. The access kernels wrap
+// and clamp, so an entry that is still in flight while the report is pending
+// stays inside the storage.
 Tensor normalize_index(const Tensor& index, int64_t dim_size) {
   Tensor idx = index;
   if (idx.dtype() != DType::Int64) {
@@ -66,29 +67,21 @@ Tensor normalize_index(const Tensor& index, int64_t dim_size) {
     return idx;
   }
 
-  // The flag tensor doubles as the readback: out[0] becomes nonzero and out[1]
-  // holds the first offending value a failing thread reports.
-  Tensor flags = Tensor::zeros({2}, DType::Int64, idx.device());
+  // The check goes onto the stream right before the gather/scatter that needs
+  // it, so both share one command buffer; the wait that drains it raises the
+  // report instead of this call waiting for a host readback.
   const std::string kernel =
       "index_bounds_check_" + scalarToMetalTypeString(idx.dtype());
   auto pso = lib.getPipelineStateForFunc(kernel);
   MPSStream* stream = getCurrentMPSStream();
   dispatch_sync_with_rethrow(stream->queue(), ^() {
     @autoreleasepool {
-      stream->endKernelCoalescing();
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:pso];
-      mtl_setArgs(encoder, idx, dim_size, flags);
+      mtl_setArgs(encoder, idx, dim_size, stream->errorBuffer());
       mtl_dispatch1DJob(encoder, pso, static_cast<NSUInteger>(n));
-      stream->synchronize(SyncType::COMMIT_AND_WAIT);
     }
   });
-  synchronizeHostAccess();
-  const int64_t* report = flags.data_ptr<int64_t>();
-  if (report[0] != 0) {
-    TP_THROW(IndexError, "index ", report[1],
-             " is out of bounds for dimension ", dim_size);
-  }
   return idx;
 }
 
@@ -104,14 +97,12 @@ void dispatch_indexing(const std::string& kernel, const Tensor& output,
   MPSStream* stream = getCurrentMPSStream();
   dispatch_sync_with_rethrow(stream->queue(), ^() {
     @autoreleasepool {
-      stream->endKernelCoalescing();
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:pso];
       mtl_setArgs(encoder, output, input, index, inner, dim_size, idx_dim);
       mtl_dispatch3DJob(encoder, pso, static_cast<NSUInteger>(inner),
                         static_cast<NSUInteger>(idx_dim),
                         static_cast<NSUInteger>(outer));
-      stream->synchronize(SyncType::COMMIT);
     }
   });
 }
@@ -127,14 +118,12 @@ void dispatch_scatter_value(const std::string& kernel, const Tensor& output,
   MPSStream* stream = getCurrentMPSStream();
   dispatch_sync_with_rethrow(stream->queue(), ^() {
     @autoreleasepool {
-      stream->endKernelCoalescing();
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:pso];
       mtl_setArgs(encoder, output, value, index, inner, out_dim, idx_dim);
       mtl_dispatch3DJob(encoder, pso, static_cast<NSUInteger>(inner),
                         static_cast<NSUInteger>(idx_dim),
                         static_cast<NSUInteger>(outer));
-      stream->synchronize(SyncType::COMMIT);
     }
   });
 }
@@ -148,12 +137,10 @@ void dispatch_masked_fill(const Tensor& out, const Tensor& mask,
   MPSStream* stream = getCurrentMPSStream();
   dispatch_sync_with_rethrow(stream->queue(), ^() {
     @autoreleasepool {
-      stream->endKernelCoalescing();
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:pso];
       mtl_setArgs(encoder, out, mask, input, value);
       mtl_dispatch1DJob(encoder, pso, static_cast<NSUInteger>(out.numel()));
-      stream->synchronize(SyncType::COMMIT);
     }
   });
 }

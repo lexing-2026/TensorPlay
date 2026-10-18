@@ -82,6 +82,13 @@ class P10_API MPSStream {
   void endKernelCoalescing();
   void synchronize(SyncType syncType);
 
+  /// Device buffer a kernel can use to report an asynchronous validation
+  /// failure; the report is raised by the wait that drains the work. Layout is
+  /// [reported, value, dimension size, reserved] as 64-bit words.
+  MTLBuffer_t errorBuffer() const {
+    return _errorBuffer;
+  }
+
   /// True while this stream holds work that has not been waited on yet, either
   /// still being encoded or already committed. A host read of shared storage
   /// only has to wait when this is set.
@@ -119,6 +126,7 @@ class P10_API MPSStream {
  private:
   Stream _stream;
   MTLCommandQueue_t _commandQueue = nil;
+  MTLBuffer_t _errorBuffer = nil;
   MPSCommandBuffer_t _commandBuffer = nil;
   MPSCommandBuffer_t _prevCommandBuffer = nil;
   MTLComputeCommandEncoder_t _commandEncoder = nil;
@@ -136,6 +144,9 @@ class P10_API MPSStream {
   void commitAndWait();
   void commitAndContinue();
   void flush();
+  // Raises a failure reported by a kernel, after the work that wrote it has
+  // completed. Clears the report so the next wait starts clean.
+  void checkError();
 };
 
 /**

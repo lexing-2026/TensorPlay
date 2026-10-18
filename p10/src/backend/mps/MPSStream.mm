@@ -6,6 +6,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstring>
 #include <mutex>
 
 // The public header exposes enableCommitAndContinue as readonly; the backend
@@ -27,6 +28,10 @@ MPSStream::MPSStream(Stream stream) : _stream(stream) {
     TP_THROW(RuntimeError, "MPSStream constructed with a non-MPS stream");
   }
   _serialQueue = dispatch_queue_create("tensorplay mps stream", nullptr);
+  _errorBuffer = [MPSDevice::getInstance()->device()
+      newBufferWithLength:4 * sizeof(int64_t)
+                options:MTLResourceStorageModeShared];
+  std::memset([_errorBuffer contents], 0, 4 * sizeof(int64_t));
   _executionDescriptor = [MPSGraphExecutionDescriptor new];
   _compilationDescriptor = [MPSGraphCompilationDescriptor new];
   // A launch commits the stream's command buffer as one stage and encoding
@@ -46,6 +51,10 @@ MPSStream::~MPSStream() {
   _executionDescriptor = nil;
   [_compilationDescriptor release];
   _compilationDescriptor = nil;
+  if (_errorBuffer) {
+    [_errorBuffer release];
+    _errorBuffer = nil;
+  }
   if (_commandBuffer) {
     [_commandBuffer release];
     _commandBuffer = nil;
@@ -130,6 +139,22 @@ void MPSStream::commitAndWait() {
     _commandBuffer = nil;
   }
   _pendingWork.store(false, std::memory_order_relaxed);
+  checkError();
+}
+
+void MPSStream::checkError() {
+  if (!_errorBuffer) {
+    return;
+  }
+  auto* report = static_cast<int64_t*>([_errorBuffer contents]);
+  if (report[0] == 0) {
+    return;
+  }
+  const int64_t value = report[1];
+  const int64_t dim_size = report[2];
+  report[0] = 0;
+  TP_THROW(IndexError, "index ", value, " is out of bounds for dimension ",
+           dim_size);
 }
 
 void MPSStream::commitAndContinue() {

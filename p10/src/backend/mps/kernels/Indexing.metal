@@ -12,8 +12,18 @@ using namespace p10::metal;
 // directly -- x walks `inner`, y the indexed dimension, z the leading dims --
 // so no thread has to decompose a flat index.
 //
-// Indices are validated and wrapped on the host before dispatch, so the
-// kernels read them directly without bounds checks.
+// A bounds-check kernel is encoded ahead of the gather/scatter in the same
+// command buffer and reports a bad entry into the stream's error buffer; the
+// wait that drains the work raises it. Until it does, the access kernels clamp
+// their index so an out-of-range entry cannot address outside the storage.
+
+// Wraps a negative entry and clamps anything still outside the dimension, so a
+// reported entry cannot make the access kernels read or write out of bounds.
+static inline ulong wrapped_index(long raw, long dim) {
+  long idx = raw < 0 ? raw + dim : raw;
+  idx = idx < 0 ? 0 : (idx >= dim ? dim - 1 : idx);
+  return static_cast<ulong>(idx);
+}
 
 // index_select: output[o, j, i] = input[o, index[j], i]
 template <typename T, typename IT>
@@ -26,8 +36,7 @@ kernel void index_select_dense(
     constant long& n_idx [[buffer(5)]],
     uint3 tid [[thread_position_in_grid]]) {
   const ulong x = tid.x;
-  const long raw = static_cast<long>(index[tid.y]);
-  const ulong j = static_cast<ulong>(raw < 0 ? raw + in_dim : raw);
+  const ulong j = wrapped_index(static_cast<long>(index[tid.y]), in_dim);
   const ulong o = tid.z;
   const ulong out_off = (o * n_idx + tid.y) * inner + x;
   const ulong in_off = (o * in_dim + j) * inner + x;
@@ -46,8 +55,7 @@ kernel void gather_dense(
     uint3 tid [[thread_position_in_grid]]) {
   const ulong x = tid.x;
   const ulong pos = (ulong(tid.z) * idx_dim + tid.y) * inner + x;
-  const long raw = static_cast<long>(index[pos]);
-  const long idx = raw < 0 ? raw + in_dim : raw;
+  const ulong idx = wrapped_index(static_cast<long>(index[pos]), in_dim);
   const ulong in_off = (ulong(tid.z) * in_dim + idx) * inner + x;
   output[pos] = input[in_off];
 }
@@ -64,8 +72,7 @@ kernel void scatter_set_dense(
     uint3 tid [[thread_position_in_grid]]) {
   const ulong x = tid.x;
   const ulong pos = (ulong(tid.z) * idx_dim + tid.y) * inner + x;
-  const long raw = static_cast<long>(index[pos]);
-  const long idx = raw < 0 ? raw + out_dim : raw;
+  const ulong idx = wrapped_index(static_cast<long>(index[pos]), out_dim);
   const ulong out_off = (ulong(tid.z) * out_dim + idx) * inner + x;
   output[out_off] = src[pos];
 }
@@ -82,8 +89,7 @@ kernel void scatter_set_dense_value(
     uint3 tid [[thread_position_in_grid]]) {
   const ulong x = tid.x;
   const ulong pos = (ulong(tid.z) * idx_dim + tid.y) * inner + x;
-  const long raw = static_cast<long>(index[pos]);
-  const long idx = raw < 0 ? raw + out_dim : raw;
+  const ulong idx = wrapped_index(static_cast<long>(index[pos]), out_dim);
   const ulong out_off = (ulong(tid.z) * out_dim + idx) * inner + x;
   output[out_off] = value;
 }
@@ -100,8 +106,7 @@ kernel void scatter_add_dense(
     uint3 tid [[thread_position_in_grid]]) {
   const ulong x = tid.x;
   const ulong pos = (ulong(tid.z) * idx_dim + tid.y) * inner + x;
-  const long raw = static_cast<long>(index[pos]);
-  const long idx = raw < 0 ? raw + out_dim : raw;
+  const ulong idx = wrapped_index(static_cast<long>(index[pos]), out_dim);
   const ulong out_off = (ulong(tid.z) * out_dim + idx) * inner + x;
   AtomicType<T>::atomic_add(
       reinterpret_cast<device AtomicType_t<T>*>(output), out_off, src[pos]);
@@ -120,8 +125,9 @@ kernel void masked_fill_scalar(
 }
 
 // Reports an index that cannot address the indexed dimension. `out[0]` becomes
-// nonzero and `out[1]` holds the offending value; the host reads them after
-// the launch completes and raises before any gather/scatter kernel runs.
+// nonzero, `out[1]` holds the offending value and `out[2]` the dimension size;
+// the report is raised by the next wait that drains the work. Any offending
+// entry is representative, so the stores need no ordering between threads.
 template <typename IT>
 kernel void index_bounds_check(
     constant IT* index [[buffer(0)]],
@@ -130,8 +136,9 @@ kernel void index_bounds_check(
     uint tid [[thread_position_in_grid]]) {
   const long raw = static_cast<long>(index[tid]);
   if (raw < -dim_size || raw >= dim_size) {
-    out[0] = 1;
     out[1] = raw;
+    out[2] = dim_size;
+    out[0] = 1;
   }
 }
 
