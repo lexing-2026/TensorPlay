@@ -279,7 +279,7 @@ void copy_staging_to_vtensor(
             pipeline_barrier,
             api::PipelineStage::TRANSFER,
             api::MemoryAccessType::WRITE),
-        {static_cast<uint32_t>(staging.buffer().mem_size()), 0u, 0u},
+        {static_cast<uint32_t>(staging.nbytes()), 0u, 0u},
         {0u, 0u, 0u},
         {0u, 0u, 0u},
         VK_NULL_HANDLE);

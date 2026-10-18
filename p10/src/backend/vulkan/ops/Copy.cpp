@@ -84,7 +84,7 @@ void transfer_cpu_to_vulkan(const Tensor& src, api::vTensor& v_dst) {
             pipeline_barrier,
             api::PipelineStage::TRANSFER,
             api::MemoryAccessType::WRITE),
-        {static_cast<uint32_t>(staging.buffer().mem_size()), 0u, 0u},
+        {static_cast<uint32_t>(staging.nbytes()), 0u, 0u},
         {0u, 0u, 0u},
         {0u, 0u, 0u},
         VK_NULL_HANDLE);
