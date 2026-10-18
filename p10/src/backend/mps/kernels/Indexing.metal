@@ -21,7 +21,8 @@ using namespace p10::metal;
 // reported entry cannot make the access kernels read or write out of bounds.
 static inline ulong wrapped_index(long raw, long dim) {
   long idx = raw < 0 ? raw + dim : raw;
-  idx = idx < 0 ? 0 : (idx >= dim ? dim - 1 : idx);
+  const long top = dim > 0 ? dim - 1 : 0;
+  idx = idx < 0 ? 0 : (idx >= dim ? top : idx);
   return static_cast<ulong>(idx);
 }
 
@@ -41,6 +42,28 @@ kernel void index_select_dense(
   const ulong out_off = (o * n_idx + tid.y) * inner + x;
   const ulong in_off = (o * in_dim + j) * inner + x;
   output[out_off] = input[in_off];
+}
+
+// Byte-wise form of index_select: one thread moves a unit of 16, 8 or 4 bytes
+// through the storage, so a row takes a fraction of the threads the element
+// form needs. The host picks the widest unit that divides the row span and
+// both base addresses.
+template <typename IT, typename Unit>
+kernel void index_select_dense_vec(
+    device uchar* output [[buffer(0)]],
+    const device uchar* input [[buffer(1)]],
+    constant IT* index [[buffer(2)]],
+    constant long& inner_units [[buffer(3)]],
+    constant long& in_dim [[buffer(4)]],
+    constant long& n_idx [[buffer(5)]],
+    uint3 tid [[thread_position_in_grid]]) {
+  const ulong x = tid.x;
+  const ulong j = wrapped_index(static_cast<long>(index[tid.y]), in_dim);
+  const ulong o = tid.z;
+  const ulong out_off = (o * n_idx + tid.y) * inner_units + x;
+  const ulong in_off = (o * in_dim + j) * inner_units + x;
+  reinterpret_cast<device Unit*>(output)[out_off] =
+      reinterpret_cast<const device Unit*>(input)[in_off];
 }
 
 // gather: output[o, c, i] = input[o, index[o, c, i], i]
@@ -221,6 +244,21 @@ kernel void index_bounds_check(
 
 REGISTER_INDEX_BOUNDS_CHECK(int)
 REGISTER_INDEX_BOUNDS_CHECK(long)
+
+#define REGISTER_INDEX_SELECT_VEC(NAME, UNIT)                                \
+  template [[host_name("index_select_vec" #NAME "_long")]] kernel void       \
+  index_select_dense_vec<long, UNIT>(                                        \
+      device uchar * output [[buffer(0)]],                                   \
+      const device uchar * input [[buffer(1)]],                              \
+      constant long * index [[buffer(2)]],                                   \
+      constant long & inner_units [[buffer(3)]],                             \
+      constant long & in_dim [[buffer(4)]],                                  \
+      constant long & n_idx [[buffer(5)]],                                   \
+      uint3 tid [[thread_position_in_grid]]);
+
+REGISTER_INDEX_SELECT_VEC(16, uint4)
+REGISTER_INDEX_SELECT_VEC(8, uint2)
+REGISTER_INDEX_SELECT_VEC(4, uint)
 
 REGISTER_INDEXING_DTYPE(float)
 REGISTER_INDEXING_DTYPE(half)

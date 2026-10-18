@@ -10,7 +10,9 @@
 
 #include <Metal/Metal.h>
 
+#include <cstdint>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -105,6 +107,54 @@ void dispatch_indexing(const std::string& kernel, const Tensor& output,
                         static_cast<NSUInteger>(outer));
     }
   });
+}
+
+// Dispatches the byte-wise index_select when the row span and both base
+// addresses admit a 16-, 8- or 4-byte unit; returns false when the row has to
+// be copied one element at a time.
+bool dispatch_index_select_wide(const Tensor& output, const Tensor& input,
+                                const Tensor& index, int64_t inner,
+                                int64_t dim_size, int64_t idx_dim) {
+  const int64_t row_bytes = inner * output.itemsize();
+  const uintptr_t src_bits = reinterpret_cast<uintptr_t>(input.data_ptr());
+  const uintptr_t dst_bits = reinterpret_cast<uintptr_t>(output.data_ptr());
+  const char* suffix = nullptr;
+  int64_t unit = 0;
+  if (row_bytes % 16 == 0 && ((src_bits | dst_bits) & 15) == 0) {
+    unit = 16;
+    suffix = "16";
+  } else if (row_bytes % 8 == 0 && ((src_bits | dst_bits) & 7) == 0) {
+    unit = 8;
+    suffix = "8";
+  } else if (row_bytes % 4 == 0 && ((src_bits | dst_bits) & 3) == 0) {
+    unit = 4;
+    suffix = "4";
+  }
+  if (unit == 0) {
+    return false;
+  }
+  const int64_t units = row_bytes / unit;
+  const int64_t outer = output.numel() / (inner * idx_dim);
+  constexpr int64_t kMaxGrid =
+      static_cast<int64_t>(std::numeric_limits<uint32_t>::max());
+  if (units > kMaxGrid || idx_dim > kMaxGrid || outer > kMaxGrid) {
+    return false;
+  }
+  const std::string kernel =
+      std::string("index_select_vec") + suffix + "_long";
+  auto pso = lib.getPipelineStateForFunc(kernel);
+  MPSStream* stream = getCurrentMPSStream();
+  dispatch_sync_with_rethrow(stream->queue(), ^() {
+    @autoreleasepool {
+      auto encoder = stream->commandEncoder();
+      [encoder setComputePipelineState:pso];
+      mtl_setArgs(encoder, output, input, index, units, dim_size, idx_dim);
+      mtl_dispatch3DJob(encoder, pso, static_cast<NSUInteger>(units),
+                        static_cast<NSUInteger>(idx_dim),
+                        static_cast<NSUInteger>(outer));
+    }
+  });
+  return true;
 }
 
 // Dispatches the scalar-value scatter kernel. `value` is converted to the
@@ -257,15 +307,23 @@ Tensor index_select_kernel(const Tensor& self, int64_t dim,
     return result;
   }
   Tensor self_c = self.contiguous();
+  // With the indexed dimension empty every entry is out of bounds; the check
+  // the stream already holds raises when it drains, and nothing is gathered.
+  if (self.numel() == 0) {
+    synchronizeHostAccess();
+    return result;
+  }
   int64_t inner = 1;
   for (int64_t i = dim + 1; i < nd; ++i) {
     inner *= self.size(i);
   }
-  const std::string kernel =
-      "index_select_dense_" + scalarToMetalTypeString(result.dtype()) +
-      "_long";
-  dispatch_indexing(kernel, result, self_c, idx_c, inner, row, n_idx,
-                    result.numel());
+  if (!dispatch_index_select_wide(result, self_c, idx_c, inner, row, n_idx)) {
+    const std::string kernel =
+        "index_select_dense_" + scalarToMetalTypeString(result.dtype()) +
+        "_long";
+    dispatch_indexing(kernel, result, self_c, idx_c, inner, row, n_idx,
+                      result.numel());
+  }
   return result;
 }
 
