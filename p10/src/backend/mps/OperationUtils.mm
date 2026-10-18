@@ -1412,18 +1412,21 @@ void dispatchChunkReduce(MTLComputePipelineState_t pso, void* out_buf,
   });
 }
 
-} // namespace
-
-std::optional<Tensor> chunkedRowSumShader(const Tensor& self,
-                                          const std::vector<int64_t>& out_shape,
-                                          float divisor) {
+// Encodes the chunk pass and the fold pass over one long unit-stride float
+// operand and returns the single-element result. `chunk_kernel` selects what
+// each chunk accumulates (the elements or their squares); both forms fold the
+// partials with the same per-row sum kernel.
+std::optional<Tensor> chunked_row_reduce(const Tensor& self,
+                                         const std::vector<int64_t>& out_shape,
+                                         const char* chunk_kernel,
+                                         float divisor) {
   uint32_t numel = 0;
   if (!wholeRowSpan(self, DType::Float32, out_shape, numel)) {
     return std::nullopt;
   }
   const uint32_t groups =
       p10::metal::ceil_div<uint32_t>(numel, kChunkedRowChunk);
-  MTLComputePipelineState_t chunk_pso = shaderPipelineNamed("sumchunk_float");
+  MTLComputePipelineState_t chunk_pso = shaderPipelineNamed(chunk_kernel);
   MTLComputePipelineState_t fold_pso = shaderPipelineNamed("rowsum_float");
   if (!chunk_pso || !fold_pso) {
     return std::nullopt;
@@ -1449,6 +1452,19 @@ std::optional<Tensor> chunkedRowSumShader(const Tensor& self,
                       groups);
   dispatchRowReduce(fold_pso, out_buf, partial_buf, 1, groups, divisor);
   return output;
+}
+
+} // namespace
+
+std::optional<Tensor> chunkedRowSumShader(const Tensor& self,
+                                          const std::vector<int64_t>& out_shape,
+                                          float divisor) {
+  return chunked_row_reduce(self, out_shape, "sumchunk_float", divisor);
+}
+
+std::optional<Tensor> chunkedRowSquareSumShader(
+    const Tensor& self, const std::vector<int64_t>& out_shape) {
+  return chunked_row_reduce(self, out_shape, "sumsqchunk_float", 0.0f);
 }
 
 std::optional<Tensor> chunkedRowExtremumShader(

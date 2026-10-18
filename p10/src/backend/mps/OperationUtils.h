@@ -201,6 +201,13 @@ std::optional<Tensor> softmaxRowShader(const Tensor& self, int64_t dim,
 // the per-row path or the graph.
 std::optional<Tensor> chunkedRowSumShader(
     const Tensor& self, const std::vector<int64_t>& out_shape, float divisor);
+
+// The sum of squares of one long unit-stride float operand whose result holds a
+// single value, dispatched in the same chunked form as chunkedRowSumShader. One
+// read of the operand answers both the square and the sum, so the caller's
+// square root completes a vector norm.
+std::optional<Tensor> chunkedRowSquareSumShader(
+    const Tensor& self, const std::vector<int64_t>& out_shape);
 std::optional<Tensor> chunkedRowExtremumShader(
     const Tensor& self, const std::vector<int64_t>& out_shape, bool is_max);
 

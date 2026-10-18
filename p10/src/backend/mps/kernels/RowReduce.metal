@@ -367,7 +367,10 @@ kernel void logsumexp_row(device T* out [[buffer(0)]],
 // accumulation inside a chunk is the one row_sum_inner uses, so a chunk costs
 // the same per-element work a whole row does -- there are just enough groups
 // to fill the device.
-template <typename T>
+// `Square` folds each element's square into the accumulation instead of the
+// element itself, which answers a vector norm's reduce-everything call from
+// one read of the operand.
+template <typename T, bool Square>
 kernel void sum_chunk(device T* out [[buffer(0)]],
                       constant T* src [[buffer(1)]],
                       constant uint& numel [[buffer(2)]],
@@ -394,11 +397,13 @@ kernel void sum_chunk(device T* out [[buffer(0)]],
   for (uint base = first; base < first + whole; base += stride) {
 #pragma unroll
     for (uint j = 0; j < kSumChains; ++j) {
-      acc[j] += src[base + j * simdgroup_size + lane];
+      const T value = src[base + j * simdgroup_size + lane];
+      acc[j] += Square ? value * value : value;
     }
   }
   for (uint i = first + whole + lane; i < last; i += simdgroup_size) {
-    acc[0] += src[i];
+    const T value = src[i];
+    acc[0] += Square ? value * value : value;
   }
   T total = acc[0];
 #pragma unroll
@@ -534,9 +539,15 @@ kernel void softmax_row(device float* out [[buffer(0)]],
 
 #define REGISTER_SUM_CHUNK(DTYPE)                                       \
   template [[host_name("sumchunk_" #DTYPE)]] kernel void                \
-  sum_chunk<DTYPE>(device DTYPE* out, constant DTYPE* src,              \
-                   constant uint& numel, constant uint& chunk,          \
-                   uint tptg, uint tgid, uint lane, uint group);
+  sum_chunk<DTYPE, false>(device DTYPE* out, constant DTYPE* src,       \
+                          constant uint& numel, constant uint& chunk,   \
+                          uint tptg, uint tgid, uint lane, uint group);
+
+#define REGISTER_SUM_SQ_CHUNK(DTYPE)                                    \
+  template [[host_name("sumsqchunk_" #DTYPE)]] kernel void              \
+  sum_chunk<DTYPE, true>(device DTYPE* out, constant DTYPE* src,        \
+                         constant uint& numel, constant uint& chunk,    \
+                         uint tptg, uint tgid, uint lane, uint group);
 
 #define REGISTER_EXTREMUM_CHUNK(HOST_NAME, OP)                          \
   template [[host_name(#HOST_NAME "_float")]] kernel void               \
@@ -574,6 +585,7 @@ kernel void softmax_row(device float* out [[buffer(0)]],
 
 REGISTER_ROW_SUM(float)
 REGISTER_SUM_CHUNK(float)
+REGISTER_SUM_SQ_CHUNK(float)
 REGISTER_EXTREMUM_CHUNK(maxchunk, arg_max<float>)
 REGISTER_EXTREMUM_CHUNK(minchunk, arg_min<float>)
 template [[host_name("logsumexp_row_float")]] kernel void

@@ -98,6 +98,14 @@ Tensor norm_kernel(const Tensor& self, double p) {
   if (p == -std::numeric_limits<double>::infinity()) {
     return self.abs().min();
   }
+  // The 2-norm is the square root of a sum of squares: one read of the
+  // operand answers both the square and the sum, where the general form walks
+  // it once per elementwise pass before the reduction.
+  if (p == 2.0) {
+    if (auto squares = chunkedRowSquareSumShader(self, {})) {
+      return squares->pow(Scalar(0.5));
+    }
+  }
   return self.abs().pow(Scalar(p)).sum().pow(Scalar(1.0 / p));
 }
 
