@@ -445,6 +445,32 @@ class TestVulkanLlmKernels(unittest.TestCase):
             want = _rope_reference(x.numpy().astype(np.float32), cos, sin, off)
             np.testing.assert_allclose(got.astype(np.float32), want, rtol=0, atol=tol)
 
+    def test_rotary_embedding_over_linear_storage(self):
+        import tensorplay as tp
+        # A token axis longer than the image axis limit has no texture form at
+        # all, so the rotation consumes the row-major payload directly.  The
+        # cosine/sine tables keep their own storage: one position still fits an
+        # image, so a long activation with a short table is the mixed case.
+        tensorplay.manual_seed(211)
+        for B, S, D, table_len, off in (
+                (3, 20000, 64, 20000, 0),
+                (2, 20003, 32, 20008, 5),
+                (1, 16400, 64, 1, 0),
+                (2, 8, 16400, 32, 0)):
+            x_cpu = (tensorplay.randn((B, S, D), device="cpu") * 0.3).numpy()
+            cos_cpu, sin_cpu = _rope_tables(D, table_len)
+            rotated = tp.functional.rotary_embedding(
+                tensorplay.from_numpy(x_cpu.copy()).to("vulkan"),
+                tensorplay.from_numpy(cos_cpu.copy()).to("vulkan"),
+                tensorplay.from_numpy(sin_cpu.copy()).to("vulkan"),
+                position_offset=off)
+            self.assertTrue(rotated.device.is_vulkan())
+            np.testing.assert_allclose(
+                rotated.cpu().numpy(),
+                _rope_reference(x_cpu, cos_cpu, sin_cpu, off),
+                rtol=1e-5, atol=1e-5,
+                err_msg=f"rope over linear storage at B={B} S={S} D={D}")
+
     def test_glu_splits_and_dtypes(self):
         # Gated linear unit over texture storage: first_half *
         # sigmoid(second_half), along whichever axis is halved.  Half
