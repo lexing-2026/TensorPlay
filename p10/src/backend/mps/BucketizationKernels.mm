@@ -11,6 +11,8 @@
 #include <Metal/Metal.h>
 
 #include <algorithm>
+#include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 
@@ -47,10 +49,36 @@ Tensor searchsorted_impl(const Tensor& seq_in, const Tensor& self_in,
     return result;
   }
 
-  const std::string kernel =
+  const std::string name =
       "searchsorted_" + scalarToMetalTypeString(queries.dtype()) + "_" +
-      scalarToMetalTypeString(out_dtype) +
-      (sorter.defined() ? "_sorter" : "");
+      scalarToMetalTypeString(out_dtype);
+
+  // One power-of-two boundary run without a sorter: the search takes a fixed
+  // number of bit-fixing steps with 32-bit positions, four queries per thread.
+  constexpr int64_t kPow2QueryLimit = int64_t{1} << 30;
+  const bool pow2 = is_1d_boundaries != 0 && !sorter.defined() &&
+      idim_bd > 0 && (idim_bd & (idim_bd - 1)) == 0 &&
+      idim_bd <= std::numeric_limits<int32_t>::max() &&
+      numel_in <= kPow2QueryLimit;
+  if (pow2) {
+    auto pso = lib.getPipelineStateForFunc(
+        name + (right ? "_pow2_right" : "_pow2_left"));
+    MPSStream* stream = getCurrentMPSStream();
+    const uint32_t n_bd = static_cast<uint32_t>(idim_bd);
+    const uint32_t n_in = static_cast<uint32_t>(numel_in);
+    const NSUInteger threads = static_cast<NSUInteger>((numel_in + 3) / 4);
+    dispatch_sync_with_rethrow(stream->queue(), ^() {
+      @autoreleasepool {
+        auto encoder = stream->commandEncoder();
+        [encoder setComputePipelineState:pso];
+        mtl_setArgs(encoder, queries, boundaries, result, n_bd, n_in);
+        mtl_dispatch1DJob(encoder, pso, threads);
+      }
+    });
+    return result;
+  }
+
+  const std::string kernel = name + (sorter.defined() ? "_sorter" : "");
   auto pso = lib.getPipelineStateForFunc(kernel);
   const int64_t max_tptg = [pso maxTotalThreadsPerThreadgroup];
   const int64_t tg_size = std::min(max_tptg, numel_in);
