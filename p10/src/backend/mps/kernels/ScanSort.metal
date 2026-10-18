@@ -379,17 +379,27 @@ kernel void sort_merge_kernel(
     uint tid [[thread_position_in_threadgroup]]) {
   const int base = (tgid / inner) * sort_size * inner + (tgid % inner);
   const bool desc = descending != 0;
+  constexpr int kElems = TPTG * TN;
   const uint pos0 = tid * TN;
+
+  // Stage the slice through threadgroup memory with grid-stride copies, so
+  // each global load and store of a SIMD group covers consecutive elements.
+  // The network below then reads each thread's four consecutive elements from
+  // threadgroup memory instead.
+  for (int i = int(tid); i < kElems; i += int(TPTG)) {
+    local_vals[i] = i < sort_size ? input[base + i * inner] : sentinel;
+    local_idx[i] = i < sort_size ? uint(i) : 0xFFFFFFFFu;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
 
   thread T v[TN];
   thread uint idx[TN];
 #pragma unroll
   for (short i = 0; i < TN; ++i) {
-    const int p = int(pos0) + i;
-    v[i] = p < sort_size ? input[base + min(p, sort_size - 1) * inner]
-                         : sentinel;
-    idx[i] = p < sort_size ? uint(p) : 0xFFFFFFFFu;
+    v[i] = local_vals[pos0 + i];
+    idx[i] = local_idx[pos0 + i];
   }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
 
   sort_simd_group<T, TN>(v, idx, tid & 31u, desc);
 
@@ -423,13 +433,16 @@ kernel void sort_merge_kernel(
     sort_merge_pass<T, TN, 256>(local_vals, local_idx, tid, v, idx, desc);
   }
 
+  threadgroup_barrier(mem_flags::mem_threadgroup);
 #pragma unroll
   for (short i = 0; i < TN; ++i) {
-    const int p = int(pos0) + i;
-    if (p < sort_size) {
-      values[base + p * inner] = v[i];
-      indices[base + p * inner] = static_cast<long>(idx[i]);
-    }
+    local_vals[pos0 + i] = v[i];
+    local_idx[pos0 + i] = idx[i];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (int i = int(tid); i < sort_size; i += int(TPTG)) {
+    values[base + i * inner] = local_vals[i];
+    indices[base + i * inner] = static_cast<long>(local_idx[i]);
   }
 }
 
