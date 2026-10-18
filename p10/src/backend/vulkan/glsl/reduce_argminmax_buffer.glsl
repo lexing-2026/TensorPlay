@@ -50,10 +50,12 @@ void main() {
   const int inner_pos = row - outer * uBlock.inner;
   const int base = outer * (uBlock.axis_size * uBlock.inner);
 
-  // The first lane position is the first candidate; lanes past the axis keep
-  // an empty sentinel that loses every comparison (all-equal rows still pick
-  // the smallest real position because its index is smaller than the sentinel).
-  float best = -3.4e38;
+  // Lanes with no candidate hold a sentinel that loses every comparison, so
+  // its sign follows the search direction: a minimum search needs the largest
+  // finite value, a maximum search the smallest.  Their positions are past the
+  // axis, so a tie against a real candidate still falls back to the smaller
+  // index, which is a real one.
+  float best = uBlock.greater != 0 ? -3.4e38 : 3.4e38;
   int best_index = tid;
   if (tid < uBlock.axis_size) {
     best = uInput.data[base + tid * uBlock.inner + inner_pos];
