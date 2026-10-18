@@ -2263,6 +2263,79 @@ class TestVulkanHalfComparison(unittest.TestCase):
             F.gt(device, 3)
 
 
+class TestVulkanHalfWhere(unittest.TestCase):
+    # Over a linear payload a half word carries two lanes while the Bool
+    # condition carries four bytes, so the two condition bytes a result word
+    # needs sit at bit 0 or bit 16 of their word.  Structured conditions, not
+    # random ones, tell those byte slots apart.
+    LENGTHS = (4096, 200003)
+
+    def _gradient(self, count):
+        idx = np.arange(count)
+        return ((idx % 512).astype(np.float16),
+                (512 + idx % 512).astype(np.float16))
+
+    def _patterns(self, count):
+        idx = np.arange(count)
+        return [
+            ("every lane", np.ones(count, dtype=bool)),
+            ("no lane", np.zeros(count, dtype=bool)),
+            ("alternating lanes", idx % 2 == 0),
+            ("lane pairs", (idx % 4) < 2),
+            ("every fourth lane", idx % 4 == 0),
+            ("upper half of each word", (idx % 4) >= 2),
+        ]
+
+    def test_half_where_selects_lanes_in_order(self):
+        import tensorplay.functional as F
+        for count in self.LENGTHS:
+            a_np, b_np = self._gradient(count)
+            a = tensorplay.from_numpy(a_np.copy()).to("vulkan")
+            b = tensorplay.from_numpy(b_np.copy()).to("vulkan")
+            for name, condition in self._patterns(count):
+                device = tensorplay.from_numpy(condition.copy()).to("vulkan")
+                np.testing.assert_array_equal(
+                    F.where(device, a, b).cpu().numpy().view(np.uint16),
+                    np.where(condition, a_np, b_np).view(np.uint16),
+                    err_msg=f"half where selecting {name} at {count} elements")
+
+    def test_half_where_keeps_rejected_lane_out_of_result(self):
+        import tensorplay.functional as F
+        # Selection is per lane and stays in the 16-bit fields: an infinity or a
+        # not-a-number on the rejected side cannot reach the result through
+        # arithmetic recombination.
+        count = 200003
+        a_np = np.full(count, np.inf, dtype=np.float16)
+        a_np[1::7] = np.nan
+        _, b_np = self._gradient(count)
+        a = tensorplay.from_numpy(a_np.copy()).to("vulkan")
+        b = tensorplay.from_numpy(b_np.copy()).to("vulkan")
+        for name, condition in self._patterns(count):
+            device = tensorplay.from_numpy(condition.copy()).to("vulkan")
+            np.testing.assert_array_equal(
+                F.where(device, a, b).cpu().numpy().view(np.uint16),
+                np.where(condition, a_np, b_np).view(np.uint16),
+                err_msg=f"half where with {name} of an infinite branch")
+
+    def test_half_where_with_scalar_branch(self):
+        import tensorplay.functional as F
+        for count in self.LENGTHS:
+            a_np, b_np = self._gradient(count)
+            _, condition = self._patterns(count)[3]
+            a = tensorplay.from_numpy(a_np.copy()).to("vulkan")
+            b = tensorplay.from_numpy(b_np.copy()).to("vulkan")
+            device = tensorplay.from_numpy(condition.copy()).to("vulkan")
+            for scalar in (0.0, -2.5, 65504.0, 70000.0, 3):
+                np.testing.assert_array_equal(
+                    F.where(device, scalar, b).cpu().numpy().view(np.uint16),
+                    np.where(condition, np.float16(scalar), b_np).view(np.uint16),
+                    err_msg=f"half scalar branch {scalar!r} at {count}")
+                np.testing.assert_array_equal(
+                    F.where(device, a, scalar).cpu().numpy().view(np.uint16),
+                    np.where(condition, a_np, np.float16(scalar)).view(np.uint16),
+                    err_msg=f"half scalar branch against {scalar!r} at {count}")
+
+
 if __name__ == "__main__":
     unittest.main()
 
