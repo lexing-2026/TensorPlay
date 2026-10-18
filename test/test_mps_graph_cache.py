@@ -42,6 +42,22 @@ def _range_on_both(shape, dtype=tp.float32):
     return cpu, mps
 
 
+def _repeating_on_both(shape):
+    """Small integers in an order that repeats along the last axis.
+
+    A row of such an operand holds its largest and smallest element several
+    times over, away from either end, so a reduction has to answer with one of
+    the positions rather than with whichever edge it happened to reach first.
+    """
+    count = math.prod(shape)
+    values = [float((7 * i * i + 11 * i) % 13 - 6) for i in range(count)]
+    cpu = tp.reshape(tp.tensor(values, dtype=tp.float32, device="cpu"),
+                     list(shape))
+    mps = tp.reshape(tp.tensor(values, dtype=tp.float32, device="mps"),
+                     list(shape))
+    return cpu, mps
+
+
 def _is_exact(dtype):
     return dtype in (tp.bool, tp.int8, tp.int16, tp.int32, tp.int64)
 
@@ -370,6 +386,220 @@ class TestMPSValueIndexReduce(MPSCase):
                 self.assert_same_result(fn(x_mps), fn(x_cpu))
 
 
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSRowValueAndPredicate(MPSCase):
+    """The last axis of a float or bool operand, answered by one row dispatch.
+
+    A reduction over the innermost axis gives each row one answer, so one SIMD
+    group walks the row and the answer leaves the group: the extremum where
+    amax, amin and the value and index of max and min ask for it, and one byte
+    where all and any ask whether the row holds a nonzero element. A tie keeps
+    the lowest position and a NaN counts as the extremum of its row and as a
+    nonzero element, which is what a scan of the row in the order it lies in
+    answers with -- and what the operand's own CPU reduction answers with.
+    """
+
+    SHAPES = ([4, 9], [37, 5], [2, 3, 64], [3, 33], [128, 1], [8, 6, 130])
+
+    def test_extrema_along_the_last_axis(self):
+        for shape in self.SHAPES:
+            x_cpu, x_mps = _repeating_on_both(shape)
+            for name, fn in (("amax", tp.amax), ("amin", tp.amin)):
+                for keepdim in (False, True):
+                    with self.subTest(shape=shape, op=name, keepdim=keepdim):
+                        self.assert_same_result(
+                            fn(x_mps, dim=[-1], keepdim=keepdim),
+                            fn(x_cpu, dim=[-1], keepdim=keepdim))
+
+    def test_value_and_index_describe_one_element(self):
+        # Both halves of the pair come out of the same pass over the row, so an
+        # index names the element the value was read from -- and it is the same
+        # element its own row's CPU reduction names.
+        for shape in self.SHAPES:
+            x_cpu, x_mps = _repeating_on_both(shape)
+            rows_cpu = tp.reshape(x_cpu, [-1, shape[-1]]).cpu().tolist()
+            for name, fn in (("max", tp.max), ("min", tp.min)):
+                for keepdim in (False, True):
+                    with self.subTest(shape=shape, op=name, keepdim=keepdim):
+                        values, indices = fn(x_mps, dim=-1, keepdim=keepdim)
+                        ref_values, ref_indices = fn(x_cpu, dim=-1,
+                                                     keepdim=keepdim)
+                        self.assert_same_result(values, ref_values)
+                        self.assertEqual(indices.cpu().tolist(),
+                                         ref_indices.cpu().tolist())
+                        got = tp.reshape(values, [-1, 1]).cpu().tolist()
+                        held = tp.reshape(indices, [-1, 1]).cpu().tolist()
+                        for row, (one_value, one_index) in enumerate(
+                                zip(got, held)):
+                            self.assertEqual(one_value[0],
+                                             rows_cpu[row][one_index[0]])
+
+    def test_ties_answer_with_the_lowest_position(self):
+        # One right answer per row in each direction, so a dispatch and a scan
+        # cannot both be correct without agreeing on the position.
+        rows = [[3.0, 5.0, 5.0, 1.0], [7.0, 7.0, 0.0, 7.0],
+                [-4.0, -4.0, 2.0, 2.0], [0.0, 0.0, 0.0, 0.0],
+                [6.0, -6.0, 6.0, -6.0]]
+        cpu = tp.tensor(rows, dtype=tp.float32, device="cpu")
+        mps = tp.tensor(rows, dtype=tp.float32, device="mps")
+        for name, fn, want_values, want_indices in (
+                ("max", tp.max, [5.0, 7.0, 2.0, 0.0, 6.0], [1, 0, 2, 0, 0]),
+                ("min", tp.min, [1.0, 0.0, -4.0, 0.0, -6.0], [3, 2, 0, 0, 1])):
+            with self.subTest(op=name):
+                values, indices = fn(mps, dim=-1)
+                self.assertEqual(values.cpu().tolist(), want_values)
+                self.assertEqual(indices.cpu().tolist(), want_indices)
+                self.assertEqual(fn(cpu, dim=-1)[1].cpu().tolist(),
+                                 want_indices)
+        for name, fn, want in (("amax", tp.amax, [5.0, 7.0, 2.0, 0.0, 6.0]),
+                               ("amin", tp.amin, [1.0, 0.0, -4.0, 0.0, -6.0])):
+            with self.subTest(op=name):
+                self.assertEqual(fn(mps, dim=[-1]).cpu().tolist(), want)
+
+    def test_a_nan_is_the_extremum_of_its_row(self):
+        # A NaN displaces every value and nothing displaces it, so the first of
+        # a row's NaNs answers in both directions. A row without one is
+        # untouched by that rule, so its own extremum still answers.
+        rows = [[1.0, float("nan"), 9.0, float("nan"), 4.0],
+                [-2.0, 7.0, 7.0, 3.0, 8.0],
+                [float("nan"), 5.0, 5.0, 6.0, 0.0],
+                [2.0, 2.0, float("nan"), 1.0, 1.0]]
+        cpu = tp.tensor(rows, dtype=tp.float32, device="cpu")
+        mps = tp.tensor(rows, dtype=tp.float32, device="mps")
+        nan_rows = (0, 2, 3)
+        for name, fn, want_indices, want_finite in (
+                ("max", tp.max, [1, 4, 0, 2], [8.0]),
+                ("min", tp.min, [1, 0, 0, 2], [-2.0])):
+            for keepdim in (False, True):
+                with self.subTest(op=name, keepdim=keepdim):
+                    values, indices = fn(mps, dim=-1, keepdim=keepdim)
+                    flat = tp.reshape(values, [-1]).cpu().tolist()
+                    for row, one in enumerate(flat):
+                        if row in nan_rows:
+                            self.assertTrue(math.isnan(one),
+                                            msg=f"row {row}: {one}")
+                        else:
+                            self.assertEqual(one, want_finite[0])
+                    self.assertEqual(tp.reshape(indices, [-1]).cpu().tolist(),
+                                     want_indices)
+                    ref_values, ref_indices = fn(cpu, dim=-1, keepdim=keepdim)
+                    self.assertEqual(
+                        tp.reshape(ref_indices, [-1]).cpu().tolist(),
+                        want_indices)
+                    self.assertEqual(
+                        [math.isnan(one) for one in
+                         tp.reshape(ref_values, [-1]).cpu().tolist()],
+                        [row in nan_rows for row in range(len(rows))])
+        for name, fn in (("amax", tp.amax), ("amin", tp.amin)):
+            with self.subTest(op=name):
+                flat = tp.reshape(fn(mps, dim=[-1]), [-1]).cpu().tolist()
+                self.assertEqual([math.isnan(one) for one in flat],
+                                 [row in nan_rows for row in range(len(rows))])
+
+    def test_predicates_along_the_last_axis(self):
+        for shape in self.SHAPES:
+            x_cpu, x_mps = _repeating_on_both(shape)
+            # A row of small integers holds zeros and nonzeros, so both answers
+            # are reached within one operand rather than only one of them.
+            for name, fn in (("all", tp.all), ("any", tp.any)):
+                for keepdim in (False, True):
+                    with self.subTest(shape=shape, op=name, keepdim=keepdim):
+                        self.assert_same_result(
+                            fn(x_mps, dim=-1, keepdim=keepdim),
+                            fn(x_cpu, dim=-1, keepdim=keepdim))
+            for name, fn in (("all", tp.all), ("any", tp.any)):
+                with self.subTest(op=name, operand="bool"):
+                    self.assert_same_result(fn(x_mps > 0.0, dim=-1),
+                                            fn(x_cpu > 0.0, dim=-1))
+
+    def test_a_nonzero_test_is_of_the_operand_s_type(self):
+        # Against zero of its own type: a negative zero is not nonzero and a NaN
+        # is, so a row of nothing but zeros and negative zeros answers false to
+        # both questions.
+        rows = [[0.0, -0.0, 0.0], [1.0, -0.0, float("nan")], [0.0, 2.0, 0.0],
+                [3.0, float("nan"), -1.0], [-0.0, -0.0, -0.0]]
+        cpu = tp.tensor(rows, dtype=tp.float32, device="cpu")
+        mps = tp.tensor(rows, dtype=tp.float32, device="mps")
+        for name, fn, want in (("all", tp.all, [False, False, False, True,
+                                                False]),
+                               ("any", tp.any, [False, True, True, True,
+                                                False])):
+            with self.subTest(op=name):
+                self.assertEqual(fn(mps, dim=-1).cpu().tolist(), want)
+                self.assertEqual(fn(cpu, dim=-1).cpu().tolist(), want)
+
+    def test_shader_and_graph_alternate_at_one_call_site(self):
+        # An axis the row dispatch serves sits between axes it declines, so a
+        # call site sees both ways of reducing and has to answer the same way
+        # both times.
+        x_cpu, x_mps = _repeating_on_both([3, 4, 5])
+        b_cpu, b_mps = x_cpu > 0.0, x_mps > 0.0
+        for rep in range(2):
+            for dim in (0, -1, 1, -1, 2, 0, -1):
+                with self.subTest(rep=rep, dim=dim):
+                    for name, fn in (("max", tp.max), ("min", tp.min)):
+                        values, indices = fn(x_mps, dim=dim)
+                        ref_values, ref_indices = fn(x_cpu, dim=dim)
+                        self.assert_same_result(values, ref_values)
+                        self.assertEqual(indices.cpu().tolist(),
+                                         ref_indices.cpu().tolist())
+                    for name, fn in (("all", tp.all), ("any", tp.any)):
+                        self.assert_same_result(fn(x_mps, dim=dim),
+                                                fn(x_cpu, dim=dim))
+                        self.assert_same_result(fn(b_mps, dim=dim),
+                                                fn(b_cpu, dim=dim))
+
+    def test_declined_inputs_agree_with_cpu(self):
+        """The last-axis reductions a single row dispatch hands to the graph."""
+        wide_cpu, wide_mps = _repeating_on_both([6, 8])
+        base_cpu, base_mps = _repeating_on_both([4, 8])
+        # A rank-1 operand leaves no shape for the write to be described with.
+        line_cpu = tp.reshape(wide_cpu[0], [8])
+        line_mps = tp.reshape(wide_mps[0], [8])
+        for name, fn in (("max", tp.max), ("min", tp.min), ("all", tp.all),
+                         ("any", tp.any)):
+            with self.subTest(op=name, operand="rank-1"):
+                if name in ("max", "min"):
+                    values, indices = fn(line_mps, dim=-1)
+                    ref_values, ref_indices = fn(line_cpu, dim=-1)
+                    self.assert_same_result(values, ref_values)
+                    self.assertEqual(indices.cpu().tolist(),
+                                     ref_indices.cpu().tolist())
+                else:
+                    self.assert_same_result(fn(line_mps, dim=-1),
+                                            fn(line_cpu, dim=-1))
+        # A permuted view does not run through its storage in the order the rows
+        # are read in, and a slice that starts inside its storage has no base
+        # offset to give.
+        for name, fn in (("amax", tp.amax), ("amin", tp.amin), ("all", tp.all),
+                         ("any", tp.any)):
+            axis = [-1] if name in ("amax", "amin") else -1
+            with self.subTest(op=name, operand="transposed"):
+                self.assert_same_result(
+                    fn(tp.transpose(base_mps, 0, 1), axis),
+                    fn(tp.transpose(base_cpu, 0, 1), axis))
+            with self.subTest(op=name, operand="offset slice"):
+                self.assert_same_result(fn(base_mps[1:4], axis),
+                                        fn(base_cpu[1:4], axis))
+        # An operand of a type no row kernel is instantiated for reduces in a
+        # type of its own, which the graph builds around the reduction.
+        for dtype in (tp.int64, tp.int32, tp.float16):
+            x_cpu, x_mps = _range_on_both([5, 7], dtype)
+            for name, fn in (("max", tp.max), ("min", tp.min), ("all", tp.all),
+                             ("any", tp.any)):
+                with self.subTest(dtype=dtype, op=name):
+                    if name in ("max", "min"):
+                        values, indices = fn(x_mps, dim=-1)
+                        ref_values, ref_indices = fn(x_cpu, dim=-1)
+                        self.assert_same_result(values, ref_values)
+                        self.assertEqual(indices.cpu().tolist(),
+                                         ref_indices.cpu().tolist())
+                    else:
+                        self.assert_same_result(fn(x_mps, dim=-1),
+                                                fn(x_cpu, dim=-1))
+
+
+@unittest.skipUnless(mps_available(), "MPS not available")
 class TestMPSUnaryOperandReads(MPSCase):
     """A unary float operand read by one shader dispatch, no graph built."""
 
