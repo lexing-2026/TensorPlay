@@ -751,6 +751,304 @@ Tensor gemv_decode_linear(
   return convert(v_output);
 }
 
+/*
+ * Products too wide for a texture, at any row count.  The decode kernels above
+ * give every output column its own invocation and never restages an operand,
+ * which is optimal while a handful of rows makes each weight word a
+ * contributing one; past that point the same words get re-read once per row and
+ * the product becomes bound by how much it moves rather than by how many
+ * threads it has.
+ *
+ * Staging a 32x32 block of each operand through shared memory bounds that
+ * re-reading at 32 uses per fetch, which is also the only way a row-major
+ * weight can be read without striding every warp across the whole matrix: the
+ * staging pass hands consecutive lanes to whichever operand axis runs along
+ * memory.  One workgroup of 8x8 threads covers a 32x32 output block and each
+ * thread keeps a 4x4 accumulator.
+ */
+constexpr int64_t kMmBufferTile = 32;
+constexpr int64_t kMmBufferTileSide = 8;
+
+Tensor mm_buffer_tiled(
+    const api::vTensor& v_lhs,
+    const api::vTensor& v_rhs,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t a_stride_m,
+    int64_t a_stride_k,
+    int64_t b_stride_n,
+    int64_t b_stride_k,
+    const std::optional<Tensor>& bias,
+    Scalar beta,
+    Scalar alpha,
+    DType dtype) {
+  api::Context* const context = api::context();
+
+  TP_CHECK(
+      dtype == DType::Float32,
+      "Vulkan products over buffer-stored operands support Float32 only");
+
+  const bool a_buffer = v_lhs.storage_type() == api::StorageType::BUFFER;
+
+  api::vTensor v_output{context, {M, N}, dtype};
+  const bool out_buffer =
+      v_output.storage_type() == api::StorageType::BUFFER;
+
+  std::optional<api::vTensor> v_bias;
+  if (bias.has_value()) {
+    v_bias = convert(*bias);
+    // The addend binding follows the result's storage, because a linear output
+    // reads it as a flat array while an image output fetches it as a texel.
+    TP_CHECK(
+        v_bias->storage_type() == v_output.storage_type(),
+        "Vulkan products over buffer-stored operands require an addend in the "
+        "same storage as the result");
+  }
+  const std::vector<int64_t> bias_sizes = bias.has_value()
+      ? shape_of(*bias)
+      : std::vector<int64_t>({1, 1});
+
+  const struct MmBufferTiledBlock final {
+    ivec4 out_sizes; // (W=N, H=M, C=1, N=1) logical product sizes
+    ivec4 bias_sizes; // (W, H, C, N) logical sizes of the addend
+    int k_elements; // length of the reduction axis
+    int k_blocks; // reduction tiles to walk
+    int a_stride_m; // element step to the next left row
+    int a_stride_k; // element step to the next left column
+    int b_stride_n; // element step to the next right column
+    int b_stride_k; // element step to the next right row
+    float alpha;
+    float beta;
+  } block{
+      api::utils::make_whcn_ivec4({M, N}),
+      api::utils::make_whcn_ivec4(bias_sizes),
+      static_cast<int32_t>(K),
+      static_cast<int32_t>(
+          api::utils::div_up(api::utils::safe_downcast_to_u32(K),
+                             static_cast<uint32_t>(kMmBufferTile))),
+      static_cast<int32_t>(a_stride_m),
+      static_cast<int32_t>(a_stride_k),
+      static_cast<int32_t>(b_stride_n),
+      static_cast<int32_t>(b_stride_k),
+      alpha.to<float>(),
+      bias.has_value() ? beta.to<float>() : 0.0f,
+  };
+
+  std::string shader = "mm_buffer_tiled";
+  if (a_buffer) {
+    shader += "_lhs";
+  }
+  if (out_buffer) {
+    shader += "_buffer";
+  }
+  if (v_bias.has_value()) {
+    shader += "_bias";
+  }
+  const char* const shader_name = shader.c_str();
+
+  api::UniformParamsBuffer params(context, block);
+  api::PipelineBarrier barrier{};
+
+  // Every workgroup item owns four output entries on each axis.
+  const api::utils::uvec3 grid{
+      api::utils::safe_downcast_to_u32(
+          api::utils::div_up(api::utils::safe_downcast_to_u32(N),
+                            static_cast<uint32_t>(kMmBufferTile)) *
+          kMmBufferTileSide),
+      api::utils::safe_downcast_to_u32(
+          api::utils::div_up(api::utils::safe_downcast_to_u32(M),
+                            static_cast<uint32_t>(kMmBufferTile)) *
+          kMmBufferTileSide),
+      1u,
+  };
+
+  const api::utils::uvec3 local{8u, 8u, 1u};
+  const bool has_bias = v_bias.has_value();
+
+  if (out_buffer) {
+    if (a_buffer) {
+      if (has_bias) {
+        context->submit_compute_job(
+            VK_KERNEL_FROM_STR(shader_name),
+            barrier,
+            grid,
+            local,
+            VK_NULL_HANDLE,
+            v_output.buffer(
+                barrier,
+                api::PipelineStage::COMPUTE,
+                api::MemoryAccessType::WRITE),
+            v_lhs.buffer(barrier, api::PipelineStage::COMPUTE),
+            v_rhs.buffer(barrier, api::PipelineStage::COMPUTE),
+            params.buffer(),
+            v_bias->buffer(barrier, api::PipelineStage::COMPUTE));
+      } else {
+        context->submit_compute_job(
+            VK_KERNEL_FROM_STR(shader_name),
+            barrier,
+            grid,
+            local,
+            VK_NULL_HANDLE,
+            v_output.buffer(
+                barrier,
+                api::PipelineStage::COMPUTE,
+                api::MemoryAccessType::WRITE),
+            v_lhs.buffer(barrier, api::PipelineStage::COMPUTE),
+            v_rhs.buffer(barrier, api::PipelineStage::COMPUTE),
+            params.buffer());
+      }
+    } else {
+      if (has_bias) {
+        context->submit_compute_job(
+            VK_KERNEL_FROM_STR(shader_name),
+            barrier,
+            grid,
+            local,
+            VK_NULL_HANDLE,
+            v_output.buffer(
+                barrier,
+                api::PipelineStage::COMPUTE,
+                api::MemoryAccessType::WRITE),
+            v_lhs.image(barrier, api::PipelineStage::COMPUTE),
+            v_rhs.buffer(barrier, api::PipelineStage::COMPUTE),
+            params.buffer(),
+            v_bias->buffer(barrier, api::PipelineStage::COMPUTE));
+      } else {
+        context->submit_compute_job(
+            VK_KERNEL_FROM_STR(shader_name),
+            barrier,
+            grid,
+            local,
+            VK_NULL_HANDLE,
+            v_output.buffer(
+                barrier,
+                api::PipelineStage::COMPUTE,
+                api::MemoryAccessType::WRITE),
+            v_lhs.image(barrier, api::PipelineStage::COMPUTE),
+            v_rhs.buffer(barrier, api::PipelineStage::COMPUTE),
+            params.buffer());
+      }
+    }
+  } else {
+    if (a_buffer) {
+      if (has_bias) {
+        context->submit_compute_job(
+            VK_KERNEL_FROM_STR(shader_name),
+            barrier,
+            grid,
+            local,
+            VK_NULL_HANDLE,
+            v_output.image(
+                barrier,
+                api::PipelineStage::COMPUTE,
+                api::MemoryAccessType::WRITE),
+            v_lhs.buffer(barrier, api::PipelineStage::COMPUTE),
+            v_rhs.buffer(barrier, api::PipelineStage::COMPUTE),
+            params.buffer(),
+            v_bias->image(barrier, api::PipelineStage::COMPUTE));
+      } else {
+        context->submit_compute_job(
+            VK_KERNEL_FROM_STR(shader_name),
+            barrier,
+            grid,
+            local,
+            VK_NULL_HANDLE,
+            v_output.image(
+                barrier,
+                api::PipelineStage::COMPUTE,
+                api::MemoryAccessType::WRITE),
+            v_lhs.buffer(barrier, api::PipelineStage::COMPUTE),
+            v_rhs.buffer(barrier, api::PipelineStage::COMPUTE),
+            params.buffer());
+      }
+    } else {
+      if (has_bias) {
+        context->submit_compute_job(
+            VK_KERNEL_FROM_STR(shader_name),
+            barrier,
+            grid,
+            local,
+            VK_NULL_HANDLE,
+            v_output.image(
+                barrier,
+                api::PipelineStage::COMPUTE,
+                api::MemoryAccessType::WRITE),
+            v_lhs.image(barrier, api::PipelineStage::COMPUTE),
+            v_rhs.buffer(barrier, api::PipelineStage::COMPUTE),
+            params.buffer(),
+            v_bias->image(barrier, api::PipelineStage::COMPUTE));
+      } else {
+        context->submit_compute_job(
+            VK_KERNEL_FROM_STR(shader_name),
+            barrier,
+            grid,
+            local,
+            VK_NULL_HANDLE,
+            v_output.image(
+                barrier,
+                api::PipelineStage::COMPUTE,
+                api::MemoryAccessType::WRITE),
+            v_lhs.image(barrier, api::PipelineStage::COMPUTE),
+            v_rhs.buffer(barrier, api::PipelineStage::COMPUTE),
+            params.buffer());
+      }
+    }
+  }
+
+  return convert(v_output);
+}
+
+/*
+ * Products over a right operand with no texture form.  A decode-shaped one
+ * never restages an operand, so the split reduction wins there; once more than
+ * a handful of rows share the same weight, the staged tiled product is the one
+ * that keeps the reads minimal.
+ */
+Tensor buffer_product(
+    const api::vTensor& v_lhs,
+    const api::vTensor& v_rhs,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t b_stride_n,
+    int64_t b_stride_k,
+    const std::optional<Tensor>& bias,
+    Scalar beta,
+    Scalar alpha,
+    DType dtype) {
+  if (M <= kGemvMaxRows) {
+    return gemv_decode_linear(
+        v_lhs,
+        v_rhs,
+        M,
+        N,
+        K,
+        b_stride_n,
+        b_stride_k,
+        bias,
+        beta,
+        alpha,
+        dtype);
+  }
+  // Every linear activation reaching here is a dense row-major (M x K)
+  // payload, so its own extents are its strides.
+  return mm_buffer_tiled(
+      v_lhs,
+      v_rhs,
+      M,
+      N,
+      K,
+      K,
+      1,
+      b_stride_n,
+      b_stride_k,
+      bias,
+      beta,
+      alpha,
+      dtype);
+}
+
 Tensor product_dispatch(
     const api::vTensor& v_lhs,
     const api::vTensor& v_rhs,
@@ -892,7 +1190,7 @@ Tensor mm_impl(
   // than relaying it.
   if (v_other.storage_type() == api::StorageType::BUFFER) {
     api::vTensor lhs = gemv_operand_lhs(self);
-    return gemv_decode_linear(
+    return buffer_product(
         lhs, v_other, M, N, K, 1, N, bias, beta, alpha, self.dtype());
   }
 
@@ -1217,7 +1515,7 @@ Tensor matmul_kernel(const Tensor& self_in, const Tensor& other_in) {
                 kTagMmWidthPackedTransposed,
                 [&] { return pack_lhs_width_transposed(lhs_src); })
           : gemv_operand_lhs(lhs_src);
-      return gemv_decode_linear(
+      return buffer_product(
           v_lhs,
           v_rhs_dense,
           M,
@@ -1394,7 +1692,7 @@ Tensor linear_kernel(
     // the layer itself.  The kernel reads the layer's own [out, in] order
     // instead: a column step skips a whole input row, a reduction step walks
     // one.
-    out2 = gemv_decode_linear(
+    out2 = buffer_product(
         v_lhs,
         v_weight,
         M,

@@ -567,6 +567,40 @@ gemv_linear_combine:
   - NAME: gemv_linear_combine_buffer_nobias
     OUTPUT_BUFFER: 1
     HAS_BIAS: 0
+mm_buffer_tiled:
+  parameter_names_with_default_values:
+    A_BUFFER: 0
+    OUTPUT_BUFFER: 1
+    HAS_BIAS: 0
+  shader_variants:
+  - NAME: mm_buffer_tiled
+    A_BUFFER: 0
+    OUTPUT_BUFFER: 0
+  - NAME: mm_buffer_tiled_bias
+    A_BUFFER: 0
+    OUTPUT_BUFFER: 0
+    HAS_BIAS: 1
+  - NAME: mm_buffer_tiled_buffer
+    A_BUFFER: 0
+    OUTPUT_BUFFER: 1
+  - NAME: mm_buffer_tiled_buffer_bias
+    A_BUFFER: 0
+    OUTPUT_BUFFER: 1
+    HAS_BIAS: 1
+  - NAME: mm_buffer_tiled_lhs
+    A_BUFFER: 1
+    OUTPUT_BUFFER: 0
+  - NAME: mm_buffer_tiled_lhs_bias
+    A_BUFFER: 1
+    OUTPUT_BUFFER: 0
+    HAS_BIAS: 1
+  - NAME: mm_buffer_tiled_lhs_buffer
+    A_BUFFER: 1
+    OUTPUT_BUFFER: 1
+  - NAME: mm_buffer_tiled_lhs_buffer_bias
+    A_BUFFER: 1
+    OUTPUT_BUFFER: 1
+    HAS_BIAS: 1
 bmm:
   parameter_names_with_default_values: {}
   generate_variant_forall:

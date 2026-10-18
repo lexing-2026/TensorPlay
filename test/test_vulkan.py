@@ -1160,6 +1160,49 @@ class TestVulkanLinearPayload(unittest.TestCase):
                 rtol=1e-3, atol=1e-3,
                 err_msg=f"linear with bias m={m} k={k} n={n}")
 
+    def test_tiled_product_over_linear_weight(self):
+        import tensorplay as tp
+        import tensorplay.functional as F
+        # Past a handful of rows the decode path would re-read the weight once
+        # per row, so a product with a linear-stored operand stages 32x32 blocks
+        # of both operands through shared memory instead.  Row, reduction and
+        # output counts are all chosen off the tile edges to cover the staged
+        # zeros outside the extents, and the wide-input shapes keep the
+        # activation in linear storage while the result still fits an image.
+        tensorplay.manual_seed(61)
+        for m, k, n in ((37, 640, 20003), (64, 1000, 17000), (40, 20003, 100)):
+            a_cpu = (tp.randn((m, k), device="cpu") * 0.5).numpy()
+            b_cpu = (tp.randn((k, n), device="cpu") * 0.02).numpy()
+            bias_cpu = (tp.randn((n,), device="cpu") * 0.25).numpy()
+            a = tensorplay.from_numpy(a_cpu.copy()).to("vulkan")
+            b = tensorplay.from_numpy(b_cpu.copy()).to("vulkan")
+            bias = tensorplay.from_numpy(bias_cpu.copy()).to("vulkan")
+
+            expect = a_cpu @ b_cpu
+            out = tp.mm(a, b)
+            self.assertTrue(out.device.is_vulkan())
+            np.testing.assert_allclose(
+                out.cpu().numpy(), expect, rtol=1e-3, atol=1e-3,
+                err_msg=f"tiled mm m={m} k={k} n={n}")
+            np.testing.assert_allclose(
+                tp.addmm(bias, a, b).cpu().numpy(), expect + bias_cpu,
+                rtol=1e-3, atol=1e-3,
+                err_msg=f"tiled addmm m={m} k={k} n={n}")
+
+        for m, k, n in ((33, 517, 20003), (8, 2048, 16391)):
+            x_cpu = (tp.randn((m, k), device="cpu") * 0.5).numpy()
+            w_cpu = (tp.randn((n, k), device="cpu") * 0.02).numpy()
+            bias_cpu = (tp.randn((n,), device="cpu") * 0.25).numpy()
+            x = tensorplay.from_numpy(x_cpu.copy()).to("vulkan")
+            weight = tensorplay.from_numpy(w_cpu.copy()).to("vulkan")
+            bias = tensorplay.from_numpy(bias_cpu.copy()).to("vulkan")
+
+            expect = x_cpu @ w_cpu.T
+            np.testing.assert_allclose(
+                F.linear(x, weight, bias).cpu().numpy(), expect + bias_cpu,
+                rtol=1e-3, atol=1e-3,
+                err_msg=f"tiled linear m={m} k={k} n={n}")
+
 
 if __name__ == "__main__":
     unittest.main()
