@@ -663,5 +663,106 @@ class TestVulkanRmsNorm(unittest.TestCase):
                 f"rms multi-axis {dtype}")
 
 
+class TestVulkanPackedParameterCache(unittest.TestCase):
+    # Matmul relayouts its operands into packed textures and reuses them per
+    # parameter identity, so these cases pin the cache contract: an in-place
+    # update must be picked up, one tensor used in two roles must keep two
+    # packs, and a working set far beyond a handful of entries must stay
+    # numerically stable across repeated passes.
+
+    @staticmethod
+    def _relerr(got, want):
+        got = np.asarray(got, dtype=np.float32)
+        want = np.asarray(want, dtype=np.float32)
+        denom = max(float(np.abs(want).max()), 1.0)
+        return float(np.abs(got - want).max()) / denom
+
+    def test_inplace_weight_update_rereads_packed_operand(self):
+        import tensorplay as tp
+        tensorplay.manual_seed(21)
+        x = tensorplay.randn((16, 48), device="cpu").to(tensorplay.float32)
+        w = tensorplay.randn((48, 24), device="cpu").to(tensorplay.float32)
+        xv, wv = x.to("vulkan"), w.to("vulkan")
+
+        first = (xv @ wv).cpu().numpy()
+        self.assertLessEqual(
+            self._relerr(first, x.numpy() @ w.numpy()), 2.0e-5)
+
+        wv.mul_(2.0)
+        w.mul_(2.0)
+        second = (xv @ wv).cpu().numpy()
+        self.assertLessEqual(
+            self._relerr(second, x.numpy() @ w.numpy()), 2.0e-5,
+            "in-place weight update was not picked up by the packed operand")
+        self.assertGreater(
+            self._relerr(second, first), 0.4,
+            "reused pack survived the version bump")
+
+        # A fresh tensor that happens to carry the same values must agree with
+        # the updated one, so the identity is the storage, not the size.
+        wv2 = w.to("vulkan")
+        self.assertLessEqual(
+            self._relerr((xv @ wv2).cpu().numpy(), x.numpy() @ w.numpy()),
+            2.0e-5)
+
+    def test_one_weight_in_two_roles_keeps_two_packs(self):
+        # The left operand streams along K in the width-packed layout and the
+        # right operand in the height-packed one; the same tensor playing both
+        # parts must not have one pack served for the other.
+        tensorplay.manual_seed(22)
+        s_cpu = tensorplay.randn((32, 32), device="cpu").to(tensorplay.float32)
+        a_cpu = tensorplay.randn((16, 32), device="cpu").to(tensorplay.float32)
+        b_cpu = tensorplay.randn((32, 16), device="cpu").to(tensorplay.float32)
+
+        sv, av, bv = s_cpu.to("vulkan"), a_cpu.to("vulkan"), b_cpu.to("vulkan")
+        cases = (
+            ("as_rhs", lambda: (av @ sv).cpu().numpy(),
+             lambda: a_cpu.numpy() @ s_cpu.numpy()),
+            ("as_lhs", lambda: (sv @ bv).cpu().numpy(),
+             lambda: s_cpu.numpy() @ b_cpu.numpy()),
+            ("both", lambda: (sv @ sv).cpu().numpy(),
+             lambda: s_cpu.numpy() @ s_cpu.numpy()),
+        )
+        for label, run, want in cases:
+            self.assertLessEqual(
+                self._relerr(run(), want()), 2.0e-5,
+                f"packed operand role collision: {label}")
+
+        sv.mul_(-1.0)
+        s_cpu.mul_(-1.0)
+        for label, run, want in cases:
+            self.assertLessEqual(
+                self._relerr(run(), want()), 2.0e-5,
+                f"packed operand stale after update: {label}")
+
+    def test_working_set_beyond_a_few_entries(self):
+        # A decoder references one weight per projection per layer, so the
+        # resident set is far larger than the handful of tensors the early
+        # convolution workloads needed; repeated passes over it must agree.
+        tensorplay.manual_seed(23)
+        count = 300
+        x_cpu = tensorplay.randn((8, 64), device="cpu").to(tensorplay.float32)
+        weights_cpu = [
+            tensorplay.randn((64, 64), device="cpu").to(tensorplay.float32)
+            for _ in range(count)
+        ]
+        xv = x_cpu.to("vulkan")
+        wv = [w.to("vulkan") for w in weights_cpu]
+
+        first = [(xv @ w).cpu().numpy() for w in wv]
+        second = [(xv @ w).cpu().numpy() for w in wv]
+        for index in (0, count // 2, count - 1):
+            want = x_cpu.numpy() @ weights_cpu[index].numpy()
+            self.assertLessEqual(
+                self._relerr(first[index], want), 2.0e-5,
+                f"pass 1 weight {index}")
+            self.assertLessEqual(
+                self._relerr(second[index], want), 2.0e-5,
+                f"pass 2 weight {index}")
+        self.assertTrue(
+            np.array_equal(first[0], second[0]),
+            "repeated pass over a cached operand changed the result")
+
+
 if __name__ == "__main__":
     unittest.main()

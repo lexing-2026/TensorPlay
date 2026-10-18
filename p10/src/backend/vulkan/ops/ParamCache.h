@@ -9,8 +9,10 @@
 
 #include <cstdint>
 #include <functional>
+#include <list>
 #include <mutex>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace tensorplay {
@@ -29,6 +31,9 @@ namespace ops {
 // a released storage simply stops matching.  Superseded versions of the same
 // storage are dropped on insert so training loops do not accumulate stale
 // payloads.
+//
+// Over the entry bound the oldest-referenced entry is dropped, so a working
+// set that fits stays resident instead of being flushed as a whole.
 //
 // `build` performs the actual materialization (host pack + upload, or a
 // device-side regroup dispatch); it runs at most once per identity.
@@ -78,8 +83,39 @@ class ParamTextureCache final {
     }
   };
 
+  // The key without its version counter: the parameter itself.  Holding the
+  // live entry per parameter here makes dropping the superseded version of an
+  // in-place update constant-time instead of a walk over every cached payload.
+  struct Identity {
+    const void* storage_ptr;
+    uint8_t layout;
+    uint32_t tag;
+
+    bool operator==(const Identity& other) const {
+      return storage_ptr == other.storage_ptr && layout == other.layout &&
+          tag == other.tag;
+    }
+  };
+
+  struct IdentityHasher {
+    inline size_t operator()(const Identity& identity) const {
+      size_t seed = std::hash<const void*>()(identity.storage_ptr);
+      seed = api::utils::hash_combine(seed, std::hash<uint8_t>()(identity.layout));
+      return api::utils::hash_combine(seed, std::hash<uint32_t>()(identity.tag));
+    }
+  };
+
+  using Entries = std::list<std::pair<Key, Entry>>;
+  using EntryRef = Entries::iterator;
+
+  // Unlinks one entry from all three tables.
+  void drop(EntryRef entry);
+
   std::mutex mutex_;
-  std::unordered_map<Key, Entry, Hasher> cache_;
+  // Recency order, most recently referenced at the front.
+  Entries lru_;
+  std::unordered_map<Key, EntryRef, Hasher> index_;
+  std::unordered_map<Identity, EntryRef, IdentityHasher> current_;
 };
 
 } // namespace ops
