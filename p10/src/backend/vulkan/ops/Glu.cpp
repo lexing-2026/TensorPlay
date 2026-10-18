@@ -22,8 +22,9 @@ namespace {
 
 void validate_float_1d_to_4d(const Tensor& t, const char* name) {
   TP_CHECK(
-      t.dtype() == DType::Float32,
-      std::string("Vulkan ") + name + " supports Float32 tensors only");
+      t.dtype() == DType::Float32 || t.dtype() == DType::Float16,
+      std::string("Vulkan ") + name +
+          " supports Float32 and Float16 tensors only");
   TP_CHECK(
       t.dim() >= 1 && t.dim() <= 4,
       std::string("Vulkan ") + name + " supports 1d to 4d tensors");
@@ -79,7 +80,9 @@ Tensor glu_kernel(const Tensor& self, int64_t dim) {
       v_input.sizes().begin(), v_input.sizes().end());
   out_sizes[static_cast<size_t>(wrapped)] = in_len / 2;
 
-  api::vTensor v_output{context, out_sizes, DType::Float32};
+  // The gate is elementwise, so the result keeps the input element type and
+  // the bound views match the format baked into the selected variant.
+  api::vTensor v_output{context, out_sizes, self.dtype()};
 
   const struct GluBlock block{
       make_whcn_ivec4(v_input.sizes()),
@@ -94,7 +97,7 @@ Tensor glu_kernel(const Tensor& self, int64_t dim) {
   api::PipelineBarrier pipeline_barrier{};
 
   context->submit_compute_job(
-      VK_KERNEL(glu), pipeline_barrier, v_output.extents(),
+      kernel_for("glu", self.dtype()), pipeline_barrier, v_output.extents(),
       adaptive_work_group_size(v_output.extents()), VK_NULL_HANDLE,
       v_output.image(
           pipeline_barrier,

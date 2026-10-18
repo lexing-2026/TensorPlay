@@ -445,6 +445,34 @@ class TestVulkanLlmKernels(unittest.TestCase):
             want = _rope_reference(x.numpy().astype(np.float32), cos, sin, off)
             np.testing.assert_allclose(got.astype(np.float32), want, rtol=0, atol=tol)
 
+    def test_glu_splits_and_dtypes(self):
+        # Gated linear unit over texture storage: first_half *
+        # sigmoid(second_half), along whichever axis is halved.  Half
+        # precision must stay half precision end to end.
+        import tensorplay as tp
+        tensorplay.manual_seed(1234)
+        for shape, dim, dtype, tol in (
+            ((3, 2, 32), -1, tensorplay.float32, 1.0e-5),
+            ((3, 2, 32), -1, tensorplay.float16, 3.0e-2),
+            ((2, 8, 16), 1, tensorplay.float32, 1.0e-5),
+            ((2, 8, 16), 1, tensorplay.float16, 3.0e-2),
+            ((4, 64), 0, tensorplay.float32, 1.0e-5),
+            ((4, 64), 0, tensorplay.float16, 3.0e-2),
+            # Halving the channel axis crosses texel lanes inside one texel.
+            ((2, 8, 3, 5), 1, tensorplay.float32, 1.0e-5),
+            ((2, 8, 3, 5), 1, tensorplay.float16, 3.0e-2),
+        ):
+            x = (tensorplay.randn(shape, device="cpu") * 1.5).to(dtype)
+            got = tp.glu(x.to("vulkan"), dim)
+            self.assertEqual(got.dtype, dtype)
+            xn = x.numpy().astype(np.float64)
+            n = xn.shape[dim]
+            a = np.take(xn, np.arange(n // 2), axis=dim)
+            b = np.take(xn, np.arange(n // 2, n), axis=dim)
+            want = a / (1.0 + np.exp(-b))
+            np.testing.assert_allclose(
+                got.cpu().numpy().astype(np.float64), want, rtol=0, atol=tol)
+
     def test_silu_and_mul(self):
         tensorplay.manual_seed(1234)
         for B, S, W, dtype, tol in (
