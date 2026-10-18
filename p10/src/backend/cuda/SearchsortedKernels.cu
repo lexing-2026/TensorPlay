@@ -27,10 +27,10 @@ constexpr int kThreads = 256;
     } \
   } while (0)
 
-template <typename T>
+template <typename T, typename OutT>
 __global__ void searchsorted_kernel(int64_t n, int64_t seq_len, bool right,
                                     int64_t idim_in, bool is_1d_boundaries,
-                                    const T* sp, const T* vp, int64_t* rp) {
+                                    const T* sp, const T* vp, OutT* rp) {
     int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
     for (; i < n; i += stride) {
@@ -43,7 +43,7 @@ __global__ void searchsorted_kernel(int64_t n, int64_t seq_len, bool right,
             const bool go_right = right ? !(sp[mid] > v) : !(sp[mid] >= v);
             if (go_right) lo = mid + 1; else hi = mid;
         }
-        rp[i] = lo - base;
+        rp[i] = static_cast<OutT>(lo - base);
     }
 }
 
@@ -83,42 +83,40 @@ Tensor searchsorted_apply_sorter_cuda(const Tensor& boundaries,
     return sorted;
 }
 
-Tensor searchsorted_impl_cuda(const Tensor& seq_f, const Tensor& vals_f,
-                              bool out_int32, bool right) {
+// Writes the insertion positions for every query value straight into
+// `result`; the caller owns the output buffer and its shape.
+void searchsorted_impl_cuda(const Tensor& seq_f, const Tensor& vals_f,
+                            bool out_int32, bool right, Tensor& result) {
     Tensor seq = seq_f.contiguous();
     Tensor vals = vals_f.contiguous();
     int64_t seq_len = seq.size(-1);
     const bool is_1d_boundaries = seq.dim() == 1;
     const int64_t idim_in =
         (vals.dim() == 0 && vals.numel() == 1) ? 1 : vals.size(-1);
-    Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(vals.shape()),
-                                  out_int32 ? DType::Int32 : DType::Int64,
-                                  vals.device());
     int64_t n = vals.numel();
-    if (n == 0) return result;
+    if (n == 0) return;
     auto stream = getCurrentCUDAStream().stream();
 
     auto run = [&](auto type_tag) {
         using T = decltype(type_tag);
+        const unsigned blocks = static_cast<unsigned>(
+            (n + kThreads - 1) / kThreads);
         if (out_int32) {
-            Tensor tmp = Tensor::empty(
-                static_cast<std::vector<int64_t>>(vals.shape()),
-                DType::Int64, vals.device());
-            searchsorted_kernel<T><<<(n + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+            searchsorted_kernel<T, int32_t><<<blocks, kThreads, 0, stream>>>(
                 n, seq_len, right, idim_in, is_1d_boundaries,
-                seq.data_ptr<T>(), vals.data_ptr<T>(), tmp.data_ptr<int64_t>());
-            CUDA_CHECK(cudaGetLastError());
-            return tmp.to(DType::Int32);
+                seq.data_ptr<T>(), vals.data_ptr<T>(),
+                static_cast<int32_t*>(result.data_ptr()));
+        } else {
+            searchsorted_kernel<T, int64_t><<<blocks, kThreads, 0, stream>>>(
+                n, seq_len, right, idim_in, is_1d_boundaries,
+                seq.data_ptr<T>(), vals.data_ptr<T>(),
+                static_cast<int64_t*>(result.data_ptr()));
         }
-        searchsorted_kernel<T><<<(n + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-            n, seq_len, right, idim_in, is_1d_boundaries,
-            seq.data_ptr<T>(), vals.data_ptr<T>(), result.data_ptr<int64_t>());
         CUDA_CHECK(cudaGetLastError());
-        return result;
     };
 
 #define TP_SS_CASE(ctype, name) \
-    case DType::name: return run(ctype{});
+    case DType::name: run(ctype{}); break;
     switch (vals.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_SS_CASE)
         default:
@@ -126,7 +124,6 @@ Tensor searchsorted_impl_cuda(const Tensor& seq_f, const Tensor& vals_f,
                     toString(vals.dtype()));
     }
 #undef TP_SS_CASE
-    return result;
 }
 
 }
@@ -155,9 +152,17 @@ Tensor& searchsorted_out_cuda_impl(const Tensor& sorted_sequence,
     const Tensor& final_input = trimmed_input.defined() ? trimmed_input : vals;
     const Tensor& final_boundaries =
         trimmed_boundaries.defined() ? trimmed_boundaries : seq;
-    Tensor computed = searchsorted_impl_cuda(final_boundaries, final_input,
-                                             out_int32, is_right);
-    if (&result != &computed) {
+    // The kernel fills the output linearly, so a non-standard-stride buffer
+    // goes through a contiguous staging tensor instead.
+    if (result.is_contiguous()) {
+        searchsorted_impl_cuda(final_boundaries, final_input, out_int32,
+                               is_right, result);
+    } else {
+        Tensor computed = Tensor::empty(
+            static_cast<std::vector<int64_t>>(result.shape()), result.dtype(),
+            result.device());
+        searchsorted_impl_cuda(final_boundaries, final_input, out_int32,
+                               is_right, computed);
         result.copy_(computed);
     }
     return result;
