@@ -4,6 +4,7 @@
 #include "Exception.h"
 #include "Context.h"
 #include "CUDARuntime.h"
+#include "GradMode.h"
 #include "Utils.h"
 
 #include <cuda_runtime.h>
@@ -46,6 +47,14 @@ inline void outer_inner(const std::vector<int64_t>& shape, int64_t dim,
     for (int64_t i = 0; i < dim; ++i) outer *= shape[i];
     for (int64_t i = dim + 1; i < static_cast<int64_t>(shape.size()); ++i) inner *= shape[i];
 }
+
+// RAII over the thread-local autograd switch: sections that mutate storage
+// directly must not record graph nodes.
+struct NoGradGuard {
+    bool prev;
+    NoGradGuard() : prev(GradMode::is_enabled()) { GradMode::set_enabled(false); }
+    ~NoGradGuard() { GradMode::set_enabled(prev); }
+};
 
 template <typename T, typename IndexT>
 __global__ void gather_kernel(int64_t n, int64_t idx_dim_size, int64_t idx_inner,
@@ -517,6 +526,44 @@ Tensor index_add_cuda(const Tensor& self, int64_t dim, const Tensor& index, cons
     return result;
 }
 
+Tensor& index_add_inplace_cuda(Tensor& self, int64_t dim, const Tensor& index, const Tensor& source) {
+    NoGradGuard __tp_nograd;
+    int64_t nd = self.dim();
+    dim = wrap_dim(dim, nd);
+    Tensor idx = (index.dtype() == DType::Int64 || index.dtype() == DType::Int32)
+        ? index.contiguous() : index.to(DType::Int64).contiguous();
+    int64_t n_idx = idx.numel();
+    if (n_idx == 0) return self;
+    int64_t row = self.size(dim);
+    int64_t outer = 1, inner = 1;
+    outer_inner(static_cast<std::vector<int64_t>>(self.shape()), dim, outer, inner);
+    Tensor source_c = source.contiguous();
+    if (source_c.dim() != nd) {
+        TP_THROW(RuntimeError, "index_add: source must have same number of dims as input");
+    }
+    if (source_c.size(dim) != n_idx) {
+        TP_THROW(RuntimeError, "index_add: source size along dim must equal index length");
+    }
+    int64_t total = outer * n_idx * inner;
+    if (total == 0) return self;
+    if (!self.is_contiguous()) {
+        // The kernel addresses the destination as a dense buffer, so a
+        // strided destination keeps the out-of-place path.
+        self.copy_(index_add_cuda(self, dim, index, source));
+        return self;
+    }
+    auto stream = getCurrentCUDAStream().stream();
+    if (idx.dtype() == DType::Int32) {
+        launch_index_add_for_index<int32_t>(
+            total, inner, row, n_idx, self, idx, source_c, stream);
+    } else {
+        launch_index_add_for_index<int64_t>(
+            total, inner, row, n_idx, self, idx, source_c, stream);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return self;
+}
+
 TENSORPLAY_LIBRARY_IMPL(CUDA, GatherScatterKernels) {
     m.impl("gather", gather_cuda);
     m.impl("scatter_add", scatter_add_cuda);
@@ -526,6 +573,7 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, GatherScatterKernels) {
     m.impl("scatter_.value", scatter_inplace_value_cuda);
     m.impl("scatter_add_", scatter_add_inplace_cuda);
     m.impl("index_add", index_add_cuda);
+    m.impl("index_add_", index_add_inplace_cuda);
 }
 
 }

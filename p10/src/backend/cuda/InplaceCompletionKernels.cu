@@ -247,18 +247,6 @@ Tensor& hypot_inplace_kernel(Tensor& self, const Tensor& other) {
     return self;
 }
 
-Tensor& index_add_inplace_kernel(Tensor& self, int64_t dim, const Tensor& index, const Tensor& source) {
-    NoGradGuard __tp_nograd;
-    self.copy_(self.index_add(dim, index, source));
-    return self;
-}
-
-Tensor& index_copy_inplace_kernel(Tensor& self, int64_t dim, const Tensor& index, const Tensor& source) {
-    NoGradGuard __tp_nograd;
-    self.copy_(self.index_copy(dim, index, source));
-    return self;
-}
-
 Tensor& index_reduce_inplace_kernel(Tensor& self, int64_t dim, const Tensor& index, const Tensor& source, const std::string& reduce, bool include_self) {
     NoGradGuard __tp_nograd;
     self.copy_(self.index_reduce(dim, index, source, reduce, include_self));
@@ -551,8 +539,6 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, InplaceCompletionKernels) {
     m.impl("hardtanh_", hardtanh_inplace_kernel);
     m.impl("heaviside_", heaviside_inplace_kernel);
     m.impl("hypot_", hypot_inplace_kernel);
-    m.impl("index_add_", index_add_inplace_kernel);
-    m.impl("index_copy_", index_copy_inplace_kernel);
     m.impl("index_reduce_", index_reduce_inplace_kernel);
     m.impl("lcm_", lcm_inplace_kernel);
     m.impl("leaky_relu_", leaky_relu_inplace_kernel);

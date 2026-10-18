@@ -5,6 +5,7 @@
 #include "Scalar.h"
 #include "Exception.h"
 #include "CUDARuntime.h"
+#include "GradMode.h"
 
 #include <cuda_runtime.h>
 #include "GPUPrimitives.cuh"
@@ -55,6 +56,14 @@ inline void outer_inner(const std::vector<int64_t>& shape, int64_t dim,
     for (int64_t i = 0; i < dim; ++i) outer *= shape[i];
     for (int64_t i = dim + 1; i < static_cast<int64_t>(shape.size()); ++i) inner *= shape[i];
 }
+
+// RAII over the thread-local autograd switch: sections that mutate storage
+// directly must not record graph nodes.
+struct NoGradGuard {
+    bool prev;
+    NoGradGuard() : prev(GradMode::is_enabled()) { GradMode::set_enabled(false); }
+    ~NoGradGuard() { GradMode::set_enabled(prev); }
+};
 
 // Index-select row gather.
 template <typename T, typename IndexT>
@@ -406,6 +415,46 @@ Tensor index_copy_cuda(const Tensor& self, int64_t dim, const Tensor& index, con
     return result;
 }
 
+Tensor& index_copy_inplace_cuda(Tensor& self, int64_t dim, const Tensor& index, const Tensor& source) {
+    NoGradGuard __tp_nograd;
+    int64_t nd = self.dim();
+    dim = wrap_dim(dim, nd);
+    Tensor idx = (index.dtype() == DType::Int64) ? index.contiguous() : index.to(DType::Int64).contiguous();
+    int64_t n_idx = idx.numel();
+    if (n_idx == 0) return self;
+    int64_t row = self.size(dim);
+    int64_t outer = 1, inner = 1;
+    outer_inner(static_cast<std::vector<int64_t>>(self.shape()), dim, outer, inner);
+    int64_t total = outer * n_idx * inner;
+    if (total == 0) return self;
+    if (!self.is_contiguous()) {
+        // The kernel addresses the destination as a dense buffer, so a
+        // strided destination keeps the out-of-place path.
+        self.copy_(index_copy_cuda(self, dim, index, source));
+        return self;
+    }
+    Tensor source_c = source.contiguous();
+    auto stream = getCurrentCUDAStream().stream();
+#define TP_IC_IP_CASE(ctype, name) \
+    case DType::name: \
+        index_copy_kernel<ctype><<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
+            total, n_idx, inner, row, static_cast<ctype*>(self.data_ptr()), \
+            idx.data_ptr<int64_t>(), static_cast<const ctype*>(source_c.data_ptr())); \
+        break;
+    switch (self.dtype()) {
+        TENSORPLAY_FORALL_SCALAR_TYPES(TP_IC_IP_CASE)
+        TENSORPLAY_FORALL_FP8_TYPES(TP_IC_IP_CASE)
+        TP_IC_IP_CASE(tensorplay::complex<Half>, ComplexHalf)
+        TP_IC_IP_CASE(tensorplay::complex<float>, ComplexFloat)
+        TP_IC_IP_CASE(tensorplay::complex<double>, ComplexDouble)
+        TP_IC_IP_CASE(tensorplay::complex<BFloat16>, BComplex32)
+        default: TP_THROW(TypeError, "index_copy: unsupported dtype");
+    }
+#undef TP_IC_IP_CASE
+    CUDA_CHECK(cudaGetLastError());
+    return self;
+}
+
 Tensor index_fill_scalar_cuda(const Tensor& self, int64_t dim, const Tensor& index, const Scalar& value);
 
 Tensor index_fill_tensor_cuda(const Tensor& self, int64_t dim, const Tensor& index, const Tensor& value) {
@@ -454,8 +503,43 @@ Tensor index_fill_scalar_cuda(const Tensor& self, int64_t dim, const Tensor& ind
 }
 
 Tensor& index_fill_scalar__cuda(Tensor& self, int64_t dim, const Tensor& index, const Scalar& value) {
-    // Fill a clone, then copy it back through the existing in-place path.
-    self.copy_(index_fill_scalar_cuda(self, dim, index, value));
+    NoGradGuard __tp_nograd;
+    int64_t nd = self.dim();
+    dim = wrap_dim(dim, nd);
+    Tensor idx = (index.dtype() == DType::Int64) ? index.contiguous() : index.to(DType::Int64).contiguous();
+    int64_t n_idx = idx.numel();
+    if (n_idx == 0) return self;
+    int64_t row = self.size(dim);
+    int64_t outer = 1, inner = 1;
+    outer_inner(static_cast<std::vector<int64_t>>(self.shape()), dim, outer, inner);
+    int64_t total = outer * n_idx * inner;
+    if (total == 0) return self;
+    if (!self.is_contiguous()) {
+        // The kernel addresses the destination as a dense buffer, so a
+        // strided destination keeps the out-of-place path.
+        self.copy_(index_fill_scalar_cuda(self, dim, index, value));
+        return self;
+    }
+    auto stream = getCurrentCUDAStream().stream();
+#define TP_IF_IP_CASE(ctype, name) \
+    case DType::name: { \
+        ctype v = value.to<ctype>(); \
+        index_fill_kernel<ctype><<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
+            total, n_idx, inner, row, static_cast<ctype*>(self.data_ptr()), \
+            idx.data_ptr<int64_t>(), v); \
+        break; \
+    }
+    switch (self.dtype()) {
+        TENSORPLAY_FORALL_SCALAR_TYPES(TP_IF_IP_CASE)
+        TENSORPLAY_FORALL_FP8_TYPES(TP_IF_IP_CASE)
+        TP_IF_IP_CASE(tensorplay::complex<Half>, ComplexHalf)
+        TP_IF_IP_CASE(tensorplay::complex<float>, ComplexFloat)
+        TP_IF_IP_CASE(tensorplay::complex<double>, ComplexDouble)
+        TP_IF_IP_CASE(tensorplay::complex<BFloat16>, BComplex32)
+        default: TP_THROW(TypeError, "index_fill: unsupported dtype");
+    }
+#undef TP_IF_IP_CASE
+    CUDA_CHECK(cudaGetLastError());
     return self;
 }
 
@@ -613,6 +697,7 @@ Tensor index_reduce_backward_src_cuda(const Tensor& grad,
 TENSORPLAY_LIBRARY_IMPL(CUDA, IndexingKernels) {
     m.impl("index_select", index_select_cuda);
     m.impl("index_copy", index_copy_cuda);
+    m.impl("index_copy_", index_copy_inplace_cuda);
     m.impl("index_fill.Tensor", index_fill_tensor_cuda);
     m.impl("index_fill.Scalar", index_fill_scalar_cuda);
     m.impl("index_fill_.Tensor", index_fill_tensor__cuda);
