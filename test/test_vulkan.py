@@ -1287,6 +1287,150 @@ class TestVulkanLinearPayload(unittest.TestCase):
                 err_msg=f"rms_norm over linear payload at shape {shape} "
                         f"span {span} weight {with_weight}")
 
+    def test_half_precision_pointwise_over_linear_payload(self):
+        from math import erf
+        import tensorplay as tp
+        import tensorplay.functional as F
+        # Device runtimes keep weights and activations in half precision, so a
+        # payload past the image axis limit arrives as a half buffer.  The
+        # linear kernels pack two lanes into one 32-bit word, low lane first,
+        # and compute in single precision with a single narrowing at the store;
+        # the expectation below is that arithmetic rounded through half.
+        def narrowed(a):
+            return np.asarray(a, dtype=np.float16).astype(np.float32)
+
+        def upload(a):
+            return tensorplay.from_numpy(
+                np.asarray(a, dtype=np.float16)).to("vulkan")
+
+        tensorplay.manual_seed(51)
+        x_cpu = (tp.randn((self.WIDTH,), device="cpu") * 3.0).numpy()
+        y_cpu = (tp.randn((self.WIDTH,), device="cpu") * 3.0).numpy()
+        pos_cpu = np.abs(x_cpu) + 0.5
+        safe_cpu = np.abs(y_cpu) + 0.75
+        x16, y16 = narrowed(x_cpu), narrowed(y_cpu)
+        pos16, safe16 = narrowed(pos_cpu), narrowed(safe_cpu)
+        sig = 1.0 / (1.0 + np.exp(-x16))
+
+        # A divisor away from zero: near-zero denominators make the single
+        # precision quotient of the kernel differ from the wider reference.
+        unary = [
+            ("abs", F.abs, np.abs(x16), x_cpu),
+            ("neg", F.neg, -x16, x_cpu),
+            ("floor", F.floor, np.floor(x16), x_cpu),
+            ("exp", F.exp, np.exp(x16), x_cpu),
+            ("tanh", F.tanh, np.tanh(x16), x_cpu),
+            ("sigmoid", F.sigmoid, sig, x_cpu),
+            ("silu", F.silu, x16 * sig, x_cpu),
+            ("relu6", F.relu6, np.clip(x16, 0.0, 6.0), x_cpu),
+            ("hardsigmoid", F.hardsigmoid,
+             np.clip(x16 / 6.0 + 0.5, 0.0, 1.0), x_cpu),
+            ("hardswish", F.hardswish,
+             x16 * np.clip(x16 / 6.0 + 0.5, 0.0, 1.0), x_cpu),
+            ("sqrt", F.sqrt, np.sqrt(pos16), pos_cpu),
+            ("rsqrt", F.rsqrt, 1.0 / np.sqrt(pos16), pos_cpu),
+            ("reciprocal", F.reciprocal, 1.0 / pos16, pos_cpu),
+            ("gelu", F.gelu, 0.5 * x16 * (
+                1.0 + np.vectorize(erf)(x16 / np.sqrt(2.0))), x_cpu),
+        ]
+        for name, fn, want, src in unary:
+            got = fn(upload(src))
+            self.assertEqual(got.dtype, tensorplay.float16,
+                             f"{name} widened a half linear payload")
+            np.testing.assert_allclose(
+                got.cpu().numpy().astype(np.float32), narrowed(want),
+                rtol=2e-3, atol=2e-3,
+                err_msg=f"{name} on a half linear payload")
+
+        for name, want in (("abs_", np.abs(x16)), ("exp_", np.exp(x16)),
+                           ("sigmoid_", sig), ("floor_", np.floor(x16)),
+                           ("relu_", np.clip(x16, 0.0, None))):
+            v = upload(x_cpu)
+            out = getattr(F, name)(v)
+            self.assertIs(out, v, f"{name} did not return the same tensor")
+            np.testing.assert_allclose(
+                out.cpu().numpy().astype(np.float32), narrowed(want),
+                rtol=2e-3, atol=2e-3,
+                err_msg=f"{name} left the half payload untouched or wrong")
+
+        for lo, hi in ((-1.5, 2.5), (0.0, None), (None, 1.0)):
+            got = F.clamp(upload(x_cpu), min=lo, max=hi).cpu().numpy()
+            np.testing.assert_allclose(
+                got.astype(np.float32), narrowed(np.clip(x16, lo, hi)),
+                rtol=0, atol=1e-6, err_msg=f"clamp({lo}, {hi}) on a half payload")
+
+        parametric = [
+            ("leaky_relu", lambda v: F.leaky_relu(v, 0.1),
+             np.where(x16 > 0, x16, 0.1 * x16)),
+            ("threshold", lambda v: F.threshold(v, 0.0, -1.0),
+             np.where(x16 > 0.0, x16, -1.0)),
+            ("hardshrink", lambda v: F.hardshrink(v, 0.5),
+             np.where(np.abs(x16) > 0.5, x16, 0.0)),
+            # An integral exponent keeps the kernel on its sign-preserving
+            # branch of the power formula.
+            ("pow_scalar", lambda v: F.pow(v, 3.0),
+             np.sign(x16) * np.power(np.abs(x16), 3.0)),
+        ]
+        for name, fn, want in parametric:
+            got = fn(upload(x_cpu))
+            np.testing.assert_allclose(
+                got.cpu().numpy().astype(np.float32), narrowed(want),
+                rtol=5e-3, atol=5e-3, err_msg=f"{name} on a half linear payload")
+
+        binary = [
+            ("add", F.add, x16 + y16, y_cpu),
+            ("sub", F.sub, x16 - y16, y_cpu),
+            ("mul", F.mul, x16 * y16, y_cpu),
+            ("div", F.div, x16 / safe16, safe_cpu),
+            ("maximum", F.maximum, np.maximum(x16, safe16), safe_cpu),
+            ("minimum", F.minimum, np.minimum(x16, safe16), safe_cpu),
+        ]
+        for name, fn, want, other in binary:
+            got = fn(upload(x_cpu), upload(other))
+            self.assertEqual(got.dtype, tensorplay.float16,
+                             f"{name} widened a half linear payload")
+            np.testing.assert_allclose(
+                got.cpu().numpy().astype(np.float32), narrowed(want),
+                rtol=2e-3, atol=2e-3,
+                err_msg=f"{name} over two half linear payloads")
+
+        v = upload(x_cpu)
+        np.testing.assert_allclose(
+            F.add(v, upload(y_cpu), alpha=0.5).cpu().numpy().astype(np.float32),
+            narrowed(x16 + 0.5 * y16), rtol=2e-3, atol=2e-3,
+            err_msg="scaled add over half linear payloads")
+        v = upload(x_cpu)
+        np.testing.assert_allclose(
+            F.rsub(v, 1.0).cpu().numpy().astype(np.float32),
+            narrowed(1.0 - x16), rtol=2e-3, atol=2e-3,
+            err_msg="scalar reverse subtract over a half linear payload")
+
+        # An odd length leaves one padding lane in the final word; the lane
+        # before it has to survive, and the length still bounds every read.
+        for width in (self.WIDTH - 1, self.WIDTH + 1, self.WIDTH + 3):
+            xs = narrowed((tp.randn((width,), device="cpu") * 3.0).numpy())
+            ys = narrowed((tp.randn((width,), device="cpu") * 3.0).numpy())
+            np.testing.assert_allclose(
+                F.exp(upload(xs)).cpu().numpy().astype(np.float32),
+                narrowed(np.exp(xs)), rtol=2e-3, atol=2e-3,
+                err_msg=f"exp over a half payload of odd length {width}")
+            np.testing.assert_allclose(
+                F.add(upload(xs), upload(ys)).cpu().numpy().astype(np.float32),
+                narrowed(xs + ys), rtol=2e-3, atol=2e-3,
+                err_msg=f"add over a half payload of odd length {width}")
+
+        # Short payloads stay in a texture, where the half twin of every pointwise
+        # kernel already applied; check the same values to keep both forms honest.
+        short = narrowed((tp.randn((64,), device="cpu") * 3.0).numpy())
+        np.testing.assert_allclose(
+            F.exp(upload(short)).cpu().numpy().astype(np.float32),
+            narrowed(np.exp(short)), rtol=2e-3, atol=2e-3,
+            err_msg="exp over a half texture payload")
+        np.testing.assert_allclose(
+            F.add(upload(short), upload(short)).cpu().numpy().astype(np.float32),
+            narrowed(short + short), rtol=2e-3, atol=2e-3,
+            err_msg="add over two half texture payloads")
+
 
 if __name__ == "__main__":
     unittest.main()
