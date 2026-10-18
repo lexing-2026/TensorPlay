@@ -11,7 +11,7 @@ import numpy as np
 
 import bench_mps_operator
 from bench_mps_operator import _ReferenceBackend, _TreeBackend, build_cases
-from check_mps_reference_speedup import evaluate, join, summarize
+from check_mps_reference_speedup import evaluate, join, load, summarize
 
 # Cases above this footprint are skipped by the inventory check: the pair of
 # runtimes materializes both sides at once, which is more than a CI shell wants
@@ -91,6 +91,39 @@ class TestSpeedupGate(unittest.TestCase):
         summary = summarize(body)
         self.assertEqual(summary["compared"], 1)
 
+    def test_duplicate_measurement_names_are_rejected(self):
+        body = payload([("a", 1.0, 2.0), ("a", 1.0, 2.0)])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "duplicate.json"
+            path.write_text(json.dumps(body), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                load(path)
+
+    def test_unexpected_unpaired_case_fails_the_gate(self):
+        ours, theirs = _two_sides(["a", "b"], ["a"])
+        summary = summarize(join(ours, theirs))
+        violations = evaluate(summary, 0.0, 0.0, None)
+        self.assertEqual(len(violations), 1)
+        self.assertIn("b", violations[0])
+        self.assertIn("not declared skipped", violations[0])
+
+    def test_declared_skip_is_not_a_gate_violation(self):
+        ours, theirs = _two_sides(["a", "b"], ["a"], requested=["b"])
+        summary = summarize(join(ours, theirs))
+        self.assertEqual(evaluate(summary, 0.0, 0.0, None), [])
+        self.assertEqual(summary["unpaired"], ["b"])
+
+
+def _two_sides(ours_names, reference_names, requested=()):
+    ours = payload([(name, 1.0, None) for name in ours_names],
+                   reference=False)
+    ours["side"] = "ours"
+    theirs = payload([(name, 1.0, None) for name in reference_names],
+                     reference=False)
+    theirs["side"] = "reference"
+    theirs["skipped"] = {"requested": list(requested), "unavailable": {}}
+    return ours, theirs
+
 
 def _primary(result):
     """The value a case produces, for tuple-returning reductions."""
@@ -114,6 +147,12 @@ class TestCaseInventory(unittest.TestCase):
     the same operation, arguments and dtype on each side, which a shape and
     value comparison catches before either number is published.
     """
+
+    def test_case_names_are_unique(self):
+        for suite in ("short", "long"):
+            names = [case[0] for case in
+                     build_cases(_TreeBackend("cpu"), suite, "f32")]
+            self.assertEqual(len(names), len(set(names)), suite)
 
     def test_paired_cases_compute_the_same_thing(self):
         for suite in ("short", "long"):
@@ -187,6 +226,24 @@ class TestTwoPassRun(unittest.TestCase):
         self.assertGreater(summary["compared"], 50)
         self.assertGreater(summary["geomean"], 0.0)
         self.assertLessEqual(summary["win_rate"], 1.0)
+
+    def test_unknown_skip_case_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "ours.json"
+            # faulthandler needs a real descriptor, so stderr goes to a file.
+            with open(Path(tmp) / "stderr.log", "w+",
+                      encoding="utf-8") as err:
+                with contextlib.redirect_stderr(err):
+                    with self.assertRaises(SystemExit):
+                        bench_mps_operator.main([
+                            "--suite", "short",
+                            "--reps", "1",
+                            "--min-run-time", "0",
+                            "--warmup", "1",
+                            "--rounds", "1",
+                            "--skip-cases", "not-a-case",
+                            "--json-out", str(out),
+                        ])
 
     def test_mismatched_suites_are_rejected(self):
         ours = {

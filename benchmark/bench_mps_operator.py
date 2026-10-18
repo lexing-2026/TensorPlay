@@ -272,10 +272,14 @@ def _flops_matmul(specs):
 def build_cases(backend, suite, dtype_key):
     A = backend
     cases = []
+    names = set()
 
     def add(name, category, operation, specs, *, long_only=False, flops=0):
         if long_only and suite == "short":
             return
+        if name in names:
+            raise ValueError(f"duplicate benchmark case name: {name}")
+        names.add(name)
         cases.append(
             (name, category, _factory(A, operation, specs, dtype_key), specs,
              flops)
@@ -533,9 +537,16 @@ def main(argv=None):
     suite = "long" if args.suite == "all" else args.suite
     measurements = {}
     samples_by_name = {}
-    skipped = {name.strip() for name in args.skip_cases.split(",")
-               if name.strip()}
+    requested_skips = {name.strip() for name in args.skip_cases.split(",")
+                       if name.strip()}
+    unavailable = {}
     cases = build_cases(backend, suite, args.dtype)
+    unknown_skips = sorted(requested_skips -
+                           {case[0] for case in cases})
+    if unknown_skips:
+        # A typo here would silently time the case and leave the pair incomplete.
+        parser.error("--skip-cases names not in this suite: " +
+                     ", ".join(unknown_skips))
     # A pass that aborts the process keeps the cases it already timed.  Either
     # side can abort: the second runtime on a device it handles badly, this one
     # on a chained case whose in-flight outputs exceed the device allocator.
@@ -555,6 +566,8 @@ def main(argv=None):
                        "min_run_time": args.min_run_time,
                        "warmup": args.warmup, "rounds": args.rounds,
                        "chain_reps": args.chain},
+            "skipped": {"requested": sorted(requested_skips),
+                        "unavailable": dict(unavailable)},
             "measurements": list(measurements.values()),
         }
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
@@ -574,7 +587,7 @@ def main(argv=None):
         offset = round_index * len(cases) // args.rounds
         ordered_cases = cases[offset:] + cases[:offset]
         for name, category, factory, specs, flops in ordered_cases:
-            if name in skipped:
+            if name in requested_skips or name in unavailable:
                 continue
             print(f"running {name}")
             # Probe support on the first pass, including tensor creation, so a
@@ -587,7 +600,8 @@ def main(argv=None):
                     backend.synchronize()
                 except (NotImplementedError, RuntimeError) as exc:
                     print(f"{name:42} [skipped: {exc}]")
-                    skipped.add(name)
+                    unavailable[name] = str(exc)
+                    write_payload()
                     continue
             else:
                 fn = factory()

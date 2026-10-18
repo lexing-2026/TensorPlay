@@ -45,6 +45,12 @@ def load(path, require_measurements=True):
         raise ValueError(f"{path} has no measurements")
     if require_measurements and not measurements:
         raise ValueError(f"{path} has no measurements")
+    names = [item.get("name") for item in measurements]
+    duplicates = sorted({name for name in names if names.count(name) > 1})
+    if duplicates:
+        # Pairing a duplicated name would silently keep one of the timings.
+        raise ValueError(f"{path} has duplicate measurement names: " +
+                         ", ".join(map(str, duplicates)))
     return payload
 
 
@@ -69,14 +75,23 @@ def join(ours, reference):
     theirs = {item["name"]: item.get("seconds")
               for item in reference["measurements"]}
     measurements = []
+    unpaired = []
     for item in ours["measurements"]:
         paired = dict(item)
         seconds = theirs.get(item["name"])
         if _positive(seconds):
             paired["reference_seconds"] = seconds
+        else:
+            unpaired.append(item["name"])
         measurements.append(paired)
+    skipped = reference.get("skipped") or {}
     joined = dict(ours)
     joined["measurements"] = measurements
+    joined["unpaired"] = unpaired
+    joined["reference_requested_skips"] = sorted(
+        skipped.get("requested") or [])
+    joined["reference_unavailable"] = sorted(
+        skipped.get("unavailable") or {})
     joined["reference"] = reference.get("runtime") or {
         "runtime": "reference", "version": "",
         "device": reference.get("device"),
@@ -99,9 +114,14 @@ def summarize(payload):
             "theirs": theirs,
             "speedup": theirs / ours,
         })
+    unpaired = list(payload.get("unpaired") or [])
+    requested = set(payload.get("reference_requested_skips") or [])
+    unexpected_unpaired = [name for name in unpaired if name not in requested]
     if not rows:
         return {"rows": [], "geomean": 0.0, "win_rate": 0.0,
                 "wins": 0, "compared": 0,
+                "unpaired": unpaired,
+                "unexpected_unpaired": unexpected_unpaired,
                 "reference": payload.get("reference", {})}
     speedups = [row["speedup"] for row in rows]
     wins = sum(1 for value in speedups if value >= 1.0)
@@ -111,6 +131,8 @@ def summarize(payload):
         "win_rate": wins / len(rows),
         "wins": wins,
         "compared": len(rows),
+        "unpaired": unpaired,
+        "unexpected_unpaired": unexpected_unpaired,
         "reference": payload.get("reference", {}),
     }
 
@@ -121,6 +143,12 @@ def evaluate(summary, min_geomean, min_win_rate, max_case_slowdown):
     if summary["compared"] == 0:
         return ["no case carries both timings; rerun the benchmark with "
                 "--reference"]
+    if summary.get("unexpected_unpaired"):
+        names = summary["unexpected_unpaired"]
+        violations.append(
+            f"{len(names)} measured cases have no reference timing and were "
+            f"not declared skipped: {', '.join(names)}"
+        )
     if summary["geomean"] < min_geomean:
         violations.append(
             f"overall speedup {summary['geomean']:.2f}x is below the "
@@ -191,6 +219,18 @@ def write_summary(path, summary, violations, min_geomean, min_win_rate):
         for row in wins
     )
     lines.append("")
+    if summary.get("unpaired"):
+        unexpected = set(summary.get("unexpected_unpaired") or [])
+        lines.extend([
+            "## Cases without a reference timing",
+            "",
+        ])
+        lines.extend(
+            f"- {name}: " + ("pairing incomplete"
+                             if name in unexpected else "declared skip")
+            for name in summary["unpaired"]
+        )
+        lines.append("")
     if violations:
         lines.extend(["## Gate", ""])
         lines.extend(f"- {item}" for item in violations)
@@ -233,6 +273,10 @@ def main():
         print(f"cases compared: {summary['compared']}")
         print(f"overall speedup: {summary['geomean']:.2f}x")
         print(f"win rate: {summary['win_rate'] * 100:.0f}%")
+    if summary.get("unpaired"):
+        unexpected = summary.get("unexpected_unpaired") or []
+        print(f"cases without a reference timing: {len(summary['unpaired'])} "
+              f"({len(unexpected)} not declared skipped)")
     for item in violations:
         print(item)
     return 1 if violations else 0
