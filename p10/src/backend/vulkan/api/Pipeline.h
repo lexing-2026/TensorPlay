@@ -43,6 +43,26 @@ enum PipelineStage : PipelineStageFlags {
   TRANSFER = 1u << 2u,
 };
 
+//
+// The GPU access a resource was last recorded against.  Barriers are derived
+// from the difference between this and the next requested access, so the
+// record travels with the resource: a recycled one may still have that access
+// pending in a command buffer that has not been submitted yet.
+//
+struct LastAccess final {
+  PipelineStageFlags stage;
+  MemoryAccessFlags access;
+
+  LastAccess()
+      : stage{PipelineStage::NO_STAGE},
+        access{MemoryAccessType::NONE} {}
+
+  LastAccess(
+      const PipelineStageFlags stage_flags,
+      const MemoryAccessFlags access_flags)
+      : stage{stage_flags}, access{access_flags} {}
+};
+
 VkAccessFlags vk_access(const PipelineStageFlags, const MemoryAccessFlags);
 VkPipelineStageFlags vk_stage(const PipelineStageFlags);
 

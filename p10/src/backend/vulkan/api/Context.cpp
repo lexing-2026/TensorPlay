@@ -137,15 +137,15 @@ void Context::recycle_pending_resources() {
   {
     std::lock_guard<std::mutex> lock(buffer_clearlist_mutex_);
     pending_count += buffers_to_clear_.size();
-    for (const VulkanBuffer& buffer : buffers_to_clear_) {
-      pending_bytes += static_cast<size_t>(buffer.mem_size());
+    for (const Parked<VulkanBuffer>& parked : buffers_to_clear_) {
+      pending_bytes += static_cast<size_t>(parked.resource.mem_size());
     }
   }
   {
     std::lock_guard<std::mutex> lock(image_clearlist_mutex_);
     pending_count += images_to_clear_.size();
-    for (const VulkanImage& image : images_to_clear_) {
-      pending_bytes += static_cast<size_t>(image.mem_size());
+    for (const Parked<VulkanImage>& parked : images_to_clear_) {
+      pending_bytes += static_cast<size_t>(parked.resource.mem_size());
     }
   }
   if (pending_bytes <= kHostVisiblePoolByteBudget &&
@@ -196,17 +196,22 @@ void Context::recycle_pending_resources() {
 
 bool Context::acquire_reusable_buffer(
     VkDeviceSize size,
-    VulkanBuffer& buffer) {
+    VulkanBuffer& buffer,
+    LastAccess& last_access) {
   std::lock_guard<std::mutex> lock(buffer_clearlist_mutex_);
   // Search newest-first so the most recently released resource is reused
   // (LIFO).  This keeps the clearlist small and bounds reserved device
   // memory to the live working set instead of accumulating stale entries.
   for (auto it = buffers_to_clear_.rbegin(); it != buffers_to_clear_.rend();
        ++it) {
-    const VkDeviceSize candidate_size = it->mem_size();
+    const VkDeviceSize candidate_size = it->resource.mem_size();
     if (candidate_size >= size &&
         candidate_size <= size + kReusableBufferSlack) {
-      buffer = std::move(*it);
+      buffer = std::move(it->resource);
+      // The access recorded against the previous owner is handed over with
+      // the resource: its command may still be pending, and the barrier the
+      // new owner inserts is derived from it.
+      last_access = it->last_access;
       buffers_to_clear_.erase(std::next(it).base());
       return true;
     }
@@ -217,15 +222,17 @@ bool Context::acquire_reusable_buffer(
 bool Context::acquire_reusable_image(
     const utils::uvec3& extents,
     VkFormat format,
-    VulkanImage& image) {
+    VulkanImage& image,
+    LastAccess& last_access) {
   std::lock_guard<std::mutex> lock(image_clearlist_mutex_);
   // Newest-first reuse (LIFO), same as buffers: keeps the clearlist small.
   for (auto it = images_to_clear_.rbegin(); it != images_to_clear_.rend();
        ++it) {
-    const VkExtent3D e = it->extents();
+    const VkExtent3D e = it->resource.extents();
     if (e.width == extents[0u] && e.height == extents[1u] &&
-        e.depth == extents[2u] && it->format() == format) {
-      image = std::move(*it);
+        e.depth == extents[2u] && it->resource.format() == format) {
+      image = std::move(it->resource);
+      last_access = it->last_access;
       images_to_clear_.erase(std::next(it).base());
       return true;
     }

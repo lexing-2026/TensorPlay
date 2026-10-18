@@ -65,11 +65,20 @@ class Context final {
   std::mutex cmd_mutex_;
   CommandBuffer cmd_;
   uint32_t submit_count_;
-  // Memory Management
+  // Memory Management.  A retired tensor resource keeps the access it was
+  // last recorded against: that access can still be pending on the GPU when
+  // the resource is handed to its next owner, which must therefore barrier
+  // against it.
+  template <typename Resource>
+  struct Parked final {
+    Resource resource;
+    LastAccess last_access;
+  };
+
   std::mutex buffer_clearlist_mutex_;
-  std::vector<VulkanBuffer> buffers_to_clear_;
+  std::vector<Parked<VulkanBuffer>> buffers_to_clear_;
   std::mutex image_clearlist_mutex_;
-  std::vector<VulkanImage> images_to_clear_;
+  std::vector<Parked<VulkanImage>> images_to_clear_;
   // Host-visible buffer pools.  Staging and uniform-parameter buffers are
   // recycled across ops instead of being re-allocated per record.  A dead
   // buffer first lands in the pending list (its last recorded use may still
@@ -140,28 +149,39 @@ class Context final {
   std::pair<VkQueryPool, uint32_t> write_timestamp();
 
   // Memory Management
-  void register_buffer_cleanup(VulkanBuffer& buffer) {
+  void register_buffer_cleanup(
+      VulkanBuffer& buffer,
+      const LastAccess last_access) {
     std::lock_guard<std::mutex> bufferlist_lock(buffer_clearlist_mutex_);
-    buffers_to_clear_.emplace_back(std::move(buffer));
+    buffers_to_clear_.emplace_back(
+        Parked<VulkanBuffer>{std::move(buffer), last_access});
   }
 
-  void register_image_cleanup(VulkanImage& image) {
+  void register_image_cleanup(
+      VulkanImage& image,
+      const LastAccess last_access) {
     std::lock_guard<std::mutex> imagelist_lock(image_clearlist_mutex_);
-    images_to_clear_.emplace_back(std::move(image));
+    images_to_clear_.emplace_back(
+        Parked<VulkanImage>{std::move(image), last_access});
   }
 
   // Reuse pool for cleared tensor storage.  A vTensorStorage that dies parks
-  // its image/buffer in the clearlist above; acquiring first checks the list
-  // for a compatible resource (byte size / image extents+format) and, when one
-  // is found, waits for in-flight work to drain so the recycled resource can
-  // be safely rebound.  This avoids a fresh device allocation (and its
-  // associated driver cost) on the hot out-of-place op path.  Returns false
-  // when no compatible resource is available; the caller allocates new.
-  bool acquire_reusable_buffer(VkDeviceSize size, VulkanBuffer& buffer);
+  // its image/buffer in the clearlist above together with the access it was
+  // last recorded against; acquiring looks for a compatible resource (byte
+  // size / image extents+format) and hands both halves back, so the new owner
+  // keeps inserting the dependencies the retired owner's pending writes
+  // imply.  This avoids a fresh device allocation (and its associated driver
+  // cost) on the hot out-of-place op path.  Returns false when no compatible
+  // resource is available; the caller allocates new.
+  bool acquire_reusable_buffer(
+      VkDeviceSize size,
+      VulkanBuffer& buffer,
+      LastAccess& last_access);
   bool acquire_reusable_image(
       const utils::uvec3& extents,
       VkFormat format,
-      VulkanImage& image);
+      VulkanImage& image,
+      LastAccess& last_access);
 
   // Host-visible buffer recycling.  `release_*` parks a dead buffer in the
   // pending list; flush() promotes pending buffers to the pools after the

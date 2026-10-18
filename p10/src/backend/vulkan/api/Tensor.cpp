@@ -315,7 +315,8 @@ vTensorStorage::vTensorStorage(
     buffer_length_ = 0;
     const VkDeviceSize nbytes_aligned = 16u;
     if (!allocate_memory ||
-        !context_->acquire_reusable_buffer(nbytes_aligned, buffer_)) {
+        !context_->acquire_reusable_buffer(
+            nbytes_aligned, buffer_, last_access_)) {
       buffer_ = context_->adapter_ptr()->vma().create_storage_buffer(
           nbytes_aligned,
           !context_->adapter_ptr()->has_unified_memory(),
@@ -338,7 +339,8 @@ vTensorStorage::vTensorStorage(
     // count stays in buffer_length_/uBlock.buf_length.
     const VkDeviceSize nbytes_aligned = (nbytes + 15u) & ~VkDeviceSize(15u);
     if (!allocate_memory ||
-        !context_->acquire_reusable_buffer(nbytes_aligned, buffer_)) {
+        !context_->acquire_reusable_buffer(
+            nbytes_aligned, buffer_, last_access_)) {
       buffer_ = context_->adapter_ptr()->vma().create_storage_buffer(
           nbytes_aligned,
           !context_->adapter_ptr()->has_unified_memory(),
@@ -364,7 +366,8 @@ vTensorStorage::vTensorStorage(
           static_cast<VkDeviceSize>(tensorplay::elementSize(dtype));
       const VkDeviceSize nbytes_aligned = (nbytes + 15u) & ~VkDeviceSize(15u);
       if (!allocate_memory ||
-          !context_->acquire_reusable_buffer(nbytes_aligned, buffer_)) {
+          !context_->acquire_reusable_buffer(
+              nbytes_aligned, buffer_, last_access_)) {
         buffer_ = context_->adapter_ptr()->vma().create_storage_buffer(
             nbytes_aligned,
             !context_->adapter_ptr()->has_unified_memory(),
@@ -375,7 +378,7 @@ vTensorStorage::vTensorStorage(
 
     if (!allocate_memory ||
         !context_->acquire_reusable_image(
-            extents_, to_vkformat(dtype), image_)) {
+            extents_, to_vkformat(dtype), image_, last_access_)) {
       image_ = allocate_image(
           context_, extents_, storage_type, to_vkformat(dtype), allocate_memory);
     }
@@ -396,12 +399,16 @@ void vTensorStorage::flush() {
   // Non-empty resources must be released via the context clearlist so that
   // they stay alive until all in-flight GPU work referencing them has
   // completed.  Destruction happens on the next flush.
+  //
+  // The recorded access goes with them: work submitted against this storage
+  // may still be pending when the resource is recycled, and whoever inherits
+  // it has to barrier against that work rather than assume a fresh allocation.
   if (context_) {
     api::VulkanImage image = std::move(image_);
-    context_->register_image_cleanup(image);
+    context_->register_image_cleanup(image, last_access_);
 
     api::VulkanBuffer buffer = std::move(buffer_);
-    context_->register_buffer_cleanup(buffer);
+    context_->register_buffer_cleanup(buffer, last_access_);
   }
 }
 

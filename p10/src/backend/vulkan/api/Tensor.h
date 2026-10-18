@@ -10,21 +10,6 @@
 
 namespace tensorplay {
 namespace vulkan {
-
-struct LastAccess {
-  api::PipelineStageFlags stage;
-  api::MemoryAccessFlags access;
-
-  LastAccess()
-      : stage{api::PipelineStage::NO_STAGE},
-        access{api::MemoryAccessType::NONE} {}
-
-  LastAccess(
-      api::PipelineStageFlags stage_flags,
-      api::MemoryAccessFlags access_flags)
-      : stage{stage_flags}, access{access_flags} {}
-};
-
 namespace api {
 
 class Context;
