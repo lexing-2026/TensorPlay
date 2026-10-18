@@ -498,9 +498,25 @@ Tensor empty_like_kernel(
     DType dtype,
     std::optional<Device> device) {
   Device dev = device.value_or(self.device());
+  const DType resolved =
+      dtype == DType::Undefined ? self.dtype() : dtype;
+  // A clone-shaped allocation keeps the storage class of the model: an op that
+  // changes only the element type has no reason to also move the payload, and
+  // consumers choose their variant by looking at what they are handed.  The
+  // class must be named here rather than left to the shape, because a shape
+  // that fits an image would silently pull a dense payload back into texels.
+  if (dev.is_vulkan()) {
+    const api::vTensor v_self = convert(self);
+    api::vTensor made = allocate_output(
+        api::context(),
+        v_self.storage_type(),
+        static_cast<std::vector<int64_t>>(self.shape()),
+        convert_dtype(resolved));
+    return convert(made);
+  }
   return empty_kernel(
       static_cast<std::vector<int64_t>>(self.shape()),
-      dtype == DType::Undefined ? self.dtype() : dtype,
+      resolved,
       dev,
       false);
 }

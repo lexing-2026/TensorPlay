@@ -14,6 +14,20 @@ namespace tensorplay {
 namespace vulkan {
 namespace ops {
 
+// Defined in View.cpp; materializes a strided view of a payload.  An identity
+// mapping over a word-stored source releases an image copy of the same
+// elements.
+Tensor materialize_view(
+    const Tensor& self,
+    const std::vector<int64_t>& out_sizes,
+    const std::vector<int64_t>& out_strides,
+    int64_t storage_offset);
+
+// Defined in BinaryOp.cpp; copies a texture payload into a dense buffer.
+api::vTensor to_buffer_storage_dispatch(
+    api::Context* context,
+    const api::vTensor& src);
+
 namespace {
 
 /*
@@ -299,6 +313,36 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
     if (src.device().is_vulkan()) {
       api::Context* const context = api::context();
       api::vTensor v_src = convert(src);
+      const bool linear_destination =
+          v_self.storage_type() == api::StorageType::BUFFER;
+
+      // A transfer binds both operands in one storage class, so a payload that
+      // arrives in the other class crosses over first: the identity gather
+      // turns words into texels, the repack turns texels into words.  The
+      // tensor that owns a gathered payload has to outlive the view of it,
+      // because a view over an existing payload only points at the storage.
+      Tensor gathered;
+      if (linear_destination !=
+          (v_src.storage_type() == api::StorageType::BUFFER)) {
+        // The gathered payload is sized from the source, and the transfer that
+        // follows runs over the destination's extents; shapes that merely share
+        // an element count would make that read past the payload just built.
+        TP_CHECK(
+            src.shape() == self.shape(),
+            "Vulkan copies between storage classes require equal shapes");
+        if (linear_destination) {
+          v_src = to_buffer_storage_dispatch(context, v_src);
+        } else {
+          const std::vector<int64_t> sizes(
+              v_src.sizes().begin(), v_src.sizes().end());
+          gathered = materialize_view(
+              src,
+              sizes,
+              SizesAndStrides::compute_contiguous_strides(sizes),
+              0);
+          v_src = convert(gathered);
+        }
+      }
 
       if (v_src.dtype() != v_self.dtype()) {
         TP_CHECK(src.shape() == self.shape(),
@@ -306,16 +350,8 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
 
         // A linear payload converts through its own kernels: the storage has
         // no texel format to name the element type, so a half payload keeps
-        // two lanes per 32-bit word and a byte-packed one four.  Mixing an
-        // image with a linear payload has no route here, since neither
-        // binding can read the other.
-        const bool linear_source =
-            v_src.storage_type() == api::StorageType::BUFFER;
-        const bool linear_destination =
-            v_self.storage_type() == api::StorageType::BUFFER;
-        if (linear_source || linear_destination) {
-          TP_CHECK(linear_source && linear_destination,
-                   "Vulkan dtype conversion does not mix storage types");
+        // two lanes per 32-bit word and a byte-packed one four.
+        if (linear_destination) {
           const char* buffer_shader =
               linear_cast_shader(v_src.dtype(), v_self.dtype());
           TP_CHECK(
@@ -360,9 +396,9 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
         return self;
       }
 
-      if (v_self.storage_type() == api::StorageType::BUFFER &&
-          v_src.storage_type() == api::StorageType::BUFFER) {
-        api::PipelineBarrier pipeline_barrier{};
+      api::PipelineBarrier pipeline_barrier{};
+
+      if (linear_destination) {
         context->submit_copy<api::VulkanBuffer, api::VulkanBuffer>(
             pipeline_barrier,
             v_src.buffer(pipeline_barrier, api::PipelineStage::TRANSFER,
@@ -375,8 +411,6 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
             VK_NULL_HANDLE);
         return self;
       }
-
-      api::PipelineBarrier pipeline_barrier{};
 
       context->submit_copy<api::VulkanImage, api::VulkanImage>(
           // pipeline barrier

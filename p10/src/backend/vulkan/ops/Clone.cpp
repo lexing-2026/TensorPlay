@@ -18,11 +18,12 @@ Tensor clone_kernel(const Tensor& self, std::optional<int64_t> memory_format) {
 
   api::vTensor v_self = convert(self);
 
-  api::vTensor v_output{
-      context,
-      v_self.sizes(),
-      v_self.dtype(),
-  };
+  // A clone is byte-identical, so the copy binds both operands in one storage
+  // class and the result has to be released in the class the model uses: a
+  // texture allocation has no buffer to receive a linear copy, and writing one
+  // leaves the image holding whatever the allocator recycled into it.
+  api::vTensor v_output = allocate_output_like(
+      context, v_self, v_self.sizes(), v_self.dtype());
 
   if (v_self.storage_type() == api::StorageType::BUFFER) {
     api::PipelineBarrier pipeline_barrier{};
