@@ -1,5 +1,9 @@
 #pragma once
+// The Metal Standard Library provides the fixed-width integer types; the host
+// translation unit gets them from the standard header.
+#ifndef __METAL__
 #include <cstdint>
+#endif
 
 #include "common.h"
 
