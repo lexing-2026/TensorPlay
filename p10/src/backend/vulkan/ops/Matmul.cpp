@@ -81,7 +81,7 @@ api::vTensor pack_lhs_width(const Tensor& src) {
   api::PipelineBarrier pack_barrier{};
 
   context->submit_compute_job(
-      VK_KERNEL(convert_channels_to_width_packed),
+      kernel_for("convert_channels_to_width_packed", src.dtype()),
       pack_barrier,
       v_dst.extents(),
       adaptive_work_group_size(v_dst.extents()),
@@ -118,7 +118,7 @@ api::vTensor pack_rhs_height(const Tensor& src) {
   api::PipelineBarrier pack_barrier{};
 
   context->submit_compute_job(
-      VK_KERNEL(convert_channels_to_height_packed),
+      kernel_for("convert_channels_to_height_packed", src.dtype()),
       pack_barrier,
       v_dst.extents(),
       adaptive_work_group_size(v_dst.extents()),
@@ -164,7 +164,7 @@ api::vTensor pack_lhs_width_transposed(const Tensor& src) {
   };
 
   context->submit_compute_job(
-      VK_KERNEL(pack_lhs_transposed),
+      kernel_for("pack_lhs_transposed", src.dtype()),
       pack_barrier,
       global_size,
       adaptive_work_group_size(global_size),
@@ -209,7 +209,7 @@ api::vTensor pack_rhs_height_transposed(const Tensor& src) {
   };
 
   context->submit_compute_job(
-      VK_KERNEL(pack_rhs_transposed),
+      kernel_for("pack_rhs_transposed", src.dtype()),
       pack_barrier,
       global_size,
       adaptive_work_group_size(global_size),
@@ -255,7 +255,7 @@ api::vTensor bmm_pack_lhs_width(const Tensor& src, int64_t batches) {
   };
 
   context->submit_compute_job(
-      VK_KERNEL(bmm_pack_lhs),
+      kernel_for("bmm_pack_lhs", src.dtype()),
       pack_barrier,
       global_size,
       adaptive_work_group_size(global_size),
@@ -298,7 +298,7 @@ api::vTensor bmm_pack_rhs_height(const Tensor& src, int64_t batches) {
   };
 
   context->submit_compute_job(
-      VK_KERNEL(bmm_pack_rhs),
+      kernel_for("bmm_pack_rhs", src.dtype()),
       pack_barrier,
       global_size,
       adaptive_work_group_size(global_size),
@@ -526,8 +526,15 @@ Tensor gemv_decode_linear(
   api::Context* const context = api::context();
 
   TP_CHECK(
-      dtype == DType::Float32,
-      "Vulkan products over buffer-stored weights support Float32 only");
+      dtype == DType::Float32 || dtype == DType::Float16,
+      "Vulkan products over buffer-stored weights support Float32 and "
+      "Float16 only");
+  // The payload families differ in how a word is read, so every operand has to
+  // carry the element type the result is computed in.
+  TP_CHECK(
+      v_lhs.dtype() == dtype && v_rhs.dtype() == dtype,
+      "Vulkan products over buffer-stored weights need operands of the "
+      "result dtype");
   TP_CHECK(
       M <= kGemvMaxRows,
       "Vulkan products over buffer-stored weights support decode shapes only");
@@ -595,7 +602,7 @@ Tensor gemv_decode_linear(
   api::UniformParamsBuffer split_params(context, split_block);
   api::PipelineBarrier split_barrier{};
 
-  const char* split_shader = nullptr;
+  std::string split_shader;
   if (rhs_vec4) {
     split_shader = lhs_buffer ? "gemv_linear_split_buffer_nk_vec4"
                               : "gemv_linear_split_nk_vec4";
@@ -605,6 +612,7 @@ Tensor gemv_decode_linear(
   } else {
     split_shader = lhs_buffer ? "gemv_linear_split_buffer" : "gemv_linear_split";
   }
+  split_shader = buffer_shader_for_dtype(split_shader, dtype);
 
   const api::utils::uvec3 split_grid{
       api::utils::safe_downcast_to_u32(N),
@@ -654,6 +662,14 @@ Tensor gemv_decode_linear(
         v_bias->storage_type() == v_output.storage_type(),
         "Vulkan products over buffer-stored weights require an addend in the "
         "same storage as the result");
+    // A linear addend is read as words of the result's element type, while an
+    // image one hands back floats whatever its format, so only the former
+    // needs to match.
+    TP_CHECK(
+        v_output.storage_type() != api::StorageType::BUFFER ||
+            v_bias->dtype() == dtype,
+        "Vulkan products over buffer-stored weights need a linear addend of "
+        "the result dtype");
   }
   const std::vector<int64_t> bias_sizes = bias.has_value()
       ? shape_of(*bias)
@@ -675,20 +691,29 @@ Tensor gemv_decode_linear(
       beta_f,
   };
 
-  const char* combine_shader = out_buffer
-      ? (v_bias.has_value() ? "gemv_linear_combine_buffer"
-                            : "gemv_linear_combine_buffer_nobias")
-      : (v_bias.has_value() ? "gemv_linear_combine"
-                           : "gemv_linear_combine_nobias");
+  std::string combine_shader = out_buffer
+      ? std::string(v_bias.has_value() ? "gemv_linear_combine_buffer"
+                                       : "gemv_linear_combine_buffer_nobias")
+      : std::string(v_bias.has_value() ? "gemv_linear_combine"
+                                       : "gemv_linear_combine_nobias");
+  combine_shader = buffer_shader_for_dtype(combine_shader, dtype);
 
   api::UniformParamsBuffer combine_params(context, combine_block);
   api::PipelineBarrier combine_barrier{};
 
-  const api::utils::uvec3 combine_grid{
-      api::utils::safe_downcast_to_u32(N),
-      api::utils::safe_downcast_to_u32(M),
-      1u,
-  };
+  // A half result in linear storage folds two elements per word, so the grid
+  // counts words; an image result keeps one element per texel channel and
+  // spreads over the product's own axes.
+  const api::utils::uvec3 combine_grid = (out_buffer && dtype == DType::Float16)
+      ? api::utils::uvec3{
+            api::utils::div_up(
+                api::utils::safe_downcast_to_u32(M * N), 2u),
+            1u,
+            1u}
+      : api::utils::uvec3{
+            api::utils::safe_downcast_to_u32(N),
+            api::utils::safe_downcast_to_u32(M),
+            1u};
 
   if (out_buffer) {
     if (v_bias.has_value()) {
@@ -1637,8 +1662,9 @@ Tensor linear_kernel(
     const Tensor& weight,
     const std::optional<Tensor>& bias_opt) {
   TP_CHECK(
-      input.dtype() == DType::Float32 && weight.dtype() == DType::Float32,
-      "Vulkan linear supports Float32 and Float16 tensors only");
+      (input.dtype() == DType::Float32 || input.dtype() == DType::Float16) &&
+          input.dtype() == weight.dtype(),
+      "Vulkan linear supports Float32 and Float16 operands of one dtype only");
   TP_CHECK(
       weight.dim() == 2,
       "Vulkan linear: weight must be 2d (out_features, in_features)");
