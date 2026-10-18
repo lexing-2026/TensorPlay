@@ -1,10 +1,11 @@
 // Unit-stride comparison kernels for operands that already share a shape.
 //
-// One thread answers one element: it reads both operands at its own index and
-// writes the predicate into the single byte that a boolean element occupies.
-// Both reads step by one element, so a threadgroup is served by two wide
-// accesses, and the whole call is one command over three buffers rather than a
-// graph execution with its feeds and results.
+// The scalar form answers one element per thread: it reads both operands at its
+// own index and writes the predicate into the single byte that a boolean
+// element occupies, so a threadgroup is served by two wide accesses and the
+// whole call is one command over three buffers rather than a graph execution
+// with its feeds and results. The four-wide form below reads one 16-byte vector
+// of each operand per predicate group instead.
 //
 // The comparisons follow the ordering of the types they read: two floats are
 // equal only when neither is NaN, and every ordered comparison against a NaN is
@@ -12,7 +13,10 @@
 
 #include <metal_stdlib>
 
+#include "common.h"
+
 using namespace metal;
+using p10::metal::ILP_PER_THREAD;
 
 struct eq_op {
   template <typename T>
@@ -77,6 +81,81 @@ kernel void compare_scalar_dense(device bool* out [[buffer(0)]],
   out[tid] = Op::apply(lhs[tid], rhs[0]);
 }
 
+// Four-wide form: a thread reads four consecutive floats of each operand as one
+// 16-byte access and writes the four predicate bytes as one 4-byte store. The
+// host only takes this path when the operands hold whole vectors, every base is
+// 16-byte aligned, and the storage type is float; anything else stays with the
+// scalar forms above.
+//
+// Each thread takes one vector per grid-wide stride rather than a run of
+// consecutive vectors, so the lanes of a SIMD group address adjacent vectors on
+// every access and one instruction covers a contiguous span.
+template <typename Op>
+inline uchar4 apply_compare4(float4 lhs, float4 rhs) {
+  return uchar4(static_cast<uchar>(Op::apply(lhs.x, rhs.x)),
+                static_cast<uchar>(Op::apply(lhs.y, rhs.y)),
+                static_cast<uchar>(Op::apply(lhs.z, rhs.z)),
+                static_cast<uchar>(Op::apply(lhs.w, rhs.w)));
+}
+
+template <typename Op>
+kernel void compare_vec(device uchar4* out [[buffer(0)]],
+                        constant float4* lhs [[buffer(1)]],
+                        constant float4* rhs [[buffer(2)]],
+                        constant uint& nvec [[buffer(3)]],
+                        uint tid [[thread_position_in_grid]],
+                        uint grid [[threads_per_grid]]) {
+  if (tid + (ILP_PER_THREAD - 1) * grid < nvec) {
+    array<float4, ILP_PER_THREAD> left;
+    array<float4, ILP_PER_THREAD> right;
+#pragma unroll
+    for (uint j = 0; j < ILP_PER_THREAD; ++j) {
+      left[j] = lhs[tid + j * grid];
+    }
+#pragma unroll
+    for (uint j = 0; j < ILP_PER_THREAD; ++j) {
+      right[j] = rhs[tid + j * grid];
+    }
+#pragma unroll
+    for (uint j = 0; j < ILP_PER_THREAD; ++j) {
+      out[tid + j * grid] = apply_compare4<Op>(left[j], right[j]);
+    }
+  } else {
+    // The threads whose last stride lands past the end, and the whole grid,
+    // when the operand holds fewer vectors than it has threads.
+    for (uint i = tid; i < nvec; i += grid) {
+      out[i] = apply_compare4<Op>(lhs[i], rhs[i]);
+    }
+  }
+}
+
+// The scalar operand is read as one float and broadcast to all four lanes, so
+// the read stays within the single element its buffer holds.
+template <typename Op>
+kernel void compare_scalar_vec(device uchar4* out [[buffer(0)]],
+                               constant float4* lhs [[buffer(1)]],
+                               constant float* rhs [[buffer(2)]],
+                               constant uint& nvec [[buffer(3)]],
+                               uint tid [[thread_position_in_grid]],
+                               uint grid [[threads_per_grid]]) {
+  const float4 scalar = float4(rhs[0]);
+  if (tid + (ILP_PER_THREAD - 1) * grid < nvec) {
+    array<float4, ILP_PER_THREAD> values;
+#pragma unroll
+    for (uint j = 0; j < ILP_PER_THREAD; ++j) {
+      values[j] = lhs[tid + j * grid];
+    }
+#pragma unroll
+    for (uint j = 0; j < ILP_PER_THREAD; ++j) {
+      out[tid + j * grid] = apply_compare4<Op>(values[j], scalar);
+    }
+  } else {
+    for (uint i = tid; i < nvec; i += grid) {
+      out[i] = apply_compare4<Op>(lhs[i], scalar);
+    }
+  }
+}
+
 #define REGISTER_COMPARE_DENSE(OP, DTYPE)                  \
   template [[host_name("compare_" #OP "_" #DTYPE)]]        \
   kernel void compare_dense<DTYPE, OP##_op>(               \
@@ -106,6 +185,26 @@ kernel void compare_scalar_dense(device bool* out [[buffer(0)]],
   REGISTER_COMPARE_SCALAR(OP, long)        \
   REGISTER_COMPARE_SCALAR(OP, int)
 
+#define REGISTER_COMPARE_VEC(OP)                      \
+  template [[host_name("compare_vec_" #OP "_float")]] \
+  kernel void compare_vec<OP##_op>(                   \
+      device uchar4* out [[buffer(0)]],               \
+      constant float4* lhs [[buffer(1)]],             \
+      constant float4* rhs [[buffer(2)]],             \
+      constant uint& nvec [[buffer(3)]],              \
+      uint tid [[thread_position_in_grid]],           \
+      uint grid [[threads_per_grid]]);
+
+#define REGISTER_COMPARE_VEC_SCALAR(OP)                      \
+  template [[host_name("compare_vec_" #OP "_scalar_float")]] \
+  kernel void compare_scalar_vec<OP##_op>(                   \
+      device uchar4* out [[buffer(0)]],                      \
+      constant float4* lhs [[buffer(1)]],                    \
+      constant float* rhs [[buffer(2)]],                     \
+      constant uint& nvec [[buffer(3)]],                     \
+      uint tid [[thread_position_in_grid]],                  \
+      uint grid [[threads_per_grid]]);
+
 REGISTER_COMPARE_DTYPES(eq)
 REGISTER_COMPARE_DTYPES(ne)
 REGISTER_COMPARE_DTYPES(lt)
@@ -119,3 +218,17 @@ REGISTER_COMPARE_SCALAR_DTYPES(lt)
 REGISTER_COMPARE_SCALAR_DTYPES(le)
 REGISTER_COMPARE_SCALAR_DTYPES(gt)
 REGISTER_COMPARE_SCALAR_DTYPES(ge)
+
+REGISTER_COMPARE_VEC(eq)
+REGISTER_COMPARE_VEC(ne)
+REGISTER_COMPARE_VEC(lt)
+REGISTER_COMPARE_VEC(le)
+REGISTER_COMPARE_VEC(gt)
+REGISTER_COMPARE_VEC(ge)
+
+REGISTER_COMPARE_VEC_SCALAR(eq)
+REGISTER_COMPARE_VEC_SCALAR(ne)
+REGISTER_COMPARE_VEC_SCALAR(lt)
+REGISTER_COMPARE_VEC_SCALAR(le)
+REGISTER_COMPARE_VEC_SCALAR(gt)
+REGISTER_COMPARE_VEC_SCALAR(ge)

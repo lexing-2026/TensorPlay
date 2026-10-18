@@ -1571,18 +1571,41 @@ std::optional<Tensor> compareShader(const std::string& op, const Tensor& self,
     return std::nullopt;
   }
 
-  const uint32_t total = static_cast<uint32_t>(numel);
+  const uint32_t elements = static_cast<uint32_t>(numel);
+  // The four-wide form moves one 16-byte read per operand and one 4-byte store
+  // per four predicates. The scalar operand is read from its single element, so
+  // only the operand and the result need to qualify for the vector form.
+  bool vec_ok = false;
+  if (self.dtype() == DType::Float32 && elements % 4 == 0) {
+    vec_ok = scalar_rhs
+                 ? wholeFloatVectors(self.dtype(), elements,
+                                     {self.data_ptr(), output.data_ptr()})
+                 : wholeFloatVectors(self.dtype(), elements,
+                                     {self.data_ptr(), other.data_ptr(),
+                                      output.data_ptr()});
+  }
+  MTLComputePipelineState_t vec_pso =
+      vec_ok ? shaderPipelineNamed(std::string("compare_vec_") + op +
+                                   (scalar_rhs ? "_scalar_float" : "_float"))
+             : nil;
+  MTLComputePipelineState_t active_pso = vec_pso ? vec_pso : pso;
+  // The vector form counts 16-byte vectors, the scalar form elements.
+  const uint32_t span = vec_pso ? elements / 4 : elements;
+  const uint32_t total = vec_pso ? denseGridSize(span) : elements;
   MPSStream* stream = getCurrentMPSStream();
   dispatch_sync_with_rethrow(stream->queue(), ^() {
     @autoreleasepool {
       auto encoder = stream->commandEncoder();
-      [encoder setComputePipelineState:pso];
+      [encoder setComputePipelineState:active_pso];
       [encoder setBuffer:(__bridge id<MTLBuffer>)out_buf offset:0 atIndex:0];
       [encoder setBuffer:(__bridge id<MTLBuffer>)self_buf offset:0 atIndex:1];
       [encoder setBuffer:(__bridge id<MTLBuffer>)other_buf offset:0 atIndex:2];
+      if (vec_pso) {
+        [encoder setBytes:&span length:sizeof(span) atIndex:3];
+      }
       const uint32_t per_group =
           std::min(total,
-                   static_cast<uint32_t>([pso maxTotalThreadsPerThreadgroup]));
+                   static_cast<uint32_t>([active_pso maxTotalThreadsPerThreadgroup]));
       [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(per_group, 1, 1)];
     }
