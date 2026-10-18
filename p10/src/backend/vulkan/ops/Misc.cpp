@@ -362,6 +362,61 @@ Tensor flip_kernel(const Tensor& self, const std::vector<int64_t>& dims) {
   api::vTensor v_input = convert(self);
   api::vTensor v_output{context, v_input.sizes(), v_input.dtype()};
 
+  // Linear payloads (shapes beyond the 3-D image axis limit) reverse through
+  // a buffer-to-buffer variant: each output coordinate maps back through the
+  // flagged axes over the dense row-major layout.
+  if (v_input.storage_type() == api::StorageType::BUFFER) {
+    const auto prepad = [](const std::vector<int64_t>& v) {
+      std::vector<int64_t> out(4, 1);
+      const int64_t offset_slots = 4 - static_cast<int64_t>(v.size());
+      for (size_t i = 0; i < v.size(); ++i) {
+        out[static_cast<size_t>(offset_slots + static_cast<int64_t>(i))] =
+            v[i];
+      }
+      return out;
+    };
+    const std::vector<int64_t> in_pre = prepad(shape_vector(self));
+    const std::vector<int64_t> in_strides =
+        SizesAndStrides::compute_contiguous_strides(in_pre);
+    const int32_t out_c_depth = static_cast<int32_t>((in_pre[1] + 3) / 4);
+    const struct FlipBufferBlock final {
+      ivec4 out_sizes;
+      ivec4 in_sizes;
+      ivec4 in_strides;
+      ivec4 flip_axes;
+      int32_t out_c_depth;
+      int32_t fill;
+    } block{
+        ivec4(in_pre[0], in_pre[1], in_pre[2], in_pre[3]),
+        ivec4(in_pre[0], in_pre[1], in_pre[2], in_pre[3]),
+        ivec4(in_strides[0], in_strides[1], in_strides[2], in_strides[3]),
+        flip_axes,
+        out_c_depth,
+        0,
+    };
+    api::UniformParamsBuffer params(context, block);
+    api::PipelineBarrier pipeline_barrier{};
+    const api::utils::uvec3 grid{
+        static_cast<uint32_t>(in_pre[3]),
+        static_cast<uint32_t>(in_pre[2]),
+        static_cast<uint32_t>(in_pre[0]) *
+            static_cast<uint32_t>(out_c_depth),
+    };
+    context->submit_compute_job(
+        VK_KERNEL_FROM_STR("flip_buffer"), pipeline_barrier, grid,
+        adaptive_work_group_size(grid), VK_NULL_HANDLE,
+        v_output.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::WRITE),
+        v_input.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::READ),
+        params.buffer());
+    return convert(v_output);
+  }
+
   const struct FlipBlock final {
     ivec4 in_sizes;
     ivec4 flip_axes;

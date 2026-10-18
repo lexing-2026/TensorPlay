@@ -982,6 +982,10 @@ flip:
   parameter_names_with_default_values: {}
   shader_variants:
   - NAME: flip
+flip_buffer:
+  parameter_names_with_default_values: {}
+  shader_variants:
+  - NAME: flip_buffer
 cat_channel:
   parameter_names_with_default_values: {}
   shader_variants:
