@@ -438,9 +438,9 @@ Tensor logspace_kernel(
 }
 
 Tensor arange_start_step_kernel(
-    Scalar start,
-    Scalar end,
-    Scalar step,
+    const Scalar& start,
+    const Scalar& end,
+    const Scalar& step,
     DType dtype,
     std::optional<Device> device) {
   double s_d = start.toDouble();
@@ -481,7 +481,7 @@ Tensor arange_start_step_kernel(
 }
 
 Tensor arange_kernel(
-    Scalar end,
+    const Scalar& end,
     DType dtype,
     std::optional<Device> device) {
   return arange_start_step_kernel(

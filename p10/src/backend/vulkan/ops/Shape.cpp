@@ -28,9 +28,9 @@ Tensor materialize_view(
 // triangular masks below use Int32 index tensors, the widest integer dtype
 // the linear path stores.
 Tensor arange_start_step_kernel(
-    Scalar start,
-    Scalar end,
-    Scalar step,
+    const Scalar& start,
+    const Scalar& end,
+    const Scalar& step,
     DType dtype,
     std::optional<Device> device);
 
