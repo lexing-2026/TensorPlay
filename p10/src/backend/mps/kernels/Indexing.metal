@@ -275,7 +275,6 @@ kernel void index_bounds_check(
       device long * out [[buffer(2)]],                           \
       uint tid [[thread_position_in_grid]]);
 
-REGISTER_INDEX_BOUNDS_CHECK(int)
 REGISTER_INDEX_BOUNDS_CHECK(long)
 
 #define REGISTER_INDEX_SELECT_VEC(NAME, UNIT)                                \

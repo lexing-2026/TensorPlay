@@ -132,21 +132,26 @@ kernel void embedding_forward(
     device uchar* out [[buffer(2)]],
     constant uint& num_embeddings [[buffer(3)]],
     constant uint& row_bytes [[buffer(4)]],
+    device long* err [[buffer(5)]],
     uint2 tid [[thread_position_in_grid]]) {
   const uint pos = tid.x * 16u;
   if (pos >= row_bytes) {
     return;
   }
-  // The range check runs as a separate kernel and reports through the stream's
-  // error buffer; clamping keeps an entry that is still in flight while the
-  // report is pending inside the weight.
+  // The copy reports an out-of-range entry into the stream's error buffer as
+  // it reads it; clamping keeps the same entry inside the weight until the
+  // wait that raises the report.
   const long ix_raw = static_cast<long>(indices[tid.y]);
-  const long ix_wrapped =
-      ix_raw < 0 ? ix_raw + long(num_embeddings) : ix_raw;
+  const long limit = long(num_embeddings);
+  if (ix_raw < -limit || ix_raw >= limit) {
+    err[1] = ix_raw;
+    err[2] = limit;
+    err[0] = 1;
+  }
+  const long ix_wrapped = ix_raw < 0 ? ix_raw + limit : ix_raw;
   const long ix = ix_wrapped < 0
       ? 0
-      : (ix_wrapped >= long(num_embeddings) ? long(num_embeddings) - 1
-                                            : ix_wrapped);
+      : (ix_wrapped >= limit ? limit - 1 : ix_wrapped);
   const ulong src = static_cast<ulong>(ix) * row_bytes + pos;
   const ulong dst = static_cast<ulong>(tid.y) * row_bytes + pos;
   const uint remaining = min(16u, row_bytes - pos);
@@ -168,6 +173,7 @@ kernel void embedding_forward(
       device uchar * out [[buffer(2)]],                                \
       constant uint& num_embeddings [[buffer(3)]],                     \
       constant uint& row_bytes [[buffer(4)]],                          \
+      device long * err [[buffer(5)]],                                 \
       uint2 tid [[thread_position_in_grid]])
 
 REGISTER_EMBEDDING_FORWARD(int);

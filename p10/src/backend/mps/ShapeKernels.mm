@@ -260,11 +260,11 @@ Tensor embedding_kernel(const Tensor& weight, const Tensor& indices,
   }
 
   // Short index lists are range-checked on the host, which answers before the
-  // call returns; longer ones are checked by a kernel on the stream, so the
-  // scan does not sit in the hot path. Either way the copy kernel clamps, so
-  // an entry that is still in flight while the report is pending stays inside
-  // the weight. The stream only has to be drained when it still holds work
-  // that may write the bytes the host scan reads.
+  // call returns; longer ones are checked by the copy kernel itself as it
+  // streams the indices, so the scan does not sit in the hot path. Either way
+  // the copy clamps, so an entry that is still in flight while the report is
+  // pending stays inside the weight. The stream only has to be drained when it
+  // still holds work that may write the bytes the host scan reads.
   constexpr int64_t kHostIndexScanLimit = 4096;
   if (n <= kHostIndexScanLimit) {
     if (getCurrentMPSStream()->hasPendingWork()) {
@@ -299,23 +299,12 @@ Tensor embedding_kernel(const Tensor& weight, const Tensor& indices,
   MPSStream* mpsStream = getCurrentMPSStream();
   dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
     @autoreleasepool {
-      id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
-      if (n > kHostIndexScanLimit) {
-        const std::string check_kernel = "index_bounds_check_" +
-            scalarToMetalTypeString(indices_c.dtype());
-        auto check_pso =
-            MetalShaderLibrary::getBundledLibrary().getPipelineStateForFunc(
-                check_kernel);
-        [computeEncoder setComputePipelineState:check_pso];
-        mtl_setArgs(computeEncoder, indices_c, num_embeddings,
-                    mpsStream->errorBuffer());
-        mtl_dispatch1DJob(computeEncoder, check_pso,
-                          static_cast<NSUInteger>(n));
-      }
+      auto computeEncoder = mpsStream->commandEncoder();
       [computeEncoder setComputePipelineState:pso];
       mtl_setArgs(computeEncoder, weight_c, indices_c, output,
                   static_cast<uint32_t>(num_embeddings),
-                  static_cast<uint32_t>(row_bytes));
+                  static_cast<uint32_t>(row_bytes),
+                  mpsStream->errorBuffer());
       mtl_dispatch3DJob(computeEncoder, pso, chunks,
                         static_cast<NSUInteger>(n), 1);
       mpsStream->endKernelCoalescing();
