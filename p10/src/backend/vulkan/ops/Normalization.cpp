@@ -311,8 +311,33 @@ Tensor batch_norm_kernel(
   };
 
   if (v_output.storage_type() == api::StorageType::BUFFER) {
-    TP_THROW(
-        NotImplementedError, "Vulkan batch_norm requires texture storage");
+    // Linear composite: (x - mean) / sqrt(var + eps) * weight + bias with
+    // per-channel statistics reshaped to broadcast over the spatial axes.
+    // Every step routes through a buffer-capable elementwise kernel.
+    const int64_t channels = get_dim<Dim4D::Channel>(v_input.sizes());
+    const std::vector<int64_t> stat_shape{1, channels, 1, 1};
+    Tensor mean = dispatch_vk<Tensor>(
+        "reshape", running_mean_opt.value(), stat_shape);
+    Tensor var = dispatch_vk<Tensor>(
+        "reshape", running_var_opt.value(), stat_shape);
+    Tensor rstd = dispatch_vk<Tensor>(
+        "rsqrt",
+        dispatch_vk<Tensor>("add.Scalar", var, Scalar(eps), Scalar(1)));
+    Tensor centered = dispatch_vk<Tensor>(
+        "sub.Tensor", input, mean, Scalar(1.0));
+    Tensor out = dispatch_vk<Tensor>("mul.Tensor", centered, rstd);
+    if (weight_opt.has_value()) {
+      out = dispatch_vk<Tensor>(
+          "mul.Tensor", out,
+          dispatch_vk<Tensor>("reshape", weight_opt.value(), stat_shape));
+    }
+    if (bias_opt.has_value()) {
+      out = dispatch_vk<Tensor>(
+          "add.Tensor", out,
+          dispatch_vk<Tensor>("reshape", bias_opt.value(), stat_shape),
+          Scalar(1));
+    }
+    return out;
   }
 
   const bool has_weight = weight_opt.has_value();
