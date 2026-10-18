@@ -333,6 +333,52 @@ Tensor index_select_kernel(
 
   api::vTensor v_output{context, {out_count}, DType::Float32};
 
+  // Linear payloads (1-d tensors or row selections of 2-d tensors whose
+  // shapes exceed the image limit) gather through a buffer-to-buffer variant
+  // with the index payload copied to a dense Int32 buffer.
+  if (v_input.storage_type() == api::StorageType::BUFFER) {
+    api::vTensor v_indices_buf =
+        to_buffer_storage_dispatch(context, v_indices);
+    api::vTensor v_out_buf{
+        context, {out_count}, DType::Float32, api::StorageType::BUFFER,
+        api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+    const uint32_t n = static_cast<uint32_t>(out_count);
+    const struct IndexSelectBufferBlock {
+      int32_t inner;
+      int32_t row_stride;
+      int32_t count;
+      int32_t rows;
+    } block{
+        static_cast<int32_t>(inner),
+        static_cast<int32_t>(inner),
+        static_cast<int32_t>(index_count),
+        static_cast<int32_t>(self.size(wrapped)),
+    };
+    api::UniformParamsBuffer params(context, block);
+    api::PipelineBarrier pipeline_barrier{};
+    context->submit_compute_job(
+        VK_KERNEL_FROM_STR("index_select_buffer"), pipeline_barrier,
+        {(n + 3u) / 4u, 1u, 1u}, {256u, 1u, 1u}, VK_NULL_HANDLE,
+        v_out_buf.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::WRITE),
+        v_input.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::READ),
+        v_indices_buf.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::READ),
+        params.buffer());
+    std::vector<int64_t> out_sizes(
+        static_cast<std::vector<int64_t>>(self.shape()));
+    out_sizes[static_cast<size_t>(wrapped)] = index_count;
+    Tensor flat_out = convert(v_out_buf);
+    return flat_out.reshape(out_sizes);
+  }
+
   const struct IndexSelectBlock block{
       static_cast<int32_t>(inner),
       static_cast<int32_t>(inner),
