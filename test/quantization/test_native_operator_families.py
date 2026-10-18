@@ -305,6 +305,18 @@ def test_native_max_pool2d_expands_singleton_kernel(device,batched):
 
 @pytest.mark.parametrize('device',DEVICES)
 @pytest.mark.parametrize('rank',[1,2,3])
+def test_native_quantized_max_pool_expands_singleton_kernel(device,rank):
+    # One length stands for every spatial axis, whichever axis count is asked
+    # for, and the empty stride falls back to the window.
+    shape=(2,3)+(5,)*rank
+    x,r=pair(np.arange(np.prod(shape)).reshape(shape)%97,'int8',device)
+    actual=getattr(tp._C,f'quantized_max_pool{rank}d')(x,[2],[],[0],[1],False)
+    expected=getattr(torch.nn.functional,f'max_pool{rank}d')(r,2)
+    same(actual,expected)
+
+
+@pytest.mark.parametrize('device',DEVICES)
+@pytest.mark.parametrize('rank',[1,2,3])
 @pytest.mark.parametrize('groups',[1,2])
 def test_transposed_convolution_geometry(device,rank,groups):
     rng=np.random.default_rng(41);x=rng.normal(size=(2,4)+(3,)*rank).astype('float32')
