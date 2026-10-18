@@ -66,6 +66,17 @@ kernel void compare_dense(device bool* out [[buffer(0)]],
   out[tid] = Op::apply(lhs[tid], rhs[tid]);
 }
 
+// A comparison against one scalar value reads that value from the single
+// element of its buffer and applies it to every operand element, which keeps
+// the operand on the unit-stride path.
+template <typename T, typename Op>
+kernel void compare_scalar_dense(device bool* out [[buffer(0)]],
+                                 constant T* lhs [[buffer(1)]],
+                                 constant T* rhs [[buffer(2)]],
+                                 uint tid [[thread_position_in_grid]]) {
+  out[tid] = Op::apply(lhs[tid], rhs[0]);
+}
+
 #define REGISTER_COMPARE_DENSE(OP, DTYPE)                  \
   template [[host_name("compare_" #OP "_" #DTYPE)]]        \
   kernel void compare_dense<DTYPE, OP##_op>(               \
@@ -82,9 +93,29 @@ kernel void compare_dense(device bool* out [[buffer(0)]],
   REGISTER_COMPARE_DENSE(OP, long)        \
   REGISTER_COMPARE_DENSE(OP, int)
 
+#define REGISTER_COMPARE_SCALAR(OP, DTYPE)                 \
+  template [[host_name("compare_" #OP "_scalar_" #DTYPE)]] \
+  kernel void compare_scalar_dense<DTYPE, OP##_op>(        \
+      device bool* out [[buffer(0)]],                      \
+      constant DTYPE* lhs [[buffer(1)]],                   \
+      constant DTYPE* rhs [[buffer(2)]],                   \
+      uint tid [[thread_position_in_grid]]);
+
+#define REGISTER_COMPARE_SCALAR_DTYPES(OP) \
+  REGISTER_COMPARE_SCALAR(OP, float)       \
+  REGISTER_COMPARE_SCALAR(OP, long)        \
+  REGISTER_COMPARE_SCALAR(OP, int)
+
 REGISTER_COMPARE_DTYPES(eq)
 REGISTER_COMPARE_DTYPES(ne)
 REGISTER_COMPARE_DTYPES(lt)
 REGISTER_COMPARE_DTYPES(le)
 REGISTER_COMPARE_DTYPES(gt)
 REGISTER_COMPARE_DTYPES(ge)
+
+REGISTER_COMPARE_SCALAR_DTYPES(eq)
+REGISTER_COMPARE_SCALAR_DTYPES(ne)
+REGISTER_COMPARE_SCALAR_DTYPES(lt)
+REGISTER_COMPARE_SCALAR_DTYPES(le)
+REGISTER_COMPARE_SCALAR_DTYPES(gt)
+REGISTER_COMPARE_SCALAR_DTYPES(ge)

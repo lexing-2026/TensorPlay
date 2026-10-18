@@ -182,6 +182,30 @@ kernel void broadcast_where(device T* out [[buffer(0)]],
       constant int * rhs_strides [[buffer(8)]],                     \
       uint tid [[thread_position_in_grid]]);
 
+// where over three operands that already share a shape and run unit-stride:
+// one thread per element, with no stride arithmetic per operand.
+template <typename T>
+kernel void where_dense(device T* out [[buffer(0)]],
+                        constant bool* cond [[buffer(1)]],
+                        constant T* lhs [[buffer(2)]],
+                        constant T* rhs [[buffer(3)]],
+                        uint tid [[thread_position_in_grid]]) {
+  out[tid] = cond[tid] ? lhs[tid] : rhs[tid];
+}
+
+#define REGISTER_WHERE_DENSE(DTYPE)                             \
+  template [[host_name("where_dense_" #DTYPE)]] kernel void     \
+  where_dense<DTYPE>(                                           \
+      device DTYPE * out [[buffer(0)]],                         \
+      constant bool * cond [[buffer(1)]],                       \
+      constant DTYPE * lhs [[buffer(2)]],                       \
+      constant DTYPE * rhs [[buffer(3)]],                       \
+      uint tid [[thread_position_in_grid]]);
+
+REGISTER_WHERE_DENSE(float)
+REGISTER_WHERE_DENSE(long)
+REGISTER_WHERE_DENSE(int)
+
 REGISTER_BROADCAST_WHERE(float)
 REGISTER_BROADCAST_WHERE(long)
 REGISTER_BROADCAST_WHERE(int)

@@ -424,7 +424,7 @@ MTLComputePipelineState_t unaryShaderPipeline(const std::string& op,
 // missing name is only possible if the two get out of step; every dtype outside
 // it is answered by the graph.
 MTLComputePipelineState_t compareShaderPipeline(const std::string& op,
-                                                DType dtype) {
+                                                DType dtype, bool scalar_rhs) {
   switch (dtype) {
     case DType::Float32:
     case DType::Int64:
@@ -433,7 +433,8 @@ MTLComputePipelineState_t compareShaderPipeline(const std::string& op,
     default:
       return nil;
   }
-  return shaderPipelineNamed("compare_" + op + "_" +
+  return shaderPipelineNamed("compare_" + op +
+                             (scalar_rhs ? "_scalar_" : "_") +
                              scalarToMetalTypeString(dtype));
 }
 
@@ -1061,19 +1062,24 @@ std::optional<Tensor> compareShader(const std::string& op, const Tensor& self,
   // A thread reads both operands at its own index, which addresses the right
   // pair only when the two share a shape and a storage type and each runs
   // through its storage in the order the output is written in, from its start.
+  // A single-element `other` applies to every element of `self`, so it stays on
+  // the same path with the scalar read once per thread.
   const std::vector<int64_t> shape =
       static_cast<std::vector<int64_t>>(self.shape());
-  if (self.dtype() != other.dtype() ||
-      shape != static_cast<std::vector<int64_t>>(other.shape()) ||
-      !self.is_contiguous() || !other.is_contiguous() ||
-      self.storage_offset() != 0 || other.storage_offset() != 0) {
+  const bool same_shape =
+      shape == static_cast<std::vector<int64_t>>(other.shape());
+  const bool scalar_rhs = !same_shape && other.numel() == 1;
+  if (self.dtype() != other.dtype() || !self.is_contiguous() ||
+      !other.is_contiguous() || self.storage_offset() != 0 ||
+      other.storage_offset() != 0 || (!same_shape && !scalar_rhs)) {
     return std::nullopt;
   }
   const int64_t numel = self.numel();
   if (numel <= 0 || numel > std::numeric_limits<uint32_t>::max()) {
     return std::nullopt;
   }
-  MTLComputePipelineState_t pso = compareShaderPipeline(op, self.dtype());
+  MTLComputePipelineState_t pso =
+      compareShaderPipeline(op, self.dtype(), scalar_rhs);
   if (!pso) {
     return std::nullopt;
   }
@@ -1172,6 +1178,56 @@ Tensor whereOp(const Tensor& condition, const Tensor& self,
   const std::vector<int64_t> out_shape =
       broadcast_shapes(broadcast_shapes(cond_shape, self_shape), other_shape);
   const DType common = promoteTypes(self.dtype(), other.dtype());
+
+  // Three operands that already share the broadcast shape and run unit-stride
+  // need no stride arithmetic: one thread selects one element directly.
+  if (condition.dtype() == DType::Bool && self.dtype() == other.dtype() &&
+      cond_shape == out_shape && self_shape == out_shape &&
+      other_shape == out_shape && condition.is_contiguous() &&
+      self.is_contiguous() && other.is_contiguous() &&
+      condition.storage_offset() == 0 && self.storage_offset() == 0 &&
+      other.storage_offset() == 0) {
+    const int64_t numel = self.numel();
+    if (numel > 0 && numel <= std::numeric_limits<uint32_t>::max()) {
+      MTLComputePipelineState_t pso = shaderPipelineNamed(
+          "where_dense_" + scalarToMetalTypeString(common));
+      void* cond_buf = getMTLBufferFromPointer(condition.data_ptr());
+      void* self_buf = getMTLBufferFromPointer(self.data_ptr());
+      void* other_buf = getMTLBufferFromPointer(other.data_ptr());
+      if (pso && cond_buf && self_buf && other_buf) {
+        Tensor output = emptyMPS(out_shape, common, self.device());
+        void* out_buf = getMTLBufferFromPointer(output.data_ptr());
+        if (out_buf) {
+          const uint32_t total = static_cast<uint32_t>(numel);
+          MPSStream* stream = getCurrentMPSStream();
+          dispatch_sync_with_rethrow(stream->queue(), ^() {
+            @autoreleasepool {
+              auto encoder = stream->commandEncoder();
+              [encoder setComputePipelineState:pso];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)out_buf
+                          offset:0
+                         atIndex:0];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)cond_buf
+                          offset:0
+                         atIndex:1];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)self_buf
+                          offset:0
+                         atIndex:2];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)other_buf
+                          offset:0
+                         atIndex:3];
+              const uint32_t per_group = std::min(
+                  total, static_cast<uint32_t>(
+                             [pso maxTotalThreadsPerThreadgroup]));
+              [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
+                  threadsPerThreadgroup:MTLSizeMake(per_group, 1, 1)];
+            }
+          });
+          return output;
+        }
+      }
+    }
+  }
 
   // Selection over broadcast operands is one strided read per operand, which
   // the shader does directly; a missing kernel or an address outside the
