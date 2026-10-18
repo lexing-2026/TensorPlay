@@ -7,8 +7,9 @@
 // share nothing, so a call of this shape needs neither threadgroup memory nor a
 // second dispatch.
 
-#include <metal_stdlib>
+#include <metal_array>
 #include <metal_simdgroup>
+#include <metal_stdlib>
 
 #include "common.h"
 
@@ -36,7 +37,7 @@ kernel void row_sum_inner(device T* out [[buffer(0)]],
   const uint n = sizes.y;
   constant T* values = src + (uint64_t)row * (uint64_t)n;
 
-  array<T, kSumChains> acc;
+  metal::array<T, kSumChains> acc;
 #pragma unroll
   for (uint j = 0; j < kSumChains; ++j) {
     acc[j] = T(0);
@@ -80,10 +81,10 @@ struct arg_max {
   // least finite value has to be reported as the extremum of its row.
   static inline constexpr T identity() { return T(-INFINITY); }
   static inline bool replace(T candidate, T held) {
-    if (::isnan(held)) {
+    if (::metal::isnan(held)) {
       return false;
     }
-    return ::isnan(candidate) || candidate > held;
+    return ::metal::isnan(candidate) || candidate > held;
   }
   static inline T reduce(T value) { return simd_max(value); }
 };
@@ -92,10 +93,10 @@ template <typename T>
 struct arg_min {
   static inline constexpr T identity() { return T(INFINITY); }
   static inline bool replace(T candidate, T held) {
-    if (::isnan(held)) {
+    if (::metal::isnan(held)) {
       return false;
     }
-    return ::isnan(candidate) || candidate < held;
+    return ::metal::isnan(candidate) || candidate < held;
   }
   static inline T reduce(T value) { return simd_min(value); }
 };
@@ -109,7 +110,7 @@ struct arg_min {
 template <typename Op, typename T>
 inline uint32_t arg_position(T value, uint32_t index) {
   const T winner = Op::reduce(value);
-  const bool holds_winner = ::isnan(value) || value == winner;
+  const bool holds_winner = ::metal::isnan(value) || value == winner;
   return simd_min(holds_winner ? index : 0xFFFFFFFFu);
 }
 
