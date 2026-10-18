@@ -1799,6 +1799,74 @@ class TestVulkanLinearPayload(unittest.TestCase):
             x32 @ w32.T, rtol=1e-4, atol=1e-4,
             err_msg="single-precision product over a linear weight")
 
+    def test_half_precision_tiled_product_over_linear_storage(self):
+        import tensorplay as tp
+        import tensorplay.functional as F
+        # Past a handful of rows the same weight words get re-read once per row,
+        # so the staged tiled product takes over: unpacking happens while the
+        # lanes go through shared memory, which holds floats, and the 32x32
+        # accumulation never narrows between terms.  A result too wide for an
+        # image stores word pairs, and an odd width would make two threads
+        # claim one word, so it is refused instead of raced.
+        def narrowed(a):
+            return np.asarray(a, dtype=np.float16).astype(np.float32)
+
+        def upload(a):
+            return tensorplay.from_numpy(np.asarray(a, dtype=np.float16)
+                                         ).to("vulkan")
+
+        tensorplay.manual_seed(131)
+        # An activation of its own in linear storage, image result.
+        for M, N, K in ((8, 64, 20000), (5, 33, 20005), (40, 7, 20000),
+                        (32, 128, 20000)):
+            x_cpu = narrowed((tp.randn((M, K), device="cpu") * 0.2).numpy())
+            w_cpu = narrowed((tp.randn((N, K), device="cpu") * 0.2).numpy())
+            got = F.linear(upload(x_cpu), upload(w_cpu))
+            self.assertEqual(got.dtype, tensorplay.float16,
+                             f"tiled product widened a half payload at "
+                             f"{M}x{N}x{K}")
+            np.testing.assert_allclose(
+                got.cpu().numpy().astype(np.float32),
+                narrowed(x_cpu @ w_cpu.T), rtol=3e-3, atol=3e-3,
+                err_msg=f"tiled product over a half linear activation at "
+                        f"{M}x{N}x{K}")
+
+        # A result in linear storage, with and without an addend of the same
+        # payload form.
+        for M, N, K in ((8, 20000, 64), (33, 20000, 64), (5, 20004, 96)):
+            x_cpu = narrowed((tp.randn((M, K), device="cpu") * 0.3).numpy())
+            w_cpu = narrowed((tp.randn((N, K), device="cpu") * 0.3).numpy())
+            b_cpu = narrowed((tp.randn((N,), device="cpu") * 0.2).numpy())
+            want = narrowed(x_cpu @ w_cpu.T)
+            np.testing.assert_allclose(
+                F.linear(upload(x_cpu), upload(w_cpu)).cpu().numpy().astype(
+                    np.float32),
+                want, rtol=3e-3, atol=3e-3,
+                err_msg=f"half result in linear storage at {M}x{N}x{K}")
+            np.testing.assert_allclose(
+                F.linear(upload(x_cpu), upload(w_cpu),
+                         upload(b_cpu)).cpu().numpy().astype(np.float32),
+                narrowed(want + b_cpu), rtol=3e-3, atol=3e-3,
+                err_msg=f"half linear result with a half addend at "
+                        f"{M}x{N}x{K}")
+
+        # A (K x N) weight walked along its column step instead of its row.
+        a_cpu = narrowed((tp.randn((9, 20000), device="cpu") * 0.2).numpy())
+        b_cpu = narrowed((tp.randn((20000, 48), device="cpu") * 0.2).numpy())
+        np.testing.assert_allclose(
+            (upload(a_cpu) @ upload(b_cpu)).cpu().numpy().astype(np.float32),
+            narrowed(a_cpu @ b_cpu), rtol=3e-3, atol=3e-3,
+            err_msg="tiled half product over a reduction-major weight")
+
+        odd = tensorplay.from_numpy(narrowed(
+            (tp.randn((8, 64), device="cpu") * 0.3).numpy()).astype(
+                np.float16)).to("vulkan")
+        wide = tensorplay.from_numpy(narrowed(
+            (tp.randn((20001, 64), device="cpu") * 0.3).numpy()).astype(
+                np.float16)).to("vulkan")
+        with self.assertRaisesRegex(RuntimeError, "even result width"):
+            F.linear(odd, wide)
+
 
 if __name__ == "__main__":
     unittest.main()

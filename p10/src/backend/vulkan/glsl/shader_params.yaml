@@ -644,6 +644,41 @@ mm_buffer_tiled:
     A_BUFFER: 1
     OUTPUT_BUFFER: 1
     HAS_BIAS: 1
+mm_buffer_tiled_half:
+  parameter_names_with_default_values:
+    A_BUFFER: 0
+    OUTPUT_BUFFER: 1
+    HAS_BIAS: 0
+    FLOAT_IMAGE_FORMAT: rgba16f
+  shader_variants:
+  - NAME: mm_buffer_tiled_half
+    A_BUFFER: 0
+    OUTPUT_BUFFER: 0
+  - NAME: mm_buffer_tiled_bias_half
+    A_BUFFER: 0
+    OUTPUT_BUFFER: 0
+    HAS_BIAS: 1
+  - NAME: mm_buffer_tiled_buffer_half
+    A_BUFFER: 0
+    OUTPUT_BUFFER: 1
+  - NAME: mm_buffer_tiled_buffer_bias_half
+    A_BUFFER: 0
+    OUTPUT_BUFFER: 1
+    HAS_BIAS: 1
+  - NAME: mm_buffer_tiled_lhs_half
+    A_BUFFER: 1
+    OUTPUT_BUFFER: 0
+  - NAME: mm_buffer_tiled_lhs_bias_half
+    A_BUFFER: 1
+    OUTPUT_BUFFER: 0
+    HAS_BIAS: 1
+  - NAME: mm_buffer_tiled_lhs_buffer_half
+    A_BUFFER: 1
+    OUTPUT_BUFFER: 1
+  - NAME: mm_buffer_tiled_lhs_buffer_bias_half
+    A_BUFFER: 1
+    OUTPUT_BUFFER: 1
+    HAS_BIAS: 1
 bmm:
   parameter_names_with_default_values: {}
   generate_variant_forall:

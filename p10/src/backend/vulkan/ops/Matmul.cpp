@@ -811,14 +811,25 @@ Tensor mm_buffer_tiled(
   api::Context* const context = api::context();
 
   TP_CHECK(
-      dtype == DType::Float32,
-      "Vulkan products over buffer-stored operands support Float32 only");
+      dtype == DType::Float32 || dtype == DType::Float16,
+      "Vulkan products over buffer-stored operands support Float32 and "
+      "Float16 only");
+  TP_CHECK(
+      v_lhs.dtype() == dtype && v_rhs.dtype() == dtype,
+      "Vulkan products over buffer-stored operands need operands of the "
+      "result dtype");
 
   const bool a_buffer = v_lhs.storage_type() == api::StorageType::BUFFER;
 
   api::vTensor v_output{context, {M, N}, dtype};
   const bool out_buffer =
       v_output.storage_type() == api::StorageType::BUFFER;
+  // A thread of the tiled kernel owns four consecutive columns, so a half
+  // result pairs them into words only when a row starts on an even element.
+  TP_CHECK(
+      !(out_buffer && dtype == DType::Float16 && N % 2 != 0),
+      "Vulkan products over buffer-stored operands need an even result width "
+      "for a half linear output");
 
   std::optional<api::vTensor> v_bias;
   if (bias.has_value()) {
@@ -829,6 +840,11 @@ Tensor mm_buffer_tiled(
         v_bias->storage_type() == v_output.storage_type(),
         "Vulkan products over buffer-stored operands require an addend in the "
         "same storage as the result");
+    TP_CHECK(
+        v_output.storage_type() != api::StorageType::BUFFER ||
+            v_bias->dtype() == dtype,
+        "Vulkan products over buffer-stored operands need a linear addend of "
+        "the result dtype");
   }
   const std::vector<int64_t> bias_sizes = bias.has_value()
       ? shape_of(*bias)
@@ -870,7 +886,7 @@ Tensor mm_buffer_tiled(
   if (v_bias.has_value()) {
     shader += "_bias";
   }
-  const char* const shader_name = shader.c_str();
+  const std::string shader_name = buffer_shader_for_dtype(shader, dtype);
 
   api::UniformParamsBuffer params(context, block);
   api::PipelineBarrier barrier{};
