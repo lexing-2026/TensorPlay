@@ -25,11 +25,11 @@ layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
  * input line up to and including its own position; the small tensors
  * targeted by this backend keep the linear walk affordable.  Width, height,
  * and batch scans accumulate texel lanes independently.  A channel scan
- * walks the texel depth of one batch: each lane adds its own value from the
- * earlier texels, then the lower lanes of its own texel, so lane L of the
- * result carries the total of channels up to and including c4*4 + L.
- * Lanes past the channel count are written as zero so the padded texel
- * region stays defined.
+ * treats the depth axis as one sequence of channels: lane L of the result
+ * holds the total of channels up to and including c4*4 + L, so the earlier
+ * texels of the batch contribute the sum of all four of their lanes while the
+ * lanes of the current texel contribute their own prefix.  Lanes past the
+ * channel count are written as zero so the padded texel region stays defined.
  */
 void main() {
   const ivec3 pos = ivec3(gl_GlobalInvocationID);
@@ -52,23 +52,28 @@ void main() {
     }
     imageStore(uOutput, pos, acc);
   } else if (uBlock.axis == 2) {
-    // Channel scan: pos.z addresses (n * c_depth + c4).
+    // Channel scan: pos.z addresses (n * c_depth + c4).  The channels run in
+    // texel order, so every earlier texel holds four real lanes and the
+    // carried total is one scalar, not a per-lane sum.
     const int n = pos.z / uBlock.c_depth;
     const int c4 = pos.z - n * uBlock.c_depth;
     const int channels = uBlock.in_sizes.z;
+    float prior = 0.0;
     for (int z = n * uBlock.c_depth; z < pos.z; ++z) {
-      acc += texelFetch(uInput, ivec3(pos.x, pos.y, z), 0);
+      prior +=
+          dot(texelFetch(uInput, ivec3(pos.x, pos.y, z), 0), vec4(1.0));
     }
     const vec4 self_texel =
         texelFetch(uInput, ivec3(pos.x, pos.y, pos.z), 0);
-    acc.x += self_texel.x;
-    acc.y += acc.x + self_texel.y;
-    acc.z += acc.y + self_texel.z;
-    acc.w += acc.z + self_texel.w;
+    vec4 total;
+    total.x = prior + self_texel.x;
+    total.y = total.x + self_texel.y;
+    total.z = total.y + self_texel.z;
+    total.w = total.z + self_texel.w;
     const vec4 lane_mask =
         vec4(lessThan(ivec4(c4 * 4, c4 * 4 + 1, c4 * 4 + 2, c4 * 4 + 3),
                       ivec4(channels)));
-    imageStore(uOutput, pos, acc * lane_mask);
+    imageStore(uOutput, pos, total * lane_mask);
   } else {
     // Batch scan: one batch step moves c_depth texels along z; the channel
     // slot (pos.z mod c_depth) stays fixed.
