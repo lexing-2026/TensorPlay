@@ -70,6 +70,35 @@ __global__ void minmax_reduce_kernel(int64_t n, const T* x, T* min_out,
     }
 }
 
+// Folds the per-block partials of minmax_reduce_kernel into the final pair.
+template <typename T>
+__global__ void minmax_combine_kernel(int64_t nblocks, const T* min_in,
+                                      const T* max_in, T* min_out, T* max_out) {
+    __shared__ T min_shm[kThreads];
+    __shared__ T max_shm[kThreads];
+    T local_min = std::numeric_limits<T>::max();
+    T local_max = std::numeric_limits<T>::lowest();
+    for (int64_t i = threadIdx.x; i < nblocks; i += blockDim.x) {
+        local_min = ::min(local_min, min_in[i]);
+        local_max = ::max(local_max, max_in[i]);
+    }
+    int tid = threadIdx.x;
+    min_shm[tid] = local_min;
+    max_shm[tid] = local_max;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            min_shm[tid] = ::min(min_shm[tid], min_shm[tid + s]);
+            max_shm[tid] = ::max(max_shm[tid], max_shm[tid + s]);
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        min_out[0] = min_shm[0];
+        max_out[0] = max_shm[0];
+    }
+}
+
 template <typename T>
 __global__ void bincount_count_kernel(int64_t n, const T* x, int64_t* bins) {
     int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -105,10 +134,19 @@ Tensor bincount_cuda(const Tensor& self, const std::optional<Tensor>& weights_op
     if (has_weights && (weights.dim() != 1 || weights.size(0) != self.size(0))) {
         TP_THROW(RuntimeError, "weights should be 1-d and have the same length as input");
     }
-    Tensor bounds_d = Tensor::empty({2}, DType::Int64, self.device());
     auto stream = getCurrentCUDAStream().stream();
-    minmax_reduce_kernel<int64_t><<<1, kThreads, 0, stream>>>(
-        n, inp.data_ptr<int64_t>(), bounds_d.data_ptr<int64_t>(),
+    // The value scan is spread over many blocks; a tiny second kernel folds
+    // the partials so only the final pair crosses to the host.
+    int64_t partial_blocks = (n + kThreads - 1) / kThreads;
+    partial_blocks = std::min<int64_t>(std::max<int64_t>(partial_blocks, 1), 4096);
+    Tensor partial = Tensor::empty({partial_blocks * 2}, DType::Int64, self.device());
+    Tensor bounds_d = Tensor::empty({2}, DType::Int64, self.device());
+    minmax_reduce_kernel<int64_t><<<static_cast<unsigned>(partial_blocks), kThreads, 0, stream>>>(
+        n, inp.data_ptr<int64_t>(), partial.data_ptr<int64_t>(),
+        partial.data_ptr<int64_t>() + partial_blocks);
+    minmax_combine_kernel<int64_t><<<1, kThreads, 0, stream>>>(
+        partial_blocks, partial.data_ptr<int64_t>(),
+        partial.data_ptr<int64_t>() + partial_blocks, bounds_d.data_ptr<int64_t>(),
         bounds_d.data_ptr<int64_t>() + 1);
     CUDA_CHECK(cudaGetLastError());
     int64_t bounds[2] = {0, 0};
