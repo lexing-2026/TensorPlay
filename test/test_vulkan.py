@@ -3404,6 +3404,56 @@ class TestVulkanWidePayload(unittest.TestCase):
                 tensorplay.float32).cpu().numpy(),
             tail.astype(np.float32), err_msg="wide conversion lost its tail")
 
+    @staticmethod
+    def _released_as_texels(payload):
+        # Whether a payload has an image or a buffer to bind decides which kernels
+        # can take it: a texel kernel refuses a dense operand outright.
+        import tensorplay.functional as F
+        try:
+            F.lerp(payload, payload, 0.5)
+        except RuntimeError:
+            return False
+        return True
+
+    def test_a_device_index_list_stays_on_the_device(self):
+        # The index list is built in whichever class the lookup already uses, so
+        # a table with an image form keeps its texel route and a table without one
+        # keeps its flat route: neither drags the other's payload across the
+        # boundary because the codes arrived 64-bit wide.
+        rows, feats = 40000, 64
+        host_table = (
+            (np.arange(rows, dtype=np.float32) % 9).reshape(rows, 1)
+            * np.ones((1, feats), np.float32)).astype(np.float32)
+        # Every code is a row of the short table too, so one reference serves
+        # both classes.
+        ids = np.array([0, 17, 255, 3, 128], dtype=np.int64)
+        lists = (
+            ("64-bit", tensorplay.from_numpy(ids.copy()).to("vulkan")),
+            ("32-bit",
+             tensorplay.from_numpy(ids.astype(np.int32)).to("vulkan")),
+            ("host", tensorplay.from_numpy(ids.copy())),
+        )
+        for name, used in (("texel", 256), ("dense", rows)):
+            table = tensorplay.from_numpy(
+                host_table[:used].copy()).to("vulkan")
+            self.assertIs(
+                self._released_as_texels(table), name == "texel",
+                f"the {name} fixture is not the class it names")
+            want = host_table[:used][ids]
+            classes = []
+            for lname, index in lists:
+                out = tensorplay.embedding(table, index)
+                np.testing.assert_allclose(
+                    out.cpu().numpy(), want, rtol=0, atol=1e-6,
+                    err_msg=f"embedding with a {lname} index list")
+                classes.append(self._released_as_texels(out))
+            self.assertEqual(
+                classes, [classes[0]] * 3,
+                f"an index list routed the {name} lookup differently")
+            self.assertIs(
+                classes[0], name == "texel",
+                f"a {name} table released its result in the wrong class")
+
     def test_wide_payloads_stop_at_the_ops_that_read_one_word_per_element(self):
         values = np.array([0, 5, 2, 7, 1], dtype=np.int64)
         payload = tensorplay.from_numpy(values.copy()).to("vulkan")
