@@ -531,7 +531,15 @@ Tensor rms_norm_buffer(
       "dispatch axes");
 
   api::Context* const context = api::context();
-  api::vTensor v_output{context, v_input.sizes(), v_input.dtype()};
+  // The result is written as a linear payload, so it has to be allocated as
+  // one: an output in the default texture class would keep the write in a
+  // buffer the image read-back never sees.
+  api::vTensor v_output{
+      context,
+      v_input.sizes(),
+      v_input.dtype(),
+      api::StorageType::BUFFER,
+      api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
 
   std::optional<api::vTensor> v_weight;
   bool weight_linear = false;
@@ -765,7 +773,15 @@ Tensor rotary_embedding_buffer(
   }
 
   api::Context* const context = api::context();
-  api::vTensor v_output{context, input.sizes(), input.dtype()};
+  // The rotation writes a linear payload, so the result has to be allocated as
+  // one; a texture-class output would keep the write in a buffer the image
+  // read-back never sees.
+  api::vTensor v_output{
+      context,
+      input.sizes(),
+      input.dtype(),
+      api::StorageType::BUFFER,
+      api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
 
   const struct RotaryLinearBlock final {
     ivec4 sizes; // (half_dim, tokens, batches, 0)

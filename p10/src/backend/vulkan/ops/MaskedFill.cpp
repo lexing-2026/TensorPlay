@@ -10,6 +10,11 @@ namespace tensorplay {
 namespace vulkan {
 namespace ops {
 
+// Defined in BinaryOp.cpp; copies a texture payload into a dense buffer.
+api::vTensor to_buffer_storage_dispatch(
+    api::Context* context,
+    const api::vTensor& src);
+
 namespace {
 
 void validate_float_1d_to_4d(const Tensor& t, const char* name) {
@@ -50,12 +55,20 @@ Tensor masked_fill_impl(
       mask.device().is_vulkan() ? mask : mask.to(self.device());
   api::vTensor v_mask = convert(mask_on_device);
 
-  api::vTensor v_output{context, v_input.sizes(), DType::Float32};
-
   // Linear payloads (shapes beyond the 3-D image axis limit) fill through a
   // buffer-to-buffer variant: the Bool mask is one byte per element and rides
   // a packed-word buffer, the input is plain row-major memory.
   if (v_input.storage_type() == api::StorageType::BUFFER) {
+    // The fill has to land in the storage the result is read from: an output
+    // allocated in the default texture class would leave the linear write in
+    // a buffer the image read-back never sees.
+    api::vTensor v_lin{
+        context,
+        v_input.sizes(),
+        DType::Float32,
+        api::StorageType::BUFFER,
+        api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+    api::vTensor v_mask_lin = to_buffer_storage_dispatch(context, v_mask);
     const uint32_t n = static_cast<uint32_t>(v_input.numel());
     const struct MaskedFillBufferBlock {
       uint32_t buf_length;
@@ -68,7 +81,7 @@ Tensor masked_fill_impl(
     context->submit_compute_job(
         VK_KERNEL_FROM_STR("masked_fill_buffer"), pipeline_barrier,
         {(n + 3u) / 4u, 1u, 1u}, {256u, 1u, 1u}, VK_NULL_HANDLE,
-        v_output.buffer(
+        v_lin.buffer(
             pipeline_barrier,
             api::PipelineStage::COMPUTE,
             api::MemoryAccessType::WRITE),
@@ -76,13 +89,15 @@ Tensor masked_fill_impl(
             pipeline_barrier,
             api::PipelineStage::COMPUTE,
             api::MemoryAccessType::READ),
-        v_mask.buffer(
+        v_mask_lin.buffer(
             pipeline_barrier,
             api::PipelineStage::COMPUTE,
             api::MemoryAccessType::READ),
         params.buffer());
-    return convert(v_output);
+    return convert(v_lin);
   }
+
+  api::vTensor v_output{context, v_input.sizes(), DType::Float32};
 
   const struct MaskedFillBlock block{
       make_whcn_ivec4(v_output.sizes()),
