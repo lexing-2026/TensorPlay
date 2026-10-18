@@ -1047,6 +1047,53 @@ compare_scalar_buffer:
     OPERATOR: greaterThan(X, Y)
   - NAME: ge_scalar_buffer
     OPERATOR: greaterThanEqual(X, Y)
+cast_i8_float:
+  parameter_names_with_default_values: {}
+  shader_variants:
+  - NAME: cast_i8_float
+cast_u8_float:
+  parameter_names_with_default_values: {}
+  shader_variants:
+  - NAME: cast_u8_float
+cast_float_i8:
+  parameter_names_with_default_values: {}
+  shader_variants:
+  - NAME: cast_float_i8
+cast_float_u8:
+  parameter_names_with_default_values: {}
+  shader_variants:
+  - NAME: cast_float_u8
+cast_float_bool:
+  parameter_names_with_default_values: {}
+  shader_variants:
+  - NAME: cast_float_bool
+cast_byte_float_buffer:
+  parameter_names_with_default_values:
+    SIGNED: true
+  generate_variant_forall:
+    SIGNED:
+    - VALUE: true
+      SUFFIX: _i8
+    - VALUE: false
+      SUFFIX: _u8
+  shader_variants:
+  - NAME: cast_byte_float_buffer
+cast_float_byte_buffer:
+  parameter_names_with_default_values:
+    LANE: uint(mod(trunc(V), 256.0))
+  shader_variants:
+  - NAME: cast_float_byte_buffer_wrap
+    LANE: uint(mod(trunc(V), 256.0))
+  - NAME: cast_float_byte_buffer_bool
+    LANE: '((V != 0.0) ? 1u : 0u)'
+cast_i32_float_buffer:
+  parameter_names_with_default_values: {}
+  shader_variants:
+  - NAME: cast_i32_float_buffer
+cast_float_i32_buffer:
+  parameter_names_with_default_values: {}
+  shader_variants:
+  - NAME: cast_float_i32_buffer
 where:
   parameter_names_with_default_values:
     DTYPE: float

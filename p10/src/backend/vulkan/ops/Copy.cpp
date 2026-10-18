@@ -196,6 +196,88 @@ void transfer_vulkan_to_cpu(api::vTensor& v_src, Tensor& dst) {
   }
 }
 
+// Device-side dtype conversions.  Float32 is the hub: every payload type the
+// backend stores has a direct route to and from it, and anything else has no
+// kernel.  Byte-packed payloads agree on the read path, since a Bool lane is
+// already 0 or 1 and an integer lane converts exactly, and split on the write
+// path: Int8 and UInt8 destinations take the wrapped value, a Bool one only
+// ever stores 0 or 1.
+const char* texture_cast_shader(const DType from, const DType to) {
+  if (to == DType::Float32) {
+    switch (from) {
+      case DType::Int32:
+        return "cast_i32_float";
+      case DType::Float16:
+        return "cast_float16_float";
+      case DType::Int8:
+      case DType::Bool:
+        return "cast_i8_float";
+      case DType::UInt8:
+        return "cast_u8_float";
+      default:
+        return nullptr;
+    }
+  }
+  if (from == DType::Float32) {
+    switch (to) {
+      case DType::Int32:
+        return "cast_float_i32";
+      case DType::Float16:
+        return "cast_float_float16";
+      case DType::Int8:
+        return "cast_float_i8";
+      case DType::UInt8:
+        return "cast_float_u8";
+      case DType::Bool:
+        return "cast_float_bool";
+      default:
+        return nullptr;
+    }
+  }
+  return nullptr;
+}
+
+const char* linear_cast_shader(const DType from, const DType to) {
+  if (to == DType::Float32) {
+    switch (from) {
+      case DType::Int32:
+        return "cast_i32_float_buffer";
+      case DType::Float16:
+        return "cast_float16_float_buffer";
+      case DType::Int8:
+      case DType::Bool:
+        return "cast_byte_float_buffer_i8";
+      case DType::UInt8:
+        return "cast_byte_float_buffer_u8";
+      default:
+        return nullptr;
+    }
+  }
+  if (from == DType::Float32) {
+    switch (to) {
+      case DType::Int32:
+        return "cast_float_i32_buffer";
+      case DType::Float16:
+        return "cast_float_float16_buffer";
+      case DType::Int8:
+      case DType::UInt8:
+        return "cast_float_byte_buffer_wrap";
+      case DType::Bool:
+        return "cast_float_byte_buffer_bool";
+      default:
+        return nullptr;
+    }
+  }
+  return nullptr;
+}
+
+// Elements one invocation owns in a linear payload: a half-precision payload
+// packs two lanes per 32-bit word, every other element width fills a word with
+// four.  The narrower side of a pair decides.
+uint32_t linear_payload_lanes(const DType dtype) {
+  return dtype == DType::Float16 ? 2u : 4u;
+}
+
 } // namespace
 
 Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
@@ -222,10 +304,11 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
         TP_CHECK(src.shape() == self.shape(),
                  "Vulkan dtype conversion requires equal shapes");
 
-        // A linear payload converts through its own pair of kernels: the half
-        // side keeps two lanes per 32-bit word, so one invocation owns one
-        // word and the two elements it covers.  Mixing an image with a linear
-        // payload has no route here, since neither binding can read the other.
+        // A linear payload converts through its own kernels: the storage has
+        // no texel format to name the element type, so a half payload keeps
+        // two lanes per 32-bit word and a byte-packed one four.  Mixing an
+        // image with a linear payload has no route here, since neither
+        // binding can read the other.
         const bool linear_source =
             v_src.storage_type() == api::StorageType::BUFFER;
         const bool linear_destination =
@@ -233,19 +316,18 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
         if (linear_source || linear_destination) {
           TP_CHECK(linear_source && linear_destination,
                    "Vulkan dtype conversion does not mix storage types");
-          const char* buffer_shader = nullptr;
-          if (v_src.dtype() == DType::Float16 &&
-              v_self.dtype() == DType::Float32) {
-            buffer_shader = "cast_float16_float_buffer";
-          } else if (
-              v_src.dtype() == DType::Float32 &&
-              v_self.dtype() == DType::Float16) {
-            buffer_shader = "cast_float_float16_buffer";
-          }
+          const char* buffer_shader =
+              linear_cast_shader(v_src.dtype(), v_self.dtype());
           TP_CHECK(
               buffer_shader != nullptr,
               "Unsupported Vulkan dtype conversion over linear storage");
           const uint32_t elements = static_cast<uint32_t>(v_self.numel());
+          const uint32_t source_lanes = linear_payload_lanes(v_src.dtype());
+          const uint32_t destination_lanes =
+              linear_payload_lanes(v_self.dtype());
+          const uint32_t lanes =
+              source_lanes < destination_lanes ? source_lanes
+                                               : destination_lanes;
           const struct CastBlock final {
             uint32_t buf_length;
             uint32_t fill0;
@@ -256,7 +338,8 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
           api::PipelineBarrier barrier{};
           context->submit_compute_job(
               VK_KERNEL_FROM_STR(buffer_shader), barrier,
-              {(elements + 1u) / 2u, 1u, 1u}, {256u, 1u, 1u}, VK_NULL_HANDLE,
+              {api::utils::div_up(elements, lanes), 1u, 1u}, {256u, 1u, 1u},
+              VK_NULL_HANDLE,
               v_self.buffer(
                   barrier, api::PipelineStage::COMPUTE,
                   api::MemoryAccessType::WRITE),
@@ -265,16 +348,7 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
           return self;
         }
 
-        const char* shader = nullptr;
-        if (v_src.dtype() == DType::Int32 && v_self.dtype() == DType::Float32) {
-          shader = "cast_i32_float";
-        } else if (v_src.dtype() == DType::Float32 && v_self.dtype() == DType::Int32) {
-          shader = "cast_float_i32";
-        } else if (v_src.dtype() == DType::Float32 && v_self.dtype() == DType::Float16) {
-          shader = "cast_float_float16";
-        } else if (v_src.dtype() == DType::Float16 && v_self.dtype() == DType::Float32) {
-          shader = "cast_float16_float";
-        }
+        const char* shader = texture_cast_shader(v_src.dtype(), v_self.dtype());
         TP_CHECK(shader != nullptr, "Unsupported Vulkan dtype conversion");
         api::PipelineBarrier barrier{};
         context->submit_compute_job(
