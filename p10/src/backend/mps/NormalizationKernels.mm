@@ -338,6 +338,7 @@ Tensor batch_norm_kernel(const Tensor& input,
         (!bias_c.defined() ||
          (bias_c.dtype() == bn_dtype && bias_c.numel() == C)) &&
         batch > 0 && spatial > 0 &&
+        input.numel() <= std::numeric_limits<uint32_t>::max() &&
         spatial <= std::numeric_limits<uint32_t>::max() &&
         C <= std::numeric_limits<uint32_t>::max() &&
         batch <= std::numeric_limits<uint32_t>::max();
@@ -608,6 +609,7 @@ Tensor group_norm_kernel(const Tensor& input, int64_t num_groups,
       const int64_t group_count = N * G;
       bool shader_ok =
           elements_per_group > 0 &&
+          input.numel() <= std::numeric_limits<uint32_t>::max() &&
           elements_per_group <= std::numeric_limits<uint32_t>::max() &&
           group_count <= std::numeric_limits<uint32_t>::max() &&
           spatial <= std::numeric_limits<uint32_t>::max() &&
