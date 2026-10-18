@@ -50,13 +50,12 @@ Tensor normalize_index(const Tensor& index, int64_t dim_size) {
     return idx;
   }
   constexpr int64_t kHostScanLimit = 4096;
-  if (n <= kHostScanLimit) {
-    // The scan reads shared storage from the host, which only has to drain the
-    // stream when work that may still write those bytes is in flight; an idle
-    // stream leaves the bytes already visible.
-    if (getCurrentMPSStream()->hasPendingWork()) {
-      synchronizeHostAccess();
-    }
+  // The scan reads shared storage from the host, so it is only safe while no
+  // work that may write those bytes is in flight. A busy stream leaves the
+  // entries to the access kernel, which reports the same error as it reads
+  // them; draining the stream here instead would serialize every call in a
+  // chain of back-to-back accesses.
+  if (n <= kHostScanLimit && !getCurrentMPSStream()->hasPendingWork()) {
     const int64_t* p = idx.data_ptr<int64_t>();
     for (int64_t i = 0; i < n; ++i) {
       const int64_t v = p[i];
