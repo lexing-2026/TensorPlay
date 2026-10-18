@@ -138,6 +138,21 @@ Tensor reductionOp(const Tensor& self, const std::vector<int64_t>& dims,
     }
   }
 
+  // A reduction over the last axis of a float operand is one row per SIMD
+  // group, so the operand goes straight from the storage it is in and nothing
+  // stands between the read and the write. A call the shader cannot address
+  // falls through to the graph below.
+  if (axes.size() == 1 && axes.front() == self.dim() - 1 &&
+      out_dtype == DType::Float32 && acc_dtype == DType::Float32 &&
+      (kind == ReductionKind::SUM || kind == ReductionKind::MEAN)) {
+    const float divisor = kind == ReductionKind::MEAN
+                              ? static_cast<float>(in_shape.back())
+                              : 0.0f;
+    if (auto result = rowSumShader(self, out_shape, divisor)) {
+      return *result;
+    }
+  }
+
   Tensor self_c = materializeForGraph(self);
   Tensor output = Tensor(out_shape, out_dtype, self.device());
   if (output.numel() == 0) {
@@ -667,6 +682,14 @@ Tensor arg_reduce_impl(const Tensor& self, int64_t dim, bool keepdim,
   Tensor indices = Tensor::empty(out_shape, DType::Int64, self.device());
   if (indices.numel() == 0) {
     return indices;
+  }
+  // Over the last axis, the whole of a row belongs to one SIMD group, so the
+  // position of the extremum is a single dispatch and the index never leaves
+  // the row it was found in.
+  if (dim == ndim - 1) {
+    if (auto result = rowArgReduceShader(self_c, out_shape, is_max)) {
+      return *result;
+    }
   }
   // The index reduction keeps the rank of its input and leaves a size-1
   // dimension where the axis was, so a partial one is written in that shape.  A
