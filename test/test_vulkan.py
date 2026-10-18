@@ -1867,6 +1867,135 @@ class TestVulkanLinearPayload(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "even result width"):
             F.linear(odd, wide)
 
+    def test_bmm_over_linear_storage(self):
+        import tensorplay as tp
+        import tensorplay.functional as F
+        # A batched product with an axis past the image limit has no texture
+        # for its result, and one of its operands may have lost its texture
+        # too.  One dispatch still covers every matrix: the batch rides the
+        # workgroup z axis and reaches the next matrix through a stride.
+        def narrowed(a):
+            return np.asarray(a, dtype=np.float16).astype(np.float32)
+
+        def softmax_rows(a):
+            shifted = a - a.max(axis=-1, keepdims=True)
+            e = np.exp(shifted)
+            return e / e.sum(axis=-1, keepdims=True)
+
+        def upload(a, dtype):
+            return tensorplay.from_numpy(np.asarray(a, dtype=dtype)
+                                         ).to("vulkan")
+
+        tensorplay.manual_seed(151)
+        # (batch, rows past the limit, k) x (batch, k, cols): only the left
+        # operand needs a linear payload, and (batch, rows, cols past the
+        # limit) x (batch, k, cols): only the right one.
+        cases = (
+            ((4, 20000, 16), (4, 16, 32), "batch rows past the limit"),
+            ((3, 32, 20000), (3, 20000, 8), "reduction past the limit"),
+            ((2, 48, 20005), (2, 20005, 12), "ragged reduction"),
+        )
+        for lhs_shape, rhs_shape, tag in cases:
+            # Half-representable values in single precision keep the reference
+            # product exact for both payload formats.
+            a_cpu = narrowed((tp.randn(lhs_shape, device="cpu") * 0.2).numpy())
+            b_cpu = narrowed((tp.randn(rhs_shape, device="cpu") * 0.2).numpy())
+            want = np.matmul(a_cpu, b_cpu)
+            for dtype, tol in ((np.float32, 2e-3), (np.float16, 6e-3)):
+                got = F.bmm(upload(a_cpu, dtype), upload(b_cpu, dtype))
+                self.assertEqual(
+                    got.shape,
+                    (lhs_shape[0], lhs_shape[1], rhs_shape[2]),
+                    f"{tag} in {np.dtype(dtype).name}")
+                np.testing.assert_allclose(
+                    got.cpu().numpy().astype(np.float32), want,
+                    rtol=tol, atol=tol,
+                    err_msg=f"batched product with {tag} in "
+                            f"{np.dtype(dtype).name}")
+
+        # A result wide enough for no image at all still writes every column.
+        a_cpu = narrowed((tp.randn((2, 64, 8), device="cpu") * 0.2).numpy())
+        b_cpu = narrowed((tp.randn((2, 8, 20000), device="cpu") * 0.2).numpy())
+        got = F.bmm(upload(a_cpu, np.float16), upload(b_cpu, np.float16))
+        np.testing.assert_allclose(
+            got.cpu().numpy().astype(np.float32),
+            narrowed(np.matmul(a_cpu, b_cpu)), rtol=6e-3, atol=6e-3,
+            err_msg="batched product with batch columns past the limit")
+
+        # Downstream ops read the same linear payload the product wrote, so a
+        # long-context attention chain continues past the image limit.
+        follow = F.softmax(got, -1)
+        np.testing.assert_allclose(
+            follow.cpu().numpy().astype(np.float32),
+            softmax_rows(np.matmul(a_cpu, b_cpu)),
+            rtol=6e-3, atol=6e-3,
+            err_msg="softmax over a batched product in linear storage")
+
+        # A half result packs two lanes per word, so two matrices may not
+        # claim one word: an odd result width is refused rather than raced.
+        odd_lhs = upload(narrowed(
+            (tp.randn((3, 20000, 8), device="cpu") * 0.2).numpy()), np.float16)
+        odd_rhs = upload(narrowed(
+            (tp.randn((3, 8, 1001), device="cpu") * 0.2).numpy()), np.float16)
+        with self.assertRaisesRegex(RuntimeError, "even result width"):
+            F.bmm(odd_lhs, odd_rhs)
+
+    def test_matmul_batch_shape_fold(self):
+        import tensorplay as tp
+        # The leading axes of both operands broadcast to one batch shape, fold
+        # into the single batch axis a batched dispatch needs, and are restored
+        # on the way out.
+        def narrowed(a):
+            return np.asarray(a, dtype=np.float16).astype(np.float32)
+
+        def upload(a, dtype):
+            return tensorplay.from_numpy(np.asarray(a, dtype=dtype)
+                                         ).to("vulkan")
+
+        tensorplay.manual_seed(163)
+        cases = (
+            ((6, 40, 8), (6, 8, 12), "equal batches"),
+            ((2, 4, 60, 8), (2, 4, 8, 32), "four-dimensional operands"),
+            ((1, 8, 48, 16), (1, 8, 16, 24), "attention-shaped pair"),
+            ((4, 30, 6), (2, 4, 6, 9), "leading axis only on the right"),
+            ((2, 4, 30, 6), (4, 6, 9), "leading axis only on the left"),
+            ((1, 40, 8), (4, 8, 12), "single batch on the left"),
+            ((4, 40, 8), (1, 8, 12), "single batch on the right"),
+            ((3, 1, 20, 5), (3, 4, 5, 7), "inner singleton batch"),
+            ((1, 5, 20, 5), (3, 5, 5, 7), "outer singleton batch"),
+            ((4, 6), (2, 3, 6, 9), "a lone matrix on the left"),
+            ((2, 3, 24, 6), (6, 5), "a lone matrix on the right"),
+            ((1, 1, 12, 5), (1, 1, 5, 8), "all singleton batches"),
+            ((0, 6, 4), (0, 4, 5), "an empty batch"),
+            ((2, 0, 6, 4), (2, 0, 4, 5), "an empty inner batch"),
+        )
+        for lhs_shape, rhs_shape, tag in cases:
+            a_cpu = (tp.randn(lhs_shape, device="cpu") * 0.2).numpy()
+            b_cpu = (tp.randn(rhs_shape, device="cpu") * 0.2).numpy()
+            want = np.matmul(a_cpu, b_cpu)
+            got = (upload(a_cpu, np.float32)
+                   @ upload(b_cpu, np.float32)).cpu().numpy()
+            self.assertEqual(got.shape, want.shape, tag)
+            np.testing.assert_allclose(
+                got, want, rtol=2e-3, atol=2e-3, err_msg=tag)
+
+        a_cpu = narrowed((tp.randn((2, 4, 50, 8), device="cpu") * 0.2).numpy())
+        b_cpu = narrowed((tp.randn((2, 4, 8, 32), device="cpu") * 0.2).numpy())
+        got = (upload(a_cpu, np.float16)
+               @ upload(b_cpu, np.float16)).cpu().numpy().astype(np.float32)
+        np.testing.assert_allclose(
+            got, narrowed(np.matmul(a_cpu, b_cpu)), rtol=6e-3, atol=6e-3,
+            err_msg="four-dimensional half product")
+
+        # A batch axis neither operand can broadcast stays a loud error.
+        with self.assertRaisesRegex(RuntimeError, "must match the size"):
+            (upload((tp.randn((3, 20, 4), device="cpu").numpy()), np.float32)
+             @ upload((tp.randn((2, 4, 6), device="cpu").numpy()), np.float32))
+
+
+if __name__ == "__main__":
+    unittest.main()
+
 
 if __name__ == "__main__":
     unittest.main()
