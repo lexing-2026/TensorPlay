@@ -407,23 +407,51 @@ kernel void extremum_chunk(device float* out [[buffer(0)]],
     return;
   }
   const uint last = min(first + chunk, numel);
+  const uint count = last - first;
 
-  float held = Op::identity();
-  for (uint i = first + lane; i < last; i += simdgroup_size) {
+  // Several independent chains per lane, like the sum kernel: the loads of a
+  // chain are far enough apart to stay in flight together, so the walk is not
+  // serialized on one comparison. Folding the chains at the end keeps the
+  // replacement rule of a single walk.
+  metal::array<float, kSumChains> held;
+#pragma unroll
+  for (uint j = 0; j < kSumChains; ++j) {
+    held[j] = Op::identity();
+  }
+  const uint stride = simdgroup_size * kSumChains;
+  const uint whole = (count / stride) * stride;
+  for (uint base = first + lane * kSumChains; base < first + whole;
+       base += stride) {
+#pragma unroll
+    for (uint j = 0; j < kSumChains; ++j) {
+      const float candidate = src[base + j];
+      if (Op::replace(candidate, held[j])) {
+        held[j] = candidate;
+      }
+    }
+  }
+  for (uint i = first + whole + lane; i < last; i += simdgroup_size) {
     const float candidate = src[i];
-    if (Op::replace(candidate, held)) {
-      held = candidate;
+    if (Op::replace(candidate, held[0])) {
+      held[0] = candidate;
+    }
+  }
+  float best = held[0];
+#pragma unroll
+  for (uint j = 1; j < kSumChains; ++j) {
+    if (Op::replace(held[j], best)) {
+      best = held[j];
     }
   }
 #pragma unroll
   for (uint mask = 1; mask < simdgroup_size; mask <<= 1) {
-    const float rival = simd_shuffle_xor(held, mask);
-    if (Op::replace(rival, held)) {
-      held = rival;
+    const float rival = simd_shuffle_xor(best, mask);
+    if (Op::replace(rival, best)) {
+      best = rival;
     }
   }
   if (lane == 0) {
-    out[gid] = held;
+    out[gid] = best;
   }
 }
 
