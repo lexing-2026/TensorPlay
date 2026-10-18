@@ -729,6 +729,44 @@ std::vector<Tensor> split_sizes_kernel(
   return result;
 }
 
+std::vector<Tensor> split_kernel(
+    const Tensor& self,
+    int64_t split_size,
+    int64_t dim) {
+  TP_CHECK(
+      self.dim() > 0, "split expects at least a 1-dimensional tensor");
+  TP_CHECK(
+      split_size >= 0,
+      "split expects split_size be non-negative, but got split_size=",
+      split_size);
+  dim = wrap_dim_checked(dim, self.dim());
+  const int64_t dim_size = self.size(dim);
+  TP_CHECK(
+      split_size > 0 || dim_size == 0,
+      "split_size can only be 0 if dimension size is 0, but got dimension "
+      "size of ", dim_size);
+
+  // split_size == 0 && dim_size == 0 yields exactly one empty split.
+  int64_t num_splits = 1;
+  int64_t last_split_size = 0;
+  if (split_size != 0) {
+    const int64_t quotient = dim_size / split_size;
+    const int64_t remainder = dim_size % split_size;
+    num_splits = std::max<int64_t>(quotient + (remainder != 0 ? 1 : 0), 1);
+    last_split_size =
+        (dim_size != 0 && remainder == 0) ? split_size : remainder;
+  }
+  std::vector<Tensor> result;
+  result.reserve(static_cast<size_t>(num_splits));
+  for (int64_t i = 0; i < num_splits; ++i) {
+    const int64_t length =
+        i < num_splits - 1 ? split_size : last_split_size;
+    result.push_back(
+        slice_kernel(self, dim, i * split_size, i * split_size + length, 1));
+  }
+  return result;
+}
+
 std::vector<Tensor> chunk_kernel(
     const Tensor& self,
     int64_t chunks,
@@ -831,6 +869,7 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, ShapeKernels) {
   m.impl("repeat", &tensorplay::vulkan::ops::repeat_kernel);
   m.impl("tile", &tensorplay::vulkan::ops::tile_kernel);
   m.impl("split.sizes", &tensorplay::vulkan::ops::split_sizes_kernel);
+  m.impl("split", &tensorplay::vulkan::ops::split_kernel);
   m.impl("chunk", &tensorplay::vulkan::ops::chunk_kernel);
   m.impl("unbind", &tensorplay::vulkan::ops::unbind_kernel);
   m.impl("movedim", &tensorplay::vulkan::ops::movedim_kernel);
