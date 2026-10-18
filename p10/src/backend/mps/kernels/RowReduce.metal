@@ -237,34 +237,34 @@ kernel void row_value_arg_inner(device float* out_value [[buffer(0)]],
 
 // Whether every element of a row is nonzero, or at least one of them is. The
 // test is against zero of the operand's own type, so a NaN answers set and a
-// negative zero does not. One byte per element of the row is folded into the one
-// byte a row answers with, so nothing of the operand's type is left to
-// reconcile afterwards.
+// negative zero does not. Each element answers with one bit held in a lane's
+// counter, the counters fold by the AND or the OR of the question, and the row
+// leaves the group as the one byte that holds its answer.
 template <typename T>
-inline uchar element_is_set(T value) {
-  return value != static_cast<T>(0) ? uchar(1) : uchar(0);
+inline uint element_is_set(T value) {
+  return value != static_cast<T>(0) ? 1u : 0u;
 }
 
-inline uchar element_is_set(bool value) { return value ? uchar(1) : uchar(0); }
+inline uint element_is_set(bool value) { return value ? 1u : 0u; }
 
 template <typename T>
 struct all_nonzero {
-  static inline constexpr uchar identity() { return uchar(1); }
-  static inline uchar test(T value) { return element_is_set(value); }
-  static inline uchar combine(uchar held, uchar seen) {
+  static inline constexpr uint identity() { return 1u; }
+  static inline uint test(T value) { return element_is_set(value); }
+  static inline uint combine(uint held, uint seen) {
     return seen < held ? seen : held;
   }
-  static inline uchar reduce(uchar held) { return simd_min(held); }
+  static inline uint reduce(uint held) { return simd_min(held); }
 };
 
 template <typename T>
 struct any_nonzero {
-  static inline constexpr uchar identity() { return uchar(0); }
-  static inline uchar test(T value) { return element_is_set(value); }
-  static inline uchar combine(uchar held, uchar seen) {
+  static inline constexpr uint identity() { return 0u; }
+  static inline uint test(T value) { return element_is_set(value); }
+  static inline uint combine(uint held, uint seen) {
     return seen > held ? seen : held;
   }
-  static inline uchar reduce(uchar held) { return simd_max(held); }
+  static inline uint reduce(uint held) { return simd_max(held); }
 };
 
 template <typename Op, typename T>
@@ -282,7 +282,7 @@ kernel void row_pred_inner(device bool* out [[buffer(0)]],
   const uint n = sizes[1];
   constant T* values = src + (uint64_t)row * (uint64_t)n;
 
-  uchar held = Op::identity();
+  uint held = Op::identity();
   for (uint i = lane; i < n; i += simdgroup_size) {
     held = Op::combine(held, Op::test(values[i]));
   }
