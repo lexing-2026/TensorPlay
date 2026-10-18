@@ -11,6 +11,13 @@ namespace tensorplay {
 namespace vulkan {
 namespace ops {
 
+// Copies a texture-stored payload into a dense buffer vTensor; sibling
+// kernels use it to bring every operand of a linear path into buffer
+// storage (see BinaryOp.cpp).
+api::vTensor to_buffer_storage_dispatch(
+    api::Context* context,
+    const api::vTensor& src);
+
 namespace {
 
 void validate_float_operand(const Tensor& t, const char* name) {
@@ -98,6 +105,57 @@ Tensor embedding_kernel(
 
   const int64_t index_count = indices.numel();
   const int64_t features = weight.size(1);
+
+  // A buffer-stored weight (large vocabulary table) is looked up through a
+  // linear path: the index payload is copied to a dense Int32 buffer and the
+  // output is forced to buffer storage, so the same row-major shader serves
+  // small and large lookups without a texture fallback.
+  if (v_weight.storage_type() == api::StorageType::BUFFER) {
+    api::vTensor v_indices_buf =
+        to_buffer_storage_dispatch(context, v_indices);
+    api::vTensor v_output{
+        context, {index_count, features}, DType::Float32,
+        api::StorageType::BUFFER, api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+    const uint32_t nf4 =
+        static_cast<uint32_t>((features + 3) / 4);
+    const uint32_t n = nf4 * static_cast<uint32_t>(index_count);
+    const struct EmbeddingBufferBlock {
+      int32_t rows;
+      int32_t features;
+      int32_t weight_rows;
+      int32_t fill;
+    } block{
+        static_cast<int32_t>(index_count),
+        static_cast<int32_t>(features),
+        static_cast<int32_t>(weight.size(0)),
+        0};
+    api::UniformParamsBuffer params(context, block);
+    api::PipelineBarrier pipeline_barrier{};
+    context->submit_compute_job(
+        VK_KERNEL_FROM_STR("embedding_buffer"), pipeline_barrier,
+        {n, 1u, 1u}, {256u, 1u, 1u}, VK_NULL_HANDLE,
+        v_output.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::WRITE),
+        v_weight.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::READ),
+        v_indices_buf.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::READ),
+        params.buffer());
+    Tensor out = convert(v_output);
+    if (indices.dim() != 1) {
+      std::vector<int64_t> out_sizes =
+          static_cast<std::vector<int64_t>>(indices.shape());
+      out_sizes.push_back(features);
+      out = out.reshape(out_sizes);
+    }
+    return out;
+  }
 
   // Output {index_count, features}: the 2-D texture geometry puts feature
   // columns on x and the lookup row on y.  Non-1d index tensors are flattened
