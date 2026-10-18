@@ -44,18 +44,46 @@ struct IndexSelectBlock final {
   int fill;
 };
 
-// Uploads the index payload: the Int64 codes narrow to Int32 on the host
-// (the backend's texture vocabulary has no 8-byte format) and ride a flat
-// 1-D Int32 texture with one index per texel.
-api::vTensor upload_index_payload(const Tensor& indices) {
+// Builds the Int32 payload a lookup walks: one code per entry of a flat 1-D
+// list, in the storage class the looked-up rows live in.  Following the model
+// keeps a lookup on the route it already chose: a dense list beside a texel
+// table would otherwise drag the whole table into linear storage to bind both
+// operands alike.  A list already on the device stays there, because a queue
+// sync to narrow its codes on the host costs a full wait per call and a decode
+// step makes one per token.  Codes in any other element type still come through
+// the host, which converts whatever it is handed.
+api::vTensor upload_index_payload(
+    const Tensor& indices,
+    api::StorageType model_storage) {
   api::Context* const context = api::context();
+
+  const api::GPUMemoryLayout model_layout =
+      model_storage == api::StorageType::BUFFER
+      ? api::GPUMemoryLayout::TENSOR_WIDTH_PACKED
+      : api::GPUMemoryLayout::TENSOR_CHANNELS_PACKED;
+
+  if (indices.device().is_vulkan() &&
+      (indices.dtype() == DType::Int32 || indices.dtype() == DType::Int64)) {
+    Tensor flat =
+        indices.dim() == 1 ? indices : indices.reshape({indices.numel()});
+    api::vTensor v{
+        context, {flat.numel()}, DType::Int32, model_storage, model_layout};
+    // The copy is the whole move: it narrows each 64-bit code to its low word,
+    // crosses the storage class if the list arrived in the other one, and is a
+    // plain transfer when both already agree.
+    Tensor codes = convert(v);
+    codes.copy_(flat);
+    return v;
+  }
+
   Tensor flat_cpu =
       indices.to(Device(DeviceType::CPU))
           .reshape({indices.numel()})
           .to(DType::Int32)
           .contiguous();
 
-  api::vTensor v{context, {flat_cpu.numel()}, DType::Int32};
+  api::vTensor v{
+      context, {flat_cpu.numel()}, DType::Int32, model_storage, model_layout};
   // The payload layout follows the storage: a texel holds one index in its .x
   // lane, so the packed host bytes are the texel-linear image, while a linear
   // payload is one int per element in row order.  Uploading the packed bytes
@@ -115,10 +143,20 @@ Tensor embedding_kernel(
   api::Context* const context = api::context();
 
   api::vTensor v_weight = convert(weight);
-  api::vTensor v_indices = upload_index_payload(indices);
 
   const int64_t index_count = indices.numel();
   const int64_t features = weight.size(1);
+
+  // The list is built in the class the lookup is going to use: a table with no
+  // image form, or a result too long to have one, takes the flat route and wants
+  // a dense list, while a lookup that can stay in texels keeps one code per
+  // texel.
+  const api::StorageType index_storage =
+      v_weight.storage_type() == api::StorageType::BUFFER ||
+          !image_storage_supported(context, {index_count, features})
+      ? api::StorageType::BUFFER
+      : api::StorageType::TEXTURE_3D;
+  api::vTensor v_indices = upload_index_payload(indices, index_storage);
 
   // A lookup runs on the flat path as soon as one of the three payloads it
   // touches has no image form: the table (a wide vocabulary), the index list
@@ -274,7 +312,7 @@ Tensor& index_copy_rows_inplace(Tensor& self, int64_t dim, const Tensor& index, 
   api::Context* const context = api::context();
   api::vTensor v_self = convert(self);
   api::vTensor v_source = convert(source);
-  api::vTensor v_indices = upload_index_payload(idx_host);
+  api::vTensor v_indices = upload_index_payload(idx_host, v_self.storage_type());
 
   // Linear payloads (shapes beyond the 3-D image axis limit) scatter through
   // a buffer-to-buffer variant: the index payload is copied to a dense
@@ -399,10 +437,20 @@ Tensor index_select_kernel(
   api::Context* const context = api::context();
 
   api::vTensor v_self = convert(self);
-  api::vTensor v_indices = upload_index_payload(index);
 
   const int64_t index_count = index.numel();
   const int64_t out_count = index_count * inner;
+
+  // The list is built in the class the gather is going to use, so a source with
+  // an image form is not dragged into dense storage just because the codes
+  // arrived wide.
+  const api::StorageType index_storage =
+      v_self.storage_type() == api::StorageType::BUFFER ||
+          !image_storage_supported(context, {self.numel()}) ||
+          !image_storage_supported(context, {out_count})
+      ? api::StorageType::BUFFER
+      : api::StorageType::TEXTURE_3D;
+  api::vTensor v_indices = upload_index_payload(index, index_storage);
 
   // The texel route walks the payload as a flat 1-D texture, so the source seen
   // whole and the gathered rows must both have an image form, and the index
