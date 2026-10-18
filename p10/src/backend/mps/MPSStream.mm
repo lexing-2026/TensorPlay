@@ -339,17 +339,21 @@ MPSStream* getStreamFromStream(const Stream& stream) {
 }
 
 void synchronizeAllMPSStreams(SyncType syncType) {
-  // Each stream is drained on its own serial queue, so the wait is ordered
-  // after the launches this thread or any other has already encoded there.
-  auto sync = [syncType](MPSStream* stream) {
-    dispatch_sync_with_rethrow(stream->queue(), ^() {
-      stream->synchronize(syncType);
-    });
-  };
-  sync(getDefaultMPSStream());
+  // Every launch is encoded on the stream's serial queue before its caller
+  // continues, so the default stream holds all of this thread's work by the
+  // time the wait starts and is waited on directly. A pool stream may have
+  // been used from another thread, so it is drained on its own queue, and an
+  // idle one is skipped: it has nothing to wait for.
+  getDefaultMPSStream()->synchronize(syncType);
   if (streamPoolInitialized.load(std::memory_order_acquire)) {
     for (int i = 0; i < kStreamsPerPool; ++i) {
-      sync(streamPool[i]);
+      MPSStream* stream = streamPool[i];
+      if (!stream->hasPendingWork()) {
+        continue;
+      }
+      dispatch_sync_with_rethrow(stream->queue(), ^() {
+        stream->synchronize(syncType);
+      });
     }
   }
 }
