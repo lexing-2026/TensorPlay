@@ -81,7 +81,7 @@ kernel void broadcast_binary_ilp(device T* out [[buffer(0)]],
                                  uint tid [[thread_position_in_grid]]) {
   const uint first = tid * ILP_PER_THREAD;
   const uint inner = sizes[0];
-  if (first + ILP_PER_THREAD <= total) {
+  if (total >= ILP_PER_THREAD && first <= total - ILP_PER_THREAD) {
     uint remaining = first / inner;
     int lhs_outer = 0;
     int rhs_outer = 0;
