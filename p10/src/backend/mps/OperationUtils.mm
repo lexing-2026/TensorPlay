@@ -1027,7 +1027,13 @@ std::optional<Tensor> clampShader(const Tensor& self,
   MTLComputePipelineState_t active_pso = vec_pso ? vec_pso : pso;
   // The vector form counts 16-byte vectors, the scalar form elements.
   const uint32_t span = vec_pso ? elements / 4 : elements;
-  const uint32_t total = denseSpanThreads(span, elements, vec_pso != nil);
+  // Clamp carries the most arithmetic per element of the dense elementwise
+  // forms, and a four-run per thread leaves too few threads in flight to keep
+  // that arithmetic off the critical path: the vector form runs one vector per
+  // thread at every size, covering the same four elements a thread of the run
+  // form would but exposing four times as many threads to the scheduler.
+  const uint32_t total =
+      vec_pso ? span : denseSpanThreads(span, elements, /*grid_stride=*/false);
   const uint32_t per_group = denseThreadsPerGroup(
       total, elements,
       static_cast<uint32_t>([active_pso maxTotalThreadsPerThreadgroup]));
