@@ -115,8 +115,12 @@ def summarize(payload):
             "speedup": theirs / ours,
         })
     unpaired = list(payload.get("unpaired") or [])
-    requested = set(payload.get("reference_requested_skips") or [])
-    unexpected_unpaired = [name for name in unpaired if name not in requested]
+    # A reference case that recorded why it did not run -- declared up front or
+    # refused by the device during the probe -- is an explicit omission. One
+    # with no record at all means the pass disappeared before it got there.
+    recorded = set(payload.get("reference_requested_skips") or [])
+    recorded.update(payload.get("reference_unavailable") or [])
+    unexpected_unpaired = [name for name in unpaired if name not in recorded]
     if not rows:
         return {"rows": [], "geomean": 0.0, "win_rate": 0.0,
                 "wins": 0, "compared": 0,
@@ -146,8 +150,8 @@ def evaluate(summary, min_geomean, min_win_rate, max_case_slowdown):
     if summary.get("unexpected_unpaired"):
         names = summary["unexpected_unpaired"]
         violations.append(
-            f"{len(names)} measured cases have no reference timing and were "
-            f"not declared skipped: {', '.join(names)}"
+            f"{len(names)} measured cases have no reference timing and no "
+            f"recorded skip: {', '.join(names)}"
         )
     if summary["geomean"] < min_geomean:
         violations.append(
@@ -226,8 +230,8 @@ def write_summary(path, summary, violations, min_geomean, min_win_rate):
             "",
         ])
         lines.extend(
-            f"- {name}: " + ("pairing incomplete"
-                             if name in unexpected else "declared skip")
+            f"- {name}: " + ("no recorded skip" if name in unexpected
+                             else "reference skipped")
             for name in summary["unpaired"]
         )
         lines.append("")

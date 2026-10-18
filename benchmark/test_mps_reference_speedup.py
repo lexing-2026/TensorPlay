@@ -105,7 +105,7 @@ class TestSpeedupGate(unittest.TestCase):
         violations = evaluate(summary, 0.0, 0.0, None)
         self.assertEqual(len(violations), 1)
         self.assertIn("b", violations[0])
-        self.assertIn("not declared skipped", violations[0])
+        self.assertIn("no recorded skip", violations[0])
 
     def test_declared_skip_is_not_a_gate_violation(self):
         ours, theirs = _two_sides(["a", "b"], ["a"], requested=["b"])
@@ -113,15 +113,23 @@ class TestSpeedupGate(unittest.TestCase):
         self.assertEqual(evaluate(summary, 0.0, 0.0, None), [])
         self.assertEqual(summary["unpaired"], ["b"])
 
+    def test_runtime_unavailable_case_is_not_a_gate_violation(self):
+        ours, theirs = _two_sides(["a", "b"], ["a"], unavailable=["b"])
+        summary = summarize(join(ours, theirs))
+        self.assertEqual(evaluate(summary, 0.0, 0.0, None), [])
+        self.assertEqual(summary["unpaired"], ["b"])
 
-def _two_sides(ours_names, reference_names, requested=()):
+
+def _two_sides(ours_names, reference_names, requested=(), unavailable=()):
     ours = payload([(name, 1.0, None) for name in ours_names],
                    reference=False)
     ours["side"] = "ours"
     theirs = payload([(name, 1.0, None) for name in reference_names],
                      reference=False)
     theirs["side"] = "reference"
-    theirs["skipped"] = {"requested": list(requested), "unavailable": {}}
+    theirs["skipped"] = {"requested": list(requested),
+                         "unavailable": {name: "probe failed"
+                                         for name in unavailable}}
     return ours, theirs
 
 
