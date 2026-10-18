@@ -40,6 +40,11 @@ struct WhereBlock final {
 
 } // namespace
 
+// Defined in BinaryOp.cpp; copies a texture payload into a dense buffer.
+api::vTensor to_buffer_storage_dispatch(
+    api::Context* context,
+    const api::vTensor& src);
+
 Tensor where_kernel(
     const Tensor& condition,
     const Tensor& self,
@@ -64,12 +69,23 @@ Tensor where_kernel(
   api::vTensor v_cond = convert(condition);
   api::vTensor v_input = convert(self);
   api::vTensor v_other = convert(other);
-  api::vTensor v_output{context, v_input.sizes(), self.dtype()};
 
   // Linear payloads (shapes beyond the 3-D image axis limit) select through
   // buffer-to-buffer variants: the Bool condition is one byte per element and
   // rides a packed-word buffer, the operands are plain row-major memory.
+  // Texel-stored operands are gathered into dense buffers first, because a
+  // texel's lanes are not adjacent in the logical order a buffer reader walks.
   if (v_input.storage_type() == api::StorageType::BUFFER) {
+    v_cond = to_buffer_storage_dispatch(context, v_cond);
+    v_other = to_buffer_storage_dispatch(context, v_other);
+    // A buffer-stored input needs a buffer-stored output: the default
+    // allocation is a texture, whose image the linear variant cannot write.
+    api::vTensor v_output{
+        context,
+        v_input.sizes(),
+        self.dtype(),
+        api::StorageType::BUFFER,
+        api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
     const char* buffer_shader = nullptr;
     uint32_t lanes_per_word = 4u;
     if (self.dtype() == DType::Int32) {
@@ -117,6 +133,8 @@ Tensor where_kernel(
         params.buffer());
     return convert(v_output);
   }
+
+  api::vTensor v_output{context, v_input.sizes(), self.dtype()};
 
   const struct WhereBlock block{
       make_whcn_ivec4(v_output.sizes()),
