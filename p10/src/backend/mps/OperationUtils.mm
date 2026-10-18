@@ -439,6 +439,12 @@ MTLComputePipelineState_t compareShaderPipeline(const std::string& op,
 
 } // namespace
 
+// A shader launch encodes into the command buffer the stream is already
+// building and leaves it open, so consecutive launches share one commit and
+// their host cost is paid once per run rather than once per launch. Whatever
+// needs the result closes the encoder before it uses the buffer -- a copy to
+// the host, a graph launch, an explicit synchronize -- and that commit carries
+// everything the chain has encoded so far.
 std::optional<Tensor> broadcastBinaryShader(
     const std::string& op, const Tensor& self, const Tensor& other,
     const std::optional<Scalar>& alpha) {
@@ -514,7 +520,6 @@ std::optional<Tensor> broadcastBinaryShader(
   MPSStream* stream = getCurrentMPSStream();
   dispatch_sync_with_rethrow(stream->queue(), ^() {
     @autoreleasepool {
-      stream->endKernelCoalescing();
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:pso];
       [encoder setBuffer:(__bridge id<MTLBuffer>)out_buf offset:0 atIndex:0];
@@ -531,7 +536,6 @@ std::optional<Tensor> broadcastBinaryShader(
                    static_cast<uint32_t>([pso maxTotalThreadsPerThreadgroup]));
       [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(per_group, 1, 1)];
-      stream->synchronize(SyncType::COMMIT);
     }
   });
   return output;
@@ -569,7 +573,6 @@ std::optional<Tensor> unaryShader(const std::string& op, const Tensor& self) {
   MPSStream* stream = getCurrentMPSStream();
   dispatch_sync_with_rethrow(stream->queue(), ^() {
     @autoreleasepool {
-      stream->endKernelCoalescing();
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:pso];
       [encoder setBuffer:(__bridge id<MTLBuffer>)out_buf offset:0 atIndex:0];
@@ -585,7 +588,6 @@ std::optional<Tensor> unaryShader(const std::string& op, const Tensor& self) {
                    static_cast<uint32_t>([pso maxTotalThreadsPerThreadgroup]));
       [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(per_group, 1, 1)];
-      stream->synchronize(SyncType::COMMIT);
     }
   });
   return output;
@@ -599,8 +601,8 @@ namespace {
 constexpr uint32_t kRowReduceThreads = 256;
 constexpr uint32_t kRowReduceSimdgroup = p10::metal::simdgroup_size;
 
-// Encodes a reduction over `rows` rows of `length` consecutive elements and
-// commits it. `divisor` rides only with the kernel that takes one.
+// Encodes a reduction over `rows` rows of `length` consecutive elements.
+// `divisor` rides only with the kernel that takes one.
 void dispatchRowReduce(MTLComputePipelineState_t pso, void* out_buf,
                        void* in_buf, uint32_t rows, uint32_t length,
                        const std::optional<float>& divisor) {
@@ -618,7 +620,6 @@ void dispatchRowReduce(MTLComputePipelineState_t pso, void* out_buf,
   MPSStream* stream = getCurrentMPSStream();
   dispatch_sync_with_rethrow(stream->queue(), ^() {
     @autoreleasepool {
-      stream->endKernelCoalescing();
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:pso];
       [encoder setBuffer:(__bridge id<MTLBuffer>)out_buf offset:0 atIndex:0];
@@ -629,7 +630,6 @@ void dispatchRowReduce(MTLComputePipelineState_t pso, void* out_buf,
       }
       [encoder dispatchThreads:MTLSizeMake(groups * threads, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
-      stream->synchronize(SyncType::COMMIT);
     }
   });
 }
@@ -761,7 +761,6 @@ std::optional<Tensor> compareShader(const std::string& op, const Tensor& self,
   MPSStream* stream = getCurrentMPSStream();
   dispatch_sync_with_rethrow(stream->queue(), ^() {
     @autoreleasepool {
-      stream->endKernelCoalescing();
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:pso];
       [encoder setBuffer:(__bridge id<MTLBuffer>)out_buf offset:0 atIndex:0];
@@ -772,7 +771,6 @@ std::optional<Tensor> compareShader(const std::string& op, const Tensor& self,
                    static_cast<uint32_t>([pso maxTotalThreadsPerThreadgroup]));
       [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(per_group, 1, 1)];
-      stream->synchronize(SyncType::COMMIT);
     }
   });
   return output;
