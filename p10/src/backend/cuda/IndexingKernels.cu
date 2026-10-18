@@ -174,6 +174,27 @@ __global__ void index_copy_kernel(int64_t total, int64_t n_idx, int64_t inner, i
     }
 }
 
+// One block column per index entry, mirroring the select kernel: no per-element
+// coordinate split, and the index value is used by a whole slice at once.
+template <typename T>
+__global__ void index_copy_slice_kernel(int64_t n_idx, int64_t outer,
+                                        int64_t inner, int64_t row,
+                                        T* d, const int64_t* ip, const T* sp) {
+    const int64_t k_stride = static_cast<int64_t>(gridDim.x);
+    const int64_t o_stride = static_cast<int64_t>(gridDim.y);
+    for (int64_t o = blockIdx.y; o < outer; o += o_stride) {
+        for (int64_t k = blockIdx.x; k < n_idx; k += k_stride) {
+            int64_t iv = ip[k];
+            TP_INDEX_RANGE_GUARD(iv, row);
+            T* destination = d + (o * row + iv) * inner;
+            const T* source = sp + (o * n_idx + k) * inner;
+            for (int64_t c = threadIdx.x; c < inner; c += blockDim.x) {
+                destination[c] = source[c];
+            }
+        }
+    }
+}
+
 template <typename T>
 __global__ void index_fill_kernel(int64_t total, int64_t n_idx, int64_t inner, int64_t row,
                                   T* d, const int64_t* ip, T v) {
@@ -429,12 +450,25 @@ Tensor index_copy_cuda(const Tensor& self, int64_t dim, const Tensor& index, con
     if (total == 0) return result;
     Tensor source_c = source.contiguous();
     auto stream = getCurrentCUDAStream().stream();
+    const int slice_threads = slice_block_threads(inner);
 #define TP_IC_CASE(ctype, name) \
-    case DType::name: \
-        index_copy_kernel<ctype><<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
-            total, n_idx, inner, row, static_cast<ctype*>(result.data_ptr()), \
-            idx.data_ptr<int64_t>(), static_cast<const ctype*>(source_c.data_ptr())); \
-        break;
+    case DType::name: { \
+        if (use_slice_kernel(inner, n_idx, outer)) { \
+            const unsigned index_blocks = static_cast<unsigned>( \
+                std::min<int64_t>(n_idx, 2147483647)); \
+            const unsigned outer_blocks = static_cast<unsigned>( \
+                std::min<int64_t>(outer, 65535)); \
+            index_copy_slice_kernel<ctype><<< \
+                dim3(index_blocks, outer_blocks), slice_threads, 0, stream>>>( \
+                n_idx, outer, inner, row, static_cast<ctype*>(result.data_ptr()), \
+                idx.data_ptr<int64_t>(), static_cast<const ctype*>(source_c.data_ptr())); \
+        } else { \
+            index_copy_kernel<ctype><<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
+                total, n_idx, inner, row, static_cast<ctype*>(result.data_ptr()), \
+                idx.data_ptr<int64_t>(), static_cast<const ctype*>(source_c.data_ptr())); \
+        } \
+        break; \
+    }
     switch (self.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_IC_CASE)
         TENSORPLAY_FORALL_FP8_TYPES(TP_IC_CASE)
@@ -469,12 +503,25 @@ Tensor& index_copy_inplace_cuda(Tensor& self, int64_t dim, const Tensor& index, 
     }
     Tensor source_c = source.contiguous();
     auto stream = getCurrentCUDAStream().stream();
+    const int slice_threads = slice_block_threads(inner);
 #define TP_IC_IP_CASE(ctype, name) \
-    case DType::name: \
-        index_copy_kernel<ctype><<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
-            total, n_idx, inner, row, static_cast<ctype*>(self.data_ptr()), \
-            idx.data_ptr<int64_t>(), static_cast<const ctype*>(source_c.data_ptr())); \
-        break;
+    case DType::name: { \
+        if (use_slice_kernel(inner, n_idx, outer)) { \
+            const unsigned index_blocks = static_cast<unsigned>( \
+                std::min<int64_t>(n_idx, 2147483647)); \
+            const unsigned outer_blocks = static_cast<unsigned>( \
+                std::min<int64_t>(outer, 65535)); \
+            index_copy_slice_kernel<ctype><<< \
+                dim3(index_blocks, outer_blocks), slice_threads, 0, stream>>>( \
+                n_idx, outer, inner, row, static_cast<ctype*>(self.data_ptr()), \
+                idx.data_ptr<int64_t>(), static_cast<const ctype*>(source_c.data_ptr())); \
+        } else { \
+            index_copy_kernel<ctype><<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
+                total, n_idx, inner, row, static_cast<ctype*>(self.data_ptr()), \
+                idx.data_ptr<int64_t>(), static_cast<const ctype*>(source_c.data_ptr())); \
+        } \
+        break; \
+    }
     switch (self.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_IC_IP_CASE)
         TENSORPLAY_FORALL_FP8_TYPES(TP_IC_IP_CASE)
