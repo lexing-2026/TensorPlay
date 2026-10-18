@@ -3282,5 +3282,112 @@ class TestVulkanDeviceBuiltPayload(unittest.TestCase):
             flat.copy_(cube)
 
 
+class TestVulkanWidePayload(unittest.TestCase):
+    # A texel carries at most four 32-bit channels, so an element wider than one
+    # word has no image form on any device and keeps the plain linear layout
+    # whatever its shape.  That is what lets a 64-bit index vector reach the
+    # device instead of being narrowed to 32 bits on the host, which costs a
+    # queue sync per call.  Reading such a payload is a transfer rather than a
+    # shader, so the ops that walk a linear payload one word per element still
+    # refuse it, and a range resolves to the widest code they do read.
+
+    @staticmethod
+    def _weight(sizes=(16, 6)):
+        count = int(np.prod(sizes))
+        return ((np.arange(count, dtype=np.float32) % 13) / 4).reshape(sizes)
+
+    def test_upload_and_readback_keep_every_bit(self):
+        # Codes that differ only in the word above them are the case worth
+        # pinning: a route that folded a pair of words into one, or narrowed on
+        # the way in, still reads back as a plausible sequence.
+        values = np.array(
+            [0, -1, 1, 2**31 - 1, -(2**31), 2**32, 2**53, -(2**53)],
+            dtype=np.int64)
+        for name, payload in (
+                ("uploaded",
+                 tensorplay.from_numpy(values.copy()).to("vulkan")),
+                ("built", tensorplay.tensor(values, device="vulkan"))):
+            self.assertEqual(payload.dtype, tensorplay.int64, name)
+            np.testing.assert_array_equal(
+                payload.cpu().numpy(), values,
+                err_msg=f"{name} 64-bit payload changed its codes")
+
+    def test_factories_emit_wide_sequences(self):
+        cases = (
+            ("zeros", tensorplay.zeros, np.zeros(9, dtype=np.int64)),
+            ("ones", tensorplay.ones, np.ones(9, dtype=np.int64)),
+            ("full", lambda shape, **kw: tensorplay.full(shape, 7, **kw),
+             np.full(9, 7, dtype=np.int64)),
+        )
+        for name, make, want in cases:
+            out = make((9,), dtype=tensorplay.int64, device="vulkan")
+            self.assertEqual(out.dtype, tensorplay.int64, name)
+            np.testing.assert_array_equal(
+                out.cpu().numpy(), want, err_msg=f"{name} of a wide dtype")
+        # An odd count leaves the last 16-byte group of the staging transfer
+        # partly past the logical end, so the tail element is the one a
+        # group-at-a-time move drops.
+        tail = tensorplay.full((17,), -3, dtype=tensorplay.int64,
+                               device="vulkan")
+        np.testing.assert_array_equal(
+            tail.cpu().numpy(), np.full(17, -3, dtype=np.int64),
+            err_msg="wide fill lost its tail")
+
+    def test_empty_of_a_wide_dtype_receives_a_copy(self):
+        values = np.arange(23, dtype=np.int64) * 4_000_000_000
+        out = tensorplay.empty((23,), dtype=tensorplay.int64,
+                               device="vulkan")
+        out.copy_(tensorplay.tensor(values.copy(), device="vulkan"))
+        np.testing.assert_array_equal(
+            out.cpu().numpy(), values, err_msg="empty_ + copy_ of a wide dtype")
+
+    def test_index_vector_drives_the_row_lookups(self):
+        # The whole point of carrying the codes: a row lookup reads its indices
+        # on the device.  Both weight storages have to accept them, because the
+        # index payload is linear either way.
+        ids = np.array([0, 7, 3, 11, 2], dtype=np.int64)
+        host = self._weight()
+        want = host[ids]
+        indices = tensorplay.from_numpy(ids.copy()).to("vulkan")
+        for name, weight in (
+                ("uploaded", tensorplay.from_numpy(host.copy()).to("vulkan")),
+                ("built", tensorplay.tensor(host.copy(), device="vulkan"))):
+            np.testing.assert_allclose(
+                tensorplay.index_select(weight, 0, indices).cpu().numpy(), want,
+                rtol=0, atol=1e-6, err_msg=f"index_select over a {name} weight")
+            np.testing.assert_allclose(
+                tensorplay.embedding(weight, indices).cpu().numpy(), want,
+                rtol=0, atol=1e-6, err_msg=f"embedding over a {name} weight")
+
+    def test_a_range_resolves_to_the_widest_readable_code(self):
+        # Nothing downstream of a range reads a pair of words per element yet,
+        # so an index vector built on the device arrives as Int32.  Pinning the
+        # resolution keeps a future wide gather honest about what it must also
+        # switch over.
+        for kwargs in ({"dtype": tensorplay.int64}, {}):
+            got = tensorplay.arange(0, 40, 2, device="vulkan", **kwargs)
+            self.assertEqual(got.dtype, tensorplay.int32)
+            np.testing.assert_array_equal(
+                got.cpu().numpy(), np.arange(0, 40, 2, dtype=np.int32))
+
+    def test_word_at_a_time_ops_refuse_a_wide_payload(self):
+        values = np.array([0, 5, 2, 7, 1], dtype=np.int64)
+        payload = tensorplay.from_numpy(values.copy()).to("vulkan")
+        # Slicing, reducing and casting each walk one word per element: they
+        # have to say so rather than read the low word of every code.
+        with self.assertRaisesRegex(RuntimeError, "Vulkan slice supports"):
+            tensorplay.narrow(payload, 0, 1, 3)
+        with self.assertRaisesRegex(
+                RuntimeError, "reductions support Float32 and Float16"):
+            payload.sum()
+        with self.assertRaisesRegex(
+                RuntimeError, "Vulkan view materialization supports"):
+            payload.to(tensorplay.float32)
+        with self.assertRaisesRegex(
+                RuntimeError, "conversion over linear storage"):
+            tensorplay.tensor(values.astype(np.int32),
+                              device="vulkan").to(tensorplay.int64)
+
+
 if __name__ == "__main__":
     unittest.main()
