@@ -668,6 +668,11 @@ Tensor where_kernel(const Tensor& condition, const Tensor& self,
 
 Tensor clamp_kernel(const Tensor& self, const std::optional<Scalar>& min,
                     const std::optional<Scalar>& max) {
+  if (min.has_value() || max.has_value()) {
+    if (auto result = clampShader(self, min, max)) {
+      return *result;
+    }
+  }
   return unaryOp(
       graphKey("clamp", {min ? scalarKey(*min) : std::string("none"),
                          max ? scalarKey(*max) : std::string("none")}), self,
@@ -694,6 +699,9 @@ Tensor clamp_kernel(const Tensor& self, const std::optional<Scalar>& min,
 }
 
 Tensor clamp_min_kernel(const Tensor& self, const Scalar& min) {
+  if (auto result = clampShader(self, min, std::nullopt)) {
+    return *result;
+  }
   return unaryOp(graphKey("clamp_min", {scalarKey(min)}), self,
                  ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* x) {
     MPSGraphTensor* lo = [g constantWithScalar:min.to<double>()
@@ -703,6 +711,9 @@ Tensor clamp_min_kernel(const Tensor& self, const Scalar& min) {
 }
 
 Tensor clamp_max_kernel(const Tensor& self, const Scalar& max) {
+  if (auto result = clampShader(self, std::nullopt, max)) {
+    return *result;
+  }
   return unaryOp(graphKey("clamp_max", {scalarKey(max)}), self,
                  ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* x) {
     MPSGraphTensor* hi = [g constantWithScalar:max.to<double>()

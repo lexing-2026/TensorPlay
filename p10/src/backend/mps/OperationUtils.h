@@ -137,6 +137,15 @@ std::optional<Tensor> broadcastTernaryShader(
 // a graph in that case.
 std::optional<Tensor> unaryShader(const std::string& op, const Tensor& self);
 
+// Clamps a contiguous float operand into [min, max] with a single shader
+// dispatch. An absent bound becomes the infinity of its sign. Returns
+// std::nullopt when the shader cannot serve the call -- another dtype, a view
+// that is not contiguous or does not start at the beginning of its storage, an
+// element count beyond the 32-bit addressing -- and the caller builds a graph.
+std::optional<Tensor> clampShader(const Tensor& self,
+                                  const std::optional<Scalar>& min,
+                                  const std::optional<Scalar>& max);
+
 // Reduces the innermost axis of a contiguous float operand with the row shader
 // and returns the result in `out_shape`, which has to hold one value per row.
 // One SIMD group takes one row, so the call is a single dispatch and needs no

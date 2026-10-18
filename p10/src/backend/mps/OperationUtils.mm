@@ -712,6 +712,75 @@ std::optional<Tensor> unaryShader(const std::string& op, const Tensor& self) {
   return output;
 }
 
+std::optional<Tensor> clampShader(const Tensor& self,
+                                  const std::optional<Scalar>& min,
+                                  const std::optional<Scalar>& max) {
+  if (!self.device().is_mps()) {
+    return std::nullopt;
+  }
+  if (self.dtype() != DType::Float32) {
+    return std::nullopt;
+  }
+  // A complex bound that the float storage cannot hold goes to the graph.
+  if (min.has_value() && min->isComplex()) {
+    return std::nullopt;
+  }
+  if (max.has_value() && max->isComplex()) {
+    return std::nullopt;
+  }
+  if (!self.is_contiguous() || self.storage_offset() != 0) {
+    return std::nullopt;
+  }
+  const int64_t numel = self.numel();
+  if (numel <= 0 || numel > std::numeric_limits<uint32_t>::max()) {
+    return std::nullopt;
+  }
+  MTLComputePipelineState_t pso = shaderPipelineNamed("clamp_elementwise_float");
+  if (!pso) {
+    return std::nullopt;
+  }
+  void* in_buf = getMTLBufferFromPointer(self.data_ptr());
+  if (!in_buf) {
+    return std::nullopt;
+  }
+  const std::vector<int64_t> shape =
+      static_cast<std::vector<int64_t>>(self.shape());
+  Tensor output = emptyMPS(shape, self.dtype(), self.device());
+  void* out_buf = getMTLBufferFromPointer(output.data_ptr());
+  if (!out_buf) {
+    return std::nullopt;
+  }
+  // An absent bound is neutral in the comparison the shader applies.
+  const float lo = min.has_value()
+                       ? min->to<float>()
+                       : -std::numeric_limits<float>::infinity();
+  const float hi = max.has_value()
+                       ? max->to<float>()
+                       : std::numeric_limits<float>::infinity();
+
+  MPSStream* stream = getCurrentMPSStream();
+  dispatch_sync_with_rethrow(stream->queue(), ^() {
+    @autoreleasepool {
+      auto encoder = stream->commandEncoder();
+      [encoder setComputePipelineState:pso];
+      [encoder setBuffer:(__bridge id<MTLBuffer>)out_buf offset:0 atIndex:0];
+      [encoder setBuffer:(__bridge id<MTLBuffer>)in_buf offset:0 atIndex:1];
+      const uint32_t elements = static_cast<uint32_t>(numel);
+      const uint32_t total = static_cast<uint32_t>(
+          p10::metal::ceil_div<uint32_t>(elements, p10::metal::ILP_PER_THREAD));
+      [encoder setBytes:&elements length:sizeof(elements) atIndex:2];
+      [encoder setBytes:&lo length:sizeof(lo) atIndex:3];
+      [encoder setBytes:&hi length:sizeof(hi) atIndex:4];
+      const uint32_t per_group =
+          std::min(total,
+                   static_cast<uint32_t>([pso maxTotalThreadsPerThreadgroup]));
+      [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(per_group, 1, 1)];
+    }
+  });
+  return output;
+}
+
 namespace {
 
 // A row reduction serves one row per SIMD group, so a threadgroup of this many

@@ -145,6 +145,47 @@ kernel void unary_elementwise(device T* out [[buffer(0)]],
       constant uint& numel [[buffer(2)]],         \
       uint tid [[thread_position_in_grid]]);
 
+// Clamps a contiguous operand into [lo, hi]. The lower comparison is applied
+// first and the upper one to its result, so a NaN operand stays a NaN and a
+// lower bound above the upper bound answers with the upper bound, which is what
+// the operation asks for. An absent bound arrives as the infinity of its sign.
+template <typename T>
+kernel void clamp_elementwise(device T* out [[buffer(0)]],
+                              constant T* src [[buffer(1)]],
+                              constant uint& numel [[buffer(2)]],
+                              constant T& lo [[buffer(3)]],
+                              constant T& hi [[buffer(4)]],
+                              uint tid [[thread_position_in_grid]]) {
+  const uint first = tid * ILP_PER_THREAD;
+  if (first + ILP_PER_THREAD <= numel) {
+    array<T, ILP_PER_THREAD> values;
+#pragma unroll
+    for (uint j = 0; j < ILP_PER_THREAD; ++j) {
+      T x = src[first + j];
+      T y = x < lo ? lo : x;
+      values[j] = y > hi ? hi : y;
+    }
+#pragma unroll
+    for (uint j = 0; j < ILP_PER_THREAD; ++j) {
+      out[first + j] = values[j];
+    }
+  } else {
+    for (uint i = first; i < numel; ++i) {
+      T x = src[i];
+      T y = x < lo ? lo : x;
+      out[i] = y > hi ? hi : y;
+    }
+  }
+}
+
+template [[host_name("clamp_elementwise_float")]]
+kernel void clamp_elementwise<float>(device float* out [[buffer(0)]],
+                                     constant float* src [[buffer(1)]],
+                                     constant uint& numel [[buffer(2)]],
+                                     constant float& lo [[buffer(3)]],
+                                     constant float& hi [[buffer(4)]],
+                                     uint tid [[thread_position_in_grid]]);
+
 // Half, bfloat16 and the integer storage types are absent: an operation with
 // one of them runs its math in a wider type, which the graph path builds as a
 // cast around the operation. A call with such a dtype stays with the graph,
