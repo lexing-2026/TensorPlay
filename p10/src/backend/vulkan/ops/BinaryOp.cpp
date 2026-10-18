@@ -262,6 +262,8 @@ Tensor binary_op_tensor(
     // The linear path reads both operands through buffer bindings; a
     // texture-stored operand (small broadcast bias, keepdim mean, etc.) is
     // copied into a dense buffer first.
+    validate_buffer_elementwise_dtype(v_self, name);
+    validate_buffer_elementwise_dtype(v_other, name);
     api::vTensor v_self_buf = to_buffer_storage(context, v_self);
     api::vTensor v_other_buf = to_buffer_storage(context, v_other);
     const uint32_t n =

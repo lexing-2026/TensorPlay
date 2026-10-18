@@ -32,6 +32,7 @@ Tensor clamp(
   // absent side of the range is the extreme of the element type, which the clip
   // leaves untouched.
   if (v_self.storage_type() == api::StorageType::BUFFER) {
+    validate_buffer_elementwise_dtype(v_self, "clamp");
     api::vTensor v_linear_output{
         context,
         v_self.sizes(),
@@ -169,6 +170,7 @@ Tensor& clamp_(
   // Linear path: the clip reads and writes the same storage buffer, so no second
   // copy of a payload that is already too wide for a texture has to be reserved.
   if (v_self.storage_type() == api::StorageType::BUFFER) {
+    validate_buffer_elementwise_dtype(v_self, "clamp");
     const uint32_t elements =
         safe_downcast_to_u32(static_cast<int64_t>(v_self.numel()));
 

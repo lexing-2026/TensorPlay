@@ -63,6 +63,8 @@ Tensor& activation_dispatch(
   const bool in_place = (&output == &input) || !input.defined();
 
   if (v_output.storage_type() == api::StorageType::BUFFER) {
+    validate_buffer_elementwise_dtype(v_output, shader.c_str());
+    validate_buffer_elementwise_dtype(v_input, shader.c_str());
     const uint32_t n =
         safe_downcast_to_u32(static_cast<int64_t>(v_output.numel()));
 

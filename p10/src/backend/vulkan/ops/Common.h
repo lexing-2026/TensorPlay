@@ -72,6 +72,22 @@ struct Dim4D final {
   static constexpr uint32_t Width = 1u;
 };
 
+// Elementwise linear-buffer kernels read and write whole 4-byte words per
+// lane.  Half-precision, integer-byte and Bool payloads have no such shader
+// yet; rejecting them here keeps a missing buffer variant visible instead of
+// silently reinterpreting 2-byte (or 1-byte) elements as Float32 words.
+inline void validate_buffer_elementwise_dtype(
+    const api::vTensor& v,
+    const char* name) {
+  if (v.storage_type() == api::StorageType::BUFFER &&
+      v.dtype() != DType::Float32 && v.dtype() != DType::Int32) {
+    TP_THROW(
+        NotImplementedError,
+        std::string("Vulkan ") + name +
+            " over buffer storage supports Float32 and Int32 tensors only");
+  }
+}
+
 } // namespace ops
 } // namespace vulkan
 } // namespace tensorplay

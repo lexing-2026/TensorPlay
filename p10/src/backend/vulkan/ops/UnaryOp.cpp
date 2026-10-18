@@ -82,6 +82,7 @@ Tensor unary_op(
                 : api::GPUMemoryLayout::TENSOR_CHANNELS_PACKED};
 
   if (is_buffer) {
+    validate_buffer_elementwise_dtype(v_self, buffer_shader_name);
     const struct BlockB final {
       uint32_t buf_length;
     } blockb{
