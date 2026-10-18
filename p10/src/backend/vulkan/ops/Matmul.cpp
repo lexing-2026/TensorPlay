@@ -7,6 +7,8 @@
 #include "Tensor.h"
 #include "../impl/Packing.h"
 
+#include <Utils.h>
+
 #include <algorithm>
 #include <functional>
 
@@ -1318,6 +1320,210 @@ Tensor addmm_kernel(
   return mm_impl(mat1, mat2, bias_vulkan, beta, alpha);
 }
 
+/*
+ * Whether a batched result has an image form.  One 3-D image in the
+ * channel-packed layout carries four batches along its depth, and the device
+ * caps every image axis; a product past the cap on its rows, its columns or
+ * its batch depth has no texture to write into.
+ */
+bool batched_result_fits_image(
+    api::Context* const context,
+    int64_t batches,
+    int64_t M,
+    int64_t N) {
+  const uint32_t limit =
+      context->adapter_ptr()->properties().limits.maxImageDimension3D;
+  return api::utils::safe_downcast_to_u32(N) <= limit &&
+      api::utils::safe_downcast_to_u32(M) <= limit &&
+      api::utils::div_up(
+          api::utils::safe_downcast_to_u32(batches), 4u) <= limit;
+}
+
+/*
+ * Batched products with no image form.  A batched product whose result rows,
+ * result columns or batch planes run past the device's image limit has no
+ * texture to write, and a long context grows all three axes at once.  One
+ * dispatch still covers every matrix: the staged tiled kernel takes the batch
+ * count on its z axis and reaches the next matrix through an element stride,
+ * so nothing is restaged between batches.
+ *
+ * An operand keeps whichever form it already has.  One that stayed an image is
+ * packed into per-batch planes by the same cached pass the batched texture
+ * kernel uses; one that lost its image form is streamed out of its own linear
+ * payload, since relaying it through an image would cost as much again as the
+ * product.  Both cases meet in the kernel's two addressing modes.
+ */
+constexpr int64_t kLinearIndexLimit = 2147483647;
+
+Tensor bmm_buffer_tiled(
+    const api::vTensor& v_lhs,
+    const api::vTensor& v_rhs,
+    int64_t batches,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    DType dtype) {
+  api::Context* const context = api::context();
+
+  TP_CHECK(
+      dtype == DType::Float32 || dtype == DType::Float16,
+      "Vulkan batched products over linear storage support Float32 and "
+      "Float16 only");
+  TP_CHECK(
+      v_lhs.dtype() == dtype && v_rhs.dtype() == dtype,
+      "Vulkan batched products over linear storage need operands of the "
+      "result dtype");
+
+  const bool a_packed = v_lhs.storage_type() != api::StorageType::BUFFER;
+  const bool b_packed = v_rhs.storage_type() != api::StorageType::BUFFER;
+  // Two image operands are the batched texture kernel's own case; reaching
+  // here means at least one payload has no image form.
+  TP_CHECK(
+      !(a_packed && b_packed),
+      "Vulkan batched products over linear storage need a linear operand");
+
+  // Every address in the kernel is a 32-bit element index, and the batch
+  // strides multiply what a single matrix already spans.
+  TP_CHECK(
+      batches * M * K <= kLinearIndexLimit &&
+          batches * K * N <= kLinearIndexLimit &&
+          batches * M * N <= kLinearIndexLimit,
+      "Vulkan batched products over linear storage exceed the element index "
+      "range a 32-bit offset can reach");
+
+  api::vTensor v_output{
+      context,
+      {batches, M, N},
+      dtype,
+      api::StorageType::BUFFER,
+      api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+
+  // A thread owns four consecutive columns of each result row, and a word of a
+  // half payload holds one such pair, so a matrix must start on an even
+  // element: the host refuses an odd width rather than letting two matrices
+  // claim one word.
+  TP_CHECK(
+      !(dtype == DType::Float16 && N % 2 != 0),
+      "Vulkan batched products over linear storage need an even result width "
+      "for a half linear output");
+
+  // A linear payload is dense in the operand's own logical order, so its
+  // extents are its strides.  A single matrix serving every batch steps by
+  // nothing, so each z lane reads the same planes.
+  const int64_t a_matrices = v_lhs.sizes().front();
+  const int64_t b_matrices = v_rhs.sizes().front();
+  const int32_t a_stride_b =
+      (a_matrices == 1 && batches > 1)
+          ? 0
+          : static_cast<int32_t>(M * K);
+  const int32_t b_stride_b =
+      (b_matrices == 1 && batches > 1)
+          ? 0
+          : static_cast<int32_t>(K * N);
+
+  const struct BmmBufferTiledBlock final {
+    ivec4 out_sizes; // (W=N, H=M, C=B, N=1) logical product sizes
+    int k_elements; // length of the reduction axis
+    int k_blocks; // reduction tiles to walk
+    int a_stride_m; // element step to the next left row
+    int a_stride_k; // element step to the next left column
+    int a_stride_b; // element step to the next left matrix
+    int b_stride_n; // element step to the next right column
+    int b_stride_k; // element step to the next right row
+    int b_stride_b; // element step to the next right matrix
+    int out_stride_b; // element step to the next result matrix
+  } block{
+      api::utils::make_whcn_ivec4({batches, M, N}),
+      static_cast<int32_t>(K),
+      static_cast<int32_t>(
+          api::utils::div_up(
+              api::utils::safe_downcast_to_u32(K),
+              static_cast<uint32_t>(kMmBufferTile))),
+      static_cast<int32_t>(K),
+      1,
+      a_stride_b,
+      1,
+      static_cast<int32_t>(N),
+      b_stride_b,
+      static_cast<int32_t>(M * N),
+  };
+
+  std::string shader = "bmm_buffer_tiled";
+  if (a_packed) {
+    shader += "_a";
+  } else if (b_packed) {
+    shader += "_b";
+  }
+  const std::string shader_name = buffer_shader_for_dtype(shader, dtype);
+
+  api::UniformParamsBuffer params(context, block);
+  api::PipelineBarrier barrier{};
+
+  // A workgroup of 8x8 items owns one 32x32 output block of one matrix, and
+  // the z axis walks the matrices.
+  const api::utils::uvec3 grid{
+      api::utils::safe_downcast_to_u32(
+          api::utils::div_up(
+              api::utils::safe_downcast_to_u32(N),
+              static_cast<uint32_t>(kMmBufferTile)) *
+          kMmBufferTileSide),
+      api::utils::safe_downcast_to_u32(
+          api::utils::div_up(
+              api::utils::safe_downcast_to_u32(M),
+              static_cast<uint32_t>(kMmBufferTile)) *
+          kMmBufferTileSide),
+      api::utils::safe_downcast_to_u32(batches),
+  };
+
+  const api::utils::uvec3 local{8u, 8u, 1u};
+
+  if (a_packed) {
+    context->submit_compute_job(
+        VK_KERNEL_FROM_STR(shader_name),
+        barrier,
+        grid,
+        local,
+        VK_NULL_HANDLE,
+        v_output.buffer(
+            barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::WRITE),
+        v_lhs.image(barrier, api::PipelineStage::COMPUTE),
+        v_rhs.buffer(barrier, api::PipelineStage::COMPUTE),
+        params.buffer());
+  } else if (b_packed) {
+    context->submit_compute_job(
+        VK_KERNEL_FROM_STR(shader_name),
+        barrier,
+        grid,
+        local,
+        VK_NULL_HANDLE,
+        v_output.buffer(
+            barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::WRITE),
+        v_lhs.buffer(barrier, api::PipelineStage::COMPUTE),
+        v_rhs.image(barrier, api::PipelineStage::COMPUTE),
+        params.buffer());
+  } else {
+    context->submit_compute_job(
+        VK_KERNEL_FROM_STR(shader_name),
+        barrier,
+        grid,
+        local,
+        VK_NULL_HANDLE,
+        v_output.buffer(
+            barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::WRITE),
+        v_lhs.buffer(barrier, api::PipelineStage::COMPUTE),
+        v_rhs.buffer(barrier, api::PipelineStage::COMPUTE),
+        params.buffer());
+  }
+
+  return convert(v_output);
+}
+
 //
 // Batched product: one dispatch covers the whole batch.  The result keeps
 // the standard channel-packed batched layout (four batches per texel z
@@ -1334,6 +1540,49 @@ Tensor bmm_impl(
 
   api::Context* const context = api::context();
 
+  if (batches == 0 || M == 0 || N == 0 || K == 0) {
+    api::vTensor v_result{
+        context,
+        {batches, M, N},
+        batch1.dtype(),
+        api::StorageType::TEXTURE_3D,
+        api::GPUMemoryLayout::TENSOR_CHANNELS_PACKED,
+    };
+    Tensor out = convert(v_result);
+    if (M != 0 && N != 0) {
+      out.fill_(Scalar(0.0));
+    }
+    return out;
+  }
+
+  api::vTensor v_raw_lhs = convert(batch1);
+  api::vTensor v_raw_rhs = convert(batch2);
+
+  // A result with no image form, or an operand that lost one, runs the batched
+  // staged product over linear storage instead.  Whichever operand kept an
+  // image still goes through the per-batch pack.
+  if (!batched_result_fits_image(context, batches, M, N) ||
+      v_raw_lhs.storage_type() == api::StorageType::BUFFER ||
+      v_raw_rhs.storage_type() == api::StorageType::BUFFER) {
+    api::vTensor lhs =
+        v_raw_lhs.storage_type() == api::StorageType::BUFFER
+        ? v_raw_lhs
+        : packed_cached(
+              batch1, shape_of(batch1),
+              api::GPUMemoryLayout::TENSOR_WIDTH_PACKED,
+              batched_tag(kTagMmWidthPackedBatched, batches),
+              [&] { return bmm_pack_lhs_width(batch1, batches); });
+    api::vTensor rhs =
+        v_raw_rhs.storage_type() == api::StorageType::BUFFER
+        ? v_raw_rhs
+        : packed_cached(
+              batch2, shape_of(batch2),
+              api::GPUMemoryLayout::TENSOR_HEIGHT_PACKED,
+              batched_tag(kTagMmHeightPackedBatched, batches),
+              [&] { return bmm_pack_rhs_height(batch2, batches); });
+    return bmm_buffer_tiled(lhs, rhs, batches, M, N, K, batch1.dtype());
+  }
+
   api::vTensor v_result{
       context,
       {batches, M, N},
@@ -1341,14 +1590,6 @@ Tensor bmm_impl(
       api::StorageType::TEXTURE_3D,
       api::GPUMemoryLayout::TENSOR_CHANNELS_PACKED,
   };
-
-  if (M == 0 || N == 0 || K == 0) {
-    Tensor out = convert(v_result);
-    if (M != 0 && N != 0) {
-      out.fill_(Scalar(0.0));
-    }
-    return out;
-  }
 
   TP_CHECK(
       v_result.storage_type() == api::StorageType::TEXTURE_3D,
@@ -1625,16 +1866,11 @@ Tensor matmul_kernel(const Tensor& self_in, const Tensor& other_in) {
     return out.reshape(out_sizes);
   }
 
-  // Batched on both sides: one tiled dispatch over the batch axis; a
-  // size-1 batch broadcasts inside the pack gather.
-  if (self_ndim >= 3 && other_ndim >= 3) {
-    const int64_t self_b = self_in.size(0);
-    const int64_t other_b = other_in.size(0);
-    TP_CHECK(
-        self_b == other_b || self_b == 1 || other_b == 1,
-        "Vulkan matmul: batch dimensions are not broadcastable");
-    const int64_t batches = std::max(self_b, other_b);
-
+  // Batched on at least one side: the leading axes broadcast to one result
+  // batch shape, fold into a single batch axis, and the product runs as one
+  // batched dispatch.  A lone matrix broadcasts across the other operand's
+  // batches.
+  if (other_ndim >= 3) {
     const int64_t M = self_in.size(self_ndim - 2);
     const int64_t K = self_in.size(self_ndim - 1);
     const int64_t N = other_in.size(other_ndim - 1);
@@ -1642,23 +1878,54 @@ Tensor matmul_kernel(const Tensor& self_in, const Tensor& other_in) {
         K == other_in.size(other_ndim - 2),
         "Vulkan matmul: matrix dimensions do not match");
 
-    // Higher-rank operands fold their leading axes into the batch axis.
-    Tensor a3 = self_ndim == 3
-        ? self_in
-        : self_in.reshape({self_in.numel() / (M * K), M, K});
-    Tensor b3 = other_ndim == 3
-        ? other_in
-        : other_in.reshape({other_in.numel() / (K * N), K, N});
+    const std::vector<int64_t> self_sizes = shape_of(self_in);
+    const std::vector<int64_t> other_sizes = shape_of(other_in);
+    const std::vector<int64_t> self_batch(
+        self_sizes.begin(), self_sizes.end() - 2);
+    const std::vector<int64_t> other_batch(
+        other_sizes.begin(), other_sizes.end() - 2);
+    const std::vector<int64_t> batch_shape =
+        broadcast_shapes(self_batch, other_batch);
 
-    if (batches == 1) {
-      // A single batch is a plain matrix product.
-      Tensor flat1 = a3.reshape({M, K});
-      Tensor flat2 = b3.reshape({K, N});
-      return mm_kernel(flat1, flat2).reshape(
-          {1, M, N});
+    int64_t batches = 1;
+    for (const int64_t size : batch_shape) {
+      batches *= size;
     }
 
-    return bmm_impl(a3, b3, batches);
+    std::vector<int64_t> out_shape = batch_shape;
+    out_shape.push_back(M);
+    out_shape.push_back(N);
+
+    // An operand already shaped to the result batch axis needs only a view of
+    // the same memory.  A lone matrix keeps its size-1 batch and broadcasts:
+    // through the pack gather for an image, through a zero batch stride for a
+    // linear payload.  Anything else materializes the broadcast.
+    auto fold = [&](const Tensor& tensor,
+                    const std::vector<int64_t>& tensor_batch,
+                    int64_t rows,
+                    int64_t cols) {
+      if (tensor_batch == batch_shape) {
+        return tensor.reshape({batches, rows, cols});
+      }
+      if (tensor.dim() == 3 && tensor.size(0) == 1) {
+        return tensor;
+      }
+      std::vector<int64_t> expanded = batch_shape;
+      expanded.push_back(rows);
+      expanded.push_back(cols);
+      return expand_kernel(tensor, expanded, false)
+          .contiguous()
+          .reshape({batches, rows, cols});
+    };
+
+    Tensor a3 = fold(self_in, self_batch, M, K);
+    Tensor b3 = fold(other_in, other_batch, K, N);
+
+    Tensor product = batches == 1
+        ? mm_kernel(a3.reshape({M, K}), b3.reshape({K, N}))
+        : bmm_impl(a3, b3, batches);
+
+    return product.reshape(out_shape);
   }
 
   TP_THROW(

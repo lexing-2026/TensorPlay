@@ -679,6 +679,34 @@ mm_buffer_tiled_half:
     A_BUFFER: 1
     OUTPUT_BUFFER: 1
     HAS_BIAS: 1
+bmm_buffer_tiled:
+  parameter_names_with_default_values:
+    A_PACKED: 0
+    B_PACKED: 0
+  shader_variants:
+  - NAME: bmm_buffer_tiled
+    A_PACKED: 0
+    B_PACKED: 0
+  - NAME: bmm_buffer_tiled_a
+    A_PACKED: 1
+    B_PACKED: 0
+  - NAME: bmm_buffer_tiled_b
+    A_PACKED: 0
+    B_PACKED: 1
+bmm_buffer_tiled_half:
+  parameter_names_with_default_values:
+    A_PACKED: 0
+    B_PACKED: 0
+  shader_variants:
+  - NAME: bmm_buffer_tiled_half
+    A_PACKED: 0
+    B_PACKED: 0
+  - NAME: bmm_buffer_tiled_a_half
+    A_PACKED: 1
+    B_PACKED: 0
+  - NAME: bmm_buffer_tiled_b_half
+    A_PACKED: 0
+    B_PACKED: 1
 bmm:
   parameter_names_with_default_values: {}
   generate_variant_forall:
