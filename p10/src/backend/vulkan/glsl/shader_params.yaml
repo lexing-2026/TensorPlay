@@ -740,6 +740,16 @@ rms_norm:
       SUFFIX: _f16
   shader_variants:
   - NAME: rms_norm
+rms_norm_buffer:
+  parameter_names_with_default_values:
+    WEIGHT_MODE: 0
+  shader_variants:
+  - NAME: rms_norm_buffer
+    WEIGHT_MODE: 0
+  - NAME: rms_norm_buffer_w
+    WEIGHT_MODE: 1
+  - NAME: rms_norm_buffer_w_tex
+    WEIGHT_MODE: 2
 batchnorm:
   parameter_names_with_default_values:
     HAS_WEIGHT: true

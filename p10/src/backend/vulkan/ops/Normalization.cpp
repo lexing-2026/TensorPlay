@@ -17,6 +17,10 @@ namespace ops {
 template <typename Return, typename... Args>
 Return dispatch_vk(const char* op, Args... args);
 
+// The smallest maxComputeWorkGroupCount any conformant device must report per
+// dispatch axis.
+constexpr int64_t kLinearDispatchAxisLimit = 65535;
+
 namespace {
 
 //
@@ -419,10 +423,6 @@ Tensor rms_norm_fused(
       v_input.sizes(),
       v_input.dtype(),
   };
-  if (v_output.storage_type() == api::StorageType::BUFFER) {
-    TP_THROW(
-        NotImplementedError, "Vulkan rms_norm requires texture storage");
-  }
 
   const bool has_weight = weight_opt.has_value();
   const std::string name = std::string("rms_norm") +
@@ -482,6 +482,129 @@ Tensor rms_norm_fused(
   return convert(v_output);
 }
 
+//
+// The same normalization over linear storage.  A payload longer than the image
+// axis limit has no texel row to scan, and the composite of square, mean, add,
+// rsqrt and two multiplies moves the row through memory five times.  One
+// workgroup of 256 invocations owns one row instead: it strides the row once to
+// fold the squares, tree-reduces them through about 1 KB of shared memory, and
+// scales the values it still holds in registers.  The row index sits on the
+// workgroup axes and spills to the third one, because the row count is not
+// bounded by a single dispatch axis.
+Tensor rms_norm_buffer(
+    const Tensor& input_arg,
+    const api::vTensor& v_input,
+    int64_t span,
+    const std::optional<Tensor>& weight_opt,
+    double eps) {
+  TP_CHECK(
+      input_arg.dtype() == DType::Float32,
+      "Vulkan rms_norm over linear storage supports Float32 only");
+  TP_CHECK(
+      span > 0 && input_arg.numel() % span == 0,
+      "Vulkan rms_norm over linear storage needs a normalized axis that tiles "
+      "the payload");
+
+  const int64_t rows = input_arg.numel() / span;
+  const int64_t rows_axis =
+      rows < kLinearDispatchAxisLimit ? rows : kLinearDispatchAxisLimit;
+  const uint32_t rows_pages = api::utils::div_up(
+      api::utils::safe_downcast_to_u32(rows),
+      static_cast<uint32_t>(rows_axis));
+  TP_CHECK(
+      static_cast<int64_t>(rows_pages) <= kLinearDispatchAxisLimit,
+      "Vulkan rms_norm over linear storage needs the row count within the two "
+      "dispatch axes");
+
+  api::Context* const context = api::context();
+  api::vTensor v_output{context, v_input.sizes(), v_input.dtype()};
+
+  std::optional<api::vTensor> v_weight;
+  bool weight_linear = false;
+  if (weight_opt.has_value()) {
+    v_weight = convert(*weight_opt);
+    weight_linear = v_weight->storage_type() == api::StorageType::BUFFER;
+    TP_CHECK(
+        !weight_linear || v_weight->dtype() == DType::Float32,
+        "Vulkan rms_norm over linear storage needs a Float32 weight read as a "
+        "flat array");
+  }
+
+  const struct RmsNormBufferBlock final {
+    int32_t span; // elements of the normalized trailing axis
+    int32_t rows; // rows to normalize
+    int32_t rows_axis; // rows named by the second axis before the third takes over
+    float inv_span; // 1 / span
+    float eps;
+    int32_t pad0;
+    int32_t pad1;
+    int32_t pad2;
+  } block{
+      static_cast<int32_t>(span),
+      static_cast<int32_t>(rows),
+      static_cast<int32_t>(rows_axis),
+      static_cast<float>(1.0 / static_cast<double>(span)),
+      static_cast<float>(eps),
+      0,
+      0,
+      0};
+
+  const api::utils::uvec3 grid{
+      1u,
+      api::utils::safe_downcast_to_u32(rows_axis),
+      rows_pages,
+  };
+  const api::utils::uvec3 local{256u, 1u, 1u};
+
+  api::UniformParamsBuffer params(context, block);
+  api::PipelineBarrier pipeline_barrier{};
+
+  if (!v_weight.has_value()) {
+    context->submit_compute_job(
+        VK_KERNEL_FROM_STR("rms_norm_buffer"),
+        pipeline_barrier,
+        grid,
+        local,
+        VK_NULL_HANDLE,
+        v_output.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::WRITE),
+        v_input.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+        params.buffer());
+  } else if (weight_linear) {
+    context->submit_compute_job(
+        VK_KERNEL_FROM_STR("rms_norm_buffer_w"),
+        pipeline_barrier,
+        grid,
+        local,
+        VK_NULL_HANDLE,
+        v_output.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::WRITE),
+        v_input.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+        params.buffer(),
+        v_weight->buffer(pipeline_barrier, api::PipelineStage::COMPUTE));
+  } else {
+    context->submit_compute_job(
+        VK_KERNEL_FROM_STR("rms_norm_buffer_w_tex"),
+        pipeline_barrier,
+        grid,
+        local,
+        VK_NULL_HANDLE,
+        v_output.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::WRITE),
+        v_input.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+        params.buffer(),
+        v_weight->image(pipeline_barrier, api::PipelineStage::COMPUTE));
+  }
+
+  return convert(v_output);
+}
+
 } // namespace
 
 Tensor rms_norm_kernel(
@@ -497,20 +620,25 @@ Tensor rms_norm_kernel(
   const int64_t norm_ndim = static_cast<int64_t>(normalized_shape.size());
   const int64_t ndim = input.dim();
 
-  // Fused single-dispatch path covers only texture-backed inputs: the
-  // shader scans a texel row, which buffer storage does not provide.
-  // Buffer-stored payloads fall through to the composite path, whose
-  // elementwise ops (mul, mean, scalar add, rsqrt) all have linear
-  // variants.
+  // The fused single-dispatch paths cover a normalized shape that is exactly
+  // the trailing axis with an optional rank-1 weight.  Over texture storage the
+  // shader scans a texel row, so it keeps the packed-layout rank bound; over
+  // linear storage a row is simply a stride-spanning block of the flat payload,
+  // so any rank works.  Everything else (several normalized axes, a
+  // higher-rank weight) falls through to the composite, whose elementwise ops
+  // (mul, mean, scalar add, rsqrt) all have linear variants.
   api::vTensor v_input = convert(input);
-  const bool fused_ok =
-      v_input.storage_type() != api::StorageType::BUFFER &&
-      norm_ndim == 1 && ndim >= 1 && ndim <= 4 &&
+  const bool fused_shape =
+      norm_ndim == 1 && ndim >= 1 &&
       normalized_shape[0] == input.size(ndim - 1) &&
       (!weight_opt.has_value() ||
        (weight_opt->dim() == 1 &&
         weight_opt->numel() == normalized_shape[0]));
-  if (fused_ok) {
+  if (fused_shape && v_input.storage_type() == api::StorageType::BUFFER) {
+    return rms_norm_buffer(
+        input, v_input, normalized_shape[0], weight_opt, eps);
+  }
+  if (fused_shape && ndim <= 4) {
     return rms_norm_fused(input, normalized_shape[0], weight_opt, eps);
   }
 
@@ -562,9 +690,6 @@ Tensor silu_and_mul_kernel(const Tensor& input) {
   Tensor gate_silu = dispatch_vk<Tensor>("silu", gate);
   return dispatch_vk<Tensor>("mul.Tensor", gate_silu, up);
 }
-
-// Vulkan guarantees at least this many workgroups along every dispatch axis.
-constexpr int64_t kLinearDispatchAxisLimit = 65535;
 
 //
 // Rotary embedding over linear storage.  A sequence longer than the device's

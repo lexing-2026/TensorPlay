@@ -1251,6 +1251,42 @@ class TestVulkanLinearPayload(unittest.TestCase):
                 rtol=1e-3, atol=1e-3,
                 err_msg=f"tiled linear m={m} k={k} n={n}")
 
+    def test_rms_norm_over_linear_payload(self):
+        import tensorplay as tp
+        import tensorplay.nn.functional as F
+        # A row or a batch axis past the image axis limit has no texture form, so
+        # the normalization consumes the row-major payload directly.  One
+        # workgroup reduces one row through shared memory, which is why the row
+        # count, not the lane count, is what a single dispatch axis has to
+        # cover: the last case needs more rows than one axis holds.  The weight
+        # keeps its own storage, so both the short image-stored vector and the
+        # wide linear one appear here.
+        tensorplay.manual_seed(71)
+        for shape, span, with_weight in (
+                ((20000, 512), 512, True),
+                ((20000, 512), 512, False),
+                ((3, 17000), 17000, True),
+                ((40000, 2), 2, False),
+                ((2, 3, 9000, 128), 128, True),
+                ((70000, 128), 128, True)):
+            x_cpu = (tp.randn(shape, device="cpu") * 0.7).numpy()
+            w_cpu = ((tp.randn((span,), device="cpu") + 1.0) * 0.5).numpy() \
+                if with_weight else None
+            x = tensorplay.from_numpy(x_cpu.copy()).to("vulkan")
+            w = tensorplay.from_numpy(w_cpu.copy()).to("vulkan") if with_weight \
+                else None
+            got = F.rms_norm(x, [span], w, 1.0e-5)
+            self.assertTrue(got.device.is_vulkan())
+            xf = x_cpu.astype(np.float64)
+            want = xf / np.sqrt((xf ** 2).mean(-1, keepdims=True) + 1.0e-5)
+            if with_weight:
+                want = want * w_cpu.astype(np.float64)
+            np.testing.assert_allclose(
+                got.cpu().numpy().astype(np.float64), want,
+                rtol=1e-5, atol=1e-5,
+                err_msg=f"rms_norm over linear payload at shape {shape} "
+                        f"span {span} weight {with_weight}")
+
 
 if __name__ == "__main__":
     unittest.main()
