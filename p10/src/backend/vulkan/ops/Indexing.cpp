@@ -250,6 +250,55 @@ Tensor& index_copy_rows_inplace(Tensor& self, int64_t dim, const Tensor& index, 
   api::vTensor v_source = convert(source);
   api::vTensor v_indices = upload_index_payload(idx_host);
 
+  // Linear payloads (shapes beyond the 3-D image axis limit) scatter through
+  // a buffer-to-buffer variant: the index payload is copied to a dense
+  // Int32 buffer and each invocation copies four feature lanes from a source
+  // row into the indexed destination row, walking the N*C planes.
+  if (v_self.storage_type() == api::StorageType::BUFFER) {
+    api::vTensor v_indices_buf =
+        to_buffer_storage_dispatch(context, v_indices);
+    // The source payload may still fit texture storage when the scatter is
+    // small; bring it to a dense buffer so every linear-path argument has
+    // memory attached (an empty buffer binding would silently skip the job).
+    api::vTensor v_source_buf =
+        to_buffer_storage_dispatch(context, v_source);
+    const int64_t planes = self.size(0) * self.size(1);
+    const int64_t width = self.size(3);
+    const uint32_t nf4 = static_cast<uint32_t>((width + 3) / 4);
+    const uint32_t n = nf4 * static_cast<uint32_t>(planes) *
+        static_cast<uint32_t>(n_idx);
+    const struct IndexCopyBufferBlock {
+      int32_t planes;
+      int32_t n_idx;
+      int32_t width;
+      int32_t rows;
+    } block{
+        static_cast<int32_t>(planes),
+        static_cast<int32_t>(n_idx),
+        static_cast<int32_t>(width),
+        static_cast<int32_t>(rows),
+    };
+    api::UniformParamsBuffer params(context, block);
+    api::PipelineBarrier pipeline_barrier{};
+    context->submit_compute_job(
+        VK_KERNEL_FROM_STR("index_copy_buffer"), pipeline_barrier,
+        {n, 1u, 1u}, {256u, 1u, 1u}, VK_NULL_HANDLE,
+        v_self.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::WRITE),
+        v_source_buf.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::READ),
+        v_indices_buf.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::READ),
+        params.buffer());
+    return self;
+  }
+
   const struct IndexCopyBlock final {
     ivec4 extents; // (texel width, destination rows, texel planes, unused)
     int n_idx;
