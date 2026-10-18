@@ -302,8 +302,6 @@ void upload_staging_to_buffer(
 void copy_staging_to_vtensor(
     api::StorageBuffer& staging,
     api::vTensor& v_dst) {
-  api::Context* const context = api::context();
-
   if (v_dst.storage_type() == api::StorageType::BUFFER) {
     upload_staging_to_buffer(staging.buffer(), v_dst, staging.nbytes());
   } else {
