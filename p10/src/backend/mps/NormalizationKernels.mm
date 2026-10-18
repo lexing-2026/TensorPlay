@@ -239,7 +239,7 @@ std::tuple<Tensor, Tensor, Tensor> native_layer_norm_kernel(
     }
 
     getCurrentMPSStream()->executeMPSGraph(graph, feeds, results,
-                                          SyncType::COMMIT_AND_WAIT);
+                                          SyncType::COMMIT_ADAPTIVE);
   }
   return std::make_tuple(out, mean, rstd);
 }
@@ -608,7 +608,7 @@ Tensor group_norm_kernel(const Tensor& input, int64_t num_groups,
     }
 
     getCurrentMPSStream()->executeMPSGraph(graph, feeds, results,
-                                          SyncType::COMMIT_AND_WAIT);
+                                          SyncType::COMMIT_ADAPTIVE);
   }
   return output;
 }

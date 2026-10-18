@@ -141,7 +141,7 @@ Tensor repeat_kernel(const Tensor& self, const std::vector<int64_t>& repeats) {
     NSDictionary* feeds = @{xt : inData};
     NSDictionary* results = @{tiled : outData};
     getCurrentMPSStream()->executeMPSGraph(graph, feeds, results,
-                                          SyncType::COMMIT_AND_WAIT);
+                                          SyncType::COMMIT_ADAPTIVE);
   }
   return output;
 }

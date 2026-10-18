@@ -153,7 +153,7 @@ Tensor avg_pool2d_kernel(const Tensor& input,
     NSDictionary* feeds = @{xt : inData};
     NSDictionary* results = @{result : outData};
     getCurrentMPSStream()->executeMPSGraph(graph, feeds, results,
-                                          SyncType::COMMIT_AND_WAIT);
+                                          SyncType::COMMIT_ADAPTIVE);
   }
   return batched ? output : output.squeeze(0);
 }
@@ -238,7 +238,7 @@ std::tuple<Tensor, Tensor> max_pool2d_with_indices_kernel(
     NSDictionary* feeds = @{xt : inData};
     NSDictionary* results = @{poolOutputs[0] : valData, idx64 : idxData};
     getCurrentMPSStream()->executeMPSGraph(graph, feeds, results,
-                                          SyncType::COMMIT_AND_WAIT);
+                                          SyncType::COMMIT_ADAPTIVE);
   }
   return batched ? std::make_tuple(values, indices)
                  : std::make_tuple(values.squeeze(0), indices.squeeze(0));
