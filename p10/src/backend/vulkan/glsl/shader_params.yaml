@@ -1108,6 +1108,13 @@ buffer_activation_param:
 buffer_gelu:
   parameter_names_with_default_values:
     GELU_TANH: false
+    INPLACE: false
+  generate_variant_forall:
+    INPLACE:
+    - VALUE: false
+      SUFFIX: ''
+    - VALUE: true
+      SUFFIX: inplace
   shader_variants:
   - NAME: buffer_gelu
     GELU_TANH: false

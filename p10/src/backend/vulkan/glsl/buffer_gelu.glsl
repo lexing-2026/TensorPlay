@@ -2,6 +2,7 @@
 // clang-format off
 #define PRECISION ${PRECISION}
 #define FORMAT ${FORMAT}
+#define INPLACE ${INPLACE}
 
 #define GELU_TANH ${GELU_TANH}
 // clang-format on
@@ -10,18 +11,32 @@ layout(std430) buffer;
 
 #include "math_ext.h"
 
-layout(set = 0, binding = 0) buffer PRECISION restrict writeonly OutBuffer {
-  float data[];
-}
-uOutput;
-layout(set = 0, binding = 1) buffer PRECISION restrict readonly InBuffer {
-  float data[];
-}
-uInput;
-layout(set = 0, binding = 2) uniform PRECISION Block {
-  uint buf_length;
-}
-uBlock;
+// clang-format off
+$if not INPLACE:
+  layout(set = 0, binding = 0) buffer PRECISION restrict writeonly OutBuffer {
+    float data[];
+  }
+  uOutput;
+  layout(set = 0, binding = 1) buffer PRECISION restrict readonly InBuffer {
+    float data[];
+  }
+  uInput;
+  layout(set = 0, binding = 2) uniform PRECISION Block {
+    uint buf_length;
+  }
+  uBlock;
+$else:
+  layout(set = 0, binding = 0) buffer PRECISION OutBuffer {
+    float data[];
+  }
+  uOutput;
+  // Numbered per variant; the params block takes the first free binding
+  // because this variant rewrites its operand instead of reading a second one.
+  layout(set = 0, binding = 1) uniform PRECISION Block {
+    uint buf_length;
+  }
+  uBlock;
+// clang-format on
 
 layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
 
@@ -37,7 +52,12 @@ void main() {
     return;
   }
 
-  const float x = uInput.data[idx];
+  // clang-format off
+  $if not INPLACE:
+    const float x = uInput.data[idx];
+  $else:
+    const float x = uOutput.data[idx];
+  // clang-format on
 
   // clang-format off
   $if GELU_TANH:

@@ -868,6 +868,21 @@ class TestVulkanLinearPayload(unittest.TestCase):
             np.testing.assert_allclose(
                 got, want, rtol=1e-4, atol=1e-4, err_msg=f"{name} left the payload untouched or wrong")
 
+    def test_gelu_inplace_over_linear_payload(self):
+        from math import erf, sqrt
+        import tensorplay as tp
+        import tensorplay.functional as F
+        tensorplay.manual_seed(19)
+        x_cpu = (tp.randn((self.WIDTH,), device="cpu") * 3.0).numpy()
+        # The default form is the exact one: 0.5 * x * (1 + erf(x / sqrt(2))).
+        want = 0.5 * x_cpu * (
+            1.0 + np.vectorize(erf)(x_cpu / sqrt(2.0))).astype(np.float32)
+        y = tensorplay.from_numpy(x_cpu.copy()).to("vulkan")
+        out = F.gelu_(y)
+        self.assertIs(out, y)
+        np.testing.assert_allclose(
+            out.cpu().numpy(), want, rtol=1e-4, atol=1e-4)
+
     def test_factory_fill_over_linear_payload(self):
         import tensorplay as tp
         # A payload too wide for image storage is cleared and offset by the
