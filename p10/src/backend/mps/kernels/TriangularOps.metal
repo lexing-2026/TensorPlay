@@ -64,6 +64,61 @@ kernel void triul(
   out[out_offs] = inp[inp_offs];
 }
 
+// The dense two-dimensional form: one thread covers four consecutive columns of
+// one row, so an access is one 16-byte vector instead of one element. A vector
+// entirely on the masked side is written without reading the operand, and one
+// entirely on the kept side is copied whole, which leaves the per-element path
+// only the vector that straddles the diagonal.
+template <bool upper>
+kernel void triul_dense_vec4(device float4* out [[buffer(0)]],
+                             constant float4* src [[buffer(1)]],
+                             constant uint& nvec [[buffer(2)]],
+                             constant int& k [[buffer(3)]],
+                             uint2 pos [[thread_position_in_grid]]) {
+  const int first = static_cast<int>(pos.x * 4) -
+                    static_cast<int>(pos.y) - k;
+  const uint index = pos.y * nvec + pos.x;
+  const float4 zero = float4(0.0f);
+  if (upper) {
+    if (first >= 0) {
+      out[index] = src[index];
+      return;
+    }
+    if (first + 3 < 0) {
+      out[index] = zero;
+      return;
+    }
+    const float4 value = src[index];
+    out[index] = float4(first >= 0 ? value.x : 0.0f,
+                        first + 1 >= 0 ? value.y : 0.0f,
+                        first + 2 >= 0 ? value.z : 0.0f,
+                        first + 3 >= 0 ? value.w : 0.0f);
+    return;
+  }
+  if (first + 3 <= 0) {
+    out[index] = src[index];
+    return;
+  }
+  if (first > 0) {
+    out[index] = zero;
+    return;
+  }
+  const float4 value = src[index];
+  out[index] = float4(first <= 0 ? value.x : 0.0f,
+                      first + 1 <= 0 ? value.y : 0.0f,
+                      first + 2 <= 0 ? value.z : 0.0f,
+                      first + 3 <= 0 ? value.w : 0.0f);
+}
+
+#define INSTANTIATE_TRIUL_VEC(DTYPE, HOST_NAME, UPPER)                     \
+  template [[host_name(#HOST_NAME "_dense_vec4_" #DTYPE)]] kernel void    \
+  triul_dense_vec4<UPPER>(device float4 * out, constant float4 * src,     \
+                          constant uint & nvec, constant int & k,         \
+                          uint2 pos [[thread_position_in_grid]])
+
+INSTANTIATE_TRIUL_VEC(float, triu, true);
+INSTANTIATE_TRIUL_VEC(float, tril, false);
+
 #define INSTANTIATE_TRIUL_KERNELS(DTYPE, IDX_TYPE)                         \
   template [[host_name("triu_inplace_" #IDX_TYPE "_" #DTYPE)]] kernel void \
   triul_inplace<DTYPE, IDX_TYPE, true>(                                    \

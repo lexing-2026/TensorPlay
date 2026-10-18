@@ -36,6 +36,29 @@ void triu_tril_impl(const Tensor& self, int64_t k, const Tensor& out,
   if (self.numel() == 0) {
     return;
   }
+  // A dense float matrix whose row length is a multiple of four moves one
+  // float4 per thread: the mask boundary is fixed, so a vector entirely on one
+  // side of it needs no per-element test. The strided kernel below remains the
+  // path for every other layout or dtype.
+  if (!inplace && self.dim() == 2 && self.dtype() == DType::Float32 &&
+      out.dtype() == DType::Float32 && self.is_contiguous() &&
+      out.is_contiguous() && self.storage_offset() == 0 &&
+      out.storage_offset() == 0 && self.size(1) % 4 == 0) {
+    const uint32_t nvec = static_cast<uint32_t>(self.size(1) / 4);
+    const NSUInteger rows = static_cast<NSUInteger>(self.size(0));
+    const int diagonal = static_cast<int>(k);
+    auto vec_pso = lib.getPipelineStateForFunc(name + "_dense_vec4_float");
+    MPSStream* vec_stream = getCurrentMPSStream();
+    dispatch_sync_with_rethrow(vec_stream->queue(), ^() {
+      @autoreleasepool {
+        auto compute_encoder = vec_stream->commandEncoder();
+        [compute_encoder setComputePipelineState:vec_pso];
+        mtl_setArgs(compute_encoder, out, self, nvec, diagonal);
+        mtl_dispatch3DJob(compute_encoder, vec_pso, nvec, rows, 1);
+      }
+    });
+    return;
+  }
   // The shader walks storage with explicit strides; bind contiguous tensors
   // so the (reversed) stride array describes the actual buffer exactly.
   const Tensor self_c = self.contiguous();
