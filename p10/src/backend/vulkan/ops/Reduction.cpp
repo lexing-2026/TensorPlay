@@ -646,13 +646,21 @@ Tensor arg_one_axis(
     api::PipelineBarrier pipeline_barrier{};
     // The winning position is an integer, so the output keeps a 32-bit element
     // per row and only the payload is read as half lanes.
+    const bool is_half = input.dtype() == DType::Float16;
     const std::string buffer_shader =
         std::string(greater ? "reduce_argmax_buffer" : "reduce_argmin_buffer") +
-        (input.dtype() == DType::Float16 ? "_half" : "");
+        (is_half ? "_half" : "");
+    // A half payload keeps one invocation per row along the x axis; the float
+    // builds are workgroup-cooperative, so the row rides on the y axis and x
+    // carries the 256 lanes that stride along it.
+    api::utils::uvec3 dispatch_grid{static_cast<uint32_t>(rows), 1u, 1u};
+    if (!is_half) {
+      dispatch_grid = api::utils::uvec3{1u, static_cast<uint32_t>(rows), 1u};
+    }
     context->submit_compute_job(
         VK_KERNEL_FROM_STR(buffer_shader.c_str()),
         pipeline_barrier,
-        {static_cast<uint32_t>(rows), 1u, 1u},
+        dispatch_grid,
         {256u, 1u, 1u}, VK_NULL_HANDLE,
         v_output.buffer(
             pipeline_barrier,

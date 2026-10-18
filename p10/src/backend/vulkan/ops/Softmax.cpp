@@ -69,13 +69,19 @@ Tensor softmax_impl(
         (is_half ? "_half" : "");
     const int64_t grid =
         is_half ? (input_arg.numel() + 1) / 2 : rows;
+    // A half payload dispatches one invocation per output word along the x
+    // axis; the float builds are workgroup-cooperative, so the row rides on
+    // the y axis and x carries the 256 lanes that stride along it.
+    api::utils::uvec3 dispatch_grid{static_cast<uint32_t>(grid), 1u, 1u};
+    if (!is_half) {
+      dispatch_grid = api::utils::uvec3{1u, static_cast<uint32_t>(grid), 1u};
+    }
     api::UniformParamsBuffer params(context, block);
     api::PipelineBarrier pipeline_barrier{};
     context->submit_compute_job(
         VK_KERNEL_FROM_STR(shader.c_str()),
         pipeline_barrier,
-        {static_cast<uint32_t>(grid), 1u, 1u},
-        {256u, 1u, 1u}, VK_NULL_HANDLE,
+        dispatch_grid, {256u, 1u, 1u}, VK_NULL_HANDLE,
         v_output.buffer(
             pipeline_barrier,
             api::PipelineStage::COMPUTE,
