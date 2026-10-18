@@ -128,17 +128,63 @@ api::vTensor narrow_linear_to_half(
   return dst;
 }
 
+// A Bool plane is an image of signed bytes with one logical channel per texel
+// lane; a buffer payload keeps one byte per element in row-major order.  The
+// two disagree about which four elements share a 32-bit unit, so the repack
+// assembles whole destination words, one per invocation.
+api::vTensor bool_texture_to_buffer(
+    api::Context* context,
+    const api::vTensor& src) {
+  api::vTensor dst{
+      context,
+      src.sizes(),
+      DType::Bool,
+      api::StorageType::BUFFER,
+      api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+  const uint32_t elements = static_cast<uint32_t>(src.numel());
+  const struct BoolToBufferBlock final {
+    ivec4 sizes; // (W, H, C, N)
+    int32_t c_depth;
+    int32_t numel;
+    int32_t fill0;
+    int32_t fill1;
+  } block{
+      make_whcn_ivec4(src.sizes()),
+      static_cast<int32_t>(c_depth_of(src.sizes())),
+      static_cast<int32_t>(elements),
+      0,
+      0};
+  api::UniformParamsBuffer params(context, block);
+  api::PipelineBarrier pipeline_barrier{};
+  context->submit_compute_job(
+      VK_KERNEL_FROM_STR("bool_to_buffer"),
+      pipeline_barrier,
+      {api::utils::div_up(elements, 4u), 1u, 1u},
+      {256u, 1u, 1u},
+      VK_NULL_HANDLE,
+      dst.buffer(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::WRITE),
+      src.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+      params.buffer());
+  return dst;
+}
+
 // Returns a buffer-stored view of a tensor for the linear binary path.
 // Buffer-stored sources are shared as-is; texture-stored sources are copied
 // into a fresh dense buffer through the gather kernel (identity strides), which
 // is how small broadcast operands (e.g. a bias loaded from host memory) can
-// participate in a buffer binary op.  Byte-packed dtypes have no buffer-copy
+// participate in a buffer binary op.  Int8 and UInt8 planes have no buffer-copy
 // shader yet and stay loudly rejected.
 api::vTensor to_buffer_storage(
     api::Context* context,
     const api::vTensor& src) {
   if (src.storage_type() == api::StorageType::BUFFER) {
     return src;
+  }
+  if (src.dtype() == DType::Bool) {
+    return bool_texture_to_buffer(context, src);
   }
   TP_CHECK(
       src.dtype() == DType::Float32 || src.dtype() == DType::Int32 ||
