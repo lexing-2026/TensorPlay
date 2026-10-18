@@ -7,6 +7,7 @@
 #include "Tensor.h"
 #include "../impl/Packing.h"
 
+#include <SizesAndStrides.h>
 #include <Utils.h>
 
 #include <algorithm>
@@ -15,6 +16,14 @@
 namespace tensorplay {
 namespace vulkan {
 namespace ops {
+
+// Defined in View.cpp; materializes a strided view into a dense payload,
+// reading a linear payload through the gather's buffer variant.
+Tensor materialize_view(
+    const Tensor& self,
+    const std::vector<int64_t>& out_sizes,
+    const std::vector<int64_t>& out_strides,
+    int64_t storage_offset);
 
 namespace {
 
@@ -1321,22 +1330,18 @@ Tensor addmm_kernel(
 }
 
 /*
- * Whether a batched result has an image form.  One 3-D image in the
- * channel-packed layout carries four batches along its depth, and the device
- * caps every image axis; a product past the cap on its rows, its columns or
- * its batch depth has no texture to write into.
+ * Whether a pair of operands can fold to the plain 2d product.  That route
+ * relays both operands through images, so an activation whose row axis passes
+ * the device's image limit has no texture to relay into.  The batched kernels
+ * read such a payload straight out of linear memory while the weight keeps its
+ * image, so the product stays batched with its size-1 batch.
  */
-bool batched_result_fits_image(
-    api::Context* const context,
-    int64_t batches,
-    int64_t M,
-    int64_t N) {
-  const uint32_t limit =
-      context->adapter_ptr()->properties().limits.maxImageDimension3D;
-  return api::utils::safe_downcast_to_u32(N) <= limit &&
-      api::utils::safe_downcast_to_u32(M) <= limit &&
-      api::utils::div_up(
-          api::utils::safe_downcast_to_u32(batches), 4u) <= limit;
+bool folds_to_mm(const Tensor& batch1, const Tensor& batch2) {
+  const api::vTensor v_lhs = convert(batch1);
+  const api::vTensor v_rhs = convert(batch2);
+  return !(
+      v_lhs.storage_type() == api::StorageType::BUFFER &&
+      v_rhs.storage_type() == api::StorageType::TEXTURE_3D);
 }
 
 /*
@@ -1354,6 +1359,31 @@ bool batched_result_fits_image(
  * product.  Both cases meet in the kernel's two addressing modes.
  */
 constexpr int64_t kLinearIndexLimit = 2147483647;
+
+/*
+ * A linear product inherits its payload from the route that had to stream its
+ * operands, but storage is otherwise a function of the shape alone: consumers
+ * pick their route by looking at what they were handed, and a texture-only
+ * kernel given a small buffer payload has no linear variant to run.  A result
+ * whose shape still has an image therefore repacks into one on the way out.
+ * The gather reads the 4-byte element types out of linear memory; every other
+ * type stays where the kernel wrote it.
+ */
+Tensor release_product_output(
+    api::Context* const context,
+    api::vTensor& v_product) {
+  Tensor flat = convert(v_product);
+  const std::vector<int64_t> sizes(
+      v_product.sizes().begin(), v_product.sizes().end());
+  if (v_product.storage_type() != api::StorageType::BUFFER ||
+      !image_storage_supported(context, sizes) ||
+      (v_product.dtype() != DType::Float32 &&
+       v_product.dtype() != DType::Int32)) {
+    return flat;
+  }
+  return materialize_view(
+      flat, sizes, SizesAndStrides::compute_contiguous_strides(sizes), 0);
+}
 
 Tensor bmm_buffer_tiled(
     const api::vTensor& v_lhs,
@@ -1521,7 +1551,7 @@ Tensor bmm_buffer_tiled(
         params.buffer());
   }
 
-  return convert(v_output);
+  return release_product_output(context, v_output);
 }
 
 //
@@ -1561,7 +1591,7 @@ Tensor bmm_impl(
   // A result with no image form, or an operand that lost one, runs the batched
   // staged product over linear storage instead.  Whichever operand kept an
   // image still goes through the per-batch pack.
-  if (!batched_result_fits_image(context, batches, M, N) ||
+  if (!image_storage_supported(context, {batches, M, N}) ||
       v_raw_lhs.storage_type() == api::StorageType::BUFFER ||
       v_raw_rhs.storage_type() == api::StorageType::BUFFER) {
     api::vTensor lhs =
@@ -1661,8 +1691,9 @@ Tensor bmm_kernel(const Tensor& batch1, const Tensor& batch2) {
       K == batch2.size(1),
       "Vulkan bmm: matrix dimensions do not match");
 
-  // A single batch is a plain matrix product; fold to the 2d kernel.
-  if (B == 1) {
+  // A single batch is a plain matrix product; fold to the 2d kernel unless an
+  // operand left the 2d route without a texture to relay.
+  if (B == 1 && folds_to_mm(batch1, batch2)) {
     Tensor flat1 = batch1.reshape({M, K});
     Tensor flat2 = batch2.reshape({K, N});
     return mm_kernel(flat1, flat2).reshape({1, M, N});
@@ -1921,7 +1952,8 @@ Tensor matmul_kernel(const Tensor& self_in, const Tensor& other_in) {
     Tensor a3 = fold(self_in, self_batch, M, K);
     Tensor b3 = fold(other_in, other_batch, K, N);
 
-    Tensor product = batches == 1
+    Tensor product =
+        batches == 1 && folds_to_mm(a3, b3)
         ? mm_kernel(a3.reshape({M, K}), b3.reshape({K, N}))
         : bmm_impl(a3, b3, batches);
 

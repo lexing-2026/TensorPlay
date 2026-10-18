@@ -2,6 +2,7 @@
 
 #include "Common.h"
 #include "Convert.h"
+#include "Factory.h"
 #include "Utils.h"
 #include "../api/Context.h"
 #include "../impl/Common.h"
@@ -220,11 +221,52 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
       api::vTensor v_src = convert(src);
 
       if (v_src.dtype() != v_self.dtype()) {
-        TP_CHECK(v_src.storage_type() == api::StorageType::TEXTURE_3D &&
-                     v_self.storage_type() == api::StorageType::TEXTURE_3D,
-                 "Vulkan dtype conversion requires texture storage");
         TP_CHECK(src.shape() == self.shape(),
                  "Vulkan dtype conversion requires equal shapes");
+
+        // A linear payload converts through its own pair of kernels: the half
+        // side keeps two lanes per 32-bit word, so one invocation owns one
+        // word and the two elements it covers.  Mixing an image with a linear
+        // payload has no route here, since neither binding can read the other.
+        const bool linear_source =
+            v_src.storage_type() == api::StorageType::BUFFER;
+        const bool linear_destination =
+            v_self.storage_type() == api::StorageType::BUFFER;
+        if (linear_source || linear_destination) {
+          TP_CHECK(linear_source && linear_destination,
+                   "Vulkan dtype conversion does not mix storage types");
+          const char* buffer_shader = nullptr;
+          if (v_src.dtype() == DType::Float16 &&
+              v_self.dtype() == DType::Float32) {
+            buffer_shader = "cast_float16_float_buffer";
+          } else if (
+              v_src.dtype() == DType::Float32 &&
+              v_self.dtype() == DType::Float16) {
+            buffer_shader = "cast_float_float16_buffer";
+          }
+          TP_CHECK(
+              buffer_shader != nullptr,
+              "Unsupported Vulkan dtype conversion over linear storage");
+          const uint32_t elements = static_cast<uint32_t>(v_self.numel());
+          const struct CastBlock final {
+            uint32_t buf_length;
+            uint32_t fill0;
+            uint32_t fill1;
+            uint32_t fill2;
+          } block{elements, 0u, 0u, 0u};
+          api::UniformParamsBuffer params(context, block);
+          api::PipelineBarrier barrier{};
+          context->submit_compute_job(
+              VK_KERNEL_FROM_STR(buffer_shader), barrier,
+              {(elements + 1u) / 2u, 1u, 1u}, {256u, 1u, 1u}, VK_NULL_HANDLE,
+              v_self.buffer(
+                  barrier, api::PipelineStage::COMPUTE,
+                  api::MemoryAccessType::WRITE),
+              v_src.buffer(barrier, api::PipelineStage::COMPUTE),
+              params.buffer());
+          return self;
+        }
+
         const char* shader = nullptr;
         if (v_src.dtype() == DType::Int32 && v_self.dtype() == DType::Float32) {
           shader = "cast_i32_float";
@@ -308,6 +350,34 @@ void transfer_vulkan_to_cpu_impl(api::vTensor& v_src, Tensor& dst) {
 }
 
 //
+// to.dtype(): a same-device element type conversion.  An unchanged type
+// aliases the input unless a copy was requested; otherwise the payload is
+// allocated in the target type and converted through the copy path, which
+// owns the supported type pairs.  A kernel running on this backend has to go
+// through the operator table for conversions, since the host-side one is a
+// CPU entry point.
+//
+Tensor to_dtype_kernel(
+    const Tensor& self,
+    DType dtype,
+    bool non_blocking,
+    bool copy,
+    std::optional<int64_t> memory_format) {
+  // The device payload is dense in whichever storage it lives in, so the
+  // requested layout has nothing to choose.
+  (void)memory_format;
+  if (self.dtype() == dtype && !copy) {
+    return self;
+  }
+  TP_CHECK(
+      self.device().is_vulkan(),
+      "Vulkan to.dtype expects a Vulkan-resident input");
+  Tensor out = empty_like_kernel(self, dtype, std::nullopt);
+  copy_kernel(out, self, non_blocking);
+  return out;
+}
+
+//
 // Backend registry hooks: availability probe and the copy entry point used
 // by the generic copy path when the Vulkan impl registry is linked without
 // the backend.
@@ -329,6 +399,7 @@ static vulkan::ImplRegistrar g_vulkan_impl(new VulkanImpl());
 
 TENSORPLAY_LIBRARY_IMPL(Vulkan, CopyKernels) {
   m.impl("copy_", &tensorplay::vulkan::ops::copy_kernel);
+  m.impl("to.dtype", &tensorplay::vulkan::ops::to_dtype_kernel);
 }
 
 #endif /* USE_VULKAN */

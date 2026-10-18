@@ -112,6 +112,31 @@ struct Dim4D final {
   static constexpr uint32_t Width = 1u;
 };
 
+//
+// Whether a channel-packed 3-D image exists for these sizes on the current
+// device.  The texel layout carries the two innermost axes as width and
+// height and folds the channel and batch axes into the depth, four channels
+// per texel lane; every axis obeys the device's image limit, so a shape with
+// one long axis has no image at all.  A kernel that wrote its result into a
+// linear payload consults this before releasing the payload, because which
+// storage a shape gets must not depend on which route produced it.
+//
+inline bool image_storage_supported(
+    api::Context* const context,
+    const std::vector<int64_t>& sizes) {
+  if (sizes.empty() || sizes.size() > 4 ||
+      api::utils::multiply_integers(sizes) == 0u) {
+    return false;
+  }
+  const uint32_t limit =
+      context->adapter_ptr()->properties().limits.maxImageDimension3D;
+  const uint32_t width = get_dim<1>(sizes);
+  const uint32_t height = get_dim<2>(sizes);
+  const uint64_t depth = static_cast<uint64_t>(div_up(get_dim<3>(sizes), 4u)) *
+      static_cast<uint64_t>(get_dim<4>(sizes));
+  return width <= limit && height <= limit && depth <= limit;
+}
+
 // Elementwise linear-buffer kernels address whole 4-byte words per lane: a
 // Float32 element fills one word, a Float16 pair shares one.  Byte-packed and
 // Bool payloads have no such shader yet; rejecting them here keeps a missing

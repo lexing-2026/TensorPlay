@@ -7,8 +7,13 @@
 #include "tensorplay/ops/TPXOpsGenerated.h"
 #include "Scalar.h"
 
+#include <algorithm>
+#include <cmath>
+#include <limits>
 #include <optional>
 #include <string>
+#include <tuple>
+#include <utility>
 
 namespace tensorplay {
 namespace vulkan {
@@ -1038,6 +1043,149 @@ int32_t sdpa_mask_mode(
       "Vulkan sdpa: the attention mask is not broadcastable to the query");
 }
 
+// Whether the fused chain can address every payload it needs.  A
+// channel-packed image carries the batch and head axes in its depth and the
+// two sequence axes as its extent, so a sequence past the device's image
+// limit leaves the score matrix with no texture at all.
+bool sdpa_images_fit(
+    api::Context* const context,
+    int64_t batches,
+    int64_t heads,
+    int64_t query_len,
+    int64_t key_len) {
+  const uint32_t limit =
+      context->adapter_ptr()->properties().limits.maxImageDimension3D;
+  return api::utils::safe_downcast_to_u32(key_len) <= limit &&
+      api::utils::safe_downcast_to_u32(query_len) <= limit &&
+      api::utils::safe_downcast_to_u32(
+          static_cast<int64_t>(sdpa_planes(heads, batches))) <= limit;
+}
+
+// Additive causal mask: query row t attends the keys up to t, and a rejected
+// entry carries the value that contributes nothing once the row is
+// normalized.  The two index axes are materialized as grids because a
+// comparison kernel addresses both operands by the same linear position.
+Tensor sdpa_causal_mask(
+    const int64_t query_len,
+    const int64_t key_len,
+    const DType dtype,
+    const Device& device) {
+  Tensor index = tpx::ops::arange(
+      Scalar(0),
+      Scalar(std::max(query_len, key_len)),
+      Scalar(1),
+      DType::Int64,
+      device);
+  Tensor rows = tpx::ops::expand(
+      tpx::ops::view(
+          tpx::ops::narrow(index, 0, 0, query_len), {query_len, 1}),
+      {query_len, key_len},
+      false);
+  Tensor cols = tpx::ops::expand(
+      tpx::ops::view(
+          tpx::ops::narrow(index, 0, 0, key_len), {1, key_len}),
+      {query_len, key_len},
+      false);
+  Tensor reject = full_kernel(
+      {query_len, key_len},
+      Scalar(-std::numeric_limits<double>::infinity()),
+      dtype,
+      device,
+      false);
+  return dispatch_vk<Tensor>(
+      "where.ScalarSelf", tpx::ops::ge(rows, cols), Scalar(0.0), reject);
+}
+
+//
+// Attention for a payload without an image form.  The two products are the
+// batched kernels, which read images and linear payloads alike and settle the
+// leading axes between themselves, and the row reduction walks the score
+// matrix in the storage it was written to.  The math is the fused chain's: the
+// scale splits across both factors of the first product, a row's largest score
+// pivots the exponentials, and a row with nothing left to attend comes back
+// as zeros.
+//
+// Grouped query heads need no repetition here.  The group axis sits directly
+// next to the query-row axis, so reading the head and the row axes as one
+// turns (B, Hq, Sq, D) into (B, Hkv, group * Sq, D): every head of a group
+// shares the key/value planes of its own kv head through the batch axes of a
+// single product.  The result is read back as four axes the same way.  A mask
+// goes through the same merge, after a broadcast onto the full grid when it
+// carries fewer planes than the query.
+//
+Tensor sdpa_composed(
+    const Tensor& query,
+    const Tensor& key,
+    const Tensor& value,
+    const std::optional<Tensor>& mask,
+    double scale,
+    bool enable_gqa) {
+  const DType origin = query.dtype();
+  // A half payload accumulates in single precision, the same tier the rgba16f
+  // builds reach through the hardware format conversion.
+  const bool widened = origin == DType::Float16;
+  const Tensor q = widened ? tpx::ops::to(query, DType::Float32) : query;
+  const Tensor k = widened ? tpx::ops::to(key, DType::Float32) : key;
+  const Tensor v = widened ? tpx::ops::to(value, DType::Float32) : value;
+
+  const int64_t batches = q.size(0);
+  const int64_t hq = q.size(1);
+  const int64_t hkv = k.size(1);
+  const int64_t sq = q.size(2);
+  const int64_t skv = k.size(2);
+  const int64_t group = enable_gqa ? hq / hkv : 1;
+
+  auto merge_heads = [&](const Tensor& t, int64_t rows) {
+    if (group == 1) {
+      return t;
+    }
+    return tpx::ops::reshape(
+        t, {batches, hkv, group * rows, t.size(-1)});
+  };
+
+  const Tensor q_m = merge_heads(q, sq);
+  const double root = std::sqrt(std::abs(scale));
+  Tensor scores = tpx::ops::matmul(
+      tpx::ops::mul(q_m, Scalar(scale < 0.0 ? -root : root)),
+      tpx::ops::mul(tpx::ops::transpose(k, -2, -1), Scalar(root)));
+  if (mask.has_value()) {
+    // The mask arrives in the accumulation tier: single precision for a half
+    // payload, the query dtype otherwise.
+    Tensor extra = *mask;
+    if (group > 1) {
+      while (extra.dim() < 4) {
+        extra = tpx::ops::unsqueeze(extra, 0);
+      }
+      if (extra.size(0) != batches || extra.size(1) != hq) {
+        extra = tpx::ops::expand(extra, {batches, hq, sq, skv}, false);
+      }
+      extra = merge_heads(extra, sq);
+    }
+    scores = tpx::ops::add(scores, extra);
+  }
+
+  Tensor pivot = tpx::ops::amax(scores, {-1}, true);
+  // A row whose every entry was rejected has no pivot to subtract and no total
+  // to divide by.  Taking zero for both keeps its weights at zero, which leaves
+  // the row's output at zero instead of at not-a-number.
+  pivot = tpx::ops::where(
+      tpx::ops::eq(pivot, Scalar(-std::numeric_limits<double>::infinity())),
+      Scalar(0.0),
+      pivot);
+  Tensor weights = tpx::ops::exp(tpx::ops::sub(scores, pivot));
+  Tensor total = tpx::ops::sum(weights, {-1}, true);
+  Tensor probs = tpx::ops::div(
+      weights,
+      tpx::ops::where(
+          tpx::ops::eq(total, Scalar(0.0)), Scalar(1.0), total));
+
+  Tensor out = tpx::ops::matmul(probs, v);
+  if (group > 1) {
+    out = tpx::ops::reshape(out, {batches, hq, sq, out.size(-1)});
+  }
+  return widened ? tpx::ops::to(out, origin) : out;
+}
+
 Tensor scaled_dot_product_attention_kernel(
     const Tensor& query,
     const Tensor& key,
@@ -1108,15 +1256,54 @@ Tensor scaled_dot_product_attention_kernel(
       scale_opt.value_or(1.0 / std::sqrt(static_cast<double>(D)));
 
   // Operands arrive channel-packed; a buffer-resident payload has no
-  // sampler view, so the boundary check fails before any dispatch.
+  // sampler view, so the fused chain cannot reach it.
   api::vTensor v_query = convert(query);
   api::vTensor v_key = convert(key);
   api::vTensor v_value = convert(value);
-  TP_CHECK(
-      v_query.storage_type() == api::StorageType::TEXTURE_3D &&
-          v_key.storage_type() == api::StorageType::TEXTURE_3D &&
-          v_value.storage_type() == api::StorageType::TEXTURE_3D,
-      "Vulkan sdpa requires texture storage");
+
+  // Without an image for every payload the attention composes instead: the
+  // two products are the batched kernels, which stream from images and from
+  // linear payloads alike, and the row reduction walks a score matrix that
+  // lives in linear storage.  A causal mask rides the same route as an
+  // explicit one, so the composite needs no triangle of its own.
+  if (v_query.storage_type() != api::StorageType::TEXTURE_3D ||
+      v_key.storage_type() != api::StorageType::TEXTURE_3D ||
+      v_value.storage_type() != api::StorageType::TEXTURE_3D ||
+      !sdpa_images_fit(context, B, Hq, Sq, Skv)) {
+    TP_CHECK(
+        !attn_mask_opt.has_value() ||
+            attn_mask_opt->dtype() == DType::Bool ||
+            attn_mask_opt->dtype() == query.dtype(),
+        "Vulkan sdpa: an attention mask must match the query dtype");
+    // The composed chain accumulates a half payload in single precision, so
+    // its mask rides the same tier: a half rejection would otherwise have to
+    // be selected over linear storage, where the byte-packed formats have no
+    // selecting shader yet.
+    const DType mask_dtype =
+        query.dtype() == DType::Float16 ? DType::Float32 : query.dtype();
+    std::optional<Tensor> composed_mask;
+    if (is_causal) {
+      composed_mask = sdpa_causal_mask(Sq, Skv, mask_dtype, query.device());
+    }
+    if (attn_mask_opt.has_value()) {
+      Tensor extra = *attn_mask_opt;
+      if (!extra.device().is_vulkan()) {
+        extra = extra.to(query.device());
+      }
+      if (extra.dtype() == DType::Bool) {
+        extra = additive_float_mask(extra, mask_dtype);
+      } else if (extra.dtype() != mask_dtype) {
+        extra = tpx::ops::to(extra, mask_dtype);
+      }
+      // Two rejections compose by addition: an entry already past the
+      // window stays past it, and an allowed entry keeps its bias.
+      composed_mask = composed_mask.has_value()
+          ? tpx::ops::add(*composed_mask, extra)
+          : extra;
+    }
+    return sdpa_composed(
+        query, key, value, composed_mask, scale, enable_gqa);
+  }
 
   // Attention mask: bool converts to an additive float mask; float masks
   // ride the texture planes per the addressing mode.

@@ -4,6 +4,7 @@
 #include "Common.h"
 #include "Convert.h"
 #include "Factory.h"
+#include "SizesAndStrides.h"
 #include "Utils.h"
 #include "../../../../include/Utils.h"
 
@@ -21,6 +22,14 @@ namespace ops {
 
 Tensor sub_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha);
 
+// Defined in View.cpp; materializes a strided view into a dense payload,
+// reading a linear payload through the gather's buffer variant.
+Tensor materialize_view(
+    const Tensor& self,
+    const std::vector<int64_t>& out_sizes,
+    const std::vector<int64_t>& out_strides,
+    int64_t storage_offset);
+
 namespace {
 
 // Materializes a tensor's shape into a plain sizes vector.  The shape
@@ -29,6 +38,29 @@ namespace {
 std::vector<int64_t> shape_vector(const Tensor& t) {
   const Size shape = t.shape();
   return std::vector<int64_t>(shape.begin(), shape.end());
+}
+
+//
+// A reduced payload inherits linear storage from its source, but storage is
+// otherwise a function of the shape alone: consumers pick their route by
+// looking at the operand, and a texture-only kernel handed a 32-element
+// buffer payload has no linear variant to run.  A result that still fits an
+// image therefore repacks into one on the way out.  The gather covers the
+// 4-byte element types; every other type stays where the kernel wrote it.
+//
+Tensor release_reduced_output(
+    api::Context* const context,
+    api::vTensor& v_reduced) {
+  Tensor flat = convert(v_reduced);
+  const std::vector<int64_t> sizes(
+      v_reduced.sizes().begin(), v_reduced.sizes().end());
+  if (!image_storage_supported(context, sizes) ||
+      (v_reduced.dtype() != DType::Float32 &&
+       v_reduced.dtype() != DType::Int32)) {
+    return flat;
+  }
+  return materialize_view(flat, sizes,
+                          SizesAndStrides::compute_contiguous_strides(sizes), 0);
 }
 
 //
@@ -116,10 +148,11 @@ Tensor reduce_one_axis(
   std::vector<int64_t> out_sizes = shape_vector(input);
   out_sizes[static_cast<size_t>(axis_from_left)] = 1;
 
-// Buffer-stored inputs (any axis beyond the 3-D image limit) reduce
-  // through a linear row-walking variant; the reduced output is kept in
-  // buffer storage.  A half payload accumulates in single precision and packs
-  // two reduced lanes per output word.
+  // Buffer-stored inputs (any axis beyond the 3-D image limit) reduce
+  // through a linear row-walking variant, which writes linear storage; a
+  // result whose own shape fits an image repacks into one on the way out.
+  // A half payload accumulates in single precision and packs two reduced
+  // lanes per output word.
   if (v_input.storage_type() == api::StorageType::BUFFER) {
     TP_CHECK(
         input.dtype() == DType::Float32 || input.dtype() == DType::Float16,
@@ -157,13 +190,13 @@ Tensor reduce_one_axis(
           context, v_tiles, v_input, kTileElements, 1, tiles, 0, 1.0f, false);
       reduce_axis_buffer_pass(
           context, v_output, v_tiles, tiles, 1, 1, 0, scale, false);
-      return convert(v_output);
+      return release_reduced_output(context, v_output);
     }
 
     reduce_axis_buffer_pass(
         context, v_output, v_input, axis_size, inner, rows, correction, scale,
         var_mode);
-    return convert(v_output);
+    return release_reduced_output(context, v_output);
   }
 
   api::vTensor v_output{
@@ -433,12 +466,12 @@ Tensor extremum_one_axis(
           context, v_tiles, v_input, kTileElements, 1, tiles, buffer_shader);
       extremum_buffer_pass(
           context, v_output, v_tiles, tiles, 1, 1, buffer_shader);
-      return convert(v_output);
+      return release_reduced_output(context, v_output);
     }
 
     extremum_buffer_pass(
         context, v_output, v_input, axis_size, inner, rows, buffer_shader);
-    return convert(v_output);
+    return release_reduced_output(context, v_output);
   }
 
   api::vTensor v_output{context, out_sizes, input.dtype()};
@@ -622,7 +655,8 @@ Tensor arg_one_axis(
   out_sizes[static_cast<size_t>(axis_from_left)] = 1;
 
   // Buffer-stored inputs (any axis beyond the 3-D image limit) reduce
-  // through a linear variant; the reduced output is kept in buffer storage.
+  // through a linear variant, which writes linear storage; a result whose
+  // own shape fits an image repacks into one on the way out.
   if (v_input.storage_type() == api::StorageType::BUFFER) {
     const int64_t axis_size = input.size(axis_from_left);
     int64_t inner = 1;
@@ -669,7 +703,7 @@ Tensor arg_one_axis(
         v_input.buffer(pipeline_barrier, api::PipelineStage::COMPUTE,
                        api::MemoryAccessType::READ),
         params.buffer());
-    return convert(v_output);
+    return release_reduced_output(context, v_output);
   }
 
   api::vTensor v_output{context, out_sizes, DType::Int32};
@@ -1306,7 +1340,7 @@ Tensor square(const Tensor& a) {
 // entry uses (keepdim mean, broadcast subtract, square, sum), with the
 // reduced span covering every axis.
 //
-// Buffer-stored inputs use a one-pass composition instead: linear binary
+  // Buffer-stored inputs use a one-pass composition instead: linear binary
 // ops reject broadcasts, so the keepdim mean cannot be expanded.  The
 // algebraically equivalent (E[x^2] - E[x]^2) form only needs same-shape
 // reductions and scalar arithmetic.
