@@ -59,7 +59,6 @@ Tensor searchsorted_impl(const Tensor& seq_in, const Tensor& self_in,
   MPSStream* stream = getCurrentMPSStream();
   dispatch_sync_with_rethrow(stream->queue(), ^() {
     @autoreleasepool {
-      stream->endKernelCoalescing();
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:pso];
       mtl_setArgs(encoder, queries, boundaries, result, idim_in, idim_bd,
@@ -69,7 +68,6 @@ Tensor searchsorted_impl(const Tensor& seq_in, const Tensor& self_in,
       }
       [encoder dispatchThreadgroups:MTLSizeMake(num_tg, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
-      stream->synchronize(SyncType::COMMIT);
     }
   });
   return result;

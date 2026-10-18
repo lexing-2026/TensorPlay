@@ -137,7 +137,6 @@ bool try_mpp_conv2d(const Tensor& input, const Tensor& weight,
   MPSStream* stream = getCurrentMPSStream();
   dispatch_sync_with_rethrow(stream->queue(), ^() {
     @autoreleasepool {
-      stream->endKernelCoalescing();
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:nchw_pso];
       mtl_setArgs(encoder, input, nhwc, channels_u, spatial_u);
@@ -163,7 +162,6 @@ bool try_mpp_conv2d(const Tensor& input, const Tensor& weight,
       [encoder dispatchThreadgroups:MTLSizeMake(o_tiles, w_tiles,
                                               h_tiles * params.N)
           threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
-      stream->synchronize(SyncType::COMMIT);
     }
   });
   return true;

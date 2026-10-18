@@ -60,7 +60,6 @@ void dispatch_scan(const std::string& kernel_name, const Tensor& src,
   MPSStream* stream = getCurrentMPSStream();
   dispatch_sync_with_rethrow(stream->queue(), ^() {
     @autoreleasepool {
-      stream->endKernelCoalescing();
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:pso];
       mtl_setArgs(encoder, src, result, d_size_i, inner_i);
@@ -68,7 +67,6 @@ void dispatch_scan(const std::string& kernel_name, const Tensor& src,
       const int tg = std::min(std::max(inner_i, 1), max_tptg);
       [encoder dispatchThreads:MTLSizeMake(inner_i, outer_i, 1)
           threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-      stream->synchronize(SyncType::COMMIT);
     }
   });
 }
@@ -92,7 +90,6 @@ void dispatch_row_scan(const std::string& kernel_name, const Tensor& src,
   MPSStream* stream = getCurrentMPSStream();
   dispatch_sync_with_rethrow(stream->queue(), ^() {
     @autoreleasepool {
-      stream->endKernelCoalescing();
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:pso];
       // One partial per lane, sized for the widest accumulator.
@@ -101,7 +98,6 @@ void dispatch_row_scan(const std::string& kernel_name, const Tensor& src,
       [encoder dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(rows),
                                                 1, 1)
           threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-      stream->synchronize(SyncType::COMMIT);
     }
   });
 }
@@ -313,7 +309,6 @@ std::tuple<Tensor, Tensor> sort_kernel(const Tensor& self, int64_t dim,
   MPSStream* stream = getCurrentMPSStream();
   dispatch_sync_with_rethrow(stream->queue(), ^() {
     @autoreleasepool {
-      stream->endKernelCoalescing();
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:pso];
       mtl_setArgs(encoder, self_c, values, indices, d_size_i, inner_i, desc_i);
@@ -322,7 +317,6 @@ std::tuple<Tensor, Tensor> sort_kernel(const Tensor& self, int64_t dim,
       [encoder setThreadgroupMemoryLength:idx_bytes atIndex:1];
       [encoder dispatchThreadgroups:MTLSizeMake(num_slices_i, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(P_i, 1, 1)];
-      stream->synchronize(SyncType::COMMIT);
     }
   });
   return std::make_tuple(values, indices);

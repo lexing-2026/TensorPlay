@@ -67,13 +67,11 @@ bool try_mpp_gemm(const Tensor& a, const Tensor& b, Tensor& output,
   MPSStream* stream = getCurrentMPSStream();
   dispatch_sync_with_rethrow(stream->queue(), ^() {
     @autoreleasepool {
-      stream->endKernelCoalescing();
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:pso];
       mtl_setArgs(encoder, a, b, output, strides, sizes, batch_u);
       [encoder dispatchThreadgroups:MTLSizeMake(grid_x, grid_y, batch_u)
               threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-      stream->synchronize(SyncType::COMMIT);
     }
   });
   return true;
