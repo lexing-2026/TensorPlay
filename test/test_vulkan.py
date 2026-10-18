@@ -953,5 +953,46 @@ class TestVulkanLinearPayload(unittest.TestCase):
         np.testing.assert_array_equal((x != 7).cpu().numpy(), x_cpu != 7)
 
 
+    def test_unaligned_widths_over_linear_payload(self):
+        import tensorplay as tp
+        import tensorplay.functional as F
+        # Linear kernels move four lanes per word, so a width that is not a
+        # multiple of four leaves a partial last word.  Writing that word whole
+        # must not disturb the lanes before it, and the read-back length has to
+        # stop at the logical end.
+        tensorplay.manual_seed(37)
+        for width in (self.WIDTH - 3, self.WIDTH - 1, self.WIDTH + 1,
+                      self.WIDTH + 6):
+            x_cpu = (tp.randn((width,), device="cpu") * 2.0).numpy()
+            y_cpu = (tp.randn((width,), device="cpu") * 2.0).numpy()
+            x = tensorplay.from_numpy(x_cpu.copy()).to("vulkan")
+            y = tensorplay.from_numpy(y_cpu.copy()).to("vulkan")
+
+            inplace = tensorplay.from_numpy(x_cpu.copy()).to("vulkan")
+            F.clamp_(inplace, -1.0, 1.0)
+            np.testing.assert_array_equal(
+                inplace.cpu().numpy(),
+                np.clip(x_cpu, -1.0, 1.0),
+                err_msg=f"clamp_ at width {width}")
+
+            z = tp.from_numpy(x_cpu.copy()).to("vulkan")
+            F.abs_(z)
+            np.testing.assert_array_equal(
+                z.cpu().numpy(), np.abs(x_cpu), err_msg=f"abs_ at width {width}")
+
+            mask = x < y
+            self.assertEqual(tuple(mask.shape), (width,))
+            np.testing.assert_array_equal(
+                mask.cpu().numpy(), x_cpu < y_cpu, err_msg="lt at odd width")
+            np.testing.assert_array_equal(
+                F.where(mask, x, y).cpu().numpy(),
+                np.where(x_cpu < y_cpu, x_cpu, y_cpu),
+                err_msg="where at odd width")
+            np.testing.assert_array_equal(
+                F.masked_fill(x, mask, -7.0).cpu().numpy(),
+                np.where(x_cpu < y_cpu, -7.0, x_cpu),
+                err_msg="masked_fill at odd width")
+
+
 if __name__ == "__main__":
     unittest.main()
