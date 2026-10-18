@@ -2890,12 +2890,14 @@ class TestVulkanCumsumStorages(unittest.TestCase):
 
 class TestVulkanDeviceBuiltPayload(unittest.TestCase):
     # Constructing straight on the device fills a row-major buffer, and the
-    # shape still fits an image, so the default result allocation is a texture.
-    # A kernel that writes the buffer of such a result leaves the image holding
-    # whatever the allocator recycled into it, which reads back as plausible but
-    # wrong data whenever an earlier dispatch of the same geometry happens to
-    # agree.  These cases pin the values for a payload that is small enough to
-    # have a texture form.
+    # shape still fits an image, so the storage a result gets is not decided by
+    # the shape alone.  Two failures hide behind that: a kernel that writes the
+    # buffer of an image-stored result leaves the image holding whatever the
+    # allocator recycled into it, which reads back as plausible but wrong data
+    # whenever an earlier dispatch of the same geometry happens to agree; and a
+    # kernel that picks its variant from the result's class never reaches its
+    # dense build, because an image exists for these shapes.  Every case below
+    # therefore runs on a payload small enough to have a texture form.
 
     @staticmethod
     def _grid(sizes, modulus=29, scale=4.0):
@@ -3051,6 +3053,147 @@ class TestVulkanDeviceBuiltPayload(unittest.TestCase):
         self.assertEqual(
             int(F.argmax(long_built, 0).cpu().numpy()),
             int(np.argmax(long_axis)))
+
+    def test_softmax_over_a_device_built_payload(self):
+        import tensorplay.functional as F
+        host = self._grid((2, 3, 4, 5))
+        built = tensorplay.tensor(host.copy(), device="vulkan")
+        half_built = tensorplay.tensor(host.astype(np.float16), device="vulkan")
+        for dim in range(4):
+            row_max = host.max(axis=dim, keepdims=True)
+            ex = np.exp(host - row_max)
+            total = ex.sum(axis=dim, keepdims=True)
+            np.testing.assert_allclose(
+                F.softmax(built, dim).cpu().numpy(), ex / total,
+                rtol=1e-5, atol=1e-6, err_msg="softmax along axis %d" % dim)
+            np.testing.assert_allclose(
+                F.softmax(half_built, dim).cpu().numpy().astype(np.float32),
+                (ex / total).astype(np.float16).astype(np.float32),
+                rtol=2e-3, atol=2e-3,
+                err_msg="half softmax along axis %d" % dim)
+        row_max = host.max(axis=-1, keepdims=True)
+        ex = np.exp(host - row_max)
+        np.testing.assert_allclose(
+            F.log_softmax(built, -1).cpu().numpy(),
+            (host - row_max) - np.log(ex.sum(axis=-1, keepdims=True)),
+            rtol=1e-5, atol=1e-6, err_msg="log_softmax")
+        channel_max = host.max(axis=1, keepdims=True)
+        channel_ex = np.exp(host - channel_max)
+        np.testing.assert_allclose(
+            F.log_softmax(built, 1).cpu().numpy(),
+            (host - channel_max) - np.log(channel_ex.sum(axis=1, keepdims=True)),
+            rtol=1e-5, atol=1e-6, err_msg="log_softmax along the channel axis")
+
+    def test_activations_over_a_device_built_payload(self):
+        from math import erf
+        import tensorplay.functional as F
+        host = self._grid((2, 3, 4, 5))
+        built = tensorplay.tensor(host.copy(), device="vulkan")
+        sigmoid = 1.0 / (1.0 + np.exp(-host))
+        cases = [
+            ("silu", F.silu, host * sigmoid),
+            ("mish", F.mish, host * np.tanh(np.log1p(np.exp(host)))),
+            ("relu6", F.relu6, np.clip(host, 0.0, 6.0)),
+            ("hardsigmoid", F.hardsigmoid, np.clip(host / 6.0 + 0.5, 0.0, 1.0)),
+            ("hardswish", F.hardswish, host * np.clip(host / 6.0 + 0.5, 0.0, 1.0)),
+            ("gelu", F.gelu, 0.5 * host * (
+                1.0 + np.vectorize(erf)(host / np.sqrt(2.0)))),
+            ("gelu_tanh", lambda v: F.gelu(v, "tanh"), 0.5 * host * (
+                1.0 + np.tanh(np.sqrt(2.0 / np.pi) *
+                              (host + 0.044715 * host ** 3)))),
+            ("leaky_relu", lambda v: F.leaky_relu(v, 0.1),
+             np.where(host > 0.0, host, 0.1 * host)),
+            ("threshold", lambda v: F.threshold(v, 0.0, 6.0),
+             np.where(host > 0.0, host, 6.0)),
+            ("hardshrink", lambda v: F.hardshrink(v, 0.1),
+             np.where(np.abs(host) > 0.1, host, 0.0)),
+        ]
+        for name, op, want in cases:
+            np.testing.assert_allclose(
+                op(built).cpu().numpy(), want, rtol=1e-5, atol=1e-6,
+                err_msg="%s over a device-built payload" % name)
+        # A half payload keeps its pointwise formula exact: the same rounding
+        # on both sides lands on the same half.
+        half_built = tensorplay.tensor(host.astype(np.float16), device="vulkan")
+        np.testing.assert_array_equal(
+            F.silu(half_built).cpu().numpy().view(np.uint16),
+            (host * sigmoid).astype(np.float16).view(np.uint16),
+            err_msg="half silu over a device-built payload")
+        # In-place keeps the payload dense and updates it where it lies.
+        inplace = tensorplay.tensor(host.copy(), device="vulkan")
+        F.silu_(inplace)
+        np.testing.assert_allclose(
+            inplace.cpu().numpy(), host * sigmoid, rtol=1e-5, atol=1e-6,
+            err_msg="silu_ in place")
+
+    def test_cat_over_a_device_built_payload(self):
+        host = self._grid((2, 3, 4, 5))
+        built = tensorplay.tensor(host.copy(), device="vulkan")
+        for dim in range(4):
+            second_sizes = list(host.shape)
+            second_sizes[dim] += 2
+            second = self._grid(tuple(second_sizes), modulus=13, scale=8.0)
+            np.testing.assert_allclose(
+                tensorplay.cat([built, tensorplay.tensor(second.copy(),
+                                                          device="vulkan")],
+                               dim).cpu().numpy(),
+                np.concatenate([host, second], axis=dim),
+                err_msg="cat along axis %d" % dim)
+        # One image operand alongside a dense one: the dense class wins, and
+        # the texel plane is pulled into words on the way through.
+        uploaded = tensorplay.from_numpy(host.copy()).to("vulkan")
+        np.testing.assert_allclose(
+            tensorplay.cat([built, uploaded], -1).cpu().numpy(),
+            np.concatenate([host, host], axis=-1),
+            err_msg="cat of a dense payload with an uploaded one")
+        np.testing.assert_allclose(
+            tensorplay.cat([uploaded, built], 0).cpu().numpy(),
+            np.concatenate([host, host], axis=0),
+            err_msg="cat with the uploaded payload first")
+        half = host.astype(np.float16)
+        half_built = tensorplay.tensor(half, device="vulkan")
+        np.testing.assert_array_equal(
+            tensorplay.cat([half_built, half_built], 1).cpu().numpy()
+            .view(np.uint16),
+            np.concatenate([half, half], axis=1).view(np.uint16),
+            err_msg="half cat over device-built payloads")
+
+    def test_batch_norm_over_a_device_built_payload(self):
+        host = self._grid((2, 3, 4, 5))
+        channels = host.shape[1]
+        shape = (1, channels, 1, 1)
+        weight = ((np.arange(channels, dtype=np.float32) + 1) / 4).reshape(shape)
+        bias = ((np.arange(channels, dtype=np.float32) - channels // 2)
+                / 8).reshape(shape)
+        mean = ((np.arange(channels, dtype=np.float32) % 5 - 2)
+                / 4).reshape(shape)
+        var = ((np.arange(channels, dtype=np.float32) % 7 + 1) / 2).reshape(shape)
+        built = tensorplay.tensor(host.copy(), device="vulkan")
+        want = (host - mean) / np.sqrt(var + 1e-5)
+
+        def as_device(array):
+            if array is None:
+                return None
+            return (tensorplay.tensor(array.copy(), device="vulkan")
+                    if use_built else
+                    tensorplay.from_numpy(array.copy()).to("vulkan"))
+
+        for use_built in (True, False):
+            for with_weight, with_bias, expected in (
+                    (True, True, want * weight + bias),
+                    (True, False, want * weight),
+                    (False, True, want + bias),
+                    (False, False, want)):
+                out = tensorplay.batch_norm(
+                    built,
+                    as_device(weight if with_weight else None),
+                    as_device(bias if with_bias else None),
+                    as_device(mean), as_device(var),
+                    False, 0.1, 1e-5)
+                np.testing.assert_allclose(
+                    out.cpu().numpy(), expected, rtol=1e-5, atol=1e-6,
+                    err_msg="batch_norm built=%s weight=%s bias=%s" % (
+                        use_built, with_weight, with_bias))
 
 
 if __name__ == "__main__":
