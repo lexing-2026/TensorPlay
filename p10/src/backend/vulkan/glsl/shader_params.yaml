@@ -986,6 +986,8 @@ compare_buffer:
       SUFFIX: ''
     - VALUE: int
       SUFFIX: _i32
+    - VALUE: half
+      SUFFIX: _f16
   shader_variants:
   - NAME: eq_buffer
     OPERATOR: equal(X, Y)
@@ -1034,6 +1036,8 @@ compare_scalar_buffer:
       SUFFIX: ''
     - VALUE: int
       SUFFIX: _i32
+    - VALUE: half
+      SUFFIX: _f16
   shader_variants:
   - NAME: eq_scalar_buffer
     OPERATOR: equal(X, Y)

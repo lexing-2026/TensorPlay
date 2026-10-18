@@ -10,13 +10,17 @@ layout(std430) buffer;
 
 // Comparison of a linear payload against a scalar.  The Bool result packs four
 // lanes per 32-bit word, lane k occupying bits [8k, 8k + 8), so one word of
-// result lines up with one 16-byte vector of the operand.
+// result lines up with one 16-byte vector of a single-precision operand.  A
+// half-precision operand packs two lanes per word, so one result word draws on
+// two operand words.
 //
 // A dispatch covers ceil(numel / 4) words; the trailing word may reach past the
 // logical end of the payload, which stays inside the allocation because buffer
 // allocations are rounded up to 16 bytes, and those lanes are never read back.
 $if DTYPE == "int":
   #define VECTOR ivec4
+$elif DTYPE == "half":
+  #define VECTOR uint
 $else:
   #define VECTOR vec4
 
@@ -48,10 +52,20 @@ void main() {
 
   $if DTYPE == "int":
     const VECTOR threshold = ivec4(uBlock.value_int);
+  $elif DTYPE == "half":
+    const vec4 threshold = vec4(uBlock.value_float);
   $else:
     const VECTOR threshold = vec4(uBlock.value_float);
+  // End of the threshold.
 
-  const bvec4 hit = OP(uInput.data[idx], threshold);
+  $if DTYPE == "half":
+    const vec2 lo = unpackHalf2x16(uInput.data[idx * 2u]);
+    const vec2 hi = unpackHalf2x16(uInput.data[idx * 2u + 1u]);
+    const bvec4 hit = OP(vec4(lo.x, lo.y, hi.x, hi.y), threshold);
+  $else:
+    const bvec4 hit = OP(uInput.data[idx], threshold);
+  // End of the operand loads.
+
   uOutput.data[idx] = (hit.x ? 1u : 0u) | (hit.y ? 256u : 0u) |
       (hit.z ? 65536u : 0u) | (hit.w ? 16777216u : 0u);
 }

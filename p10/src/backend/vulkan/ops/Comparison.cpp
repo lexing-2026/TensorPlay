@@ -16,9 +16,9 @@ namespace {
 
 void validate_operand(const Tensor& t, const char* name) {
   TP_CHECK(
-      t.dtype() == DType::Float32 || t.dtype() == DType::Int32 ||
-          t.dtype() == DType::Int8 || t.dtype() == DType::UInt8 ||
-          t.dtype() == DType::Bool,
+      t.dtype() == DType::Float32 || t.dtype() == DType::Float16 ||
+          t.dtype() == DType::Int32 || t.dtype() == DType::Int8 ||
+          t.dtype() == DType::UInt8 || t.dtype() == DType::Bool,
       std::string("Vulkan ") + name + " has an unsupported dtype");
   TP_CHECK(
       t.dim() <= 4,
@@ -32,8 +32,10 @@ struct CompareBlock final {
 };
 
 // Linear form: the Bool result packs one byte per element, four lanes to a
-// word, and the operands move as 16-byte vectors, so a dispatch covers four
-// elements per invocation.
+// word, so a dispatch covers four elements per invocation and one invocation
+// owns one whole result word.  Single-precision operands move as 16-byte
+// vectors; half-precision ones pack two lanes per word, so a result word
+// draws on two operand words.
 struct CompareBufferBlock final {
   uint32_t buf_length;
   uint32_t fill0;
@@ -53,9 +55,29 @@ struct CompareScalarBufferBlock final {
 // a linear variant of their own.
 void validate_linear_compare_dtype(DType dtype, const char* name) {
   TP_CHECK(
-      dtype == DType::Float32 || dtype == DType::Int32,
+      dtype == DType::Float32 || dtype == DType::Float16 ||
+          dtype == DType::Int32,
       std::string("Vulkan ") + name +
-          " over buffer storage supports Float32 and Int32 only");
+          " over buffer storage supports Float32, Float16 and Int32 only");
+}
+
+// Linear kernels specialize on the element vocabulary: single precision takes
+// the plain name, integers the `_i32` twin, halves the `_f16` one.
+const char* linear_dtype_suffix(DType dtype) {
+  return dtype == DType::Int32
+      ? "_i32"
+      : (dtype == DType::Float16 ? "_f16" : "");
+}
+
+// A comparison against a scalar runs in the tensor's own element domain, so a
+// half payload first takes the nearest representable half of the scalar.  Both
+// sides then move through single precision, where half values map exactly and
+// the decision is the same as in the narrow type.
+float scalar_threshold(const Tensor& self, Scalar other) {
+  const float value = other.to<float>();
+  return self.dtype() == DType::Float16
+      ? static_cast<float>(tensorplay::Half(value))
+      : value;
 }
 
 // Elementwise comparison driver for equal-shaped tensor operands.
@@ -99,7 +121,7 @@ Tensor compare_impl(
     const CompareBufferBlock block{n, 0u, 0u, 0u};
     const std::string linear_shader =
         std::string(kernel_name) + "_buffer" +
-        (self.dtype() == DType::Int32 ? "_i32" : "");
+        linear_dtype_suffix(self.dtype());
 
     api::UniformParamsBuffer params(context, block);
     api::PipelineBarrier pipeline_barrier{};
@@ -147,9 +169,15 @@ Tensor compare_impl(
 
 Tensor compare_scalar(const Tensor& self, Scalar other, const char* name) {
   validate_operand(self, name);
-  const char* suffix = self.dtype() == DType::Float32 ? "" :
-      self.dtype() == DType::UInt8 ? "_u8" : "_i32";
+  // The single-precision texel shader samples an rgba16f view and the hardware
+  // widens each half lane exactly, so a half payload reuses the float variant.
+  const bool is_float =
+      self.dtype() == DType::Float32 || self.dtype() == DType::Float16;
+  const char* suffix =
+      is_float ? "" : (self.dtype() == DType::UInt8 ? "_u8" : "_i32");
   const std::string shader = std::string(name) + "_scalar" + suffix;
+  const float threshold = is_float ? scalar_threshold(self, other) : 0.0f;
+  const int32_t integer = is_float ? 0 : other.to<int32_t>();
   api::Context* context = api::context();
   api::vTensor input = convert(self);
 
@@ -162,14 +190,9 @@ Tensor compare_scalar(const Tensor& self, Scalar other, const char* name) {
         api::StorageType::BUFFER,
         api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
     const uint32_t n = safe_downcast_to_u32(static_cast<int64_t>(input.numel()));
-    const bool is_float = self.dtype() == DType::Float32;
-    const CompareScalarBufferBlock block{
-        n,
-        is_float ? other.to<float>() : 0.0f,
-        is_float ? 0 : other.to<int32_t>(),
-        0u};
+    const CompareScalarBufferBlock block{n, threshold, integer, 0u};
     const std::string linear_shader =
-        std::string(name) + "_scalar_buffer" + (is_float ? "" : "_i32");
+        std::string(name) + "_scalar_buffer" + linear_dtype_suffix(self.dtype());
     api::UniformParamsBuffer params(context, block);
     api::PipelineBarrier barrier{};
     context->submit_compute_job(
@@ -193,9 +216,8 @@ Tensor compare_scalar(const Tensor& self, Scalar other, const char* name) {
     int32_t value_int;
     uint32_t value_uint;
     int32_t fill;
-  } block{self.dtype() == DType::Float32 ? other.to<float>() : 0.0f,
-          self.dtype() != DType::Float32 && self.dtype() != DType::UInt8 ?
-              other.to<int32_t>() : 0,
+  } block{threshold,
+          self.dtype() != DType::UInt8 ? integer : 0,
           self.dtype() == DType::UInt8 ? other.to<uint32_t>() : 0u, 0};
   api::UniformParamsBuffer params(context, block);
   api::PipelineBarrier barrier{};

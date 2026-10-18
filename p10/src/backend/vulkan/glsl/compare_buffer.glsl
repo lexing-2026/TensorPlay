@@ -10,9 +10,10 @@ layout(std430) buffer;
 
 // Elementwise comparison of two linear payloads.  The Bool result is one byte
 // per element, so four lanes travel packed in each 32-bit word: lane k of a
-// word occupies bits [8k, 8k + 8).  Operands are 4-byte elements and are read
-// as 16-byte vectors, which lines one word of the result up with one word of
-// each operand.
+// word occupies bits [8k, 8k + 8).  A single-precision operand is read as
+// 16-byte vectors, which lines one word of the result up with one word of each
+// operand; a half-precision operand packs two lanes per word, so one result
+// word draws on two operand words.
 //
 // A dispatch covers ceil(numel / 4) words.  The last word may hold lanes past
 // the logical end of the payload, but buffer allocations are rounded up to 16
@@ -20,6 +21,8 @@ layout(std430) buffer;
 // contain is never read back, because the logical length stops before them.
 $if DTYPE == "int":
   #define VECTOR ivec4
+$elif DTYPE == "half":
+  #define VECTOR uint
 $else:
   #define VECTOR vec4
 
@@ -51,7 +54,21 @@ void main() {
     return;
   }
 
+$if DTYPE == "half":
+  // Half lanes widen to single precision before comparing: the mapping is
+  // exact and order preserving, so a float comparison decides exactly what a
+  // comparison in the narrow type would.  One invocation owns a whole result
+  // word, so no two invocations can race on the same destination.
+  const vec2 a01 = unpackHalf2x16(uInput.data[idx * 2u]);
+  const vec2 a23 = unpackHalf2x16(uInput.data[idx * 2u + 1u]);
+  const vec2 b01 = unpackHalf2x16(uOther.data[idx * 2u]);
+  const vec2 b23 = unpackHalf2x16(uOther.data[idx * 2u + 1u]);
+  const bvec4 hit =
+      OP(vec4(a01.x, a01.y, a23.x, a23.y), vec4(b01.x, b01.y, b23.x, b23.y));
+$else:
   const bvec4 hit = OP(uInput.data[idx], uOther.data[idx]);
+// End of the operand loads.
+
   uOutput.data[idx] = (hit.x ? 1u : 0u) | (hit.y ? 256u : 0u) |
       (hit.z ? 65536u : 0u) | (hit.w ? 16777216u : 0u);
 }
