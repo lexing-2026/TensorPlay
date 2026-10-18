@@ -768,5 +768,70 @@ class TestMPSGraphCacheParameters(MPSCase):
                                 tp.log_softmax(cpu, axis))
 
 
+@unittest.skipUnless(mps_available(), "MPS not available")
+class TestMPSQueuedChains(MPSCase):
+    """A chain of calls the stream commits, and reads, only once.
+
+    A call queues into the command buffer its stream is already building and
+    leaves that buffer open, so nothing reaches the GPU until something needs
+    what the chain has produced: a copy to the host, a graph launch, an explicit
+    synchronize. The whole chain then runs in the order it was queued. Each check
+    below builds a chain and reads it back exactly once, so a link that read
+    storage a later link had already been given -- or a link the single commit
+    left behind -- would answer wrong.
+    """
+
+    def test_graph_and_shader_links_in_one_chain(self):
+        # The three matrix links are served by a graph and the three math links
+        # by a single shader dispatch, so the buffer changes hands twice.
+        def scaled(shape, device):
+            # A spread of magnitudes rather than one near-constant answer, so a
+            # link that read the wrong storage cannot hide inside the tolerance.
+            count = math.prod(shape)
+            values = tp.reshape(tp.arange(count, dtype=tp.float32, device=device),
+                                list(shape))
+            return (values - count / 2) / count
+
+        def chain(x, w, v, bias):
+            first = tp.mm(x, w)
+            second = tp.addmm(bias, first, v)
+            operand = tp.reshape(second, [4, 2, 2])
+            third = tp.bmm(operand, operand)
+            return tp.relu(tp.exp(third) - 0.5)
+
+        shapes = ([4, 8], [8, 4], [4, 4], [4])
+        cpu = [scaled(shape, "cpu") for shape in shapes]
+        mps = [scaled(shape, "mps") for shape in shapes]
+        self.assert_same_result(chain(*mps), chain(*cpu))
+
+    def test_dropped_intermediates_are_rewritten(self):
+        # Each round queues a graph link and two shader links and frees every
+        # intermediate as soon as the link after it has been queued, so blocks
+        # return to the pool while the chain is still open and a later link is
+        # routinely handed the storage an earlier one is queued to read.
+        def scaled(rows, device):
+            values = tp.reshape(tp.arange(rows * rows, dtype=tp.float32,
+                                          device=device), [rows, rows])
+            return (values - rows * rows / 2) / (rows * rows)
+
+        shifts = (0.25, -0.5, 1.0, -0.75, 0.5, -0.25, 0.75, -1.0)
+        for device in ("cpu", "mps"):
+            x = scaled(8, device)
+            w = scaled(8, device)
+            acc = None
+            for value in shifts:
+                product = tp.mm(x, w)
+                bounded = tp.tanh(product)
+                del product
+                shifted = tp.add(bounded, tp.full([8, 8], value, device=device))
+                del bounded
+                acc = shifted if acc is None else tp.add(acc, shifted)
+            if device == "cpu":
+                on_cpu = acc
+            else:
+                on_mps = acc
+        self.assert_same_result(on_mps, on_cpu)
+
+
 if __name__ == "__main__":
     unittest.main()
