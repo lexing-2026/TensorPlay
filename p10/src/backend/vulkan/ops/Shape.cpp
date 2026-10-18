@@ -45,6 +45,10 @@ Tensor where_kernel(
     const Tensor& self,
     const Tensor& other);
 
+// Defined in Misc.cpp; reverses the flagged axes.  rot90 composes this with
+// the transpose kernel below.
+Tensor flip_kernel(const Tensor& self, const std::vector<int64_t>& dims);
+
 // Defined in BinaryOp.cpp; copies a texture payload into a dense buffer.
 api::vTensor to_buffer_storage_dispatch(
     api::Context* context,
@@ -959,6 +963,88 @@ Tensor& tril_inplace_kernel(Tensor& self, int64_t diagonal) {
   return self;
 }
 
+namespace {
+
+// One wrap-around shift along `dim`: destination coordinate c reads source
+// coordinate (c + start) % size, which is the concatenation of the trailing
+// [start, size) block with the leading [0, start) block.
+Tensor roll_one_dim(
+    const Tensor& self,
+    int64_t shift,
+    int64_t dim) {
+  if (self.numel() == 0) {
+    return self.clone();
+  }
+  dim = wrap_dim_checked(dim, self.dim());
+  const int64_t size = self.size(dim);
+  const int64_t shift_norm = ((shift % size) + size) % size;
+  const int64_t start = (size - shift_norm) % size;
+  if (start == 0) {
+    return self.clone();
+  }
+  return cat_kernel(
+      {slice_kernel(self, dim, start, std::nullopt, 1),
+       slice_kernel(self, dim, 0, start, 1)},
+      dim);
+}
+
+} // namespace
+
+Tensor roll_kernel(
+    const Tensor& self,
+    const std::vector<int64_t>& shifts,
+    const std::vector<int64_t>& dims) {
+  if (shifts.empty()) {
+    TP_THROW(RuntimeError, "`shifts` required");
+  }
+  if (dims.empty() && shifts.size() == 1) {
+    // Flatten-roll: roll the flattened payload and restore the shape.
+    const Tensor flat = self.contiguous().reshape({self.numel()});
+    return roll_kernel(flat, {shifts[0]}, {0}).reshape(shape_vector(self));
+  }
+  if (shifts.size() != dims.size()) {
+    TP_THROW(
+        RuntimeError,
+        "shifts and dimensions must align. shifts: ", shifts.size(),
+        ", dims: ", dims.size());
+  }
+  Tensor cur = self;
+  for (size_t i = 0; i < dims.size(); ++i) {
+    cur = roll_one_dim(cur, shifts[i], dims[i]);
+  }
+  return cur;
+}
+
+Tensor rot90_kernel(
+    const Tensor& self,
+    int64_t k,
+    const std::vector<int64_t>& dims) {
+  const int64_t total_dims = self.dim();
+  TP_CHECK(
+      dims.size() == 2,
+      "expected total rotation dims == 2, but got dims = ", dims.size());
+  TP_CHECK(
+      total_dims >= 2,
+      "expected total dims >= 2, but got total dims = ", total_dims);
+  const int64_t dim0 = wrap_dim_checked(dims[0], total_dims);
+  const int64_t dim1 = wrap_dim_checked(dims[1], total_dims);
+  TP_CHECK(
+      dim0 != dim1,
+      "expected rotation dims to be different, but got dim0 = ", dims[0],
+      " and dim1 = ", dims[1]);
+  k = (4 + (k % 4)) % 4;
+  switch (k) {
+    case 1:
+      return transpose_kernel(flip_kernel(self, {dim1}), dim0, dim1);
+    case 2:
+      return flip_kernel(self, {dim0, dim1});
+    case 3:
+      return transpose_kernel(flip_kernel(self, {dim0}), dim0, dim1);
+    default:
+      return self.clone();
+  }
+}
+
 } // namespace ops
 } // namespace vulkan
 } // namespace tensorplay
@@ -975,6 +1061,8 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, ShapeKernels) {
   m.impl("tril", &tensorplay::vulkan::ops::tril_kernel);
   m.impl("triu_", &tensorplay::vulkan::ops::triu_inplace_kernel);
   m.impl("tril_", &tensorplay::vulkan::ops::tril_inplace_kernel);
+  m.impl("roll", &tensorplay::vulkan::ops::roll_kernel);
+  m.impl("rot90", &tensorplay::vulkan::ops::rot90_kernel);
   m.impl("select.int", &tensorplay::vulkan::ops::select_kernel);
   m.impl("cat", &tensorplay::vulkan::ops::cat_kernel);
   m.impl("stack", &tensorplay::vulkan::ops::stack_kernel);
