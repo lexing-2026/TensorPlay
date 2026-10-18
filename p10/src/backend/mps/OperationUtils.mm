@@ -418,6 +418,25 @@ MTLComputePipelineState_t unaryShaderPipeline(const std::string& op,
                              scalarToMetalTypeString(dtype));
 }
 
+// The pipeline for `op` over `dtype` in DenseCompare.metal, or nil when the
+// shader is not built for that combination. The list below and the
+// instantiations at the bottom of that file are checked in the same order, so a
+// missing name is only possible if the two get out of step; every dtype outside
+// it is answered by the graph.
+MTLComputePipelineState_t compareShaderPipeline(const std::string& op,
+                                                DType dtype) {
+  switch (dtype) {
+    case DType::Float32:
+    case DType::Int64:
+    case DType::Int32:
+      break;
+    default:
+      return nil;
+  }
+  return shaderPipelineNamed("compare_" + op + "_" +
+                             scalarToMetalTypeString(dtype));
+}
+
 } // namespace
 
 std::optional<Tensor> broadcastBinaryShader(
@@ -698,6 +717,64 @@ std::optional<Tensor> rowArgReduceShader(const Tensor& self,
     return std::nullopt;
   }
   dispatchRowReduce(pso, out_buf, in_buf, rows, length, std::nullopt);
+  return output;
+}
+
+std::optional<Tensor> compareShader(const std::string& op, const Tensor& self,
+                                    const Tensor& other) {
+  if (!self.device().is_mps() || !other.device().is_mps()) {
+    return std::nullopt;
+  }
+  // A thread reads both operands at its own index, which addresses the right
+  // pair only when the two share a shape and a storage type and each runs
+  // through its storage in the order the output is written in, from its start.
+  const std::vector<int64_t> shape =
+      static_cast<std::vector<int64_t>>(self.shape());
+  if (self.dtype() != other.dtype() ||
+      shape != static_cast<std::vector<int64_t>>(other.shape()) ||
+      !self.is_contiguous() || !other.is_contiguous() ||
+      self.storage_offset() != 0 || other.storage_offset() != 0) {
+    return std::nullopt;
+  }
+  const int64_t numel = self.numel();
+  if (numel <= 0 || numel > std::numeric_limits<uint32_t>::max()) {
+    return std::nullopt;
+  }
+  MTLComputePipelineState_t pso = compareShaderPipeline(op, self.dtype());
+  if (!pso) {
+    return std::nullopt;
+  }
+  void* self_buf = getMTLBufferFromPointer(self.data_ptr());
+  void* other_buf = getMTLBufferFromPointer(other.data_ptr());
+  if (!self_buf || !other_buf) {
+    return std::nullopt;
+  }
+  // A comparison answers one byte per element whatever the operands hold, which
+  // is the width the boolean storage uses.
+  Tensor output = emptyMPS(shape, DType::Bool, self.device());
+  void* out_buf = getMTLBufferFromPointer(output.data_ptr());
+  if (!out_buf) {
+    return std::nullopt;
+  }
+
+  const uint32_t total = static_cast<uint32_t>(numel);
+  MPSStream* stream = getCurrentMPSStream();
+  dispatch_sync_with_rethrow(stream->queue(), ^() {
+    @autoreleasepool {
+      stream->endKernelCoalescing();
+      auto encoder = stream->commandEncoder();
+      [encoder setComputePipelineState:pso];
+      [encoder setBuffer:(__bridge id<MTLBuffer>)out_buf offset:0 atIndex:0];
+      [encoder setBuffer:(__bridge id<MTLBuffer>)self_buf offset:0 atIndex:1];
+      [encoder setBuffer:(__bridge id<MTLBuffer>)other_buf offset:0 atIndex:2];
+      const uint32_t per_group =
+          std::min(total,
+                   static_cast<uint32_t>([pso maxTotalThreadsPerThreadgroup]));
+      [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(per_group, 1, 1)];
+      stream->synchronize(SyncType::COMMIT);
+    }
+  });
   return output;
 }
 
