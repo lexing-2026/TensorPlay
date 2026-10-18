@@ -277,6 +277,18 @@ MPSBinaryOpBlock geBlock = ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* a,
   return [g greaterThanOrEqualToWithPrimaryTensor:a secondaryTensor:b name:nil];
 };
 
+// The bundled shader when the operand suits it, the graph when it does not. A
+// call for an operation the metallib has no function for, or for an operand the
+// shader cannot address, is answered by the graph without a second check here:
+// `unaryShader` reports that it took nothing.
+Tensor unaryShaderOrOp(const std::string& op, const Tensor& self,
+                       MPSUnaryOpBlock block) {
+  if (auto result = unaryShader(op, self)) {
+    return *result;
+  }
+  return unaryOp(op, self, block);
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -284,28 +296,26 @@ MPSBinaryOpBlock geBlock = ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* a,
 // ---------------------------------------------------------------------------
 
 Tensor abs_kernel(const Tensor& self) {
-  if (auto result = unaryShader("abs", self)) {
-    return *result;
-  }
-  return unaryOp("abs", self, absBlock);
+  return unaryShaderOrOp("abs", self, absBlock);
 }
-Tensor neg_kernel(const Tensor& self) { return unaryOp("neg", self, negBlock); }
+Tensor neg_kernel(const Tensor& self) {
+  return unaryShaderOrOp("neg", self, negBlock);
+}
 Tensor square_kernel(const Tensor& self) {
-  return unaryOp("square", self, squareBlock);
+  return unaryShaderOrOp("square", self, squareBlock);
 }
 Tensor sign_kernel(const Tensor& self) {
   return unaryOp("sign", self, signBlock);
 }
 Tensor exp_kernel(const Tensor& self) {
-  if (auto result = unaryShader("exp", self)) {
-    return *result;
-  }
-  return unaryOp("exp", self, expBlock);
+  return unaryShaderOrOp("exp", self, expBlock);
 }
 Tensor expm1_kernel(const Tensor& self) {
   return unaryOp("expm1", self, expm1Block);
 }
-Tensor log_kernel(const Tensor& self) { return unaryOp("log", self, logBlock); }
+Tensor log_kernel(const Tensor& self) {
+  return unaryShaderOrOp("log", self, logBlock);
+}
 Tensor log10_kernel(const Tensor& self) {
   return unaryOp("log10", self,
                  ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* x) {
@@ -322,22 +332,20 @@ Tensor log1p_kernel(const Tensor& self) {
   return unaryOp("log1p", self, log1pBlock);
 }
 Tensor sqrt_kernel(const Tensor& self) {
-  if (auto result = unaryShader("sqrt", self)) {
-    return *result;
-  }
-  return unaryOp("sqrt", self, sqrtBlock);
+  return unaryShaderOrOp("sqrt", self, sqrtBlock);
 }
 Tensor rsqrt_kernel(const Tensor& self) {
-  if (auto result = unaryShader("rsqrt", self)) {
-    return *result;
-  }
-  return unaryOp("rsqrt", self, rsqrtBlock);
+  return unaryShaderOrOp("rsqrt", self, rsqrtBlock);
 }
 Tensor reciprocal_kernel(const Tensor& self) {
-  return unaryOp("reciprocal", self, reciprocalBlock);
+  return unaryShaderOrOp("reciprocal", self, reciprocalBlock);
 }
-Tensor sin_kernel(const Tensor& self) { return unaryOp("sin", self, sinBlock); }
-Tensor cos_kernel(const Tensor& self) { return unaryOp("cos", self, cosBlock); }
+Tensor sin_kernel(const Tensor& self) {
+  return unaryShaderOrOp("sin", self, sinBlock);
+}
+Tensor cos_kernel(const Tensor& self) {
+  return unaryShaderOrOp("cos", self, cosBlock);
+}
 Tensor tan_kernel(const Tensor& self) { return unaryOp("tan", self, tanBlock); }
 Tensor asin_kernel(const Tensor& self) {
   return unaryOp("asin", self, asinBlock);
@@ -355,7 +363,7 @@ Tensor cosh_kernel(const Tensor& self) {
   return unaryOp("cosh", self, coshBlock);
 }
 Tensor tanh_kernel(const Tensor& self) {
-  return unaryOp("tanh", self, tanhBlock);
+  return unaryShaderOrOp("tanh", self, tanhBlock);
 }
 Tensor asinh_kernel(const Tensor& self) {
   return unaryOp("asinh", self, asinhBlock);
@@ -410,10 +418,7 @@ Tensor sigmoid_kernel(const Tensor& self) {
 }
 
 Tensor relu_kernel(const Tensor& self) {
-  if (auto result = unaryShader("relu", self)) {
-    return *result;
-  }
-  return unaryOp("relu", self, reluBlock);
+  return unaryShaderOrOp("relu", self, reluBlock);
 }
 
 Tensor& relu_inplace_kernel(Tensor& self) {
