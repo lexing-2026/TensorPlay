@@ -206,12 +206,18 @@ class TestMPSComparison(unittest.TestCase):
 
     def test_comparison_with_nan(self):
         # A NaN is equal to nothing, not even to itself, and every ordered
-        # comparison against one is false.
+        # comparison against one is false. The value beside it answers by the
+        # ordinary rules, so a self-comparison separates the two cases.
         x = tp.tensor([float("nan"), 1.0], dtype=tp.float32, device="mps")
-        self.assertEqual(tp.eq(x, x).cpu().tolist(), [False, True])
-        self.assertEqual(tp.ne(x, x).cpu().tolist(), [True, False])
-        for op in (tp.lt, tp.le, tp.gt, tp.ge):
-            self.assertEqual(op(x, x).cpu().tolist(), [False, False])
+        for op, expected in (
+            (tp.eq, [False, True]),
+            (tp.ne, [True, False]),
+            (tp.lt, [False, False]),
+            (tp.le, [False, True]),
+            (tp.gt, [False, False]),
+            (tp.ge, [False, True]),
+        ):
+            self.assertEqual(op(x, x).cpu().tolist(), expected, op.__name__)
 
     def test_comparisons_needing_a_graph(self):
         # The operands a single dispatch cannot address: one that has to be
