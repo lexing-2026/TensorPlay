@@ -180,6 +180,16 @@ std::optional<Tensor> rowSumShader(const Tensor& self,
                                    const std::vector<int64_t>& out_shape,
                                    float divisor);
 
+// The softmax over the innermost axis of a contiguous float operand, written in
+// the operand's own shape. The shader caches each row in threadgroup memory, so
+// the maximum, the shifted exponential sum and the scaling cost one global read
+// and one global write. Returns std::nullopt for an operand of another dtype or
+// one whose softmax axis is not the innermost, for a row too long for the
+// threadgroup cache, and for an operand the shader cannot address; the caller
+// then takes the graph.
+std::optional<Tensor> softmaxRowShader(const Tensor& self, int64_t dim,
+                                       DType out_dtype);
+
 // The sum, or the extremum, of one long unit-stride float operand whose result
 // holds a single value. The operand is split into fixed-size chunks, one
 // SIMD group each, and the partials are folded by a second dispatch, so the

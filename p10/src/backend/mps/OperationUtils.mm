@@ -1104,6 +1104,94 @@ std::optional<Tensor> rowSumShader(const Tensor& self,
   return output;
 }
 
+std::optional<Tensor> softmaxRowShader(const Tensor& self, int64_t dim,
+                                       DType out_dtype) {
+  if (!self.device().is_mps() || self.dtype() != DType::Float32 ||
+      out_dtype != DType::Float32) {
+    return std::nullopt;
+  }
+  // The kernel walks one row after another through storage, so the operand has
+  // to be that run from its start.
+  if (!self.is_contiguous() || self.storage_offset() != 0) {
+    return std::nullopt;
+  }
+  const std::vector<int64_t> shape =
+      static_cast<std::vector<int64_t>>(self.shape());
+  if (shape.empty()) {
+    return std::nullopt;
+  }
+  const int64_t nd = static_cast<int64_t>(shape.size());
+  if (dim < 0) {
+    dim += nd;
+  }
+  if (dim != nd - 1) {
+    return std::nullopt;
+  }
+  const int64_t length64 = shape.back();
+  const int64_t numel = self.numel();
+  if (length64 <= 0 || numel <= 0 ||
+      length64 > std::numeric_limits<uint32_t>::max()) {
+    return std::nullopt;
+  }
+  const int64_t rows64 = numel / length64;
+  if (rows64 > std::numeric_limits<uint32_t>::max()) {
+    return std::nullopt;
+  }
+  const uint32_t rows = static_cast<uint32_t>(rows64);
+  const uint32_t length = static_cast<uint32_t>(length64);
+  MTLComputePipelineState_t pso = shaderPipelineNamed("softmax_row_float");
+  if (!pso) {
+    return std::nullopt;
+  }
+  // A threadgroup caches one row per SIMD group in it. As many groups as the
+  // threadgroup memory budget seats run together; a row too long for one group
+  // to cache is left to the graph.
+  uint32_t groups =
+      std::min(kRowReduceThreads,
+               static_cast<uint32_t>([pso maxTotalThreadsPerThreadgroup])) /
+      kRowReduceSimdgroup;
+  const uint64_t cache_limit =
+      static_cast<uint64_t>([[pso device] maxThreadgroupMemoryLength]);
+  while (groups > 1 &&
+         static_cast<uint64_t>(groups) * length * sizeof(float) >
+             cache_limit) {
+    groups >>= 1;
+  }
+  if (groups == 0 ||
+      static_cast<uint64_t>(groups) * length * sizeof(float) >
+          cache_limit) {
+    return std::nullopt;
+  }
+  void* in_buf = getMTLBufferFromPointer(self.data_ptr());
+  if (!in_buf) {
+    return std::nullopt;
+  }
+  Tensor output = emptyMPS(shape, DType::Float32, self.device());
+  void* out_buf = getMTLBufferFromPointer(output.data_ptr());
+  if (!out_buf) {
+    return std::nullopt;
+  }
+  const uint32_t threads = groups * kRowReduceSimdgroup;
+  const uint32_t threadgroups = (rows + groups - 1) / groups;
+  const std::array<uint32_t, 2> sizes = {rows, length};
+  const NSUInteger cache_bytes =
+      static_cast<NSUInteger>(groups) * length * sizeof(float);
+  MPSStream* stream = getCurrentMPSStream();
+  dispatch_sync_with_rethrow(stream->queue(), ^() {
+    @autoreleasepool {
+      auto encoder = stream->commandEncoder();
+      [encoder setComputePipelineState:pso];
+      [encoder setBuffer:(__bridge id<MTLBuffer>)out_buf offset:0 atIndex:0];
+      [encoder setBuffer:(__bridge id<MTLBuffer>)in_buf offset:0 atIndex:1];
+      [encoder setBytes:sizes.data() length:sizeof(sizes) atIndex:2];
+      [encoder setThreadgroupMemoryLength:cache_bytes atIndex:0];
+      [encoder dispatchThreads:MTLSizeMake(threadgroups * threads, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+    }
+  });
+  return output;
+}
+
 std::optional<Tensor> logsumexpRowShader(const Tensor& self,
                                          const std::vector<int64_t>& out_shape) {
   uint32_t rows = 0;

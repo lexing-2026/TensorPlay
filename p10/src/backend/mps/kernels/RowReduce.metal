@@ -427,6 +427,50 @@ kernel void extremum_chunk(device float* out [[buffer(0)]],
   }
 }
 
+// softmax over one row: exp(x - max) / sum(exp(x - max)). The row is cached in
+// threadgroup memory as it is read, so the maximum, the shifted exponentials
+// and the final scaling cost one global read and one global write. Each SIMD
+// group owns the cache region at its own offset, and every lane reads back only
+// the positions it wrote, so no barrier stands between the passes.
+kernel void softmax_row(device float* out [[buffer(0)]],
+                        constant float* src [[buffer(1)]],
+                        constant RowSizes& sizes [[buffer(2)]],
+                        threadgroup float* cache [[threadgroup(0)]],
+                        uint tptg [[threads_per_threadgroup]],
+                        uint tgid [[threadgroup_position_in_grid]],
+                        uint lane [[thread_index_in_simdgroup]],
+                        uint group [[simdgroup_index_in_threadgroup]]) {
+  const uint row = tgid * (tptg / simdgroup_size) + group;
+  if (row >= sizes[0]) {
+    return;
+  }
+  const uint n = sizes[1];
+  constant float* values = src + (uint64_t)row * (uint64_t)n;
+  device float* out_row = out + (uint64_t)row * (uint64_t)n;
+  threadgroup float* cache_row = cache + (uint64_t)group * (uint64_t)n;
+
+  float maximum = -INFINITY;
+  for (uint i = lane; i < n; i += simdgroup_size) {
+    const float value = values[i];
+    cache_row[i] = value;
+    maximum = max(maximum, value);
+  }
+  maximum = simd_max(maximum);
+
+  float total = 0.0f;
+  for (uint i = lane; i < n; i += simdgroup_size) {
+    const float e = exp(cache_row[i] - maximum);
+    cache_row[i] = e;
+    total += e;
+  }
+  total = simd_sum(total);
+
+  const float scale = 1.0f / total;
+  for (uint i = lane; i < n; i += simdgroup_size) {
+    out_row[i] = cache_row[i] * scale;
+  }
+}
+
 // Float is the only storage type the extrema read: an operand of another type
 // reduces in a type of its own, which the graph path builds around the
 // reduction. The predicates answer for float and for bool, the two the suite
@@ -479,6 +523,10 @@ kernel void extremum_chunk(device float* out [[buffer(0)]],
                                    uint group);
 
 REGISTER_ROW_SUM(float)
+template [[host_name("softmax_row_float")]] kernel void
+    softmax_row(device float* out, constant float* src,
+                constant RowSizes& sizes, threadgroup float* cache,
+                uint tptg, uint tgid, uint lane, uint group);
 REGISTER_SUM_CHUNK(float)
 REGISTER_EXTREMUM_CHUNK(maxchunk, arg_max<float>)
 REGISTER_EXTREMUM_CHUNK(minchunk, arg_min<float>)

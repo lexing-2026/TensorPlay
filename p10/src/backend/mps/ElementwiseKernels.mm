@@ -753,6 +753,9 @@ DType resolve_softmax_dtype(DType dtype, DType self_dtype) {
 Tensor softmax_kernel(const Tensor& self, int64_t dim, DType dtype) {
   const DType out_dtype = resolve_softmax_dtype(dtype, self.dtype());
   if (dim < 0) dim += self.dim();
+  if (auto result = softmaxRowShader(self, dim, out_dtype)) {
+    return *result;
+  }
   return unaryOp(graphKey("softmax", {std::to_string(dim)}), self,
                  ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* x) {
     MPSDataType dt = getMPSDataType(out_dtype);

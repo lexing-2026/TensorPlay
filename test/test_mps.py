@@ -269,6 +269,15 @@ class TestMPSSoftmaxReduction(unittest.TestCase):
         x = tp.full((2, 3), 2, device="mps", dtype=tp.float32)
         s = tp.softmax(x, dim=1)
         self.assertTrue(tp.allclose(s.cpu().sum(dim=1), tp.ones((2,))))
+        # A row longer than one lane stride and not a multiple of it.
+        y = (tp.arange(5 * 129, dtype=tp.float32, device="mps")
+             .reshape(5, 129) * 0.01)
+        self.assertTrue(tp.allclose(tp.softmax(y, dim=1).cpu(),
+                                    tp.softmax(y.cpu(), dim=1), atol=1e-6))
+        # A softmax over a middle axis stays with the graph.
+        z = tp.arange(24, dtype=tp.float32, device="mps").reshape(2, 3, 4)
+        self.assertTrue(tp.allclose(tp.softmax(z, dim=1).cpu(),
+                                    tp.softmax(z.cpu(), dim=1), atol=1e-6))
 
     def test_reductions(self):
         x = tp.arange(6, dtype=tp.float32, device="mps").reshape(2, 3)
