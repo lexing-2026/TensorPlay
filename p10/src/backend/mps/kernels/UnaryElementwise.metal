@@ -240,85 +240,28 @@ kernel void unary_elementwise_vec(device float4* out [[buffer(0)]],
 
 // Clamps a contiguous operand into [lo, hi]. The lower comparison is applied
 // first and the upper one to its result, so a NaN operand stays a NaN and a
-// lower bound above the upper bound answers with the upper bound, which is what
-// the operation asks for. An absent bound arrives as the infinity of its sign.
+// lower bound above the upper bound answers with the upper bound. An absent
+// bound arrives as the infinity of its sign. One element per thread at every
+// size: a four-wide form leaves a quarter of the threads in flight, and at the
+// sizes where this pass is bandwidth-bound that costs more than the wider
+// access saves.
 template <typename T>
 kernel void clamp_elementwise(device T* out [[buffer(0)]],
                               constant T* src [[buffer(1)]],
-                              constant uint& numel [[buffer(2)]],
-                              constant T& lo [[buffer(3)]],
-                              constant T& hi [[buffer(4)]],
+                              constant T& lo [[buffer(2)]],
+                              constant T& hi [[buffer(3)]],
                               uint tid [[thread_position_in_grid]]) {
-  const uint first = tid * ILP_PER_THREAD;
-  if (first + ILP_PER_THREAD <= numel) {
-    array<T, ILP_PER_THREAD> values;
-#pragma unroll
-    for (uint j = 0; j < ILP_PER_THREAD; ++j) {
-      T x = src[first + j];
-      T y = x < lo ? lo : x;
-      values[j] = y > hi ? hi : y;
-    }
-#pragma unroll
-    for (uint j = 0; j < ILP_PER_THREAD; ++j) {
-      out[first + j] = values[j];
-    }
-  } else {
-    for (uint i = first; i < numel; ++i) {
-      T x = src[i];
-      T y = x < lo ? lo : x;
-      out[i] = y > hi ? hi : y;
-    }
-  }
+  const T x = src[tid];
+  const T y = x < lo ? lo : x;
+  out[tid] = y > hi ? hi : y;
 }
 
 template [[host_name("clamp_elementwise_float")]]
 kernel void clamp_elementwise<float>(device float* out [[buffer(0)]],
                                      constant float* src [[buffer(1)]],
-                                     constant uint& numel [[buffer(2)]],
-                                     constant float& lo [[buffer(3)]],
-                                     constant float& hi [[buffer(4)]],
+                                     constant float& lo [[buffer(2)]],
+                                     constant float& hi [[buffer(3)]],
                                      uint tid [[thread_position_in_grid]]);
-
-// Four-wide clamp: the same lower-then-upper order on each component, with the
-// vector moved by one 16-byte access each way. As in the unary form, a thread
-// takes one vector per grid-wide stride so every load and store of a SIMD
-// group covers a contiguous span.
-inline float4 clamp4(float4 v, float lo, float hi) {
-  const float x = v.x < lo ? lo : v.x;
-  const float y = v.y < lo ? lo : v.y;
-  const float z = v.z < lo ? lo : v.z;
-  const float w = v.w < lo ? lo : v.w;
-  return float4(x > hi ? hi : x, y > hi ? hi : y, z > hi ? hi : z,
-                w > hi ? hi : w);
-}
-
-kernel void clamp_elementwise_vec_float(device float4* out [[buffer(0)]],
-                                        constant float4* src [[buffer(1)]],
-                                        constant uint& nvec [[buffer(2)]],
-                                        constant float& lo [[buffer(3)]],
-                                        constant float& hi [[buffer(4)]],
-                                        uint tid [[thread_position_in_grid]],
-                                        uint grid [[threads_per_grid]]) {
-  if (tid + (ILP_PER_THREAD - 1) * grid < nvec) {
-    array<float4, ILP_PER_THREAD> values;
-#pragma unroll
-    for (uint j = 0; j < ILP_PER_THREAD; ++j) {
-      values[j] = src[tid + j * grid];
-    }
-#pragma unroll
-    for (uint j = 0; j < ILP_PER_THREAD; ++j) {
-      values[j] = clamp4(values[j], lo, hi);
-    }
-#pragma unroll
-    for (uint j = 0; j < ILP_PER_THREAD; ++j) {
-      out[tid + j * grid] = values[j];
-    }
-  } else {
-    for (uint i = tid; i < nvec; i += grid) {
-      out[i] = clamp4(src[i], lo, hi);
-    }
-  }
-}
 
 // Half, bfloat16 and the integer storage types are absent: an operation with
 // one of them runs its math in a wider type, which the graph path builds as a
