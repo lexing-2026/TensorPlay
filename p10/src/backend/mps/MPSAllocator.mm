@@ -232,7 +232,11 @@ class MPSAllocatorImpl final : public IMPSAllocator {
 
   BufferBlock* findReusableBlock(size_t aligned) {
     // Best-fit: the smallest cached block large enough to serve the request.
+    // The key's id is zero so that a cached block of exactly this size compares
+    // equal or greater; the set's id tiebreaker would otherwise order every
+    // same-sized block before the key and hide it from the search.
     BufferBlock key(aligned, aligned);
+    key.buf_id = 0;
     auto it = m_available_buffers.lower_bound(&key);
     if (it != m_available_buffers.end()) {
       BufferBlock* block = *it;
