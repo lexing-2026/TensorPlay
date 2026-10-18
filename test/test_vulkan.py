@@ -2198,6 +2198,71 @@ class TestVulkanDtypeConversion(unittest.TestCase):
             device.to(tp.float16)
 
 
+class TestVulkanHalfComparison(unittest.TestCase):
+    # Comparisons read a half payload through single precision, which maps each
+    # lane exactly, so ties, signed zeros, infinities and not-a-number decide
+    # the same way the host reference does.  Both storages need a case: a row
+    # wider than the image-axis limit lives in a buffer, where two lanes share
+    # one word and the Bool result packs four lanes per word.
+    LENGTHS = (4096, 200003)
+    OPS = ("eq", "ne", "lt", "le", "gt", "ge")
+
+    def _half_values(self, count, seed):
+        rng = np.random.default_rng(seed)
+        values = (rng.standard_normal(count) * 4.0).astype(np.float16)
+        specials = np.array(
+            [np.inf, -np.inf, np.nan, 0.0, -0.0, 65504.0, -65504.0,
+             2.0 ** -24, 1.0009765625, 1.0], dtype=np.float16)
+        values[:specials.size] = specials
+        return values
+
+    def test_half_tensors_compare_elementwise(self):
+        import tensorplay.functional as F
+        for count in self.LENGTHS:
+            a_cpu = self._half_values(count, 5)
+            b_cpu = self._half_values(count, 6)
+            a = tensorplay.from_numpy(a_cpu.copy()).to("vulkan")
+            b = tensorplay.from_numpy(b_cpu.copy()).to("vulkan")
+            host_a = tensorplay.from_numpy(a_cpu.copy())
+            host_b = tensorplay.from_numpy(b_cpu.copy())
+            for name in self.OPS:
+                op = getattr(F, name)
+                got = op(a, b).cpu().numpy()
+                want = op(host_a, host_b).cpu().numpy()
+                np.testing.assert_array_equal(
+                    got.astype(np.int8), want.astype(np.int8),
+                    err_msg=f"{name} over half lanes at {count} elements")
+
+    def test_half_against_scalar_rounds_the_threshold(self):
+        import tensorplay.functional as F
+        # The scalar enters the element domain before the decision, so a value
+        # that falls between two representable halves is worth whichever one it
+        # rounds to: 1.00048828125 sits below the midpoint above 1.0 and so
+        # matches a lane holding exactly 1.0.
+        scalars = (0.0, -0.0, 1.0, 1.00048828125, 1.0009765625, -3.5,
+                   65504.0, 70000.0, 2, 1)
+        for count in self.LENGTHS:
+            values = self._half_values(count, 9)
+            device = tensorplay.from_numpy(values.copy()).to("vulkan")
+            host = tensorplay.from_numpy(values.copy())
+            for name in self.OPS:
+                op = getattr(F, name)
+                for scalar in scalars:
+                    np.testing.assert_array_equal(
+                        op(device, scalar).cpu().numpy().astype(np.int8),
+                        op(host, scalar).cpu().numpy().astype(np.int8),
+                        err_msg=f"{name} against {scalar!r} at {count} elements")
+
+    def test_half_comparison_rejects_operand_without_a_kernel(self):
+        import tensorplay.functional as F
+        # Byte lanes have no linear comparison form: a wide payload of them is
+        # refused instead of being read with the wrong element width.
+        device = tensorplay.from_numpy(
+            np.arange(200003, dtype=np.int8)).to("vulkan")
+        with self.assertRaisesRegex(RuntimeError, "over buffer storage"):
+            F.gt(device, 3)
+
+
 if __name__ == "__main__":
     unittest.main()
 
