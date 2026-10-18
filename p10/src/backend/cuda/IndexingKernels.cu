@@ -80,6 +80,33 @@ inline bool use_slice_kernel(int64_t inner, int64_t n_idx, int64_t outer) {
            n_idx * std::min<int64_t>(outer, 65535) >= 64;
 }
 
+// The chunked slice kernels move each row in 16-byte units, which needs the
+// row payload to divide evenly into chunks and both ends of every move to sit
+// on a 16-byte boundary.
+inline bool vec_slice_ok(const void* first, const void* second) {
+    if (reinterpret_cast<uintptr_t>(first) % 16 != 0) return false;
+    return second == nullptr ||
+           reinterpret_cast<uintptr_t>(second) % 16 == 0;
+}
+
+// Block shape for the chunked slice kernels: `c_span` chunks of a row across
+// the x dimension and `k_span` rows per block down the y dimension, tuned so
+// that a block holds close to 128 threads for narrow rows while wide rows get
+// the larger blocks.
+inline void vec_slice_block(int64_t chunks, int& c_span, int& k_span) {
+    if (chunks >= 512) {
+        c_span = 512;
+        k_span = 1;
+    } else if (chunks >= 128) {
+        c_span = static_cast<int>((chunks + 31) / 32 * 32);
+        k_span = 1;
+    } else {
+        c_span = static_cast<int>(std::max<int64_t>(chunks, 1));
+        k_span = static_cast<int>(
+            std::min<int64_t>(std::max<int64_t>(1, 128 / c_span), 16));
+    }
+}
+
 // Index-select row gather.
 template <typename T, typename IndexT>
 __global__ void index_select_kernel(int64_t total_out_elems, int64_t n_idx, int64_t inner,
@@ -228,6 +255,163 @@ __global__ void index_fill_slice_kernel(int64_t n_idx, int64_t outer,
             }
         }
     }
+}
+
+// Chunked variants of the slice kernels: a row moves in 16-byte units so each
+// thread shifts one vector per step, and a block covers `k_span` consecutive
+// entries with `c_span` chunks of each row across its two block dimensions.
+// The payload size and pointer alignment that make the casts sound are checked
+// before every launch.
+template <typename IndexT>
+__global__ void index_select_slice_vec_kernel(int64_t n_idx, int64_t outer,
+                                              int64_t chunks, int64_t row,
+                                              const uint4* s, const IndexT* ip,
+                                              uint4* d) {
+    const int64_t c_span = blockDim.x;
+    const int64_t k_span = blockDim.y;
+    const int64_t k_stride = static_cast<int64_t>(gridDim.x) * k_span;
+    const int64_t o_stride = static_cast<int64_t>(gridDim.y);
+    for (int64_t o = blockIdx.y; o < outer; o += o_stride) {
+        for (int64_t k = static_cast<int64_t>(blockIdx.x) * k_span + threadIdx.y;
+             k < n_idx; k += k_stride) {
+            int64_t source_index = ip[k];
+            TP_INDEX_RANGE_GUARD(source_index, row);
+            const uint4* source = s + (o * row + source_index) * chunks;
+            uint4* destination = d + (o * n_idx + k) * chunks;
+            for (int64_t c = threadIdx.x; c < chunks; c += c_span) {
+                destination[c] = source[c];
+            }
+        }
+    }
+}
+
+__global__ void index_copy_slice_vec_kernel(int64_t n_idx, int64_t outer,
+                                            int64_t chunks, int64_t row,
+                                            uint4* d, const int64_t* ip,
+                                            const uint4* sp) {
+    const int64_t c_span = blockDim.x;
+    const int64_t k_span = blockDim.y;
+    const int64_t k_stride = static_cast<int64_t>(gridDim.x) * k_span;
+    const int64_t o_stride = static_cast<int64_t>(gridDim.y);
+    for (int64_t o = blockIdx.y; o < outer; o += o_stride) {
+        for (int64_t k = static_cast<int64_t>(blockIdx.x) * k_span + threadIdx.y;
+             k < n_idx; k += k_stride) {
+            int64_t destination_index = ip[k];
+            TP_INDEX_RANGE_GUARD(destination_index, row);
+            uint4* destination = d + (o * row + destination_index) * chunks;
+            const uint4* source = sp + (o * n_idx + k) * chunks;
+            for (int64_t c = threadIdx.x; c < chunks; c += c_span) {
+                destination[c] = source[c];
+            }
+        }
+    }
+}
+
+template <typename T>
+__global__ void index_fill_slice_vec_kernel(int64_t n_idx, int64_t outer,
+                                            int64_t chunks, int64_t row,
+                                            uint4* d, const int64_t* ip, T v) {
+    alignas(16) unsigned char bytes[16];
+    const unsigned char* value_bytes =
+        reinterpret_cast<const unsigned char*>(&v);
+    for (int i = 0; i < 16; i += static_cast<int>(sizeof(T))) {
+        for (int b = 0; b < static_cast<int>(sizeof(T)); ++b) {
+            bytes[i + b] = value_bytes[b];
+        }
+    }
+    const uint4 pattern = *reinterpret_cast<const uint4*>(bytes);
+    const int64_t c_span = blockDim.x;
+    const int64_t k_span = blockDim.y;
+    const int64_t k_stride = static_cast<int64_t>(gridDim.x) * k_span;
+    const int64_t o_stride = static_cast<int64_t>(gridDim.y);
+    for (int64_t o = blockIdx.y; o < outer; o += o_stride) {
+        for (int64_t k = static_cast<int64_t>(blockIdx.x) * k_span + threadIdx.y;
+             k < n_idx; k += k_stride) {
+            int64_t destination_index = ip[k];
+            TP_INDEX_RANGE_GUARD(destination_index, row);
+            uint4* destination = d + (o * row + destination_index) * chunks;
+            for (int64_t c = threadIdx.x; c < chunks; c += c_span) {
+                destination[c] = pattern;
+            }
+        }
+    }
+}
+
+// Launch the chunked select kernel when the row payload divides into 16-byte
+// chunks and both ends are 16-byte aligned; returns false so the caller can
+// fall back to the scalar kernels.
+template <typename IndexT>
+bool launch_index_select_slice_vec(int64_t n_idx, int64_t inner, int64_t row,
+                                   int64_t outer, const Tensor& self,
+                                   const Tensor& index, Tensor& result,
+                                   cudaStream_t stream) {
+    const int64_t row_bytes =
+        inner * static_cast<int64_t>(self.itemsize());
+    if (row_bytes % 16 != 0) return false;
+    if (!vec_slice_ok(self.data_ptr(), result.data_ptr())) return false;
+    const int64_t chunks = row_bytes / 16;
+    int c_span = 1, k_span = 1;
+    vec_slice_block(chunks, c_span, k_span);
+    const unsigned index_blocks = static_cast<unsigned>(
+        std::min<int64_t>((n_idx + k_span - 1) / k_span, 2147483647));
+    const unsigned outer_blocks = static_cast<unsigned>(
+        std::min<int64_t>(outer, 65535));
+    index_select_slice_vec_kernel<IndexT><<<dim3(index_blocks, outer_blocks),
+                                            dim3(c_span, k_span), 0, stream>>>(
+        n_idx, outer, chunks, row,
+        static_cast<const uint4*>(self.data_ptr()),
+        index.data_ptr<IndexT>(), static_cast<uint4*>(result.data_ptr()));
+    return true;
+}
+
+// Same for the copy kernel: both ends of every move must be 16-byte aligned.
+bool launch_index_copy_slice_vec(int64_t n_idx, int64_t inner, int64_t row,
+                                 int64_t outer, Tensor& destination,
+                                 const Tensor& source, const Tensor& index,
+                                 cudaStream_t stream) {
+    const int64_t row_bytes =
+        inner * static_cast<int64_t>(destination.itemsize());
+    if (row_bytes % 16 != 0) return false;
+    if (!vec_slice_ok(destination.data_ptr(), source.data_ptr())) return false;
+    const int64_t chunks = row_bytes / 16;
+    int c_span = 1, k_span = 1;
+    vec_slice_block(chunks, c_span, k_span);
+    const unsigned index_blocks = static_cast<unsigned>(
+        std::min<int64_t>((n_idx + k_span - 1) / k_span, 2147483647));
+    const unsigned outer_blocks = static_cast<unsigned>(
+        std::min<int64_t>(outer, 65535));
+    index_copy_slice_vec_kernel<<<dim3(index_blocks, outer_blocks),
+                                  dim3(c_span, k_span), 0, stream>>>(
+        n_idx, outer, chunks, row,
+        static_cast<uint4*>(destination.data_ptr()),
+        index.data_ptr<int64_t>(),
+        static_cast<const uint4*>(source.data_ptr()));
+    return true;
+}
+
+// Same for the fill kernel; the value repeats across the 16-byte pattern.
+template <typename T>
+bool launch_index_fill_slice_vec(int64_t n_idx, int64_t inner, int64_t row,
+                                 int64_t outer, Tensor& destination,
+                                 const Tensor& index, T v,
+                                 cudaStream_t stream) {
+    const int64_t row_bytes =
+        inner * static_cast<int64_t>(destination.itemsize());
+    if (row_bytes % 16 != 0) return false;
+    if (!vec_slice_ok(destination.data_ptr(), nullptr)) return false;
+    const int64_t chunks = row_bytes / 16;
+    int c_span = 1, k_span = 1;
+    vec_slice_block(chunks, c_span, k_span);
+    const unsigned index_blocks = static_cast<unsigned>(
+        std::min<int64_t>((n_idx + k_span - 1) / k_span, 2147483647));
+    const unsigned outer_blocks = static_cast<unsigned>(
+        std::min<int64_t>(outer, 65535));
+    index_fill_slice_vec_kernel<T><<<dim3(index_blocks, outer_blocks),
+                                     dim3(c_span, k_span), 0, stream>>>(
+        n_idx, outer, chunks, row,
+        static_cast<uint4*>(destination.data_ptr()),
+        index.data_ptr<int64_t>(), v);
+    return true;
 }
 
 #define TP_NZ_ITEMS(ctype) (sizeof(ctype) >= 8 ? 2 : 4)
@@ -419,6 +603,17 @@ Tensor index_select_cuda(const Tensor& self, int64_t dim, const Tensor& index) {
     Tensor self_c = self.contiguous();
     auto stream = getCurrentCUDAStream().stream();
     const int slice_threads = slice_block_threads(inner);
+    if (use_slice_kernel(inner, n_idx, outer)) {
+        const bool chunked = idx.dtype() == DType::Int32
+            ? launch_index_select_slice_vec<int32_t>(
+                  n_idx, inner, row, outer, self_c, idx, result, stream)
+            : launch_index_select_slice_vec<int64_t>(
+                  n_idx, inner, row, outer, self_c, idx, result, stream);
+        if (chunked) {
+            CUDA_CHECK(cudaGetLastError());
+            return result;
+        }
+    }
     if (idx.dtype() == DType::Int32) {
         launch_index_select_for_index<int32_t>(
             total, n_idx, inner, row, outer, self_c, idx, result,
@@ -451,6 +646,12 @@ Tensor index_copy_cuda(const Tensor& self, int64_t dim, const Tensor& index, con
     Tensor source_c = source.contiguous();
     auto stream = getCurrentCUDAStream().stream();
     const int slice_threads = slice_block_threads(inner);
+    if (use_slice_kernel(inner, n_idx, outer) &&
+        launch_index_copy_slice_vec(n_idx, inner, row, outer, result,
+                                    source_c, idx, stream)) {
+        CUDA_CHECK(cudaGetLastError());
+        return result;
+    }
 #define TP_IC_CASE(ctype, name) \
     case DType::name: { \
         if (use_slice_kernel(inner, n_idx, outer)) { \
@@ -504,6 +705,12 @@ Tensor& index_copy_inplace_cuda(Tensor& self, int64_t dim, const Tensor& index, 
     Tensor source_c = source.contiguous();
     auto stream = getCurrentCUDAStream().stream();
     const int slice_threads = slice_block_threads(inner);
+    if (use_slice_kernel(inner, n_idx, outer) &&
+        launch_index_copy_slice_vec(n_idx, inner, row, outer, self,
+                                    source_c, idx, stream)) {
+        CUDA_CHECK(cudaGetLastError());
+        return self;
+    }
 #define TP_IC_IP_CASE(ctype, name) \
     case DType::name: { \
         if (use_slice_kernel(inner, n_idx, outer)) { \
@@ -566,14 +773,18 @@ Tensor index_fill_scalar_cuda(const Tensor& self, int64_t dim, const Tensor& ind
     case DType::name: { \
         ctype v = value.to<ctype>(); \
         if (use_slice_kernel(inner, n_idx, outer)) { \
-            const unsigned index_blocks = static_cast<unsigned>( \
-                std::min<int64_t>(n_idx, 2147483647)); \
-            const unsigned outer_blocks = static_cast<unsigned>( \
-                std::min<int64_t>(outer, 65535)); \
-            index_fill_slice_kernel<ctype><<< \
-                dim3(index_blocks, outer_blocks), slice_threads, 0, stream>>>( \
-                n_idx, outer, inner, row, static_cast<ctype*>(result.data_ptr()), \
-                idx.data_ptr<int64_t>(), v); \
+            const bool chunked = launch_index_fill_slice_vec<ctype>( \
+                n_idx, inner, row, outer, result, idx, v, stream); \
+            if (!chunked) { \
+                const unsigned index_blocks = static_cast<unsigned>( \
+                    std::min<int64_t>(n_idx, 2147483647)); \
+                const unsigned outer_blocks = static_cast<unsigned>( \
+                    std::min<int64_t>(outer, 65535)); \
+                index_fill_slice_kernel<ctype><<< \
+                    dim3(index_blocks, outer_blocks), slice_threads, 0, stream>>>( \
+                    n_idx, outer, inner, row, static_cast<ctype*>(result.data_ptr()), \
+                    idx.data_ptr<int64_t>(), v); \
+            } \
         } else { \
             index_fill_kernel<ctype><<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
                 total, n_idx, inner, row, static_cast<ctype*>(result.data_ptr()), \
@@ -619,14 +830,18 @@ Tensor& index_fill_scalar__cuda(Tensor& self, int64_t dim, const Tensor& index, 
     case DType::name: { \
         ctype v = value.to<ctype>(); \
         if (use_slice_kernel(inner, n_idx, outer)) { \
-            const unsigned index_blocks = static_cast<unsigned>( \
-                std::min<int64_t>(n_idx, 2147483647)); \
-            const unsigned outer_blocks = static_cast<unsigned>( \
-                std::min<int64_t>(outer, 65535)); \
-            index_fill_slice_kernel<ctype><<< \
-                dim3(index_blocks, outer_blocks), slice_threads, 0, stream>>>( \
-                n_idx, outer, inner, row, static_cast<ctype*>(self.data_ptr()), \
-                idx.data_ptr<int64_t>(), v); \
+            const bool chunked = launch_index_fill_slice_vec<ctype>( \
+                n_idx, inner, row, outer, self, idx, v, stream); \
+            if (!chunked) { \
+                const unsigned index_blocks = static_cast<unsigned>( \
+                    std::min<int64_t>(n_idx, 2147483647)); \
+                const unsigned outer_blocks = static_cast<unsigned>( \
+                    std::min<int64_t>(outer, 65535)); \
+                index_fill_slice_kernel<ctype><<< \
+                    dim3(index_blocks, outer_blocks), slice_threads, 0, stream>>>( \
+                    n_idx, outer, inner, row, static_cast<ctype*>(self.data_ptr()), \
+                    idx.data_ptr<int64_t>(), v); \
+            } \
         } else { \
             index_fill_kernel<ctype><<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
                 total, n_idx, inner, row, static_cast<ctype*>(self.data_ptr()), \
