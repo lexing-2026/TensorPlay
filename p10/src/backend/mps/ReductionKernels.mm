@@ -722,9 +722,12 @@ Tensor arg_reduce_impl(const Tensor& self, int64_t dim, bool keepdim,
       if (i != dim) out_shape.push_back(in_shape[i]);
     }
   }
-  Tensor indices = Tensor::empty(out_shape, DType::Int64, self.device());
-  if (indices.numel() == 0) {
-    return indices;
+  int64_t out_numel = 1;
+  for (int64_t size : out_shape) {
+    out_numel *= size;
+  }
+  if (out_numel == 0) {
+    return Tensor::empty(out_shape, DType::Int64, self.device());
   }
   // Over the last axis, the whole of a row belongs to one SIMD group, so the
   // position of the extremum is a single dispatch and the index never leaves
@@ -734,6 +737,7 @@ Tensor arg_reduce_impl(const Tensor& self, int64_t dim, bool keepdim,
       return *result;
     }
   }
+  Tensor indices = Tensor::empty(out_shape, DType::Int64, self.device());
   // The index reduction keeps the rank of its input and leaves a size-1
   // dimension where the axis was, so a partial one is written in that shape.  A
   // rank-1 input reduced over its only axis leaves no rank, so that result is
