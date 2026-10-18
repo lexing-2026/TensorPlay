@@ -635,7 +635,12 @@ if(USE_VULKAN)
     if(NOT TP_GLSLANG_VALIDATOR)
         message(FATAL_ERROR "USE_VULKAN requires glslangValidator (expected under tools/bin).")
     endif()
-    file(GLOB_RECURSE TP_VULKAN_GLSL CONFIG_DEPENDS
+    # The registry is one generated translation unit holding every shader, so
+    # its dependency list has to track newly added sources. Without re-globbing
+    # at build time a kernel added since the last configure never enters the
+    # list, the generator reports nothing to do, and a relinked library
+    # silently predates the .glsl files on disk.
+    file(GLOB_RECURSE TP_VULKAN_GLSL CONFIGURE_DEPENDS
         "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/vulkan/glsl/*.glsl")
     list(APPEND TP_VULKAN_GLSL
         "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/vulkan/glsl/shader_params.yaml")
