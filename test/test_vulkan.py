@@ -2336,6 +2336,96 @@ class TestVulkanHalfWhere(unittest.TestCase):
                     err_msg=f"half scalar branch against {scalar!r} at {count}")
 
 
+class TestVulkanHalfGather(unittest.TestCase):
+    # A half gather moves 16-bit lanes: one result word owns two elements, and a
+    # row width that is not a multiple of two leaves a word shared between two
+    # rows.  Whole-number payloads keep the bit-for-bit comparison meaningful.
+
+    @staticmethod
+    def _table(rows, cols):
+        r = np.arange(rows, dtype=np.int64)[:, None]
+        c = np.arange(cols, dtype=np.int64)[None, :]
+        return ((r * 31 + c * 7) % 2048 - 1024).astype(np.float16)
+
+    def _check_pair(self, table_np, sel, vk_table, vk_sel, err_msg):
+        import tensorplay.functional as F
+        want = table_np[sel].view(np.uint16)
+        for name, out in (
+                ("embedding", F.embedding(vk_table, vk_sel)),
+                ("index_select", F.index_select(vk_table, 0, vk_sel))):
+            got = out.cpu().numpy()
+            np.testing.assert_array_equal(
+                got.view(np.uint16), want, err_msg=f"{name} {err_msg}")
+
+    def test_half_gather_over_texel_table(self):
+        # A table whose flat form fits an image axis is gathered through the
+        # texel route, which reads half lanes widened by the format conversion.
+        rng = np.random.default_rng(3)
+        for cols in (32, 37):
+            table_np = self._table(200, cols)
+            vk_table = tensorplay.from_numpy(table_np.copy()).to("vulkan")
+            for count in (129, 512):
+                sel = rng.integers(0, 200, count).astype(np.int32)
+                self._check_pair(
+                    table_np, sel, vk_table,
+                    tensorplay.from_numpy(sel.copy()).to("vulkan"),
+                    f"over a 200x{cols} texel table at {count} indices")
+
+    def test_half_gather_straddling_the_image_axis_limit(self):
+        # The index list holds one index per texel, so a list beyond the axis
+        # limit has no image form even when the table does; the gather then
+        # copies the half payload into dense linear storage instead of refusing
+        # the shape pair.  The lengths below cross the limit from both sides.
+        rng = np.random.default_rng(4)
+        table_np = self._table(1000, 8)
+        vk_table = tensorplay.from_numpy(table_np.copy()).to("vulkan")
+        for count in (512, 16383, 16384, 16385, 20000):
+            sel = rng.integers(0, 1000, count).astype(np.int32)
+            self._check_pair(
+                table_np, sel, vk_table,
+                tensorplay.from_numpy(sel.copy()).to("vulkan"),
+                f"over a texel table at {count} indices")
+
+    def test_half_gather_over_linear_table(self):
+        # A vocabulary past the axis limit lives in linear storage already, so
+        # the gather reads it where it lies; the widths below leave half rows
+        # straddling word bounds.
+        rng = np.random.default_rng(6)
+        for cols in (64, 33):
+            table_np = self._table(20000, cols)
+            vk_table = tensorplay.from_numpy(table_np.copy()).to("vulkan")
+            count = 512 if cols == 64 else 4096
+            sel = rng.integers(0, 20000, count).astype(np.int32)
+            self._check_pair(
+                table_np, sel, vk_table,
+                tensorplay.from_numpy(sel.copy()).to("vulkan"),
+                f"over a 20000x{cols} linear table at {count} indices")
+
+    def test_half_gather_of_a_flat_linear_payload(self):
+        import tensorplay.functional as F
+        # A long 1-d payload is stored linearly and gathered with one element per
+        # logical position, so the row stride of the selection is one.
+        rng = np.random.default_rng(7)
+        table_np = (np.arange(70000) % 2048).astype(np.float16)
+        vk_table = tensorplay.from_numpy(table_np.copy()).to("vulkan")
+        for count in (66558, 66559, 66560):
+            sel = rng.integers(0, table_np.size, count).astype(np.int32)
+            got = F.index_select(
+                vk_table, 0,
+                tensorplay.from_numpy(sel.copy()).to("vulkan")).cpu().numpy()
+            np.testing.assert_array_equal(
+                got.view(np.uint16), table_np[sel].view(np.uint16),
+                err_msg=f"flat half gather at {count} indices")
+
+    def test_half_gather_rejects_integer_table(self):
+        import tensorplay.functional as F
+        device = tensorplay.from_numpy(
+            np.arange(200003, dtype=np.int32)).to("vulkan")
+        sel = tensorplay.from_numpy(np.arange(8, dtype=np.int32)).to("vulkan")
+        with self.assertRaisesRegex(RuntimeError, "Float32 and Float16"):
+            F.index_select(device, 0, sel)
+
+
 if __name__ == "__main__":
     unittest.main()
 
