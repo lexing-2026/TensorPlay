@@ -37,14 +37,16 @@ inline Device vulkan_device() {
 
 //
 // Restricts creation-time dtypes to the element types the backend implements:
-// 1-, 2-, and 4-byte payloads backed by a matching VkFormat.  Requests outside
-// the set are rejected at allocation time.
+// 1-, 2-, and 4-byte payloads backed by a matching VkFormat, plus 64-bit
+// codes, which have no texel form and therefore live only in linear storage.
+// Requests outside the set are rejected at allocation time.
 //
 inline DType convert_dtype(const DType dtype) {
   switch (toUnderlyingStorageType(dtype)) {
     case DType::UInt8:
     case DType::Int8:
     case DType::Int32:
+    case DType::Int64:
     case DType::Bool:
     case DType::Float16:
     case DType::Float32:

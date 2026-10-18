@@ -305,6 +305,16 @@ vTensorStorage::vTensorStorage(
       last_access_{} {
   verify();
 
+  // A texel holds at most four 32-bit channels, so a code wider than one word
+  // has no image form on any device: it keeps the plain linear layout whatever
+  // the shape.  This is how a 64-bit index vector reaches the device, where a
+  // kernel reads it as pairs of words instead of narrowing it on the host.
+  if (api::StorageType::TEXTURE_3D == storage_type_ &&
+      tensorplay::elementSize(dtype) > 4u) {
+    storage_type_ = api::StorageType::BUFFER;
+    gpu_memory_layout_ = api::GPUMemoryLayout::TENSOR_WIDTH_PACKED;
+  }
+
   // Zero-element payloads have no valid image extents and no bytes to move;
   // keep a minimal linear backing allocation so Vulkan resource creation
   // succeeds, and report buffer storage with a zero logical length.
@@ -325,10 +335,12 @@ vTensorStorage::vTensorStorage(
     return;
   }
 
+  // The members, not the parameters: a payload whose element has no texel form
+  // has already been switched to the linear layout above.
   const std::vector<int64_t> gpu_sizes =
-      calc_gpu_sizes(sizes, gpu_memory_layout, storage_type);
+      calc_gpu_sizes(sizes, gpu_memory_layout_, storage_type_);
 
-  if (api::StorageType::BUFFER == storage_type) {
+  if (api::StorageType::BUFFER == storage_type_) {
     buffer_length_ = static_cast<int64_t>(utils::multiply_integers(sizes));
 
     const VkDeviceSize nbytes =
@@ -349,8 +361,9 @@ vTensorStorage::vTensorStorage(
     return;
   }
 
-  if (api::StorageType::TEXTURE_3D == storage_type) {
-    extents_ = create_image_extents(gpu_sizes, storage_type, gpu_memory_layout);
+  if (api::StorageType::TEXTURE_3D == storage_type_) {
+    extents_ = create_image_extents(
+        gpu_sizes, storage_type_, gpu_memory_layout_);
 
     if (!texture_extents_supported(context_, extents_)) {
       // This shape maps to image axes beyond the device limit (long 1-D
@@ -380,7 +393,8 @@ vTensorStorage::vTensorStorage(
         !context_->acquire_reusable_image(
             extents_, to_vkformat(dtype), image_, last_access_)) {
       image_ = allocate_image(
-          context_, extents_, storage_type, to_vkformat(dtype), allocate_memory);
+          context_, extents_, storage_type_, to_vkformat(dtype),
+          allocate_memory);
     }
     return;
   }

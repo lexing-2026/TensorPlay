@@ -338,6 +338,9 @@ void scatter_staging_values_buffer_1d(
     case DType::Int32:
       scatter_staging_buffer_1d<int32_t>(v, steps, fill);
       return;
+    case DType::Int64:
+      scatter_staging_buffer_1d<int64_t>(v, steps, fill);
+      return;
     case DType::Int8:
     case DType::Bool:
       scatter_staging_buffer_1d<int8_t>(v, steps, fill);
@@ -471,9 +474,11 @@ Tensor arange_start_step_kernel(
   if (dtype == DType::Undefined) {
     dtype = DType::Float32;
   } else if (dtype == DType::Int64) {
-    // The composite arange resolves integral inputs to Int64, which the
-    // Vulkan backend does not store; Int32 is the widest supported integer
-    // payload.
+    // A 64-bit sequence stores fine, but a range is only ever built so that
+    // something else can read it, and the consumers of an index vector (slice,
+    // view, compare) walk a linear payload one word per element.  Handing them
+    // a pair per element would stop the first of them; the widest code they
+    // implement is the one a range resolves to.
     dtype = DType::Int32;
   } else if (dtype == DType::Float64) {
     dtype = DType::Float32;
