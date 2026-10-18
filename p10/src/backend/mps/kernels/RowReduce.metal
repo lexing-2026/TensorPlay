@@ -260,6 +260,8 @@ struct all_nonzero {
     return seen < held ? seen : held;
   }
   static inline uint reduce(uint held) { return simd_min(held); }
+  // The row's answer cannot change once a zero has been folded in.
+  static inline bool settled(uint folded) { return folded == 0; }
 };
 
 template <typename T>
@@ -270,6 +272,8 @@ struct any_nonzero {
     return seen > held ? seen : held;
   }
   static inline uint reduce(uint held) { return simd_max(held); }
+  // The row's answer cannot change once a nonzero has been folded in.
+  static inline bool settled(uint folded) { return folded != 0; }
 };
 
 template <typename Op, typename T>
@@ -303,6 +307,22 @@ kernel void row_pred_inner(device bool* out [[buffer(0)]],
     for (uint j = 0; j < kSumChains; ++j) {
       held[j] = Op::combine(held[j],
                             Op::test(values[base + j * simdgroup_size + lane]));
+    }
+    // A predicate row is settled as soon as one element answers against the
+    // question: an `all` that has met a zero stays false and an `any` that has
+    // met a nonzero stays true. Folding the chains after each block lets the
+    // walk stop there instead of reading the rest of the row.
+    uint current = held[0];
+#pragma unroll
+    for (uint j = 1; j < kSumChains; ++j) {
+      current = Op::combine(current, held[j]);
+    }
+    const uint seen = Op::reduce(current);
+    if (Op::settled(seen)) {
+      if (lane == 0) {
+        out[row] = seen != 0;
+      }
+      return;
     }
   }
   for (uint i = whole + lane; i < n; i += simdgroup_size) {
