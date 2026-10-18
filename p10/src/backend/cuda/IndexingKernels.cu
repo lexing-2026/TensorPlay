@@ -260,9 +260,10 @@ __global__ void nonzero_block_offsets(int32_t blocks, int32_t* per_block) {
 // *consecutive* elements and loads them as one vector: consecutive lanes then
 // cover consecutive vectors, and — because a thread's items are adjacent — the
 // slots the block scan hands out are already in ascending order, so the
-// positions come out sorted without a second exchange pass.
+// coordinate rows come out sorted without a second exchange pass.
 template <typename T, int BLOCK, int ITEMS>
-__global__ void nonzero_flag_kernel(int64_t n, const T* x, int64_t* flat,
+__global__ void nonzero_flag_kernel(int64_t n, const T* x, int64_t ndim,
+                                    const int64_t* dim_sizes, int64_t* out,
                                     const int32_t* block_base) {
     using Vec = NonZeroVec<T, ITEMS>;
     constexpr int kWarps = BLOCK / 32;
@@ -313,31 +314,24 @@ __global__ void nonzero_flag_kernel(int64_t n, const T* x, int64_t* flat,
         block_total = warp_prefix + warp_totals[kWarps - 1];
     }
     __syncthreads();
-    int slot = slot_base + warp_prefix + inclusive - mine;
+    int64_t slot = slot_base + warp_prefix + inclusive - mine;
 #pragma unroll
     for (int i = 0; i < ITEMS; ++i) {
-        if (nz[i]) flat[slot++] = idx[i];
+        if (nz[i]) {
+            int64_t rem = idx[i];
+            int64_t* row = out + slot * ndim;
+            for (int64_t d = ndim - 1; d >= 0; --d) {
+                row[d] = rem % dim_sizes[d];
+                rem /= dim_sizes[d];
+            }
+            ++slot;
+        }
     }
     __syncthreads();
     slot_base += block_total;
     }
 }
 
-__global__ void nonzero_write_indices(int64_t count, int64_t ndim,
-                                      const int64_t* sizes, const int64_t* flat,
-                                      int64_t* out) {
-    const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (int64_t m = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-         m < count; m += stride) {
-        int64_t rem = flat[m];
-        int64_t* row = out + m * ndim;
-        for (int64_t d = ndim - 1; d >= 0; --d) {
-            const int64_t size = sizes[d];
-            row[d] = rem % size;
-            rem /= size;
-        }
-    }
-}
 }
 
 // ---------------------------------------------------------------------------
@@ -553,7 +547,7 @@ Tensor& index_fill_tensor__cuda(Tensor& self, int64_t dim, const Tensor& index, 
 }
 
 // ---------------------------------------------------------------------------
-// nonzero (device flag/prefix pass followed by an ordered coordinate pass).
+// nonzero (device count pass followed by an ordered coordinate pass).
 // ---------------------------------------------------------------------------
 
 Tensor nonzero_cuda(const Tensor& self) {
@@ -607,11 +601,16 @@ Tensor nonzero_cuda(const Tensor& self) {
     CUDA_CHECK(cudaMemcpyAsync(&count_host, count_d.data_ptr<int32_t>(),
                                sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    Tensor result = Tensor::zeros({count_host, nd}, DType::Int64, self.device());
+    Tensor result = Tensor::empty({count_host, nd}, DType::Int64, self.device());
     if (count_host == 0) return result;
 
-    // Pass two scans each block's tile and writes the matching positions.
-    Tensor flat = Tensor::empty({count_host}, DType::Int64, self.device());
+    // Pass two scans each block's tile and expands every match straight into
+    // per-axis coordinates: a match's slot is its global ordinal, so the rows
+    // are written in place with no intermediate position list.
+    std::vector<int64_t> h_sizes(static_cast<std::vector<int64_t>>(self_c.shape()));
+    Tensor sizes_d = Tensor::empty({nd}, DType::Int64, self.device());
+    CUDA_CHECK(cudaMemcpyAsync(sizes_d.data_ptr<int64_t>(), h_sizes.data(),
+                               nd * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
     constexpr int kFlagBlock = 256;
 #define TP_NZC_FLAG(ctype, name)                                                  \
     case DType::name:                                                            \
@@ -623,8 +622,8 @@ Tensor nonzero_cuda(const Tensor& self) {
             std::min<int64_t>(tiles, kMaxBlocks));                            \
         nonzero_flag_kernel<ctype, kFlagBlock, kItems>                        \
         <<<blocks, kFlagBlock, 0, stream>>>(                                  \
-            n, self_c.data_ptr<ctype>(), flat.data_ptr<int64_t>(),                 \
-            block_counts.data_ptr<int32_t>());                               \
+            n, self_c.data_ptr<ctype>(), nd, sizes_d.data_ptr<int64_t>(),      \
+            result.data_ptr<int64_t>(), block_counts.data_ptr<int32_t>());    \
         break;                                                             \
     }
     switch (self_c.dtype()) {
@@ -637,18 +636,6 @@ Tensor nonzero_cuda(const Tensor& self) {
         default: TP_THROW(TypeError, "nonzero: unsupported dtype");
     }
 #undef TP_NZC_FLAG
-    CUDA_CHECK(cudaGetLastError());
-
-    // Pass three expands the positions into per-axis coordinates.
-    std::vector<int64_t> h_sizes(static_cast<std::vector<int64_t>>(self_c.shape()));
-    Tensor sizes_d = Tensor::empty({nd}, DType::Int64, self.device());
-    CUDA_CHECK(cudaMemcpyAsync(sizes_d.data_ptr<int64_t>(), h_sizes.data(),
-                               nd * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
-    const int64_t expand_blocks = std::min<int64_t>(
-        (count_host + kThreads - 1) / kThreads, 65535);
-    nonzero_write_indices<<<static_cast<unsigned>(expand_blocks), kThreads, 0, stream>>>(
-        static_cast<int64_t>(count_host), nd, sizes_d.data_ptr<int64_t>(),
-        flat.data_ptr<int64_t>(), result.data_ptr<int64_t>());
     CUDA_CHECK(cudaGetLastError());
     return result;
 }
