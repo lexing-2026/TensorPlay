@@ -16,6 +16,17 @@ namespace vulkan {
 namespace ops {
 
 //
+// The slots of an accelerator are named, so a payload has to say which one it
+// sits in: the allocator numbers the adapter it drew from, and an unnamed
+// device compares unequal to the one a device string resolves to.  Naming the
+// same slot here keeps a tensor built on the device and a tensor uploaded to it
+// pairable by the two-operand paths.
+//
+inline Device vulkan_device() {
+  return Device(DeviceType::Vulkan, 0);
+}
+
+//
 // The Vulkan tensor payload lives in the tensor's Storage: its DataPtr wraps
 // a shared_ptr<api::vTensorStorage> as the deleter context.  These helpers
 // convert between the public Tensor surface and the api::vTensor view.
@@ -86,7 +97,7 @@ inline Tensor convert(const api::vTensor& tensor) {
           : nullptr,
       holder,
       &detail::delete_vtensor_storage,
-      Device(DeviceType::Vulkan));
+      vulkan_device());
 
   Storage storage(std::move(data_ptr), nbytes, nullptr);
 

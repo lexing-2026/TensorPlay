@@ -353,7 +353,12 @@ void scatter_staging_values_buffer_1d(
 }
 
 Device resolve_device(std::optional<Device> device) {
-  return device.value_or(Device(DeviceType::Vulkan));
+  // An unindexed request names the slot the payloads report, so a tensor built
+  // from it compares equal to one the device produced.
+  if (!device.has_value() || device->index() < 0) {
+    return vulkan_device();
+  }
+  return *device;
 }
 
 template <typename Filler>
