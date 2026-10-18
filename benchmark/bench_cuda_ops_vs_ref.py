@@ -156,6 +156,138 @@ def build_cases(dev, dtype):
                       F.embedding_dense_backward(tgo3, tidx, nw, -1, False),
                   lambda idx=idx, go3=go3, nw=num_weights:
                       torch.ops.aten.embedding_dense_backward(go3, idx, nw, -1, False)))
+    # ---- 索引家族（IndexingKernels.cu / GatherScatterKernels.cu）----
+    # 行收集：embedding 风格（每行 128 元素）与大切片（每行 4096 元素）两种粒度，
+    # 以及沿列收集（inner=1 的逐元素路径）。
+    x = r(131072, 128)
+    idx = torch.randint(0, 131072, (16384,), generator=g, device=dev)
+    tx, tidx = T(x), T(idx)
+    C.append(("index_select.rows128x16k",
+              lambda tx=tx, tidx=tidx: F.index_select(tx, 0, tidx),
+              lambda x=x, idx=idx: torch.index_select(x, 0, idx)))
+    x = r(8192, 4096)
+    idx = torch.randint(0, 8192, (2048,), generator=g, device=dev)
+    tx, tidx = T(x), T(idx)
+    C.append(("index_select.slice4kx2k",
+              lambda tx=tx, tidx=tidx: F.index_select(tx, 0, tidx),
+              lambda x=x, idx=idx: torch.index_select(x, 0, idx)))
+    x = r(512, 65536)
+    idx = torch.randint(0, 65536, (8192,), generator=g, device=dev)
+    tx, tidx = T(x), T(idx)
+    C.append(("index_select.cols64kx8k",
+              lambda tx=tx, tidx=tidx: F.index_select(tx, 1, tidx),
+              lambda x=x, idx=idx: torch.index_select(x, 1, idx)))
+    idx32 = idx.to(torch.int32)
+    tidx32 = T(idx32)
+    C.append(("index_select.cols32.8k",
+              lambda tx=tx, tidx32=tidx32: F.index_select(tx, 1, tidx32),
+              lambda x=x, idx32=idx32: torch.index_select(x, 1, idx32)))
+    # gather：最后一维逐元素（inner=1）与内部维（inner=4096）两种。
+    x = r(4096, 4096)
+    idx = torch.randint(0, 4096, (4096, 4096), generator=g, device=dev)
+    tx, tidx = T(x), T(idx)
+    C.append(("gather.dim-1", lambda tx=tx, tidx=tidx: F.gather(tx, -1, tidx),
+              lambda x=x, idx=idx: torch.gather(x, -1, idx)))
+    C.append(("gather.dim0", lambda tx=tx, tidx=tidx: F.gather(tx, 0, tidx),
+              lambda x=x, idx=idx: torch.gather(x, 0, idx)))
+    x3 = r(64, 256, 512)
+    idx3 = torch.randint(0, 256, (64, 64, 512), generator=g, device=dev)
+    tx3, tidx3 = T(x3), T(idx3)
+    C.append(("gather.dim1.3d", lambda tx3=tx3, tidx3=tidx3: F.gather(tx3, 1, tidx3),
+              lambda x3=x3, idx3=idx3: torch.gather(x3, 1, idx3)))
+    # scatter：写入（幂等）与累加两种；scatter_add_ 数值随重复调用累积，仅看时间。
+    x = r(4096, 4096)
+    idx = torch.randint(0, 4096, (4096, 4096), generator=g, device=dev)
+    src = r(4096, 4096)
+    tx, tidx, tsrc = T(x), T(idx), T(src)
+    C.append(("scatter.dim-1", lambda tx=tx, tidx=tidx, tsrc=tsrc: F.scatter(tx, -1, tidx, tsrc),
+              lambda x=x, idx=idx, src=src: torch.scatter(x, -1, idx, src)))
+    C.append(("scatter_.dim-1", lambda tx=tx, tidx=tidx, tsrc=tsrc: tx.scatter_(-1, tidx, tsrc),
+              lambda x=x, idx=idx, src=src: x.scatter_(-1, idx, src)))
+    C.append(("scatter_add.dim0", lambda tx=tx, tidx=tidx, tsrc=tsrc: F.scatter_add(tx, 0, tidx, tsrc),
+              lambda x=x, idx=idx, src=src: torch.scatter_add(x, 0, idx, src)))
+    C.append(("scatter_add_.dim0", lambda tx=tx, tidx=tidx, tsrc=tsrc: tx.scatter_add_(0, tidx, tsrc),
+              lambda x=x, idx=idx, src=src: x.scatter_add_(0, idx, src)))
+    # index_add_ / index_copy_ / index_fill_：embedding 梯度式的行更新。
+    x = r(65536, 128)
+    idx = torch.randint(0, 65536, (8192,), generator=g, device=dev)
+    src = r(8192, 128)
+    tx, tidx, tsrc = T(x), T(idx), T(src)
+    C.append(("index_add_.rows128x8k",
+              lambda tx=tx, tidx=tidx, tsrc=tsrc: tx.index_add_(0, tidx, tsrc),
+              lambda x=x, idx=idx, src=src: x.index_add_(0, idx, src)))
+    C.append(("index_copy_.rows128x8k",
+              lambda tx=tx, tidx=tidx, tsrc=tsrc: tx.index_copy_(0, tidx, tsrc),
+              lambda x=x, idx=idx, src=src: x.index_copy_(0, idx, src)))
+    C.append(("index_add.rows128x8k",
+              lambda tx=tx, tidx=tidx, tsrc=tsrc: F.index_add(tx, 0, tidx, tsrc),
+              lambda x=x, idx=idx, src=src: torch.index_add(x, 0, idx, src)))
+    C.append(("index_fill_.rows128x8k",
+              lambda tx=tx, tidx=tidx: tx.index_fill_(0, tidx, 0.0),
+              lambda x=x, idx=idx: x.index_fill_(0, idx, 0.0)))
+    # 高级索引：二维索引对（可能有重复行）的收集与写入。
+    x = r(65536, 128)
+    i0 = torch.randint(0, 65536, (65536,), generator=g, device=dev)
+    i1 = torch.randint(0, 128, (65536,), generator=g, device=dev)
+    v = r(65536)
+    tx, ti0, ti1, tv = T(x), T(i0), T(i1), T(v)
+    C.append(("index.2d.pairs",
+              lambda tx=tx, ti0=ti0, ti1=ti1: F.index(tx, [ti0, ti1]),
+              lambda x=x, i0=i0, i1=i1: x[i0, i1]))
+    C.append(("index_put_.pairs",
+              lambda tx=tx, ti0=ti0, ti1=ti1, tv=tv: tx.index_put_((ti0, ti1), tv),
+              lambda x=x, i0=i0, i1=i1, v=v: x.index_put_((i0, i1), v)))
+    # masked_select / nonzero / count_nonzero：条件收集。
+    x = r(4096, 4096)
+    x.masked_fill_(x.abs() < 1.0, 0)
+    mask = x != 0
+    tx, tmask = T(x), T(mask)
+    C.append(("masked_select.p50",
+              lambda tx=tx, tmask=tmask: F.masked_select(tx, tmask),
+              lambda x=x, mask=mask: torch.masked_select(x, mask)))
+    C.append(("nonzero.p10", lambda tx=tx: F.nonzero(tx),
+              lambda x=x: torch.nonzero(x)))
+    C.append(("count_nonzero", lambda tx=tx: F.count_nonzero(tx),
+              lambda x=x: torch.count_nonzero(x)))
+    C.append(("count_nonzero.dim-1", lambda tx=tx: F.count_nonzero(tx, [-1]),
+              lambda x=x: torch.count_nonzero(x, [-1])))
+    # take / where / flip / roll：扁平收集与逐元素选择。
+    x = r(4194304)
+    idx = torch.randint(0, 4194304, (1048576,), generator=g, device=dev)
+    tx, tidx = T(x), T(idx)
+    C.append(("take.flat4M", lambda tx=tx, tidx=tidx: F.take(tx, tidx),
+              lambda x=x, idx=idx: torch.take(x, idx)))
+    x = r(4096, 4096)
+    a = r(4096, 4096)
+    b = r(4096, 4096)
+    cond = torch.rand(4096, 4096, generator=g, device=dev) < 0.5
+    tx, ta, tb, tcond = T(x), T(a), T(b), T(cond)
+    C.append(("where.ternary", lambda tcond=tcond, ta=ta, tb=tb: F.where(tcond, ta, tb),
+              lambda cond=cond, a=a, b=b: torch.where(cond, a, b)))
+    C.append(("flip.dim1", lambda tx=tx: F.flip(tx, [1]),
+              lambda x=x: torch.flip(x, [1])))
+    C.append(("roll.dim1", lambda tx=tx: F.roll(tx, 3, [1]),
+              lambda x=x: torch.roll(x, 3, [1])))
+    # searchsorted / bincount / unique / repeat_interleave：排序与计数系。
+    s = torch.sort(torch.rand(1 << 20, generator=g, device=dev, dtype=torch.float32)).values.to(dtype)
+    q = torch.rand(1 << 20, generator=g, device=dev, dtype=torch.float32).to(dtype)
+    ts, tq = T(s), T(q)
+    C.append(("searchsorted.1M", lambda ts=ts, tq=tq: F.searchsorted(ts, tq),
+              lambda s=s, q=q: torch.searchsorted(s, q)))
+    v1 = torch.randint(0, 50000, (4194304,), generator=g, device=dev)
+    tv1 = T(v1)
+    C.append(("bincount.4M50k", lambda tv1=tv1: F.bincount(tv1, minlength=50000),
+              lambda v1=v1: torch.bincount(v1, minlength=50000)))
+    u = torch.randint(0, 200000, (1048576,), generator=g, device=dev)
+    tu = T(u)
+    C.append(("unique.1M200k", lambda tu=tu: F.unique(tu),
+              lambda u=u: torch.unique(u)))
+    x = r(4096, 128)
+    reps = torch.randint(1, 3, (4096, 128), generator=g, device=dev)
+    tx, treps = T(x), T(reps)
+    C.append(("repeat_interleave.tensor",
+              lambda tx=tx, treps=treps: F.repeat_interleave(tx, treps),
+              lambda x=x, reps=reps: torch.repeat_interleave(x, reps)))
     # ---- 卷积 / 池化 ----
     x = r(32, 64, 56, 56)
     w = r(64, 64, 3, 3)
