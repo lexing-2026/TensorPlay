@@ -119,11 +119,18 @@ Tensor embedding_kernel(
   const int64_t index_count = indices.numel();
   const int64_t features = weight.size(1);
 
-  // A buffer-stored weight (large vocabulary table) is looked up through a
-  // linear path: the index payload is copied to a dense Int32 buffer and the
-  // output is forced to buffer storage, so the same row-major shader serves
-  // small and large lookups without a texture fallback.
-  if (v_weight.storage_type() == api::StorageType::BUFFER) {
+  // A lookup runs on the flat path as soon as one of the three payloads it
+  // touches has no image form: the table (a wide vocabulary), the index list
+  // (one texel per entry) or the output rows it implies.  The texture-stored
+  // operands are copied into dense linear storage so the same row-major
+  // shader serves small and large lookups, and the output is released as a
+  // linear payload beside them.
+  const bool linear_lookup =
+      v_weight.storage_type() == api::StorageType::BUFFER ||
+      v_indices.storage_type() == api::StorageType::BUFFER ||
+      !image_storage_supported(context, {index_count, features});
+  if (linear_lookup) {
+    api::vTensor v_weight_buf = to_buffer_storage_dispatch(context, v_weight);
     api::vTensor v_indices_buf =
         to_buffer_storage_dispatch(context, v_indices);
     api::vTensor v_output{
@@ -151,7 +158,7 @@ Tensor embedding_kernel(
             pipeline_barrier,
             api::PipelineStage::COMPUTE,
             api::MemoryAccessType::WRITE),
-        v_weight.buffer(
+        v_weight_buf.buffer(
             pipeline_barrier,
             api::PipelineStage::COMPUTE,
             api::MemoryAccessType::READ),
@@ -393,12 +400,16 @@ Tensor index_select_kernel(
   const int64_t index_count = index.numel();
   const int64_t out_count = index_count * inner;
 
-  api::vTensor v_output{context, {out_count}, DType::Float32};
-
-  // Linear payloads (1-d tensors or row selections of 2-d tensors whose
-  // shapes exceed the image limit) gather through a buffer-to-buffer variant
-  // with the index payload copied to a dense Int32 buffer.
-  if (v_input.storage_type() == api::StorageType::BUFFER) {
+  // A gather runs flat as soon as one of the payloads it touches has no image
+  // form: the rows it reads, the index list (one texel per entry) or the rows
+  // it writes.  A texture-stored source is copied into dense linear storage
+  // so the flat shader can read it beside the index buffer.
+  const bool linear_gather =
+      v_input.storage_type() == api::StorageType::BUFFER ||
+      v_indices.storage_type() == api::StorageType::BUFFER ||
+      !image_storage_supported(context, {out_count});
+  if (linear_gather) {
+    api::vTensor v_input_buf = to_buffer_storage_dispatch(context, v_input);
     api::vTensor v_indices_buf =
         to_buffer_storage_dispatch(context, v_indices);
     api::vTensor v_out_buf{
@@ -425,7 +436,7 @@ Tensor index_select_kernel(
             pipeline_barrier,
             api::PipelineStage::COMPUTE,
             api::MemoryAccessType::WRITE),
-        v_input.buffer(
+        v_input_buf.buffer(
             pipeline_barrier,
             api::PipelineStage::COMPUTE,
             api::MemoryAccessType::READ),
@@ -441,6 +452,10 @@ Tensor index_select_kernel(
     return flat_out.reshape(out_sizes);
   }
 
+  // Both operands have an image form, so the gather walks the flattened texture
+  // with one texel per selected element.
+  api::vTensor v_output{context, {out_count}, DType::Float32};
+
   const struct IndexSelectBlock block{
       static_cast<int32_t>(inner),
       static_cast<int32_t>(inner),
@@ -451,9 +466,18 @@ Tensor index_select_kernel(
   api::UniformParamsBuffer params(context, block);
   api::PipelineBarrier pipeline_barrier{};
 
+  // The shader reads invocation (slot inside the gathered row, index), so the
+  // grid spans inner by the index count even though each payload is a flat
+  // 1-D texture: the output's own extents only run over the flat element and
+  // would leave every row past the first slot unwritten.
+  const api::utils::uvec3 grid{
+      static_cast<uint32_t>(inner),
+      static_cast<uint32_t>(index_count),
+      1u};
+
   context->submit_compute_job(
-      VK_KERNEL(index_select), pipeline_barrier, v_output.extents(),
-      adaptive_work_group_size(v_output.extents()), VK_NULL_HANDLE,
+      VK_KERNEL(index_select), pipeline_barrier, grid,
+      adaptive_work_group_size(grid), VK_NULL_HANDLE,
       v_output.image(
           pipeline_barrier,
           api::PipelineStage::COMPUTE,
