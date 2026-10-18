@@ -2888,5 +2888,170 @@ class TestVulkanCumsumStorages(unittest.TestCase):
             F.cumsum(device, 0)
 
 
+class TestVulkanDeviceBuiltPayload(unittest.TestCase):
+    # Constructing straight on the device fills a row-major buffer, and the
+    # shape still fits an image, so the default result allocation is a texture.
+    # A kernel that writes the buffer of such a result leaves the image holding
+    # whatever the allocator recycled into it, which reads back as plausible but
+    # wrong data whenever an earlier dispatch of the same geometry happens to
+    # agree.  These cases pin the values for a payload that is small enough to
+    # have a texture form.
+
+    @staticmethod
+    def _grid(sizes, modulus=29, scale=4.0):
+        count = int(np.prod(sizes))
+        return ((np.arange(count, dtype=np.float32) % modulus - modulus // 2)
+                / scale).reshape(sizes)
+
+    def test_masked_fill_over_a_device_built_payload(self):
+        import tensorplay.functional as F
+        host = self._grid((2, 3, 4, 5))
+        mask = host > 0.0
+        want = np.where(mask, 0.5, host)
+        built = tensorplay.tensor(host.copy(), device="vulkan")
+        for name, condition in (
+                ("built", tensorplay.tensor(mask, device="vulkan")),
+                ("uploaded", tensorplay.tensor(mask).to("vulkan"))):
+            got = F.masked_fill(built, condition, 0.5).cpu().numpy()
+            np.testing.assert_array_equal(
+                got, want, err_msg=f"masked_fill with a {name} mask")
+        # An odd element count leaves the last condition word partly past the
+        # logical end; the tail lane still has to select.
+        tail = self._grid((37,))
+        tail_mask = tail > 0.0
+        got = F.masked_fill(
+            tensorplay.tensor(tail, device="vulkan"),
+            tensorplay.tensor(tail_mask, device="vulkan"),
+            -1.0).cpu().numpy()
+        np.testing.assert_array_equal(
+            got, np.where(tail_mask, -1.0, tail), err_msg="masked_fill tail")
+
+    def test_where_over_a_device_built_payload(self):
+        import tensorplay.functional as F
+        host = self._grid((2, 3, 4, 5))
+        condition = host > 0.0
+        other = (np.arange(host.size, dtype=np.float32) % 5 + 1).reshape(
+            host.shape)
+        built = tensorplay.tensor(host.copy(), device="vulkan")
+        want = np.where(condition, host, other)
+        for name, cond, rhs in (
+                ("built both",
+                 tensorplay.tensor(condition, device="vulkan"),
+                 tensorplay.tensor(other, device="vulkan")),
+                ("uploaded mask", tensorplay.tensor(condition).to("vulkan"),
+                 tensorplay.tensor(other, device="vulkan")),
+                ("uploaded branch", tensorplay.tensor(condition,
+                                                     device="vulkan"),
+                 tensorplay.tensor(other).to("vulkan"))):
+            got = F.where(cond, built, rhs).cpu().numpy()
+            np.testing.assert_array_equal(
+                got, want, err_msg=f"where with operands {name}")
+        # A half payload packs two lanes per word, so one invocation has to own
+        # the whole destination word of the selection.
+        half = host.astype(np.float16)
+        half_other = other.astype(np.float16)
+        half_want = np.where(condition, half, half_other)
+        got = F.where(
+            tensorplay.tensor(condition, device="vulkan"),
+            tensorplay.tensor(half, device="vulkan"),
+            tensorplay.tensor(half_other, device="vulkan")).cpu().numpy()
+        np.testing.assert_array_equal(
+            got.view(np.uint16), half_want.view(np.uint16),
+            err_msg="half where over a device-built payload")
+
+    def test_rms_norm_over_a_device_built_payload(self):
+        import tensorplay.nn.functional as Fn
+        host = self._grid((2, 3, 4, 8), modulus=23, scale=3.0)
+        weight = ((np.arange(8, dtype=np.float32) % 5 + 1) / 3.0)
+        xf = host.astype(np.float64)
+        want = xf / np.sqrt((xf ** 2).mean(-1, keepdims=True) + 1.0e-5)
+        built = tensorplay.tensor(host.copy(), device="vulkan")
+        for name, scaled in (
+                ("plain", False),
+                ("built weight", True),
+                ("uploaded weight", True)):
+            w = None
+            if scaled:
+                w = tensorplay.tensor(
+                    weight, device="vulkan") if name == "built weight" \
+                    else tensorplay.tensor(weight).to("vulkan")
+            expected = want * weight if scaled else want
+            got = Fn.rms_norm(built, [8], w, 1.0e-5).cpu().numpy()
+            np.testing.assert_allclose(
+                got.astype(np.float64), expected, rtol=1e-5, atol=1e-5,
+                err_msg=f"rms_norm with a {name}")
+        # Half lanes round once when stored, so the reference narrows the same
+        # way and the bit patterns compare.
+        half = host.astype(np.float16)
+        half_weight = weight.astype(np.float16)
+        hf = half.astype(np.float32)
+        half_want = (hf / np.sqrt(
+            (hf ** 2).mean(-1, keepdims=True) + 1.0e-5)
+            * half_weight).astype(np.float16)
+        got = Fn.rms_norm(
+            tensorplay.tensor(half, device="vulkan"), [8],
+            tensorplay.tensor(half_weight, device="vulkan"),
+            1.0e-5).cpu().numpy()
+        np.testing.assert_array_equal(
+            got.view(np.uint16), half_want.view(np.uint16),
+            err_msg="half rms_norm over a device-built payload")
+
+    def test_rotary_embedding_over_a_device_built_payload(self):
+        import tensorplay.functional as F
+        for (B, S, D, table_len, off) in (
+                (2, 6, 8, 12, 0), (1, 4, 16, 6, 2), (3, 5, 4, 16, 1)):
+            host = self._grid((B, S, D), modulus=23, scale=3.0)
+            cos, sin = _rope_tables(D, table_len)
+            want = _rope_reference(host, cos, sin, off)
+            built = tensorplay.tensor(host.copy(), device="vulkan")
+            for name, maker in (
+                    ("built", lambda a: tensorplay.tensor(a, device="vulkan")),
+                    ("uploaded", lambda a: tensorplay.tensor(a).to("vulkan"))):
+                got = F.rotary_embedding(
+                    built, maker(cos), maker(sin), off).cpu().numpy()
+                np.testing.assert_allclose(
+                    got, want, rtol=1e-5, atol=1e-5,
+                    err_msg=f"rope over a device-built payload with {name} "
+                            f"tables at B={B} S={S} D={D} off={off}")
+
+    def test_index_search_over_a_device_built_payload(self):
+        import tensorplay.functional as F
+        host = self._grid((2, 3, 4, 5), modulus=17, scale=2.0)
+        built = tensorplay.tensor(host.copy(), device="vulkan")
+        for dim in range(4):
+            # An axis shorter than the 256 lanes of a workgroup leaves idle
+            # lanes in the search; they must lose, whichever bound they carry.
+            np.testing.assert_array_equal(
+                F.argmin(built, dim).cpu().numpy(),
+                np.argmin(host, axis=dim),
+                err_msg=f"argmin over a device-built payload at dim {dim}")
+            np.testing.assert_array_equal(
+                F.argmax(built, dim).cpu().numpy(),
+                np.argmax(host, axis=dim),
+                err_msg=f"argmax over a device-built payload at dim {dim}")
+        # The first occurrence wins a tie, and a strided search walks several
+        # positions per lane before the shared reduction meets them.
+        ties = np.full((2, 300), 1.0, dtype=np.float32)
+        ties[0, 7] = -2.0
+        ties[1, 150] = 3.0
+        tie_built = tensorplay.tensor(ties, device="vulkan")
+        np.testing.assert_array_equal(
+            F.argmin(tie_built, 1).cpu().numpy(), np.argmin(ties, axis=1),
+            err_msg="argmin first occurrence")
+        np.testing.assert_array_equal(
+            F.argmax(tie_built, 1).cpu().numpy(), np.argmax(ties, axis=1),
+            err_msg="argmax first occurrence")
+        # A flat payload longer than the image axis limit keeps the same rule
+        # over one long axis.
+        long_axis = (np.arange(70001, dtype=np.float32) % 300 - 150)
+        long_built = tensorplay.tensor(long_axis, device="vulkan")
+        self.assertEqual(
+            int(F.argmin(long_built, 0).cpu().numpy()),
+            int(np.argmin(long_axis)))
+        self.assertEqual(
+            int(F.argmax(long_built, 0).cpu().numpy()),
+            int(np.argmax(long_axis)))
+
+
 if __name__ == "__main__":
     unittest.main()
