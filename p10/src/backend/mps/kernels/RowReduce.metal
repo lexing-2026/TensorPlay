@@ -205,8 +205,11 @@ kernel void row_value_inner(device float* out [[buffer(0)]],
   float held;
   uint32_t held_index;
   scan_row<Op>(values, n, lane, held, held_index);
+  // The fold exchanges values between the whole group, so every lane takes
+  // part in it; only the write is one lane's business.
+  const Extremum<float> answer = fold_row<Op>(held, held_index);
   if (lane == 0) {
-    out[row] = fold_row<Op>(held, held_index).value;
+    out[row] = answer.value;
   }
 }
 
@@ -287,8 +290,11 @@ kernel void row_pred_inner(device bool* out [[buffer(0)]],
   for (uint i = lane; i < n; i += simdgroup_size) {
     held = Op::combine(held, Op::test(values[i]));
   }
+  // As for the extrema, the step that joins the lanes asks all of them, so it
+  // happens before any lane is left behind.
+  const uint folded = Op::reduce(held);
   if (lane == 0) {
-    out[row] = Op::reduce(held) != 0;
+    out[row] = folded != 0;
   }
 }
 
