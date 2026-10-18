@@ -13,10 +13,12 @@ using namespace metal;
 using p10::metal::ILP_PER_THREAD;
 
 struct exp_op {
-  // The precise spelling, not the plain one, which a shorter approximation may
-  // answer.
+  // The hardware approximation rather than the precise software evaluation.
+  // The operation's contract admits a few units in the last place of error, and
+  // the approximation is what keeps a long operand from spending most of its
+  // time in the polynomial evaluation.
   template <typename T>
-  static inline T apply(T x) { return ::precise::exp(x); }
+  static inline T apply(T x) { return ::metal::exp(x); }
 };
 
 struct sqrt_op {
@@ -64,23 +66,28 @@ struct reciprocal_op {
 };
 
 struct log_op {
+  // The hardware approximation, for the reason given on exp above. The
+  // logarithm of one still answers exactly zero and the special values keep
+  // their results: zero gives -inf and a negative operand gives NaN.
   template <typename T>
-  static inline T apply(T x) { return ::precise::log(x); }
+  static inline T apply(T x) { return ::metal::log(x); }
 };
 
 struct sin_op {
+  // The hardware approximation; a NaN operand answers a NaN, and the range
+  // reduction covers the operands these kernels serve.
   template <typename T>
-  static inline T apply(T x) { return ::precise::sin(x); }
+  static inline T apply(T x) { return ::metal::sin(x); }
 };
 
 struct cos_op {
   template <typename T>
-  static inline T apply(T x) { return ::precise::cos(x); }
+  static inline T apply(T x) { return ::metal::cos(x); }
 };
 
 struct tanh_op {
   template <typename T>
-  static inline T apply(T x) { return ::precise::tanh(x); }
+  static inline T apply(T x) { return ::metal::tanh(x); }
 };
 
 struct floor_op {
