@@ -344,9 +344,11 @@ MTLComputePipelineState_t shaderPipelineNamed(const std::string& name) {
 // storage type; a call with one of them belongs with the graph, which builds
 // the cast and the operation together. The list below and the instantiations at
 // the bottom of that file are checked in the same order: dtype first, so a
-// missing name is only possible if the two get out of step.
+// missing name is only possible if the two get out of step. `ilp` selects the
+// form that takes a run of consecutive elements per thread; the same
+// operations are instantiated in both forms.
 MTLComputePipelineState_t broadcastShaderPipeline(const std::string& op,
-                                                  DType dtype) {
+                                                  DType dtype, bool ilp) {
   switch (dtype) {
     case DType::Float32:
     case DType::Int64:
@@ -356,7 +358,8 @@ MTLComputePipelineState_t broadcastShaderPipeline(const std::string& op,
       return nil;
   }
   return shaderPipelineNamed("broadcast_" + op + "_" +
-                             scalarToMetalTypeString(dtype));
+                             scalarToMetalTypeString(dtype) +
+                             (ilp ? "_ilp" : ""));
 }
 
 // The pipeline for a unit-stride form of `op` over `dtype`, or nil when the
@@ -510,7 +513,12 @@ std::optional<Tensor> broadcastBinaryShader(
   if (self.storage_offset() != 0 || other.storage_offset() != 0) {
     return std::nullopt;
   }
-  MTLComputePipelineState_t pso = broadcastShaderPipeline(op, self.dtype());
+  // A thread can take a run of consecutive output elements when the innermost
+  // dimension is a multiple of the run width, so no run crosses a row and the
+  // coordinates of the outer dimensions are formed once per run.
+  const bool ilp = out_shape.back() % p10::metal::ILP_PER_THREAD == 0;
+  MTLComputePipelineState_t pso =
+      broadcastShaderPipeline(op, self.dtype(), ilp);
   if (!pso) {
     return std::nullopt;
   }
@@ -554,10 +562,17 @@ std::optional<Tensor> broadcastBinaryShader(
                 atIndex:5];
       [encoder setBytes:rhs_strides.data() length:sizeof(rhs_strides)
                 atIndex:6];
+      const uint32_t threads =
+          ilp ? p10::metal::ceil_div<uint32_t>(total,
+                                               p10::metal::ILP_PER_THREAD)
+              : total;
+      if (ilp) {
+        [encoder setBytes:&total length:sizeof(total) atIndex:7];
+      }
       const uint32_t per_group =
-          std::min(total,
+          std::min(threads,
                    static_cast<uint32_t>([pso maxTotalThreadsPerThreadgroup]));
-      [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
+      [encoder dispatchThreads:MTLSizeMake(threads, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(per_group, 1, 1)];
     }
   });

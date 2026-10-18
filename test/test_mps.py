@@ -129,6 +129,40 @@ class TestMPSArithmetic(unittest.TestCase):
         self.assertTrue(tp.allclose(tp.addcdiv(x, y, z).cpu(),
                                     tp.full((2, 3), 1 + 2 / 3.0)))
 
+    def test_broadcast_ops(self):
+        a = tp.arange(32 * 64, dtype=tp.float32).reshape(32, 1, 64) / 64.0 - 3.0
+        b = tp.arange(16 * 64, dtype=tp.float32).reshape(1, 16, 64) / 32.0 + 1.0
+        am = a.to("mps")
+        bm = b.to("mps")
+        for op in (tp.add, tp.sub, tp.mul):
+            with self.subTest(op=op.__name__):
+                self.assertTrue(tp.allclose(op(am, bm).cpu(), op(a, b)))
+        self.assertTrue(tp.allclose((am / bm).cpu(), a / b))
+        full = tp.arange(32 * 16 * 64, dtype=tp.float32).reshape(32, 16, 64) / 128.0
+        self.assertTrue(tp.allclose(tp.add(full.to("mps"), bm).cpu(), full + b))
+
+    def test_broadcast_ops_other_inner_size(self):
+        # An innermost size that is not a multiple of the run width takes the
+        # per-element form; a broadcast along the innermost axis exercises a
+        # zero stride inside a run.
+        a = tp.arange(5 * 7, dtype=tp.float32).reshape(5, 1, 7) - 4.0
+        b = tp.arange(3 * 7, dtype=tp.float32).reshape(1, 3, 7) + 0.5
+        self.assertTrue(tp.allclose(tp.add(a.to("mps"), b.to("mps")).cpu(), a + b))
+        self.assertTrue(tp.allclose(tp.mul(a.to("mps"), b.to("mps")).cpu(), a * b))
+        col = tp.arange(6, dtype=tp.float32).reshape(6, 1)
+        row = tp.arange(4, dtype=tp.float32).reshape(1, 4)
+        self.assertTrue(tp.allclose(tp.add(col.to("mps"), row.to("mps")).cpu(),
+                                    col + row))
+
+    def test_broadcast_ops_integral(self):
+        a = tp.arange(4 * 8).reshape(4, 1, 8) - 5
+        b = tp.arange(3 * 8).reshape(1, 3, 8) + 2
+        am = a.to("mps")
+        bm = b.to("mps")
+        self.assertTrue(tp.all(tp.add(am, bm).cpu() == a + b).item())
+        self.assertTrue(tp.all(tp.sub(am, bm).cpu() == a - b).item())
+        self.assertTrue(tp.all(tp.mul(am, bm).cpu() == a * b).item())
+
 
 @unittest.skipUnless(mps_available(), "MPS not available")
 class TestMPSUnary(unittest.TestCase):
