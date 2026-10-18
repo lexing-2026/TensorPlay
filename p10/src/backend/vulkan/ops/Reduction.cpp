@@ -56,6 +56,13 @@ void reduce_axis_buffer_pass(
     int32_t correction,
     float scale,
     bool var_mode) {
+  const bool is_half = input.dtype() == DType::Float16;
+  const std::string shader =
+      std::string(var_mode ? "var_axis_buffer" : "sum_axis_buffer") +
+      (is_half ? "_half" : "");
+  // A half payload stores two reduced lanes per word, so the row grid becomes a
+  // word grid and every invocation owns the word it writes.
+  const int64_t grid_rows = is_half ? (rows + 1) / 2 : rows;
   const struct ReduceAxisBufferBlock final {
     int32_t axis_size;
     int32_t inner;
@@ -75,9 +82,9 @@ void reduce_axis_buffer_pass(
   api::UniformParamsBuffer params(context, block);
   api::PipelineBarrier pipeline_barrier{};
   context->submit_compute_job(
-      var_mode ? VK_KERNEL(var_axis_buffer) : VK_KERNEL(sum_axis_buffer),
+      VK_KERNEL_FROM_STR(shader.c_str()),
       pipeline_barrier,
-      {static_cast<uint32_t>(rows), 1u, 1u},
+      {static_cast<uint32_t>(grid_rows), 1u, 1u},
       {256u, 1u, 1u},
       VK_NULL_HANDLE,
       output.buffer(
@@ -111,13 +118,13 @@ Tensor reduce_one_axis(
 
 // Buffer-stored inputs (any axis beyond the 3-D image limit) reduce
   // through a linear row-walking variant; the reduced output is kept in
-  // buffer storage.  Float16 buffer payloads are byte-packed with no
-  // buffer-writing reduction yet.
+  // buffer storage.  A half payload accumulates in single precision and packs
+  // two reduced lanes per output word.
   if (v_input.storage_type() == api::StorageType::BUFFER) {
     TP_CHECK(
-        input.dtype() == DType::Float32,
-        "Vulkan reductions over Float16 buffer storage are not supported "
-        "yet");
+        input.dtype() == DType::Float32 || input.dtype() == DType::Float16,
+        "Vulkan reductions over linear storage support Float32 and Float16 "
+        "tensors only");
     api::vTensor v_output{
         context, out_sizes, input.dtype(), api::StorageType::BUFFER,
         api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
@@ -350,10 +357,15 @@ void extremum_buffer_pass(
 
   api::UniformParamsBuffer params(context, block);
   api::PipelineBarrier pipeline_barrier{};
+  // A half payload stores two reduced lanes per word, so the row grid becomes a
+  // word grid and every invocation owns the word it writes.
+  const int64_t grid_rows = output.dtype() == DType::Float16
+      ? (rows + 1) / 2
+      : rows;
   context->submit_compute_job(
       VK_KERNEL_FROM_STR(shader),
       pipeline_barrier,
-      {static_cast<uint32_t>(rows), 1u, 1u},
+      {static_cast<uint32_t>(grid_rows), 1u, 1u},
       {256u, 1u, 1u},
       VK_NULL_HANDLE,
       output.buffer(
@@ -380,16 +392,19 @@ Tensor extremum_one_axis(
 
   // Buffer payloads reduce through the linear variant; only the extremum
   // kinds have one, so a product over buffer storage still reports the
-  // texture requirement below.
+  // texture requirement below.  The half builds pack two winners per word.
+  const bool is_half = input.dtype() == DType::Float16;
   const char* buffer_shader = kind == ExtremumKind::kMax
-      ? "reduce_max_buffer"
-      : kind == ExtremumKind::kMin ? "reduce_min_buffer" : nullptr;
+      ? (is_half ? "reduce_max_buffer_half" : "reduce_max_buffer")
+      : kind == ExtremumKind::kMin
+          ? (is_half ? "reduce_min_buffer_half" : "reduce_min_buffer")
+          : nullptr;
   if (v_input.storage_type() == api::StorageType::BUFFER &&
       buffer_shader != nullptr) {
     api::vTensor v_output{
         context,
         out_sizes,
-        DType::Float32,
+        input.dtype(),
         api::StorageType::BUFFER,
         api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
 
@@ -411,7 +426,7 @@ Tensor extremum_one_axis(
       api::vTensor v_tiles{
           context,
           std::vector<int64_t>{tiles},
-          DType::Float32,
+          input.dtype(),
           api::StorageType::BUFFER,
           api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
       extremum_buffer_pass(
@@ -426,7 +441,7 @@ Tensor extremum_one_axis(
     return convert(v_output);
   }
 
-  api::vTensor v_output{context, out_sizes, DType::Float32};
+  api::vTensor v_output{context, out_sizes, input.dtype()};
   TP_CHECK(
       v_input.storage_type() == api::StorageType::TEXTURE_3D &&
           v_output.storage_type() == api::StorageType::TEXTURE_3D,
@@ -451,8 +466,7 @@ Tensor extremum_one_axis(
   api::UniformParamsBuffer params(context, block);
   api::PipelineBarrier pipeline_barrier{};
   context->submit_compute_job(
-      VK_KERNEL_FROM_STR(extremum_shader_name(kind)),
-      pipeline_barrier,
+      kernel_for(extremum_shader_name(kind), input.dtype()), pipeline_barrier,
       v_output.extents(),
       adaptive_work_group_size(v_output.extents()),
       VK_NULL_HANDLE,
@@ -472,8 +486,8 @@ Tensor extremum_impl(
     bool keepdim,
     ExtremumKind kind) {
   TP_CHECK(
-      self.dtype() == DType::Float32,
-      "Vulkan reductions support Float32 tensors only");
+      self.dtype() == DType::Float32 || self.dtype() == DType::Float16,
+      "Vulkan reductions support Float32 and Float16 tensors only");
   TP_CHECK(
       self.dim() >= 1 && self.dim() <= 4,
       "Vulkan reductions support 1d to 4d tensors");
@@ -630,9 +644,13 @@ Tensor arg_one_axis(
     };
     api::UniformParamsBuffer params(context, block);
     api::PipelineBarrier pipeline_barrier{};
+    // The winning position is an integer, so the output keeps a 32-bit element
+    // per row and only the payload is read as half lanes.
+    const std::string buffer_shader =
+        std::string(greater ? "reduce_argmax_buffer" : "reduce_argmin_buffer") +
+        (input.dtype() == DType::Float16 ? "_half" : "");
     context->submit_compute_job(
-        greater ? VK_KERNEL(reduce_argmax_buffer)
-                : VK_KERNEL(reduce_argmin_buffer),
+        VK_KERNEL_FROM_STR(buffer_shader.c_str()),
         pipeline_barrier,
         {static_cast<uint32_t>(rows), 1u, 1u},
         {256u, 1u, 1u}, VK_NULL_HANDLE,
@@ -671,7 +689,7 @@ Tensor arg_one_axis(
   api::UniformParamsBuffer params(context, block);
   api::PipelineBarrier pipeline_barrier{};
   context->submit_compute_job(
-      greater ? VK_KERNEL(reduce_argmax) : VK_KERNEL(reduce_argmin),
+      kernel_for(greater ? "reduce_argmax" : "reduce_argmin", input.dtype()),
       pipeline_barrier,
       v_output.extents(),
       adaptive_work_group_size(v_output.extents()),
@@ -692,8 +710,8 @@ Tensor arg_impl(
     bool keepdim,
     bool greater) {
   TP_CHECK(
-      self.dtype() == DType::Float32,
-      "Vulkan index reductions support Float32 tensors only");
+      self.dtype() == DType::Float32 || self.dtype() == DType::Float16,
+      "Vulkan index reductions support Float32 and Float16 tensors only");
   TP_CHECK(
       self.dim() >= 1 && self.dim() <= 4,
       "Vulkan index reductions support 1d to 4d tensors");
@@ -904,11 +922,11 @@ Tensor mean_dim_kernel(
 //
 Tensor sum_kernel(const Tensor& self, DType dtype) {
   TP_CHECK(
-      self.dtype() == DType::Float32,
-      "Vulkan reductions support Float32 tensors only");
+      self.dtype() == DType::Float32 || self.dtype() == DType::Float16,
+      "Vulkan reductions support Float32 and Float16 tensors only");
   if (self.numel() == 0) {
     return full_kernel(
-        {}, Scalar(0.0), DType::Float32, Device(DeviceType::Vulkan), false);
+        {}, Scalar(0.0), self.dtype(), Device(DeviceType::Vulkan), false);
   }
   std::vector<int64_t> dims;
   dims.reserve(static_cast<size_t>(self.dim()));
@@ -920,8 +938,8 @@ Tensor sum_kernel(const Tensor& self, DType dtype) {
 
 Tensor mean_kernel(const Tensor& self, DType dtype) {
   TP_CHECK(
-      self.dtype() == DType::Float32,
-      "Vulkan reductions support Float32 tensors only");
+      self.dtype() == DType::Float32 || self.dtype() == DType::Float16,
+      "Vulkan reductions support Float32 and Float16 tensors only");
   Tensor summed = sum_kernel(self, dtype);
   return summed.mul(Scalar(1.0 / static_cast<double>(self.numel())));
 }
@@ -1284,6 +1302,23 @@ Tensor square(const Tensor& a) {
 // ops reject broadcasts, so the keepdim mean cannot be expanded.  The
 // algebraically equivalent (E[x^2] - E[x]^2) form only needs same-shape
 // reductions and scalar arithmetic.
+// A half variance over one axis has a walk that keeps both raw moments in
+// single precision, so only the variance itself narrows.  The two-pass
+// composition would round every squared deviation to the payload format, and
+// the sum of those squares leaves the finite range of the format on a long
+// axis.  Both storages have that walk.
+std::optional<Tensor> var_half_single_axis(
+    const Tensor& self,
+    const std::vector<int64_t>& dims,
+    bool keepdim,
+    int64_t correction) {
+  if (self.dtype() != DType::Float16 || dims.size() != 1) {
+    return std::nullopt;
+  }
+  return reduce_impl(self, dims, keepdim, /*mean_mode=*/false,
+                     /*var_mode=*/true, correction);
+}
+
 Tensor var_buffer_one_pass(
     const Tensor& self,
     const std::vector<int64_t>& dims,
@@ -1293,16 +1328,34 @@ Tensor var_buffer_one_pass(
   for (const int64_t axis : dims) {
     count *= self.size(axis);
   }
-  Tensor sum = reduce_impl(self, dims, /*keepdim=*/true, false, false, 0);
-  // self.mul(self) routes through the buffer-capable square kernel; the
-  // local image-only square helper would read no buffer payload.
-  Tensor sum_sq =
-      reduce_impl(self.mul(self), dims, /*keepdim=*/true, false, false, 0);
   const double denom =
       static_cast<double>(std::max<int64_t>(count - correction, 1));
-  Tensor centered =
-      sum_sq.sub(sum.mul(sum).mul(Scalar(1.0 / count)));
-  Tensor result = centered.mul(Scalar(1.0 / denom));
+
+  // A half payload cannot carry the raw sums: the square sum of a long axis
+  // leaves the finite range of the format well before the axis ends.  Several
+  // axes have no fused walk, so the moments are taken as means instead, each
+  // bounded by the largest squared element rather than by the span length.
+  const bool is_half = self.dtype() == DType::Float16;
+
+  Tensor result = [&]() {
+    if (is_half) {
+      const Tensor mean =
+          reduce_impl(self, dims, /*keepdim=*/true, true, false, 0);
+      const Tensor mean_sq =
+          reduce_impl(self.mul(self), dims, /*keepdim=*/true, true, false, 0);
+      return mean_sq.sub(mean.mul(mean))
+          .mul(Scalar(static_cast<double>(count) / denom));
+    }
+    const Tensor sum =
+        reduce_impl(self, dims, /*keepdim=*/true, false, false, 0);
+    // self.mul(self) routes through the buffer-capable square kernel; the
+    // local image-only square helper would read no buffer payload.
+    const Tensor sum_sq =
+        reduce_impl(self.mul(self), dims, /*keepdim=*/true, false, false, 0);
+    return sum_sq.sub(sum.mul(sum).mul(Scalar(1.0 / count)))
+        .mul(Scalar(1.0 / denom));
+  }();
+
   if (keepdim) {
     return result;
   }
@@ -1322,8 +1375,8 @@ Tensor var_buffer_one_pass(
 
 Tensor var_kernel(const Tensor& self, int64_t correction) {
   TP_CHECK(
-      self.dtype() == DType::Float32,
-      "Vulkan var supports Float32 tensors only");
+      self.dtype() == DType::Float32 || self.dtype() == DType::Float16,
+      "Vulkan var supports Float32 and Float16 tensors only");
   TP_CHECK(self.dim() >= 1 && self.dim() <= 4, "Vulkan var: 1d to 4d only");
   TP_CHECK(self.numel() > 0, "Vulkan var does not support empty tensors");
 
@@ -1331,6 +1384,10 @@ Tensor var_kernel(const Tensor& self, int64_t correction) {
   dims.reserve(static_cast<size_t>(self.dim()));
   for (int64_t d = 0; d < self.dim(); ++d) {
     dims.push_back(d);
+  }
+
+  if (auto fused = var_half_single_axis(self, dims, false, correction)) {
+    return *fused;
   }
 
   api::vTensor v_self = convert(self);
@@ -1360,8 +1417,8 @@ Tensor var_dim_kernel(
     int64_t correction,
     bool keepdim) {
   TP_CHECK(
-      self.dtype() == DType::Float32,
-      "Vulkan var supports Float32 tensors only");
+      self.dtype() == DType::Float32 || self.dtype() == DType::Float16,
+      "Vulkan var supports Float32 and Float16 tensors only");
   TP_CHECK(
       self.dim() >= 1 && self.dim() <= 4,
       "Vulkan var supports 1d to 4d tensors");
@@ -1377,6 +1434,9 @@ Tensor var_dim_kernel(
     count *= self.size(axis);
   }
 
+  if (auto fused = var_half_single_axis(self, dims, keepdim, correction)) {
+    return *fused;
+  }
   api::vTensor v_self = convert(self);
   if (v_self.storage_type() == api::StorageType::BUFFER) {
     return var_buffer_one_pass(self, dims, keepdim, correction);

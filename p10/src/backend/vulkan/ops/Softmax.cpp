@@ -5,6 +5,7 @@
 #include "Convert.h"
 
 #include <algorithm>
+#include <string>
 #include <vector>
 
 namespace tensorplay {
@@ -41,12 +42,14 @@ Tensor softmax_impl(
   };
 
   // Buffer-stored payloads (any axis beyond the 3-D image limit) reduce
-  // through a linear row-walking variant.  Float16 buffer payloads are
-  // byte-packed with no buffer-writing softmax yet.
+  // through a linear row-walking variant.  A half payload normalizes two
+  // elements per output word, so its grid counts words instead of rows.
   if (v_output.storage_type() == api::StorageType::BUFFER) {
+    const bool is_half = v_input.dtype() == DType::Float16;
     TP_CHECK(
-        v_input.dtype() == DType::Float32,
-        "Vulkan softmax over Float16 buffer storage is not supported yet");
+        v_input.dtype() == DType::Float32 || is_half,
+        "Vulkan softmax over linear storage supports Float32 and Float16 "
+        "tensors only");
     const int64_t axis_size = input_arg.size(dim);
     int64_t inner = 1;
     for (int64_t d = dim + 1; d < ndim; ++d) {
@@ -61,13 +64,17 @@ Tensor softmax_impl(
         static_cast<int32_t>(axis_size), static_cast<int32_t>(inner),
         static_cast<int32_t>(rows),
     };
+    const std::string shader =
+        std::string(log_mode ? "log_softmax_buffer" : "softmax_buffer") +
+        (is_half ? "_half" : "");
+    const int64_t grid =
+        is_half ? (input_arg.numel() + 1) / 2 : rows;
     api::UniformParamsBuffer params(context, block);
     api::PipelineBarrier pipeline_barrier{};
     context->submit_compute_job(
-        log_mode ? VK_KERNEL(log_softmax_buffer)
-                 : VK_KERNEL(softmax_buffer),
+        VK_KERNEL_FROM_STR(shader.c_str()),
         pipeline_barrier,
-        {static_cast<uint32_t>(rows), 1u, 1u},
+        {static_cast<uint32_t>(grid), 1u, 1u},
         {256u, 1u, 1u}, VK_NULL_HANDLE,
         v_output.buffer(
             pipeline_barrier,

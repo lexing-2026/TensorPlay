@@ -1446,6 +1446,14 @@ reduce_axis_buffer:
     MODE: 0
   - NAME: var_axis_buffer
     MODE: 1
+reduce_axis_buffer_half:
+  parameter_names_with_default_values:
+    MODE: 0
+  shader_variants:
+  - NAME: sum_axis_buffer_half
+    MODE: 0
+  - NAME: var_axis_buffer_half
+    MODE: 1
 reduce_extremum_buffer:
   parameter_names_with_default_values:
     GREATER: 1
@@ -1453,6 +1461,22 @@ reduce_extremum_buffer:
   - NAME: reduce_max_buffer
     GREATER: 1
   - NAME: reduce_min_buffer
+    GREATER: 0
+reduce_extremum_buffer_half:
+  parameter_names_with_default_values:
+    GREATER: 1
+  shader_variants:
+  - NAME: reduce_max_buffer_half
+    GREATER: 1
+  - NAME: reduce_min_buffer_half
+    GREATER: 0
+reduce_argminmax_buffer_half:
+  parameter_names_with_default_values:
+    GREATER: 0
+  shader_variants:
+  - NAME: reduce_argmax_buffer_half
+    GREATER: 1
+  - NAME: reduce_argmin_buffer_half
     GREATER: 0
 hardshrink_mask:
   parameter_names_with_default_values: {}
@@ -1465,6 +1489,14 @@ softmax_buffer:
   - NAME: softmax_buffer
     LOG_MODE: 0
   - NAME: log_softmax_buffer
+    LOG_MODE: 1
+softmax_buffer_half:
+  parameter_names_with_default_values:
+    LOG_MODE: 0
+  shader_variants:
+  - NAME: softmax_buffer_half
+    LOG_MODE: 0
+  - NAME: log_softmax_buffer_half
     LOG_MODE: 1
 one_minus:
   parameter_names_with_default_values:
