@@ -253,47 +253,71 @@ Tensor conv2d_kernel(const Tensor& input, const Tensor& weight,
     return output;
   }
 
+  const std::vector<int64_t> input_shape =
+      static_cast<std::vector<int64_t>>(input.shape());
+  const std::vector<int64_t> weight_shape =
+      static_cast<std::vector<int64_t>>(weight.shape());
+  // One graph per shape and convolution configuration; the buffers behind its
+  // placeholders are swapped on every call, so a repeated call only feeds and
+  // encodes the graph.
+  const std::string key = graphKey(
+      "conv2d",
+      {shapeKey(input_shape), shapeKey(weight_shape),
+       dtypeKey(input_c.dtype()), dtypeKey(weight_c.dtype()),
+       std::to_string(sH), std::to_string(sW), std::to_string(pH),
+       std::to_string(pW), std::to_string(dH), std::to_string(dW),
+       std::to_string(groups), std::string(has_bias ? "bias" : "nobias")});
   @autoreleasepool {
     @try {
-    MPSGraph* graph = [[MPSGraph new] autorelease];
-    MPSShape* inShape = getMPSShape(static_cast<std::vector<int64_t>>(input.shape()));
-    MPSShape* wShape = getMPSShape(static_cast<std::vector<int64_t>>(weight.shape()));
+    MPSShape* inShape = getMPSShape(input_shape);
+    MPSShape* wShape = getMPSShape(weight_shape);
     MPSShape* outShape = getMPSShape(out_shape);
     std::vector<int64_t> bias_shape = {1, O, 1, 1};
     MPSShape* biasShape = getMPSShape(bias_shape);
     const MPSDataType dt = getMPSDataType(input_c.dtype());
 
-    MPSGraphTensor* xt = [graph placeholderWithShape:inShape
-                                           dataType:dt
-                                                name:@"x"];
-    MPSGraphTensor* wt = [graph placeholderWithShape:wShape
-                                    dataType:dt
-                                         name:@"w"];
-    MPSGraphConvolution2DOpDescriptor* desc =
-        [[MPSGraphConvolution2DOpDescriptor new] autorelease];
-    desc.strideInX = sW;
-    desc.strideInY = sH;
-    desc.dilationRateInX = dW;
-    desc.dilationRateInY = dH;
-    desc.paddingStyle = MPSGraphPaddingStyleExplicit;
-    desc.paddingLeft = pW;
-    desc.paddingRight = pW;
-    desc.paddingTop = pH;
-    desc.paddingBottom = pH;
-    desc.dataLayout = MPSGraphTensorNamedDataLayoutNCHW;
-    desc.weightsLayout = MPSGraphTensorNamedDataLayoutOIHW;
-    desc.groups = groups;
+    CachedGraph* entry = findCachedGraph(key);
+    if (!entry) {
+      MPSGraph* graph = [[MPSGraph alloc] init];
+      MPSGraphTensor* xt = [graph placeholderWithShape:inShape
+                                             dataType:dt
+                                                  name:@"x"];
+      MPSGraphTensor* wt = [graph placeholderWithShape:wShape
+                                      dataType:dt
+                                           name:@"w"];
+      MPSGraphConvolution2DOpDescriptor* desc =
+          [[MPSGraphConvolution2DOpDescriptor new] autorelease];
+      desc.strideInX = sW;
+      desc.strideInY = sH;
+      desc.dilationRateInX = dW;
+      desc.dilationRateInY = dH;
+      desc.paddingStyle = MPSGraphPaddingStyleExplicit;
+      desc.paddingLeft = pW;
+      desc.paddingRight = pW;
+      desc.paddingTop = pH;
+      desc.paddingBottom = pH;
+      desc.dataLayout = MPSGraphTensorNamedDataLayoutNCHW;
+      desc.weightsLayout = MPSGraphTensorNamedDataLayoutOIHW;
+      desc.groups = groups;
 
-    MPSGraphTensor* conv =
-        [graph convolution2DWithSourceTensor:xt
-                            weightsTensor:wt
-                               descriptor:desc
-                                     name:nil];
-    MPSGraphTensor* result = conv;
-    MPSGraphTensor* bt = nil;
-    if (has_bias) {
-      bt = [graph placeholderWithShape:biasShape dataType:dt name:@"b"];
-      result = [graph additionWithPrimaryTensor:conv secondaryTensor:bt name:nil];
+      MPSGraphTensor* conv =
+          [graph convolution2DWithSourceTensor:xt
+                              weightsTensor:wt
+                                 descriptor:desc
+                                       name:nil];
+      MPSGraphTensor* result = conv;
+      MPSGraphTensor* bt = nil;
+      if (has_bias) {
+        bt = [graph placeholderWithShape:biasShape dataType:dt name:@"b"];
+        result = [graph additionWithPrimaryTensor:conv
+                                  secondaryTensor:bt
+                                             name:nil];
+      }
+      entry = new CachedGraph{graph, [xt retain], [wt retain],
+                              has_bias ? [bt retain] : nil,
+                              [result retain]};
+      storeCachedGraph(key, entry);
+      entry = findCachedGraph(key);
     }
 
     id<MTLBuffer> inBuf = mtlBufferOf(input_c);
@@ -312,18 +336,18 @@ Tensor conv2d_kernel(const Tensor& input, const Tensor& weight,
                                                 shape:outShape
                                              dataType:dt] autorelease];
     NSMutableDictionary* feeds =
-        [NSMutableDictionary dictionaryWithObjectsAndKeys:inData, xt,
-                                                          wData, wt, nil];
-    NSDictionary* results = @{result : outData};
+        [NSMutableDictionary dictionaryWithObjectsAndKeys:
+            inData, entry->input0, wData, entry->input1, nil];
+    NSDictionary* results = @{entry->result : outData};
     if (has_bias) {
       MPSGraphTensorData* bData =
           [[[MPSGraphTensorData alloc] initWithMTLBuffer:mtlBufferOf(bias_c)
                                                   shape:biasShape
                                                dataType:dt] autorelease];
-      feeds[bt] = bData;
+      feeds[entry->input2] = bData;
     }
 
-    getCurrentMPSStream()->executeMPSGraph(graph, feeds, results,
+    getCurrentMPSStream()->executeMPSGraph(entry->graph, feeds, results,
                                           SyncType::COMMIT_ADAPTIVE);
     } @catch (NSException* e) {
       std::string reason =

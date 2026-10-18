@@ -117,27 +117,46 @@ Tensor avg_pool2d_kernel(const Tensor& input,
   }
 
   Tensor x_c = materializeForGraph(x);
+  const std::vector<int64_t> x_shape =
+      static_cast<std::vector<int64_t>>(x.shape());
+  // The graph only depends on the shapes and pooling parameters; its buffers
+  // are fed per call, so a repeated call pays feed and encode only.
+  const std::string key = graphKey(
+      "avg_pool2d",
+      {shapeKey(x_shape), dtypeKey(x_c.dtype()),
+       std::to_string(kH), std::to_string(kW), std::to_string(dH),
+       std::to_string(dW), std::to_string(padH), std::to_string(padW),
+       std::string(ceil_mode ? "ceil" : "floor"),
+       std::string(count_include_pad ? "pad" : "nopad"),
+       std::string(use_divisor ? "div" : "nodiv"),
+       scalarKey(Scalar(divisor_scale))});
   @autoreleasepool {
-    MPSGraph* graph = [[MPSGraph new] autorelease];
-    MPSShape* inShape = getMPSShape(static_cast<std::vector<int64_t>>(x.shape()));
+    MPSShape* inShape = getMPSShape(x_shape);
     MPSShape* outShape = getMPSShape(out_shape);
     const MPSDataType dt = getMPSDataType(x_c.dtype());
 
-    MPSGraphTensor* xt = [graph placeholderWithShape:inShape
-                                           dataType:dt
-                                                name:@"x"];
-    MPSGraphPooling2DOpDescriptor* desc = poolingDescriptor(
-        kH, kW, dH, dW, padH, padW, ceil_mode,
-        use_divisor ? true : count_include_pad);
-    MPSGraphTensor* pooled =
-        [graph avgPooling2DWithSourceTensor:xt descriptor:desc name:nil];
-    MPSGraphTensor* result = pooled;
-    if (use_divisor) {
-      MPSGraphTensor* scaleTensor =
-          [graph constantWithScalar:divisor_scale dataType:dt];
-      result = [graph multiplicationWithPrimaryTensor:pooled
-                                     secondaryTensor:scaleTensor
-                                                name:nil];
+    CachedGraph* entry = findCachedGraph(key);
+    if (!entry) {
+      MPSGraph* graph = [[MPSGraph alloc] init];
+      MPSGraphTensor* xt = [graph placeholderWithShape:inShape
+                                             dataType:dt
+                                                  name:@"x"];
+      MPSGraphPooling2DOpDescriptor* desc = poolingDescriptor(
+          kH, kW, dH, dW, padH, padW, ceil_mode,
+          use_divisor ? true : count_include_pad);
+      MPSGraphTensor* pooled =
+          [graph avgPooling2DWithSourceTensor:xt descriptor:desc name:nil];
+      MPSGraphTensor* result = pooled;
+      if (use_divisor) {
+        MPSGraphTensor* scaleTensor =
+            [graph constantWithScalar:divisor_scale dataType:dt];
+        result = [graph multiplicationWithPrimaryTensor:pooled
+                                       secondaryTensor:scaleTensor
+                                                  name:nil];
+      }
+      entry = new CachedGraph{graph, [xt retain], nil, nil, [result retain]};
+      storeCachedGraph(key, entry);
+      entry = findCachedGraph(key);
     }
 
     id<MTLBuffer> inBuf = mtlBufferOf(x_c);
@@ -150,9 +169,9 @@ Tensor avg_pool2d_kernel(const Tensor& input,
         [[[MPSGraphTensorData alloc] initWithMTLBuffer:outBuf
                                                 shape:outShape
                                              dataType:dt] autorelease];
-    NSDictionary* feeds = @{xt : inData};
-    NSDictionary* results = @{result : outData};
-    getCurrentMPSStream()->executeMPSGraph(graph, feeds, results,
+    NSDictionary* feeds = @{entry->input0 : inData};
+    NSDictionary* results = @{entry->result : outData};
+    getCurrentMPSStream()->executeMPSGraph(entry->graph, feeds, results,
                                           SyncType::COMMIT_ADAPTIVE);
   }
   return batched ? output : output.squeeze(0);
@@ -197,28 +216,44 @@ std::tuple<Tensor, Tensor> max_pool2d_with_indices_kernel(
   }
 
   Tensor x_c = materializeForGraph(x);
+  const std::vector<int64_t> x_shape =
+      static_cast<std::vector<int64_t>>(x.shape());
+  const std::string key = graphKey(
+      "max_pool2d",
+      {shapeKey(x_shape), dtypeKey(x_c.dtype()),
+       std::to_string(kH), std::to_string(kW), std::to_string(dH),
+       std::to_string(dW), std::to_string(dilH), std::to_string(dilW),
+       std::to_string(padH), std::to_string(padW),
+       std::string(ceil_mode ? "ceil" : "floor")});
   @autoreleasepool {
-    MPSGraph* graph = [[MPSGraph new] autorelease];
-    MPSShape* inShape = getMPSShape(static_cast<std::vector<int64_t>>(x.shape()));
+    MPSShape* inShape = getMPSShape(x_shape);
     MPSShape* outShape = getMPSShape(out_shape);
     const MPSDataType dt = getMPSDataType(x_c.dtype());
     const MPSDataType idx_dt = getMPSDataType(DType::Int64);
 
-    MPSGraphTensor* xt = [graph placeholderWithShape:inShape
-                                           dataType:dt
-                                                name:@"x"];
-    MPSGraphPooling2DOpDescriptor* desc = poolingDescriptor(
-        kH, kW, dH, dW, padH, padW, ceil_mode, false);
-    desc.returnIndicesMode = MPSGraphPoolingReturnIndicesGlobalFlatten2D;
-    desc.returnIndicesDataType = MPSDataTypeInt32;
-    NSArray<MPSGraphTensor*>* poolOutputs =
-        [graph maxPooling2DReturnIndicesWithSourceTensor:xt
-                                              descriptor:desc
-                                                    name:nil];
-    MPSGraphTensor* idx32 = poolOutputs[1];
-    MPSGraphTensor* idx64 = ([idx32 dataType] == idx_dt)
-        ? idx32
-        : [graph castTensor:idx32 toType:idx_dt name:@"cast_idx"];
+    CachedGraph* entry = findCachedGraph(key);
+    if (!entry) {
+      MPSGraph* graph = [[MPSGraph alloc] init];
+      MPSGraphTensor* xt = [graph placeholderWithShape:inShape
+                                             dataType:dt
+                                                  name:@"x"];
+      MPSGraphPooling2DOpDescriptor* desc = poolingDescriptor(
+          kH, kW, dH, dW, padH, padW, ceil_mode, false);
+      desc.returnIndicesMode = MPSGraphPoolingReturnIndicesGlobalFlatten2D;
+      desc.returnIndicesDataType = MPSDataTypeInt32;
+      NSArray<MPSGraphTensor*>* poolOutputs =
+          [graph maxPooling2DReturnIndicesWithSourceTensor:xt
+                                                descriptor:desc
+                                                      name:nil];
+      MPSGraphTensor* idx32 = poolOutputs[1];
+      MPSGraphTensor* idx64 = ([idx32 dataType] == idx_dt)
+          ? idx32
+          : [graph castTensor:idx32 toType:idx_dt name:@"cast_idx"];
+      entry = new CachedGraph{graph, [xt retain], nil, nil,
+                              [poolOutputs[0] retain], [idx64 retain]};
+      storeCachedGraph(key, entry);
+      entry = findCachedGraph(key);
+    }
 
     id<MTLBuffer> inBuf = mtlBufferOf(x_c);
     id<MTLBuffer> valBuf = mtlBufferOf(values);
@@ -235,9 +270,10 @@ std::tuple<Tensor, Tensor> max_pool2d_with_indices_kernel(
         [[[MPSGraphTensorData alloc] initWithMTLBuffer:idxBuf
                                                 shape:outShape
                                              dataType:idx_dt] autorelease];
-    NSDictionary* feeds = @{xt : inData};
-    NSDictionary* results = @{poolOutputs[0] : valData, idx64 : idxData};
-    getCurrentMPSStream()->executeMPSGraph(graph, feeds, results,
+    NSDictionary* feeds = @{entry->input0 : inData};
+    NSDictionary* results = @{entry->result : valData,
+                              entry->result2 : idxData};
+    getCurrentMPSStream()->executeMPSGraph(entry->graph, feeds, results,
                                           SyncType::COMMIT_ADAPTIVE);
   }
   return batched ? std::make_tuple(values, indices)
