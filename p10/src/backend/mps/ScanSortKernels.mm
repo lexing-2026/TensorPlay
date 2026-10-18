@@ -12,6 +12,7 @@
 #include <Metal/Metal.h>
 
 #include <algorithm>
+#include <array>
 #include <limits>
 #include <tuple>
 #include <vector>
@@ -72,6 +73,52 @@ void dispatch_scan(const std::string& kernel_name, const Tensor& src,
   });
 }
 
+// Scans `rows` rows of `len` consecutive elements, one threadgroup per row.
+// The shader reads four elements per thread, so the group width follows the
+// row length up to a full pass; only a whole number of SIMD groups is valid.
+void dispatch_row_scan(const std::string& kernel_name, const Tensor& src,
+                       const Tensor& result, int64_t rows, int64_t len) {
+  auto pso = lib.getPipelineStateForFunc(kernel_name);
+  const std::array<uint32_t, 2> sizes = {static_cast<uint32_t>(rows),
+                                         static_cast<uint32_t>(len)};
+  constexpr uint32_t kReadsPerThread = 4;
+  const uint32_t wanted =
+      static_cast<uint32_t>((len + kReadsPerThread - 1) / kReadsPerThread);
+  uint32_t tg = std::min<uint32_t>(wanted, 256);
+  tg = (tg + 31) / 32 * 32;
+  tg = std::max<uint32_t>(tg, 32);
+  tg = std::min<uint32_t>(
+      tg, static_cast<uint32_t>([pso maxTotalThreadsPerThreadgroup]) / 32 * 32);
+  MPSStream* stream = getCurrentMPSStream();
+  dispatch_sync_with_rethrow(stream->queue(), ^() {
+    @autoreleasepool {
+      stream->endKernelCoalescing();
+      auto encoder = stream->commandEncoder();
+      [encoder setComputePipelineState:pso];
+      // One partial per lane, sized for the widest accumulator.
+      [encoder setThreadgroupMemoryLength:32 * sizeof(long) atIndex:0];
+      mtl_setArgs(encoder, src, result, sizes);
+      [encoder dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(rows),
+                                                1, 1)
+          threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+      stream->synchronize(SyncType::COMMIT);
+    }
+  });
+}
+
+// Whether the scan can run down rows of the contiguous buffer: only the
+// innermost axis lands on consecutive elements, and the shader addresses rows
+// and elements with 32-bit indices. Returns the row count in `rows`.
+bool innermost_rows(const Tensor& src, int64_t inner, int64_t d_size,
+                    int64_t outer, uint64_t& rows) {
+  if (inner != 1 || src.storage_offset() != 0) {
+    return false;
+  }
+  rows = static_cast<uint64_t>(outer);
+  return d_size > 0 && d_size <= std::numeric_limits<uint32_t>::max() &&
+         rows <= std::numeric_limits<uint32_t>::max();
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -98,8 +145,14 @@ Tensor cumsum_kernel(const Tensor& self, int64_t dim,
   int64_t inner = 1;
   outer_inner(static_cast<std::vector<int64_t>>(src.shape()), dim, outer,
               inner);
-  dispatch_scan("cumsum_" + scalarToMetalTypeString(out_dtype), src, result,
-                d_size, inner, outer);
+  uint64_t rows = 0;
+  if (innermost_rows(src, inner, d_size, outer, rows)) {
+    dispatch_row_scan("scan_rows_sum_" + scalarToMetalTypeString(out_dtype),
+                      src, result, static_cast<int64_t>(rows), d_size);
+  } else {
+    dispatch_scan("cumsum_" + scalarToMetalTypeString(out_dtype), src, result,
+                  d_size, inner, outer);
+  }
   return result;
 }
 
@@ -123,8 +176,14 @@ Tensor cumprod_kernel(const Tensor& self, int64_t dim,
   int64_t inner = 1;
   outer_inner(static_cast<std::vector<int64_t>>(src.shape()), dim, outer,
               inner);
-  dispatch_scan("cumprod_" + scalarToMetalTypeString(out_dtype), src, result,
-                d_size, inner, outer);
+  uint64_t rows = 0;
+  if (innermost_rows(src, inner, d_size, outer, rows)) {
+    dispatch_row_scan("scan_rows_prod_" + scalarToMetalTypeString(out_dtype),
+                      src, result, static_cast<int64_t>(rows), d_size);
+  } else {
+    dispatch_scan("cumprod_" + scalarToMetalTypeString(out_dtype), src, result,
+                  d_size, inner, outer);
+  }
   return result;
 }
 
