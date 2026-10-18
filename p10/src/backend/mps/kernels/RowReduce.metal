@@ -45,14 +45,15 @@ kernel void row_sum_inner(device T* out [[buffer(0)]],
   for (uint j = 0; j < kSumChains; ++j) {
     acc[j] = T(0);
   }
-  // A lane covers kSumChains consecutive elements at a time, so a full block of
-  // the row spans the whole group once per chain.
+  // One element per chain per step, the chains one group-wide stride apart, so
+  // every load instruction covers one contiguous stretch of the row while the
+  // chains keep several loads in flight.
   const uint stride = simdgroup_size * kSumChains;
   const uint whole = (n / stride) * stride;
-  for (uint base = lane * kSumChains; base < whole; base += stride) {
+  for (uint base = 0; base < whole; base += stride) {
 #pragma unroll
     for (uint j = 0; j < kSumChains; ++j) {
-      acc[j] += values[base + j];
+      acc[j] += values[base + j * simdgroup_size + lane];
     }
   }
   // The rest of the row, one element per lane per step.
@@ -368,11 +369,10 @@ kernel void sum_chunk(device T* out [[buffer(0)]],
   }
   const uint stride = simdgroup_size * kSumChains;
   const uint whole = (count / stride) * stride;
-  for (uint base = first + lane * kSumChains; base < first + whole;
-       base += stride) {
+  for (uint base = first; base < first + whole; base += stride) {
 #pragma unroll
     for (uint j = 0; j < kSumChains; ++j) {
-      acc[j] += src[base + j];
+      acc[j] += src[base + j * simdgroup_size + lane];
     }
   }
   for (uint i = first + whole + lane; i < last; i += simdgroup_size) {
@@ -409,9 +409,9 @@ kernel void extremum_chunk(device float* out [[buffer(0)]],
   const uint last = min(first + chunk, numel);
   const uint count = last - first;
 
-  // Several independent chains per lane, like the sum kernel: the loads of a
-  // chain are far enough apart to stay in flight together, so the walk is not
-  // serialized on one comparison. Folding the chains at the end keeps the
+  // Several independent chains per lane, like the sum kernel, so the walk is
+  // not serialized on one comparison and each load instruction covers one
+  // contiguous stretch of the chunk. Folding the chains at the end keeps the
   // replacement rule of a single walk.
   metal::array<float, kSumChains> held;
 #pragma unroll
@@ -420,11 +420,10 @@ kernel void extremum_chunk(device float* out [[buffer(0)]],
   }
   const uint stride = simdgroup_size * kSumChains;
   const uint whole = (count / stride) * stride;
-  for (uint base = first + lane * kSumChains; base < first + whole;
-       base += stride) {
+  for (uint base = first; base < first + whole; base += stride) {
 #pragma unroll
     for (uint j = 0; j < kSumChains; ++j) {
-      const float candidate = src[base + j];
+      const float candidate = src[base + j * simdgroup_size + lane];
       if (Op::replace(candidate, held[j])) {
         held[j] = candidate;
       }
