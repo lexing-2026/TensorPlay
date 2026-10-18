@@ -34,12 +34,11 @@ int64_t wrap_dim(int64_t dim, int64_t ndim) {
   return d;
 }
 
-// Returns a contiguous int64 copy of `index` with every entry checked against
-// `dim_size`. Short indices are scanned on the host; longer ones are checked
-// by a kernel encoded on the stream just before the gather/scatter, which
-// reports a bad entry into the stream's error buffer. The access kernels wrap
-// and clamp, so an entry that is still in flight while the report is pending
-// stays inside the storage.
+// Returns a contiguous int64 copy of `index`. Short indices are checked on the
+// host; longer ones are checked inside the access kernel itself, which reports
+// a bad entry into the stream's error buffer while reading the index for the
+// access. The access kernels wrap and clamp, so an entry that is still in
+// flight while the report is pending stays inside the storage.
 Tensor normalize_index(const Tensor& index, int64_t dim_size) {
   Tensor idx = index;
   if (idx.dtype() != DType::Int64) {
@@ -68,10 +67,13 @@ Tensor normalize_index(const Tensor& index, int64_t dim_size) {
     }
     return idx;
   }
+  return idx;
+}
 
-  // The check goes onto the stream right before the gather/scatter that needs
-  // it, so both share one command buffer; the wait that drains it raises the
-  // report instead of this call waiting for a host readback.
+// Reports an out-of-range entry for a result with no elements for the access
+// kernel to visit. The report goes onto the stream right before the wait that
+// raises it.
+void dispatch_bounds_check(const Tensor& idx, int64_t dim_size) {
   const std::string kernel =
       "index_bounds_check_" + scalarToMetalTypeString(idx.dtype());
   auto pso = lib.getPipelineStateForFunc(kernel);
@@ -81,15 +83,16 @@ Tensor normalize_index(const Tensor& index, int64_t dim_size) {
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:pso];
       mtl_setArgs(encoder, idx, dim_size, stream->errorBuffer());
-      mtl_dispatch1DJob(encoder, pso, static_cast<NSUInteger>(n));
+      mtl_dispatch1DJob(encoder, pso,
+                        static_cast<NSUInteger>(idx.numel()));
     }
   });
-  return idx;
 }
 
 // Dispatches a dense indexing kernel that reads one element of `input` per
 // output element. The grid is (inner, indexed dim, outer), the layout the
-// kernels address directly.
+// kernels address directly. The kernels also report an out-of-range index
+// entry into the stream's error buffer as they read it.
 void dispatch_indexing(const std::string& kernel, const Tensor& output,
                        const Tensor& input, const Tensor& index,
                        int64_t inner, int64_t dim_size, int64_t idx_dim,
@@ -101,7 +104,8 @@ void dispatch_indexing(const std::string& kernel, const Tensor& output,
     @autoreleasepool {
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:pso];
-      mtl_setArgs(encoder, output, input, index, inner, dim_size, idx_dim);
+      mtl_setArgs(encoder, output, input, index, inner, dim_size, idx_dim,
+                  stream->errorBuffer());
       mtl_dispatch3DJob(encoder, pso, static_cast<NSUInteger>(inner),
                         static_cast<NSUInteger>(idx_dim),
                         static_cast<NSUInteger>(outer));
@@ -148,7 +152,8 @@ bool dispatch_index_select_wide(const Tensor& output, const Tensor& input,
     @autoreleasepool {
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:pso];
-      mtl_setArgs(encoder, output, input, index, units, dim_size, idx_dim);
+      mtl_setArgs(encoder, output, input, index, units, dim_size, idx_dim,
+                  stream->errorBuffer());
       mtl_dispatch3DJob(encoder, pso, static_cast<NSUInteger>(units),
                         static_cast<NSUInteger>(idx_dim),
                         static_cast<NSUInteger>(outer));
@@ -170,7 +175,8 @@ void dispatch_scatter_value(const std::string& kernel, const Tensor& output,
     @autoreleasepool {
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:pso];
-      mtl_setArgs(encoder, output, value, index, inner, out_dim, idx_dim);
+      mtl_setArgs(encoder, output, value, index, inner, out_dim, idx_dim,
+                  stream->errorBuffer());
       mtl_dispatch3DJob(encoder, pso, static_cast<NSUInteger>(inner),
                         static_cast<NSUInteger>(idx_dim),
                         static_cast<NSUInteger>(outer));
@@ -307,9 +313,10 @@ Tensor index_select_kernel(const Tensor& self, int64_t dim,
     return result;
   }
   Tensor self_c = self.contiguous();
-  // With the indexed dimension empty every entry is out of bounds; the check
-  // the stream already holds raises when it drains, and nothing is gathered.
+  // With the indexed dimension empty every entry is out of bounds; report the
+  // first one and raise it before the access could touch the empty storage.
   if (self.numel() == 0) {
+    dispatch_bounds_check(idx_c, row);
     synchronizeHostAccess();
     return result;
   }
@@ -379,13 +386,20 @@ void scatter_impl(Tensor& result, int64_t dim, const Tensor& index,
   if (idx_c.numel() == 0) {
     return;
   }
+  const int64_t self_dim = result.size(dim);
+  // Every entry addresses the empty indexed dimension; report one and raise it
+  // before the access could write the empty storage.
+  if (result.numel() == 0) {
+    dispatch_bounds_check(idx_c, self_dim);
+    synchronizeHostAccess();
+    return;
+  }
 
   int64_t idx_inner = 1;
   for (int64_t i = dim + 1; i < nd; ++i) {
     idx_inner *= idx_c.size(i);
   }
   const int64_t idx_dim = idx_c.size(dim);
-  const int64_t self_dim = result.size(dim);
   const std::string suffix = scalarToMetalTypeString(result.dtype());
 
   if (mode == ScatterMode::Assign && value != nullptr) {

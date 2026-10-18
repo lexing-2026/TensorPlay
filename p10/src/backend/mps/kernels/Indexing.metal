@@ -12,10 +12,11 @@ using namespace p10::metal;
 // directly -- x walks `inner`, y the indexed dimension, z the leading dims --
 // so no thread has to decompose a flat index.
 //
-// A bounds-check kernel is encoded ahead of the gather/scatter in the same
-// command buffer and reports a bad entry into the stream's error buffer; the
-// wait that drains the work raises it. Until it does, the access kernels clamp
-// their index so an out-of-range entry cannot address outside the storage.
+// Each access kernel reports an out-of-range index entry into the stream's
+// error buffer as it reads the entry; the wait that drains the work raises it.
+// Until it does, the kernels clamp their index so the entry cannot address
+// outside the storage. A standalone bounds-check kernel covers the paths where
+// no access runs because the result has no elements.
 
 // Wraps a negative entry and clamps anything still outside the dimension, so a
 // reported entry cannot make the access kernels read or write out of bounds.
@@ -24,6 +25,20 @@ static inline ulong wrapped_index(long raw, long dim) {
   const long top = dim > 0 ? dim - 1 : 0;
   idx = idx < 0 ? 0 : (idx >= dim ? top : idx);
   return static_cast<ulong>(idx);
+}
+
+// Reports an index that cannot address the indexed dimension into the stream's
+// error buffer. `out[0]` becomes nonzero, `out[1]` holds the offending value
+// and `out[2]` the dimension size; the report is raised by the next wait that
+// drains the work. Any offending entry is representative, so the stores need
+// no ordering between threads. Reporting from inside the access kernel keeps
+// the index read to the one the access itself performs.
+static inline void report_bad_index(long raw, long dim, device long* out) {
+  if (raw < -dim || raw >= dim) {
+    out[1] = raw;
+    out[2] = dim;
+    out[0] = 1;
+  }
 }
 
 // index_select: output[o, j, i] = input[o, index[j], i]
@@ -35,9 +50,12 @@ kernel void index_select_dense(
     constant long& inner [[buffer(3)]],
     constant long& in_dim [[buffer(4)]],
     constant long& n_idx [[buffer(5)]],
+    device long* err [[buffer(6)]],
     uint3 tid [[thread_position_in_grid]]) {
   const ulong x = tid.x;
-  const ulong j = wrapped_index(static_cast<long>(index[tid.y]), in_dim);
+  const long raw = static_cast<long>(index[tid.y]);
+  report_bad_index(raw, in_dim, err);
+  const ulong j = wrapped_index(raw, in_dim);
   const ulong o = tid.z;
   const ulong out_off = (o * n_idx + tid.y) * inner + x;
   const ulong in_off = (o * in_dim + j) * inner + x;
@@ -56,9 +74,12 @@ kernel void index_select_dense_vec(
     constant long& inner_units [[buffer(3)]],
     constant long& in_dim [[buffer(4)]],
     constant long& n_idx [[buffer(5)]],
+    device long* err [[buffer(6)]],
     uint3 tid [[thread_position_in_grid]]) {
   const ulong x = tid.x;
-  const ulong j = wrapped_index(static_cast<long>(index[tid.y]), in_dim);
+  const long raw = static_cast<long>(index[tid.y]);
+  report_bad_index(raw, in_dim, err);
+  const ulong j = wrapped_index(raw, in_dim);
   const ulong o = tid.z;
   const ulong out_off = (o * n_idx + tid.y) * inner_units + x;
   const ulong in_off = (o * in_dim + j) * inner_units + x;
@@ -75,10 +96,13 @@ kernel void gather_dense(
     constant long& inner [[buffer(3)]],
     constant long& in_dim [[buffer(4)]],
     constant long& idx_dim [[buffer(5)]],
+    device long* err [[buffer(6)]],
     uint3 tid [[thread_position_in_grid]]) {
   const ulong x = tid.x;
   const ulong pos = (ulong(tid.z) * idx_dim + tid.y) * inner + x;
-  const ulong idx = wrapped_index(static_cast<long>(index[pos]), in_dim);
+  const long raw = static_cast<long>(index[pos]);
+  report_bad_index(raw, in_dim, err);
+  const ulong idx = wrapped_index(raw, in_dim);
   const ulong in_off = (ulong(tid.z) * in_dim + idx) * inner + x;
   output[pos] = input[in_off];
 }
@@ -92,10 +116,13 @@ kernel void scatter_set_dense(
     constant long& inner [[buffer(3)]],
     constant long& out_dim [[buffer(4)]],
     constant long& idx_dim [[buffer(5)]],
+    device long* err [[buffer(6)]],
     uint3 tid [[thread_position_in_grid]]) {
   const ulong x = tid.x;
   const ulong pos = (ulong(tid.z) * idx_dim + tid.y) * inner + x;
-  const ulong idx = wrapped_index(static_cast<long>(index[pos]), out_dim);
+  const long raw = static_cast<long>(index[pos]);
+  report_bad_index(raw, out_dim, err);
+  const ulong idx = wrapped_index(raw, out_dim);
   const ulong out_off = (ulong(tid.z) * out_dim + idx) * inner + x;
   output[out_off] = src[pos];
 }
@@ -109,10 +136,13 @@ kernel void scatter_set_dense_value(
     constant long& inner [[buffer(3)]],
     constant long& out_dim [[buffer(4)]],
     constant long& idx_dim [[buffer(5)]],
+    device long* err [[buffer(6)]],
     uint3 tid [[thread_position_in_grid]]) {
   const ulong x = tid.x;
   const ulong pos = (ulong(tid.z) * idx_dim + tid.y) * inner + x;
-  const ulong idx = wrapped_index(static_cast<long>(index[pos]), out_dim);
+  const long raw = static_cast<long>(index[pos]);
+  report_bad_index(raw, out_dim, err);
+  const ulong idx = wrapped_index(raw, out_dim);
   const ulong out_off = (ulong(tid.z) * out_dim + idx) * inner + x;
   output[out_off] = value;
 }
@@ -126,10 +156,13 @@ kernel void scatter_add_dense(
     constant long& inner [[buffer(3)]],
     constant long& out_dim [[buffer(4)]],
     constant long& idx_dim [[buffer(5)]],
+    device long* err [[buffer(6)]],
     uint3 tid [[thread_position_in_grid]]) {
   const ulong x = tid.x;
   const ulong pos = (ulong(tid.z) * idx_dim + tid.y) * inner + x;
-  const ulong idx = wrapped_index(static_cast<long>(index[pos]), out_dim);
+  const long raw = static_cast<long>(index[pos]);
+  report_bad_index(raw, out_dim, err);
+  const ulong idx = wrapped_index(raw, out_dim);
   const ulong out_off = (ulong(tid.z) * out_dim + idx) * inner + x;
   AtomicType<T>::atomic_add(
       reinterpret_cast<device AtomicType_t<T>*>(output), out_off, src[pos]);
@@ -157,12 +190,7 @@ kernel void index_bounds_check(
     constant long& dim_size [[buffer(1)]],
     device long* out [[buffer(2)]],
     uint tid [[thread_position_in_grid]]) {
-  const long raw = static_cast<long>(index[tid]);
-  if (raw < -dim_size || raw >= dim_size) {
-    out[1] = raw;
-    out[2] = dim_size;
-    out[0] = 1;
-  }
+  report_bad_index(static_cast<long>(index[tid]), dim_size, out);
 }
 
 #define REGISTER_INDEX_SELECT_DTYPE(DTYPE)                                   \
@@ -174,6 +202,7 @@ kernel void index_bounds_check(
       constant long & inner [[buffer(3)]],                                    \
       constant long & in_dim [[buffer(4)]],                                   \
       constant long & n_idx [[buffer(5)]],                                    \
+      device long * err [[buffer(6)]],                                        \
       uint3 tid [[thread_position_in_grid]]);
 
 #define REGISTER_GATHER_DTYPE(DTYPE)                                         \
@@ -185,6 +214,7 @@ kernel void index_bounds_check(
       constant long & inner [[buffer(3)]],                                    \
       constant long & in_dim [[buffer(4)]],                                   \
       constant long & idx_dim [[buffer(5)]],                                  \
+      device long * err [[buffer(6)]],                                        \
       uint3 tid [[thread_position_in_grid]]);
 
 #define REGISTER_SCATTER_SET_DTYPE(DTYPE)                                    \
@@ -196,6 +226,7 @@ kernel void index_bounds_check(
       constant long & inner [[buffer(3)]],                                    \
       constant long & out_dim [[buffer(4)]],                                  \
       constant long & idx_dim [[buffer(5)]],                                  \
+      device long * err [[buffer(6)]],                                        \
       uint3 tid [[thread_position_in_grid]]);                                  \
   template [[host_name("scatter_set_dense_value_" #DTYPE "_long")]]          \
   kernel void scatter_set_dense_value<DTYPE, long>(                           \
@@ -205,6 +236,7 @@ kernel void index_bounds_check(
       constant long & inner [[buffer(3)]],                                    \
       constant long & out_dim [[buffer(4)]],                                  \
       constant long & idx_dim [[buffer(5)]],                                  \
+      device long * err [[buffer(6)]],                                        \
       uint3 tid [[thread_position_in_grid]]);
 
 #define REGISTER_SCATTER_ADD_DTYPE(DTYPE)                                    \
@@ -216,6 +248,7 @@ kernel void index_bounds_check(
       constant long & inner [[buffer(3)]],                                    \
       constant long & out_dim [[buffer(4)]],                                  \
       constant long & idx_dim [[buffer(5)]],                                  \
+      device long * err [[buffer(6)]],                                        \
       uint3 tid [[thread_position_in_grid]]);
 
 #define REGISTER_MASKED_FILL_DTYPE(DTYPE)                                    \
@@ -254,6 +287,7 @@ REGISTER_INDEX_BOUNDS_CHECK(long)
       constant long & inner_units [[buffer(3)]],                             \
       constant long & in_dim [[buffer(4)]],                                  \
       constant long & n_idx [[buffer(5)]],                                   \
+      device long * err [[buffer(6)]],                                       \
       uint3 tid [[thread_position_in_grid]]);
 
 REGISTER_INDEX_SELECT_VEC(16, uint4)
