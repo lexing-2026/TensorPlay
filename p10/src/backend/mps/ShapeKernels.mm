@@ -8,7 +8,9 @@
 #include "backend/mps/MetalShaderLibrary.h"
 #include "backend/mps/MetalUtils.h"
 #include "backend/mps/MPSStream.h"
+#include "backend/mps/kernels/Copy.h"
 
+#include <algorithm>
 #include <cstring>
 #include <vector>
 
@@ -64,6 +66,34 @@ int64_t slice_numel(const std::vector<int64_t>& shape, int64_t dim) {
   return n;
 }
 
+using BlockCopyPipeline = id<MTLComputePipelineState>;
+
+// Encodes `input`'s bytes into the output blocks described by the geometry.
+// The launch is chunked so the byte length fits its 32-bit field.
+void encode_block_copy(id<MTLComputeCommandEncoder> encoder,
+                       BlockCopyPipeline pso, const Tensor& input,
+                       const Tensor& output, int64_t slice_bytes,
+                       int64_t out_stride_bytes, int64_t off_bytes) {
+  const int64_t nbytes = input.numel() * input.itemsize();
+  if (nbytes == 0) {
+    return;
+  }
+  constexpr int64_t kChunkBytes = int64_t{1} << 30;
+  for (int64_t base = 0; base < nbytes; base += kChunkBytes) {
+    StridedBlockCopyParams params{};
+    params.base = static_cast<uint64_t>(base);
+    params.slice_bytes = static_cast<uint64_t>(slice_bytes);
+    params.out_stride_bytes = static_cast<uint64_t>(out_stride_bytes);
+    params.off_bytes = static_cast<uint64_t>(off_bytes);
+    params.nbytes = static_cast<uint32_t>(
+        std::min<int64_t>(kChunkBytes, nbytes - base));
+    params.flat = slice_bytes >= nbytes ? 1u : 0u;
+    mtl_setArgs(encoder, input, output, params);
+    mtl_dispatch1DJob(encoder, pso,
+                      (static_cast<NSUInteger>(params.nbytes) + 15) / 16);
+  }
+}
+
 } // namespace
 
 Tensor cat_kernel(const std::vector<Tensor>& tensors, int64_t dim) {
@@ -86,24 +116,43 @@ Tensor cat_kernel(const std::vector<Tensor>& tensors, int64_t dim) {
     return output;
   }
 
-  // The factory fills below were committed without waiting; make them
-  // visible to the host mapping before the memcpy reads it.
-  getCurrentMPSStream()->synchronize(SyncType::COMMIT_AND_WAIT);
-
-  const int64_t itemsize = output.itemsize();
-  const int64_t slice = slice_numel(out_shape, dim);
-  int64_t offset = 0;
+  // The inputs are copied on the GPU into their slots of the output: each is
+  // one contiguous run of `size(dim)` slices, and consecutive slices sit
+  // `output.size(dim)` apart.
+  std::vector<Tensor> prepared;
+  prepared.reserve(tensors.size());
   for (const Tensor& t : tensors) {
     if (t.size(dim) == 0) continue;
     Tensor tc = t.is_contiguous() ? t : t.contiguous();
     if (tc.dtype() != out_dtype) {
       tc = tc.to(out_dtype);
     }
-    const int64_t nbytes = tc.numel() * itemsize;
-    std::memcpy(static_cast<char*>(output.data_ptr()) + offset * itemsize,
-                tc.data_ptr(), nbytes);
-    offset += t.size(dim) * slice;
+    tc = materializeForGraph(tc);
+    prepared.push_back(tc);
   }
+
+  const int64_t itemsize = output.itemsize();
+  const int64_t inner_bytes = slice_numel(out_shape, dim) * itemsize;
+  const int64_t out_stride_bytes = output.size(dim) * inner_bytes;
+  const BlockCopyPipeline pso =
+      MetalShaderLibrary::getBundledLibrary().getPipelineStateForFunc(
+          "strided_block_copy");
+  MPSStream* stream = getCurrentMPSStream();
+  dispatch_sync_with_rethrow(stream->queue(), ^() {
+    @autoreleasepool {
+      stream->endKernelCoalescing();
+      auto encoder = stream->commandEncoder();
+      [encoder setComputePipelineState:pso];
+      int64_t offset = 0;
+      for (const Tensor& tc : prepared) {
+        const int64_t slice_bytes = tc.size(dim) * inner_bytes;
+        encode_block_copy(encoder, pso, tc, output, slice_bytes,
+                          out_stride_bytes, offset * inner_bytes);
+        offset += tc.size(dim);
+      }
+      stream->synchronize(SyncType::COMMIT);
+    }
+  });
   return output;
 }
 
@@ -139,20 +188,44 @@ Tensor stack_kernel(const std::vector<Tensor>& tensors, int64_t dim) {
     return output;
   }
 
-  getCurrentMPSStream()->synchronize(SyncType::COMMIT_AND_WAIT);
-
-  const int64_t itemsize = output.itemsize();
-  int64_t offset = 0;
+  std::vector<Tensor> prepared;
+  prepared.reserve(tensors.size());
   for (const Tensor& t : tensors) {
     Tensor tc = t.is_contiguous() ? t : t.contiguous();
     if (tc.dtype() != out_dtype) {
       tc = tc.to(out_dtype);
     }
-    const int64_t nbytes = tc.numel() * itemsize;
-    std::memcpy(static_cast<char*>(output.data_ptr()) + offset * itemsize,
-                tc.data_ptr(), nbytes);
-    offset += tc.numel();
+    tc = materializeForGraph(tc);
+    prepared.push_back(tc);
   }
+
+  // Each input is [outer, inner] when the trailing dims from `dim` on are
+  // flattened; the j-th input fills the j-th block of the new axis.
+  const int64_t itemsize = output.itemsize();
+  int64_t inner_bytes = itemsize;
+  for (int64_t d = dim; d < ndim; ++d) {
+    inner_bytes *= first.size(d);
+  }
+  const int64_t out_stride_bytes =
+      static_cast<int64_t>(tensors.size()) * inner_bytes;
+  const BlockCopyPipeline pso =
+      MetalShaderLibrary::getBundledLibrary().getPipelineStateForFunc(
+          "strided_block_copy");
+  MPSStream* stream = getCurrentMPSStream();
+  dispatch_sync_with_rethrow(stream->queue(), ^() {
+    @autoreleasepool {
+      stream->endKernelCoalescing();
+      auto encoder = stream->commandEncoder();
+      [encoder setComputePipelineState:pso];
+      int64_t off_bytes = 0;
+      for (const Tensor& tc : prepared) {
+        encode_block_copy(encoder, pso, tc, output, inner_bytes,
+                          out_stride_bytes, off_bytes);
+        off_bytes += inner_bytes;
+      }
+      stream->synchronize(SyncType::COMMIT);
+    }
+  });
   return output;
 }
 
@@ -171,6 +244,8 @@ Tensor embedding_kernel(const Tensor& weight, const Tensor& indices,
   }
   Tensor indices_c = indices.is_contiguous() ? indices : indices.contiguous();
   Tensor weight_c = weight.is_contiguous() ? weight : weight.contiguous();
+  indices_c = materializeForGraph(indices_c);
+  weight_c = materializeForGraph(weight_c);
 
   std::vector<int64_t> out_shape =
       static_cast<std::vector<int64_t>>(indices.shape());
@@ -186,6 +261,7 @@ Tensor embedding_kernel(const Tensor& weight, const Tensor& indices,
 
   // Range-check the indices on the host (unified memory makes the buffer
   // host-readable); the shader assumes valid indices afterwards.
+  synchronizeHostAccess();
   if (indices_c.dtype() == DType::Int64) {
     const int64_t* idx = indices_c.data_ptr<int64_t>();
     for (int64_t i = 0; i < n; ++i) {
@@ -205,22 +281,22 @@ Tensor embedding_kernel(const Tensor& weight, const Tensor& indices,
     }
   }
 
+  const int64_t row_bytes = emb_dim * weight.itemsize();
+  const NSUInteger chunks = static_cast<NSUInteger>(row_bytes + 15) / 16;
+  const std::string kernel = "embedding_forward_" +
+      scalarToMetalTypeString(indices_c.dtype());
+  auto pso = MetalShaderLibrary::getBundledLibrary().getPipelineStateForFunc(
+      kernel);
   MPSStream* mpsStream = getCurrentMPSStream();
   dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
     @autoreleasepool {
       id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
-      const std::string kernel = "embedding_forward_" +
-          scalarToMetalTypeString(weight_c.dtype()) + "_" +
-          scalarToMetalTypeString(indices_c.dtype());
-      id<MTLComputePipelineState> PSO =
-          MetalShaderLibrary::getBundledLibrary().getPipelineStateForFunc(
-              kernel);
-      [computeEncoder setComputePipelineState:PSO];
+      [computeEncoder setComputePipelineState:pso];
       mtl_setArgs(computeEncoder, weight_c, indices_c, output,
                   static_cast<uint32_t>(num_embeddings),
-                  static_cast<uint32_t>(emb_dim),
-                  static_cast<uint32_t>(n));
-      mtl_dispatch1DJob(computeEncoder, PSO, static_cast<NSUInteger>(n));
+                  static_cast<uint32_t>(row_bytes));
+      mtl_dispatch3DJob(computeEncoder, pso, chunks,
+                        static_cast<NSUInteger>(n), 1);
       mpsStream->endKernelCoalescing();
     }
   });

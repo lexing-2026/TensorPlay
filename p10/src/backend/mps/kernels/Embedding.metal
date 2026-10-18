@@ -120,41 +120,37 @@ REGISTER_EMBEDDING_DENSE_BACKWARD(bfloat, long, uint, 32);
 REGISTER_EMBEDDING_DENSE_BACKWARD(bfloat, long, ulong, 64);
 
 // Embedding forward: gathers `weight[indices[i]]` rows into the output.
-template <typename T, typename I>
+// One thread moves up to 16 bytes of a row, so neighboring lanes of a
+// threadgroup touch consecutive addresses on both sides. The row is treated as
+// raw bytes, which lets a single kernel serve every storage type.
+template <typename I>
 kernel void embedding_forward(
-    constant T* weight [[buffer(0)]],
+    constant uchar* weight [[buffer(0)]],
     constant I* indices [[buffer(1)]],
-    device T* out [[buffer(2)]],
+    device uchar* out [[buffer(2)]],
     constant uint& num_embeddings [[buffer(3)]],
-    constant uint& emb_dim [[buffer(4)]],
-    constant uint& num_indices [[buffer(5)]],
-    uint tid [[thread_position_in_grid]]) {
-  if (tid >= num_indices) {
+    constant uint& row_bytes [[buffer(4)]],
+    uint2 tid [[thread_position_in_grid]]) {
+  const uint pos = tid.x * 16u;
+  if (pos >= row_bytes) {
     return;
   }
-  const long ix_raw = static_cast<long>(indices[tid]);
-  const long ix = ix_raw < 0 ? ix_raw + num_embeddings : ix_raw;
-  const ulong src = static_cast<ulong>(ix) * emb_dim;
-  const ulong dst = static_cast<ulong>(tid) * emb_dim;
-  for (uint d = 0; d < emb_dim; ++d) {
-    out[dst + d] = weight[src + d];
-  }
+  const long ix_raw = static_cast<long>(indices[tid.y]);
+  const long ix = ix_raw < 0 ? ix_raw + long(num_embeddings) : ix_raw;
+  const ulong src = static_cast<ulong>(ix) * row_bytes + pos;
+  const ulong dst = static_cast<ulong>(tid.y) * row_bytes + pos;
+  copy_bytes_aligned(out + dst, weight + src, min(16u, row_bytes - pos));
 }
 
-#define REGISTER_EMBEDDING_FORWARD(T, I)                                  \
-  template [[host_name("embedding_forward_" #T "_" #I)]] kernel void      \
-  embedding_forward<T, I>(                                                \
-      constant T * weight [[buffer(0)]],                                  \
-      constant I * indices [[buffer(1)]],                                 \
-      device T * out [[buffer(2)]],                                       \
-      constant uint& num_embeddings [[buffer(3)]],                        \
-      constant uint& emb_dim [[buffer(4)]],                               \
-      constant uint& num_indices [[buffer(5)]],                           \
-      uint tid [[thread_position_in_grid]])
+#define REGISTER_EMBEDDING_FORWARD(I)                                  \
+  template [[host_name("embedding_forward_" #I)]] kernel void          \
+  embedding_forward<I>(                                                \
+      constant uchar * weight [[buffer(0)]],                           \
+      constant I * indices [[buffer(1)]],                              \
+      device uchar * out [[buffer(2)]],                                \
+      constant uint& num_embeddings [[buffer(3)]],                     \
+      constant uint& row_bytes [[buffer(4)]],                          \
+      uint2 tid [[thread_position_in_grid]])
 
-REGISTER_EMBEDDING_FORWARD(float, int);
-REGISTER_EMBEDDING_FORWARD(float, long);
-REGISTER_EMBEDDING_FORWARD(half, int);
-REGISTER_EMBEDDING_FORWARD(half, long);
-REGISTER_EMBEDDING_FORWARD(bfloat, int);
-REGISTER_EMBEDDING_FORWARD(bfloat, long);
+REGISTER_EMBEDDING_FORWARD(int);
+REGISTER_EMBEDDING_FORWARD(long);

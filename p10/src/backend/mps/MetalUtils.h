@@ -110,6 +110,26 @@ inline void mtl_dispatch1DJob(id<MTLComputeCommandEncoder> encoder,
       threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
 }
 
+// Dispatches a grid whose threads read their position from
+// thread_position_in_grid, which avoids the div/mod a flat index needs. The
+// threadgroup fills the trailing dimensions first and never exceeds the
+// pipeline's thread limit.
+inline void mtl_dispatch3DJob(id<MTLComputeCommandEncoder> encoder,
+                              id<MTLComputePipelineState> cplState,
+                              NSUInteger x, NSUInteger y, NSUInteger z) {
+  const auto maxThreadsPerGroup = [cplState maxTotalThreadsPerThreadgroup];
+  x = std::max<NSUInteger>(x, 1);
+  y = std::max<NSUInteger>(y, 1);
+  z = std::max<NSUInteger>(z, 1);
+  const NSUInteger tgX = std::min<NSUInteger>(x, maxThreadsPerGroup);
+  const NSUInteger tgY = std::min<NSUInteger>(
+      y, std::max<NSUInteger>(1, maxThreadsPerGroup / tgX));
+  const NSUInteger tgZ = std::min<NSUInteger>(
+      z, std::max<NSUInteger>(1, maxThreadsPerGroup / (tgX * tgY)));
+  [encoder dispatchThreads:MTLSizeMake(x, y, z)
+      threadsPerThreadgroup:MTLSizeMake(tgX, tgY, tgZ)];
+}
+
 // Whether this GPU vends the argument encoders that foreach kernels depend on.
 // Such a kernel reads the tensors it updates out of an argument buffer, and an
 // encoder is the only way to put a buffer's device address into one: the
