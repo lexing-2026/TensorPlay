@@ -163,7 +163,7 @@ def inline_includes(text: str, shader_dir: Path, depth: int = 0) -> str:
     return "".join(out)
 
 
-def parse_bindings_text(expanded: str) -> list[str]:
+def parse_bindings_text(expanded: str, label: str = "") -> list[str]:
     """Recover the ordered descriptor signature from expanded shader text."""
     bindings: dict[int, str] = {}
     pattern = re.compile(r"layout\(set\s*=\s*0,\s*binding\s*=\s*(\d+)[^)]*\)(.*)")
@@ -190,9 +190,20 @@ def parse_bindings_text(expanded: str) -> list[str]:
         bindings[binding_idx] = descriptor_type
 
     if not bindings:
-        raise AssertionError(f"No set-0 bindings found in {src_path}")
+        raise AssertionError(f"No set-0 bindings found in {label or src_path}")
 
-    return [bindings[i] for i in sorted(bindings)]
+    # The runtime builds the descriptor set layout from this ordered list and
+    # assigns layout(binding=N) to the Nth argument of a dispatch, so binding
+    # numbers have to run from zero without gaps.  A variant that keeps a slot
+    # free for a descriptor it does not use would silently bind its arguments
+    # one slot early.
+    order = sorted(bindings)
+    if order != list(range(len(order))):
+        raise AssertionError(
+            f"Binding numbers of {label or src_path} are {order}; "
+            "they must be numbered contiguously from 0")
+
+    return [bindings[i] for i in order]
 
 
 def create_shader_params(
@@ -324,7 +335,7 @@ def generate(shader_dir: Path, out_dir: Path, glslang: Path) -> None:
                     str(out_glsl),
                 ])
 
-                compiled[shader_name] = (out_spv, parse_bindings_text(expanded))
+                compiled[shader_name] = (out_spv, parse_bindings_text(expanded, shader_name))
 
     # Shaders without template entries are compiled verbatim.
     for stem, src_path in templates.items():
@@ -344,7 +355,7 @@ def generate(shader_dir: Path, out_dir: Path, glslang: Path) -> None:
             "-o", str(out_spv),
             str(out_glsl),
         ])
-        compiled[stem] = (out_spv, parse_bindings_text(expanded))
+        compiled[stem] = (out_spv, parse_bindings_text(expanded, stem))
 
     # C++ file generation
     spv_bin_arrays = []
