@@ -76,6 +76,65 @@ class TestVulkanRoundtrip(unittest.TestCase):
         )
 
 
+class TestVulkanDeviceIdentity(unittest.TestCase):
+    # A payload names the slot it sits in, so the device a tensor reports and
+    # the device a request resolves to compare equal however the tensor got
+    # there.  Two-operand paths check that pair first: a device that differs
+    # only in whether it spells the slot makes every mixed call refuse a pair
+    # that shares the hardware.
+
+    def test_every_creation_path_reports_the_same_device(self):
+        host = tensorplay.arange(6, dtype=tensorplay.float32).reshape(2, 3)
+        uploaded = host.to("vulkan")
+        made = [
+            ("requested slot", tensorplay.zeros((1,), device="vulkan:0").device),
+            ("bare name", tensorplay.zeros((1,), device="vulkan").device),
+            ("zeros", tensorplay.zeros((2, 3), device="vulkan").device),
+            ("ones", tensorplay.ones((2, 3), device="vulkan").device),
+            ("full", tensorplay.full((2, 3), 1.0, device="vulkan").device),
+            ("empty", tensorplay.empty((2, 3), device="vulkan").device),
+            ("arange", tensorplay.arange(6, device="vulkan").device),
+            ("upload", uploaded.device),
+            ("host array", tensorplay.tensor(
+                host.cpu().numpy(), device="vulkan").device),
+            ("sum result", (uploaded + uploaded).device),
+            ("reduction result", uploaded.sum().device),
+            ("reshape result", uploaded.reshape(3, 2).device),
+        ]
+        for name, device in made:
+            self.assertEqual(
+                device, uploaded.device,
+                f"{name} reported {device} rather than {uploaded.device}")
+
+    def test_a_device_built_payload_pairs_with_an_uploaded_one(self):
+        import tensorplay.functional as F
+        host = np.arange(6, dtype=np.float32).reshape(2, 3)
+        built = tensorplay.tensor(host.copy(), device="vulkan")
+        uploaded = tensorplay.from_numpy(host.copy()).to("vulkan")
+        for name, got, want in (
+                ("add", F.add(built, uploaded), 2.0 * host),
+                ("mul", F.mul(built, uploaded), host * host),
+                ("sub", F.sub(uploaded, built), np.zeros_like(host)),
+                ("div", F.div(uploaded, built + 1.0), host / (host + 1.0))):
+            np.testing.assert_allclose(
+                got.cpu().numpy(), want, rtol=1e-6, atol=1e-6,
+                err_msg=f"{name} over a device-built and an uploaded payload")
+
+    def test_device_built_tensors_survive_a_round_trip(self):
+        host = np.arange(12, dtype=np.float32).reshape(3, 4)
+        built = tensorplay.tensor(host.copy(), device="vulkan")
+        np.testing.assert_allclose(
+            built.cpu().numpy(), host, rtol=0, atol=1e-6,
+            err_msg="a device-built payload did not read back")
+
+    def test_a_device_payload_prints_the_device_it_sits_on(self):
+        # The summary line names the backend, so a Vulkan payload does not read
+        # as if it lived on the other accelerator.
+        text = repr(tensorplay.zeros((2, 2), device="vulkan"))
+        self.assertIn("device='vulkan:0'", text)
+        self.assertNotIn("cuda", text)
+
+
 class TestVulkanOps(unittest.TestCase):
     def test_add_tensor(self):
         a = tensorplay.ones((2, 3), device="vulkan")
