@@ -1494,7 +1494,8 @@ convert_channels_to_height_packed:
   shader_variants:
   - NAME: convert_channels_to_height_packed
 rotary_embedding:
-  parameter_names_with_default_values: {}
+  parameter_names_with_default_values:
+    TABLE_BUFFER: 0
   generate_variant_forall:
     FORMAT:
     - VALUE: rgba32f
@@ -1503,6 +1504,12 @@ rotary_embedding:
       SUFFIX: _f16
   shader_variants:
   - NAME: rotary_embedding
+  - NAME: rotary_embedding_lin_table
+    TABLE_BUFFER: 1
+    FORMAT: rgba32f
+  - NAME: rotary_embedding_lin_table_f16
+    TABLE_BUFFER: 1
+    FORMAT: rgba16f
 rotary_embedding_buffer:
   parameter_names_with_default_values:
     TABLE_BUFFER: 1

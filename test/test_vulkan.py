@@ -471,6 +471,28 @@ class TestVulkanLlmKernels(unittest.TestCase):
                 rtol=1e-5, atol=1e-5,
                 err_msg=f"rope over linear storage at B={B} S={S} D={D}")
 
+        # A decode step reads one short activation from a cached table that has
+        # outgrown the image limit, so the payload keeps its texture form while
+        # the tables are read as flat arrays.
+        for S, D, table_len, off, dtype, tol in (
+                (1, 64, 20000, 19999, tensorplay.float32, 3.0e-4),
+                (9, 32, 20000, 512, tensorplay.float32, 3.0e-4),
+                (1, 128, 16500, 400, tensorplay.float16, 3.0e-2)):
+            x_cpu = (tensorplay.randn((2, S, D), device="cpu")
+                     * 0.3).to(dtype).numpy()
+            cos_cpu, sin_cpu = _rope_tables(D, table_len)
+            rotated = tp.functional.rotary_embedding(
+                tensorplay.from_numpy(x_cpu.copy()).to("vulkan"),
+                tensorplay.from_numpy(cos_cpu.copy()).to("vulkan"),
+                tensorplay.from_numpy(sin_cpu.copy()).to("vulkan"),
+                position_offset=off)
+            self.assertEqual(rotated.dtype, dtype)
+            np.testing.assert_allclose(
+                rotated.cpu().numpy().astype(np.float32),
+                _rope_reference(x_cpu.astype(np.float32), cos_cpu, sin_cpu, off),
+                rtol=0, atol=tol,
+                err_msg=f"rope over a linear table at S={S} D={D}")
+
     def test_glu_splits_and_dtypes(self):
         # Gated linear unit over texture storage: first_half *
         # sigmoid(second_half), along whichever axis is halved.  Half

@@ -580,34 +580,19 @@ constexpr int64_t kLinearDispatchAxisLimit = 65535;
 // dispatchable.
 Tensor rotary_embedding_buffer(
     const Tensor& input,
-    const Tensor& cos,
     const api::vTensor& v_input,
     const api::vTensor& v_cos,
     const api::vTensor& v_sin,
+    int64_t half_dim,
+    int64_t tokens,
+    int64_t table_rows,
     int64_t position_offset) {
   TP_CHECK(
-      input.dtype() == DType::Float32 && cos.dtype() == DType::Float32,
+      input.dtype() == DType::Float32,
       "Vulkan rotary_embedding over linear storage supports Float32 only");
-  TP_CHECK(
-      v_cos.storage_type() == v_sin.storage_type(),
-      "Vulkan rotary_embedding needs the cosine and sine tables in the same "
-      "storage");
 
-  const int64_t head_dim = input.size(-1);
-  TP_CHECK(
-      head_dim % 2 == 0,
-      "Vulkan rotary_embedding needs an even head dimension");
-  const int64_t half_dim = head_dim / 2;
-  TP_CHECK(
-      cos.size(-1) == half_dim,
-      "Vulkan rotary_embedding needs cosine/sine tables of head_dim/2 entries "
-      "per position");
-  const int64_t tokens = input.size(-2);
+  const int64_t head_dim = 2 * half_dim;
   const int64_t batches = input.numel() / (tokens * head_dim);
-  // A 1D table broadcasts over every token; a 2D table is [positions, half_dim]
-  // and supplies one row per token.  Linear storage has no image extents, so
-  // the geometry comes from the logical shapes.
-  const int64_t table_rows = cos.dim() >= 2 ? cos.size(-2) : 1;
   TP_CHECK(
       table_rows == 1 || position_offset + tokens <= table_rows,
       "Vulkan rotary_embedding: the cosine/sine table is shorter than the "
@@ -703,23 +688,37 @@ Tensor rotary_embedding_kernel(
   api::vTensor v_cos = convert(cos);
   api::vTensor v_sin = convert(sin);
 
+  const int64_t head_dim = input.size(-1);
+  TP_CHECK(
+      head_dim % 2 == 0,
+      "Vulkan rotary_embedding needs an even head dimension");
+  const int64_t half_dim = head_dim / 2;
+  const int64_t tokens = input.size(-2);
+  // A 1D table broadcasts over every token; a 2D table is [positions, half_dim]
+  // and supplies one row per token.  Linear storage has no image extents, so
+  // the geometry is read from the logical shapes.
+  const int64_t table_rows = cos.dim() >= 2 ? cos.size(-2) : 1;
+
+  TP_CHECK(
+      v_cos.storage_type() == v_sin.storage_type(),
+      "Vulkan rotary_embedding needs the cosine and sine tables in the same "
+      "storage");
+  TP_CHECK(
+      cos.size(-1) == half_dim,
+      "Vulkan rotary_embedding needs cosine/sine tables of head_dim/2 entries "
+      "per position");
+  const bool table_linear = v_cos.storage_type() == api::StorageType::BUFFER;
+  TP_CHECK(
+      !table_linear || cos.dtype() == DType::Float32,
+      "Vulkan rotary_embedding needs Float32 cosine/sine tables over linear "
+      "storage");
+
   // An activation with no texture form rotates over its linear payload.
   if (v_input.storage_type() != api::StorageType::TEXTURE_3D) {
     return rotary_embedding_buffer(
-        input, cos, v_input, v_cos, v_sin, position_offset);
+        input, v_input, v_cos, v_sin, half_dim, tokens, table_rows,
+        position_offset);
   }
-  if (v_cos.storage_type() != api::StorageType::TEXTURE_3D ||
-      v_sin.storage_type() != api::StorageType::TEXTURE_3D) {
-    TP_THROW(
-        NotImplementedError,
-        "Vulkan rotary_embedding with a texture-stored input requires "
-        "texture-stored cosine/sine tables");
-  }
-
-  const int64_t head_dim = input.size(-1);
-  const int64_t half_dim = head_dim / 2;
-  const int64_t tokens = input.size(-2);
-  const int64_t table_rows = v_cos.extents()[1u];
 
   // The rotation is elementwise in the head dimension, so the result keeps the
   // input's element type; widening a Float16 activation here would both change
@@ -733,7 +732,7 @@ Tensor rotary_embedding_kernel(
     int32_t half_dim;
     int32_t table_rows;
     int32_t position_offset;
-    int32_t fill0;
+    int32_t table_stride;
   } block{
       ivec4(
           static_cast<int32_t>(half_dim),
@@ -744,7 +743,7 @@ Tensor rotary_embedding_kernel(
       static_cast<int32_t>(half_dim),
       static_cast<int32_t>(table_rows),
       static_cast<int32_t>(position_offset),
-      0};
+      static_cast<int32_t>(half_dim)};
 
   api::UniformParamsBuffer params(context, block);
   api::PipelineBarrier pipeline_barrier{};
@@ -754,17 +753,37 @@ Tensor rotary_embedding_kernel(
       v_output.extents()[1u],
       v_output.extents()[2u]};
 
-  context->submit_compute_job(
-      kernel_for("rotary_embedding", input.dtype()), pipeline_barrier, grid,
-      adaptive_work_group_size(grid), VK_NULL_HANDLE,
-      v_output.image(
-          pipeline_barrier,
-          api::PipelineStage::COMPUTE,
-          api::MemoryAccessType::WRITE),
-      v_input.image(pipeline_barrier, api::PipelineStage::COMPUTE),
-      v_cos.image(pipeline_barrier, api::PipelineStage::COMPUTE),
-      v_sin.image(pipeline_barrier, api::PipelineStage::COMPUTE),
-      params.buffer());
+  if (table_linear) {
+    context->submit_compute_job(
+        kernel_for("rotary_embedding_lin_table", input.dtype()),
+        pipeline_barrier,
+        grid,
+        adaptive_work_group_size(grid),
+        VK_NULL_HANDLE,
+        v_output.image(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::WRITE),
+        v_input.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+        v_cos.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+        v_sin.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+        params.buffer());
+  } else {
+    context->submit_compute_job(
+        kernel_for("rotary_embedding", input.dtype()),
+        pipeline_barrier,
+        grid,
+        adaptive_work_group_size(grid),
+        VK_NULL_HANDLE,
+        v_output.image(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::WRITE),
+        v_input.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+        v_cos.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+        v_sin.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+        params.buffer());
+  }
 
   return convert(v_output);
 }
