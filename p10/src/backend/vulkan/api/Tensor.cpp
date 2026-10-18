@@ -121,31 +121,39 @@ std::vector<int64_t> calc_gpu_sizes(
     gpu_sizes.at(3) = api::utils::val_at(-1, sizes);
   }
 
-  size_t ndim = gpu_sizes.size();
-  switch (memory_layout) {
-    case api::GPUMemoryLayout::TENSOR_WIDTH_PACKED:
-      if (ndim >= 1) {
-        gpu_sizes.at(ndim - 1) =
-            api::utils::align_up(
-                static_cast<uint32_t>(api::utils::val_at(-1, sizes)), 4u);
-      }
-      break;
+  // Texture storage packs elements across a texel axis, so the packed
+  // dimension is aligned up to a multiple of four.  Linear buffer storage is
+  // plain row-major memory and must keep the logical sizes untouched; applying
+  // the texel alignment here would inflate gpu_numel and drive staging-buffer
+  // copies beyond the source payload whenever the innermost dim is not a
+  // multiple of four.
+  if (storage_type != api::StorageType::BUFFER) {
+    size_t ndim = gpu_sizes.size();
+    switch (memory_layout) {
+      case api::GPUMemoryLayout::TENSOR_WIDTH_PACKED:
+        if (ndim >= 1) {
+          gpu_sizes.at(ndim - 1) =
+              api::utils::align_up(
+                  static_cast<uint32_t>(api::utils::val_at(-1, sizes)), 4u);
+        }
+        break;
 
-    case api::GPUMemoryLayout::TENSOR_HEIGHT_PACKED:
-      if (ndim >= 2) {
-        gpu_sizes.at(ndim - 2) =
-            api::utils::align_up(
-                static_cast<uint32_t>(api::utils::val_at(-2, sizes)), 4u);
-      }
-      break;
+      case api::GPUMemoryLayout::TENSOR_HEIGHT_PACKED:
+        if (ndim >= 2) {
+          gpu_sizes.at(ndim - 2) =
+              api::utils::align_up(
+                  static_cast<uint32_t>(api::utils::val_at(-2, sizes)), 4u);
+        }
+        break;
 
-    case api::GPUMemoryLayout::TENSOR_CHANNELS_PACKED:
-      if (ndim >= 3) {
-        gpu_sizes.at(ndim - 3) =
-            api::utils::align_up(
-                static_cast<uint32_t>(api::utils::val_at(-3, sizes)), 4u);
-      }
-      break;
+      case api::GPUMemoryLayout::TENSOR_CHANNELS_PACKED:
+        if (ndim >= 3) {
+          gpu_sizes.at(ndim - 3) =
+              api::utils::align_up(
+                  static_cast<uint32_t>(api::utils::val_at(-3, sizes)), 4u);
+        }
+        break;
+    }
   }
 
   return gpu_sizes;
