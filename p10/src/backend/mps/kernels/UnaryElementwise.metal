@@ -83,6 +83,36 @@ struct tanh_op {
   static inline T apply(T x) { return ::precise::tanh(x); }
 };
 
+struct erf_op {
+  template <typename T>
+  static inline T apply(T x) { return erf(x); }
+};
+
+struct floor_op {
+  template <typename T>
+  static inline T apply(T x) { return floor(x); }
+};
+
+struct ceil_op {
+  template <typename T>
+  static inline T apply(T x) { return ceil(x); }
+};
+
+struct round_op {
+  // Halfway cases go to the even neighbour, the rounding the CPU kernel uses.
+  template <typename T>
+  static inline T apply(T x) { return rint(x); }
+};
+
+struct sign_op {
+  // Zero keeps its sign bit and a NaN stays a NaN; only a nonzero operand is
+  // replaced by a signed one.
+  template <typename T>
+  static inline T apply(T x) {
+    return x > T(0) ? T(1) : (x < T(0) ? T(-1) : x);
+  }
+};
+
 template <typename T, typename Op>
 kernel void unary_elementwise(device T* out [[buffer(0)]],
                               constant T* src [[buffer(1)]],
@@ -136,3 +166,8 @@ REGISTER_UNARY_ELEMENTWISE(log, float)
 REGISTER_UNARY_ELEMENTWISE(sin, float)
 REGISTER_UNARY_ELEMENTWISE(cos, float)
 REGISTER_UNARY_ELEMENTWISE(tanh, float)
+REGISTER_UNARY_ELEMENTWISE(erf, float)
+REGISTER_UNARY_ELEMENTWISE(floor, float)
+REGISTER_UNARY_ELEMENTWISE(ceil, float)
+REGISTER_UNARY_ELEMENTWISE(round, float)
+REGISTER_UNARY_ELEMENTWISE(sign, float)

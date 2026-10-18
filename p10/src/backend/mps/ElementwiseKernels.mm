@@ -305,7 +305,7 @@ Tensor square_kernel(const Tensor& self) {
   return unaryShaderOrOp("square", self, squareBlock);
 }
 Tensor sign_kernel(const Tensor& self) {
-  return unaryOp("sign", self, signBlock);
+  return unaryShaderOrOp("sign", self, signBlock);
 }
 Tensor exp_kernel(const Tensor& self) {
   return unaryShaderOrOp("exp", self, expBlock);
@@ -374,18 +374,20 @@ Tensor acosh_kernel(const Tensor& self) {
 Tensor atanh_kernel(const Tensor& self) {
   return unaryOp("atanh", self, atanhBlock);
 }
-Tensor erf_kernel(const Tensor& self) { return unaryOp("erf", self, erfBlock); }
+Tensor erf_kernel(const Tensor& self) {
+  return unaryShaderOrOp("erf", self, erfBlock);
+}
 Tensor erfc_kernel(const Tensor& self) {
   return unaryOp("erfc", self, erfcBlock);
 }
 Tensor floor_kernel(const Tensor& self) {
-  return unaryOp("floor", self, floorBlock);
+  return unaryShaderOrOp("floor", self, floorBlock);
 }
 Tensor ceil_kernel(const Tensor& self) {
-  return unaryOp("ceil", self, ceilBlock);
+  return unaryShaderOrOp("ceil", self, ceilBlock);
 }
 Tensor round_kernel(const Tensor& self) {
-  return unaryOp("round", self, roundBlock);
+  return unaryShaderOrOp("round", self, roundBlock);
 }
 Tensor trunc_kernel(const Tensor& self) {
   return unaryOp("trunc", self, truncBlock);
