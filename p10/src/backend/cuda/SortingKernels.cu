@@ -357,19 +357,63 @@ __global__ void sort_radix_fill_offsets_kernel(int n_offsets, int64_t d_size, in
     if (i < n_offsets) offsets[i] = static_cast<int>(static_cast<int64_t>(i) * d_size);
 }
 
+__global__ void sort_radix_fill_positions_kernel(int64_t n, int64_t* positions) {
+    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    for (; i < n; i += stride) positions[i] = i;
+}
+
 template <typename T>
 void sort_radix_impl(const Tensor& self_c, Tensor& values, Tensor& indices,
                      int64_t d_size, int64_t slices, int64_t inner, bool descending) {
-    using Key = typename SortRadixTraits<T>::key_type;
     const int64_t n = self_c.numel();
     const auto device = self_c.device();
+    auto stream = getCurrentCUDAStream().stream();
+    // Integer keys in a single contiguous run need no conversion: the radix
+    // sort applies the signed-key transform itself, and positions are the
+    // permutation, so the run sorts straight from the input into the two
+    // outputs without a pack or unpack pass.
+    if constexpr (std::is_integral_v<T> && !std::is_same_v<T, bool>) {
+        if (d_size == n && inner == 1) {
+            const int n_items = static_cast<int>(n);
+            const int fill_blocks =
+                static_cast<int>((n + kThreads - 1) / kThreads);
+            Tensor positions = Tensor::empty({n}, DType::Int64, device);
+            sort_radix_fill_positions_kernel<<<fill_blocks, kThreads, 0, stream>>>(
+                n, positions.data_ptr<int64_t>());
+            const int bits = static_cast<int>(sizeof(T) * 8);
+            size_t direct_bytes = 0;
+            auto launch = [&](void* tmp_ptr) {
+                return descending
+                    ? cub::DeviceRadixSort::SortPairsDescending(
+                          tmp_ptr, direct_bytes,
+                          static_cast<const T*>(self_c.data_ptr()),
+                          static_cast<T*>(values.data_ptr()),
+                          positions.data_ptr<int64_t>(),
+                          indices.data_ptr<int64_t>(), n_items, 0, bits, stream)
+                    : cub::DeviceRadixSort::SortPairs(
+                          tmp_ptr, direct_bytes,
+                          static_cast<const T*>(self_c.data_ptr()),
+                          static_cast<T*>(values.data_ptr()),
+                          positions.data_ptr<int64_t>(),
+                          indices.data_ptr<int64_t>(), n_items, 0, bits, stream);
+            };
+            CUDA_CHECK(launch(nullptr));
+            Tensor direct_tmp = Tensor::empty(
+                {static_cast<int64_t>(std::max<size_t>(direct_bytes, 1))},
+                DType::UInt8, device);
+            CUDA_CHECK(launch(direct_tmp.data_ptr()));
+            (void)slices;
+            return;
+        }
+    }
+    using Key = typename SortRadixTraits<T>::key_type;
     const DType key_dtype = sizeof(Key) == 8 ? DType::UInt64 : DType::UInt32;
     Tensor keys_a = Tensor::empty({n}, key_dtype, device);
     Tensor keys_b = Tensor::empty({n}, key_dtype, device);
     Tensor pos_a = Tensor::empty({n}, DType::Int64, device);
     Tensor pos_b = Tensor::empty({n}, DType::Int64, device);
     Tensor offsets = Tensor::empty({slices + 1}, DType::Int32, device);
-    auto stream = getCurrentCUDAStream().stream();
     const int blocks = static_cast<int>((n + kThreads - 1) / kThreads);
     sort_radix_pack_kernel<T><<<blocks, kThreads, 0, stream>>>(
         n, d_size, inner, static_cast<const T*>(self_c.data_ptr()),
