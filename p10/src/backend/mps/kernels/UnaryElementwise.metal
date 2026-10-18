@@ -108,6 +108,36 @@ struct sign_op {
   }
 };
 
+struct erf_op {
+  // The error function, faithfully rounded to within about one unit in the
+  // last place. Above the branch point the answer is 1 - exp(-q(|x|)) for a
+  // degree-6 polynomial q; below it a degree-6 polynomial in x*x, scaled by x.
+  template <typename T>
+  static inline T apply(T x) {
+    const float a = static_cast<float>(x);
+    const float t = ::metal::abs(a);
+    const float s = a * a;
+    if (t > 0.927734375f) {
+      float r = ::metal::fma(-1.72853470e-5f, t, 3.83197126e-4f);
+      const float u = ::metal::fma(-3.88396438e-3f, t, 2.42546219e-2f);
+      r = ::metal::fma(r, s, u);
+      r = ::metal::fma(r, t, -1.06777877e-1f);
+      r = ::metal::fma(r, t, -6.34846687e-1f);
+      r = ::metal::fma(r, t, -1.28717512e-1f);
+      r = ::metal::fma(r, t, -t);
+      r = 1.0f - ::metal::exp(r);
+      return static_cast<T>(::metal::copysign(r, a));
+    }
+    float r = -5.96761703e-4f;
+    r = ::metal::fma(r, s, 4.99119423e-3f);
+    r = ::metal::fma(r, s, -2.67681349e-2f);
+    r = ::metal::fma(r, s, 1.12819925e-1f);
+    r = ::metal::fma(r, s, -3.76125336e-1f);
+    r = ::metal::fma(r, s, 1.28379166e-1f);
+    return static_cast<T>(::metal::fma(r, a, a));
+  }
+};
+
 template <typename T, typename Op>
 kernel void unary_elementwise(device T* out [[buffer(0)]],
                               constant T* src [[buffer(1)]],
@@ -206,3 +236,4 @@ REGISTER_UNARY_ELEMENTWISE(floor, float)
 REGISTER_UNARY_ELEMENTWISE(ceil, float)
 REGISTER_UNARY_ELEMENTWISE(round, float)
 REGISTER_UNARY_ELEMENTWISE(sign, float)
+REGISTER_UNARY_ELEMENTWISE(erf, float)

@@ -152,6 +152,10 @@ class TestMPSUnary(unittest.TestCase):
         self.assertTrue(tp.all(tp.ceil(tp.full((2, 2), 3.2, device="mps")).cpu() == 4).item())
         self.assertTrue(tp.all(tp.round(tp.full((2, 2), 3.5, device="mps")).cpu() == 4).item())
         self.assertTrue(tp.all(tp.trunc(tp.full((2, 2), -3.7, device="mps")).cpu() == -3).item())
+        self.assertTrue(tp.allclose(tp.erf(tp.zeros((2, 2), device="mps")).cpu(),
+                                    tp.zeros((2, 2))))
+        self.assertTrue(tp.allclose(tp.erf(tp.ones((2, 2), device="mps")).cpu(),
+                                    tp.full((2, 2), 0.84270079), atol=1e-6))
 
     def test_activations(self):
         x = tp.full((2, 2), -1, device="mps", dtype=tp.float32)

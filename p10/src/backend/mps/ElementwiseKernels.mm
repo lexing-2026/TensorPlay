@@ -375,8 +375,7 @@ Tensor atanh_kernel(const Tensor& self) {
   return unaryOp("atanh", self, atanhBlock);
 }
 Tensor erf_kernel(const Tensor& self) {
-  // No Metal standard-library error function, so this one stays on the graph.
-  return unaryOp("erf", self, erfBlock);
+  return unaryShaderOrOp("erf", self, erfBlock);
 }
 Tensor erfc_kernel(const Tensor& self) {
   return unaryOp("erfc", self, erfcBlock);
