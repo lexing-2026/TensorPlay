@@ -175,7 +175,7 @@ inline bool sort_less(T a, T b, bool desc) {
   // NaN takes the extreme position so the order stays a total order: last
   // ascending, first descending. Without it equal-pair decisions disagree
   // across lanes and the same position can be emitted twice.
-  IF_CONSTEXPR (metal::is_floating_point_v<T>) {
+  if IF_CONSTEXPR (metal::is_floating_point_v<T>) {
     const bool a_nan = a != a;
     const bool b_nan = b != b;
     if (a_nan || b_nan) {
