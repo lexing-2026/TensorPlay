@@ -150,14 +150,11 @@ on:
       mps_reference_requirement:
         required: false
         type: string
-        default: "torch==2.7.1"
+        default: "torch"
         description: >
           Package requirement installed for the second MPS benchmark pass. The
-          newest release allocates device buffers from Metal heaps, and that
-          allocation fails outright on the benchmark runner (95 of 97 cases
-          were refused even 16 KiB), so the default stays on the newest release
-          whose allocator runs there. Every run records the version it actually
-          compared against.
+          default follows the latest release; every run records the version it
+          actually compared against.
       mps_require_speedup_win:
         required: false
         type: boolean
