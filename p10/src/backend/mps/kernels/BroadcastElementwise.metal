@@ -239,9 +239,14 @@ kernel void dense_scalar_binary(device T* out [[buffer(0)]],
 
 // Four-wide forms of the two dense kernels. The vector type states the
 // 16-byte alignment the buffers carry on this path, so the compiler emits one
-// load and one store per four elements instead of four of each; the bytes a
-// thread keeps in flight are unchanged. The host only selects these when the
-// storage is float, the span holds whole vectors and every base is aligned.
+// load and one store per four elements instead of four of each. The host only
+// selects these when the storage is float, the span holds whole vectors and
+// every base is aligned.
+//
+// A thread takes one vector per grid-wide stride: the lanes of a SIMD group
+// then access consecutive 16-byte vectors, so each instruction covers a
+// contiguous span instead of reaching across as many cache lines as a block of
+// consecutive vectors per thread would.
 template <typename Op>
 inline float4 apply_binary4(float4 a, float4 b) {
   return float4(Op::apply(a.x, b.x), Op::apply(a.y, b.y),
@@ -259,15 +264,15 @@ kernel void dense_binary_vec(device float4* out [[buffer(0)]],
                              constant float4* lhs [[buffer(1)]],
                              constant float4* rhs [[buffer(2)]],
                              constant uint& nvec [[buffer(3)]],
-                             uint tid [[thread_position_in_grid]]) {
-  const uint first = tid * ILP_PER_THREAD;
-  if (first + ILP_PER_THREAD <= nvec) {
+                             uint tid [[thread_position_in_grid]],
+                             uint grid [[threads_per_grid]]) {
+  if (tid + (ILP_PER_THREAD - 1) * grid < nvec) {
     array<float4, ILP_PER_THREAD> left;
     array<float4, ILP_PER_THREAD> right;
 #pragma unroll
     for (uint j = 0; j < ILP_PER_THREAD; ++j) {
-      left[j] = lhs[first + j];
-      right[j] = rhs[first + j];
+      left[j] = lhs[tid + j * grid];
+      right[j] = rhs[tid + j * grid];
     }
 #pragma unroll
     for (uint j = 0; j < ILP_PER_THREAD; ++j) {
@@ -275,10 +280,10 @@ kernel void dense_binary_vec(device float4* out [[buffer(0)]],
     }
 #pragma unroll
     for (uint j = 0; j < ILP_PER_THREAD; ++j) {
-      out[first + j] = left[j];
+      out[tid + j * grid] = left[j];
     }
   } else {
-    for (uint i = first; i < nvec; ++i) {
+    for (uint i = tid; i < nvec; i += grid) {
       out[i] = apply_binary4<Op>(lhs[i], rhs[i]);
     }
   }
@@ -289,13 +294,13 @@ kernel void dense_scalar_binary_vec(device float4* out [[buffer(0)]],
                                     constant float4* lhs [[buffer(1)]],
                                     constant float& rhs [[buffer(2)]],
                                     constant uint& nvec [[buffer(3)]],
-                                    uint tid [[thread_position_in_grid]]) {
-  const uint first = tid * ILP_PER_THREAD;
-  if (first + ILP_PER_THREAD <= nvec) {
+                                    uint tid [[thread_position_in_grid]],
+                                    uint grid [[threads_per_grid]]) {
+  if (tid + (ILP_PER_THREAD - 1) * grid < nvec) {
     array<float4, ILP_PER_THREAD> values;
 #pragma unroll
     for (uint j = 0; j < ILP_PER_THREAD; ++j) {
-      values[j] = lhs[first + j];
+      values[j] = lhs[tid + j * grid];
     }
 #pragma unroll
     for (uint j = 0; j < ILP_PER_THREAD; ++j) {
@@ -303,10 +308,10 @@ kernel void dense_scalar_binary_vec(device float4* out [[buffer(0)]],
     }
 #pragma unroll
     for (uint j = 0; j < ILP_PER_THREAD; ++j) {
-      out[first + j] = values[j];
+      out[tid + j * grid] = values[j];
     }
   } else {
-    for (uint i = first; i < nvec; ++i) {
+    for (uint i = tid; i < nvec; i += grid) {
       out[i] = apply_binary4<Op>(lhs[i], rhs);
     }
   }
@@ -337,7 +342,8 @@ kernel void dense_scalar_binary_vec(device float4* out [[buffer(0)]],
       constant float4 * lhs [[buffer(1)]],            \
       constant float4 * rhs [[buffer(2)]],            \
       constant uint & nvec [[buffer(3)]],             \
-      uint tid [[thread_position_in_grid]]);
+      uint tid [[thread_position_in_grid]],           \
+      uint grid [[threads_per_grid]]);
 
 #define REGISTER_DENSE_SCALAR_BINARY_VEC(OP)             \
   template [[host_name("dense_vec_" #OP "_scalar_float")]] \
@@ -346,7 +352,8 @@ kernel void dense_scalar_binary_vec(device float4* out [[buffer(0)]],
       constant float4 * lhs [[buffer(1)]],               \
       constant float & rhs [[buffer(2)]],                \
       constant uint & nvec [[buffer(3)]],                \
-      uint tid [[thread_position_in_grid]]);
+      uint tid [[thread_position_in_grid]],              \
+      uint grid [[threads_per_grid]]);
 
 // Same dtype set as the stride-addressed forms: half, bfloat16 and the narrow
 // integers do their operation math in another type and stay with the graph,

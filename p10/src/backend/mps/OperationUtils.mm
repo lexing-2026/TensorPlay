@@ -606,8 +606,8 @@ bool denseScaleIsOne(const std::optional<Scalar>& alpha) {
          (!alpha->isComplex() && alpha->toDouble() == 1.0);
 }
 
-// A dense launch addresses `elements` consecutive values and hands each thread
-// a run of ILP_PER_THREAD of them.
+// A dense launch hands each thread ILP_PER_THREAD positions, one per grid-wide
+// stride, so the grid is that much shorter than the span.
 uint32_t denseGridSize(uint32_t elements) {
   return static_cast<uint32_t>(
       p10::metal::ceil_div<uint32_t>(elements, p10::metal::ILP_PER_THREAD));
@@ -934,8 +934,8 @@ std::optional<Tensor> unaryShader(const std::string& op, const Tensor& self) {
   MTLComputePipelineState_t active_pso = vec_pso ? vec_pso : pso;
   // The vector form counts 16-byte vectors, the scalar form elements.
   const uint32_t span = vec_pso ? elements / 4 : elements;
-  // A thread serves one run of ILP_PER_THREAD positions, which is how much
-  // shorter than the span the grid has to be.
+  // A thread serves one position per grid-wide stride, ILP_PER_THREAD times,
+  // which is how much shorter than the span the grid has to be.
   const uint32_t total = static_cast<uint32_t>(
       p10::metal::ceil_div<uint32_t>(span, p10::metal::ILP_PER_THREAD));
 
