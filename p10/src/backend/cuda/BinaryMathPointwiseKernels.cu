@@ -602,10 +602,14 @@ Tensor& rsqrt_inplace_kernel_cuda(Tensor& self) {
 
 // --- Masked Select ---
 // The gather reads the input through the compacted position list, so the
-// input is touched twice with no per-element flag or prefix array.
+// input is touched twice with no per-element flag or prefix array.  The count
+// is read from device memory so every launch is issued before the host looks
+// at the result, and the returned tensor aliases the prefix the count selects.
 template <typename T, typename IndexT>
 __global__ void masked_select_gather_kernel(
-    int64_t count, const T* input, const IndexT* selected, T* output) {
+    const int64_t* count_ptr, const T* input, const IndexT* selected,
+    T* output) {
+    const int64_t count = *count_ptr;
     int64_t m = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
     for (; m < count; m += stride) {
@@ -654,62 +658,68 @@ Tensor masked_select_kernel_cuda(const Tensor& self, const Tensor& mask) {
         mask_c.data_ptr<bool>(), selected.data_ptr<int32_t>(),
         num_selected.data_ptr<int64_t>(), static_cast<int>(n), stream));
 
+    // The gather covers the whole input while the count is still only on the
+    // device; every launch is issued before the host reads the count back, so
+    // all of the device work shares one wait and the host only has metadata
+    // left to do afterwards.
+    Tensor gathered = Tensor::empty({n}, self.dtype(), self.device());
+    const int kSelectBlock = 256;
+    const unsigned select_blocks = static_cast<unsigned>(std::min<int64_t>(
+        (n + kSelectBlock - 1) / kSelectBlock, 1048576));
+#define SEL_CASE(ctype, name) \
+    case DType::name: { \
+        masked_select_gather_kernel<ctype, int32_t><<<select_blocks, kSelectBlock, 0, stream>>>( \
+            num_selected.data_ptr<int64_t>(), self_c.data_ptr<ctype>(), \
+            selected.data_ptr<int32_t>(), gathered.data_ptr<ctype>()); \
+        break; \
+    }
+    switch (self.dtype()) {
+        TENSORPLAY_FORALL_SCALAR_TYPES(SEL_CASE)
+        TENSORPLAY_FORALL_FP8_TYPES(SEL_CASE)
+        case DType::ComplexHalf:
+            masked_select_gather_kernel<tensorplay::complex<Half>, int32_t><<<
+                select_blocks, kSelectBlock, 0, stream>>>(
+                num_selected.data_ptr<int64_t>(),
+                static_cast<const tensorplay::complex<Half>*>(self_c.data_ptr()),
+                selected.data_ptr<int32_t>(),
+                static_cast<tensorplay::complex<Half>*>(gathered.data_ptr()));
+            break;
+        case DType::ComplexFloat:
+            masked_select_gather_kernel<tensorplay::complex<float>, int32_t><<<
+                select_blocks, kSelectBlock, 0, stream>>>(
+                num_selected.data_ptr<int64_t>(),
+                static_cast<const tensorplay::complex<float>*>(self_c.data_ptr()),
+                selected.data_ptr<int32_t>(),
+                static_cast<tensorplay::complex<float>*>(gathered.data_ptr()));
+            break;
+        case DType::ComplexDouble:
+            masked_select_gather_kernel<tensorplay::complex<double>, int32_t><<<
+                select_blocks, kSelectBlock, 0, stream>>>(
+                num_selected.data_ptr<int64_t>(),
+                static_cast<const tensorplay::complex<double>*>(self_c.data_ptr()),
+                selected.data_ptr<int32_t>(),
+                static_cast<tensorplay::complex<double>*>(gathered.data_ptr()));
+            break;
+        case DType::BComplex32:
+            masked_select_gather_kernel<tensorplay::complex<BFloat16>, int32_t><<<
+                select_blocks, kSelectBlock, 0, stream>>>(
+                num_selected.data_ptr<int64_t>(),
+                static_cast<const tensorplay::complex<BFloat16>*>(self_c.data_ptr()),
+                selected.data_ptr<int32_t>(),
+                static_cast<tensorplay::complex<BFloat16>*>(gathered.data_ptr()));
+            break;
+        default: TP_THROW(TypeError, "CUDA masked_select: unsupported dtype");
+    }
+#undef SEL_CASE
+
     int64_t count = 0;
     CUDA_CHECK(cudaMemcpyAsync(
         &count, num_selected.data_ptr<int64_t>(), sizeof(int64_t),
         cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    Tensor result = Tensor::empty({count}, self.dtype(), self.device());
-    if (count > 0) {
-        const int kSelectBlock = 256;
-        const unsigned select_blocks = static_cast<unsigned>(std::min<int64_t>(
-            (count + kSelectBlock - 1) / kSelectBlock, 1048576));
-#define SEL_CASE(ctype, name) \
-        case DType::name: { \
-            masked_select_gather_kernel<ctype, int32_t><<<select_blocks, kSelectBlock, 0, stream>>>( \
-                count, self_c.data_ptr<ctype>(), \
-                selected.data_ptr<int32_t>(), result.data_ptr<ctype>()); \
-            break; \
-        }
-        switch (self.dtype()) {
-            TENSORPLAY_FORALL_SCALAR_TYPES(SEL_CASE)
-            TENSORPLAY_FORALL_FP8_TYPES(SEL_CASE)
-            case DType::ComplexHalf:
-                masked_select_gather_kernel<tensorplay::complex<Half>, int32_t><<<
-                    select_blocks, kSelectBlock, 0, stream>>>(
-                    count, static_cast<const tensorplay::complex<Half>*>(self_c.data_ptr()),
-                    selected.data_ptr<int32_t>(),
-                    static_cast<tensorplay::complex<Half>*>(result.data_ptr()));
-                break;
-            case DType::ComplexFloat:
-                masked_select_gather_kernel<tensorplay::complex<float>, int32_t><<<
-                    select_blocks, kSelectBlock, 0, stream>>>(
-                    count, static_cast<const tensorplay::complex<float>*>(self_c.data_ptr()),
-                    selected.data_ptr<int32_t>(),
-                    static_cast<tensorplay::complex<float>*>(result.data_ptr()));
-                break;
-            case DType::ComplexDouble:
-                masked_select_gather_kernel<tensorplay::complex<double>, int32_t><<<
-                    select_blocks, kSelectBlock, 0, stream>>>(
-                    count, static_cast<const tensorplay::complex<double>*>(self_c.data_ptr()),
-                    selected.data_ptr<int32_t>(),
-                    static_cast<tensorplay::complex<double>*>(result.data_ptr()));
-                break;
-            case DType::BComplex32:
-                masked_select_gather_kernel<tensorplay::complex<BFloat16>, int32_t><<<
-                    select_blocks, kSelectBlock, 0, stream>>>(
-                    count, static_cast<const tensorplay::complex<BFloat16>*>(self_c.data_ptr()),
-                    selected.data_ptr<int32_t>(),
-                    static_cast<tensorplay::complex<BFloat16>*>(result.data_ptr()));
-                break;
-            default: TP_THROW(TypeError, "CUDA masked_select: unsupported dtype");
-        }
-#undef SEL_CASE
-    }
-
     CUDA_CHECK(cudaGetLastError());
-    return result;
+
+    return Tensor(gathered.impl()->storage(), {count}, {1}, self.dtype(), 0);
 }
 
 TENSORPLAY_LIBRARY_IMPL(CUDA, PointwiseKernels) {
