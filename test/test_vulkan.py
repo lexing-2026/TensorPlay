@@ -1700,6 +1700,105 @@ class TestVulkanLinearPayload(unittest.TestCase):
             rtol=1e-4, atol=1e-4,
             err_msg="variance over a single-precision long axis")
 
+    def test_half_precision_decode_product_over_linear_weight(self):
+        import tensorplay as tp
+        import tensorplay.functional as F
+        # A weight row past the image axis limit reaches the decode product as
+        # a linear payload of half lanes, so the split pass unpacks pairs and
+        # keeps its accumulators in single precision.  When the result is too
+        # wide for an image, the fold pass owns one word and writes both of the
+        # elements it carries, which is what lets rows start at an odd offset
+        # without disturbing a neighbour's lane.
+        def narrowed(a):
+            return np.asarray(a, dtype=np.float16).astype(np.float32)
+
+        def upload(a):
+            return tensorplay.from_numpy(np.asarray(a, dtype=np.float16)
+                                         ).to("vulkan")
+
+        tensorplay.manual_seed(113)
+        for M, N, K in ((1, 8, 20000), (4, 130, 20000), (3, 7, 20010),
+                        (1, 64, 20003), (1, 4096, 20000)):
+            x_cpu = narrowed((tp.randn((M, K), device="cpu") * 0.3).numpy())
+            w_cpu = narrowed((tp.randn((N, K), device="cpu") * 0.3).numpy())
+            b_cpu = narrowed((tp.randn((N,), device="cpu") * 0.2).numpy())
+            want = narrowed(x_cpu @ w_cpu.T)
+            x, w = upload(x_cpu), upload(w_cpu)
+            got = F.linear(x, w)
+            self.assertEqual(got.dtype, tensorplay.float16,
+                             f"linear widened a half product at {M}x{N}x{K}")
+            np.testing.assert_allclose(
+                got.cpu().numpy().astype(np.float32), want,
+                rtol=2e-3, atol=2e-3,
+                err_msg=f"linear over a half linear weight at {M}x{N}x{K}")
+            np.testing.assert_allclose(
+                F.linear(x, w, upload(b_cpu)).cpu().numpy().astype(
+                    np.float32),
+                narrowed(want + b_cpu), rtol=2e-3, atol=2e-3,
+                err_msg=f"addend folded into a half product at {M}x{N}x{K}")
+
+        # Results this wide have no image form, so the fold writes words.
+        for M, N, K in ((1, 20003, 64), (4, 20001, 128), (2, 32000, 64)):
+            x_cpu = narrowed((tp.randn((M, K), device="cpu") * 0.3).numpy())
+            w_cpu = narrowed((tp.randn((N, K), device="cpu") * 0.3).numpy())
+            b_cpu = narrowed((tp.randn((N,), device="cpu") * 0.2).numpy())
+            got = F.linear(upload(x_cpu), upload(w_cpu), upload(b_cpu))
+            self.assertTrue(got.device.is_vulkan())
+            np.testing.assert_allclose(
+                got.cpu().numpy().astype(np.float32),
+                narrowed(narrowed(x_cpu @ w_cpu.T) + b_cpu),
+                rtol=2e-3, atol=2e-3,
+                err_msg=f"half result in linear storage at {M}x{N}x{K}")
+
+        # A reduction length that leaves a ragged last word, and an activation
+        # long enough to stream from a payload of its own.
+        for K in (20001, 20005):
+            x_cpu = narrowed((tp.randn((2, K), device="cpu") * 0.3).numpy())
+            w_cpu = narrowed((tp.randn((17, K), device="cpu") * 0.3).numpy())
+            np.testing.assert_allclose(
+                F.linear(upload(x_cpu), upload(w_cpu)).cpu().numpy().astype(
+                    np.float32),
+                narrowed(x_cpu @ w_cpu.T), rtol=2e-3, atol=2e-3,
+                err_msg=f"half product over a ragged reduction of {K}")
+
+        # Weights that keep an image form are restaged by the packing kernels,
+        # which now pick the format of the payload they are handed.
+        for M, N, K in ((1, 256, 64), (4, 128, 96)):
+            x_cpu = narrowed((tp.randn((M, K), device="cpu") * 0.4).numpy())
+            w_cpu = narrowed((tp.randn((N, K), device="cpu") * 0.4).numpy())
+            np.testing.assert_allclose(
+                F.linear(upload(x_cpu), upload(w_cpu)).cpu().numpy().astype(
+                    np.float32),
+                narrowed(x_cpu @ w_cpu.T), rtol=2e-3, atol=2e-3,
+                err_msg=f"half product over a packed weight at {M}x{N}x{K}")
+
+        batch1 = narrowed(
+            (tp.randn((3, 32, 24), device="cpu") * 0.4).numpy())
+        batch2 = narrowed(
+            (tp.randn((3, 24, 16), device="cpu") * 0.4).numpy())
+        np.testing.assert_allclose(
+            F.bmm(upload(batch1), upload(batch2)).cpu().numpy().astype(
+                np.float32),
+            narrowed(np.stack([a @ c for a, c in zip(batch1, batch2)])),
+            rtol=2e-3, atol=2e-3, err_msg="half bmm over packed planes")
+
+        with self.assertRaisesRegex(RuntimeError, "one dtype"):
+            F.linear(
+                upload(narrowed(
+                    (tp.randn((1, 64), device="cpu") * 0.4).numpy())),
+                tensorplay.from_numpy(
+                    (tp.randn((32, 64), device="cpu") * 0.4).numpy()
+                ).to("vulkan"))
+
+        # Single precision keeps its own builds on the same shapes.
+        x32 = (tp.randn((1, 20000), device="cpu") * 0.3).numpy()
+        w32 = (tp.randn((8, 20000), device="cpu") * 0.3).numpy()
+        np.testing.assert_allclose(
+            F.linear(tensorplay.from_numpy(x32).to("vulkan"),
+                     tensorplay.from_numpy(w32).to("vulkan")).cpu().numpy(),
+            x32 @ w32.T, rtol=1e-4, atol=1e-4,
+            err_msg="single-precision product over a linear weight")
+
 
 if __name__ == "__main__":
     unittest.main()
