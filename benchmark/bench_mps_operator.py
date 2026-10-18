@@ -439,10 +439,10 @@ def build_cases(backend, suite, dtype_key):
     add("masked_fill[1M]", "indexing",
         lambda a, m: A.masked_fill(a, m, A.scalar(0.0)),
         (vector, mask))
-    idx_1m = _spec("integer", (1 << 18,), 702, upper=1024)
+    idx_1m = _spec("integer", (1024,), 702, upper=1024)
     add("index_select[1M]", "indexing",
         lambda a, i: A.index_select(a, 0, i),
-        (_spec("normal", (1024, 1 << 18), 703), idx_1m), long_only=True)
+        (_spec("normal", (1024, 1024), 703), idx_1m), long_only=True)
     gather_x = _spec("normal", (1024, 1024), 704)
     gather_idx = _spec("integer", (1024, 1024), 705, upper=1024)
     add("gather[1024x1024]", "indexing",
@@ -540,6 +540,7 @@ def main(argv=None):
     requested_skips = {name.strip() for name in args.skip_cases.split(",")
                        if name.strip()}
     unavailable = {}
+    out_of_memory = set()
     cases = build_cases(backend, suite, args.dtype)
     unknown_skips = sorted(requested_skips -
                            {case[0] for case in cases})
@@ -567,7 +568,8 @@ def main(argv=None):
                        "warmup": args.warmup, "rounds": args.rounds,
                        "chain_reps": args.chain},
             "skipped": {"requested": sorted(requested_skips),
-                        "unavailable": dict(unavailable)},
+                        "unavailable": dict(unavailable),
+                        "out_of_memory": sorted(out_of_memory)},
             "measurements": list(measurements.values()),
         }
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
@@ -581,6 +583,10 @@ def main(argv=None):
         print(backend.describe())
     reps_per_round = math.ceil(args.reps / args.rounds)
     time_per_round = args.min_run_time / args.rounds
+    # Each side keeps whatever its allocator reuses for the rest of the pass;
+    # flushing between cases would time allocator setup instead of the
+    # operation and would compare the two sides under different rules.
+    backend.release_cached_memory()
     for round_index in range(args.rounds):
         print(f"round {round_index + 1}/{args.rounds}")
         # Rotate the starting case so each pass samples a different ordering.
@@ -599,8 +605,11 @@ def main(argv=None):
                     fn()
                     backend.synchronize()
                 except (NotImplementedError, RuntimeError) as exc:
-                    print(f"{name:42} [skipped: {exc}]")
-                    unavailable[name] = str(exc)
+                    message = str(exc)
+                    print(f"{name:42} [skipped: {message}]")
+                    unavailable[name] = message
+                    if "out of memory" in message.lower():
+                        out_of_memory.add(name)
                     write_payload()
                     continue
             else:
@@ -629,7 +638,6 @@ def main(argv=None):
                   f"({len(samples)} samples of x{chain}, median "
                   f"{statistics.median(samples) * 1e3:.3f} ms)")
             measurements[name] = entry
-            backend.release_cached_memory()
             if incremental:
                 write_payload()
             del fn

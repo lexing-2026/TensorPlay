@@ -150,11 +150,11 @@ on:
       mps_reference_requirement:
         required: false
         type: string
-        default: "torch==2.7.1"
+        default: "torch"
         description: >
-          Package requirement installed for the second MPS benchmark pass.
-          Pinned because the newest release of that runtime refuses every
-          device allocation on the benchmark runner.
+          Package requirement installed for the second MPS benchmark pass. The
+          default follows the latest release; every run records the version it
+          actually compared against.
       mps_require_speedup_win:
         required: false
         type: boolean

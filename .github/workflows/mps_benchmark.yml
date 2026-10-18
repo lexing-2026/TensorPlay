@@ -32,10 +32,13 @@ on:
         type: boolean
         default: false
       reference_requirement:
-        description: Package requirement for the second benchmark pass
+        description: >
+          Package requirement for the second benchmark pass. The default
+          follows the latest release; every run records the version it
+          actually compared against.
         required: false
         type: string
-        default: "torch==2.7.1"
+        default: "torch"
       reference_skip_cases:
         description: Cases left out of the second benchmark pass
         required: false
@@ -83,7 +86,7 @@ jobs:
       # scheduled run enforces the floor; dispatched runs do so on request.
       mps_compare_reference: true
       mps_require_speedup_win: ${{ github.event_name == 'schedule' || inputs.require_speedup_win }}
-      mps_reference_requirement: ${{ inputs.reference_requirement || 'torch==2.7.1' }}
+      mps_reference_requirement: ${{ inputs.reference_requirement || 'torch' }}
       mps_reference_skip_cases: ${{ inputs.reference_skip_cases || 'layer_norm[64x1024]' }}
       upload_release: false
     secrets: inherit

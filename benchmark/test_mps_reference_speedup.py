@@ -119,17 +119,43 @@ class TestSpeedupGate(unittest.TestCase):
         self.assertEqual(evaluate(summary, 0.0, 0.0, None), [])
         self.assertEqual(summary["unpaired"], ["b"])
 
+    def test_reference_oom_is_a_gate_violation(self):
+        ours, theirs = _two_sides(["a", "b"], ["a"], unavailable=["b"],
+                                  oom=["b"])
+        summary = summarize(join(ours, theirs))
+        violations = evaluate(summary, 0.0, 0.0, None)
+        self.assertEqual(len(violations), 1)
+        self.assertIn("ran out of memory", violations[0])
+        self.assertIn("b", violations[0])
 
-def _two_sides(ours_names, reference_names, requested=(), unavailable=()):
+    def test_ours_unavailable_case_fails_the_gate(self):
+        ours, theirs = _two_sides(["a"], ["a"], ours_unavailable=["b"])
+        summary = summarize(join(ours, theirs))
+        violations = evaluate(summary, 0.0, 0.0, None)
+        self.assertEqual(len(violations), 1)
+        self.assertIn("did not run on our side", violations[0])
+        self.assertIn("b", violations[0])
+
+
+def _two_sides(ours_names, reference_names, requested=(), unavailable=(),
+               oom=(), ours_unavailable=()):
     ours = payload([(name, 1.0, None) for name in ours_names],
                    reference=False)
     ours["side"] = "ours"
+    if ours_unavailable:
+        ours["skipped"] = {
+            "requested": [],
+            "unavailable": {name: "probe failed"
+                            for name in ours_unavailable},
+            "out_of_memory": [],
+        }
     theirs = payload([(name, 1.0, None) for name in reference_names],
                      reference=False)
     theirs["side"] = "reference"
     theirs["skipped"] = {"requested": list(requested),
                          "unavailable": {name: "probe failed"
-                                         for name in unavailable}}
+                                         for name in unavailable},
+                         "out_of_memory": list(oom)}
     return ours, theirs
 
 
@@ -161,6 +187,14 @@ class TestCaseInventory(unittest.TestCase):
             names = [case[0] for case in
                      build_cases(_TreeBackend("cpu"), suite, "f32")]
             self.assertEqual(len(names), len(set(names)), suite)
+
+    def test_index_select_case_stays_at_one_million_elements(self):
+        cases = build_cases(_TreeBackend("cpu"), "long", "f32")
+        specs = next(case[3] for case in cases
+                     if case[0] == "index_select[1M]")
+        source_shape = specs[0][1]
+        index_shape = specs[1][1]
+        self.assertEqual(source_shape[1] * index_shape[0], 1 << 20)
 
     def test_paired_cases_compute_the_same_thing(self):
         for suite in ("short", "long"):
@@ -301,6 +335,45 @@ class TestUnavailableReference(unittest.TestCase):
         summary = summarize(body)
         self.assertEqual(summary["compared"], 0)
         self.assertEqual(len(evaluate(summary, 1.0, 0.0, None)), 1)
+
+
+class TestReferenceOutOfMemory(unittest.TestCase):
+    """An allocation refusal is recorded as such, never as a plain skip."""
+
+    def setUp(self):
+        self._device = bench_mps_operator._DEVICE
+        self._tensor = bench_mps_operator._ReferenceBackend.tensor
+        bench_mps_operator._DEVICE = "cpu"
+
+        def exhaust(self, array, dtype_key=None):
+            raise RuntimeError(
+                "MPS backend out of memory (MPS allocated: 8.00 MB, other "
+                "allocations: 1024.00 KB). Tried to allocate 256 bytes on "
+                "shared pool.")
+
+        bench_mps_operator._ReferenceBackend.tensor = exhaust
+
+    def tearDown(self):
+        bench_mps_operator._DEVICE = self._device
+        bench_mps_operator._ReferenceBackend.tensor = self._tensor
+
+    def test_run_records_the_cases_that_ran_out_of_memory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "mps-operator.json"
+            with contextlib.redirect_stdout(io.StringIO()):
+                bench_mps_operator.main([
+                    "--side", "reference",
+                    "--suite", "short",
+                    "--reps", "1",
+                    "--min-run-time", "0",
+                    "--warmup", "1",
+                    "--rounds", "1",
+                    "--json-out", str(out),
+                ])
+            body = json.loads(out.read_text(encoding="utf-8"))
+        recorded = body["skipped"]["out_of_memory"]
+        self.assertTrue(recorded)
+        self.assertEqual(recorded, sorted(body["skipped"]["unavailable"]))
 
 
 if __name__ == "__main__":

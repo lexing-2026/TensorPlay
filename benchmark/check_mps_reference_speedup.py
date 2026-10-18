@@ -85,13 +85,22 @@ def join(ours, reference):
             unpaired.append(item["name"])
         measurements.append(paired)
     skipped = reference.get("skipped") or {}
+    ours_skipped = ours.get("skipped") or {}
     joined = dict(ours)
     joined["measurements"] = measurements
     joined["unpaired"] = unpaired
+    joined["ours_requested_skips"] = sorted(
+        ours_skipped.get("requested") or [])
+    joined["ours_unavailable"] = sorted(
+        ours_skipped.get("unavailable") or {})
+    joined["ours_out_of_memory"] = sorted(
+        ours_skipped.get("out_of_memory") or [])
     joined["reference_requested_skips"] = sorted(
         skipped.get("requested") or [])
     joined["reference_unavailable"] = sorted(
         skipped.get("unavailable") or {})
+    joined["reference_out_of_memory"] = sorted(
+        skipped.get("out_of_memory") or {})
     joined["reference"] = reference.get("runtime") or {
         "runtime": "reference", "version": "",
         "device": reference.get("device"),
@@ -121,12 +130,20 @@ def summarize(payload):
     recorded = set(payload.get("reference_requested_skips") or [])
     recorded.update(payload.get("reference_unavailable") or [])
     unexpected_unpaired = [name for name in unpaired if name not in recorded]
+    ours_requested = set(payload.get("ours_requested_skips") or [])
+    ours_unavailable = [name for name in (payload.get("ours_unavailable") or [])
+                        if name not in ours_requested]
+    ours_oom = list(payload.get("ours_out_of_memory") or [])
+    reference_oom = list(payload.get("reference_out_of_memory") or [])
+    common = {"unpaired": unpaired,
+              "unexpected_unpaired": unexpected_unpaired,
+              "ours_unavailable": ours_unavailable,
+              "ours_out_of_memory": ours_oom,
+              "reference_out_of_memory": reference_oom,
+              "reference": payload.get("reference", {})}
     if not rows:
         return {"rows": [], "geomean": 0.0, "win_rate": 0.0,
-                "wins": 0, "compared": 0,
-                "unpaired": unpaired,
-                "unexpected_unpaired": unexpected_unpaired,
-                "reference": payload.get("reference", {})}
+                "wins": 0, "compared": 0, **common}
     speedups = [row["speedup"] for row in rows]
     wins = sum(1 for value in speedups if value >= 1.0)
     return {
@@ -135,9 +152,7 @@ def summarize(payload):
         "win_rate": wins / len(rows),
         "wins": wins,
         "compared": len(rows),
-        "unpaired": unpaired,
-        "unexpected_unpaired": unexpected_unpaired,
-        "reference": payload.get("reference", {}),
+        **common,
     }
 
 
@@ -152,6 +167,17 @@ def evaluate(summary, min_geomean, min_win_rate, max_case_slowdown):
         violations.append(
             f"{len(names)} measured cases have no reference timing and no "
             f"recorded skip: {', '.join(names)}"
+        )
+    if summary.get("ours_unavailable"):
+        names = summary["ours_unavailable"]
+        violations.append(
+            f"{len(names)} cases did not run on our side: {', '.join(names)}"
+        )
+    if summary.get("reference_out_of_memory"):
+        names = summary["reference_out_of_memory"]
+        violations.append(
+            f"{len(names)} reference cases ran out of memory: "
+            f"{', '.join(names)}"
         )
     if summary["geomean"] < min_geomean:
         violations.append(
@@ -235,6 +261,17 @@ def write_summary(path, summary, violations, min_geomean, min_win_rate):
             for name in summary["unpaired"]
         )
         lines.append("")
+    if summary.get("ours_out_of_memory") or \
+            summary.get("reference_out_of_memory"):
+        lines.extend([
+            "## Out-of-memory cases",
+            "",
+        ])
+        lines.extend(f"- ours: {name}" for name in
+                     summary.get("ours_out_of_memory") or [])
+        lines.extend(f"- reference: {name}" for name in
+                     summary.get("reference_out_of_memory") or [])
+        lines.append("")
     if violations:
         lines.extend(["## Gate", ""])
         lines.extend(f"- {item}" for item in violations)
@@ -281,6 +318,9 @@ def main():
         unexpected = summary.get("unexpected_unpaired") or []
         print(f"cases without a reference timing: {len(summary['unpaired'])} "
               f"({len(unexpected)} not declared skipped)")
+    if summary.get("reference_out_of_memory"):
+        print(f"reference cases out of memory: "
+              f"{len(summary['reference_out_of_memory'])}")
     for item in violations:
         print(item)
     return 1 if violations else 0
