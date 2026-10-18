@@ -65,6 +65,21 @@ struct NoGradGuard {
     ~NoGradGuard() { GradMode::set_enabled(prev); }
 };
 
+// Block size for the slice-structured kernels: just enough threads to cover
+// one slice, with the larger blocks kept for wide slices.
+inline int slice_block_threads(int64_t inner) {
+    if (inner >= 1024) return 512;
+    if (inner >= 256) return 256;
+    return static_cast<int>((inner + 31) / 32 * 32);
+}
+
+// The slice kernels parallelize over (outer, index) pairs; below this many
+// pairs the flat kernel spreads the work over more blocks.
+inline bool use_slice_kernel(int64_t inner, int64_t n_idx, int64_t outer) {
+    return inner >= 64 &&
+           n_idx * std::min<int64_t>(outer, 65535) >= 64;
+}
+
 // Index-select row gather.
 template <typename T, typename IndexT>
 __global__ void index_select_kernel(int64_t total_out_elems, int64_t n_idx, int64_t inner,
@@ -81,21 +96,24 @@ __global__ void index_select_kernel(int64_t total_out_elems, int64_t n_idx, int6
     }
 }
 
+// One block column per index entry: the block walks the destination slices of
+// that entry in order, so the coordinate split costs no division and the index
+// value is loaded once per block.
 template <typename T, typename IndexT>
-__global__ void index_select_slice_kernel(int64_t n_slices, int64_t n_idx,
+__global__ void index_select_slice_kernel(int64_t n_idx, int64_t outer,
                                           int64_t inner, int64_t row,
                                           const T* s, const IndexT* ip, T* d) {
-    const int64_t slice_stride = static_cast<int64_t>(gridDim.x);
-    for (int64_t slice = static_cast<int64_t>(blockIdx.x); slice < n_slices;
-         slice += slice_stride) {
-        const int64_t outer_index = slice / n_idx;
-        const int64_t index_position = slice % n_idx;
-        int64_t source_index = ip[index_position];
-        TP_INDEX_RANGE_GUARD(source_index, row);
-        const T* source = s + (outer_index * row + source_index) * inner;
-        T* destination = d + slice * inner;
-        for (int64_t c = threadIdx.x; c < inner; c += blockDim.x) {
-            destination[c] = source[c];
+    const int64_t k_stride = static_cast<int64_t>(gridDim.x);
+    const int64_t o_stride = static_cast<int64_t>(gridDim.y);
+    for (int64_t o = blockIdx.y; o < outer; o += o_stride) {
+        for (int64_t k = blockIdx.x; k < n_idx; k += k_stride) {
+            int64_t source_index = ip[k];
+            TP_INDEX_RANGE_GUARD(source_index, row);
+            const T* source = s + (o * row + source_index) * inner;
+            T* destination = d + (o * n_idx + k) * inner;
+            for (int64_t c = threadIdx.x; c < inner; c += blockDim.x) {
+                destination[c] = source[c];
+            }
         }
     }
 }
@@ -107,12 +125,14 @@ void launch_index_select_for_index(
         int slice_threads, cudaStream_t stream) {
 #define TP_IS_CASE(ctype, name) \
     case DType::name: { \
-        if (inner >= 64) { \
-            const int64_t slices = outer * n_idx; \
-            const int64_t blocks = std::min<int64_t>(slices, 4096); \
+        if (use_slice_kernel(inner, n_idx, outer)) { \
+            const unsigned index_blocks = static_cast<unsigned>( \
+                std::min<int64_t>(n_idx, 2147483647)); \
+            const unsigned outer_blocks = static_cast<unsigned>( \
+                std::min<int64_t>(outer, 65535)); \
             index_select_slice_kernel<ctype, IndexT><<< \
-                static_cast<unsigned>(blocks), slice_threads, 0, stream>>>( \
-                slices, n_idx, inner, row, \
+                dim3(index_blocks, outer_blocks), slice_threads, 0, stream>>>( \
+                n_idx, outer, inner, row, \
                 static_cast<const ctype*>(self.data_ptr()), \
                 index.data_ptr<IndexT>(), static_cast<ctype*>(result.data_ptr())); \
         } else { \
@@ -166,6 +186,26 @@ __global__ void index_fill_kernel(int64_t total, int64_t n_idx, int64_t inner, i
         int64_t iv = ip[k];
         TP_INDEX_RANGE_GUARD(iv, row);
         d[(o * row + iv) * inner + c] = v;
+    }
+}
+
+// One block column per index entry, mirroring the select kernel: no per-element
+// coordinate split, and the index value is used by a whole slice at once.
+template <typename T>
+__global__ void index_fill_slice_kernel(int64_t n_idx, int64_t outer,
+                                        int64_t inner, int64_t row,
+                                        T* d, const int64_t* ip, T v) {
+    const int64_t k_stride = static_cast<int64_t>(gridDim.x);
+    const int64_t o_stride = static_cast<int64_t>(gridDim.y);
+    for (int64_t o = blockIdx.y; o < outer; o += o_stride) {
+        for (int64_t k = blockIdx.x; k < n_idx; k += k_stride) {
+            int64_t iv = ip[k];
+            TP_INDEX_RANGE_GUARD(iv, row);
+            T* destination = d + (o * row + iv) * inner;
+            for (int64_t c = threadIdx.x; c < inner; c += blockDim.x) {
+                destination[c] = v;
+            }
+        }
     }
 }
 
@@ -357,7 +397,7 @@ Tensor index_select_cuda(const Tensor& self, int64_t dim, const Tensor& index) {
     if (total == 0) return result;
     Tensor self_c = self.contiguous();
     auto stream = getCurrentCUDAStream().stream();
-    const int slice_threads = inner >= 1024 ? 512 : kThreads;
+    const int slice_threads = slice_block_threads(inner);
     if (idx.dtype() == DType::Int32) {
         launch_index_select_for_index<int32_t>(
             total, n_idx, inner, row, outer, self_c, idx, result,
@@ -474,12 +514,24 @@ Tensor index_fill_scalar_cuda(const Tensor& self, int64_t dim, const Tensor& ind
     int64_t total = outer * n_idx * inner;
     if (total == 0) return result;
     auto stream = getCurrentCUDAStream().stream();
+    const int slice_threads = slice_block_threads(inner);
 #define TP_IF_CASE(ctype, name) \
     case DType::name: { \
         ctype v = value.to<ctype>(); \
-        index_fill_kernel<ctype><<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
-            total, n_idx, inner, row, static_cast<ctype*>(result.data_ptr()), \
-            idx.data_ptr<int64_t>(), v); \
+        if (use_slice_kernel(inner, n_idx, outer)) { \
+            const unsigned index_blocks = static_cast<unsigned>( \
+                std::min<int64_t>(n_idx, 2147483647)); \
+            const unsigned outer_blocks = static_cast<unsigned>( \
+                std::min<int64_t>(outer, 65535)); \
+            index_fill_slice_kernel<ctype><<< \
+                dim3(index_blocks, outer_blocks), slice_threads, 0, stream>>>( \
+                n_idx, outer, inner, row, static_cast<ctype*>(result.data_ptr()), \
+                idx.data_ptr<int64_t>(), v); \
+        } else { \
+            index_fill_kernel<ctype><<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
+                total, n_idx, inner, row, static_cast<ctype*>(result.data_ptr()), \
+                idx.data_ptr<int64_t>(), v); \
+        } \
         break; \
     }
     switch (self.dtype()) {
@@ -515,12 +567,24 @@ Tensor& index_fill_scalar__cuda(Tensor& self, int64_t dim, const Tensor& index, 
         return self;
     }
     auto stream = getCurrentCUDAStream().stream();
+    const int slice_threads = slice_block_threads(inner);
 #define TP_IF_IP_CASE(ctype, name) \
     case DType::name: { \
         ctype v = value.to<ctype>(); \
-        index_fill_kernel<ctype><<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
-            total, n_idx, inner, row, static_cast<ctype*>(self.data_ptr()), \
-            idx.data_ptr<int64_t>(), v); \
+        if (use_slice_kernel(inner, n_idx, outer)) { \
+            const unsigned index_blocks = static_cast<unsigned>( \
+                std::min<int64_t>(n_idx, 2147483647)); \
+            const unsigned outer_blocks = static_cast<unsigned>( \
+                std::min<int64_t>(outer, 65535)); \
+            index_fill_slice_kernel<ctype><<< \
+                dim3(index_blocks, outer_blocks), slice_threads, 0, stream>>>( \
+                n_idx, outer, inner, row, static_cast<ctype*>(self.data_ptr()), \
+                idx.data_ptr<int64_t>(), v); \
+        } else { \
+            index_fill_kernel<ctype><<<(total + kThreads - 1) / kThreads, kThreads, 0, stream>>>( \
+                total, n_idx, inner, row, static_cast<ctype*>(self.data_ptr()), \
+                idx.data_ptr<int64_t>(), v); \
+        } \
         break; \
     }
     switch (self.dtype()) {
