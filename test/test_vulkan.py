@@ -1188,8 +1188,11 @@ class TestVulkanLinearPayload(unittest.TestCase):
         # must not disturb the lanes before it, and the read-back length has to
         # stop at the logical end.
         tensorplay.manual_seed(37)
+        # 66558 and 66559 need a second look: their word counts (16640) are an
+        # exact multiple of the workgroup size, so the launch carries no padded
+        # invocation that could pick up a leftover lane.
         for width in (self.WIDTH - 3, self.WIDTH - 1, self.WIDTH + 1,
-                      self.WIDTH + 6):
+                      self.WIDTH + 6, 66558, 66559):
             x_cpu = (tp.randn((width,), device="cpu") * 2.0).numpy()
             y_cpu = (tp.randn((width,), device="cpu") * 2.0).numpy()
             x = tensorplay.from_numpy(x_cpu.copy()).to("vulkan")
@@ -1219,6 +1222,29 @@ class TestVulkanLinearPayload(unittest.TestCase):
                 F.masked_fill(x, mask, -7.0).cpu().numpy(),
                 np.where(x_cpu < y_cpu, -7.0, x_cpu),
                 err_msg="masked_fill at odd width")
+
+    def test_index_payload_over_linear_storage(self):
+        import tensorplay as tp
+        import tensorplay.functional as F
+        # A gather over a table too tall for a texture reads its index list
+        # from a linear payload, where one element is one int in row order
+        # rather than one lane of a texel.  The lengths below also leave a
+        # partial last word, so the leftover lanes must be reached too.
+        rng = np.random.default_rng(5)
+        table = rng.standard_normal(70000, dtype=np.float32)
+        for count in (66558, 66559, 66560):
+            sel = rng.integers(0, table.size, count).astype(np.int32)
+            out = F.index_select(
+                tp.from_numpy(table.copy()).to("vulkan"), 0,
+                tp.from_numpy(sel.copy()).to("vulkan")).cpu().numpy()
+            np.testing.assert_array_equal(
+                out, table[sel], err_msg=f"index_select at {count}")
+            id_sel = np.arange(count, dtype=np.int32)
+            out = F.index_select(
+                tp.from_numpy(table.copy()).to("vulkan"), 0,
+                tp.from_numpy(id_sel.copy()).to("vulkan")).cpu().numpy()
+            np.testing.assert_array_equal(
+                out, table[:count], err_msg=f"identity select at {count}")
 
     def test_decode_product_over_linear_weight(self):
         import tensorplay as tp
