@@ -251,7 +251,7 @@ binary_op_tensor:
     OPERATOR: X - Y * (X / Y)
     FORMAT: rgba32i
   - NAME: fmod
-    OPERATOR: X - Y * trunc(X / Y)
+    OPERATOR: (X - Y * trunc(X / Y)) - Y * step(abs(Y), abs(X - Y * trunc(X / Y))) * sign(X - Y * trunc(X / Y))
   - NAME: fmod_i32
     DTYPE: int
     OPERATOR: X - Y * (X / Y)
@@ -449,7 +449,7 @@ buffer_binary_op_tensor:
     DTYPE: int
     OPERATOR: X - Y * (X / Y)
   - NAME: buffer_fmod
-    OPERATOR: X - Y * trunc(X / Y)
+    OPERATOR: (X - Y * trunc(X / Y)) - Y * step(abs(Y), abs(X - Y * trunc(X / Y))) * sign(X - Y * trunc(X / Y))
   - NAME: buffer_fmod_i32
     DTYPE: int
     OPERATOR: X - Y * (X / Y)
@@ -1857,10 +1857,10 @@ buffer_half_binary_op_tensor:
     OPERATOR: 'floor(X / Y)'
     INPLACE: true
   - NAME: buffer_fmod_half
-    OPERATOR: 'X - Y * trunc(X / Y)'
+    OPERATOR: '(X - Y * trunc(X / Y)) - Y * step(abs(Y), abs(X - Y * trunc(X / Y))) * sign(X - Y * trunc(X / Y))'
     INPLACE: false
   - NAME: buffer_fmod_halfinplace
-    OPERATOR: 'X - Y * trunc(X / Y)'
+    OPERATOR: '(X - Y * trunc(X / Y)) - Y * step(abs(Y), abs(X - Y * trunc(X / Y))) * sign(X - Y * trunc(X / Y))'
     INPLACE: true
   - NAME: buffer_logaddexp_half
     OPERATOR: 'max(X, Y) + log(1.0f + exp(-abs(X - Y)))'

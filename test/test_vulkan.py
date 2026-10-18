@@ -1251,6 +1251,34 @@ class TestVulkanLinearPayload(unittest.TestCase):
                 rtol=1e-3, atol=1e-3,
                 err_msg=f"tiled linear m={m} k={k} n={n}")
 
+    def test_fmod_exact_multiples_over_linear_payload(self):
+        import tensorplay.functional as F
+        # The remainder is formed as x - y*trunc(x/y), so a quotient that lands
+        # one unit below its true integer makes the dividend come back whole
+        # instead of a zero remainder.  Exact multiples pin that boundary, and
+        # one guarded step has to clear it for every lane.
+        vals = np.array(
+            [-2.544922, 1.262695, 4.300781, -2.027344, 7.0, 3.0, -6.0, 5.0],
+            dtype=np.float32)
+        divs = np.array(
+            [2.544922, 1.262695, 2.150391, 1.013672, 2.0, 3.0, 2.0, 2.0],
+            dtype=np.float32)
+        for width in (self.WIDTH, vals.size):
+            for dtype in (np.float32, np.float16):
+                x = np.resize(vals, width).astype(dtype)
+                b = np.resize(divs, width).astype(dtype)
+                got = F.fmod(
+                    tensorplay.from_numpy(x.copy()).to("vulkan"),
+                    tensorplay.from_numpy(b.copy()).to("vulkan"),
+                ).cpu().numpy().astype(np.float32)
+                want = np.fmod(
+                    x.astype(np.float64), b.astype(np.float64)).astype(dtype)
+                np.testing.assert_allclose(
+                    got, want.astype(np.float32), rtol=1e-3, atol=1e-3,
+                    err_msg=(f"fmod over {np.dtype(dtype).name} payload of "
+                             f"width {width} returned the dividend instead of "
+                             f"the remainder"))
+
     def test_rms_norm_over_linear_payload(self):
         import tensorplay as tp
         import tensorplay.nn.functional as F
