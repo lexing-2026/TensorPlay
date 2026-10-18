@@ -287,13 +287,35 @@ kernel void row_pred_inner(device bool* out [[buffer(0)]],
   const uint n = sizes[1];
   constant T* values = src + (uint64_t)row * (uint64_t)n;
 
-  uint held = Op::identity();
-  for (uint i = lane; i < n; i += simdgroup_size) {
-    held = Op::combine(held, Op::test(values[i]));
+  metal::array<uint, kSumChains> held;
+#pragma unroll
+  for (uint j = 0; j < kSumChains; ++j) {
+    held[j] = Op::identity();
+  }
+  // Several independent chains per lane, like the sum kernel: one accumulator
+  // would serialize the walk on a comparison per load, while the chains keep a
+  // whole group of loads in flight and each load instruction covers one
+  // contiguous stretch of the row.
+  const uint stride = simdgroup_size * kSumChains;
+  const uint whole = (n / stride) * stride;
+  for (uint base = 0; base < whole; base += stride) {
+#pragma unroll
+    for (uint j = 0; j < kSumChains; ++j) {
+      held[j] = Op::combine(held[j],
+                            Op::test(values[base + j * simdgroup_size + lane]));
+    }
+  }
+  for (uint i = whole + lane; i < n; i += simdgroup_size) {
+    held[0] = Op::combine(held[0], Op::test(values[i]));
+  }
+  uint acc = held[0];
+#pragma unroll
+  for (uint j = 1; j < kSumChains; ++j) {
+    acc = Op::combine(acc, held[j]);
   }
   // As for the extrema, the step that joins the lanes asks all of them, so it
   // happens before any lane is left behind.
-  const uint folded = Op::reduce(held);
+  const uint folded = Op::reduce(acc);
   if (lane == 0) {
     out[row] = folded != 0;
   }
