@@ -83,11 +83,6 @@ struct tanh_op {
   static inline T apply(T x) { return ::precise::tanh(x); }
 };
 
-struct erf_op {
-  template <typename T>
-  static inline T apply(T x) { return erf(x); }
-};
-
 struct floor_op {
   template <typename T>
   static inline T apply(T x) { return floor(x); }
@@ -166,7 +161,6 @@ REGISTER_UNARY_ELEMENTWISE(log, float)
 REGISTER_UNARY_ELEMENTWISE(sin, float)
 REGISTER_UNARY_ELEMENTWISE(cos, float)
 REGISTER_UNARY_ELEMENTWISE(tanh, float)
-REGISTER_UNARY_ELEMENTWISE(erf, float)
 REGISTER_UNARY_ELEMENTWISE(floor, float)
 REGISTER_UNARY_ELEMENTWISE(ceil, float)
 REGISTER_UNARY_ELEMENTWISE(round, float)
