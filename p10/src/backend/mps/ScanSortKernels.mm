@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <string>
 #include <tuple>
 #include <vector>
 
@@ -222,20 +223,28 @@ std::tuple<Tensor, Tensor> sort_kernel(const Tensor& self, int64_t dim,
     return std::make_tuple(values, indices);
   }
 
-  auto pso = lib.getPipelineStateForFunc("sort_" +
-                                         scalarToMetalTypeString(self_c.dtype()));
-  const int max_tptg = [pso maxTotalThreadsPerThreadgroup];
-  int64_t P = 1;
-  while (P < d_size) P <<= 1;
-  if (P > max_tptg) {
+  // Each thread keeps four elements; the threadgroup covers the slice, and a
+  // slice beyond 256 threads stays on the error path for now.
+  constexpr int64_t kSortLanes = 4;
+  constexpr int64_t kSortMaxTptg = 256;
+  constexpr int64_t kSortMaxSlice = kSortLanes * kSortMaxTptg;
+  if (d_size > kSortMaxSlice) {
     TP_THROW(NotImplementedError,
-             "sort: slices longer than ", max_tptg,
+             "sort: slices longer than ", kSortMaxSlice,
              " are not supported on MPS yet");
   }
+  int64_t tptg = 32;
+  while (tptg * kSortLanes < d_size) {
+    tptg <<= 1;
+  }
+  auto pso = lib.getPipelineStateForFunc(
+      "sort_merge_" + scalarToMetalTypeString(self_c.dtype()) + "_tptg" +
+      std::to_string(tptg));
 
   const DType dt = self_c.dtype();
   const int desc_i = descending ? 1 : 0;
-  // Sentinel value: infinities for floats, min/max for integers.
+  // Sentinel value: NaN ascending (it sorts past everything, including +inf),
+  // -inf descending; min/max for integers.
   float f_sent = 0.0f;
   Half h_sent(0.0f);
   BFloat16 b_sent(0.0f);
@@ -249,19 +258,19 @@ std::tuple<Tensor, Tensor> sort_kernel(const Tensor& self, int64_t dim,
   switch (dt) {
     case DType::Float32:
       f_sent = descending ? -std::numeric_limits<float>::infinity()
-                        : std::numeric_limits<float>::infinity();
+                        : std::numeric_limits<float>::quiet_NaN();
       sentinel_ptr = &f_sent;
       sentinel_size = sizeof(float);
       break;
     case DType::Float16:
       h_sent = Half(descending ? -std::numeric_limits<float>::infinity()
-                               : std::numeric_limits<float>::infinity());
+                               : std::numeric_limits<float>::quiet_NaN());
       sentinel_ptr = &h_sent;
       sentinel_size = sizeof(Half);
       break;
     case DType::BFloat16:
       b_sent = BFloat16(descending ? -std::numeric_limits<float>::infinity()
-                                    : std::numeric_limits<float>::infinity());
+                                    : std::numeric_limits<float>::quiet_NaN());
       sentinel_ptr = &b_sent;
       sentinel_size = sizeof(BFloat16);
       break;
@@ -302,9 +311,8 @@ std::tuple<Tensor, Tensor> sort_kernel(const Tensor& self, int64_t dim,
   const int d_size_i = static_cast<int>(d_size);
   const int inner_i = static_cast<int>(inner);
   const int num_slices_i = static_cast<int>(outer * inner);
-  const int P_i = static_cast<int>(P);
-  const size_t val_bytes = P * self_c.itemsize();
-  const size_t idx_bytes = P * sizeof(int64_t);
+  const size_t val_bytes = tptg * kSortLanes * self_c.itemsize();
+  const size_t idx_bytes = tptg * kSortLanes * sizeof(uint32_t);
 
   MPSStream* stream = getCurrentMPSStream();
   dispatch_sync_with_rethrow(stream->queue(), ^() {
@@ -316,7 +324,7 @@ std::tuple<Tensor, Tensor> sort_kernel(const Tensor& self, int64_t dim,
       [encoder setThreadgroupMemoryLength:val_bytes atIndex:0];
       [encoder setThreadgroupMemoryLength:idx_bytes atIndex:1];
       [encoder dispatchThreadgroups:MTLSizeMake(num_slices_i, 1, 1)
-          threadsPerThreadgroup:MTLSizeMake(P_i, 1, 1)];
+          threadsPerThreadgroup:MTLSizeMake(static_cast<NSUInteger>(tptg), 1, 1)];
     }
   });
   return std::make_tuple(values, indices);

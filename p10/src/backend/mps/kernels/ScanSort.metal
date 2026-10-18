@@ -164,12 +164,208 @@ kernel void scan_rows_inner(
 }
 
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ sort ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-// Bitonic sort.  One threadgroup sorts one slice of `sort_size` elements; the
-// threadgroup size is the next power of two.  The slice's elements are
+// One threadgroup sorts one slice. Each thread keeps four consecutive elements
+// in registers; a SIMD-group bitonic network orders 128 elements without a
+// barrier, then pairwise merges of ordered runs double the span inside
+// threadgroup memory until the slice is whole. The slice's elements are
 // `inner` apart in the contiguous buffer (slice index = threadgroup id).
 
 template <typename T>
-kernel void sort_kernel(
+inline bool sort_less(T a, T b, bool desc) {
+  // NaN takes the extreme position so the order stays a total order: last
+  // ascending, first descending. Without it equal-pair decisions disagree
+  // across lanes and the same position can be emitted twice.
+  IF_CONSTEXPR (metal::is_floating_point_v<T>) {
+    const bool a_nan = a != a;
+    const bool b_nan = b != b;
+    if (a_nan || b_nan) {
+      return desc ? (a_nan && !b_nan) : (b_nan && !a_nan);
+    }
+  }
+  return desc ? (a > b) : (a < b);
+}
+
+// Total order over (value, original position). Positions are unique, so equal
+// values stay deterministic, and padding (the largest position) follows every
+// real element that shares its value.
+template <typename T>
+inline bool sort_before(T va, uint ia, T vb, uint ib, bool desc) {
+  if (sort_less(va, vb, desc)) {
+    return true;
+  }
+  if (sort_less(vb, va, desc)) {
+    return false;
+  }
+  return ia < ib;
+}
+
+template <typename T, metal::enable_if_t<sizeof(T) == 1, bool> = true>
+inline T sort_shuffle(T v, ushort delta) {
+  return as_type<T>(uchar(simd_shuffle_xor(uint(as_type<uchar>(v)), delta)));
+}
+
+template <typename T, metal::enable_if_t<sizeof(T) == 2, bool> = true>
+inline T sort_shuffle(T v, ushort delta) {
+  return as_type<T>(ushort(simd_shuffle_xor(uint(as_type<ushort>(v)), delta)));
+}
+
+template <typename T, metal::enable_if_t<sizeof(T) == 4, bool> = true>
+inline T sort_shuffle(T v, ushort delta) {
+  return as_type<T>(simd_shuffle_xor(as_type<uint>(v), delta));
+}
+
+template <typename T, metal::enable_if_t<sizeof(T) == 8, bool> = true>
+inline T sort_shuffle(T v, ushort delta) {
+  const ulong u = as_type<ulong>(v);
+  const uint lo = simd_shuffle_xor(uint(u), delta);
+  const uint hi = simd_shuffle_xor(uint(u >> 32), delta);
+  return as_type<T>(ulong(lo) | (ulong(hi) << 32));
+}
+
+inline uint sort_shuffle_index(uint v, ushort delta) {
+  return simd_shuffle_xor(v, delta);
+}
+
+// Exchange partner elements held by the same thread.
+template <typename T, short TN, int K, int OFFSET>
+inline void sort_substage_reg(thread T (&v)[TN], thread uint (&idx)[TN],
+                              uint lane, bool desc) {
+  const uint pbase = lane * TN;
+#pragma unroll
+  for (short i = 0; i < TN; ++i) {
+    const short pi = i ^ OFFSET;
+    if (pi > i) {
+      const bool ascending = (((pbase + i) & K) == 0);
+      const bool before = sort_before(v[i], idx[i], v[pi], idx[pi], desc);
+      const bool swap = ascending ? !before : before;
+      const T tv = v[i];
+      const uint ti = idx[i];
+      v[i] = swap ? v[pi] : v[i];
+      idx[i] = swap ? idx[pi] : idx[i];
+      v[pi] = swap ? tv : v[pi];
+      idx[pi] = swap ? ti : idx[pi];
+    }
+  }
+}
+
+// Exchange partner elements held by another lane of the SIMD group.
+template <typename T, short TN, int K, int OFFSET>
+inline void sort_substage_simd(thread T (&v)[TN], thread uint (&idx)[TN],
+                               uint lane, bool desc) {
+  constexpr ushort kLaneOffset = OFFSET / TN;
+  const bool low = (lane & uint(kLaneOffset)) == 0;
+  const bool ascending = (((lane * TN) & K) == 0);
+#pragma unroll
+  for (short i = 0; i < TN; ++i) {
+    const T vp = sort_shuffle(v[i], kLaneOffset);
+    const uint ip = sort_shuffle_index(idx[i], kLaneOffset);
+    const bool first = sort_before(v[i], idx[i], vp, ip, desc);
+    const bool take = first != (ascending == low);
+    v[i] = take ? vp : v[i];
+    idx[i] = take ? ip : idx[i];
+  }
+}
+
+// Sort 32 lanes of TN elements: a bitonic network over 128 positions whose
+// cross-lane stages are register exchanges inside the SIMD group.
+template <typename T, short TN>
+inline void sort_simd_group(thread T (&v)[TN], thread uint (&idx)[TN],
+                            uint lane, bool desc) {
+  sort_substage_reg<T, TN, 2, 1>(v, idx, lane, desc);
+
+  sort_substage_reg<T, TN, 4, 2>(v, idx, lane, desc);
+  sort_substage_reg<T, TN, 4, 1>(v, idx, lane, desc);
+
+  sort_substage_simd<T, TN, 8, 4>(v, idx, lane, desc);
+  sort_substage_reg<T, TN, 8, 2>(v, idx, lane, desc);
+  sort_substage_reg<T, TN, 8, 1>(v, idx, lane, desc);
+
+  sort_substage_simd<T, TN, 16, 8>(v, idx, lane, desc);
+  sort_substage_simd<T, TN, 16, 4>(v, idx, lane, desc);
+  sort_substage_reg<T, TN, 16, 2>(v, idx, lane, desc);
+  sort_substage_reg<T, TN, 16, 1>(v, idx, lane, desc);
+
+  sort_substage_simd<T, TN, 32, 16>(v, idx, lane, desc);
+  sort_substage_simd<T, TN, 32, 8>(v, idx, lane, desc);
+  sort_substage_simd<T, TN, 32, 4>(v, idx, lane, desc);
+  sort_substage_reg<T, TN, 32, 2>(v, idx, lane, desc);
+  sort_substage_reg<T, TN, 32, 1>(v, idx, lane, desc);
+
+  sort_substage_simd<T, TN, 64, 32>(v, idx, lane, desc);
+  sort_substage_simd<T, TN, 64, 16>(v, idx, lane, desc);
+  sort_substage_simd<T, TN, 64, 8>(v, idx, lane, desc);
+  sort_substage_simd<T, TN, 64, 4>(v, idx, lane, desc);
+  sort_substage_reg<T, TN, 64, 2>(v, idx, lane, desc);
+  sort_substage_reg<T, TN, 64, 1>(v, idx, lane, desc);
+
+  sort_substage_simd<T, TN, 128, 64>(v, idx, lane, desc);
+  sort_substage_simd<T, TN, 128, 32>(v, idx, lane, desc);
+  sort_substage_simd<T, TN, 128, 16>(v, idx, lane, desc);
+  sort_substage_simd<T, TN, 128, 8>(v, idx, lane, desc);
+  sort_substage_simd<T, TN, 128, 4>(v, idx, lane, desc);
+  sort_substage_reg<T, TN, 128, 2>(v, idx, lane, desc);
+  sort_substage_reg<T, TN, 128, 1>(v, idx, lane, desc);
+}
+
+// Number of A elements among the first `diag` outputs of merging two ordered
+// runs of `asz` and `bsz` elements.
+template <typename T>
+inline int sort_partition(threadgroup const T* A, threadgroup const uint* ai,
+                          threadgroup const T* B, threadgroup const uint* bi,
+                          int asz, int bsz, int diag, bool desc) {
+  int lo = max(0, diag - bsz);
+  int hi = min(diag, asz);
+  while (lo < hi) {
+    const int m = lo + (hi - lo) / 2;
+    if (sort_before(B[diag - 1 - m], bi[diag - 1 - m], A[m], ai[m], desc)) {
+      hi = m;
+    } else {
+      lo = m + 1;
+    }
+  }
+  return lo;
+}
+
+// Merges TN consecutive outputs starting at the run-local offsets (a0, b0).
+template <typename T, short TN>
+inline void sort_merge_step(threadgroup const T* A, threadgroup const uint* ai,
+                            threadgroup const T* B, threadgroup const uint* bi,
+                            int asz, int bsz, int a0, int b0,
+                            thread T (&v)[TN], thread uint (&idx)[TN],
+                            bool desc) {
+  int a = a0;
+  int b = b0;
+#pragma unroll
+  for (short i = 0; i < TN; ++i) {
+    const bool take_b =
+        b < bsz && (a >= asz || sort_before(B[b], bi[b], A[a], ai[a], desc));
+    v[i] = take_b ? B[min(b, bsz - 1)] : A[min(a, asz - 1)];
+    idx[i] = take_b ? bi[min(b, bsz - 1)] : ai[min(a, asz - 1)];
+    a += take_b ? 0 : 1;
+    b += take_b ? 1 : 0;
+  }
+}
+
+// Merges the two halves of every `MT * TN`-element group in threadgroup
+// memory; each thread emits its TN outputs into registers.
+template <typename T, short TN, int MT>
+inline void sort_merge_pass(threadgroup T* tv, threadgroup uint* ti, uint lid,
+                            thread T (&v)[TN], thread uint (&idx)[TN],
+                            bool desc) {
+  constexpr int kRun = MT * TN;
+  const uint grp = lid / uint(MT);
+  const uint lane = lid % uint(MT);
+  const int st = kRun * int(grp);
+  constexpr int kHalf = kRun / 2;
+  const int diag = TN * int(lane);
+  const int p = sort_partition(tv + st, ti + st, tv + st + kHalf,
+                               ti + st + kHalf, kHalf, kHalf, diag, desc);
+  sort_merge_step<T, TN>(tv + st, ti + st, tv + st + kHalf, ti + st + kHalf,
+                         kHalf, kHalf, p, diag - p, v, idx, desc);
+}
+
+template <typename T, short TPTG, short TN>
+kernel void sort_merge_kernel(
     device const T* input [[buffer(0)]],
     device T* values [[buffer(1)]],
     device long* indices [[buffer(2)]],
@@ -178,49 +374,62 @@ kernel void sort_kernel(
     constant int& descending [[buffer(5)]],
     constant T& sentinel [[buffer(6)]],
     threadgroup T* local_vals [[threadgroup(0)]],
-    threadgroup long* local_idx [[threadgroup(1)]],
+    threadgroup uint* local_idx [[threadgroup(1)]],
     uint tgid [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint tptg [[threads_per_threadgroup]]) {
+    uint tid [[thread_position_in_threadgroup]]) {
   const int base = (tgid / inner) * sort_size * inner + (tgid % inner);
-  const int P = static_cast<int>(tptg);
   const bool desc = descending != 0;
+  const uint pos0 = tid * TN;
 
-  if (tid < sort_size) {
-    local_vals[tid] = input[base + tid * inner];
-    local_idx[tid] = static_cast<long>(tid);
+  thread T v[TN];
+  thread uint idx[TN];
+#pragma unroll
+  for (short i = 0; i < TN; ++i) {
+    const int p = int(pos0) + i;
+    v[i] = p < sort_size ? input[base + min(p, sort_size - 1) * inner]
+                         : sentinel;
+    idx[i] = p < sort_size ? uint(p) : 0xFFFFFFFFu;
   }
-  for (int i = tid; i < P; i += tptg) {
-    if (i >= sort_size) {
-      local_vals[i] = sentinel;
-      local_idx[i] = -1;
+
+  sort_simd_group<T, TN>(v, idx, tid & 31u, desc);
+
+  if (TPTG >= 64) {
+#pragma unroll
+    for (short i = 0; i < TN; ++i) {
+      local_vals[pos0 + i] = v[i];
+      local_idx[pos0 + i] = idx[i];
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sort_merge_pass<T, TN, 64>(local_vals, local_idx, tid, v, idx, desc);
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  for (int k = 2; k <= P; k <<= 1) {
-    for (int j = k >> 1; j > 0; j >>= 1) {
-      const int ixj = tid ^ j;
-      if (ixj > tid) {
-        const bool up = (((tid & k) == 0) != desc);
-        const T a = local_vals[tid];
-        const T b = local_vals[ixj];
-        const bool swap = up ? (a > b) : (a < b);
-        if (swap) {
-          const long tmp_i = local_idx[tid];
-          local_vals[tid] = b;
-          local_idx[tid] = local_idx[ixj];
-          local_vals[ixj] = a;
-          local_idx[ixj] = tmp_i;
-        }
-      }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (TPTG >= 128) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+#pragma unroll
+    for (short i = 0; i < TN; ++i) {
+      local_vals[pos0 + i] = v[i];
+      local_idx[pos0 + i] = idx[i];
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sort_merge_pass<T, TN, 128>(local_vals, local_idx, tid, v, idx, desc);
+  }
+  if (TPTG >= 256) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+#pragma unroll
+    for (short i = 0; i < TN; ++i) {
+      local_vals[pos0 + i] = v[i];
+      local_idx[pos0 + i] = idx[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sort_merge_pass<T, TN, 256>(local_vals, local_idx, tid, v, idx, desc);
   }
 
-  if (tid < sort_size) {
-    values[base + tid * inner] = local_vals[tid];
-    indices[base + tid * inner] = local_idx[tid];
+#pragma unroll
+  for (short i = 0; i < TN; ++i) {
+    const int p = int(pos0) + i;
+    if (p < sort_size) {
+      values[base + p * inner] = v[i];
+      indices[base + p * inner] = static_cast<long>(idx[i]);
+    }
   }
 }
 
@@ -264,11 +473,18 @@ REGISTER_SCAN_ROWS(char, int, char)
 REGISTER_SCAN_ROWS(uchar, uint, uchar)
 REGISTER_SCAN_ROWS(bool, int, bool)
 
-#define REGISTER_SORT(DTYPE)                                               \
-  template [[host_name("sort_" #DTYPE)]] kernel void sort_kernel<DTYPE>(   \
-      device const DTYPE*, device DTYPE*, device long*, constant int&, \
-      constant int&, constant int&, constant DTYPE&, threadgroup DTYPE*, \
-      threadgroup long*, uint, uint, uint);
+#define REGISTER_SORT_TPTG(DTYPE, TPTG)                                     \
+  template [[host_name("sort_merge_" #DTYPE "_tptg" #TPTG)]] kernel void    \
+  sort_merge_kernel<DTYPE, TPTG, 4>(                                        \
+      device const DTYPE*, device DTYPE*, device long*, constant int&,      \
+      constant int&, constant int&, constant DTYPE&, threadgroup DTYPE*,    \
+      threadgroup uint*, uint, uint);
+
+#define REGISTER_SORT(DTYPE)    \
+  REGISTER_SORT_TPTG(DTYPE, 32) \
+  REGISTER_SORT_TPTG(DTYPE, 64) \
+  REGISTER_SORT_TPTG(DTYPE, 128) \
+  REGISTER_SORT_TPTG(DTYPE, 256)
 
 REGISTER_SORT(float)
 REGISTER_SORT(half)
