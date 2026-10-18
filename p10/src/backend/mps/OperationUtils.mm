@@ -613,6 +613,21 @@ uint32_t denseGridSize(uint32_t elements) {
       p10::metal::ceil_div<uint32_t>(elements, p10::metal::ILP_PER_THREAD));
 }
 
+// A four-wide launch moves 16 bytes per access, which needs float storage,
+// whole vectors over the span, and every base on a 16-byte boundary.
+bool wholeFloatVectors(DType dtype, uint32_t elements,
+                       std::initializer_list<const void*> bases) {
+  if (dtype != DType::Float32 || elements % 4 != 0) {
+    return false;
+  }
+  for (const void* base : bases) {
+    if (reinterpret_cast<uintptr_t>(base) % 16 != 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
 } // namespace
 
 std::optional<Tensor> denseBinaryShader(const std::string& op,
@@ -645,19 +660,27 @@ std::optional<Tensor> denseBinaryShader(const std::string& op,
   }
 
   const uint32_t elements = static_cast<uint32_t>(numel);
-  const uint32_t total = denseGridSize(elements);
+  MTLComputePipelineState_t vec_pso =
+      wholeFloatVectors(self.dtype(), elements,
+                        {self.data_ptr(), other.data_ptr(), output.data_ptr()})
+          ? shaderPipelineNamed("dense_vec_" + op + "_float")
+          : nil;
+  MTLComputePipelineState_t active_pso = vec_pso ? vec_pso : pso;
+  // The vector form counts 16-byte vectors, the scalar form elements.
+  const uint32_t span = vec_pso ? elements / 4 : elements;
+  const uint32_t total = denseGridSize(span);
   MPSStream* stream = getCurrentMPSStream();
   dispatch_sync_with_rethrow(stream->queue(), ^() {
     @autoreleasepool {
       auto encoder = stream->commandEncoder();
-      [encoder setComputePipelineState:pso];
+      [encoder setComputePipelineState:active_pso];
       [encoder setBuffer:(__bridge id<MTLBuffer>)out_buf offset:0 atIndex:0];
       [encoder setBuffer:(__bridge id<MTLBuffer>)self_buf offset:0 atIndex:1];
       [encoder setBuffer:(__bridge id<MTLBuffer>)other_buf offset:0 atIndex:2];
-      [encoder setBytes:&elements length:sizeof(elements) atIndex:3];
+      [encoder setBytes:&span length:sizeof(span) atIndex:3];
       const uint32_t per_group =
           std::min(total,
-                   static_cast<uint32_t>([pso maxTotalThreadsPerThreadgroup]));
+                   static_cast<uint32_t>([active_pso maxTotalThreadsPerThreadgroup]));
       [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(per_group, 1, 1)];
     }
@@ -704,7 +727,15 @@ std::optional<Tensor> denseScalarBinaryShader(const std::string& op,
   }
 
   const uint32_t elements = static_cast<uint32_t>(numel);
-  const uint32_t total = denseGridSize(elements);
+  MTLComputePipelineState_t vec_pso =
+      wholeFloatVectors(self.dtype(), elements,
+                        {self.data_ptr(), output.data_ptr()})
+          ? shaderPipelineNamed("dense_vec_" + op + "_scalar_float")
+          : nil;
+  MTLComputePipelineState_t active_pso = vec_pso ? vec_pso : pso;
+  // The vector form counts 16-byte vectors, the scalar form elements.
+  const uint32_t span = vec_pso ? elements / 4 : elements;
+  const uint32_t total = denseGridSize(span);
   // The scalar is converted once, in the storage type the kernel reads.
   float value_f = 0.0f;
   int64_t value_l = 0;
@@ -733,14 +764,14 @@ std::optional<Tensor> denseScalarBinaryShader(const std::string& op,
   dispatch_sync_with_rethrow(stream->queue(), ^() {
     @autoreleasepool {
       auto encoder = stream->commandEncoder();
-      [encoder setComputePipelineState:pso];
+      [encoder setComputePipelineState:active_pso];
       [encoder setBuffer:(__bridge id<MTLBuffer>)out_buf offset:0 atIndex:0];
       [encoder setBuffer:(__bridge id<MTLBuffer>)self_buf offset:0 atIndex:1];
       [encoder setBytes:value length:value_size atIndex:2];
-      [encoder setBytes:&elements length:sizeof(elements) atIndex:3];
+      [encoder setBytes:&span length:sizeof(span) atIndex:3];
       const uint32_t per_group =
           std::min(total,
-                   static_cast<uint32_t>([pso maxTotalThreadsPerThreadgroup]));
+                   static_cast<uint32_t>([active_pso maxTotalThreadsPerThreadgroup]));
       [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(per_group, 1, 1)];
     }
@@ -894,22 +925,31 @@ std::optional<Tensor> unaryShader(const std::string& op, const Tensor& self) {
     return std::nullopt;
   }
 
+  const uint32_t elements = static_cast<uint32_t>(numel);
+  MTLComputePipelineState_t vec_pso =
+      wholeFloatVectors(self.dtype(), elements,
+                        {self.data_ptr(), output.data_ptr()})
+          ? shaderPipelineNamed("unary_vec_" + op + "_float")
+          : nil;
+  MTLComputePipelineState_t active_pso = vec_pso ? vec_pso : pso;
+  // The vector form counts 16-byte vectors, the scalar form elements.
+  const uint32_t span = vec_pso ? elements / 4 : elements;
+  // A thread serves one run of ILP_PER_THREAD positions, which is how much
+  // shorter than the span the grid has to be.
+  const uint32_t total = static_cast<uint32_t>(
+      p10::metal::ceil_div<uint32_t>(span, p10::metal::ILP_PER_THREAD));
+
   MPSStream* stream = getCurrentMPSStream();
   dispatch_sync_with_rethrow(stream->queue(), ^() {
     @autoreleasepool {
       auto encoder = stream->commandEncoder();
-      [encoder setComputePipelineState:pso];
+      [encoder setComputePipelineState:active_pso];
       [encoder setBuffer:(__bridge id<MTLBuffer>)out_buf offset:0 atIndex:0];
       [encoder setBuffer:(__bridge id<MTLBuffer>)in_buf offset:0 atIndex:1];
-      const uint32_t elements = static_cast<uint32_t>(numel);
-      // A thread serves one run of ILP_PER_THREAD elements, which is how much
-      // shorter than the operand the grid has to be.
-      const uint32_t total = static_cast<uint32_t>(
-          p10::metal::ceil_div<uint32_t>(elements, p10::metal::ILP_PER_THREAD));
-      [encoder setBytes:&elements length:sizeof(elements) atIndex:2];
+      [encoder setBytes:&span length:sizeof(span) atIndex:2];
       const uint32_t per_group =
           std::min(total,
-                   static_cast<uint32_t>([pso maxTotalThreadsPerThreadgroup]));
+                   static_cast<uint32_t>([active_pso maxTotalThreadsPerThreadgroup]));
       [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(per_group, 1, 1)];
     }
@@ -962,23 +1002,31 @@ std::optional<Tensor> clampShader(const Tensor& self,
   const float hi = max.has_value()
                        ? max->to<float>()
                        : std::numeric_limits<float>::infinity();
+  const uint32_t elements = static_cast<uint32_t>(numel);
+  MTLComputePipelineState_t vec_pso =
+      wholeFloatVectors(self.dtype(), elements,
+                        {self.data_ptr(), output.data_ptr()})
+          ? shaderPipelineNamed("clamp_elementwise_vec_float")
+          : nil;
+  MTLComputePipelineState_t active_pso = vec_pso ? vec_pso : pso;
+  // The vector form counts 16-byte vectors, the scalar form elements.
+  const uint32_t span = vec_pso ? elements / 4 : elements;
 
   MPSStream* stream = getCurrentMPSStream();
   dispatch_sync_with_rethrow(stream->queue(), ^() {
     @autoreleasepool {
       auto encoder = stream->commandEncoder();
-      [encoder setComputePipelineState:pso];
+      [encoder setComputePipelineState:active_pso];
       [encoder setBuffer:(__bridge id<MTLBuffer>)out_buf offset:0 atIndex:0];
       [encoder setBuffer:(__bridge id<MTLBuffer>)in_buf offset:0 atIndex:1];
-      const uint32_t elements = static_cast<uint32_t>(numel);
       const uint32_t total = static_cast<uint32_t>(
-          p10::metal::ceil_div<uint32_t>(elements, p10::metal::ILP_PER_THREAD));
-      [encoder setBytes:&elements length:sizeof(elements) atIndex:2];
+          p10::metal::ceil_div<uint32_t>(span, p10::metal::ILP_PER_THREAD));
+      [encoder setBytes:&span length:sizeof(span) atIndex:2];
       [encoder setBytes:&lo length:sizeof(lo) atIndex:3];
       [encoder setBytes:&hi length:sizeof(hi) atIndex:4];
       const uint32_t per_group =
           std::min(total,
-                   static_cast<uint32_t>([pso maxTotalThreadsPerThreadgroup]));
+                   static_cast<uint32_t>([active_pso maxTotalThreadsPerThreadgroup]));
       [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(per_group, 1, 1)];
     }

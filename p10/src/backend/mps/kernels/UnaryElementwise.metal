@@ -175,6 +175,54 @@ kernel void unary_elementwise(device T* out [[buffer(0)]],
       constant uint& numel [[buffer(2)]],         \
       uint tid [[thread_position_in_grid]]);
 
+// The same run over four-wide vectors. Without an alignment the compiler has
+// to assume the base pointer may be arbitrary, so the scalar form above costs
+// four separate 4-byte accesses each way even though a thread's run is
+// contiguous. Stating the vector type turns each run into one 16-byte load and
+// one 16-byte store while the bytes a thread keeps in flight stay the same.
+// The host only takes this path when both buffers are 16-byte aligned and the
+// operand holds whole vectors.
+template <typename Op>
+inline float4 apply_unary4(float4 v) {
+  return float4(Op::apply(v.x), Op::apply(v.y), Op::apply(v.z),
+                Op::apply(v.w));
+}
+
+template <typename Op>
+kernel void unary_elementwise_vec(device float4* out [[buffer(0)]],
+                                  constant float4* src [[buffer(1)]],
+                                  constant uint& nvec [[buffer(2)]],
+                                  uint tid [[thread_position_in_grid]]) {
+  const uint first = tid * ILP_PER_THREAD;
+  if (first + ILP_PER_THREAD <= nvec) {
+    array<float4, ILP_PER_THREAD> values;
+#pragma unroll
+    for (uint j = 0; j < ILP_PER_THREAD; ++j) {
+      values[j] = src[first + j];
+    }
+#pragma unroll
+    for (uint j = 0; j < ILP_PER_THREAD; ++j) {
+      values[j] = apply_unary4<Op>(values[j]);
+    }
+#pragma unroll
+    for (uint j = 0; j < ILP_PER_THREAD; ++j) {
+      out[first + j] = values[j];
+    }
+  } else {
+    for (uint i = first; i < nvec; ++i) {
+      out[i] = apply_unary4<Op>(src[i]);
+    }
+  }
+}
+
+#define REGISTER_UNARY_ELEMENTWISE_VEC(OP)           \
+  template [[host_name("unary_vec_" #OP "_float")]]  \
+  kernel void unary_elementwise_vec<OP##_op>(        \
+      device float4* out [[buffer(0)]],              \
+      constant float4* src [[buffer(1)]],            \
+      constant uint& nvec [[buffer(2)]],             \
+      uint tid [[thread_position_in_grid]]);
+
 // Clamps a contiguous operand into [lo, hi]. The lower comparison is applied
 // first and the upper one to its result, so a NaN operand stays a NaN and a
 // lower bound above the upper bound answers with the upper bound, which is what
@@ -216,6 +264,45 @@ kernel void clamp_elementwise<float>(device float* out [[buffer(0)]],
                                      constant float& hi [[buffer(4)]],
                                      uint tid [[thread_position_in_grid]]);
 
+// Four-wide clamp: the same lower-then-upper order on each component, with the
+// run of four moved by one 16-byte access each way.
+inline float4 clamp4(float4 v, float lo, float hi) {
+  const float x = v.x < lo ? lo : v.x;
+  const float y = v.y < lo ? lo : v.y;
+  const float z = v.z < lo ? lo : v.z;
+  const float w = v.w < lo ? lo : v.w;
+  return float4(x > hi ? hi : x, y > hi ? hi : y, z > hi ? hi : z,
+                w > hi ? hi : w);
+}
+
+kernel void clamp_elementwise_vec_float(device float4* out [[buffer(0)]],
+                                        constant float4* src [[buffer(1)]],
+                                        constant uint& nvec [[buffer(2)]],
+                                        constant float& lo [[buffer(3)]],
+                                        constant float& hi [[buffer(4)]],
+                                        uint tid [[thread_position_in_grid]]) {
+  const uint first = tid * ILP_PER_THREAD;
+  if (first + ILP_PER_THREAD <= nvec) {
+    array<float4, ILP_PER_THREAD> values;
+#pragma unroll
+    for (uint j = 0; j < ILP_PER_THREAD; ++j) {
+      values[j] = src[first + j];
+    }
+#pragma unroll
+    for (uint j = 0; j < ILP_PER_THREAD; ++j) {
+      values[j] = clamp4(values[j], lo, hi);
+    }
+#pragma unroll
+    for (uint j = 0; j < ILP_PER_THREAD; ++j) {
+      out[first + j] = values[j];
+    }
+  } else {
+    for (uint i = first; i < nvec; ++i) {
+      out[i] = clamp4(src[i], lo, hi);
+    }
+  }
+}
+
 // Half, bfloat16 and the integer storage types are absent: an operation with
 // one of them runs its math in a wider type, which the graph path builds as a
 // cast around the operation. A call with such a dtype stays with the graph,
@@ -237,3 +324,21 @@ REGISTER_UNARY_ELEMENTWISE(ceil, float)
 REGISTER_UNARY_ELEMENTWISE(round, float)
 REGISTER_UNARY_ELEMENTWISE(sign, float)
 REGISTER_UNARY_ELEMENTWISE(erf, float)
+
+REGISTER_UNARY_ELEMENTWISE_VEC(exp)
+REGISTER_UNARY_ELEMENTWISE_VEC(sqrt)
+REGISTER_UNARY_ELEMENTWISE_VEC(rsqrt)
+REGISTER_UNARY_ELEMENTWISE_VEC(abs)
+REGISTER_UNARY_ELEMENTWISE_VEC(relu)
+REGISTER_UNARY_ELEMENTWISE_VEC(neg)
+REGISTER_UNARY_ELEMENTWISE_VEC(square)
+REGISTER_UNARY_ELEMENTWISE_VEC(reciprocal)
+REGISTER_UNARY_ELEMENTWISE_VEC(log)
+REGISTER_UNARY_ELEMENTWISE_VEC(sin)
+REGISTER_UNARY_ELEMENTWISE_VEC(cos)
+REGISTER_UNARY_ELEMENTWISE_VEC(tanh)
+REGISTER_UNARY_ELEMENTWISE_VEC(floor)
+REGISTER_UNARY_ELEMENTWISE_VEC(ceil)
+REGISTER_UNARY_ELEMENTWISE_VEC(round)
+REGISTER_UNARY_ELEMENTWISE_VEC(sign)
+REGISTER_UNARY_ELEMENTWISE_VEC(erf)
