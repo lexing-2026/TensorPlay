@@ -53,10 +53,10 @@ void validate_elementwise_4d(const Tensor& t, const char* name) {
       std::string("Vulkan ") + name + " supports 1d to 4d tensors");
 }
 
-// A half payload is allowed here: the arithmetic is single precision inside
-// the shader and only the store narrows, so an exponent operand keeps the
-// element width of the base.
-void validate_power_operand_4d(const Tensor& t, const char* name) {
+// Both float widths are accepted here: the arithmetic is single precision
+// inside the shader and only the store narrows, so a half payload keeps the
+// element width of the base and needs no wider result type.
+void validate_float_or_half_1d_to_4d(const Tensor& t, const char* name) {
   TP_CHECK(
       t.dtype() == DType::Float32 || t.dtype() == DType::Float16,
       std::string("Vulkan ") + name +
@@ -64,6 +64,14 @@ void validate_power_operand_4d(const Tensor& t, const char* name) {
   TP_CHECK(
       t.dim() >= 1 && t.dim() <= 4,
       std::string("Vulkan ") + name + " supports 1d to 4d tensors");
+}
+
+// Refuses a payload that fell back to linear storage: the op samples every
+// operand as a texture, and a buffer has no texel to name.
+void require_texture_operand(const api::vTensor& v, const char* name) {
+  TP_CHECK(
+      v.storage_type() == api::StorageType::TEXTURE_3D,
+      std::string("Vulkan ") + name + " requires texture storage");
 }
 
 } // namespace
@@ -133,7 +141,7 @@ Tensor& addcmul__kernel(
 }
 
 Tensor pow_scalar_kernel(const Tensor& self, const Scalar& exponent) {
-  validate_power_operand_4d(self, "pow");
+  validate_float_or_half_1d_to_4d(self, "pow");
   // Delegates to the shared binary op path so buffer-stored payloads use
   // the linear scalar variant; the integer-exponent handling is part of the
   // shader operator.
@@ -143,8 +151,8 @@ Tensor pow_scalar_kernel(const Tensor& self, const Scalar& exponent) {
 }
 
 Tensor pow_tensor_kernel(const Tensor& self, const Tensor& exponent) {
-  validate_power_operand_4d(self, "pow");
-  validate_power_operand_4d(exponent, "pow");
+  validate_float_or_half_1d_to_4d(self, "pow");
+  validate_float_or_half_1d_to_4d(exponent, "pow");
   // Delegates to the shared binary op path: the tensor variant gets
   // broadcast handling and the linear buffer twin for buffer-stored
   // payloads.
@@ -153,7 +161,7 @@ Tensor pow_tensor_kernel(const Tensor& self, const Tensor& exponent) {
 }
 
 Tensor lerp_scalar_kernel(const Tensor& self, const Tensor& end, const Scalar& weight) {
-  validate_elementwise_4d(self, "lerp");
+  validate_float_or_half_1d_to_4d(self, "lerp");
   TP_CHECK(
       end.numel() == 1 || end.shape() == self.shape(),
       "Vulkan lerp expects a scalar or same-shape end tensor");
@@ -161,6 +169,8 @@ Tensor lerp_scalar_kernel(const Tensor& self, const Tensor& end, const Scalar& w
 
   api::vTensor v_self = convert(self);
   api::vTensor v_end = convert(end);
+  require_texture_operand(v_self, "lerp");
+  require_texture_operand(v_end, "lerp");
 
   api::vTensor v_output{context, v_self.sizes(), v_self.dtype()};
 
@@ -184,7 +194,7 @@ Tensor lerp_scalar_kernel(const Tensor& self, const Tensor& end, const Scalar& w
   api::PipelineBarrier pipeline_barrier{};
 
   context->submit_compute_job(
-      VK_KERNEL(lerp), pipeline_barrier, v_output.extents(),
+      kernel_for("lerp", self.dtype()), pipeline_barrier, v_output.extents(),
       adaptive_work_group_size(v_output.extents()), VK_NULL_HANDLE,
       v_output.image(
           pipeline_barrier,
@@ -201,7 +211,7 @@ Tensor lerp_tensor_kernel(
     const Tensor& self,
     const Tensor& end,
     const Tensor& weight) {
-  validate_elementwise_4d(self, "lerp");
+  validate_float_or_half_1d_to_4d(self, "lerp");
   TP_CHECK(
       (end.numel() == 1 || end.shape() == self.shape()) &&
           (weight.numel() == 1 || weight.shape() == self.shape()),
@@ -211,6 +221,9 @@ Tensor lerp_tensor_kernel(
   api::vTensor v_self = convert(self);
   api::vTensor v_end = convert(end);
   api::vTensor v_weight = convert(weight);
+  require_texture_operand(v_self, "lerp");
+  require_texture_operand(v_end, "lerp");
+  require_texture_operand(v_weight, "lerp");
 
   api::vTensor v_output{context, v_self.sizes(), v_self.dtype()};
 
@@ -234,7 +247,8 @@ Tensor lerp_tensor_kernel(
   api::PipelineBarrier pipeline_barrier{};
 
   context->submit_compute_job(
-      VK_KERNEL(lerp_tensor), pipeline_barrier, v_output.extents(),
+      kernel_for("lerp_tensor", self.dtype()), pipeline_barrier,
+      v_output.extents(),
       adaptive_work_group_size(v_output.extents()), VK_NULL_HANDLE,
       v_output.image(
           pipeline_barrier,
@@ -252,7 +266,7 @@ Tensor& lerp_scalar_inplace_kernel(
     Tensor& self,
     const Tensor& end,
     const Scalar& weight) {
-  validate_elementwise_4d(self, "lerp");
+  validate_float_or_half_1d_to_4d(self, "lerp");
   TP_CHECK(
       end.numel() == 1 || end.shape() == self.shape(),
       "Vulkan lerp expects a scalar or same-shape end tensor");
@@ -260,6 +274,8 @@ Tensor& lerp_scalar_inplace_kernel(
 
   api::vTensor v_self = convert(self);
   api::vTensor v_end = convert(end);
+  require_texture_operand(v_self, "lerp");
+  require_texture_operand(v_end, "lerp");
 
   const struct LerpBlock final {
     ivec4 extents;
@@ -281,7 +297,8 @@ Tensor& lerp_scalar_inplace_kernel(
   api::PipelineBarrier pipeline_barrier{};
 
   context->submit_compute_job(
-      VK_KERNEL(lerpinplace), pipeline_barrier, v_self.extents(),
+      kernel_for("lerpinplace", self.dtype()), pipeline_barrier,
+      v_self.extents(),
       adaptive_work_group_size(v_self.extents()), VK_NULL_HANDLE,
       v_self.image(
           pipeline_barrier,
@@ -297,7 +314,7 @@ Tensor& lerp_tensor_inplace_kernel(
     Tensor& self,
     const Tensor& end,
     const Tensor& weight) {
-  validate_elementwise_4d(self, "lerp");
+  validate_float_or_half_1d_to_4d(self, "lerp");
   TP_CHECK(
       (end.numel() == 1 || end.shape() == self.shape()) &&
           (weight.numel() == 1 || weight.shape() == self.shape()),
@@ -307,6 +324,9 @@ Tensor& lerp_tensor_inplace_kernel(
   api::vTensor v_self = convert(self);
   api::vTensor v_end = convert(end);
   api::vTensor v_weight = convert(weight);
+  require_texture_operand(v_self, "lerp");
+  require_texture_operand(v_end, "lerp");
+  require_texture_operand(v_weight, "lerp");
 
   const struct LerpBlock final {
     ivec4 extents;
@@ -328,7 +348,8 @@ Tensor& lerp_tensor_inplace_kernel(
   api::PipelineBarrier pipeline_barrier{};
 
   context->submit_compute_job(
-      VK_KERNEL(lerp_tensorinplace), pipeline_barrier, v_self.extents(),
+      kernel_for("lerp_tensorinplace", self.dtype()), pipeline_barrier,
+      v_self.extents(),
       adaptive_work_group_size(v_self.extents()), VK_NULL_HANDLE,
       v_self.image(
           pipeline_barrier,
@@ -355,7 +376,7 @@ std::vector<int64_t> shape_vector(const Tensor& t) {
 } // namespace
 
 Tensor flip_kernel(const Tensor& self, const std::vector<int64_t>& dims) {
-  validate_elementwise_4d(self, "flip");
+  validate_float_or_half_1d_to_4d(self, "flip");
 
   const int64_t ndim = self.dim();
   std::set<int64_t> unique;
@@ -373,12 +394,20 @@ Tensor flip_kernel(const Tensor& self, const std::vector<int64_t>& dims) {
   api::Context* const context = api::context();
 
   api::vTensor v_input = convert(self);
-  api::vTensor v_output{context, v_input.sizes(), v_input.dtype()};
 
   // Linear payloads (shapes beyond the 3-D image axis limit) reverse through
   // a buffer-to-buffer variant: each output coordinate maps back through the
   // flagged axes over the dense row-major layout.
   if (v_input.storage_type() == api::StorageType::BUFFER) {
+    // A buffer-stored input needs a buffer-stored output: the default
+    // allocation is a texture, and a texture image has no linear payload for
+    // the variant to write into.
+    api::vTensor v_output{
+        context,
+        v_input.sizes(),
+        v_input.dtype(),
+        api::StorageType::BUFFER,
+        api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
     const auto prepad = [](const std::vector<int64_t>& v) {
       std::vector<int64_t> out(4, 1);
       const int64_t offset_slots = 4 - static_cast<int64_t>(v.size());
@@ -409,15 +438,26 @@ Tensor flip_kernel(const Tensor& self, const std::vector<int64_t>& dims) {
     };
     api::UniformParamsBuffer params(context, block);
     api::PipelineBarrier pipeline_barrier{};
-    const api::utils::uvec3 grid{
-        static_cast<uint32_t>(in_pre[3]),
-        static_cast<uint32_t>(in_pre[2]),
-        static_cast<uint32_t>(in_pre[0]) *
-            static_cast<uint32_t>(out_c_depth),
-    };
+    // A half payload packs two lanes per 32-bit word, and adjacent words mix
+    // lanes owned by different channel groups, so the linear half variant runs
+    // over destination words instead: one invocation reverses the two lanes it
+    // stores.
+    const bool is_half = self.dtype() == DType::Float16;
+    const api::utils::uvec3 grid = is_half
+        ? api::utils::uvec3{
+              static_cast<uint32_t>((self.numel() + 1) / 2), 1u, 1u}
+        : api::utils::uvec3{
+              static_cast<uint32_t>(in_pre[3]),
+              static_cast<uint32_t>(in_pre[2]),
+              static_cast<uint32_t>(in_pre[0]) *
+                  static_cast<uint32_t>(out_c_depth)};
     context->submit_compute_job(
-        VK_KERNEL_FROM_STR("flip_buffer"), pipeline_barrier, grid,
-        adaptive_work_group_size(grid), VK_NULL_HANDLE,
+        is_half ? VK_KERNEL_FROM_STR("flip_buffer_half")
+                : VK_KERNEL(flip_buffer),
+        pipeline_barrier, grid,
+        is_half ? api::utils::uvec3{256u, 1u, 1u}
+                : adaptive_work_group_size(grid),
+        VK_NULL_HANDLE,
         v_output.buffer(
             pipeline_barrier,
             api::PipelineStage::COMPUTE,
@@ -429,6 +469,8 @@ Tensor flip_kernel(const Tensor& self, const std::vector<int64_t>& dims) {
         params.buffer());
     return convert(v_output);
   }
+
+  api::vTensor v_output{context, v_input.sizes(), v_input.dtype()};
 
   const struct FlipBlock final {
     ivec4 in_sizes;
@@ -446,7 +488,7 @@ Tensor flip_kernel(const Tensor& self, const std::vector<int64_t>& dims) {
   api::PipelineBarrier pipeline_barrier{};
 
   context->submit_compute_job(
-      VK_KERNEL(flip), pipeline_barrier, v_output.extents(),
+      kernel_for("flip", self.dtype()), pipeline_barrier, v_output.extents(),
       adaptive_work_group_size(v_output.extents()), VK_NULL_HANDLE,
       v_output.image(
           pipeline_barrier,

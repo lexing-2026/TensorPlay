@@ -921,12 +921,22 @@ upsample_bilinear2d:
     ALIGN_CORNERS: false
 cumsum:
   parameter_names_with_default_values: {}
+  generate_variant_forall:
+    FORMAT:
+    - VALUE: rgba32f
+      SUFFIX: ''
+    - VALUE: rgba16f
+      SUFFIX: _f16
   shader_variants:
   - NAME: cumsum
 cumsum_buffer:
   parameter_names_with_default_values: {}
   shader_variants:
   - NAME: cumsum_buffer
+cumsum_buffer_half:
+  parameter_names_with_default_values: {}
+  shader_variants:
+  - NAME: cumsum_buffer_half
 masked_fill:
   parameter_names_with_default_values:
     VALUE_FROM_TENSOR: false
@@ -1250,12 +1260,22 @@ pack_weight_transpose2d:
   - NAME: pack_weight_transpose2d
 flip:
   parameter_names_with_default_values: {}
+  generate_variant_forall:
+    FORMAT:
+    - VALUE: rgba32f
+      SUFFIX: ''
+    - VALUE: rgba16f
+      SUFFIX: _f16
   shader_variants:
   - NAME: flip
 flip_buffer:
   parameter_names_with_default_values: {}
   shader_variants:
   - NAME: flip_buffer
+flip_buffer_half:
+  parameter_names_with_default_values: {}
+  shader_variants:
+  - NAME: flip_buffer_half
 cat_channel:
   parameter_names_with_default_values: {}
   shader_variants:
@@ -1336,6 +1356,12 @@ lerp:
     TENSOR_WEIGHT: false
     INPLACE: false
     BLOCK_BINDING: 5
+  generate_variant_forall:
+    FORMAT:
+    - VALUE: rgba32f
+      SUFFIX: ''
+    - VALUE: rgba16f
+      SUFFIX: _f16
   shader_variants:
   - NAME: lerp
     TENSOR_WEIGHT: false

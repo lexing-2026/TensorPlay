@@ -10,12 +10,21 @@ namespace tensorplay {
 namespace vulkan {
 namespace ops {
 
+// Forward declaration of the element type conversion entry point.
+Tensor to_dtype_kernel(
+    const Tensor& self,
+    DType dtype,
+    bool non_blocking,
+    bool copy,
+    std::optional<int64_t> memory_format);
+
 namespace {
 
 void validate_float_1d_to_4d(const Tensor& t, const char* name) {
   TP_CHECK(
-      t.dtype() == DType::Float32,
-      std::string("Vulkan ") + name + " supports Float32 tensors only");
+      t.dtype() == DType::Float32 || t.dtype() == DType::Float16,
+      std::string("Vulkan ") + name +
+          " supports Float32 and Float16 tensors only");
   TP_CHECK(
       t.dim() >= 1 && t.dim() <= 4,
       std::string("Vulkan ") + name + " supports 1d to 4d tensors");
@@ -43,9 +52,21 @@ struct ScanBlock final {
 Tensor cumsum_kernel(
     const Tensor& self, int64_t dim, std::optional<DType> dtype) {
   validate_float_1d_to_4d(self, "cumsum");
+  const DType out_dtype = dtype.value_or(self.dtype());
   TP_CHECK(
-      !dtype.has_value() || dtype.value() == DType::Float32,
-      "Vulkan cumsum supports Float32 output only");
+      out_dtype == DType::Float32 || out_dtype == DType::Float16,
+      "Vulkan cumsum supports Float32 and Float16 outputs only");
+  if (out_dtype != self.dtype()) {
+    // A requested result width scans in the payload's own type first: the
+    // conversion path owns both directions over each storage, so the scan
+    // kernels keep one element type end to end.
+    return to_dtype_kernel(
+        cumsum_kernel(self, dim, std::nullopt),
+        out_dtype,
+        /*non_blocking=*/false,
+        /*copy=*/true,
+        std::nullopt);
+  }
 
   api::Context* const context = api::context();
 
@@ -63,31 +84,49 @@ Tensor cumsum_kernel(
     }
     const int64_t rows = self.numel() / axis_size;
     api::vTensor v_output{
-        context, v_input.sizes(), DType::Float32,
-        api::StorageType::BUFFER, api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
-    const struct CumsumBufferBlock final {
-      int32_t axis_size;
-      int32_t inner;
-      int32_t rows;
-    } block{
-        static_cast<int32_t>(axis_size), static_cast<int32_t>(inner),
-        static_cast<int32_t>(rows),
-    };
-    api::UniformParamsBuffer params(context, block);
+        context,
+        v_input.sizes(),
+        out_dtype,
+        api::StorageType::BUFFER,
+        api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+    // A half payload shares one 32-bit word between two neighbouring inner
+    // positions, which belong to different rows, so the scan runs twice and
+    // each pass stores only the flat positions of one word lane.
+    const bool is_half = out_dtype == DType::Float16;
+    const int32_t passes = is_half ? 2 : 1;
     api::PipelineBarrier pipeline_barrier{};
-    context->submit_compute_job(
-        VK_KERNEL(cumsum_buffer), pipeline_barrier,
-        {static_cast<uint32_t>(rows), 1u, 1u}, {256u, 1u, 1u},
-        VK_NULL_HANDLE,
-        v_output.buffer(
-            pipeline_barrier,
-            api::PipelineStage::COMPUTE,
-            api::MemoryAccessType::WRITE),
-        v_input.buffer(
-            pipeline_barrier,
-            api::PipelineStage::COMPUTE,
-            api::MemoryAccessType::READ),
-        params.buffer());
+    for (int32_t pass = 0; pass < passes; ++pass) {
+      const struct CumsumBufferBlock final {
+        int32_t axis_size;
+        int32_t inner;
+        int32_t rows;
+        int32_t word_lane;
+      } block{
+          static_cast<int32_t>(axis_size),
+          static_cast<int32_t>(inner),
+          static_cast<int32_t>(rows),
+          is_half ? pass : 0,
+      };
+      api::UniformParamsBuffer params(context, block);
+      context->submit_compute_job(
+          is_half ? VK_KERNEL_FROM_STR("cumsum_buffer_half")
+                  : VK_KERNEL(cumsum_buffer),
+          pipeline_barrier,
+          {static_cast<uint32_t>(rows), 1u, 1u},
+          {256u, 1u, 1u},
+          VK_NULL_HANDLE,
+          v_output.buffer(
+              pipeline_barrier,
+              api::PipelineStage::COMPUTE,
+              is_half ? (api::MemoryAccessType::READ |
+                         api::MemoryAccessType::WRITE)
+                      : api::MemoryAccessType::WRITE),
+          v_input.buffer(
+              pipeline_barrier,
+              api::PipelineStage::COMPUTE,
+              api::MemoryAccessType::READ),
+          params.buffer());
+    }
     return convert(v_output);
   }
 
@@ -95,7 +134,7 @@ Tensor cumsum_kernel(
     TP_THROW(NotImplementedError, "Vulkan cumsum requires texture storage");
   }
 
-  api::vTensor v_output{context, v_input.sizes(), DType::Float32};
+  api::vTensor v_output{context, v_input.sizes(), out_dtype};
 
   const struct ScanBlock block{
       make_whcn_ivec4(v_input.sizes()),
@@ -107,8 +146,10 @@ Tensor cumsum_kernel(
   api::UniformParamsBuffer params(context, block);
   api::PipelineBarrier pipeline_barrier{};
 
+  // The running total is kept in single precision inside the shader, so a
+  // half result only needs the store to name the narrower format.
   context->submit_compute_job(
-      VK_KERNEL(cumsum), pipeline_barrier, v_output.extents(),
+      kernel_for("cumsum", out_dtype), pipeline_barrier, v_output.extents(),
       adaptive_work_group_size(v_output.extents()), VK_NULL_HANDLE,
       v_output.image(
           pipeline_barrier,
