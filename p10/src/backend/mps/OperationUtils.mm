@@ -447,7 +447,7 @@ MTLComputePipelineState_t compareShaderPipeline(const std::string& op,
 // everything the chain has encoded so far.
 std::optional<Tensor> broadcastBinaryShader(
     const std::string& op, const Tensor& self, const Tensor& other,
-    const std::optional<Scalar>& alpha) {
+    const std::optional<Scalar>& alpha, bool allow_unexpanded) {
   if (!self.device().is_mps() || !other.device().is_mps()) {
     return std::nullopt;
   }
@@ -468,8 +468,10 @@ std::optional<Tensor> broadcastBinaryShader(
   const std::vector<int64_t> out_shape =
       broadcast_shapes(self_shape, other_shape);
   // Where nothing expands, both paths are a single dispatch over the same
-  // buffers, so there is nothing for the shader to save.
-  if (self_shape == out_shape && other_shape == out_shape) {
+  // buffers; callers that measure the graph as the cheaper of the two keep
+  // that choice by leaving `allow_unexpanded` clear.
+  if (!allow_unexpanded && self_shape == out_shape &&
+      other_shape == out_shape) {
     return std::nullopt;
   }
   if (out_shape.empty() || out_shape.size() > kShaderMaxNdims) {

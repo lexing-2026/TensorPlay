@@ -196,6 +196,15 @@ Tensor div_kernel(const Tensor& self, const Tensor& other) {
       isIntegralType(other.dtype(), true)) {
     common = DType::Float32;
   }
+  // A float division is one elementwise pass in the shader even when no
+  // operand expands; the graph's division is the slower of the two there.
+  if (!common.has_value() && self.dtype() == DType::Float32 &&
+      other.dtype() == DType::Float32) {
+    if (auto result = broadcastBinaryShader("div", self, other, std::nullopt,
+                                            /*allow_unexpanded=*/true)) {
+      return *result;
+    }
+  }
   return binaryOp("div", self, other, divBlock, std::nullopt, common);
 }
 

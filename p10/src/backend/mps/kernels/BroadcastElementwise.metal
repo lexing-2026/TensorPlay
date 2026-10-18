@@ -42,6 +42,11 @@ struct mul_op {
   static inline T apply(T lhs, T rhs) { return lhs * rhs; }
 };
 
+struct div_op {
+  template <typename T>
+  static inline T apply(T lhs, T rhs) { return lhs / rhs; }
+};
+
 template <typename T, typename Op>
 kernel void broadcast_binary(device T* out [[buffer(0)]],
                              device const T* lhs [[buffer(1)]],
@@ -79,6 +84,9 @@ kernel void broadcast_binary(device T* out [[buffer(0)]],
 REGISTER_BROADCAST_DTYPES(add)
 REGISTER_BROADCAST_DTYPES(sub)
 REGISTER_BROADCAST_DTYPES(mul)
+// Division reads integral operands as the float type they promote to before
+// this kernel would see them, so only the float form is instantiated.
+REGISTER_BROADCAST_BINARY(div, float)
 
 // Ternary forms: out = self + value * lhs * rhs (addcmul) or
 // self + value * lhs / rhs (addcdiv). All three operands broadcast

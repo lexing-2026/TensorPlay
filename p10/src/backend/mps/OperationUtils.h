@@ -105,17 +105,18 @@ Tensor unaryOp(const std::string& op, const Tensor& self,
 Tensor whereOp(const Tensor& condition, const Tensor& self,
                const Tensor& other);
 
-// Runs `op` -- "add", "sub" or "mul" -- over broadcast operands with the
-// stride-addressed shader, which reads each operand out of the storage it
+// Runs `op` -- "add", "sub", "mul" or "div" -- over broadcast operands with
+// the stride-addressed shader, which reads each operand out of the storage it
 // already has instead of materializing an expanded copy. Returns std::nullopt
-// when a call cannot be expressed that way: operands that need no expansion (a
-// graph is then one dispatch either way), a dtype or an alpha the shader is not
-// instantiated for, a non-zero storage offset, a negative stride, a rank or an
-// element index beyond the 32-bit addressing the shader uses. The caller builds
-// a graph in that case.
+// when a call cannot be expressed that way: operands that need no expansion
+// unless `allow_unexpanded` is set (a graph is then one dispatch either way), a
+// dtype or an alpha the shader is not instantiated for, a non-zero storage
+// offset, a negative stride, a rank or an element index beyond the 32-bit
+// addressing the shader uses. The caller builds a graph in that case.
 std::optional<Tensor> broadcastBinaryShader(
     const std::string& op, const Tensor& self, const Tensor& other,
-    const std::optional<Scalar>& alpha = std::nullopt);
+    const std::optional<Scalar>& alpha = std::nullopt,
+    bool allow_unexpanded = false);
 
 // Runs `op` -- "addcmul" or "addcdiv" -- as `self + value * lhs * rhs` or
 // `self + value * lhs / rhs` over three independently broadcast operands, in
