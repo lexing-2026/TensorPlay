@@ -71,14 +71,20 @@ Tensor where_kernel(
   // rides a packed-word buffer, the operands are plain row-major memory.
   if (v_input.storage_type() == api::StorageType::BUFFER) {
     const char* buffer_shader = nullptr;
+    uint32_t lanes_per_word = 4u;
     if (self.dtype() == DType::Int32) {
       buffer_shader = "where_i32_buffer";
     } else if (self.dtype() == DType::Float32) {
       buffer_shader = "where_buffer";
+    } else if (self.dtype() == DType::Float16) {
+      // Half lanes pack two to a word, so a dispatch covers half as many
+      // words as the four-lane vocabularies do.
+      buffer_shader = "where_half_buffer";
+      lanes_per_word = 2u;
     } else {
       TP_THROW(
           NotImplementedError,
-          "Vulkan where over buffer supports Float32 and Int32 only");
+          "Vulkan where over buffer supports Float32, Float16 and Int32 only");
     }
     const uint32_t n = static_cast<uint32_t>(v_input.numel());
     const struct WhereBufferBlock {
@@ -90,7 +96,8 @@ Tensor where_kernel(
     api::PipelineBarrier pipeline_barrier{};
     context->submit_compute_job(
         VK_KERNEL_FROM_STR(buffer_shader), pipeline_barrier,
-        {(n + 3u) / 4u, 1u, 1u}, {256u, 1u, 1u}, VK_NULL_HANDLE,
+        {(n + lanes_per_word - 1u) / lanes_per_word, 1u, 1u}, {256u, 1u, 1u},
+        VK_NULL_HANDLE,
         v_output.buffer(
             pipeline_barrier,
             api::PipelineStage::COMPUTE,

@@ -1113,6 +1113,10 @@ where_i32_buffer:
   parameter_names_with_default_values: {}
   shader_variants:
   - NAME: where_i32_buffer
+where_half_buffer:
+  parameter_names_with_default_values: {}
+  shader_variants:
+  - NAME: where_half_buffer
 embedding:
   parameter_names_with_default_values: {}
   shader_variants:
