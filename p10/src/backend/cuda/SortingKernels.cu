@@ -18,6 +18,7 @@
 #include <limits>
 #include <string>
 #include <tuple>
+#include <type_traits>
 #include <vector>
 
 namespace tensorplay {
@@ -532,13 +533,37 @@ void sort_radix_impl_large(const Tensor& self_c, Tensor& values, Tensor& indices
 template <typename T>
 void sort_keys_radix_impl(const Tensor& self_c, Tensor& values,
                           int64_t d_size, int64_t inner, int64_t slices) {
-    using Key = typename SortRadixTraits<T>::key_type;
     const int64_t n = self_c.numel();
     const auto device = self_c.device();
+    auto stream = getCurrentCUDAStream().stream();
+    // Integer keys need no conversion when the whole array is one contiguous
+    // run: the flip the key encoding applies to signed values is exactly what
+    // the device radix sort applies to signed keys itself, so the sort reads
+    // the input and writes the sorted output directly.
+    if constexpr (std::is_integral_v<T> && !std::is_same_v<T, bool>) {
+        if (d_size == n && inner == 1) {
+            const int n_items = static_cast<int>(n);
+            size_t direct_bytes = 0;
+            CUDA_CHECK(cub::DeviceRadixSort::SortKeys(
+                nullptr, direct_bytes, static_cast<const T*>(self_c.data_ptr()),
+                static_cast<T*>(values.data_ptr()), n_items, 0,
+                static_cast<int>(sizeof(T) * 8), stream));
+            Tensor direct_tmp = Tensor::empty(
+                {static_cast<int64_t>(std::max<size_t>(direct_bytes, 1))},
+                DType::UInt8, device);
+            CUDA_CHECK(cub::DeviceRadixSort::SortKeys(
+                direct_tmp.data_ptr(), direct_bytes,
+                static_cast<const T*>(self_c.data_ptr()),
+                static_cast<T*>(values.data_ptr()), n_items, 0,
+                static_cast<int>(sizeof(T) * 8), stream));
+            (void)slices;
+            return;
+        }
+    }
+    using Key = typename SortRadixTraits<T>::key_type;
     const DType key_dtype = sizeof(Key) == 8 ? DType::UInt64 : DType::UInt32;
     Tensor keys_a = Tensor::empty({n}, key_dtype, device);
     Tensor keys_b = Tensor::empty({n}, key_dtype, device);
-    auto stream = getCurrentCUDAStream().stream();
     const int blocks = static_cast<int>((n + kThreads - 1) / kThreads);
     sort_radix_pack_kernel<T><<<blocks, kThreads, 0, stream>>>(
         n, d_size, inner, static_cast<const T*>(self_c.data_ptr()),
