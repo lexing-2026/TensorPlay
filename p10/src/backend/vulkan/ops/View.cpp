@@ -59,6 +59,7 @@ Tensor gather_view(
       "Vulkan view materialization supports Float32, Float16, Int8, Int32 and Bool tensors only");
   const bool is_int8 = input.dtype() == DType::Int8 || input.dtype() == DType::Bool;
   const bool is_int32 = input.dtype() == DType::Int32;
+  const bool is_half = input.dtype() == DType::Float16;
 
   api::Context* const context = api::context();
   api::vTensor v_input = convert(input);
@@ -113,13 +114,16 @@ Tensor gather_view(
   // buffer storage; the gather then writes plain row-major elements through
   // a buffer-binding variant instead of an image store.
   if (v_output.storage_type() == api::StorageType::BUFFER) {
-    // Float16, Int8 and Bool buffer payloads are byte-packed with no
-    // buffer-writing shader yet; reject loudly instead of corrupting them.
+    // Byte-packed payloads have no buffer-writing shader yet; reject loudly
+    // instead of corrupting them.
     TP_CHECK(
-        input.dtype() != DType::Float16 && input.dtype() != DType::Int8 &&
-            input.dtype() != DType::Bool,
+        input.dtype() != DType::Int8 && input.dtype() != DType::Bool,
         "Vulkan view materialization of this dtype into buffer storage is "
         "not supported yet");
+    // A half destination shares one 32-bit word between two elements, so its
+    // grid runs over words and each invocation writes both lanes it covers.
+    const api::utils::uvec3 word_grid{
+        static_cast<uint32_t>((multiply_integers(out_sizes) + 1) / 2), 1u, 1u};
     const api::utils::uvec3 grid{
         static_cast<uint32_t>(out_padded[3]),
         static_cast<uint32_t>(out_padded[2]),
@@ -132,10 +136,15 @@ Tensor gather_view(
     if (v_input.storage_type() == api::StorageType::BUFFER) {
       const api::ShaderInfo shader = is_int32
           ? VK_KERNEL(view_gather_int32_buffer_to_buffer)
+          : is_half
+          ? VK_KERNEL_FROM_STR("view_gather_buffer_to_buffer_half")
           : kernel_for("view_gather_buffer_to_buffer", input.dtype());
+      const api::utils::uvec3 launch = is_half ? word_grid : grid;
       context->submit_compute_job(
-          shader, pipeline_barrier, grid,
-          adaptive_work_group_size(grid), VK_NULL_HANDLE,
+          shader, pipeline_barrier, launch,
+          is_half ? api::utils::uvec3{256u, 1u, 1u}
+                  : adaptive_work_group_size(launch),
+          VK_NULL_HANDLE,
           v_output.buffer(
               pipeline_barrier,
               api::PipelineStage::COMPUTE,
@@ -148,10 +157,15 @@ Tensor gather_view(
     }
     const api::ShaderInfo shader = is_int32
         ? VK_KERNEL(view_gather_int32_buffer)
+        : is_half
+        ? VK_KERNEL_FROM_STR("view_gather_buffer_half")
         : kernel_for("view_gather_buffer", input.dtype());
+    const api::utils::uvec3 launch = is_half ? word_grid : grid;
     context->submit_compute_job(
-        shader, pipeline_barrier, grid,
-        adaptive_work_group_size(grid), VK_NULL_HANDLE,
+        shader, pipeline_barrier, launch,
+        is_half ? api::utils::uvec3{256u, 1u, 1u}
+                : adaptive_work_group_size(launch),
+        VK_NULL_HANDLE,
         v_output.buffer(
             pipeline_barrier,
             api::PipelineStage::COMPUTE,
@@ -165,14 +179,17 @@ Tensor gather_view(
   // reads through the linear binding and writes the dense output in one
   // pass, for both buffer and image destinations.
   if (v_input.storage_type() == api::StorageType::BUFFER) {
-    // Float16, Int8 and Bool buffer payloads are byte-packed with no
-    // buffer-reading shader yet; reject loudly instead of misreading them.
+    // Byte-packed payloads have no buffer-reading shader yet; reject loudly
+    // instead of misreading them.
     TP_CHECK(
-        input.dtype() == DType::Float32 || input.dtype() == DType::Int32,
+        input.dtype() == DType::Float32 || input.dtype() == DType::Int32 ||
+            input.dtype() == DType::Float16,
         "Vulkan view materialization from buffer storage supports "
-        "Float32 and Int32 inputs only");
+        "Float32, Int32 and Float16 inputs only");
     const api::ShaderInfo shader = is_int32
         ? VK_KERNEL(view_gather_int32_buffer_to_texture)
+        : is_half
+        ? VK_KERNEL_FROM_STR("view_gather_buffer_to_texture_half")
         : kernel_for("view_gather_buffer_to_texture", input.dtype());
     context->submit_compute_job(
         shader, pipeline_barrier, v_output.extents(),

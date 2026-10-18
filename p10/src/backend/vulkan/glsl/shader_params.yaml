@@ -1266,6 +1266,10 @@ cat:
   - NAME: cat
   - NAME: cat_buffer_to_buffer
   - NAME: cat_int32_buffer_to_buffer
+cat_buffer_to_buffer_half:
+  parameter_names_with_default_values: {}
+  shader_variants:
+  - NAME: cat_buffer_to_buffer_half
 pad2d:
   parameter_names_with_default_values:
     REPLICATE: false
@@ -1314,6 +1318,19 @@ view_gather_int32_buffer:
   - NAME: view_gather_int32_buffer
   - NAME: view_gather_int32_buffer_to_buffer
   - NAME: view_gather_int32_buffer_to_texture
+view_gather_buffer_half:
+  parameter_names_with_default_values: {}
+  shader_variants:
+  - NAME: view_gather_buffer_half
+view_gather_buffer_to_buffer_half:
+  parameter_names_with_default_values: {}
+  shader_variants:
+  - NAME: view_gather_buffer_to_buffer_half
+view_gather_buffer_to_texture_half:
+  parameter_names_with_default_values: {}
+  shader_variants:
+  - NAME: view_gather_buffer_to_texture_half
+    FORMAT: rgba16f
 lerp:
   parameter_names_with_default_values:
     TENSOR_WEIGHT: false

@@ -507,14 +507,19 @@ Tensor cat_kernel(const std::vector<Tensor>& tensors, int64_t dim) {
   if (v_output.storage_type() == api::StorageType::BUFFER) {
     TP_CHECK(
         tensors[0].dtype() == DType::Float32 ||
-            tensors[0].dtype() == DType::Int32,
-        "Vulkan cat over buffer storage supports Float32 and Int32 only");
+            tensors[0].dtype() == DType::Int32 ||
+            tensors[0].dtype() == DType::Float16,
+        "Vulkan cat over buffer storage supports Float32, Int32 and Float16 "
+        "only");
     TP_CHECK(
         ndim >= 1 && ndim <= 4,
         "Vulkan cat supports 1d to 4d tensors");
     const bool is_int32 = tensors[0].dtype() == DType::Int32;
+    const bool is_half = tensors[0].dtype() == DType::Float16;
     const api::ShaderInfo shader = is_int32
         ? VK_KERNEL(cat_int32_buffer_to_buffer)
+        : is_half
+        ? VK_KERNEL_FROM_STR("cat_buffer_to_buffer_half")
         : kernel_for("cat_buffer_to_buffer", tensors[0].dtype());
 
     const auto prepad = [](const std::vector<int64_t>& v) {
@@ -532,12 +537,13 @@ Tensor cat_kernel(const std::vector<Tensor>& tensors, int64_t dim) {
     const int32_t axis = static_cast<int32_t>(ndim - 1 - dim);
     const int32_t out_c_depth =
         static_cast<int32_t>((out_pre[1] + 3) / 4);
+    const int64_t new_numel = multiply_integers(new_sizes);
 
     // One linear dispatch per input: the shader scatters each input's
     // elements into the row-major output buffer, shifting only the
     // concatenated axis by the running offset.  Passes reuse the barrier
     // object and declare read/write on the output to serialize through the
-    // barrier system, mirroring the image path.
+    // barrier system, the same way the image path does.
     api::PipelineBarrier pipeline_barrier{};
     int64_t offset = 0;
     for (const Tensor& t : tensors) {
@@ -572,16 +578,23 @@ Tensor cat_kernel(const std::vector<Tensor>& tensors, int64_t dim) {
 
       api::UniformParamsBuffer params(context, block);
 
-      const api::utils::uvec3 grid{
-          static_cast<uint32_t>(out_pre[3]),
-          static_cast<uint32_t>(out_pre[2]),
-          static_cast<uint32_t>(out_pre[0]) *
-              static_cast<uint32_t>(out_c_depth),
-      };
+      const api::utils::uvec3 grid = is_half
+          // A half payload packs two lanes per word, so its passes run over
+          // destination words in row-major order rather than over output
+          // coordinates; each invocation then owns every lane of its word.
+          ? api::utils::uvec3{
+                static_cast<uint32_t>((new_numel + 1) / 2), 1u, 1u}
+          : api::utils::uvec3{
+                static_cast<uint32_t>(out_pre[3]),
+                static_cast<uint32_t>(out_pre[2]),
+                static_cast<uint32_t>(out_pre[0]) *
+                    static_cast<uint32_t>(out_c_depth)};
 
       context->submit_compute_job(
           shader, pipeline_barrier, grid,
-          adaptive_work_group_size(grid), VK_NULL_HANDLE,
+          is_half ? api::utils::uvec3{256u, 1u, 1u}
+                  : adaptive_work_group_size(grid),
+          VK_NULL_HANDLE,
           v_output.buffer(
               pipeline_barrier,
               api::PipelineStage::COMPUTE,
