@@ -52,6 +52,38 @@ Tensor masked_fill_impl(
 
   api::vTensor v_output{context, v_input.sizes(), DType::Float32};
 
+  // Linear payloads (shapes beyond the 3-D image axis limit) fill through a
+  // buffer-to-buffer variant: the Bool mask is one byte per element and rides
+  // a packed-word buffer, the input is plain row-major memory.
+  if (v_input.storage_type() == api::StorageType::BUFFER) {
+    const uint32_t n = static_cast<uint32_t>(v_input.numel());
+    const struct MaskedFillBufferBlock {
+      uint32_t buf_length;
+      uint32_t fill0;
+      float value;
+      int32_t fill;
+    } block{n, 0u, static_cast<float>(value.toDouble()), 0};
+    api::UniformParamsBuffer params(context, block);
+    api::PipelineBarrier pipeline_barrier{};
+    context->submit_compute_job(
+        VK_KERNEL_FROM_STR("masked_fill_buffer"), pipeline_barrier,
+        {(n + 3u) / 4u, 1u, 1u}, {256u, 1u, 1u}, VK_NULL_HANDLE,
+        v_output.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::WRITE),
+        v_input.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::READ),
+        v_mask.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::READ),
+        params.buffer());
+    return convert(v_output);
+  }
+
   const struct MaskedFillBlock block{
       make_whcn_ivec4(v_output.sizes()),
       c_depth_of(v_output.sizes()),

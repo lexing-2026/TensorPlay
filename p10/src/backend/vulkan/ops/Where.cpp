@@ -66,6 +66,51 @@ Tensor where_kernel(
   api::vTensor v_other = convert(other);
   api::vTensor v_output{context, v_input.sizes(), self.dtype()};
 
+  // Linear payloads (shapes beyond the 3-D image axis limit) select through
+  // buffer-to-buffer variants: the Bool condition is one byte per element and
+  // rides a packed-word buffer, the operands are plain row-major memory.
+  if (v_input.storage_type() == api::StorageType::BUFFER) {
+    const char* buffer_shader = nullptr;
+    if (self.dtype() == DType::Int32) {
+      buffer_shader = "where_i32_buffer";
+    } else if (self.dtype() == DType::Float32) {
+      buffer_shader = "where_buffer";
+    } else {
+      TP_THROW(
+          NotImplementedError,
+          "Vulkan where over buffer supports Float32 and Int32 only");
+    }
+    const uint32_t n = static_cast<uint32_t>(v_input.numel());
+    const struct WhereBufferBlock {
+      uint32_t buf_length;
+      uint32_t fill0;
+      int32_t fill;
+    } block{n, 0u, 0};
+    api::UniformParamsBuffer params(context, block);
+    api::PipelineBarrier pipeline_barrier{};
+    context->submit_compute_job(
+        VK_KERNEL_FROM_STR(buffer_shader), pipeline_barrier,
+        {(n + 3u) / 4u, 1u, 1u}, {256u, 1u, 1u}, VK_NULL_HANDLE,
+        v_output.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::WRITE),
+        v_cond.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::READ),
+        v_input.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::READ),
+        v_other.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::READ),
+        params.buffer());
+    return convert(v_output);
+  }
+
   const struct WhereBlock block{
       make_whcn_ivec4(v_output.sizes()),
       c_depth_of(v_output.sizes()),
