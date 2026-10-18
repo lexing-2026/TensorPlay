@@ -391,6 +391,12 @@ class vTensor final {
 
  private:
   /*
+   * Fail if the payload lives in buffer storage, where no texture view exists
+   * to bind.
+   */
+  void require_texture_view() const;
+
+  /*
    * Update the size metadata of the vTensor to be new sizes. Should not be
    * used directly, reallocate() or virtual_resize() should be used instead.
    */

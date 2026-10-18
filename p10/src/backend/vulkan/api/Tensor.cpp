@@ -599,9 +599,26 @@ vTensor::vTensor(
       // Reference the caller-owned storage without owning it
       view_(&existing_storage, [](vTensorStorage*) {}) {}
 
+/*
+ * A buffer-backed payload has no image to bind, so a texture view of one comes
+ * back empty.  The dispatch helper reads an empty argument as "nothing to do"
+ * and skips the kernel, which leaves the output holding whatever the allocator
+ * handed over.  Failing at the view request keeps that mistake visible instead
+ * of turning it into silently wrong data.
+ */
+void vTensor::require_texture_view() const {
+  if (view_->storage_type_ == api::StorageType::BUFFER && gpu_numel() > 0u) {
+    VK_THROW(
+        "Vulkan: this kernel requires texture storage, but the operand has ",
+        gpu_numel(),
+        " elements in buffer storage");
+  }
+}
+
 api::VulkanImage& vTensor::image(
     api::PipelineBarrier& pipeline_barrier,
     const api::PipelineStageFlags stage) const& {
+  require_texture_view();
   view_->transition(pipeline_barrier, stage, api::MemoryAccessType::READ);
   return view_->image_;
 }
@@ -610,6 +627,7 @@ api::VulkanImage& vTensor::image(
     api::PipelineBarrier& pipeline_barrier,
     const api::PipelineStageFlags stage,
     const api::MemoryAccessFlags access) & {
+  require_texture_view();
   view_->transition(pipeline_barrier, stage, access);
   return view_->image_;
 }
