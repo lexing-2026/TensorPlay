@@ -305,6 +305,25 @@ vTensorStorage::vTensorStorage(
       last_access_{} {
   verify();
 
+  // Zero-element payloads have no valid image extents and no bytes to move;
+  // keep a minimal linear backing allocation so Vulkan resource creation
+  // succeeds, and report buffer storage with a zero logical length.
+  if (utils::multiply_integers(sizes) == 0) {
+    storage_type_ = api::StorageType::BUFFER;
+    gpu_memory_layout_ = api::GPUMemoryLayout::TENSOR_WIDTH_PACKED;
+    extents_ = {0u, 0u, 0u};
+    buffer_length_ = 0;
+    const VkDeviceSize nbytes_aligned = 16u;
+    if (!allocate_memory ||
+        !context_->acquire_reusable_buffer(nbytes_aligned, buffer_)) {
+      buffer_ = context_->adapter_ptr()->vma().create_storage_buffer(
+          nbytes_aligned,
+          !context_->adapter_ptr()->has_unified_memory(),
+          allocate_memory);
+    }
+    return;
+  }
+
   const std::vector<int64_t> gpu_sizes =
       calc_gpu_sizes(sizes, gpu_memory_layout, storage_type);
 
@@ -550,7 +569,9 @@ vTensor::vTensor(
       gpu_sizes_{calc_gpu_sizes(sizes, memory_layout_, storage_type)},
       gpu_strides_{calc_strides(gpu_sizes_, memory_layout_, storage_type)},
       virtual_extents_(
-          create_image_extents(gpu_sizes_, storage_type, memory_layout)),
+          utils::multiply_integers(sizes) == 0
+              ? api::utils::uvec3{0u, 0u, 0u}
+              : create_image_extents(gpu_sizes_, storage_type, memory_layout)),
       // Utility Uniform Buffers that can be passed to shaders as arguments
       metadata_uniform_(),
       cpu_sizes_uniform_(nullptr),
