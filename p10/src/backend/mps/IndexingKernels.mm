@@ -49,7 +49,12 @@ Tensor normalize_index(const Tensor& index, int64_t dim_size) {
   }
   constexpr int64_t kHostScanLimit = 4096;
   if (n <= kHostScanLimit) {
-    synchronizeHostAccess();
+    // The scan reads shared storage from the host, which only has to drain the
+    // stream when work that may still write those bytes is in flight; an idle
+    // stream leaves the bytes already visible.
+    if (getCurrentMPSStream()->hasPendingWork()) {
+      synchronizeHostAccess();
+    }
     const int64_t* p = idx.data_ptr<int64_t>();
     for (int64_t i = 0; i < n; ++i) {
       const int64_t v = p[i];

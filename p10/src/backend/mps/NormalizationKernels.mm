@@ -343,7 +343,11 @@ Tensor batch_norm_kernel(const Tensor& input,
         C <= std::numeric_limits<uint32_t>::max() &&
         batch <= std::numeric_limits<uint32_t>::max();
     if (shader_ok) {
-      synchronizeHostAccess();
+      // Folding the statistics reads unified storage from the host; an idle
+      // stream leaves those bytes already visible.
+      if (getCurrentMPSStream()->hasPendingWork()) {
+        synchronizeHostAccess();
+      }
       Tensor scale_shift =
           Tensor::empty({2 * C}, DType::Float32, input.device());
       float* folded = scale_shift.data_ptr<float>();

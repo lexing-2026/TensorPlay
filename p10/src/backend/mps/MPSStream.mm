@@ -63,6 +63,7 @@ MPSStream::~MPSStream() {
 MPSCommandBuffer* MPSStream::commandBuffer() {
   if (!_commandBuffer) {
     _commandBuffer = [[MPSCommandBuffer commandBufferFromCommandQueue:_commandQueue] retain];
+    _pendingWork.store(true, std::memory_order_relaxed);
   }
   return _commandBuffer;
 }
@@ -128,6 +129,7 @@ void MPSStream::commitAndWait() {
     [_commandBuffer release];
     _commandBuffer = nil;
   }
+  _pendingWork.store(false, std::memory_order_relaxed);
 }
 
 void MPSStream::commitAndContinue() {

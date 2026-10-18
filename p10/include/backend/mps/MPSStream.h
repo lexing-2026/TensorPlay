@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <utility>
 
@@ -80,6 +81,13 @@ class P10_API MPSStream {
   MTLComputeCommandEncoder_t commandEncoder();
   void endKernelCoalescing();
   void synchronize(SyncType syncType);
+
+  /// True while this stream holds work that has not been waited on yet, either
+  /// still being encoded or already committed. A host read of shared storage
+  /// only has to wait when this is set.
+  bool hasPendingWork() const {
+    return _pendingWork.load(std::memory_order_relaxed);
+  }
   void copy(MTLBuffer_t srcBuffer,
             MTLBuffer_t dstBuffer,
             size_t length,
@@ -119,6 +127,9 @@ class P10_API MPSStream {
   dispatch_queue_t _serialQueue = nullptr;
   // CommitAndContinue is enabled by default.
   bool _enableCommitAndContinue = true;
+  // Set when a command buffer is created and cleared once a wait has drained
+  // the stream; shared storage is only safe to read from the host when clear.
+  std::atomic<bool> _pendingWork{false};
 
   // Use synchronize() to access any of these commit functions outside MPSStream.
   void commit();

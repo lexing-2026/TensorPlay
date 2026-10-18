@@ -260,8 +260,11 @@ Tensor embedding_kernel(const Tensor& weight, const Tensor& indices,
   const int64_t n = indices_c.numel();
 
   // Range-check the indices on the host (unified memory makes the buffer
-  // host-readable); the shader assumes valid indices afterwards.
-  synchronizeHostAccess();
+  // host-readable); the shader assumes valid indices afterwards. The stream
+  // only has to be drained when it still holds work that may write the bytes.
+  if (getCurrentMPSStream()->hasPendingWork()) {
+    synchronizeHostAccess();
+  }
   if (indices_c.dtype() == DType::Int64) {
     const int64_t* idx = indices_c.data_ptr<int64_t>();
     for (int64_t i = 0; i < n; ++i) {
