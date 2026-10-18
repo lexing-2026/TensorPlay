@@ -125,5 +125,24 @@ std::optional<Tensor> broadcastBinaryShader(
 // a graph in that case.
 std::optional<Tensor> unaryShader(const std::string& op, const Tensor& self);
 
+// Reduces the innermost axis of a contiguous float operand with the row shader
+// and returns the result in `out_shape`, which has to hold one value per row.
+// One SIMD group takes one row, so the call is a single dispatch and needs no
+// threadgroup memory: nothing crosses a row boundary. `divisor` above zero
+// divides each row's accumulated value on the way out, which is how an average
+// costs no more than a sum. Returns std::nullopt for an operand the shader
+// cannot address, as above.
+std::optional<Tensor> rowSumShader(const Tensor& self,
+                                   const std::vector<int64_t>& out_shape,
+                                   float divisor);
+
+// The position along the innermost axis at which `self` holds its extremum --
+// the first such position when several hold it, and a NaN counts as holding the
+// extremum of its row -- written as Int64 in `out_shape`. Returns std::nullopt
+// for an operand the shader cannot address, as above.
+std::optional<Tensor> rowArgReduceShader(const Tensor& self,
+                                         const std::vector<int64_t>& out_shape,
+                                         bool is_max);
+
 } // namespace mps
 } // namespace tensorplay
