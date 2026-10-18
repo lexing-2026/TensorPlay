@@ -1538,6 +1538,14 @@ rotary_embedding_buffer:
     TABLE_BUFFER: 1
   - NAME: rotary_embedding_buffer_tex_table
     TABLE_BUFFER: 0
+rotary_embedding_buffer_half:
+  parameter_names_with_default_values:
+    TABLE_BUFFER: 1
+  shader_variants:
+  - NAME: rotary_embedding_buffer_half
+    TABLE_BUFFER: 1
+  - NAME: rotary_embedding_buffer_half_tex_table
+    TABLE_BUFFER: 0
 sdpa_qk:
   parameter_names_with_default_values: {}
   generate_variant_forall:

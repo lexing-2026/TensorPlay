@@ -730,9 +730,11 @@ Tensor rotary_embedding_buffer(
     int64_t tokens,
     int64_t table_rows,
     int64_t position_offset) {
+  const bool is_half = input.dtype() == DType::Float16;
   TP_CHECK(
-      input.dtype() == DType::Float32,
-      "Vulkan rotary_embedding over linear storage supports Float32 only");
+      input.dtype() == DType::Float32 || is_half,
+      "Vulkan rotary_embedding over linear storage supports Float32 and "
+      "Float16 tensors only");
 
   const int64_t head_dim = 2 * half_dim;
   const int64_t batches = input.numel() / (tokens * head_dim);
@@ -746,6 +748,16 @@ Tensor rotary_embedding_buffer(
           batches <= kLinearDispatchAxisLimit,
       "Vulkan rotary_embedding over linear storage needs every dispatch axis "
       "within the workgroup count limit");
+
+  // A pair of rotated dimensions is two adjacent elements, which for a half
+  // payload is exactly one 32-bit word.  A flat table is read as words of the
+  // payload's own width, so it has to carry the same element type.
+  if (is_half && v_cos.storage_type() == api::StorageType::BUFFER) {
+    TP_CHECK(
+        v_cos.dtype() == DType::Float16 && v_sin.dtype() == DType::Float16,
+        "Vulkan rotary_embedding over linear storage needs Float16 cosine and "
+        "sine tables for a Float16 payload");
+  }
 
   api::Context* const context = api::context();
   api::vTensor v_output{context, input.sizes(), input.dtype()};
@@ -779,9 +791,15 @@ Tensor rotary_embedding_buffer(
   api::UniformParamsBuffer params(context, block);
   api::PipelineBarrier pipeline_barrier{};
 
+  const char* const linear_kernel =
+      v_cos.storage_type() == api::StorageType::BUFFER
+      ? (is_half ? "rotary_embedding_buffer_half" : "rotary_embedding_buffer")
+      : (is_half ? "rotary_embedding_buffer_half_tex_table"
+                 : "rotary_embedding_buffer_tex_table");
+
   if (v_cos.storage_type() == api::StorageType::BUFFER) {
     context->submit_compute_job(
-        VK_KERNEL_FROM_STR("rotary_embedding_buffer"),
+        VK_KERNEL_FROM_STR(linear_kernel),
         pipeline_barrier,
         grid,
         adaptive_work_group_size(grid),
@@ -796,7 +814,7 @@ Tensor rotary_embedding_buffer(
         params.buffer());
   } else {
     context->submit_compute_job(
-        VK_KERNEL_FROM_STR("rotary_embedding_buffer_tex_table"),
+        VK_KERNEL_FROM_STR(linear_kernel),
         pipeline_barrier,
         grid,
         adaptive_work_group_size(grid),
@@ -851,10 +869,23 @@ Tensor rotary_embedding_kernel(
       "Vulkan rotary_embedding needs cosine/sine tables of head_dim/2 entries "
       "per position");
   const bool table_linear = v_cos.storage_type() == api::StorageType::BUFFER;
-  TP_CHECK(
-      !table_linear || cos.dtype() == DType::Float32,
-      "Vulkan rotary_embedding needs Float32 cosine/sine tables over linear "
-      "storage");
+  // A linear table is read as raw words, so its element width has to match the
+  // way the consumer indexes it: a texture-stored activation reads one float
+  // texel-sized lane per entry, while a half linear payload unpacks two lanes
+  // out of every word.
+  if (table_linear) {
+    if (v_input.storage_type() != api::StorageType::TEXTURE_3D) {
+      TP_CHECK(
+          cos.dtype() == input.dtype(),
+          "Vulkan rotary_embedding needs cosine/sine tables of the payload "
+          "dtype over linear storage");
+    } else {
+      TP_CHECK(
+          cos.dtype() == DType::Float32,
+          "Vulkan rotary_embedding needs Float32 cosine/sine tables over "
+          "linear storage for a texture-stored payload");
+    }
+  }
 
   // An activation with no texture form rotates over its linear payload.
   if (v_input.storage_type() != api::StorageType::TEXTURE_3D) {

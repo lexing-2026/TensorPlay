@@ -493,6 +493,60 @@ class TestVulkanLlmKernels(unittest.TestCase):
                 rtol=0, atol=tol,
                 err_msg=f"rope over a linear table at S={S} D={D}")
 
+    def test_half_precision_rotary_embedding_over_linear_payload(self):
+        import tensorplay as tp
+        # Decoding keeps the activations and the cached tables in half
+        # precision, and a rotated pair is exactly the two lanes of one 32-bit
+        # word, so an invocation owns and writes that word whole.  A linear
+        # table is read as words of its own element type, which pins its width
+        # to the payload's.
+        tensorplay.manual_seed(4207)
+        for B, S, D, table_len, off, flat in (
+                (2, 20000, 64, 20000, 0, False),
+                (3, 20003, 32, 20010, 5, False),
+                (1, 16400, 64, 1, 0, False),
+                (2, 8, 16400, 32, 0, False),
+                (1, 16390, 6, 16390, 0, False),
+                (1, 16385, 128, 1, 0, True)):
+            x_cpu = (tensorplay.randn((B, S, D), device="cpu")
+                     * 0.3).to(tensorplay.float16).numpy()
+            cos_cpu, sin_cpu = _rope_tables(D, table_len)
+            if flat:
+                cos_cpu, sin_cpu = cos_cpu[0], sin_cpu[0]
+            cos_cpu = cos_cpu.astype(np.float16)
+            sin_cpu = sin_cpu.astype(np.float16)
+            rotated = tp.functional.rotary_embedding(
+                tensorplay.from_numpy(x_cpu.copy()).to("vulkan"),
+                tensorplay.from_numpy(
+                    np.ascontiguousarray(cos_cpu)).to("vulkan"),
+                tensorplay.from_numpy(
+                    np.ascontiguousarray(sin_cpu)).to("vulkan"),
+                position_offset=off)
+            self.assertEqual(rotated.dtype, tensorplay.float16)
+            self.assertEqual(tuple(rotated.shape), x_cpu.shape)
+            # The rotation is exact once the tables carry the payload width, so
+            # compare the bit patterns instead of a tolerance.
+            want = _rope_reference(
+                x_cpu.astype(np.float32),
+                cos_cpu.astype(np.float32),
+                sin_cpu.astype(np.float32),
+                off).astype(np.float16)
+            np.testing.assert_array_equal(
+                rotated.cpu().numpy().view(np.uint16),
+                want.view(np.uint16),
+                err_msg=f"half rope at B={B} S={S} D={D} off={off}")
+
+        # A float32 table would be read as pairs of halves over linear storage.
+        with self.assertRaisesRegex(RuntimeError, "payload dtype"):
+            tp.functional.rotary_embedding(
+                tensorplay.from_numpy(
+                    (np.random.randn(1, 16400, 32) * 0.3)
+                    .astype(np.float16)).to("vulkan"),
+                tensorplay.from_numpy(np.zeros((20000, 16), np.float32)
+                                      ).to("vulkan"),
+                tensorplay.from_numpy(np.zeros((20000, 16), np.float32)
+                                      ).to("vulkan"))
+
     def test_glu_splits_and_dtypes(self):
         # Gated linear unit over texture storage: first_half *
         # sigmoid(second_half), along whichever axis is halved.  Half
