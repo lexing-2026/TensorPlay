@@ -3370,23 +3370,61 @@ class TestVulkanWidePayload(unittest.TestCase):
             np.testing.assert_array_equal(
                 got.cpu().numpy(), np.arange(0, 40, 2, dtype=np.int32))
 
-    def test_word_at_a_time_ops_refuse_a_wide_payload(self):
+    def test_wide_payloads_convert_on_the_device(self):
+        # A wide code is narrowed a pair of words at a time, so the element the
+        # destination names decides the route: an image destination cannot hold
+        # one, so the codes are converted while both payloads are still linear
+        # and only then carried across as the destination's own type.
+        codes = np.array(
+            [0, 1, -1, 5, 2**31 - 1, -(2**31), 2**32, -(2**32), 2**40, -12345],
+            dtype=np.int64)
+        payload = tensorplay.from_numpy(codes.copy()).to("vulkan")
+        cases = (
+            ("narrowed", payload.to(tensorplay.int32),
+             codes.astype(np.int32).astype(np.int64)),
+            ("single precision", payload.to(tensorplay.float32),
+             codes.astype(np.float32).astype(np.int64)),
+        )
+        for name, got, want in cases:
+            np.testing.assert_array_equal(
+                got.cpu().numpy().astype(np.int64), want,
+                err_msg=f"{name} cast of 64-bit codes")
+        # Int32 codes widen by repeating the sign bit into the word above them.
+        widened = tensorplay.tensor(
+            codes.astype(np.int32).copy(), device="vulkan").to(
+                tensorplay.int64)
+        np.testing.assert_array_equal(
+            widened.cpu().numpy(), codes.astype(np.int32).astype(np.int64),
+            err_msg="widened codes lost their sign")
+        # An odd element count ends a wide payload on a 16-byte boundary that a
+        # four-element group does not cover: the tail codes still convert.
+        tail = np.array([7, -8, 9], dtype=np.int64)
+        np.testing.assert_array_equal(
+            tensorplay.from_numpy(tail.copy()).to("vulkan").to(
+                tensorplay.float32).cpu().numpy(),
+            tail.astype(np.float32), err_msg="wide conversion lost its tail")
+
+    def test_wide_payloads_stop_at_the_ops_that_read_one_word_per_element(self):
         values = np.array([0, 5, 2, 7, 1], dtype=np.int64)
         payload = tensorplay.from_numpy(values.copy()).to("vulkan")
-        # Slicing, reducing and casting each walk one word per element: they
-        # have to say so rather than read the low word of every code.
+        # Slicing and reducing walk a payload one word per element: they have to
+        # say so rather than read the low word of every code.
         with self.assertRaisesRegex(RuntimeError, "Vulkan slice supports"):
             tensorplay.narrow(payload, 0, 1, 3)
         with self.assertRaisesRegex(
                 RuntimeError, "reductions support Float32 and Float16"):
             payload.sum()
+        # A half payload packs two lanes into one word, so a wide code would
+        # need three of them, and rounding a float into 64 bits needs arithmetic
+        # no 32-bit shader has.
         with self.assertRaisesRegex(
-                RuntimeError, "Vulkan view materialization supports"):
-            payload.to(tensorplay.float32)
+                RuntimeError, "conversion from a wide payload"):
+            payload.to(tensorplay.float16)
         with self.assertRaisesRegex(
                 RuntimeError, "conversion over linear storage"):
-            tensorplay.tensor(values.astype(np.int32),
-                              device="vulkan").to(tensorplay.int64)
+            tensorplay.tensor(
+                np.array([1.5, -2.25], dtype=np.float32),
+                device="vulkan").to(tensorplay.int64)
 
 
 if __name__ == "__main__":
