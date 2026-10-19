@@ -7,6 +7,8 @@
 #include "tensorplay/ops/TPXOpsGenerated.h"
 #include "Scalar.h"
 
+#include <SizesAndStrides.h>
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -25,6 +27,19 @@ Return dispatch_vk(const char* op, Args... args);
 // The smallest maxComputeWorkGroupCount any conformant device must report per
 // dispatch axis.
 constexpr int64_t kLinearDispatchAxisLimit = 65535;
+
+// Defined in BinaryOp.cpp; copies a texture payload into a dense buffer.
+api::vTensor to_buffer_storage_dispatch(
+    api::Context* context,
+    const api::vTensor& src);
+
+// Defined in View.cpp; writes a strided view of a payload as a dense one,
+// which is how a result computed in linear storage repacks into an image.
+Tensor materialize_view(
+    const Tensor& self,
+    const std::vector<int64_t>& out_sizes,
+    const std::vector<int64_t>& out_strides,
+    int64_t storage_offset);
 
 namespace {
 
@@ -1201,6 +1216,256 @@ Tensor sdpa_composed(
   return widened ? tpx::ops::to(out, origin) : out;
 }
 
+//
+// Row tile, key chunk and widest head dimension of the single-walk attention
+// kernel; they have to match the constants of its shader.
+//
+constexpr int32_t kFlashRowTile = 8;
+constexpr int32_t kFlashKeyChunk = 16;
+constexpr int32_t kFlashMaxHeadDim = 128;
+constexpr int32_t kFlashThreads = 32;
+
+// Shared bytes the walk reserves whatever the head dimension: the query tile,
+// the key chunk and the accumulator all span the widest row, each padded by a
+// slot so consecutive rows miss each other's banks, plus the score block and
+// four running values per row.  A device whose shared pool is below this cannot
+// back the pipeline at all, so the walk stays off such hardware.
+constexpr int64_t kFlashSharedBytes =
+    (int64_t(2 * kFlashRowTile + kFlashKeyChunk) *
+         (kFlashMaxHeadDim + 1) +
+     int64_t(kFlashRowTile) * (kFlashKeyChunk + 1) + 4 * kFlashRowTile) *
+    4;
+
+// Element index range a 32-bit offset in a buffer kernel can reach.
+constexpr int64_t kLinearIndexLimit = 2147483647;
+
+// Texel lanes of a score matrix above which that one intermediate costs more
+// than an on-device deployment can spare for it (64 MB in single precision).
+constexpr int64_t kScoreTexelBudget = 4LL << 20;
+
+// Row tiles the walk needs before the serial pass it takes over the keys, one
+// per tile, still leaves the device with enough workgroups to fill.
+constexpr int64_t kFlashMinWorkgroups = 1024;
+
+namespace {
+
+// A payload the linear reads can walk: single precision, and dense in logical
+// order.  The cast and the stride fix are each one pass over one operand,
+// which is what the walk saves by never writing the score matrix down.
+Tensor to_float32_linear(const Tensor& t) {
+  const Tensor widened =
+      t.dtype() == DType::Float32 ? t : tpx::ops::to(t, DType::Float32);
+  return widened.is_contiguous() ? widened : widened.contiguous();
+}
+
+// Element steps of a dense [..., a, b, c] payload read through four axes: the
+// outermost of the four crosses whole matrices.
+ivec4 dense_strides(int64_t a, int64_t b, int64_t c) {
+  return ivec4(
+      static_cast<int32_t>(a * b * c),
+      static_cast<int32_t>(b * c),
+      static_cast<int32_t>(c),
+      1);
+}
+
+// The four axes a mask is addressed by, right-aligned and checked against the
+// extents it has to cover.  An axis of size one broadcasts, and steps by
+// nothing so every position reads the single slot it carries.
+ivec4 mask_addressing(
+    const std::vector<int64_t>& sizes,
+    const int64_t batch,
+    const int64_t heads,
+    const int64_t query_len,
+    const int64_t key_len) {
+  const int rank = static_cast<int>(sizes.size());
+  TP_CHECK(
+      rank <= 4,
+      "Vulkan sdpa over linear storage takes an attention mask of at most four axes");
+  std::vector<int64_t> padded(4, 1);
+  for (int axis = 0; axis < rank; ++axis) {
+    padded[4 - rank + axis] = sizes[axis];
+  }
+  const int64_t expected[4] = {batch, heads, query_len, key_len};
+  for (int axis = 0; axis < 4; ++axis) {
+    TP_CHECK(
+        padded[axis] == 1 || padded[axis] == expected[axis],
+        "Vulkan sdpa over linear storage: the attention mask is not broadcastable "
+        "to the query");
+  }
+  int64_t running = 1;
+  ivec4 strides{0, 0, 0, 0};
+  for (int axis = 3; axis >= 0; --axis) {
+    strides[axis] = padded[axis] == 1 ? 0 : static_cast<int32_t>(running);
+    running *= padded[axis];
+  }
+  return strides;
+}
+
+//
+// Attention in one walk of the key sequence, over payloads read as raw words.
+// A workgroup owns a tile of query rows of one (batch, head) pair and keeps
+// only that tile's running maximum, exponential sum and weighted value
+// accumulator, so the score matrix - one entry per (query row, key) pair,
+// which is what a two-product chain has to write down before it can normalize
+// - never exists.  Over a long prefill window that intermediate is the largest
+// object in the model, and on a device with a few hundred megabytes to spare it
+// is what keeps attention from running at all.
+//
+// The walk is the online form of the row softmax: every chunk rescales what the
+// pass has kept so far by the exponential of the pivot it was taken against
+// versus the new one, so one pass reaches the same result as normalizing once
+// the whole row is known.  Rejected entries (past the causal window, outside
+// either sequence, or carrying a rejection in the mask) fall out of both sums
+// by themselves, and a row with nothing left to attend comes back as zeros.
+//
+// Grouped query heads need no repetition: a query head reads the key and value
+// rows of head h / group.  The mask arrives as an additive payload read through
+// its own strides, so any broadcast of it costs no extra pass.
+//
+Tensor sdpa_flash(
+    const Tensor& query,
+    const Tensor& key,
+    const Tensor& value,
+    const std::optional<Tensor>& attn_mask_opt,
+    double scale,
+    bool is_causal,
+    int64_t group) {
+  api::Context* const context = api::context();
+
+  const DType origin = query.dtype();
+  const int64_t B = query.size(0);
+  const int64_t Hq = query.size(1);
+  const int64_t Sq = query.size(2);
+  const int64_t Hkv = key.size(1);
+  const int64_t Skv = key.size(2);
+  const int64_t D = query.size(3);
+
+  // Every address the kernel forms is a 32-bit element offset into a payload.
+  TP_CHECK(
+      B * Hq * Sq * D <= kLinearIndexLimit &&
+          B * Hkv * Skv * D <= kLinearIndexLimit,
+      "Vulkan sdpa over linear storage exceeds the element index range a "
+      "32-bit offset can reach");
+
+  const Tensor q = to_float32_linear(query);
+  const Tensor k = to_float32_linear(key);
+  const Tensor v = to_float32_linear(value);
+
+  std::optional<Tensor> mask;
+  ivec4 mask_strides{0, 0, 0, 0};
+  if (attn_mask_opt.has_value()) {
+    mask = to_float32_linear(*attn_mask_opt);
+    mask_strides = mask_addressing(
+        static_cast<std::vector<int64_t>>(mask->shape()), B, Hq, Sq, Skv);
+    TP_CHECK(
+        mask->numel() <= kLinearIndexLimit,
+        "Vulkan sdpa over linear storage exceeds the element index range a "
+        "32-bit offset can reach");
+  }
+
+  const api::vTensor v_q = to_buffer_storage_dispatch(context, convert(q));
+  const api::vTensor v_k = to_buffer_storage_dispatch(context, convert(k));
+  const api::vTensor v_v = to_buffer_storage_dispatch(context, convert(v));
+  // A call without a mask reads nothing from the fourth operand binding, but
+  // the descriptor still needs memory behind it.
+  const api::vTensor v_mask = mask.has_value()
+      ? to_buffer_storage_dispatch(context, convert(*mask))
+      : v_q;
+
+  const int32_t chunks = static_cast<int32_t>(api::utils::div_up(
+      api::utils::safe_downcast_to_u32(Skv),
+      static_cast<uint32_t>(kFlashKeyChunk)));
+  const int32_t d_quads = static_cast<int32_t>(
+      api::utils::div_up(api::utils::safe_downcast_to_u32(D), 4u));
+
+  const struct SdpaFlashBlock final {
+    ivec4 q_strides; // element steps of the query payload
+    ivec4 kv_strides; // steps shared by the key and value payloads
+    ivec4 out_strides; // element steps of the result
+    ivec4 mask_strides; // steps of the mask, zero on a broadcast axis
+    int32_t seq_q; // Sq
+    int32_t seq_kv; // Skv
+    int32_t dim; // head dimension D
+    int32_t chunks; // key chunks the walk covers
+    int32_t d_quads; // staging groups per row
+    int32_t hq; // query head count
+    int32_t group; // query heads per key/value head
+    float scale; // multiplier of every score
+    int32_t is_causal;
+    int32_t has_mask;
+    int32_t fill1;
+    int32_t fill2;
+  } block{
+      dense_strides(Hq, Sq, D),
+      dense_strides(Hkv, Skv, D),
+      dense_strides(Hq, Sq, D),
+      mask_strides,
+      static_cast<int32_t>(Sq),
+      static_cast<int32_t>(Skv),
+      static_cast<int32_t>(D),
+      chunks,
+      d_quads,
+      static_cast<int32_t>(Hq),
+      static_cast<int32_t>(group),
+      static_cast<float>(scale),
+      is_causal ? 1 : 0,
+      mask.has_value() ? 1 : 0,
+      0,
+      0};
+
+  api::vTensor v_output{
+      context,
+      {B, Hq, Sq, D},
+      DType::Float32,
+      api::StorageType::BUFFER,
+      api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+
+  // One workgroup of 32 lanes per row tile of one (batch, head) pair.  The
+  // launch counts invocations, so the lane axis carries exactly a workgroup's
+  // worth and the two axes above it number the tiles and the planes.
+  const uint32_t row_tiles = api::utils::safe_downcast_to_u32(
+      api::utils::div_up(
+          api::utils::safe_downcast_to_u32(Sq),
+          static_cast<uint32_t>(kFlashRowTile)));
+  const uint32_t planes = api::utils::safe_downcast_to_u32(B * Hq);
+  TP_CHECK(
+      static_cast<int64_t>(row_tiles) <= kLinearDispatchAxisLimit &&
+          static_cast<int64_t>(planes) <= kLinearDispatchAxisLimit,
+      "Vulkan sdpa over linear storage needs the row tiles and the head planes "
+      "within the two dispatch axes");
+
+  api::UniformParamsBuffer params(context, block);
+  api::PipelineBarrier barrier{};
+  context->submit_compute_job(
+      VK_KERNEL_FROM_STR("sdpa_flash_buffer"),
+      barrier,
+      api::utils::uvec3{static_cast<uint32_t>(kFlashThreads), row_tiles, planes},
+      api::utils::uvec3{static_cast<uint32_t>(kFlashThreads), 1u, 1u},
+      VK_NULL_HANDLE,
+      v_output.buffer(
+          barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::WRITE),
+      v_q.buffer(barrier, api::PipelineStage::COMPUTE),
+      v_k.buffer(barrier, api::PipelineStage::COMPUTE),
+      v_v.buffer(barrier, api::PipelineStage::COMPUTE),
+      v_mask.buffer(barrier, api::PipelineStage::COMPUTE),
+      params.buffer());
+
+  // Storage remains a function of the shape alone: a result whose extents still
+  // have an image repacks into one on the way out, so a consumer that only
+  // reads texels is handed what it expects whichever route produced it.
+  const std::vector<int64_t> sizes = {B, Hq, Sq, D};
+  Tensor out = convert(v_output);
+  if (image_storage_supported(context, sizes)) {
+    out = materialize_view(
+        out, sizes, SizesAndStrides::compute_contiguous_strides(sizes), 0);
+  }
+  return origin == DType::Float32 ? out : tpx::ops::to(out, origin);
+}
+
+} // namespace
+
 Tensor scaled_dot_product_attention_kernel(
     const Tensor& query,
     const Tensor& key,
@@ -1276,15 +1541,65 @@ Tensor scaled_dot_product_attention_kernel(
   api::vTensor v_key = convert(key);
   api::vTensor v_value = convert(value);
 
+  // Both of the routes below write one score per (query row, key) pair before
+  // it is normalized: the fused chain hands that matrix to a texture, the
+  // composition to a buffer.  The walk keeps it off the device altogether, at
+  // the cost of a serial pass over the keys per row tile.  So it runs when the
+  // matrix has no image form at all, or when it is large enough that giving it
+  // one is the point of the exercise, and the shapes below that keep the
+  // per-texel parallelism of the chain.
+  const int64_t score_lanes =
+      static_cast<int64_t>(sdpa_planes(Hq, B)) * Sq * Skv;
+  const int64_t row_tiles =
+      static_cast<int64_t>(
+          api::utils::div_up(
+              api::utils::safe_downcast_to_u32(Sq),
+              static_cast<uint32_t>(kFlashRowTile))) *
+      B * Hq;
+  const bool no_image_form =
+      v_query.storage_type() != api::StorageType::TEXTURE_3D ||
+      v_key.storage_type() != api::StorageType::TEXTURE_3D ||
+      v_value.storage_type() != api::StorageType::TEXTURE_3D ||
+      !sdpa_images_fit(context, B, Hq, Sq, Skv);
+  const bool walk_reachable =
+      D <= kFlashMaxHeadDim && Sq >= kFlashRowTile &&
+      row_tiles >= kFlashMinWorkgroups &&
+      kFlashSharedBytes <=
+          static_cast<int64_t>(
+              context->adapter_ptr()
+                  ->properties()
+                  .limits.maxComputeSharedMemorySize) &&
+      B * Hq * Sq * D <= kLinearIndexLimit &&
+      B * Hkv * Skv * D <= kLinearIndexLimit;
+  if (walk_reachable && (no_image_form || score_lanes > kScoreTexelBudget)) {
+    std::optional<Tensor> flash_mask;
+    if (attn_mask_opt.has_value()) {
+      TP_CHECK(
+          attn_mask_opt->dtype() == DType::Bool ||
+              attn_mask_opt->dtype() == DType::Float32 ||
+              attn_mask_opt->dtype() == DType::Float16,
+          "Vulkan sdpa over linear storage: an attention mask must be a bool "
+          "or a floating payload");
+      Tensor extra = *attn_mask_opt;
+      if (!extra.device().is_vulkan()) {
+        extra = extra.to(query.device());
+      }
+      // A rejection of a bool mask arrives as the additive payload the walk
+      // reads; an additive one is already in that form.
+      flash_mask = extra.dtype() == DType::Bool
+          ? additive_float_mask(extra, DType::Float32)
+          : extra;
+    }
+    return sdpa_flash(
+        query, key, value, flash_mask, scale, is_causal, group);
+  }
+
   // Without an image for every payload the attention composes instead: the
   // two products are the batched kernels, which stream from images and from
   // linear payloads alike, and the row reduction walks a score matrix that
   // lives in linear storage.  A causal mask rides the same route as an
   // explicit one, so the composite needs no triangle of its own.
-  if (v_query.storage_type() != api::StorageType::TEXTURE_3D ||
-      v_key.storage_type() != api::StorageType::TEXTURE_3D ||
-      v_value.storage_type() != api::StorageType::TEXTURE_3D ||
-      !sdpa_images_fit(context, B, Hq, Sq, Skv)) {
+  if (no_image_form) {
     TP_CHECK(
         !attn_mask_opt.has_value() ||
             attn_mask_opt->dtype() == DType::Bool ||
