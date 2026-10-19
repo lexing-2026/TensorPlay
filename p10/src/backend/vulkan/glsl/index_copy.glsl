@@ -34,6 +34,12 @@ void main() {
   }
 
   const int dest_row = texelFetch(uIndices, ivec3(pos.y, 0, 0), 0).x;
+  // A code naming no row of the destination writes nothing, the same way a
+  // read-side lookup returns zeros for one.  Addressing an image outside its
+  // extents is undefined, so the row it would have landed on is left alone.
+  if (dest_row < 0 || dest_row >= uBlock.extents.y) {
+    return;
+  }
   imageStore(
       uSelf,
       ivec3(pos.x, dest_row, pos.z),

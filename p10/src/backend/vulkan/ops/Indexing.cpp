@@ -302,8 +302,10 @@ Tensor embedding_kernel(
 //
 // In-place index_copy_: role as the vulkan write path for row updates along
 // the sequence axis, e.g. appending decode steps to a preallocated kv cache.
-// The destination rows arrive through an Int32 payload that the shader walks;
-// the host folds an Int64 payload, validates the range, and uploads it.
+// The destination rows arrive through an Int32 payload that the shader walks,
+// so a list already on the device stays there: folding it onto the host would
+// cost a queue sync per call, and a decode step makes one per token.  Range is
+// settled in the shader, where a code naming no row writes nothing.
 //
 // Geometry note: a 4-D channel-packed [N, C, S, W] tensor keeps its rows on
 // the texture's y extent, so a dim == 2 scatter is texel aligned from row to
@@ -344,18 +346,10 @@ Tensor& index_copy_rows_inplace(Tensor& self, int64_t dim, const Tensor& index, 
           self.size(3) == source.size(3),
       "Vulkan index_copy_: source must match off-axis sizes");
 
-  Tensor idx_host = index.to(Device(DeviceType::CPU)).to(DType::Int64).contiguous();
-  const int64_t* ivals = idx_host.data_ptr<int64_t>();
-  for (int64_t i = 0; i < n_idx; ++i) {
-    TP_CHECK(
-        ivals[i] >= 0 && ivals[i] < rows,
-        "Vulkan index_copy_: index out of range");
-  }
-
   api::Context* const context = api::context();
   api::vTensor v_self = convert(self);
   api::vTensor v_source = convert(source);
-  api::vTensor v_indices = upload_index_payload(idx_host, v_self.storage_type());
+  api::vTensor v_indices = upload_index_payload(index, v_self.storage_type());
 
   // Linear payloads (shapes beyond the 3-D image axis limit) scatter through
   // a buffer-to-buffer variant: the index payload is copied to a dense

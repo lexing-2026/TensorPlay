@@ -47,6 +47,8 @@ void main() {
   const uint f4 = rem % nf4;
 
   const int dest_row = uIndices.data[r];
+  // Same rule as the texel variant: a code naming no destination row writes
+  // nothing, so an out-of-range scatter never touches memory it does not own.
   if (dest_row < 0 || dest_row >= uBlock.rows) {
     return;
   }
