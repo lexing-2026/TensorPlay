@@ -1526,29 +1526,36 @@ void lookup_impl(const uint8_t* x, uint8_t* y, int64_t size, const float* table)
     }
     for (; i < size; ++i) y[i] = static_cast<uint8_t>(table[x[i]]);
 }
-template<class Q>
+// The operation and whether to clamp at zero are chosen once per call, so they
+// enter as template parameters and the element loop holds no branch at all.
+template<class Q, int Op, bool Relu>
 void binary_codes(const void* aa, const void* bb, void* yy, int64_t size,
-        double as, int64_t az, double bs, int64_t bz, double ys, int64_t yz, int op, bool relu) {
+        double as, int64_t az, double bs, int64_t bz, double ys, int64_t yz) {
     using T = typename Q::underlying;
     using QV = vec::Vectorized<Q>;
     using FV = vec::Vectorized<float>;
     const T* a = static_cast<const T*>(aa); const T* b = static_cast<const T*>(bb); T* y = static_cast<T*>(yy);
-    const FV asc(as), azp(az), bsc(bs), bzp(bz), zero(0.f);
+    const FV asc(as), bsc(bs);
+    // A code stands for scale*(code - zero_point), whose two terms share the
+    // scale factor; folding it leaves one multiply-add per lane instead of a
+    // subtraction and a multiply.
+    const FV ashift(-static_cast<float>(as) * static_cast<float>(az));
+    const FV bshift(-static_cast<float>(bs) * static_cast<float>(bz));
     const FV lower((std::numeric_limits<T>::lowest() - yz) * static_cast<float>(ys));
     const FV upper((std::numeric_limits<T>::max() - yz) * static_cast<float>(ys));
+    // The grid's lowest code sits at or below zero, so a relu floor already
+    // implies that bound and the two clamps collapse into one.
+    const FV at_least = Relu ? FV(0.f) : lower;
     int64_t i = 0;
     for (; i + QV::size() <= size; i += QV::size()) {
-        auto av = QV::loadu(a + i).dequantize(asc, azp);
-        auto bv = QV::loadu(b + i).dequantize(bsc, bzp);
+        auto av = QV::loadu(a + i).dequantize(asc, FV(static_cast<float>(az)), ashift);
+        auto bv = QV::loadu(b + i).dequantize(bsc, FV(static_cast<float>(bz)), bshift);
         for (size_t j = 0; j < av.size(); ++j) {
-            switch (op) {
-                case 0: av[j] = av[j] + bv[j]; break;
-                case 1: av[j] = av[j] - bv[j]; break;
-                case 2: av[j] = av[j] * bv[j]; break;
-                default: av[j] = av[j] / bv[j]; break;
-            }
-            if (relu) av[j] = vec::maximum(av[j], zero);
-            av[j] = vec::minimum(vec::maximum(av[j], lower), upper);
+            if constexpr (Op == 0) av[j] = av[j] + bv[j];
+            else if constexpr (Op == 1) av[j] = av[j] - bv[j];
+            else if constexpr (Op == 2) av[j] = av[j] * bv[j];
+            else av[j] = av[j] / bv[j];
+            av[j] = vec::minimum(vec::maximum(av[j], at_least), upper);
         }
         QV::quantize(av, ys, yz, 1.f / static_cast<float>(ys)).store(y + i);
     }
@@ -1556,16 +1563,37 @@ void binary_codes(const void* aa, const void* bb, void* yy, int64_t size,
         const float av = static_cast<float>(static_cast<int64_t>(a[i]) - az) * static_cast<float>(as);
         const float bv = static_cast<float>(static_cast<int64_t>(b[i]) - bz) * static_cast<float>(bs);
         float v;
-        switch (op) { case 0: v = av + bv; break; case 1: v = av - bv; break; case 2: v = av * bv; break; default: v = av / bv; }
-        if (relu) v = std::fmax(v, 0.f);
+        if constexpr (Op == 0) v = av + bv;
+        else if constexpr (Op == 1) v = av - bv;
+        else if constexpr (Op == 2) v = av * bv;
+        else v = av / bv;
+        if constexpr (Relu) v = std::fmax(v, 0.f);
         y[i] = quant::encode<T>(v, 1.f / static_cast<float>(ys), yz);
+    }
+}
+
+template<class Q, int Op>
+void binary_relu(const void* a, const void* b, void* y, int64_t size,
+        double as, int64_t az, double bs, int64_t bz, double ys, int64_t yz, bool relu) {
+    if (relu) binary_codes<Q, Op, true>(a, b, y, size, as, az, bs, bz, ys, yz);
+    else binary_codes<Q, Op, false>(a, b, y, size, as, az, bs, bz, ys, yz);
+}
+
+template<class Q>
+void binary_typed(const void* a, const void* b, void* y, int64_t size,
+        double as, int64_t az, double bs, int64_t bz, double ys, int64_t yz, int op, bool relu) {
+    switch (op) {
+        case 0: binary_relu<Q, 0>(a, b, y, size, as, az, bs, bz, ys, yz, relu); break;
+        case 1: binary_relu<Q, 1>(a, b, y, size, as, az, bs, bz, ys, yz, relu); break;
+        case 2: binary_relu<Q, 2>(a, b, y, size, as, az, bs, bz, ys, yz, relu); break;
+        default: binary_relu<Q, 3>(a, b, y, size, as, az, bs, bz, ys, yz, relu); break;
     }
 }
 
 void binary_impl(const void* a, const void* b, void* y, int64_t size, DType dtype,
         double as, int64_t az, double bs, int64_t bz, double ys, int64_t yz, int op, bool relu) {
-    if (dtype == DType::QInt8) binary_codes<qint8>(a,b,y,size,as,az,bs,bz,ys,yz,op,relu);
-    else if (dtype == DType::QUInt8) binary_codes<quint8>(a,b,y,size,as,az,bs,bz,ys,yz,op,relu);
+    if (dtype == DType::QInt8) binary_typed<qint8>(a,b,y,size,as,az,bs,bz,ys,yz,op,relu);
+    else if (dtype == DType::QUInt8) binary_typed<quint8>(a,b,y,size,as,az,bs,bz,ys,yz,op,relu);
 }
 
 template<class T>
