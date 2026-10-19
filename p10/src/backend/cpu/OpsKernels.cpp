@@ -1116,25 +1116,6 @@ Tensor& clamp__cpu(Tensor& self, const std::optional<Scalar>& min, const std::op
 // Activations
 // ===========================================================================
 
-Tensor selu_cpu(const Tensor& self) {
-    // selu: scale * max(0,x) + scale * alpha * (exp(min(0,x)) - 1)
-    constexpr double kAlpha = 1.6732632423543772848170429916717;
-    constexpr double kScale = 1.0507009873554804934193349852946;
-    return dtype_unary_kernel(self, [](auto x) -> decltype(x) {
-        using T = decltype(x);
-        double v = static_cast<double>(x);
-        return static_cast<T>(v > 0 ? kScale * v : kScale * kAlpha * (std::exp(v) - 1.0));
-    }, "selu");
-}
-Tensor celu_cpu(const Tensor& self, const Scalar& alpha) {
-    // celu: max(0,x) + alpha * (exp(x/alpha) - 1) on the negative side
-    double a = alpha.toDouble();
-    return dtype_unary_kernel(self, [a](auto x) -> decltype(x) {
-        using T = decltype(x);
-        double v = static_cast<double>(x);
-        return static_cast<T>(v > 0 ? v : a * (std::exp(v / a) - 1.0));
-    }, "celu");
-}
 Tensor hardshrink_cpu(const Tensor& self, const Scalar& lambd) {
     double l = lambd.toDouble();
     // lambd.to<scalar_t>(), so float32 boundary values compare exactly.
@@ -1341,8 +1322,6 @@ TENSORPLAY_LIBRARY_IMPL(CPU, OpsKernels) {
     m.impl("clamp_min.Tensor", clamp_min_tensor_cpu);
     m.impl("clamp_max.Tensor", clamp_max_tensor_cpu);
     // Activations
-    m.impl("selu", selu_cpu);
-    m.impl("celu", celu_cpu);
     m.impl("hardshrink", hardshrink_cpu);
     m.impl("hardshrink_backward", hardshrink_backward_cpu);
     m.impl("softshrink", softshrink_cpu);

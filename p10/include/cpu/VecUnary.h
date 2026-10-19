@@ -60,7 +60,7 @@ enum class VOp : int {
     // composite activations
     Sigmoid, GeluNone, GeluTanh, Silu, Mish, Selu,
     Elu, Softplus, Hardswish, Hardsigmoid, LeakyRelu,
-    Hardtanh, Relu6, Celu,
+    Hardtanh, Relu6,
 };
 
 // Runtime scalars for parameterised ops (elu, softplus, celu, leaky_relu,
@@ -106,7 +106,7 @@ inline bool avx512_available() {
 // case for them, so they run there (or on the scalar loop) instead.
 inline bool f64_avx2_only(VOp op) {
     return op == VOp::Elu || op == VOp::Softplus || op == VOp::LeakyRelu ||
-           op == VOp::Celu || op == VOp::Hardswish || op == VOp::Hardsigmoid;
+           op == VOp::Hardswish || op == VOp::Hardsigmoid;
 }
 
 // ---------------------------------------------------------------------------
@@ -218,11 +218,6 @@ inline T scalar_apply(VOp op, VParams prm, T x) {
         }
         case VOp::Relu6: { // hardtanh(0, 6)
             return x < T(0) ? T(0) : (x > T(6) ? T(6) : x);
-        }
-        case VOp::Celu: {
-            const T a = static_cast<T>(prm.p0);
-            T af = x;
-            return af > T(0) ? af : static_cast<T>(static_cast<double>(a)) * (std::expm1(af / a));
         }
         default: return x;
     }
@@ -477,13 +472,6 @@ inline __m256 apply_f32(VOp op, VParams prm, __m256 x) {
         }
         case VOp::Relu6:
             return _mm256_min_ps(_mm256_set1_ps(6.0f), _mm256_max_ps(zero, x));
-        case VOp::Celu: {
-            const __m256 a = _mm256_set1_ps(static_cast<float>(prm.p0));
-            __m256 neg = _mm256_mul_ps(a, tensorplay::tpsleef::expm1(_mm256_div_ps(x, a)));
-            __m256 pos = _mm256_max_ps(zero, x);
-            __m256 minneg = _mm256_min_ps(neg, zero);
-            return _mm256_add_ps(pos, minneg);
-        }
         default: return x;
     }
 }
@@ -702,13 +690,6 @@ inline __m256d apply_f64(VOp op, VParams prm, __m256d x) {
         }
         case VOp::Relu6:
             return _mm256_min_pd(_mm256_set1_pd(6.0), _mm256_max_pd(zero, x));
-        case VOp::Celu: {
-            const __m256d a = _mm256_set1_pd(prm.p0);
-            __m256d neg = _mm256_mul_pd(a, tensorplay::tpsleef::expm1(_mm256_div_pd(x, a)));
-            __m256d pos = _mm256_max_pd(_mm256_setzero_pd(), x);
-            __m256d minneg = _mm256_min_pd(neg, _mm256_setzero_pd());
-            return _mm256_add_pd(pos, minneg);
-        }
         default: return x;
     }
 }
@@ -1080,13 +1061,6 @@ inline __m512 apply16_f32(VOp op, VParams prm, __m512 x) {
         }
         case VOp::Relu6:
             return _mm512_min_ps(_mm512_set1_ps(6.0f), _mm512_max_ps(zero, x));
-        case VOp::Celu: {
-            const __m512 a = _mm512_set1_ps(static_cast<float>(prm.p0));
-            __m512 neg = _mm512_mul_ps(a, tensorplay::tpsleef::expm1(_mm512_div_ps(x, a)));
-            __m512 pos = _mm512_max_ps(zero, x);
-            __m512 minneg = _mm512_min_ps(neg, zero);
-            return _mm512_add_ps(pos, minneg);
-        }
         default: return x;
     }
 }
@@ -1462,7 +1436,7 @@ inline void run_f64(VOp op, VParams prm, const double* src, double* dst, int64_t
     f64_chunk_avx2(op, prm, src, dst, b, e);
     return;
 #endif
-    // Elu/Softplus/LeakyRelu/Celu/Hardswish/Hardsigmoid have AVX2 double
+    // Elu/Softplus/LeakyRelu/Hardswish/Hardsigmoid have AVX2 double
     // kernels only; everything else goes 512-bit.
     if (avx512_available() && !f64_avx2_only(op)) {
         f64_chunk_avx512(op, prm, src, dst, b, e);

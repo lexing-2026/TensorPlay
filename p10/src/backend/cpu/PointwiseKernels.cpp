@@ -1512,13 +1512,14 @@ Tensor selu_kernel_impl(const Tensor& self) {
 
 Tensor celu_kernel_impl(const Tensor& self, Scalar alpha) {
     double a = alpha.toDouble();
-    vecunary::VParams prm;
-    prm.p0 = a;
-    return unary_float_op_kernel(self, [a](auto x) {
-        using T = decltype(x);
-        T af = static_cast<T>(static_cast<activation_math_t<T>>(x));
-        return af > T(0) ? af : static_cast<T>(a) * (std::expm1(af / static_cast<T>(a)));
-    }, vecunary::VOp::Celu, prm);
+    if (a == 0.0) {
+        TP_THROW(RuntimeError, "ZeroDivisionError: alpha cannot be 0 for CELU");
+    }
+    // The negative branch is alpha * expm1(x / alpha): the same shape elu
+    // evaluates, with scale 1 and input_scale 1/alpha.  Going through that
+    // kernel keeps one expm1-based formula (a plain exp(x) - 1 underflows to
+    // +0 for |x / alpha| below ~1e-16) and the vectorized loop.
+    return elu_kernel_impl(self, alpha, Scalar(1.0), Scalar(1.0 / a));
 }
 
 Tensor softplus_kernel_impl(const Tensor& self, const Scalar& beta, const Scalar& threshold) {
@@ -3369,6 +3370,8 @@ TENSORPLAY_LIBRARY_IMPL(CPU, PointwiseKernels) {
     m.impl("leaky_relu_backward", leaky_relu_backward_kernel_impl);
     m.impl("elu", elu_kernel_impl);
     m.impl("elu_backward", elu_backward_kernel_impl);
+    m.impl("selu", selu_kernel_impl);
+    m.impl("celu", celu_kernel_impl);
     m.impl("mish", mish_kernel_impl);
     m.impl("mish_backward", mish_backward_kernel_impl);
     m.impl("softplus", softplus_kernel_impl);
