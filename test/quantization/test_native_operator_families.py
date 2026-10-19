@@ -178,6 +178,20 @@ def test_unary_and_axis_operations(device, dtype, zp, op):
 
 
 @pytest.mark.parametrize('device', DEVICES)
+@pytest.mark.parametrize('dtype,zp', TYPES)
+@pytest.mark.parametrize('width', [1, 31, 32, 33, 63, 64, 97, 129])
+def test_softmax_rows_wider_than_a_vector(device, dtype, zp, width):
+    # A row that fills a vector is folded in runs of that vector's width, so the
+    # whole runs and the leftover tail have to land on the same codes.
+    codes = np.arange(3 * width, dtype='int64').reshape(3, width)
+    if dtype == 'int8': codes = codes % 251 - 124
+    elif dtype == 'uint8': codes = codes % 251
+    else: codes = codes % 601 - 300
+    x, r = pair(codes, dtype, device, zp=zp)
+    same(F.softmax(x, 1, .003, zp), torch.ops.quantized.softmax(r, 1, .003, zp), 1)
+
+
+@pytest.mark.parametrize('device', DEVICES)
 @pytest.mark.parametrize('dtype,zp', TYPES[:2])
 @pytest.mark.parametrize('shapes', [((7,), (7,)), ((7,), (2,7,5)), ((3,7), (7,)),
                                    ((2,1,3,7), (1,4,7,5)), ((0,3,7), (7,5)), ((3,0), (0,5))])
