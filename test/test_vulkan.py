@@ -4752,5 +4752,199 @@ class TestVulkanPowerLanes(unittest.TestCase):
             rtol=1e-3, atol=1e-3, err_msg="corners written back")
 
 
+class TestVulkanScatterValue(unittest.TestCase):
+    # Writing one number wherever a list of codes says so is a gather read
+    # backwards: the walk belongs to the list, while the stores belong to the
+    # destination.  A texel or a word carries four lanes and one store replaces
+    # all of them, so a store made for the lane a code names would drop the
+    # lanes that code never mentioned.  The first pass marks the destinations
+    # the list names and the second reads a whole group at a time, keeping the
+    # unmarked lanes as they were.
+
+    LENGTHS = (100001, 100003, 200003)
+
+    @staticmethod
+    def _device(payload):
+        return tensorplay.from_numpy(np.ascontiguousarray(payload)).to("vulkan")
+
+    @staticmethod
+    def _host(payload):
+        return tensorplay.from_numpy(np.ascontiguousarray(payload))
+
+    @staticmethod
+    def _fill(payload, dim, codes, value):
+        # Each coordinate of the list picks a row along the scattered axis of
+        # the same coordinates in the destination.  A list may be narrower than
+        # the destination anywhere but along that axis, so the walk belongs to
+        # the list rather than to the destination.
+        out = payload.copy()
+        axis = dim if dim >= 0 else dim + payload.ndim
+        for at in np.ndindex(codes.shape):
+            destination = list(at)
+            destination[axis] = int(codes[at])
+            out[tuple(destination)] = value
+        return out
+
+    def _check_written(self, base_np, codes, dim, value, dtype=np.float32):
+        payload = base_np.astype(dtype)
+        want = self._fill(payload, dim, codes, value).astype(np.float32)
+        got = self._device(payload).scatter_(
+            dim, self._device(codes), value).cpu().numpy().astype(np.float32)
+        np.testing.assert_allclose(
+            got, want, rtol=1e-3, atol=1e-3,
+            err_msg=f"written into a {payload.shape} destination along axis {dim}")
+        # The copy on top of the destination is what the out-of-place call has to
+        # return, so both orders of the same write are covered.
+        kept = self._device(payload)
+        held = tensorplay.scatter(kept, dim, self._device(codes), value)
+        np.testing.assert_allclose(
+            held.cpu().numpy().astype(np.float32), want,
+            rtol=1e-3, atol=1e-3, err_msg="out-of-place write")
+        np.testing.assert_allclose(
+            kept.cpu().numpy().astype(np.float32), payload.astype(np.float32),
+            rtol=1e-3, atol=1e-3, err_msg="the destination left alone")
+
+    def test_a_code_names_one_lane_of_the_destination(self):
+        # The last axis is the width of a texel, so the lanes of a group are
+        # neighbours in the list of codes: a store that answered for the whole
+        # group would spread one code over its neighbours.
+        rng = np.random.default_rng(31)
+        base = np.zeros((2, 6), np.float32)
+        self._check_written(base, np.array([[0, 2, 4], [1, 3, 5]], np.int64),
+                            1, -1.0)
+        self._check_written(base, np.array([[0, 2, 4], [1, 3, 5]], np.int32),
+                            1, 7.5)
+        # A code naming the same lane twice is still that lane; two codes of a
+        # group naming different lanes have to keep both.
+        self._check_written(np.zeros((1, 8), np.float32),
+                            np.array([[1, 1, 2, 2]], np.int64), 1, 5.0)
+        self._check_written(np.ones((4, 7), np.float32),
+                            np.array([[0, 6], [1, 5], [2, 4], [3, 0]], np.int32),
+                            1, 6.0)
+        # A width that is not a multiple of four ends in a partly used group.
+        self._check_written(
+            np.zeros((3, 5), np.float32),
+            rng.integers(0, 5, (3, 4)).astype(np.int64), 1, 0.25)
+        # A negative axis counts from the back, as the destination is walked.
+        self._check_written(
+            np.zeros((3, 4), np.float32),
+            np.array([[0, 1], [2, 3], [0, 2]], np.int64), -1, 2.0)
+
+    def test_a_code_moves_a_whole_inner_span(self):
+        # Along an axis other than the last a code stands for a row of the
+        # destination, so every element the span reaches is named while the
+        # spans it skipped keep their values.
+        rng = np.random.default_rng(32)
+        self._check_written(
+            np.zeros((2, 5, 3), np.float32),
+            np.array([[[0, 1], [2, 3]], [[1, 1], [0, 2]]], np.int64), 1, 9.0)
+        self._check_written(
+            np.zeros((2, 3, 4, 5), np.float32),
+            rng.integers(0, 3, (1, 3, 4, 5)).astype(np.int64), 1, 4.0)
+        # A list narrower than the destination along the scattered axis leaves
+        # the rows nobody names, but it still has to reach the right rows.
+        self._check_written(
+            np.zeros((2, 4, 6), np.float32),
+            np.array([[[0, 2], [1, 3]], [[3, 1], [0, 2]]], np.int64), 1, -3.0)
+        for axis in (0, 1, 2):
+            self._check_written(
+                rng.normal(size=(3, 5, 4)).astype(np.float32),
+                rng.integers(0, (3, 5, 4)[axis], (3, 5, 4)).astype(np.int64),
+                axis, 1.5)
+
+    def test_a_half_plane_keeps_its_neighbour(self):
+        # Two half values share a word of linear storage and four share a texel,
+        # so a write that answered for the group would rewrite the half beside
+        # the one asked for.
+        rng = np.random.default_rng(33)
+        self._check_written(
+            np.zeros((2, 6), np.float32),
+            np.array([[0, 2, 4], [1, 3, 5]], np.int64), 1, -1.5,
+            dtype=np.float16)
+        self._check_written(
+            rng.normal(size=(3, 5, 4)).astype(np.float32),
+            rng.integers(0, 4, (3, 5, 4)).astype(np.int64), 2, 0.75,
+            dtype=np.float16)
+
+    def test_a_long_destination_writes_through_linear_storage(self):
+        # Past the reach of an image the destination rides words of four lanes,
+        # so the group a store replaces is a word rather than a texel and the
+        # marking pass counts elements of the flat payload.
+        rng = np.random.default_rng(34)
+        for dtype in (np.float32, np.float16):
+            for width in self.LENGTHS:
+                base = np.zeros((2, width), np.float32)
+                codes = np.sort(
+                    rng.integers(0, width, (2, 5)), axis=1).astype(np.int64)
+                self._check_written(
+                    base, codes, 1, 3.25, dtype=dtype)
+        # The last lane of a ragged width sits in a partly used word.
+        self._check_written(
+            np.ones((1, 100003), np.float32),
+            np.array([[0, 100001, 100002]], np.int64), 1, -0.5)
+
+    def test_a_row_of_a_wide_destination_writes_every_group_it_spans(self):
+        # A decode step bans tokens by naming a row of the logits, which is the
+        # whole width of the destination: the write has to reach the last texel
+        # and the last word of a width that is not a multiple of four.
+        rng = np.random.default_rng(35)
+        for width in self.LENGTHS:
+            base = np.ones((1, width), np.float32) * 0.5
+            codes = np.sort(rng.integers(0, width, (1, 17)),
+                            axis=1).astype(np.int64)
+            self._check_written(base, codes, 1, -1e4)
+
+    def test_a_code_outside_the_rows_names_nothing(self):
+        # Reaching past the end of an axis is refused on the host but left
+        # untouched here, the same policy the row lookups already follow.
+        base = np.zeros((1, 8), np.float32)
+        codes = np.array([[0, 2, 9, -1]], np.int64)
+        want = base.copy()
+        want[0, 0] = want[0, 2] = 5.0
+        got = self._device(base.copy()).scatter_(
+            1, self._device(codes), 5.0).cpu().numpy()
+        np.testing.assert_allclose(got, want, rtol=0, atol=1e-6,
+                                   err_msg="a code outside the rows")
+
+    def test_two_writes_over_one_destination_do_not_stay_marked(self):
+        # The marks are a temporary of the destination's size, so a second write
+        # that reuses the storage of the first has to clear it: a leftover mark
+        # would keep writing where the earlier list said so.
+        base = np.zeros((3, 8), np.float32)
+        first = np.array([[0, 1], [2, 3], [4, 5]], np.int64)
+        second = np.array([[7], [6], [0]], np.int64)
+        payload = self._device(base.copy())
+        payload.scatter_(1, self._device(first), 1.0)
+        payload.scatter_(1, self._device(second), 2.0)
+        want = self._fill(self._fill(base, 1, first, 1.0), 1, second, 2.0)
+        np.testing.assert_allclose(
+            payload.cpu().numpy(), want, rtol=0, atol=1e-6,
+            err_msg="two writes over one destination")
+
+    def test_a_destination_without_lanes_is_left_alone(self):
+        empty = self._device(np.zeros((0, 4), np.float32))
+        self.assertEqual(
+            tuple(empty.scatter_(
+                1, self._device(np.zeros((0, 4), np.int64)), 3.0
+            ).shape), (0, 4))
+        kept = self._device(np.zeros((2, 3), np.float32))
+        np.testing.assert_allclose(
+            kept.scatter_(1, self._device(np.zeros((2, 0), np.int64)),
+                         3.0).cpu().numpy(),
+            np.zeros((2, 3), np.float32), rtol=0, atol=0,
+            err_msg="an empty list writes nothing")
+
+    def test_an_impossible_shape_is_refused(self):
+        payload = self._device(np.zeros((2, 4), np.float32))
+        with self.assertRaisesRegex(RuntimeError, "same rank as the destination"):
+            payload.scatter_(1, self._device(np.zeros((4,), np.int64)), 1.0)
+        with self.assertRaisesRegex(RuntimeError, "wider than the destination"):
+            payload.scatter_(1, self._device(np.zeros((3, 2), np.int64)), 1.0)
+        with self.assertRaisesRegex(RuntimeError, "dimension out of range"):
+            payload.scatter_(2, self._device(np.zeros((2, 4), np.int64)), 1.0)
+        with self.assertRaisesRegex(RuntimeError, "Int32 or Int64"):
+            payload.scatter_(1, self._device(np.zeros((2, 2), np.float32)), 1.0)
+
+
 if __name__ == "__main__":
     unittest.main()
