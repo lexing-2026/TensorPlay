@@ -1613,49 +1613,73 @@ void softmax_rows(const T* x, T* y, int64_t width, int64_t inner, int64_t first,
         int64_t zp, float scale, float inverse) {
     using V = vec::Vectorized<float>;
     constexpr int lanes = V::size();
+    // A row of codes sits next to each other in storage, so it is read through the
+    // vector of its own type: finding the largest and turning a run of codes into
+    // the values they stand for then cost one instruction per run instead of one
+    // per code.
+    using Q = std::conditional_t<std::is_same_v<T, int8_t>, qint8,
+            std::conditional_t<std::is_same_v<T, uint8_t>, quint8, qint32>>;
+    using QV = vec::Vectorized<Q>;
+    constexpr int codes_per_run = QV::size();
+    const V one(1.f), zero(0.f), grid(scale);
     std::vector<float> exponentials;
     if (inner == 1) exponentials.resize(width);
     for (int64_t row = first; row < last; ++row) {
         const int64_t base = row / inner * width * inner + row % inner;
         int64_t maximum = std::numeric_limits<T>::lowest();
-        for (int64_t c = 0; c < width; ++c) maximum = std::max<int64_t>(maximum, x[base + c * inner]);
         if (inner == 1) {
-            V partial(0.f);
-            alignas(64) float values[lanes];
+            // A code grows with the value it stands for, so the largest code of a
+            // row is the value every exponent of that row is shifted by.
+            QV best(Q(std::numeric_limits<T>::lowest()));
             int64_t c = 0;
-            for (; c + lanes <= width; c += lanes) {
-                for (int lane = 0; lane < lanes; ++lane) values[lane] = static_cast<float>(x[base + c + lane]);
-                const V exp = ((V::loadu(values) - V(static_cast<float>(maximum))) * V(scale)).exp();
-                exp.store(exponentials.data() + c);
-                partial += exp;
+            for (; c + codes_per_run <= width; c += codes_per_run)
+                best = best.maximum(QV::loadu(x + base + c));
+            alignas(64) T largest[codes_per_run];
+            best.store(largest);
+            for (int lane = 0; lane < codes_per_run; ++lane) maximum = std::max<int64_t>(maximum, largest[lane]);
+            for (; c < width; ++c) maximum = std::max<int64_t>(maximum, x[base + c]);
+            V partial(0.f);
+            const V shift(static_cast<float>(maximum));
+            int64_t j = 0;
+            for (; j + codes_per_run <= width; j += codes_per_run) {
+                const auto raw = QV::loadu(x + base + j).dequantize(one, zero);
+                for (size_t part = 0; part < raw.size(); ++part) {
+                    const V exp = ((raw[part] - shift) * grid).exp();
+                    exp.store(exponentials.data() + j + part * lanes);
+                    partial += exp;
+                }
             }
             float sum = 0.f;
+            alignas(64) float values[lanes];
             partial.store(values);
             for (float value : values) sum += value;
-            for (; c < width; ++c) {
-                const float exp = ::expf(static_cast<float>(static_cast<int64_t>(x[base + c]) - maximum) * scale);
-                exponentials[c] = exp;
+            for (; j < width; ++j) {
+                const float exp = ::expf(static_cast<float>(static_cast<int64_t>(x[base + j]) - maximum) * scale);
+                exponentials[j] = exp;
                 sum += exp;
             }
             const float normalization = 1.f / sum;
             int64_t output_end = 0;
 #if defined(CPU_CAPABILITY_AVX2) || defined(CPU_CAPABILITY_AVX512)
             if constexpr (std::is_same_v<T, int8_t> || std::is_same_v<T, uint8_t>) {
-                using Q = std::conditional_t<std::is_same_v<T, int8_t>, qint8, quint8>;
-                using QV = vec::Vectorized<Q>;
-                c = 0;
-                for (; c + QV::size() <= width; c += QV::size()) {
-                    typename QV::float_vec_return_type normalized;
+                using Q8 = std::conditional_t<std::is_same_v<T, int8_t>, qint8, quint8>;
+                using Q8V = vec::Vectorized<Q8>;
+                int64_t k = 0;
+                for (; k + Q8V::size() <= width; k += Q8V::size()) {
+                    typename Q8V::float_vec_return_type normalized;
                     for (size_t part = 0; part < normalized.size(); ++part)
-                        normalized[part] = V::loadu(exponentials.data() + c + part * lanes) * V(normalization);
-                    QV::quantize(normalized, 1.f, static_cast<int32_t>(zp), inverse).store(y + base + c);
+                        normalized[part] = V::loadu(exponentials.data() + k + part * lanes) * V(normalization);
+                    Q8V::quantize(normalized, 1.f, static_cast<int32_t>(zp), inverse).store(y + base + k);
                 }
-                output_end = c;
+                output_end = k;
             }
 #endif
             for (c = output_end; c < width; ++c)
                 y[base + c] = quant::encode<T>(exponentials[c] * normalization, inverse, zp);
         } else {
+            // A strided row has no contiguous run to read, so its largest code is
+            // found one step at a time.
+            for (int64_t c = 0; c < width; ++c) maximum = std::max<int64_t>(maximum, x[base + c * inner]);
             float sum = 0.f;
             for (int64_t c = 0; c < width; ++c)
                 sum += ::expf(static_cast<float>(static_cast<int64_t>(x[base + c * inner]) - maximum) * scale);
