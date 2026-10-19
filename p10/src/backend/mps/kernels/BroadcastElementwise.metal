@@ -472,6 +472,91 @@ kernel void broadcast_ternary(
 REGISTER_BROADCAST_TERNARY_DTYPES(addcmul)
 REGISTER_BROADCAST_TERNARY_DTYPES(addcdiv)
 
+// The ternary counterpart of broadcast_binary_ilp. The host only selects it
+// when the innermost dimension is a multiple of the run width, so a run stays
+// inside one row and one decomposition of the outer coordinates serves the
+// whole run.
+template <typename T, typename Op>
+kernel void broadcast_ternary_ilp(
+    device T* out [[buffer(0)]],
+    device const T* self [[buffer(1)]],
+    device const T* lhs [[buffer(2)]],
+    device const T* rhs [[buffer(3)]],
+    constant T& value [[buffer(4)]],
+    constant uint& ndim [[buffer(5)]],
+    constant uint* sizes [[buffer(6)]],
+    constant int* self_strides [[buffer(7)]],
+    constant int* lhs_strides [[buffer(8)]],
+    constant int* rhs_strides [[buffer(9)]],
+    constant uint& total [[buffer(10)]],
+    uint tid [[thread_position_in_grid]]) {
+  const uint first = tid * ILP_PER_THREAD;
+  const uint inner = sizes[0];
+  if (total >= ILP_PER_THREAD && first <= total - ILP_PER_THREAD) {
+    uint remaining = first / inner;
+    int self_outer = 0;
+    int lhs_outer = 0;
+    int rhs_outer = 0;
+    for (uint d = 1; d < ndim; ++d) {
+      const uint coord = remaining % sizes[d];
+      remaining /= sizes[d];
+      self_outer += static_cast<int>(coord) * self_strides[d];
+      lhs_outer += static_cast<int>(coord) * lhs_strides[d];
+      rhs_outer += static_cast<int>(coord) * rhs_strides[d];
+    }
+    const uint start = first % inner;
+    const int self_first =
+        self_outer + static_cast<int>(start) * self_strides[0];
+    const int lhs_first =
+        lhs_outer + static_cast<int>(start) * lhs_strides[0];
+    const int rhs_first =
+        rhs_outer + static_cast<int>(start) * rhs_strides[0];
+    array<T, ILP_PER_THREAD> values;
+#pragma unroll
+    for (uint j = 0; j < ILP_PER_THREAD; ++j) {
+      values[j] = Op::apply(
+          self[self_first + static_cast<int>(j) * self_strides[0]],
+          lhs[lhs_first + static_cast<int>(j) * lhs_strides[0]],
+          rhs[rhs_first + static_cast<int>(j) * rhs_strides[0]], value);
+    }
+#pragma unroll
+    for (uint j = 0; j < ILP_PER_THREAD; ++j) {
+      out[first + j] = values[j];
+    }
+  } else {
+    for (uint i = first; i < total; ++i) {
+      out[i] = Op::apply(
+          self[element_offset<int>(i, sizes, self_strides, ndim)],
+          lhs[element_offset<int>(i, sizes, lhs_strides, ndim)],
+          rhs[element_offset<int>(i, sizes, rhs_strides, ndim)], value);
+    }
+  }
+}
+
+#define REGISTER_BROADCAST_TERNARY_ILP(OP, DTYPE)                    \
+  template [[host_name("broadcast_" #OP "_" #DTYPE "_ilp")]]         \
+  kernel void broadcast_ternary_ilp<DTYPE, OP##_op>(                 \
+      device DTYPE * out [[buffer(0)]],                              \
+      device const DTYPE * self [[buffer(1)]],                       \
+      device const DTYPE * lhs [[buffer(2)]],                        \
+      device const DTYPE * rhs [[buffer(3)]],                        \
+      constant DTYPE & value [[buffer(4)]],                          \
+      constant uint & ndim [[buffer(5)]],                            \
+      constant uint * sizes [[buffer(6)]],                           \
+      constant int * self_strides [[buffer(7)]],                     \
+      constant int * lhs_strides [[buffer(8)]],                      \
+      constant int * rhs_strides [[buffer(9)]],                      \
+      constant uint & total [[buffer(10)]],                          \
+      uint tid [[thread_position_in_grid]]);
+
+#define REGISTER_BROADCAST_TERNARY_ILP_DTYPES(OP) \
+  REGISTER_BROADCAST_TERNARY_ILP(OP, float)       \
+  REGISTER_BROADCAST_TERNARY_ILP(OP, long)        \
+  REGISTER_BROADCAST_TERNARY_ILP(OP, int)
+
+REGISTER_BROADCAST_TERNARY_ILP_DTYPES(addcmul)
+REGISTER_BROADCAST_TERNARY_ILP_DTYPES(addcdiv)
+
 // where: out = condition ? lhs : rhs. The condition is a byte per element and
 // each operand walks its own strides, so the mask broadcasts independently.
 template <typename T>

@@ -894,8 +894,12 @@ std::optional<Tensor> broadcastTernaryShader(
       rhs.storage_offset() != 0) {
     return std::nullopt;
   }
+  // A thread can take a run of consecutive output elements when the innermost
+  // dimension is a multiple of the run width, so no run crosses a row.
+  const bool ilp = out_shape.back() % p10::metal::ILP_PER_THREAD == 0;
   MTLComputePipelineState_t pso = shaderPipelineNamed(
-      "broadcast_" + op + "_" + scalarToMetalTypeString(self.dtype()));
+      "broadcast_" + op + "_" + scalarToMetalTypeString(self.dtype()) +
+      (ilp ? "_ilp" : ""));
   if (!pso) {
     return std::nullopt;
   }
@@ -959,10 +963,17 @@ std::optional<Tensor> broadcastTernaryShader(
       [encoder setBytes:rhs_stride_array.data()
                  length:sizeof(rhs_stride_array)
                 atIndex:9];
+      const uint32_t threads =
+          ilp ? p10::metal::ceil_div<uint32_t>(total,
+                                               p10::metal::ILP_PER_THREAD)
+              : total;
+      if (ilp) {
+        [encoder setBytes:&total length:sizeof(total) atIndex:10];
+      }
       const uint32_t per_group =
-          std::min(total,
+          std::min(threads,
                    static_cast<uint32_t>([pso maxTotalThreadsPerThreadgroup]));
-      [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
+      [encoder dispatchThreads:MTLSizeMake(threads, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(per_group, 1, 1)];
     }
   });
