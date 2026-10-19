@@ -1366,8 +1366,9 @@ constexpr int64_t kLinearIndexLimit = 2147483647;
  * pick their route by looking at what they were handed, and a texture-only
  * kernel given a small buffer payload has no linear variant to run.  A result
  * whose shape still has an image therefore repacks into one on the way out.
- * The gather reads the 4-byte element types out of linear memory; every other
- * type stays where the kernel wrote it.
+ * The gather knows the linear layout of the types that fill or share a word --
+ * single precision, integer codes, and halves two to a word -- so a product of
+ * any of those crosses over; every other type stays where the kernel wrote it.
  */
 Tensor release_product_output(
     api::Context* const context,
@@ -1376,9 +1377,12 @@ Tensor release_product_output(
   const std::vector<int64_t> sizes(
       v_product.sizes().begin(), v_product.sizes().end());
   if (v_product.storage_type() != api::StorageType::BUFFER ||
-      !image_storage_supported(context, sizes) ||
-      (v_product.dtype() != DType::Float32 &&
-       v_product.dtype() != DType::Int32)) {
+      !image_storage_supported(context, sizes)) {
+    return flat;
+  }
+  const DType dtype = v_product.dtype();
+  if (dtype != DType::Float32 && dtype != DType::Int32 &&
+      dtype != DType::Float16) {
     return flat;
   }
   return materialize_view(
