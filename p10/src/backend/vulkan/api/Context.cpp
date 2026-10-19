@@ -249,6 +249,32 @@ void Context::flush() {
 
   VK_CHECK(vkQueueWaitIdle(queue()));
 
+  recycle_synced_state();
+}
+
+/*
+ * One queue completes its submissions in the order it received them, so a
+ * fence that has just signalled covers every batch this context recorded
+ * before it.  A path that synced through such a fence has nothing left to
+ * wait for, and waiting on the queue again costs as much as the transfer it
+ * follows.  Work that was recorded but never submitted falls outside that
+ * fence, so it stays parked for flush() to submit and recycle.
+ */
+void Context::retire_synced_work() {
+  if (cmd_) {
+    return;
+  }
+  recycle_synced_state();
+}
+
+/*
+ * Hands back everything a drained queue leaves behind: the command and
+ * descriptor pools recycle what they handed out, retired tensor resources are
+ * released, and dead host-visible buffers return to the staging and parameter
+ * pools.  No submission may still be in flight here, as resetting a pool
+ * whose command buffer or descriptor sets a pending batch reads is undefined.
+ */
+void Context::recycle_synced_state() {
   command_pool_.flush();
   descriptor_pool_.flush();
   // If there is an existing command buffer, invalidate it

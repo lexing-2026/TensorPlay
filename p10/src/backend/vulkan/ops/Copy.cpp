@@ -146,7 +146,7 @@ void transfer_vulkan_to_cpu(api::vTensor& v_src, Tensor& dst) {
           staging.buffer(), {static_cast<uint32_t>(v_src.nbytes()), 0u, 0u},
           {0u, 0u, 0u}, {0u, 0u, 0u}, fence.get_submit_handle());
       fence.wait();
-      context->flush();
+      context->retire_synced_work();
     }
     context->fences().return_fence(fence);
     Tensor host(v_src.sizes(), v_src.dtype(), Device(DeviceType::CPU));
@@ -179,7 +179,9 @@ void transfer_vulkan_to_cpu(api::vTensor& v_src, Tensor& dst) {
 
     fence.wait();
 
-    context->flush();
+    // The signalled fence covers the copy and everything recorded before it,
+    // so the queue has nothing left to wait for here.
+    context->retire_synced_work();
     // cmd_mutex_ will be released when exiting this scope.
   }
 

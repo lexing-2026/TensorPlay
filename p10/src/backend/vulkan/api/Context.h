@@ -270,6 +270,16 @@ class Context final {
 
   void flush();
 
+  // Recycles what a signalled fence has just completed, without waiting on the
+  // queue a second time.  Callers use it while holding the dispatch lock,
+  // right after the fence of a batch that included everything they recorded.
+  void retire_synced_work();
+
+  // Recycles command buffers, descriptor sets and host-visible buffers.  Every
+  // submission must have completed, as resetting a pool a pending batch still
+  // reads is undefined.
+  void recycle_synced_state();
+
   // Promotes over-budget pending staging buffers and clears retired tensor
   // resources after the queue drains; called from submit_cmd_to_gpu so
   // asynchronous-only workloads stay bounded.
