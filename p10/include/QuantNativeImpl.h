@@ -36,15 +36,24 @@ __global__ void apply_kernel(int64_t size, F fn) {
 }
 #endif
 
+// One chunk should cover roughly this many element-visits, so an iteration that
+// walks a window or a row has to shrink the chunk by that many visits or the
+// shape never reaches the thread pool.
+constexpr int64_t kQuantChunkVisits = 32768;
+
+inline int64_t chunk_grain(int64_t visits_per_item) {
+    return std::max<int64_t>(1, kQuantChunkVisits / std::max<int64_t>(1, visits_per_item));
+}
+
 template<class F>
-void apply(int64_t size, F fn) {
+void apply(int64_t size, F fn, int64_t grain = kQuantChunkVisits) {
     if (!size) return;
 #ifdef TP_QUANT_CUDA
     const int blocks = static_cast<int>(std::min<int64_t>((size + 255) / 256, 4096));
     apply_kernel<<<blocks, 256, 0, tensorplay::cuda::getCurrentCUDAStream().stream()>>>(size, fn);
     tensorplay::cuda::checkCuda(cudaGetLastError(), "Quantized execution");
 #else
-    parallel::parallel_for(0, size, 32768, [&](int64_t first, int64_t last) {
+    parallel::parallel_for(0, size, grain, [&](int64_t first, int64_t last) {
         for (int64_t i = first; i < last; ++i) fn(i);
     });
 #endif
@@ -313,13 +322,15 @@ Tensor cat(const std::vector<Tensor>& inputs, int64_t dim, std::optional<double>
                 } else {
                     apply(outer, CatRows<T>{x.data_ptr<T>(), y.data_ptr<T>(), src.size(dim),
                         shape[dim], offset, quantized::q_zero_point(src), yz,
-                        static_cast<float>(quantized::q_scale(src)), 1.f / static_cast<float>(ys), relu});
+                        static_cast<float>(quantized::q_scale(src)), 1.f / static_cast<float>(ys), relu},
+                        chunk_grain(src.size(dim)));
                 }
 #endif
             } else {
                 apply(x.numel(), CatCodes<T>{x.data_ptr<T>(), y.data_ptr<T>(), src.size(dim), inner,
                     shape[dim], offset, quantized::q_zero_point(src), yz,
-                    static_cast<float>(quantized::q_scale(src)), 1.f / static_cast<float>(ys), relu});
+                    static_cast<float>(quantized::q_scale(src)), 1.f / static_cast<float>(ys), relu},
+                    chunk_grain(4));
             }
         });
         offset += src.size(dim);
@@ -329,29 +340,35 @@ Tensor cat(const std::vector<Tensor>& inputs, int64_t dim, std::optional<double>
 
 template<class T>
 struct PoolCodes {
-    const T* x; T* y; PoolGeometry g;
+    const T* x; T* y; PoolGeometry g; const PoolWindow* windows = nullptr;
     TP_QN_DEVICE void operator()(int64_t i) const {
         const int64_t outer = g.channels_last ? i / (g.channels * g.out_size) * g.channels + i % g.channels : i / g.out_size;
         int64_t start[3]{}, end[3]{1,1,1}, count = 1, valid = 1;
-        int64_t p = g.channels_last ? i / g.channels % g.out_size : i % g.out_size;
-        for (int d = g.rank - 1; d >= 0; --d) {
-            const int64_t o = p % g.out[d]; p /= g.out[d];
-            if (g.mode == 1) {
-                start[d] = o * g.in[d] / g.out[d];
-                end[d] = ((o + 1) * g.in[d] + g.out[d] - 1) / g.out[d];
-            } else {
-                start[d] = o * g.stride[d] - g.pad[d];
-                end[d] = start[d] + (g.kernel[d] - 1) * g.dilation[d] + 1;
-                const int64_t padded_end = end[d] < g.in[d] + g.pad[d] ? end[d] : g.in[d] + g.pad[d];
-                count *= padded_end - start[d];
-            }
-            if (g.mode != 2) {
-                if (start[d] < 0) start[d] = 0;
-                if (end[d] > g.in[d]) end[d] = g.in[d];
-                valid *= end[d] - start[d];
-            } else {
-                while (start[d] < 0) start[d] += g.dilation[d];
-                if (end[d] > g.in[d]) end[d] = g.in[d];
+        const int64_t location = g.channels_last ? i / g.channels % g.out_size : i % g.out_size;
+        if (windows) {
+            const PoolWindow& window = windows[location];
+            for (int d = 0; d < 3; ++d) { start[d] = window.start[d]; end[d] = window.end[d]; }
+        } else {
+            int64_t p = location;
+            for (int d = g.rank - 1; d >= 0; --d) {
+                const int64_t o = p % g.out[d]; p /= g.out[d];
+                if (g.mode == 1) {
+                    start[d] = o * g.in[d] / g.out[d];
+                    end[d] = ((o + 1) * g.in[d] + g.out[d] - 1) / g.out[d];
+                } else {
+                    start[d] = o * g.stride[d] - g.pad[d];
+                    end[d] = start[d] + (g.kernel[d] - 1) * g.dilation[d] + 1;
+                    const int64_t padded_end = end[d] < g.in[d] + g.pad[d] ? end[d] : g.in[d] + g.pad[d];
+                    count *= padded_end - start[d];
+                }
+                if (g.mode != 2) {
+                    if (start[d] < 0) start[d] = 0;
+                    if (end[d] > g.in[d]) end[d] = g.in[d];
+                    valid *= end[d] - start[d];
+                } else {
+                    while (start[d] < 0) start[d] += g.dilation[d];
+                    if (end[d] > g.in[d]) end[d] = g.in[d];
+                }
             }
         }
         const T* row = x + outer / g.channels * g.batch_stride + outer % g.channels * g.channel_stride;
@@ -513,7 +530,38 @@ Tensor pool(const Tensor& input, const std::vector<int64_t>& kernel,
         });
     } else
 #endif
+    {
+#ifdef TP_QUANT_CUDA
         codes(input.dtype(), [&]<class T>() { apply(y.numel(), PoolCodes<T>{input.data_ptr<T>(), y.data_ptr<T>(), g}); });
+#else
+        // A maximum window depends only on the output location, so tabulating it
+        // once replaces a per-element derivation. The table is only repaid when
+        // the batch and channel axes visit each location again.
+        const int64_t reuse = g.out_size ? y.numel() / g.out_size : 0;
+        std::vector<PoolWindow> max_windows;
+        if (g.mode == 2 && reuse > 1) {
+            max_windows.resize(g.out_size);
+            for (int64_t location = 0; location < g.out_size; ++location) {
+                auto& window = max_windows[location];
+                int64_t p = location;
+                for (int d = 2; d >= 0; --d) {
+                    const int64_t o = p % g.out[d]; p /= g.out[d];
+                    window.start[d] = o * g.stride[d] - g.pad[d];
+                    window.end[d] = window.start[d] + (g.kernel[d] - 1) * g.dilation[d] + 1;
+                    while (window.start[d] < 0) window.start[d] += g.dilation[d];
+                    window.end[d] = std::min(window.end[d], g.in[d]);
+                }
+            }
+        }
+        const PoolWindow* table = max_windows.empty() ? nullptr : max_windows.data();
+        const int64_t visits = g.mode == 2
+            ? std::max<int64_t>(1, g.kernel[0] * g.kernel[1] * g.kernel[2]) : 1;
+        codes(input.dtype(), [&]<class T>() {
+            apply(y.numel(), PoolCodes<T>{input.data_ptr<T>(), y.data_ptr<T>(), g, table},
+                chunk_grain(visits));
+        });
+#endif
+    }
     return y;
 }
 
