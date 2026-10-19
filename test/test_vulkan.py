@@ -5201,5 +5201,122 @@ class TestVulkanWhereScalars(unittest.TestCase):
             self.assertEqual(float(got.cpu().numpy()[0]), 1.0 if condition[0] else 0.0)
 
 
+class TestVulkanIntegralSum(unittest.TestCase):
+    # A plane that counts rather than measures has no reduced type to carry its
+    # own total: the answer to a sum over a mask is the number of lanes it
+    # settles on, and it has to arrive as a whole number wider than the lane.
+    # Every step of a decode asks for one of these (how much of the window is
+    # real, how many lanes a check banned), so a round trip that loses a lane's
+    # number on the way in is a bug the model would answer with.
+
+    LENGTHS = (100001, 100003)
+
+    @staticmethod
+    def _device(payload):
+        return tensorplay.from_numpy(np.ascontiguousarray(payload)).to("vulkan")
+
+    @staticmethod
+    def _truth(shape, order):
+        return np.random.default_rng(order).random(shape) > 0.4
+
+    @staticmethod
+    def _held(shape, order):
+        rng = np.random.default_rng(order)
+        return rng.integers(-1000, 1000, shape).astype(np.int32)
+
+    def test_a_truth_plane_totals_the_lanes_it_sets(self):
+        truth = self._truth((3, 8), 61)
+        got = self._device(truth).sum()
+        self.assertEqual(str(got.dtype), "tensorplay.int64")
+        self.assertEqual(int(got.cpu().numpy()), int(truth.sum()),
+                         "a mask's total is its set lanes")
+
+    def test_a_counted_plane_carries_its_own_total(self):
+        held = self._held((4, 5), 62)
+        got = self._device(held).sum()
+        self.assertEqual(str(got.dtype), "tensorplay.int64")
+        self.assertEqual(int(got.cpu().numpy()), int(held.sum(dtype=np.int64)),
+                         "a plane of whole numbers")
+
+    def test_a_row_of_truth_counts_alone(self):
+        truth = self._truth((2, 3, 4), 63)
+        got = self._device(truth).sum(1)
+        self.assertEqual(tuple(got.shape), (2, 4))
+        np.testing.assert_array_equal(
+            got.cpu().numpy(), truth.sum(axis=1, dtype=np.int64),
+            err_msg="a middle axis of a truth plane")
+
+    def test_a_truth_plane_keeps_the_axis_it_collapsed(self):
+        truth = self._truth((3, 6), 64)
+        got = self._device(truth).sum(-1, keepdim=True)
+        self.assertEqual(tuple(got.shape), (3, 1))
+        np.testing.assert_array_equal(
+            got.cpu().numpy(),
+            truth.sum(axis=-1, dtype=np.int64, keepdims=True),
+            err_msg="a kept axis")
+
+    def test_a_long_truth_plane_is_totalled_through_linear_storage(self):
+        # Past the reach of an image the lanes live in words, so the total of a
+        # whole window has to be built without the walk that reads a texture.
+        for width in self.LENGTHS:
+            truth = self._truth((2, width), 65)
+            got = self._device(truth).sum(-1)
+            np.testing.assert_array_equal(
+                got.cpu().numpy(), truth.sum(axis=-1, dtype=np.int64),
+                err_msg=f"a row of {width} lanes")
+
+    def test_a_lane_past_the_reach_of_a_fraction_keeps_its_number(self):
+        # Whole numbers past what single precision names exactly have to arrive
+        # whole, which is why the walk reads the plane as its own width.
+        held = np.array(
+            [2**24 + 1, 2**24 + 3, -(2**24 + 5), 2**24], np.int32)
+        got = self._device(held).sum()
+        self.assertEqual(int(got.cpu().numpy()), int(held.sum(dtype=np.int64)),
+                         "a total no fraction could hold")
+
+    def test_a_wide_lane_counted_across_axes_keeps_its_number(self):
+        held = (np.arange(6 * 7, dtype=np.int32).reshape(6, 7) * 4_000_000)
+        got = self._device(held).sum(1)
+        np.testing.assert_array_equal(
+            got.cpu().numpy(), held.sum(axis=1, dtype=np.int64),
+            err_msg="rows of numbers past a fraction's reach")
+
+    def test_a_fraction_is_named_by_the_caller(self):
+        truth = self._truth((5, 7), 66)
+        got = self._device(truth).sum(dtype=tensorplay.float32)
+        self.assertEqual(str(got.dtype), "tensorplay.float32")
+        self.assertAlmostEqual(
+            float(got.cpu().numpy()), float(truth.sum()), places=4,
+            msg="a mask's total asked for as a fraction")
+
+    def test_a_count_of_a_truth_plane_answers_the_same_as_its_total(self):
+        truth = self._truth((4, 9, 2), 67)
+        counted = self._device(truth).count_nonzero(-1)
+        np.testing.assert_array_equal(
+            counted.cpu().numpy(),
+            truth.sum(axis=-1, dtype=np.int64),
+            err_msg="a count over the last axis of a mask")
+
+    def test_a_plane_without_lanes_totals_to_nothing(self):
+        for payload in (np.zeros((0, 4), np.bool_), np.zeros((0, 4), np.int32)):
+            got = self._device(payload).sum()
+            self.assertEqual(str(got.dtype), "tensorplay.int64")
+            self.assertEqual(int(got.cpu().numpy()), 0,
+                             "nothing adds to nothing")
+
+    def test_a_width_the_backend_cannot_name_is_refused(self):
+        truth = self._truth((2, 3), 68)
+        with self.assertRaisesRegex(RuntimeError, "Int64, Float32"):
+            self._device(truth).sum(dtype=tensorplay.int16)
+
+    def test_a_plane_of_wide_lanes_stays_outside_the_walk(self):
+        # A lane that is already the wide word has no walk here that adds it
+        # without rounding, so the plane is refused rather than answered with
+        # the low half of every number.
+        wide = self._device(np.arange(5, dtype=np.int64))
+        with self.assertRaisesRegex(RuntimeError, "Float32 and Float16"):
+            wide.sum()
+
+
 if __name__ == "__main__":
     unittest.main()
