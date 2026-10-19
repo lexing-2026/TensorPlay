@@ -10,9 +10,6 @@
 
 #include <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
 
-#include <atomic>
-#include <cstdio>
-
 namespace tensorplay {
 namespace mps {
 
@@ -287,19 +284,7 @@ MPSBinaryOpBlock geBlock = ^MPSGraphTensor*(MPSGraph* g, MPSGraphTensor* a,
 Tensor unaryShaderOrOp(const std::string& op, const Tensor& self,
                        MPSUnaryOpBlock block) {
   if (auto result = unaryShader(op, self)) {
-    if (op == "relu") {
-      static std::atomic<int> taken{0};
-      if (taken.fetch_add(1) < 5) {
-        std::fprintf(stderr, "[mps-diag] relu took the shader path\n");
-      }
-    }
     return *result;
-  }
-  if (op == "relu") {
-    static std::atomic<int> reports{0};
-    if (reports.fetch_add(1) < 5) {
-      std::fprintf(stderr, "[mps-diag] relu took the graph fallback\n");
-    }
   }
   return unaryOp(op, self, block);
 }

@@ -5,6 +5,7 @@
 
 #include "backend/mps/MPSAllocator.h"
 #include "backend/mps/MPSStream.h"
+#include "backend/mps/DiagTimer.h"
 #include "backend/mps/MetalShaderLibrary.h"
 #include "backend/mps/MetalUtils.h"
 #include "backend/mps/kernels/common.h"
@@ -691,6 +692,7 @@ std::optional<Tensor> denseBinaryShader(const std::string& op,
                                         const Tensor& self,
                                         const Tensor& other,
                                         const std::optional<Scalar>& alpha) {
+  const unsigned long long diag_t0 = diagNowNs();
   if (!denseScaleIsOne(alpha) || !denseOperandPair(self, other)) {
     return std::nullopt;
   }
@@ -718,11 +720,13 @@ std::optional<Tensor> denseBinaryShader(const std::string& op,
   }
   const std::vector<int64_t> shape =
       static_cast<std::vector<int64_t>>(self.shape());
+  const unsigned long long diag_a0 = diagNowNs();
   Tensor output = emptyMPS(shape, self.dtype(), self.device());
   void* out_buf = getMTLBufferFromPointer(output.data_ptr());
   if (!out_buf) {
     return std::nullopt;
   }
+  const unsigned long long diag_a1 = diagNowNs();
 
   const uint32_t elements = static_cast<uint32_t>(numel);
   MTLComputePipelineState_t vec_pso =
@@ -750,6 +754,15 @@ std::optional<Tensor> denseBinaryShader(const std::string& op,
           threadsPerThreadgroup:MTLSizeMake(per_group, 1, 1)];
     }
   });
+  if (op == "add") {
+    const unsigned long long diag_end = diagNowNs();
+    static thread_local DiagTimer total{"binary add total"};
+    static thread_local DiagTimer alloc{"binary add alloc"};
+    static thread_local DiagTimer enc{"binary add encode"};
+    total.record(diag_end - diag_t0);
+    alloc.record(diag_a1 - diag_a0);
+    enc.record(diag_end - diag_a1);
+  }
   return output;
 }
 
@@ -981,6 +994,7 @@ std::optional<Tensor> broadcastTernaryShader(
 }
 
 std::optional<Tensor> unaryShader(const std::string& op, const Tensor& self) {
+  const unsigned long long diag_t0 = diagNowNs();
   if (!self.device().is_mps()) {
     return std::nullopt;
   }
@@ -1012,11 +1026,13 @@ std::optional<Tensor> unaryShader(const std::string& op, const Tensor& self) {
   }
   const std::vector<int64_t> shape =
       static_cast<std::vector<int64_t>>(self.shape());
+  const unsigned long long diag_a0 = diagNowNs();
   Tensor output = emptyMPS(shape, self.dtype(), self.device());
   void* out_buf = getMTLBufferFromPointer(output.data_ptr());
   if (!out_buf) {
     return std::nullopt;
   }
+  const unsigned long long diag_a1 = diagNowNs();
 
   const uint32_t elements = static_cast<uint32_t>(numel);
   MTLComputePipelineState_t vec_pso =
@@ -1044,6 +1060,15 @@ std::optional<Tensor> unaryShader(const std::string& op, const Tensor& self) {
           threadsPerThreadgroup:MTLSizeMake(per_group, 1, 1)];
     }
   });
+  if (op == "relu") {
+    const unsigned long long diag_end = diagNowNs();
+    static thread_local DiagTimer total{"unary relu total"};
+    static thread_local DiagTimer alloc{"unary relu alloc"};
+    static thread_local DiagTimer enc{"unary relu encode"};
+    total.record(diag_end - diag_t0);
+    alloc.record(diag_a1 - diag_a0);
+    enc.record(diag_end - diag_a1);
+  }
   return output;
 }
 
