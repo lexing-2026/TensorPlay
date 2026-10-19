@@ -4558,5 +4558,99 @@ class TestVulkanUnaryWidth(unittest.TestCase):
             self.assertEqual(written.dtype, tp.float32, msg=name)
 
 
+class TestVulkanPowerLanes(unittest.TestCase):
+    # A texel and a word each carry several exponents, so the three decisions a
+    # power makes -- whether the exponent is whole, which sign a negative base
+    # takes, and how a fraction reads back into a count -- belong to one lane at
+    # a time.  Taken for the whole word they answer for exponents the lane never
+    # had: a signed word rounded the half a negative power names up into a whole
+    # count, and a single precision word lost the sign of the lanes that shared
+    # it with a fractional exponent.
+
+    LENGTHS = (100001, 200003)
+
+    # Whole exponents of both parities beside fractional ones that have no
+    # value at all over a negative base.
+    EXPONENTS = np.array([2.0, 2.5, 4.0, 4.5, 3.0, 0.5, 6.0, 1.5],
+                         dtype=np.float32)
+    SIGNED = np.array([4.0, np.nan, 16.0, np.nan, -8.0, np.nan, 64.0, np.nan],
+                      dtype=np.float32)
+
+    @staticmethod
+    def _device(values):
+        return tensorplay.from_numpy(np.array(values)).to("vulkan")
+
+    @staticmethod
+    def _host(values):
+        return tensorplay.from_numpy(np.array(values))
+
+    def _check_signed(self, got, want, label):
+        self.assertTrue(np.array_equal(np.isnan(got), np.isnan(want)),
+                        msg=f"{label}: which lanes have no value")
+        np.testing.assert_allclose(
+            np.nan_to_num(got, nan=0.0), np.nan_to_num(want, nan=0.0),
+            rtol=1e-3, atol=1e-3, err_msg=label)
+
+    def test_a_base_reflected_into_mixed_exponents_keeps_each_lane(self):
+        for dtype in (np.float32, np.float16):
+            exponents = self.EXPONENTS.astype(dtype)
+            signed = self.SIGNED.astype(dtype)
+            got = ((-2.0) ** self._device(exponents)).cpu().numpy()
+            self._check_signed(
+                got, signed, f"reflected base, {np.dtype(dtype).name}")
+            self.assertEqual(got.dtype, dtype, msg="reflected width")
+
+        # One exponent per word on the linear path, and a whole row of texels
+        # past the image edge on the packed one.
+        for count in self.LENGTHS:
+            exponents = np.resize(self.EXPONENTS, count).astype(np.float32)
+            signed = np.resize(self.SIGNED, count).astype(np.float32)
+            got = ((-2.0) ** self._device(exponents)).cpu().numpy()
+            self._check_signed(got, signed, f"reflected base at {count}")
+
+    def test_a_pair_of_payloads_keeps_each_lanes_value(self):
+        bases = np.full(self.EXPONENTS.shape, -2.0, dtype=np.float32)
+        got = tensorplay.pow(self._device(bases),
+                             self._device(self.EXPONENTS)).cpu().numpy()
+        self._check_signed(got, self.SIGNED, "base and exponent as payloads")
+
+        for count in self.LENGTHS:
+            exponents = np.resize(self.EXPONENTS, count).astype(np.float32)
+            bases = np.full(count, -2.0, dtype=np.float32)
+            got = tensorplay.pow(self._device(bases),
+                                 self._device(exponents)).cpu().numpy()
+            self._check_signed(got, np.resize(self.SIGNED, count),
+                               f"payload pair at {count}")
+
+    def test_a_fraction_of_a_count_is_read_the_way_the_word_holds_it(self):
+        # Half of a count: the answer has no fractions to keep, and a half
+        # rounded up would name a count no division of it gives.
+        np.testing.assert_array_equal(
+            (2 ** self._device(np.array([-1], dtype=np.int32))).cpu().numpy(),
+            np.array([0], dtype=np.int32),
+            err_msg="a half read back into a count")
+
+        exponents = np.array([-1, 2, -1, 2, -2, 3, -3, 0], dtype=np.int32)
+        for base in (2, -2, 3):
+            want = (base ** self._host(exponents)).cpu().numpy()
+            np.testing.assert_array_equal(
+                (base ** self._device(exponents)).cpu().numpy(), want,
+                err_msg=f"count exponents under {base}")
+
+        # A whole power that reaches past a word stays on the number it names.
+        wide = np.array([30, 29, -1, 0], dtype=np.int32)
+        np.testing.assert_array_equal(
+            (2 ** self._device(wide)).cpu().numpy(),
+            (2 ** self._host(wide)).cpu().numpy(),
+            err_msg="count exponents at the top of a word")
+
+        for count in self.LENGTHS:
+            row = np.resize(exponents, count).astype(np.int32)
+            np.testing.assert_array_equal(
+                (2 ** self._device(row)).cpu().numpy(),
+                (2 ** self._host(row)).cpu().numpy(),
+                err_msg=f"count exponents at {count}")
+
+
 if __name__ == "__main__":
     unittest.main()
