@@ -1431,6 +1431,51 @@ class TestVulkanLinearPayload(unittest.TestCase):
                 rtol=1e-3, atol=1e-3,
                 err_msg=f"linear with bias m={m} k={k} n={n}")
 
+    def test_half_precision_layers_down_a_streamed_embedding(self):
+        import tensorplay as tp
+        import tensorplay.functional as F
+        # A table taller than the image axis limit has no texel form, so the rows
+        # a lookup reads out of it -- and every half product that a linear weight
+        # writes into linear storage -- used to reach the next layer as a payload
+        # its texture-only kernel cannot read.  Both producers now hand back an
+        # image as soon as the shape still has one, a half payload crossing that
+        # boundary two lanes to a word.  The last layer takes a weight small
+        # enough to keep its texels, so it only runs if the repack happened.
+        rng = np.random.default_rng(83)
+        rows, features, narrow, tail = 20000, 64, 33, 16
+
+        def half(scale, *shape):
+            return (rng.standard_normal(shape) * scale).astype(np.float16)
+
+        table_cpu = half(0.4, rows, features)
+        w1_cpu = half(0.05, rows, features)
+        w2_cpu = half(0.05, narrow, rows)
+        w3_cpu = half(0.05, tail, narrow)
+        ids_cpu = np.array([5, 19999, 0, 7777], dtype=np.int64)
+
+        table = tensorplay.from_numpy(table_cpu.copy()).to("vulkan")
+        ids = tensorplay.from_numpy(ids_cpu.copy()).to("vulkan")
+        w1 = tensorplay.from_numpy(w1_cpu.copy()).to("vulkan")
+        w2 = tensorplay.from_numpy(w2_cpu.copy()).to("vulkan")
+        w3 = tensorplay.from_numpy(w3_cpu.copy()).to("vulkan")
+
+        x = tp.embedding(table, ids)
+        self.assertEqual(x.dtype, tp.float16)
+        y = F.linear(x, w1)
+        z = F.linear(y, w2)
+        out = F.linear(z, w3)
+
+        expect = (
+            (
+                table_cpu[ids_cpu].astype(np.float32)
+                @ w1_cpu.T.astype(np.float32)
+            )
+            @ w2_cpu.T.astype(np.float32)
+        ) @ w3_cpu.T.astype(np.float32)
+        self.assertEqual(tuple(out.shape), (4, tail))
+        np.testing.assert_allclose(
+            out.cpu().numpy(), expect, rtol=2e-2, atol=2e-3)
+
     def test_tiled_product_over_linear_weight(self):
         import tensorplay as tp
         import tensorplay.functional as F
