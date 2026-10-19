@@ -158,3 +158,36 @@ def test_w4a16_linear_over_both_storages(m, k, n, with_bias):
     assert out.dtype == tp.float16
     assert tuple(out.shape) == (m, n)
     np.testing.assert_array_equal(out.cpu().numpy(), expected)
+
+
+# The output projection of a full vocabulary is a weight with far more rows than
+# an image axis holds, so it can only arrive as integer codes in linear storage
+# and be named as a quantized payload where it landed.  A row count within the
+# limit draws an image instead, which keeps both payload forms of the factory in
+# one parametrized sweep.
+@pytest.mark.parametrize("n,k", [(16384, 8), (16385, 13), (20000, 8)])
+def test_w4a16_linear_from_an_uploaded_weight(n, k):
+    rng = np.random.default_rng(n * 7 + k)
+    codes = rng.integers(-8, 8, (n, k)).astype(np.int8)
+    w_scales = np.exp2(-rng.integers(1, 4, n)).astype(np.float32)
+    bias_values = rng.integers(-3, 4, n).astype(np.float32)
+    act_codes = rng.integers(-4, 5, (3, k)).astype(np.float32)
+
+    weight = tp._C._make_per_tensor_quantized_tensor(
+        tp.from_numpy(codes.copy()).to("vulkan"), 1.0, 0)
+    assert weight.dtype == tp.qint8
+    assert weight.q_scale() == 1.0
+    assert weight.q_zero_point() == 0
+
+    act = tp.tensor(act_codes, dtype=tp.float32).to("vulkan").to(tp.float16)
+    out = tp._C.w4a16_linear(
+        act,
+        weight,
+        tp.tensor(w_scales, dtype=tp.float32),
+        tp.tensor(bias_values, dtype=tp.float32),
+    )
+    expected = (
+        act_codes @ codes.T.astype(np.float32) * w_scales + bias_values
+    ).astype(np.float16)
+    assert tuple(out.shape) == (3, n)
+    np.testing.assert_array_equal(out.cpu().numpy(), expected)
