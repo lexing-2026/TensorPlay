@@ -1249,6 +1249,19 @@ void clip_impl(const void* x, void* y, int64_t size, DType dtype, int64_t lo, in
     }
 }
 
+// The register gather and the buffer gather deduce to the same signature over a
+// float table, and MSVC cannot order that pair. Spelling the element type at the
+// call resolves it, but selects the buffer form on every compiler; naming the
+// scale alone keeps the register form wherever the instruction exists.
+inline vec::Vectorized<float> table_gather(const float* table,
+        const vec::Vectorized<int32_t>& index) {
+#ifdef _MSC_VER
+    return vec::gather<4, float>(table, index);
+#else
+    return vec::gather<4>(table, index);
+#endif
+}
+
 void lookup_impl(const uint8_t* x, uint8_t* y, int64_t size, const float* table) {
     using QV = vec::Vectorized<quint8>;
     using FV = vec::Vectorized<float>;
@@ -1257,7 +1270,7 @@ void lookup_impl(const uint8_t* x, uint8_t* y, int64_t size, const float* table)
     for (; i + QV::size() <= size; i += QV::size()) {
         auto values = QV::loadu(x + i).dequantize(one, zero);
         for (auto& v : values)
-            v = vec::gather<4, float>(table, vec::convert_to_int_of_same_size<float>(v));
+            v = table_gather(table, vec::convert_to_int_of_same_size<float>(v));
         QV::quantize(values, 1.f, 0, 1.f).store(y + i);
     }
     for (; i < size; ++i) y[i] = static_cast<uint8_t>(table[x[i]]);
