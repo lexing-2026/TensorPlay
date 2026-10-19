@@ -882,6 +882,110 @@ __global__ void binary_row_broadcast_vec_kernel(
     }
 }
 
+// Flat specialization of the row-segment kernel for a rank-2 output: when an
+// operand's row base is one row stride away from the previous row, the row
+// coordinate falls straight out of blockIdx.y, so this kernel carries no
+// coordinate math and keeps only the packed access pattern of the same-shape
+// kernel.  An operand that repeats one element across the row (or the same
+// row across the batch) contributes a splat scalar; the others are read as
+// packed groups.
+template <typename T, int VecSize, typename Op>
+__global__ void binary_row_flat_vec_kernel(
+    int64_t inner, int64_t vec_inner,
+    const T* __restrict__ a, int64_t a_row_stride, bool a_splat,
+    const T* __restrict__ b, int64_t b_row_stride, bool b_splat,
+    T* __restrict__ y, typename BinaryOpMath<T>::type alpha, Op op) {
+    using M = typename BinaryOpMath<T>::type;
+    const int64_t row = blockIdx.y;
+    const int64_t group = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (group >= vec_inner) return;
+    const int64_t col = group * VecSize;
+    TPVecPack<T, VecSize> po;
+    if (a_splat) {
+        const M x = static_cast<M>(a[row * a_row_stride]);
+        const TPVecPack<T, VecSize> pb =
+            *reinterpret_cast<const TPVecPack<T, VecSize>*>(b + row * b_row_stride + col);
+#pragma unroll
+        for (int v = 0; v < VecSize; ++v) {
+            po.v[v] = static_cast<T>(op(x, static_cast<M>(pb.v[v]), static_cast<M>(alpha)));
+        }
+    } else if (b_splat) {
+        const M u = static_cast<M>(b[row * b_row_stride]);
+        const TPVecPack<T, VecSize> pa =
+            *reinterpret_cast<const TPVecPack<T, VecSize>*>(a + row * a_row_stride + col);
+#pragma unroll
+        for (int v = 0; v < VecSize; ++v) {
+            po.v[v] = static_cast<T>(op(static_cast<M>(pa.v[v]), u, static_cast<M>(alpha)));
+        }
+    } else {
+        const TPVecPack<T, VecSize> pa =
+            *reinterpret_cast<const TPVecPack<T, VecSize>*>(a + row * a_row_stride + col);
+        const TPVecPack<T, VecSize> pb =
+            *reinterpret_cast<const TPVecPack<T, VecSize>*>(b + row * b_row_stride + col);
+#pragma unroll
+        for (int v = 0; v < VecSize; ++v) {
+            po.v[v] = static_cast<T>(
+                op(static_cast<M>(pa.v[v]), static_cast<M>(pb.v[v]), static_cast<M>(alpha)));
+        }
+    }
+    *reinterpret_cast<TPVecPack<T, VecSize>*>(y + row * inner + col) = po;
+}
+
+// Launches the flat specialization when the output is a contiguous 2-D tensor
+// and both operands right-align to it with at most one row stride each.  A
+// trailing size-1 dim makes an operand a per-row splat; a trailing dim equal
+// to the row length is read as packed groups, which needs a unit inner stride
+// and 4-element-aligned row bases.  Returns false so the general row kernel
+// (or the per-element kernel) takes the shape instead.
+template <typename T, typename Op>
+inline bool try_row_flat(
+    int64_t inner, int64_t rows, const Tensor& a, const Tensor& b, Tensor& y,
+    typename BinaryOpMath<T>::type alpha, Op op, cudaStream_t stream) {
+    constexpr int kVec = 4;
+    const uintptr_t align_mask = sizeof(T) * kVec - 1;
+    if (y.dim() != 2 || inner % kVec != 0) return false;
+    if (rows <= 0 || rows > 65535 || a.dim() < 1 || b.dim() < 1) return false;
+    if (a.dim() > 2 || b.dim() > 2) return false;
+    // Broadcasting contract, right-aligned: the trailing dim spans the row or
+    // repeats one element, and a rank-2 leading dim spans the rows or repeats.
+    const bool a_full = a.size(-1) == inner;
+    const bool b_full = b.size(-1) == inner;
+    if (!a_full && a.size(-1) != 1) return false;
+    if (!b_full && b.size(-1) != 1) return false;
+    if (a.dim() == 2 && a.size(0) != 1 && a.size(0) != rows) return false;
+    if (b.dim() == 2 && b.size(0) != 1 && b.size(0) != rows) return false;
+    const int64_t a_row_stride = (a.dim() == 2 && a.size(0) != 1) ? a.stride(0) : 0;
+    const int64_t b_row_stride = (b.dim() == 2 && b.size(0) != 1) ? b.stride(0) : 0;
+    if (a_full &&
+        (a.stride(-1) != 1 || a_row_stride % kVec != 0 ||
+         (reinterpret_cast<uintptr_t>(a.data_ptr<T>()) & align_mask) != 0)) {
+        return false;
+    }
+    if (b_full &&
+        (b.stride(-1) != 1 || b_row_stride % kVec != 0 ||
+         (reinterpret_cast<uintptr_t>(b.data_ptr<T>()) & align_mask) != 0)) {
+        return false;
+    }
+    if ((reinterpret_cast<uintptr_t>(y.data_ptr<T>()) & align_mask) != 0) return false;
+
+    const int64_t vec_inner = inner / kVec;
+    // Short rows would leave most lanes idle in a full block; shrink the block
+    // to a warp multiple that still covers the row.
+    unsigned threads = 256;
+    if (vec_inner < static_cast<int64_t>(threads)) {
+        threads = static_cast<unsigned>(((vec_inner + 31) / 32) * 32);
+    }
+    const int64_t blocks_x = (vec_inner + threads - 1) / threads;
+    if (blocks_x > 2147483647) return false;
+    dim3 grid(static_cast<unsigned>(blocks_x), static_cast<unsigned>(rows));
+    binary_row_flat_vec_kernel<T, kVec, Op><<<grid, threads, 0, stream>>>(
+        inner, vec_inner,
+        a.data_ptr<T>(), a_row_stride, !a_full,
+        b.data_ptr<T>(), b_row_stride, !b_full,
+        y.data_ptr<T>(), alpha, op);
+    return true;
+}
+
 // Returns true when the row-segment kernel handled the op.  Eligibility:
 // contiguous output and operands whose dimensions are all full-length or 1
 // (the broadcasting contract), with the output rank <= 1 or an inner row the
@@ -904,6 +1008,9 @@ inline bool try_binary_row_broadcast(
     if (y.dim() > CUDA_BROADCAST_MAX_DIMS || a.dim() > static_cast<int>(y.dim()) ||
         b.dim() > static_cast<int>(y.dim())) {
         return false;
+    }
+    if (try_row_flat<T>(inner, rows, a, b, y, alpha, op, stream)) {
+        return true;
     }
     const TensorDesc y_desc = make_desc(y, static_cast<size_t>(y.dim()));
     const TensorDesc a_desc = make_desc(a, static_cast<size_t>(y.dim()));
