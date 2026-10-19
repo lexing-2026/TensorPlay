@@ -19,6 +19,16 @@ api::vTensor to_buffer_storage_dispatch(
     api::Context* context,
     const api::vTensor& src);
 
+// Defined in View.cpp; materializes a strided view of a payload.  An identity
+// mapping over a word-stored source releases an image copy of the same
+// elements, which is how a lookup that had to stream its table still hands its
+// rows to the kernels that read texels.
+Tensor materialize_view(
+    const Tensor& self,
+    const std::vector<int64_t>& out_sizes,
+    const std::vector<int64_t>& out_strides,
+    int64_t storage_offset);
+
 namespace {
 
 void validate_gather_operand(const Tensor& t, const char* name) {
@@ -238,6 +248,13 @@ Tensor embedding_kernel(
             api::MemoryAccessType::READ),
         params.buffer());
     Tensor out = convert(v_output);
+    // A lookup that had to stream its table still hands its rows out in the
+    // form their own shape fits: the kernels downstream read a texture, and a
+    // small payload left in words has no linear variant to run on.
+    if (image_storage_supported(context, {index_count, features})) {
+      out = materialize_view(
+          out, {index_count, features}, {features, 1}, 0);
+    }
     if (indices.dim() != 1) {
       std::vector<int64_t> out_sizes =
           static_cast<std::vector<int64_t>>(indices.shape());
