@@ -379,7 +379,7 @@ Tensor batch_norm_kernel(const Tensor& input,
       const uint32_t channels_u = static_cast<uint32_t>(C);
       const uint32_t batch_u = static_cast<uint32_t>(batch);
       MPSStream* mpsStream = getCurrentMPSStream();
-      dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+      run_serialized(mpsStream->queue(), ^() {
         @autoreleasepool {
           id<MTLComputeCommandEncoder> encoder = mpsStream->commandEncoder();
           [encoder setComputePipelineState:pso];
@@ -649,7 +649,7 @@ Tensor group_norm_kernel(const Tensor& input, int64_t num_groups,
         tptg = std::max<uint32_t>(tptg, 32);
         const float eps_f = static_cast<float>(eps);
         MPSStream* mpsStream = getCurrentMPSStream();
-        dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+        run_serialized(mpsStream->queue(), ^() {
           @autoreleasepool {
             id<MTLComputeCommandEncoder> encoder =
                 mpsStream->commandEncoder();

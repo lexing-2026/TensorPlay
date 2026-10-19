@@ -138,7 +138,7 @@ Tensor cat_kernel(const std::vector<Tensor>& tensors, int64_t dim) {
       MetalShaderLibrary::getBundledLibrary().getPipelineStateForFunc(
           "strided_block_copy");
   MPSStream* stream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(stream->queue(), ^() {
+  run_serialized(stream->queue(), ^() {
     @autoreleasepool {
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:pso];
@@ -210,7 +210,7 @@ Tensor stack_kernel(const std::vector<Tensor>& tensors, int64_t dim) {
       MetalShaderLibrary::getBundledLibrary().getPipelineStateForFunc(
           "strided_block_copy");
   MPSStream* stream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(stream->queue(), ^() {
+  run_serialized(stream->queue(), ^() {
     @autoreleasepool {
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:pso];
@@ -297,7 +297,7 @@ Tensor embedding_kernel(const Tensor& weight, const Tensor& indices,
   auto pso = MetalShaderLibrary::getBundledLibrary().getPipelineStateForFunc(
       kernel);
   MPSStream* mpsStream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+  run_serialized(mpsStream->queue(), ^() {
     @autoreleasepool {
       auto computeEncoder = mpsStream->commandEncoder();
       [computeEncoder setComputePipelineState:pso];

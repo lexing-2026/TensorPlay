@@ -53,7 +53,7 @@ std::tuple<Tensor, Tensor> native_dropout_kernel(const Tensor& input, double p,
   auto pso = lib.getPipelineStateForFunc("dropout_fwd_" +
                                          scalarToMetalTypeString(input_c.dtype()));
   MPSStream* stream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(stream->queue(), ^() {
+  run_serialized(stream->queue(), ^() {
     @autoreleasepool {
       stream->endKernelCoalescing();
       auto encoder = stream->commandEncoder();
@@ -79,7 +79,7 @@ Tensor native_dropout_backward_kernel(const Tensor& grad_output,
   auto pso = lib.getPipelineStateForFunc("dropout_bwd_" +
                                          scalarToMetalTypeString(grad_output.dtype()));
   MPSStream* stream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(stream->queue(), ^() {
+  run_serialized(stream->queue(), ^() {
     @autoreleasepool {
       stream->endKernelCoalescing();
       auto encoder = stream->commandEncoder();

@@ -77,7 +77,7 @@ void dispatch_bounds_check(const Tensor& idx, int64_t dim_size) {
       "index_bounds_check_" + scalarToMetalTypeString(idx.dtype());
   auto pso = lib.getPipelineStateForFunc(kernel);
   MPSStream* stream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(stream->queue(), ^() {
+  run_serialized(stream->queue(), ^() {
     @autoreleasepool {
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:pso];
@@ -99,7 +99,7 @@ void dispatch_indexing(const std::string& kernel, const Tensor& output,
   auto pso = lib.getPipelineStateForFunc(kernel);
   const int64_t outer = length / (inner * idx_dim);
   MPSStream* stream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(stream->queue(), ^() {
+  run_serialized(stream->queue(), ^() {
     @autoreleasepool {
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:pso];
@@ -147,7 +147,7 @@ bool dispatch_index_select_wide(const Tensor& output, const Tensor& input,
       std::string("index_select_vec") + suffix + "_long";
   auto pso = lib.getPipelineStateForFunc(kernel);
   MPSStream* stream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(stream->queue(), ^() {
+  run_serialized(stream->queue(), ^() {
     @autoreleasepool {
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:pso];
@@ -170,7 +170,7 @@ void dispatch_scatter_value(const std::string& kernel, const Tensor& output,
   auto pso = lib.getPipelineStateForFunc(kernel);
   const int64_t outer = index.numel() / (inner * idx_dim);
   MPSStream* stream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(stream->queue(), ^() {
+  run_serialized(stream->queue(), ^() {
     @autoreleasepool {
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:pso];
@@ -190,7 +190,7 @@ void dispatch_masked_fill(const Tensor& out, const Tensor& mask,
   auto pso = lib.getPipelineStateForFunc(
       "masked_fill_scalar_" + scalarToMetalTypeString(out.dtype()));
   MPSStream* stream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(stream->queue(), ^() {
+  run_serialized(stream->queue(), ^() {
     @autoreleasepool {
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:pso];

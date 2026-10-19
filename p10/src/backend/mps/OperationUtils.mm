@@ -588,7 +588,7 @@ std::optional<Tensor> broadcastBinaryShader(
   }
 
   MPSStream* stream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(stream->queue(), ^() {
+  run_serialized(stream->queue(), ^() {
     @autoreleasepool {
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:pso];
@@ -738,7 +738,7 @@ std::optional<Tensor> denseBinaryShader(const std::string& op,
       total, elements,
       static_cast<uint32_t>([active_pso maxTotalThreadsPerThreadgroup]));
   MPSStream* stream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(stream->queue(), ^() {
+  run_serialized(stream->queue(), ^() {
     @autoreleasepool {
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:active_pso];
@@ -837,7 +837,7 @@ std::optional<Tensor> denseScalarBinaryShader(const std::string& op,
   }
 
   MPSStream* stream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(stream->queue(), ^() {
+  run_serialized(stream->queue(), ^() {
     @autoreleasepool {
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:active_pso];
@@ -934,7 +934,7 @@ std::optional<Tensor> broadcastTernaryShader(
   }
 
   MPSStream* stream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(stream->queue(), ^() {
+  run_serialized(stream->queue(), ^() {
     @autoreleasepool {
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:pso];
@@ -1033,7 +1033,7 @@ std::optional<Tensor> unaryShader(const std::string& op, const Tensor& self) {
       static_cast<uint32_t>([active_pso maxTotalThreadsPerThreadgroup]));
 
   MPSStream* stream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(stream->queue(), ^() {
+  run_serialized(stream->queue(), ^() {
     @autoreleasepool {
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:active_pso];
@@ -1112,7 +1112,7 @@ std::optional<Tensor> clampShader(const Tensor& self,
       static_cast<uint32_t>([active_pso maxTotalThreadsPerThreadgroup]));
 
   MPSStream* stream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(stream->queue(), ^() {
+  run_serialized(stream->queue(), ^() {
     @autoreleasepool {
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:active_pso];
@@ -1153,7 +1153,7 @@ void dispatchRowReduce(MTLComputePipelineState_t pso, void* out_buf,
   const std::array<uint32_t, 2> sizes = {rows, length};
   const float division = divisor.value_or(0.0f);
   MPSStream* stream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(stream->queue(), ^() {
+  run_serialized(stream->queue(), ^() {
     @autoreleasepool {
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:pso];
@@ -1182,7 +1182,7 @@ void dispatchRowValueIndex(MTLComputePipelineState_t pso, void* value_buf,
   const uint32_t groups = (rows + rows_per_group - 1) / rows_per_group;
   const std::array<uint32_t, 2> sizes = {rows, length};
   MPSStream* stream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(stream->queue(), ^() {
+  run_serialized(stream->queue(), ^() {
     @autoreleasepool {
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:pso];
@@ -1334,7 +1334,7 @@ std::optional<Tensor> softmaxRowShader(const Tensor& self, int64_t dim,
   const NSUInteger cache_bytes =
       static_cast<NSUInteger>(groups) * length * sizeof(float);
   MPSStream* stream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(stream->queue(), ^() {
+  run_serialized(stream->queue(), ^() {
     @autoreleasepool {
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:pso];
@@ -1471,7 +1471,7 @@ void dispatchChunkReduce(MTLComputePipelineState_t pso, void* out_buf,
   const uint32_t threadgroups =
       (groups + groups_per_threadgroup - 1) / groups_per_threadgroup;
   MPSStream* stream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(stream->queue(), ^() {
+  run_serialized(stream->queue(), ^() {
     @autoreleasepool {
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:pso];
@@ -1714,7 +1714,7 @@ std::optional<Tensor> compareShader(const std::string& op, const Tensor& self,
       total, elements,
       static_cast<uint32_t>([active_pso maxTotalThreadsPerThreadgroup]));
   MPSStream* stream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(stream->queue(), ^() {
+  run_serialized(stream->queue(), ^() {
     @autoreleasepool {
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:active_pso];
@@ -1816,7 +1816,7 @@ Tensor whereOp(const Tensor& condition, const Tensor& self,
         if (out_buf) {
           const uint32_t total = static_cast<uint32_t>(numel);
           MPSStream* stream = getCurrentMPSStream();
-          dispatch_sync_with_rethrow(stream->queue(), ^() {
+          run_serialized(stream->queue(), ^() {
             @autoreleasepool {
               auto encoder = stream->commandEncoder();
               [encoder setComputePipelineState:pso];
@@ -1878,7 +1878,7 @@ Tensor whereOp(const Tensor& condition, const Tensor& self,
         void* out_buf = getMTLBufferFromPointer(output.data_ptr());
         if (out_buf) {
           MPSStream* stream = getCurrentMPSStream();
-          dispatch_sync_with_rethrow(stream->queue(), ^() {
+          run_serialized(stream->queue(), ^() {
             @autoreleasepool {
               auto encoder = stream->commandEncoder();
               [encoder setComputePipelineState:pso];

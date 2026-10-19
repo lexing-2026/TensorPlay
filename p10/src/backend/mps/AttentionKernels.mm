@@ -170,7 +170,7 @@ std::optional<Tensor> sdpa_decode_shader(const Tensor& q_in,
   const float scale_f = static_cast<float>(scale_factor);
 
   MPSStream* mpsStream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+  run_serialized(mpsStream->queue(), ^() {
     @autoreleasepool {
       id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
       id<MTLComputePipelineState> PSO =
@@ -309,7 +309,7 @@ std::optional<Tensor> sdpa_decode_2pass_shader(
   const float scale_f = static_cast<float>(scale_factor);
 
   MPSStream* mpsStream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+  run_serialized(mpsStream->queue(), ^() {
     @autoreleasepool {
       id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
       id<MTLComputePipelineState> pass1PSO =
@@ -547,7 +547,7 @@ std::optional<Tensor> sdpa_prefill_shader(const Tensor& q_in,
 
   const int64_t nQ = (qL + shape.BQ - 1) / shape.BQ;
   MPSStream* mpsStream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+  run_serialized(mpsStream->queue(), ^() {
     @autoreleasepool {
       id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
       id<MTLComputePipelineState> PSO =

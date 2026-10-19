@@ -14,6 +14,7 @@
 #include <array>
 #include <cstring>
 #include <exception>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <type_traits>
@@ -204,21 +205,21 @@ class ForeachArguments {
   NSUInteger bytes_ = 0;
 };
 
-// Runs a block on the MPS stream's serial queue, rethrowing C++ exceptions
-// across the dispatch boundary.
-inline void dispatch_sync_with_rethrow(dispatch_queue_t queue,
-                                       void (^block)()) {
-  __block std::optional<std::exception_ptr> block_exception;
-  dispatch_sync(queue, ^() {
-    try {
-      block();
-    } catch (...) {
-      block_exception = std::current_exception();
-    }
-  });
-  if (block_exception) {
-    std::rethrow_exception(*block_exception);
+// Runs an encoding block against the stream that owns `queue`, keeping
+// launches from interleaving. The block runs on the calling thread under the
+// lock the stream attached to the queue: handing every launch to the queue's
+// worker costs a thread handoff, and the lock provides the same exclusion
+// without one. Exceptions reach the caller as they would from any other call.
+//
+// A queue without a lock is not a stream queue; it keeps its own ordering.
+inline void run_serialized(dispatch_queue_t queue, void (^block)()) {
+  auto* lock = static_cast<std::mutex*>(dispatch_get_context(queue));
+  if (!lock) {
+    dispatch_sync(queue, block);
+    return;
   }
+  std::lock_guard<std::mutex> guard(*lock);
+  block();
 }
 
 } // namespace mps

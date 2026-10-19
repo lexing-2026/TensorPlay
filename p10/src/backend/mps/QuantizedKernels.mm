@@ -197,7 +197,7 @@ Tensor weight_int8pack_mm_kernel(const Tensor& self, const Tensor& mat2,
   std::array<uint32_t, 3> sizes = {
       static_cast<uint32_t>(M), static_cast<uint32_t>(K),
       static_cast<uint32_t>(N)};
-  dispatch_sync(mpsStream->queue(), ^{
+  run_serialized(mpsStream->queue(), ^{
     @autoreleasepool {
       id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
       const std::string kernel = (M < 12)
@@ -252,7 +252,7 @@ Tensor convert_weight_to_int4pack_kernel(const Tensor& in,
   MPSStream* mpsStream = getCurrentMPSStream();
   std::array<uint32_t, 2> sizes = {
       static_cast<uint32_t>(N), static_cast<uint32_t>(Kdiv2 / 4)};
-  dispatch_sync(mpsStream->queue(), ^{
+  run_serialized(mpsStream->queue(), ^{
     @autoreleasepool {
       id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
       id<MTLComputePipelineState> PSO =
@@ -319,7 +319,7 @@ Tensor weight_int4pack_mm_kernel(const Tensor& self, const Tensor& mat2,
   std::array<uint32_t, 3> sizes = {
       static_cast<uint32_t>(M), static_cast<uint32_t>(K),
       static_cast<uint32_t>(N)};
-  dispatch_sync(mpsStream->queue(), ^{
+  run_serialized(mpsStream->queue(), ^{
     @autoreleasepool {
       id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
       const std::string kernel = "int4pack_mm_" +

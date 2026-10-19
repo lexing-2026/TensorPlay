@@ -65,7 +65,7 @@ bool try_mpp_gemm(const Tensor& a, const Tensor& b, Tensor& output,
       static_cast<uint64_t>(n), 1};
   const uint32_t batch_u = static_cast<uint32_t>(batch);
   MPSStream* stream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(stream->queue(), ^() {
+  run_serialized(stream->queue(), ^() {
     @autoreleasepool {
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:pso];

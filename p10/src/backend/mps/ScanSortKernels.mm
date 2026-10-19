@@ -59,7 +59,7 @@ void dispatch_scan(const std::string& kernel_name, const Tensor& src,
   const int inner_i = static_cast<int>(inner);
   const int outer_i = static_cast<int>(outer);
   MPSStream* stream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(stream->queue(), ^() {
+  run_serialized(stream->queue(), ^() {
     @autoreleasepool {
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:pso];
@@ -89,7 +89,7 @@ void dispatch_row_scan(const std::string& kernel_name, const Tensor& src,
   tg = std::min<uint32_t>(
       tg, static_cast<uint32_t>([pso maxTotalThreadsPerThreadgroup]) / 32 * 32);
   MPSStream* stream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(stream->queue(), ^() {
+  run_serialized(stream->queue(), ^() {
     @autoreleasepool {
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:pso];
@@ -315,7 +315,7 @@ std::tuple<Tensor, Tensor> sort_kernel(const Tensor& self, int64_t dim,
   const size_t idx_bytes = tptg * kSortLanes * sizeof(uint32_t);
 
   MPSStream* stream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(stream->queue(), ^() {
+  run_serialized(stream->queue(), ^() {
     @autoreleasepool {
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:pso];

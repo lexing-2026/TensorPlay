@@ -28,6 +28,9 @@ MPSStream::MPSStream(Stream stream) : _stream(stream) {
     TP_THROW(RuntimeError, "MPSStream constructed with a non-MPS stream");
   }
   _serialQueue = dispatch_queue_create("tensorplay mps stream", nullptr);
+  // Launches serialize against this lock rather than against the queue's
+  // worker thread; it is kept for as long as the queue itself.
+  dispatch_set_context(_serialQueue, new std::mutex());
   _errorBuffer = [MPSDevice::getInstance()->device()
       newBufferWithLength:4 * sizeof(int64_t)
                 options:MTLResourceStorageModeShared];
@@ -185,7 +188,7 @@ void MPSStream::flush() {
 }
 
 void MPSStream::addCompletedHandler(MTLCommandBufferHandler block) {
-  dispatch_sync(_serialQueue, ^() {
+  run_serialized(_serialQueue, ^() {
     @autoreleasepool {
       [commandBuffer() addCompletedHandler:block];
     }
@@ -198,7 +201,7 @@ void MPSStream::copy(MTLBuffer_t srcBuffer,
                      size_t srcOffset,
                      size_t dstOffset,
                      SyncType syncType) {
-  dispatch_sync(_serialQueue, ^() {
+  run_serialized(_serialQueue, ^() {
     @autoreleasepool {
       endKernelCoalescing();
       id<MTLBlitCommandEncoder> blitEncoder = [commandBuffer() blitCommandEncoder];
@@ -229,7 +232,7 @@ void MPSStream::executeMPSGraph(MPSGraph* mpsGraph,
                                 NSDictionary* feeds,
                                 NSDictionary* results,
                                 SyncType syncType) {
-  dispatch_sync_with_rethrow(_serialQueue, ^() {
+  run_serialized(_serialQueue, ^() {
     @autoreleasepool {
       endKernelCoalescing();
       @try {
@@ -308,9 +311,9 @@ void setCurrentMPSStream(MPSStream* stream) {
 
 void synchronizeHostAccess() {
   MPSStream* stream = getCurrentMPSStream();
-  // Draining on the stream's own queue keeps the wait in step with the launches
-  // that are still being encoded.
-  dispatch_sync_with_rethrow(stream->queue(), ^() {
+  // Draining under the stream's launch lock keeps the wait in step with the
+  // launches that are still being encoded.
+  run_serialized(stream->queue(), ^() {
     @autoreleasepool {
       stream->synchronize(SyncType::COMMIT_AND_WAIT);
     }
@@ -339,11 +342,11 @@ MPSStream* getStreamFromStream(const Stream& stream) {
 }
 
 void synchronizeAllMPSStreams(SyncType syncType) {
-  // Every launch is encoded on the stream's serial queue before its caller
+  // Every launch is encoded under the stream's lock before its caller
   // continues, so the default stream holds all of this thread's work by the
   // time the wait starts and is waited on directly. A pool stream may have
-  // been used from another thread, so it is drained on its own queue, and an
-  // idle one is skipped: it has nothing to wait for.
+  // been used from another thread, so it is drained under its own lock, and
+  // an idle one is skipped: it has nothing to wait for.
   getDefaultMPSStream()->synchronize(syncType);
   if (streamPoolInitialized.load(std::memory_order_acquire)) {
     for (int i = 0; i < kStreamsPerPool; ++i) {
@@ -351,7 +354,7 @@ void synchronizeAllMPSStreams(SyncType syncType) {
       if (!stream->hasPendingWork()) {
         continue;
       }
-      dispatch_sync_with_rethrow(stream->queue(), ^() {
+      run_serialized(stream->queue(), ^() {
         stream->synchronize(syncType);
       });
     }

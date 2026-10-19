@@ -115,7 +115,7 @@ std::tuple<Tensor, Tensor> rms_norm_forward(
   constexpr uint32_t kLoopedLimit = 4096;
   const bool looped = N > kLoopedLimit;
 
-  dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+  run_serialized(mpsStream->queue(), ^() {
     @autoreleasepool {
       id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
       const std::string kernel = (looped ? "rms_norm_looped_" : "rms_norm_") +

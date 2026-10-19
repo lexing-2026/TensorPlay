@@ -49,7 +49,7 @@ void triu_tril_impl(const Tensor& self, int64_t k, const Tensor& out,
     const int diagonal = static_cast<int>(k);
     auto vec_pso = lib.getPipelineStateForFunc(name + "_dense_vec4_float");
     MPSStream* vec_stream = getCurrentMPSStream();
-    dispatch_sync_with_rethrow(vec_stream->queue(), ^() {
+    run_serialized(vec_stream->queue(), ^() {
       @autoreleasepool {
         auto compute_encoder = vec_stream->commandEncoder();
         [compute_encoder setComputePipelineState:vec_pso];
@@ -77,7 +77,7 @@ void triu_tril_impl(const Tensor& self, int64_t k, const Tensor& out,
       static_cast<uint32_t>(self_c.numel() / (sizes[0] * sizes[1]));
 
   MPSStream* stream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(stream->queue(), ^() {
+  run_serialized(stream->queue(), ^() {
     @autoreleasepool {
       auto computeEncoder = stream->commandEncoder();
       [computeEncoder setComputePipelineState:pso];

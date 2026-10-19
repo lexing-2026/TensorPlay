@@ -67,7 +67,7 @@ Tensor searchsorted_impl(const Tensor& seq_in, const Tensor& self_in,
     const uint32_t n_bd = static_cast<uint32_t>(idim_bd);
     const uint32_t n_in = static_cast<uint32_t>(numel_in);
     const NSUInteger threads = static_cast<NSUInteger>((numel_in + 3) / 4);
-    dispatch_sync_with_rethrow(stream->queue(), ^() {
+    run_serialized(stream->queue(), ^() {
       @autoreleasepool {
         auto encoder = stream->commandEncoder();
         [encoder setComputePipelineState:pso];
@@ -85,7 +85,7 @@ Tensor searchsorted_impl(const Tensor& seq_in, const Tensor& self_in,
   const int64_t num_tg = (numel_in + tg_size - 1) / tg_size;
 
   MPSStream* stream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(stream->queue(), ^() {
+  run_serialized(stream->queue(), ^() {
     @autoreleasepool {
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:pso];

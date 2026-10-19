@@ -135,7 +135,7 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> embedding_bag_kernel(
       scalarToMetalTypeString(indices_c.dtype());
 
   MPSStream* mpsStream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+  run_serialized(mpsStream->queue(), ^() {
     @autoreleasepool {
       id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
       id<MTLComputePipelineState> PSO =
@@ -250,7 +250,7 @@ Tensor embedding_bag_dense_backward_kernel(
       scalarToMetalTypeString(indices.dtype());
 
   MPSStream* mpsStream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+  run_serialized(mpsStream->queue(), ^() {
     @autoreleasepool {
       id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
       id<MTLComputePipelineState> PSO =
@@ -321,7 +321,7 @@ Tensor embedding_bag_per_sample_weights_backward_kernel(
       scalarToMetalTypeString(indices.dtype());
 
   MPSStream* mpsStream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+  run_serialized(mpsStream->queue(), ^() {
     @autoreleasepool {
       id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
       id<MTLComputePipelineState> PSO =

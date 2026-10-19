@@ -63,7 +63,7 @@ template <typename T>
 void fill_shader_impl(Tensor& self, T value) {
   const uint32_t numel = static_cast<uint32_t>(self.numel());
   MPSStream* mpsStream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+  run_serialized(mpsStream->queue(), ^() {
     @autoreleasepool {
       @try {
         id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
@@ -423,7 +423,7 @@ Tensor eye_kernel(int64_t n, int64_t m, DType dtype, Device device) {
     const uint32_t rows = static_cast<uint32_t>(n);
     const uint32_t cols = static_cast<uint32_t>(m);
     MPSStream* mpsStream = getCurrentMPSStream();
-    dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+    run_serialized(mpsStream->queue(), ^() {
       @autoreleasepool {
         id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
         id<MTLComputePipelineState> PSO =
@@ -494,7 +494,7 @@ Tensor arange_start_step_kernel(Scalar start, Scalar end, Scalar step,
   const double s = s_d;
   const double st = st_d;
   MPSStream* mpsStream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+  run_serialized(mpsStream->queue(), ^() {
     @autoreleasepool {
       id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
       id<MTLComputePipelineState> PSO =
@@ -544,7 +544,7 @@ Tensor linspace_kernel(Scalar start, Scalar end, int64_t steps, DType dtype,
     TP_THROW(NotImplementedError, "linspace does not support this dtype on MPS");
   }
   MPSStream* mpsStream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+  run_serialized(mpsStream->queue(), ^() {
     @autoreleasepool {
       id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
       id<MTLComputePipelineState> PSO =
@@ -589,7 +589,7 @@ Tensor logspace_kernel(Scalar start, Scalar end, int64_t steps, double base,
     TP_THROW(NotImplementedError, "logspace does not support this dtype on MPS");
   }
   MPSStream* mpsStream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+  run_serialized(mpsStream->queue(), ^() {
     @autoreleasepool {
       id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
       id<MTLComputePipelineState> PSO =
@@ -639,7 +639,7 @@ Tensor rand_kernel(const std::vector<int64_t>& size, DType dtype,
   auto& gen = default_generator();
   const uint32_t seed = gen.random();
   MPSStream* mpsStream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+  run_serialized(mpsStream->queue(), ^() {
     @autoreleasepool {
       id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
       id<MTLComputePipelineState> PSO =
@@ -678,7 +678,7 @@ Tensor randn_kernel(const std::vector<int64_t>& size, DType dtype,
   auto& gen = default_generator();
   const uint32_t seed = gen.random();
   MPSStream* mpsStream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+  run_serialized(mpsStream->queue(), ^() {
     @autoreleasepool {
       id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
       id<MTLComputePipelineState> PSO =
@@ -717,7 +717,7 @@ Tensor randint_kernel(int64_t low, int64_t high,
     auto& gen = default_generator();
     const uint32_t seed = gen.random();
     MPSStream* mpsStream = getCurrentMPSStream();
-    dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+    run_serialized(mpsStream->queue(), ^() {
       @autoreleasepool {
         id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
         id<MTLComputePipelineState> PSO =

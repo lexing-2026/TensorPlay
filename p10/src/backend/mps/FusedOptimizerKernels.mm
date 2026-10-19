@@ -655,7 +655,7 @@ void fused_adam_impl(std::vector<Tensor> params,
 
   MPSStream* mpsStream = getCurrentMPSStream();
   // The caller advances the state steps before invoking this update.
-  dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+  run_serialized(mpsStream->queue(), ^() {
     @autoreleasepool {
       id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
       if (p_nz.size() > 1) {
@@ -830,7 +830,7 @@ void fused_sgd_impl(std::vector<Tensor> params,
   }
 
   MPSStream* mpsStream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+  run_serialized(mpsStream->queue(), ^() {
     @autoreleasepool {
       id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
       dispatch_fused_sgd_multi(computeEncoder, p_nz, g_nz, m_nz, use_momentum,

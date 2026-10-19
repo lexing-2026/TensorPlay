@@ -63,7 +63,7 @@ void dispatch_amp_multi(const std::string& kernel_name,
   constexpr int64_t kmaxThreadGroups = 32;
 
   MPSStream* mpsStream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+  run_serialized(mpsStream->queue(), ^() {
     @autoreleasepool {
       id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
       id<MTLComputePipelineState> PSO =
@@ -192,7 +192,7 @@ void amp_non_finite_check_and_unscale_single_impl(const Tensor& scaled_grad,
   MTLSize gridSize = MTLSizeMake(numel, 1, 1);
 
   MPSStream* mpsStream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+  run_serialized(mpsStream->queue(), ^() {
     @autoreleasepool {
       id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
       id<MTLComputePipelineState> PSO =
@@ -222,7 +222,7 @@ void amp_update_scale_impl(Tensor& self,
   const std::string kernel =
       "ampUpdateScale_" + scalarToMetalTypeString(self.dtype());
   MPSStream* mpsStream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+  run_serialized(mpsStream->queue(), ^() {
     @autoreleasepool {
       id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
       id<MTLComputePipelineState> PSO =
