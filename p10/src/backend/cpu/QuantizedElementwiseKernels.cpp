@@ -1971,6 +1971,51 @@ inline void nibble_codes(const uint8_t* row, int64_t first, vec::Vectorized<floa
     }
 }
 
+// Four codes share a byte, so sixteen bytes carry sixty-four of them and one
+// split serves eight vectors: the four fields of every byte are gathered apart
+// under their own mask, and two levels of interleaving put the fields of a byte
+// back in the order of their columns because the lowest field is its earliest
+// column.
+template <int Groups>
+inline void pair_codes(const uint8_t* row, int64_t first, vec::Vectorized<float>* codes) {
+    using FV = vec::Vectorized<float>;
+    constexpr int lanes = FV::size();
+    for (int g = 0; g < Groups; ++g) {
+#if defined(CPU_CAPABILITY_AVX2)
+        const auto stream = _mm_loadu_si128(
+            reinterpret_cast<const __m128i*>(row + (first + g * 8 * lanes) / 4));
+        const auto mask = _mm_set1_epi8(0x03);
+        const auto lead = _mm_and_si128(stream, mask);
+        const auto after = _mm_and_si128(_mm_srli_epi16(stream, 2), mask);
+        const auto third = _mm_and_si128(_mm_srli_epi16(stream, 4), mask);
+        const auto last = _mm_and_si128(_mm_srli_epi16(stream, 6), mask);
+        const auto near = _mm_unpacklo_epi8(lead, after);
+        const auto far = _mm_unpackhi_epi8(lead, after);
+        const auto upper = _mm_unpacklo_epi8(third, last);
+        const auto under = _mm_unpackhi_epi8(third, last);
+        const auto front = _mm_unpacklo_epi16(near, upper);
+        const auto middle = _mm_unpackhi_epi16(near, upper);
+        const auto back = _mm_unpacklo_epi16(far, under);
+        const auto end = _mm_unpackhi_epi16(far, under);
+        codes[g * 8 + 0] = FV(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(front)));
+        codes[g * 8 + 1] = FV(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(front, 8))));
+        codes[g * 8 + 2] = FV(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(middle)));
+        codes[g * 8 + 3] = FV(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(middle, 8))));
+        codes[g * 8 + 4] = FV(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(back)));
+        codes[g * 8 + 5] = FV(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(back, 8))));
+        codes[g * 8 + 6] = FV(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(end)));
+        codes[g * 8 + 7] = FV(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(end, 8))));
+#else
+        float unpacked[8 * lanes];
+        for (int c = 0; c < 8 * lanes; ++c) {
+            unpacked[c] = static_cast<float>(
+                quant::row_code(row, first + g * 8 * lanes + c, 2));
+        }
+        for (int t = 0; t < 8; ++t) codes[g * 8 + t] = FV::loadu(unpacked + t * lanes);
+#endif
+    }
+}
+
 // A run of blocks, one per column vector, holds its sums in registers while the
 // rows of the bag pass through: a block count fixed here is what keeps the
 // accumulators out of memory, and every column adds its own rows in order
@@ -1989,6 +2034,11 @@ __attribute__((always_inline)) inline void hold_blocks(const uint8_t* const* row
         if constexpr (Bits == 4 && Blocks >= 4) {
             FV codes[Blocks];
             nibble_codes<Blocks / 4>(rows[k], col, codes);
+            for (int t = 0; t < Blocks; ++t)
+                sums[t] = vec::fmadd(codes[t], gradient, sums[t] + shift);
+        } else if constexpr (Bits == 2 && Blocks >= 8) {
+            FV codes[Blocks];
+            pair_codes<Blocks / 8>(rows[k], col, codes);
             for (int t = 0; t < Blocks; ++t)
                 sums[t] = vec::fmadd(codes[t], gradient, sums[t] + shift);
         } else {
