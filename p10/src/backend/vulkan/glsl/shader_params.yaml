@@ -1646,6 +1646,22 @@ dequantize_per_tensor_qint32:
   parameter_names_with_default_values: {}
   shader_variants:
   - NAME: dequantize_per_tensor_qint32
+w4a16_pack_buffer:
+  parameter_names_with_default_values:
+    INPUT_BUFFER: 1
+  shader_variants:
+  - NAME: w4a16_pack_buffer
+    INPUT_BUFFER: 1
+  - NAME: w4a16_pack_image_input
+    INPUT_BUFFER: 0
+w4a16_linear_buffer:
+  parameter_names_with_default_values:
+    OUTPUT_BUFFER: 1
+  shader_variants:
+  - NAME: w4a16_linear_buffer
+    OUTPUT_BUFFER: 1
+  - NAME: w4a16_linear_buffer_image
+    OUTPUT_BUFFER: 0
 random_fill:
   parameter_names_with_default_values:
     DIST: 0

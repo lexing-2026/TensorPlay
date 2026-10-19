@@ -3,6 +3,7 @@
 #include "Blocks.h"
 #include "Common.h"
 #include "Convert.h"
+#include "Factory.h"
 #include "ParamCache.h"
 #include "Quantizer.h"
 #include "Utils.h"
@@ -26,6 +27,8 @@ constexpr uint32_t kTagQLinearWeightHeightPacked = 20u;
 constexpr uint32_t kTagQLinearParams = 21u;
 constexpr uint32_t kTagW4A16WeightHeightPacked = 22u;
 constexpr uint32_t kTagW4A16Params = 23u;
+constexpr uint32_t kTagW4A16WeightLinear = 24u;
+constexpr uint32_t kTagW4A16ParamsLinear = 25u;
 
 //
 // Quantized elementwise arithmetic over Int8 textures with explicit affine
@@ -1500,6 +1503,241 @@ Tensor int_repr_kernel(const Tensor& self) {
   return quantized::strip_quantizer(self).clone();
 }
 
+// Defined in BinaryOp.cpp; copies a texture payload into a dense buffer.
+api::vTensor to_buffer_storage_dispatch(
+    api::Context* context,
+    const api::vTensor& src);
+
+//
+// The per-output-channel scales and addends of a W4A16 weight, staged as one
+// linear single-precision payload: `params_width` slots of scales followed by
+// `params_width` slots of addends, both zero-filled past their own length.
+// The reader takes the pair from one binding, so a call without an addend
+// still lands on the same shape and adds zero.
+//
+api::vTensor w4a16_linear_params(
+    api::Context* const context,
+    const Tensor& weight,
+    const Tensor& weight_scales,
+    const std::optional<Tensor>& bias,
+    const int64_t out_features,
+    const int64_t params_width) {
+  return ParamTextureCache::singleton().get_or_create(
+      weight, {2, params_width}, api::GPUMemoryLayout::TENSOR_WIDTH_PACKED,
+      kTagW4A16ParamsLinear,
+      [&]() {
+        std::vector<float> host(
+            static_cast<size_t>(2 * params_width), 0.0f);
+        const Tensor scales = weight_scales.to(Device(DeviceType::CPU))
+                                  .to(DType::Float32)
+                                  .contiguous();
+        std::memcpy(
+            host.data(),
+            scales.data_ptr<float>(),
+            sizeof(float) * static_cast<size_t>(out_features));
+        if (bias.has_value()) {
+          const Tensor bias_f = bias->to(Device(DeviceType::CPU))
+                                    .to(DType::Float32)
+                                    .contiguous();
+          std::memcpy(
+              host.data() + params_width,
+              bias_f.data_ptr<float>(),
+              sizeof(float) * static_cast<size_t>(out_features));
+        }
+        api::vTensor v{
+            context,
+            {2, params_width},
+            DType::Float32,
+            api::StorageType::BUFFER,
+            api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+        utils::upload_host_bytes(
+            v, host.data(), host.size() * sizeof(float));
+        return v;
+      });
+}
+
+//
+// The 4-bit weight codes of an [N, K] weight packed into linear storage, eight
+// to a word with one row per run of ceil(K / 8) words.  The pack runs device
+// side over the weight's own payload, whichever storage it drew, so a weight
+// uploaded once stays packed for every later call.
+//
+api::vTensor w4a16_linear_packed_weight(
+    api::Context* const context,
+    const Tensor& weight,
+    const api::vTensor& v_weight,
+    const int64_t K,
+    const int64_t N,
+    const int64_t k_words) {
+  const int64_t words = N * k_words;
+  return ParamTextureCache::singleton().get_or_create(
+      weight, {words}, api::GPUMemoryLayout::TENSOR_WIDTH_PACKED,
+      kTagW4A16WeightLinear,
+      [&]() {
+        api::vTensor v_packed{
+            context,
+            {words},
+            DType::Int32,
+            api::StorageType::BUFFER,
+            api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+        const struct PackBlock final {
+          int k;
+          int n;
+          int k_words;
+          int fill;
+        } pack_block{
+            static_cast<int32_t>(K),
+            static_cast<int32_t>(N),
+            static_cast<int32_t>(k_words),
+            0};
+        api::UniformParamsBuffer pack_params(context, pack_block);
+        api::PipelineBarrier pack_barrier{};
+        const api::utils::uvec3 pack_grid{
+            api::utils::safe_downcast_to_u32(words), 1u, 1u};
+        const bool weight_linear =
+            v_weight.storage_type() == api::StorageType::BUFFER;
+        // The two builds differ only in where the codes come from, so the
+        // payload the reader sees never depends on which form the weight drew.
+        if (weight_linear) {
+          context->submit_compute_job(
+              VK_KERNEL(w4a16_pack_buffer),
+              pack_barrier,
+              pack_grid,
+              adaptive_work_group_size(pack_grid),
+              VK_NULL_HANDLE,
+              v_packed.buffer(
+                  pack_barrier,
+                  api::PipelineStage::COMPUTE,
+                  api::MemoryAccessType::WRITE),
+              v_weight.buffer(pack_barrier, api::PipelineStage::COMPUTE),
+              pack_params.buffer());
+        } else {
+          context->submit_compute_job(
+              VK_KERNEL(w4a16_pack_image_input),
+              pack_barrier,
+              pack_grid,
+              adaptive_work_group_size(pack_grid),
+              VK_NULL_HANDLE,
+              v_packed.buffer(
+                  pack_barrier,
+                  api::PipelineStage::COMPUTE,
+                  api::MemoryAccessType::WRITE),
+              v_weight.image(pack_barrier, api::PipelineStage::COMPUTE),
+              pack_params.buffer());
+        }
+        return v_packed;
+      });
+}
+
+//
+// The W4A16 product over operands that have no texel form.  A weight whose row
+// count passes the device's image axis limit -- the shape a large output
+// projection has -- arrives in linear storage and never gains an image form, so
+// the reduction must read codes and halves out of buffer words instead of
+// sampling texels.  The result follows whichever storage its own shape fits,
+// and a linear one keeps the packed pair of halves that its payload stores.
+//
+Tensor w4a16_linear_over_buffers(
+    api::Context* const context,
+    const Tensor& input,
+    const Tensor& weight,
+    const Tensor& weight_scales,
+    const std::optional<Tensor>& bias,
+    const api::vTensor& v_weight,
+    const int64_t M,
+    const int64_t N,
+    const int64_t K) {
+  const int64_t k_words = (K + 7) / 8;
+  const int64_t params_width = api::utils::align_up(N, 4);
+
+  // Every offset the kernels below compute is a 32-bit integer: the reader
+  // names an element by row * N + col and the activation by row * K, so a
+  // product that passes that range has no addressable form here.
+  TP_CHECK(
+      M * N <= std::numeric_limits<int32_t>::max(),
+      "Vulkan w4a16_linear: the product of the row and channel counts passes "
+      "what one linear payload can address; split the batch");
+  TP_CHECK(
+      M * K <= std::numeric_limits<int32_t>::max(),
+      "Vulkan w4a16_linear: the activation rows pass what one linear payload "
+      "can address; split the batch");
+
+  api::PipelineBarrier pipeline_barrier{};
+
+  api::vTensor v_act = to_buffer_storage_dispatch(context, convert(input));
+  api::vTensor v_packed = w4a16_linear_packed_weight(
+      context, weight, v_weight, K, N, k_words);
+  api::vTensor v_params = w4a16_linear_params(
+      context, weight, weight_scales, bias, N, params_width);
+
+  api::vTensor v_output{context, {M, N}, DType::Float16};
+  const bool out_buffer =
+      v_output.storage_type() == api::StorageType::BUFFER;
+
+  const struct LinearBlock final {
+    ivec4 out_sizes;
+    int k;
+    int k_words;
+    int params_words;
+    int fill;
+  } block{
+      api::utils::make_whcn_ivec4({M, N}),
+      static_cast<int32_t>(K),
+      static_cast<int32_t>(k_words),
+      static_cast<int32_t>(params_width / 4),
+      0};
+  api::UniformParamsBuffer params(context, block);
+
+  // A linear result folds two elements into every word, so the launch counts
+  // words; a texel one names one element per invocation.
+  const api::utils::uvec3 grid = out_buffer
+      ? api::utils::uvec3{
+            api::utils::div_up(
+                api::utils::safe_downcast_to_u32(M * N), 2u),
+            1u,
+            1u}
+      : api::utils::uvec3{
+            api::utils::safe_downcast_to_u32(N),
+            api::utils::safe_downcast_to_u32(M),
+            1u};
+  const char* const kernel =
+      out_buffer ? "w4a16_linear_buffer" : "w4a16_linear_buffer_image";
+
+  if (out_buffer) {
+    context->submit_compute_job(
+        VK_KERNEL_FROM_STR(kernel),
+        pipeline_barrier,
+        grid,
+        adaptive_work_group_size(grid),
+        VK_NULL_HANDLE,
+        v_output.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::WRITE),
+        v_act.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+        v_packed.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+        v_params.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+        params.buffer());
+  } else {
+    context->submit_compute_job(
+        VK_KERNEL_FROM_STR(kernel),
+        pipeline_barrier,
+        grid,
+        adaptive_work_group_size(grid),
+        VK_NULL_HANDLE,
+        v_output.image(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::WRITE),
+        v_act.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+        v_packed.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+        v_params.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+        params.buffer());
+  }
+
+  return convert(v_output);
+}
+
 Tensor w4a16_linear_kernel(
     const Tensor& input,
     const Tensor& weight,
@@ -1534,20 +1772,35 @@ Tensor w4a16_linear_kernel(
 
   api::Context* const context = api::context();
 
-  api::vTensor v_input = convert(input);
-  api::vTensor v_weight = convert(weight);
-  if (v_input.storage_type() != api::StorageType::TEXTURE_3D ||
-      v_weight.storage_type() != api::StorageType::TEXTURE_3D) {
-    TP_THROW(
-        NotImplementedError,
-        "Vulkan w4a16_linear requires texture storage");
-  }
-
   const int64_t M = input.size(0);
   const int64_t N = weight.size(0);
   const int64_t K = input.size(1);
+  if (M == 0 || N == 0) {
+    // A product with no rows or no channels has no payload for either route to
+    // stage, so the result is released empty instead of dispatched.
+    return empty_kernel({M, N}, DType::Float16, input.device(), false);
+  }
   const int64_t K_tex8 = (K + 7) / 8;
   const int64_t params_width = api::utils::align_up(out_features, 4);
+
+  api::vTensor v_input = convert(input);
+  api::vTensor v_weight = convert(weight);
+
+  // The texel route stages three payloads as images: the packed weight row per
+  // output channel, the parameter pair, and the product itself.  A shape with
+  // no image form for any of them runs on linear storage instead, because
+  // which storage a weight draws is a property of the device's image limit,
+  // not of the caller's choosing.
+  const bool texture_route =
+      v_input.storage_type() == api::StorageType::TEXTURE_3D &&
+      v_weight.storage_type() == api::StorageType::TEXTURE_3D &&
+      image_storage_supported(context, {K, N}) &&
+      image_storage_supported(context, {M, N}) &&
+      image_storage_supported(context, {3, params_width});
+  if (!texture_route) {
+    return w4a16_linear_over_buffers(
+        context, input, weight, weight_scales, bias, v_weight, M, N, K);
+  }
 
   // Per-channel scale (row 0) and bias (row 2) float texture, cached on
   // the weight identity.  Row 1 (zero points) is unused by the symmetric
