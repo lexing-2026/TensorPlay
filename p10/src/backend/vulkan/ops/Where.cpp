@@ -289,6 +289,27 @@ Tensor where_scalar_other_kernel(
   return where_kernel(condition, self, folded);
 }
 
+// With both branches numbers, the condition is the only payload and its own
+// shape answers for the result.  The width comes from the pair: a fraction is
+// carried in single precision, which is as wide as this backend's planes reach,
+// and a count in the integer plane the selection reads.
+Tensor where_scalar_scalar_kernel(
+    const Tensor& condition,
+    const Scalar& self,
+    const Scalar& other) {
+  TP_CHECK(
+      !self.isComplex() && !other.isComplex(),
+      "Vulkan where does not select between complex numbers");
+  const DType vocabulary =
+      self.isFloatingPoint() || other.isFloatingPoint() ? DType::Float32
+                                                        : DType::Int32;
+  Tensor held =
+      full_kernel({1}, self, vocabulary, condition.device(), false);
+  Tensor taken =
+      full_kernel({1}, other, vocabulary, condition.device(), false);
+  return where_kernel(condition, held, taken);
+}
+
 } // namespace ops
 } // namespace vulkan
 } // namespace tensorplay
@@ -301,6 +322,9 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, WhereKernels) {
   m.impl(
       "where.ScalarOther",
       &tensorplay::vulkan::ops::where_scalar_other_kernel);
+  m.impl(
+      "where.Scalar",
+      &tensorplay::vulkan::ops::where_scalar_scalar_kernel);
 }
 
 #endif /* USE_VULKAN */
