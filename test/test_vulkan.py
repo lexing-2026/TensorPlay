@@ -4470,5 +4470,93 @@ class TestVulkanScalarVocabulary(unittest.TestCase):
             self._device(np.array([1, 2], dtype=np.int8)) + 2
 
 
+class TestVulkanUnaryWidth(unittest.TestCase):
+    # The width a unary answer lands in belongs to the formula, not to the
+    # payload: a series or a ratio has fractions in it, so a count is read in
+    # single precision and the result names that width, while rounding, sign and
+    # magnitude work keep the count a count.  Written back the destination keeps
+    # the width it was allocated in, so a fractional formula has no place there
+    # and is named rather than rounded into the words.
+
+    LENGTHS = (100001, 200003)
+
+    @staticmethod
+    def _device(values):
+        return tensorplay.from_numpy(np.array(values)).to("vulkan")
+
+    def test_a_fractional_formula_reads_a_count_in_single_precision(self):
+        import tensorplay as tp
+        counts = np.array([-3, -1, 0, 1, 2, 5], dtype=np.int32)
+        for name in ("exp", "sqrt", "sigmoid", "sin", "cos", "tanh",
+                     "reciprocal"):
+            host = getattr(tensorplay.from_numpy(counts.copy()), name)()
+            got = getattr(self._device(counts), name)()
+            label = f"count {name}"
+            self.assertEqual(got.dtype, host.dtype, msg=label)
+            self.assertEqual(got.dtype, tp.float32, msg=label)
+            np.testing.assert_allclose(
+                got.cpu().numpy(), host.cpu().numpy(),
+                rtol=1e-3, atol=1e-3, err_msg=label)
+
+        # Past the image edge the same payload rides the linear writer, where
+        # the width is named by the element type of the words rather than by a
+        # texel format.
+        rng = np.random.default_rng(7)
+        for count in self.LENGTHS:
+            row = rng.integers(-4, 6, count).astype(np.int32)
+            for name in ("exp", "sigmoid", "cos", "reciprocal"):
+                host = getattr(tensorplay.from_numpy(row.copy()), name)()
+                got = getattr(self._device(row), name)()
+                self.assertEqual(got.dtype, tp.float32,
+                                 msg=f"linear {name} at {count}")
+                np.testing.assert_allclose(
+                    got.cpu().numpy(), host.cpu().numpy(),
+                    rtol=1e-3, atol=1e-3,
+                    err_msg=f"linear {name} at {count}")
+
+        # A float payload keeps its own width: nothing is read in for it.
+        halves = np.array([-3.0, -1.0, 0.5, 1.0, 2.0, 5.0], dtype=np.float16)
+        for name in ("exp", "sin", "sigmoid"):
+            got = getattr(self._device(halves), name)()
+            self.assertEqual(got.dtype, tp.float16, msg=f"half {name}")
+
+    def test_an_integral_formula_keeps_its_count(self):
+        counts = np.array([-3, -1, 0, 1, 2, 5], dtype=np.int32)
+        # The sign of a count has no writer that keeps the count in place yet,
+        # so only its out-of-place form is checked.
+        written_back = ("abs", "neg", "floor", "ceil", "trunc", "round",
+                        "square", "relu")
+        for name in ("abs", "neg", "floor", "ceil", "trunc", "round", "sign",
+                     "square", "relu"):
+            host = getattr(tensorplay.from_numpy(counts.copy()), name)()
+            got = getattr(self._device(counts), name)()
+            self.assertEqual(got.dtype, host.dtype, msg=name)
+            np.testing.assert_array_equal(
+                got.cpu().numpy(), host.cpu().numpy(), err_msg=name)
+
+            if name not in written_back:
+                continue
+            written = self._device(counts)
+            getattr(written, name + "_")()
+            np.testing.assert_array_equal(
+                written.cpu().numpy(), host.cpu().numpy(),
+                err_msg=f"{name} written back")
+
+    def test_a_fractional_formula_is_refused_where_it_cannot_write(self):
+        import tensorplay as tp
+        counts = np.array([-3, -1, 0, 1, 2, 5], dtype=np.int32)
+        for name in ("sin_", "cos_", "exp_", "sqrt_", "tanh_", "sigmoid_",
+                     "reciprocal_"):
+            with self.assertRaisesRegex(
+                    RuntimeError, "has no Int32 kernel"):
+                getattr(self._device(counts), name)()
+        # Written into a float the same formulas need no such step.
+        reals = np.array([-3.0, -1.0, 0.5, 1.0, 2.0, 5.0], dtype=np.float32)
+        for name in ("sin_", "exp_", "sigmoid_", "reciprocal_"):
+            written = self._device(reals)
+            getattr(written, name)()
+            self.assertEqual(written.dtype, tp.float32, msg=name)
+
+
 if __name__ == "__main__":
     unittest.main()
