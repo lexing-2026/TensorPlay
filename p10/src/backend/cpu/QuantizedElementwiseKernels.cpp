@@ -2032,10 +2032,14 @@ __attribute__((always_inline)) inline void hold_blocks(const uint8_t* const* row
     for (int k = 0; k < held; ++k) {
         const FV gradient(gradients[k]), shift(shifts[k]);
         if constexpr (Bits == 4 && Blocks >= 4) {
-            FV codes[Blocks];
-            nibble_codes<Blocks / 4>(rows[k], col, codes);
-            for (int t = 0; t < Blocks; ++t)
-                sums[t] = vec::fmadd(codes[t], gradient, sums[t] + shift);
+            // One split fills four vectors, so a block of eight is folded as two
+            // runs: the codes of the whole block never have to stay live at once.
+            for (int t = 0; t < Blocks; t += 4) {
+                FV codes[4];
+                nibble_codes<1>(rows[k], col + t * lanes, codes);
+                for (int u = 0; u < 4; ++u)
+                    sums[t + u] = vec::fmadd(codes[u], gradient, sums[t + u] + shift);
+            }
         } else if constexpr (Bits == 2 && Blocks >= 8) {
             FV codes[Blocks];
             pair_codes<Blocks / 8>(rows[k], col, codes);
