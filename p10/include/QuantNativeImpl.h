@@ -45,6 +45,11 @@ inline int64_t chunk_grain(int64_t visits_per_item) {
     return std::max<int64_t>(1, kQuantChunkVisits / std::max<int64_t>(1, visits_per_item));
 }
 
+// A thread joins a pooling only once the share it is handed pays for the
+// dispatch that hands it: a window visit is one read and one compare, while a
+// dispatch costs about a microsecond of them.
+constexpr int64_t kPoolChunkVisits = 4096;
+
 template<class F>
 void apply(int64_t size, F fn, int64_t grain = kQuantChunkVisits) {
     if (!size) return;
@@ -590,9 +595,17 @@ Tensor pool(const Tensor& input, const std::vector<int64_t>& kernel,
         const PoolWindow* table = max_windows.empty() ? nullptr : max_windows.data();
         const int64_t visits = g.mode == 2
             ? std::max<int64_t>(1, g.kernel[0] * g.kernel[1] * g.kernel[2]) : 1;
+        const int64_t items = y.numel();
+        // The team divides the range in even shares, so a chunk count only decides
+        // how many threads take part. Splitting a pooling into one share per thread
+        // is worth it once its visits outweigh a dispatch each; short of that the
+        // walk stays whole, because a thread handed no share still crosses the
+        // barrier the working threads wait at.
+        const int64_t threads = std::max<int64_t>(1, parallel::get_num_threads());
+        const int64_t grain = items * visits >= kPoolChunkVisits * threads
+            ? std::max<int64_t>(1, (items + threads - 1) / threads) : items;
         codes(input.dtype(), [&]<class T>() {
-            apply(y.numel(), PoolCodes<T>{input.data_ptr<T>(), y.data_ptr<T>(), g, table},
-                chunk_grain(visits));
+            apply(items, PoolCodes<T>{input.data_ptr<T>(), y.data_ptr<T>(), g, table}, grain);
         });
 #endif
     }
