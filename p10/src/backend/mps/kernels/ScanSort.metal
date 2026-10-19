@@ -107,12 +107,8 @@ kernel void scan_rows_inner(
   device T* dst = out + (uint64_t)tgid * (uint64_t)len;
   const uint groups = tptg / simdgroup_size;
   const AccT identity = scan_identity<AccT, Product>();
-  // The fold reads one entry per lane, so the lanes beyond the last group need
-  // a value of their own; the identity leaves them out of every prefix.
-  if (tid < simdgroup_size) {
-    partials[tid] = identity;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  // Lanes past the last group hold no run total; the fold loads the identity
+  // for them, so no entry needs pre-filling and no barrier is spent on it.
   AccT carried = identity;
 
   for (uint base = 0; base < len; base += tptg * kScanReads) {
@@ -134,7 +130,8 @@ kernel void scan_rows_inner(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (group == 0) {
-      partials[lane] = scan_exclusive<AccT, Product>(partials[lane]);
+      const AccT run = lane < groups ? partials[lane] : identity;
+      partials[lane] = scan_exclusive<AccT, Product>(run);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (int i = 0; i < kScanReads; ++i) {
