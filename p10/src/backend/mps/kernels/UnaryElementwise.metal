@@ -238,14 +238,16 @@ kernel void unary_elementwise_vec(device float4* out [[buffer(0)]],
       uint tid [[thread_position_in_grid]],          \
       uint grid [[threads_per_grid]]);
 
-// Clamps a contiguous operand into [lo, hi]. The lower comparison is applied
-// first and the upper one to its result, so a NaN operand stays a NaN and a
-// lower bound above the upper bound answers with the upper bound. An absent
-// bound arrives as the infinity of its sign.
+// Clamps a contiguous operand into [lo, hi]. The lower bound is applied first
+// and the upper bound to its result, so a lower bound above the upper bound
+// answers with the upper bound and an absent bound arrives as the infinity of
+// its sign. The NaN test of the operand is free in the fast-math build, which
+// assumes NaNs are absent, and keeps a NaN operand intact otherwise.
 template <typename T>
 inline T clamp_scalar(T x, T lo, T hi) {
-  const T y = x < lo ? lo : x;
-  return y > hi ? hi : y;
+  const T y = ::metal::max(x, lo);
+  const T z = ::metal::min(y, hi);
+  return x != x ? x : z;
 }
 
 template <typename T>
@@ -281,10 +283,10 @@ kernel void clamp_elementwise<float>(device float* out [[buffer(0)]],
                                      constant float& hi [[buffer(4)]],
                                      uint tid [[thread_position_in_grid]]);
 
-// Four-wide clamp: the same lower-then-upper order on each component, with the
-// vector moved by one 16-byte access each way. As in the unary form, a thread
-// takes one vector per grid-wide stride so every load and store of a SIMD
-// group covers a contiguous span.
+// Four-wide clamp: each component takes the same two native bound operations,
+// and the vector moves by one 16-byte access each way. A thread takes one
+// vector per grid-wide stride so every load and store of a SIMD group covers a
+// contiguous span.
 inline float4 clamp4(float4 v, float lo, float hi) {
   return float4(clamp_scalar(v.x, lo, hi), clamp_scalar(v.y, lo, hi),
                 clamp_scalar(v.z, lo, hi), clamp_scalar(v.w, lo, hi));
