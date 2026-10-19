@@ -52,6 +52,31 @@ Tensor add_scalar_kernel(const Tensor& self, const Scalar& other, const Scalar& 
 Tensor mul_scalar_kernel(const Tensor& self, const Scalar& other);
 Tensor& relu_inplace_kernel(Tensor& self);
 
+// A wrapped scalar meets a reduced storage in the compute domain, and which of
+// its bits survive the trip depends on the op.  add/sub round both alpha and
+// the scalar to the storage width and keep their product in float32, while
+// mul/div carry the float32 scalar straight into the loop.  Either way the
+// result rounds once, on store.
+namespace {
+
+template <typename ctype>
+inline constexpr bool is_reduced_storage_v =
+    std::is_same_v<ctype, Half> || std::is_same_v<ctype, BFloat16>;
+
+// The value a float takes after a round trip through the storage width.
+template <typename ctype>
+inline float storage_value(float value) {
+    return static_cast<float>(static_cast<ctype>(value));
+}
+
+template <typename ctype>
+inline float scalar_fold(const Scalar& alpha, const Scalar& other) {
+    return storage_value<ctype>(alpha.to<float>()) *
+           storage_value<ctype>(other.to<float>());
+}
+
+}  // namespace
+
 // --- AVX-512 runtime-dispatched contiguous binary kernels -------------------
 // Zen4-class CPUs run zmm natively; the build carries no global -mavx512f so
 // these carry their own target attribute and are gated by cpuid at runtime.
@@ -76,6 +101,14 @@ inline bool cpu_has_avx512() {
 inline bool cpu_has_avx2f() {
     static const bool ok = __builtin_cpu_supports("avx2") != 0 &&
                            __builtin_cpu_supports("fma") != 0;
+    return ok;
+}
+
+// Half storages need the convert pair as well; without it the narrow binary
+// loops cannot widen a vector at a time.
+inline bool cpu_has_f16c() {
+    static const bool ok = cpu_has_avx2f() &&
+                           __builtin_cpu_supports("f16c") != 0;
     return ok;
 }
 
@@ -1131,6 +1164,97 @@ void bf16_scalar_avx512(int code, const uint16_t* a, uint16_t* y,
     }
 }
 
+// --- reduced-precision binary loops ----------------------------------------
+// A half or bfloat16 elementwise chain needs the same three memory streams as
+// the float32 loop, so the only thing that can make it slow is converting one
+// element at a time.  Both storages widen 8 lanes to float32, do the
+// arithmetic there and round once on store.  The float32 product of two
+// narrow values is exact (11 + 11 significand bits fit in 24), so the fused
+// add used for BIN_ADD cannot disagree with multiply-then-add, and alpha == -1
+// gives subtraction for free.
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256 narrow_op(int code, __m256 af, __m256 bf, __m256 valpha) {
+    switch (code) {
+        case BIN_ADD: return _mm256_fmadd_ps(valpha, bf, af);
+        case BIN_MUL: return _mm256_mul_ps(af, bf);
+        default:      return _mm256_div_ps(af, bf);
+    }
+}
+
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256 bf16_widen8(const uint16_t* p) {
+    return _mm256_castsi256_ps(_mm256_slli_epi32(
+        _mm256_cvtepu16_epi32(
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(p))),
+        16));
+}
+
+// Byte selectors are lane-local: every 128-bit lane contributes four bf16
+// values and the -1 entries zero the rest, so the two halves concatenate.
+__attribute__((target("avx2,fma"), always_inline))
+inline void bf16_store8(uint16_t* p, __m256 y) {
+    const __m256i pack_pick = _mm256_setr_epi8(
+        0, 1, 4, 5, 8, 9, 12, 13, -1, -1, -1, -1, -1, -1, -1, -1,
+        0, 1, 4, 5, 8, 9, 12, 13, -1, -1, -1, -1, -1, -1, -1, -1);
+    // Round-to-nearest-even back to bf16: the same expression as the scalar
+    // store, so the tail and the vector loop cannot disagree.
+    const __m256i u = _mm256_castps_si256(y);
+    const __m256i rounding = _mm256_add_epi32(
+        _mm256_set1_epi32(0x7FFFu),
+        _mm256_srli_epi32(_mm256_and_si256(u, _mm256_set1_epi32(0x10000u)), 16));
+    const __m256i shifted = _mm256_srli_epi32(_mm256_add_epi32(u, rounding), 16);
+    const __m256i packed = _mm256_shuffle_epi8(shifted, pack_pick);
+    _mm_storeu_si128(
+        reinterpret_cast<__m128i*>(p),
+        _mm_unpacklo_epi64(_mm256_castsi256_si128(packed),
+                           _mm256_extracti128_si256(packed, 1)));
+}
+
+__attribute__((target("avx2,fma"), noinline))
+void binary_bf16_avx256(int code, const uint16_t* a, const uint16_t* b,
+                        uint16_t* y, int64_t n, float alpha) {
+    const __m256 valpha = _mm256_set1_ps(alpha);
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 af = bf16_widen8(a + i);
+        const __m256 bf = bf16_widen8(b + i);
+        bf16_store8(y + i, narrow_op(code, af, bf, valpha));
+    }
+    for (; i < n; ++i) {
+        const float af = detail::bfloat16_to_float_bits(a[i]);
+        const float bf = detail::bfloat16_to_float_bits(b[i]);
+        float out;
+        switch (code) {
+            case BIN_ADD: out = af + alpha * bf; break;
+            case BIN_MUL: out = af * bf; break;
+            default:      out = af / bf; break;
+        }
+        y[i] = detail::float_to_bfloat16_bits(out);
+    }
+}
+
+__attribute__((target("avx2,fma"), noinline))
+void scalar_bf16_avx256(int code, const uint16_t* a, uint16_t* y, int64_t n,
+                        float scalar) {
+    const __m256 vscalar = _mm256_set1_ps(scalar);
+    const __m256 one = _mm256_set1_ps(1.0f);
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 af = bf16_widen8(a + i);
+        bf16_store8(y + i, narrow_op(code, af, vscalar, one));
+    }
+    for (; i < n; ++i) {
+        const float af = detail::bfloat16_to_float_bits(a[i]);
+        float out;
+        switch (code) {
+            case BIN_ADD: out = af + scalar; break;
+            case BIN_MUL: out = af * scalar; break;
+            default:      out = af / scalar; break;
+        }
+        y[i] = detail::float_to_bfloat16_bits(out);
+    }
+}
+
 inline void bf16_binary_contiguous(int code, const BFloat16* a,
                                    const BFloat16* b, BFloat16* y,
                                    int64_t n, float alpha) {
@@ -1140,6 +1264,13 @@ inline void bf16_binary_contiguous(int code, const BFloat16* a,
     if (cpu_has_avx512_bf16()) {
         parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
             bf16_binary_avx512(code, ap + begin, bp + begin, yp + begin,
+                               end - begin, alpha);
+        });
+        return;
+    }
+    if (cpu_has_avx2f()) {
+        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+            binary_bf16_avx256(code, ap + begin, bp + begin, yp + begin,
                                end - begin, alpha);
         });
         return;
@@ -1166,6 +1297,13 @@ inline void bf16_scalar_contiguous(int code, const BFloat16* a, BFloat16* y,
         });
         return;
     }
+    if (cpu_has_avx2f()) {
+        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+            scalar_bf16_avx256(code, ap + begin, yp + begin, end - begin,
+                               scalar);
+        });
+        return;
+    }
     parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
         for (int64_t i = begin; i < end; ++i) {
             const float av = static_cast<float>(a[i]);
@@ -1176,10 +1314,217 @@ inline void bf16_scalar_contiguous(int code, const BFloat16* a, BFloat16* y,
     });
 }
 
+// Half storages need the F16C convert pair; the software conversion used
+// outside of it would keep the loop at one element at a time.
+__attribute__((target("avx2,fma,f16c"), always_inline))
+inline __m256 f16_widen8(const uint16_t* p) {
+    return _mm256_cvtph_ps(
+        _mm_loadu_si128(reinterpret_cast<const __m128i*>(p)));
+}
+
+__attribute__((target("avx2,fma,f16c"), always_inline))
+inline void f16_store8(uint16_t* p, __m256 y) {
+    _mm_storeu_si128(
+        reinterpret_cast<__m128i*>(p),
+        _mm256_cvtps_ph(y, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+}
+
+__attribute__((target("avx2,fma,f16c"), noinline))
+void binary_f16_avx256(int code, const uint16_t* a, const uint16_t* b,
+                       uint16_t* y, int64_t n, float alpha) {
+    const __m256 valpha = _mm256_set1_ps(alpha);
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 af = f16_widen8(a + i);
+        const __m256 bf = f16_widen8(b + i);
+        f16_store8(y + i, narrow_op(code, af, bf, valpha));
+    }
+    for (; i < n; ++i) {
+        const float af = detail::half_to_float_bits(a[i]);
+        const float bf = detail::half_to_float_bits(b[i]);
+        float out;
+        switch (code) {
+            case BIN_ADD: out = af + alpha * bf; break;
+            case BIN_MUL: out = af * bf; break;
+            default:      out = af / bf; break;
+        }
+        y[i] = detail::float_to_half_bits(out);
+    }
+}
+
+__attribute__((target("avx2,fma,f16c"), noinline))
+void scalar_f16_avx256(int code, const uint16_t* a, uint16_t* y, int64_t n,
+                       float scalar) {
+    const __m256 vscalar = _mm256_set1_ps(scalar);
+    const __m256 one = _mm256_set1_ps(1.0f);
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 af = f16_widen8(a + i);
+        f16_store8(y + i, narrow_op(code, af, vscalar, one));
+    }
+    for (; i < n; ++i) {
+        const float af = detail::half_to_float_bits(a[i]);
+        float out;
+        switch (code) {
+            case BIN_ADD: out = af + scalar; break;
+            case BIN_MUL: out = af * scalar; break;
+            default:      out = af / scalar; break;
+        }
+        y[i] = detail::float_to_half_bits(out);
+    }
+}
+
+// Half storages can only take the vector loop when F16C is present; the
+// caller keeps the generic iterator otherwise.
+inline bool f16_binary_contiguous(int code, const Half* a, const Half* b,
+                                  Half* y, int64_t n, float alpha) {
+    if (!cpu_has_f16c()) return false;
+    const auto* ap = reinterpret_cast<const uint16_t*>(a);
+    const auto* bp = reinterpret_cast<const uint16_t*>(b);
+    auto* yp = reinterpret_cast<uint16_t*>(y);
+    parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        binary_f16_avx256(code, ap + begin, bp + begin, yp + begin,
+                          end - begin, alpha);
+    });
+    return true;
+}
+
+inline bool f16_scalar_contiguous(int code, const Half* a, Half* y, int64_t n,
+                                  float scalar) {
+    if (!cpu_has_f16c()) return false;
+    const auto* ap = reinterpret_cast<const uint16_t*>(a);
+    auto* yp = reinterpret_cast<uint16_t*>(y);
+    parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        scalar_f16_avx256(code, ap + begin, yp + begin, end - begin, scalar);
+    });
+    return true;
+}
+
+// Both narrow storages scale an addend in their own width before entering the
+// float32 loop, so alpha has to be rounded to the storage first -- otherwise a
+// value like 1.1 would keep its float32 bits and round the sum differently
+// than every other path does.
+inline float narrow_alpha(float alpha, DType dt) {
+    return dt == DType::BFloat16 ? storage_value<BFloat16>(alpha)
+                                 : storage_value<Half>(alpha);
+}
+
+// A wrapped scalar reaches the same loop already folded: both factors take
+// their storage value, the product stays in float32.
+inline float narrow_scalar_fold(const Scalar& alpha, const Scalar& other,
+                               DType dt) {
+    return dt == DType::BFloat16 ? scalar_fold<BFloat16>(alpha, other)
+                                 : scalar_fold<Half>(alpha, other);
+}
+
+// Same-shape contiguous binary over a narrow storage.  A false return means
+// the host cannot run the loop (Half without F16C) and the caller should fall
+// through to the generic iterator.
+static bool narrow_binary_fill(Tensor& result, const Tensor& self,
+                               const Tensor& other, int code, float alpha) {
+    if (self.dtype() == DType::BFloat16) {
+        bf16_binary_contiguous(code, self.data_ptr<BFloat16>(),
+                               other.data_ptr<BFloat16>(),
+                               result.data_ptr<BFloat16>(), self.numel(), alpha);
+        return true;
+    }
+    if (self.dtype() == DType::Float16) {
+        return f16_binary_contiguous(code, self.data_ptr<Half>(),
+                                     other.data_ptr<Half>(),
+                                     result.data_ptr<Half>(), self.numel(),
+                                     alpha);
+    }
+    return false;
+}
+
+// Tensor op scalar.  add/sub fold a pre-rounded scalar (the operand is a
+// zero-rank tensor of the storage dtype), while mul/div keep the divisor in
+// float32 -- the same split the float32 surface uses.
+static bool narrow_scalar_fill(Tensor& result, const Tensor& self, int code,
+                               float scalar) {
+    if (self.dtype() == DType::BFloat16) {
+        bf16_scalar_contiguous(code, self.data_ptr<BFloat16>(),
+                               result.data_ptr<BFloat16>(), self.numel(),
+                               scalar);
+        return true;
+    }
+    if (self.dtype() == DType::Float16) {
+        return f16_scalar_contiguous(code, self.data_ptr<Half>(),
+                                     result.data_ptr<Half>(), self.numel(),
+                                     scalar);
+    }
+    return false;
+}
+
+static bool narrow_binary_pair(const Tensor& self, const Tensor& other) {
+    return (self.dtype() == DType::BFloat16 ||
+            self.dtype() == DType::Float16) &&
+           other.dtype() == self.dtype() && self.is_contiguous() &&
+           other.is_contiguous() && self.shape() == other.shape();
+}
+
+// A wrapped scalar carries no layout, so only the storage side has to be a
+// flat contiguous run of the narrow width, and the result dtype has to stay
+// inside that width (no promotion to a wider float).
+static bool narrow_scalar_pair(const Tensor& self, DType result_dtype) {
+    return (self.dtype() == DType::BFloat16 ||
+            self.dtype() == DType::Float16) &&
+           result_dtype == self.dtype() && self.is_contiguous();
+}
+
+// The same loop with the destination aliased to self, as every x *= y chain
+// needs.
+static bool narrow_binary_inplace(Tensor& self, const Tensor& other, int code,
+                                  float alpha) {
+    if (self.dtype() == DType::BFloat16) {
+        bf16_binary_contiguous(code, self.data_ptr<BFloat16>(),
+                               other.data_ptr<BFloat16>(),
+                               self.data_ptr<BFloat16>(), self.numel(), alpha);
+        return true;
+    }
+    if (self.dtype() == DType::Float16) {
+        return f16_binary_contiguous(code, self.data_ptr<Half>(),
+                                     other.data_ptr<Half>(),
+                                     self.data_ptr<Half>(), self.numel(), alpha);
+    }
+    return false;
+}
+
 }  // namespace
 #endif  // __x86_64__
 
 // --- Helper for Binary Ops ---
+
+template <typename ctype>
+inline ctype add_scalar_element(ctype a, const Scalar& alpha,
+                                const Scalar& other) {
+    if constexpr (is_reduced_storage_v<ctype>) {
+        return static_cast<ctype>(static_cast<float>(a) +
+                                  scalar_fold<ctype>(alpha, other));
+    } else {
+        return static_cast<ctype>(a + alpha.to<ctype>() * other.to<ctype>());
+    }
+}
+
+template <typename ctype>
+inline ctype sub_scalar_element(ctype a, const Scalar& alpha,
+                                const Scalar& other) {
+    if constexpr (is_reduced_storage_v<ctype>) {
+        return static_cast<ctype>(static_cast<float>(a) -
+                                  scalar_fold<ctype>(alpha, other));
+    } else {
+        return static_cast<ctype>(a - alpha.to<ctype>() * other.to<ctype>());
+    }
+}
+
+template <typename ctype>
+inline ctype mul_scalar_element(ctype a, const Scalar& other) {
+    if constexpr (is_reduced_storage_v<ctype>) {
+        return static_cast<ctype>(static_cast<float>(a) * other.to<float>());
+    } else {
+        return static_cast<ctype>(a * other.to<ctype>());
+    }
+}
 
 // Scalar-division element step. Arithmetic happens in the compute domain
 // (opmath) so Half/BFloat16 inputs divide in float, and reduced complex
@@ -1195,8 +1540,7 @@ ctype div_scalar_element(ctype a, const Scalar& other) {
                      static_cast<typename ctype::value_type>(rm.imag()));
     } else {
         using math_t = opmath_type<ctype>;
-        return static_cast<ctype>(static_cast<math_t>(a) /
-                                  static_cast<math_t>(other.to<ctype>()));
+        return static_cast<ctype>(static_cast<math_t>(a) / other.to<math_t>());
     }
 }
 
@@ -1452,6 +1796,25 @@ bool try_add_float32_out(const Tensor& self, const Tensor& other,
         }
     });
     return true;
+}
+
+// The same fused loop over a reduced storage.  alpha takes its storage value,
+// the sum stays in float32 and rounds once on store.
+bool try_add_narrow_out(const Tensor& self, const Tensor& other, Scalar alpha,
+                        Tensor& out) {
+#if defined(__x86_64__)
+    if (!narrow_binary_pair(self, other) || out.dtype() != self.dtype() ||
+        self.shape() != out.shape() || !out.is_contiguous() ||
+        alpha.isComplex() || has_output_alias(out, self) ||
+        has_output_alias(out, other)) {
+        return false;
+    }
+    return narrow_binary_fill(
+        out, self, other, BIN_ADD,
+        narrow_alpha(alpha.to<float>(), self.dtype()));
+#else
+    return false;
+#endif
 }
 
 bool try_add_tensor_iterator_out(const Tensor& self, const Tensor& other,
@@ -1933,20 +2296,17 @@ Tensor add_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha) 
     }
     
 #if defined(__x86_64__)
-    // Native BF16 add: widen once, apply alpha in float32, and round once on
-    // store.  The generic TensorIterator path is scalar for this dtype.
-    if (self.dtype() == DType::BFloat16 && other.dtype() == DType::BFloat16 &&
-        self.is_contiguous() && other.is_contiguous() &&
-        self.shape() == other.shape() && !alpha.isComplex()) {
+    // Native BF16/Half add: widen once, apply alpha in float32, and round once
+    // on store.  The generic TensorIterator path is scalar for these dtypes.
+    if (narrow_binary_pair(self, other) && !alpha.isComplex()) {
         Tensor result = Tensor::empty(
-            static_cast<std::vector<int64_t>>(self.shape()), DType::BFloat16,
+            static_cast<std::vector<int64_t>>(self.shape()), self.dtype(),
             self.device());
-        bf16_binary_contiguous(BIN_ADD, self.data_ptr<BFloat16>(),
-                               other.data_ptr<BFloat16>(),
-                               result.data_ptr<BFloat16>(), self.numel(),
-                               static_cast<float>(static_cast<BFloat16>(
-                                   alpha.to<float>())));
-        return result;
+        if (narrow_binary_fill(result, self, other, BIN_ADD,
+                               narrow_alpha(alpha.to<float>(),
+                                            self.dtype()))) {
+            return result;
+        }
     }
 #endif
 
@@ -2140,6 +2500,7 @@ Tensor& add_out_kernel(const Tensor& self, const Tensor& other, const Scalar& al
         static_cast<std::vector<int64_t>>(other.shape()));
     if (static_cast<std::vector<int64_t>>(out.shape()) == out_shape) {
         if (try_add_float32_out(self, other, alpha, out) ||
+            try_add_narrow_out(self, other, alpha, out) ||
             try_add_tensor_iterator_out(self, other, alpha, result_dtype, out)) {
             return out;
         }
@@ -2361,16 +2722,13 @@ Tensor mul_kernel(const Tensor& self, const Tensor& other) {
     #endif
 
 #if defined(__x86_64__)
-    if (self.dtype() == DType::BFloat16 && other.dtype() == DType::BFloat16 &&
-        self.is_contiguous() && other.is_contiguous() &&
-        self.shape() == other.shape()) {
+    if (narrow_binary_pair(self, other)) {
         Tensor result = Tensor::empty(
-            static_cast<std::vector<int64_t>>(self.shape()), DType::BFloat16,
+            static_cast<std::vector<int64_t>>(self.shape()), self.dtype(),
             self.device());
-        bf16_binary_contiguous(BIN_MUL, self.data_ptr<BFloat16>(),
-                               other.data_ptr<BFloat16>(),
-                               result.data_ptr<BFloat16>(), self.numel(), 1.0f);
-        return result;
+        if (narrow_binary_fill(result, self, other, BIN_MUL, 1.0f)) {
+            return result;
+        }
     }
 #endif
 
@@ -2568,16 +2926,13 @@ Tensor div_kernel(const Tensor& self, const Tensor& other) {
     #endif
 
 #if defined(__x86_64__)
-    if (self.dtype() == DType::BFloat16 && other.dtype() == DType::BFloat16 &&
-        self.is_contiguous() && other.is_contiguous() &&
-        self.shape() == other.shape()) {
+    if (narrow_binary_pair(self, other)) {
         Tensor result = Tensor::empty(
-            static_cast<std::vector<int64_t>>(self.shape()), DType::BFloat16,
+            static_cast<std::vector<int64_t>>(self.shape()), self.dtype(),
             self.device());
-        bf16_binary_contiguous(BIN_DIV, self.data_ptr<BFloat16>(),
-                               other.data_ptr<BFloat16>(),
-                               result.data_ptr<BFloat16>(), self.numel(), 1.0f);
-        return result;
+        if (narrow_binary_fill(result, self, other, BIN_DIV, 1.0f)) {
+            return result;
+        }
     }
 #endif
 
@@ -2712,15 +3067,12 @@ Tensor& add_inplace_kernel(Tensor& self, const Tensor& other, const Scalar& alph
     }
 
 #if defined(__x86_64__)
-    if (self.dtype() == DType::BFloat16 && other.dtype() == DType::BFloat16 &&
-        self.is_contiguous() && other.is_contiguous() &&
-        self.shape() == other.shape() && !alpha.isComplex()) {
-        bf16_binary_contiguous(BIN_ADD, self.data_ptr<BFloat16>(),
-                               other.data_ptr<BFloat16>(),
-                               self.data_ptr<BFloat16>(), self.numel(),
-                               static_cast<float>(static_cast<BFloat16>(
-                                   alpha.to<float>())));
-        return self;
+    if (narrow_binary_pair(self, other) && !alpha.isComplex()) {
+        if (narrow_binary_inplace(self, other, BIN_ADD,
+                                  narrow_alpha(alpha.to<float>(),
+                                               self.dtype()))) {
+            return self;
+        }
     }
 
     // Muon's common mixed-precision update: FP32 parameter plus BF16 update.
@@ -3195,7 +3547,15 @@ Tensor& mul_inplace_kernel(Tensor& self, const Tensor& other) {
         optimized = true;
         #endif
     }
-    
+
+#if defined(__x86_64__)
+    // The out-of-place form already runs a vectorized loop over a reduced
+    // storage; an in-place chain has to reach it through the same door.
+    if (!optimized && narrow_binary_pair(self, other)) {
+        optimized = narrow_binary_inplace(self, other, BIN_MUL, 1.0f);
+    }
+#endif
+
     if (!optimized) {
         Tensor other_c = (other.dtype() == self.dtype()) ? other : other.to(self.dtype());
         { auto op = [](auto x, auto y) { return x * y; };
@@ -3354,7 +3714,13 @@ Tensor& div_inplace_kernel(Tensor& self, const Tensor& other) {
         optimized = true;
         #endif
     }
-    
+
+#if defined(__x86_64__)
+    if (!optimized && narrow_binary_pair(self, other)) {
+        optimized = narrow_binary_inplace(self, other, BIN_DIV, 1.0f);
+    }
+#endif
+
     if (!optimized) {
         Tensor other_c = (other.dtype() == self.dtype()) ? other : other.to(self.dtype());
         { auto op = [](auto x, auto y) {
@@ -3418,6 +3784,19 @@ Tensor add_scalar_kernel(const Tensor& self, const Scalar& other, const Scalar& 
                               result.data_ptr<double>(), self.numel(), scalar);
         return result;
     }
+    // Reduced storages fold the scaled scalar in float32 and round once on
+    // store; the recursive functor would also round the product, which shifts
+    // every sum whose product is not representable.
+    if (narrow_scalar_pair(self, result_dtype) && !other.isComplex() &&
+        !alpha.isComplex()) {
+        Tensor result = Tensor::empty(
+            static_cast<std::vector<int64_t>>(self.shape()), result_dtype,
+            self.device());
+        if (narrow_scalar_fill(result, self, BIN_ADD,
+                               narrow_scalar_fold(alpha, other, self.dtype()))) {
+            return result;
+        }
+    }
 #endif
 
     Tensor result = empty_scalar_result(self, result_dtype);
@@ -3426,7 +3805,7 @@ Tensor add_scalar_kernel(const Tensor& self, const Scalar& other, const Scalar& 
     #define OP_CASE(ctype, name) \
     case DType::name: { \
         auto op = [other, alpha](ctype a) -> ctype { \
-            return static_cast<ctype>(a + alpha.to<ctype>() * other.to<ctype>()); \
+            return add_scalar_element(a, alpha, other); \
         }; \
         apply_unary_op_recursive<ctype>(result.data_ptr<ctype>(), result.strides(), \
                                        self_casted, self_casted.strides(), \
@@ -3472,6 +3851,19 @@ Tensor sub_scalar_kernel(const Tensor& self, const Scalar& other, const Scalar& 
                               result.data_ptr<double>(), self.numel(), -scalar);
         return result;
     }
+    // The negated fold enters the same add loop: subtracting a product is the
+    // round trip of one sum, so no separate code is needed.
+    if (narrow_scalar_pair(self, result_dtype) && !other.isComplex() &&
+        !alpha.isComplex()) {
+        Tensor result = Tensor::empty(
+            static_cast<std::vector<int64_t>>(self.shape()), result_dtype,
+            self.device());
+        if (narrow_scalar_fill(
+                result, self, BIN_ADD,
+                -narrow_scalar_fold(alpha, other, self.dtype()))) {
+            return result;
+        }
+    }
 #endif
 
     Tensor result = empty_scalar_result(self, result_dtype);
@@ -3480,7 +3872,7 @@ Tensor sub_scalar_kernel(const Tensor& self, const Scalar& other, const Scalar& 
     #define OP_CASE(ctype, name) \
     case DType::name: { \
         auto op = [other, alpha](ctype a) -> ctype { \
-            return static_cast<ctype>(a - alpha.to<ctype>() * other.to<ctype>()); \
+            return sub_scalar_element(a, alpha, other); \
         }; \
         apply_unary_op_recursive<ctype>(result.data_ptr<ctype>(), result.strides(), \
                                        self_casted, self_casted.strides(), \
@@ -3524,15 +3916,15 @@ Tensor mul_scalar_kernel(const Tensor& self, const Scalar& other) {
 #endif
 
 #if defined(__x86_64__)
-    if (self.dtype() == DType::BFloat16 && result_dtype == DType::BFloat16 &&
-        !other.isComplex() && self.is_contiguous()) {
+    // A wrapped multiplier keeps its float32 bits on a reduced storage, so it
+    // enters the loop without a round trip through the storage width.
+    if (narrow_scalar_pair(self, result_dtype) && !other.isComplex()) {
         Tensor result = Tensor::empty(
-            static_cast<std::vector<int64_t>>(self.shape()), DType::BFloat16,
+            static_cast<std::vector<int64_t>>(self.shape()), result_dtype,
             self.device());
-        bf16_scalar_contiguous(BIN_MUL, self.data_ptr<BFloat16>(),
-                               result.data_ptr<BFloat16>(), self.numel(),
-                               other.to<float>());
-        return result;
+        if (narrow_scalar_fill(result, self, BIN_MUL, other.to<float>())) {
+            return result;
+        }
     }
 #endif
 
@@ -3542,7 +3934,7 @@ Tensor mul_scalar_kernel(const Tensor& self, const Scalar& other) {
     #define OP_CASE(ctype, name) \
     case DType::name: { \
         auto op = [other](ctype a) -> ctype { \
-            return static_cast<ctype>(a * other.to<ctype>()); \
+            return mul_scalar_element(a, other); \
         }; \
         apply_unary_op_recursive<ctype>(result.data_ptr<ctype>(), result.strides(), \
                                        self_casted, self_casted.strides(), \
@@ -3593,15 +3985,14 @@ Tensor div_scalar_kernel(const Tensor& self, const Scalar& other) {
 #endif
 
 #if defined(__x86_64__)
-    if (self.dtype() == DType::BFloat16 && result_dtype == DType::BFloat16 &&
-        !other.isComplex() && self.is_contiguous()) {
+    // The divisor likewise stays in float32.
+    if (narrow_scalar_pair(self, result_dtype) && !other.isComplex()) {
         Tensor result = Tensor::empty(
-            static_cast<std::vector<int64_t>>(self.shape()), DType::BFloat16,
+            static_cast<std::vector<int64_t>>(self.shape()), result_dtype,
             self.device());
-        bf16_scalar_contiguous(BIN_DIV, self.data_ptr<BFloat16>(),
-                               result.data_ptr<BFloat16>(), self.numel(),
-                               other.to<float>());
-        return result;
+        if (narrow_scalar_fill(result, self, BIN_DIV, other.to<float>())) {
+            return result;
+        }
     }
 #endif
 
@@ -3649,12 +4040,19 @@ Tensor& add_scalar_inplace_kernel(Tensor& self, const Scalar& other, const Scala
         }
         return self;
     }
+    if (narrow_scalar_pair(self, self.dtype()) && !other.isComplex() &&
+        !alpha.isComplex()) {
+        if (narrow_scalar_fill(self, self, BIN_ADD,
+                               narrow_scalar_fold(alpha, other, self.dtype()))) {
+            return self;
+        }
+    }
 #endif
 
     #define OP_CASE(ctype, name) \
     case DType::name: { \
         auto op = [other, alpha](ctype a) -> ctype { \
-            return static_cast<ctype>(a + alpha.to<ctype>() * other.to<ctype>()); \
+            return add_scalar_element(a, alpha, other); \
         }; \
         apply_unary_op_recursive<ctype>(self.data_ptr<ctype>(), self.strides(), \
                                        self, self.strides(), \
@@ -3685,12 +4083,20 @@ Tensor& sub_scalar_inplace_kernel(Tensor& self, const Scalar& other, const Scala
         }
         return self;
     }
+    if (narrow_scalar_pair(self, self.dtype()) && !other.isComplex() &&
+        !alpha.isComplex()) {
+        if (narrow_scalar_fill(
+                self, self, BIN_ADD,
+                -narrow_scalar_fold(alpha, other, self.dtype()))) {
+            return self;
+        }
+    }
 #endif
 
     #define OP_CASE(ctype, name) \
     case DType::name: { \
         auto op = [other, alpha](ctype a) -> ctype { \
-            return static_cast<ctype>(a - alpha.to<ctype>() * other.to<ctype>()); \
+            return sub_scalar_element(a, alpha, other); \
         }; \
         apply_unary_op_recursive<ctype>(self.data_ptr<ctype>(), self.strides(), \
                                         self, self.strides(), \
@@ -3724,19 +4130,17 @@ Tensor& mul_scalar_inplace_kernel(Tensor& self, const Scalar& other) {
 #endif
 
 #if defined(__x86_64__)
-    if (self.dtype() == DType::BFloat16 && !other.isComplex() &&
-        self.is_contiguous()) {
-        bf16_scalar_contiguous(BIN_MUL, self.data_ptr<BFloat16>(),
-                               self.data_ptr<BFloat16>(), self.numel(),
-                               other.to<float>());
-        return self;
+    if (narrow_scalar_pair(self, self.dtype()) && !other.isComplex()) {
+        if (narrow_scalar_fill(self, self, BIN_MUL, other.to<float>())) {
+            return self;
+        }
     }
 #endif
 
     #define OP_CASE(ctype, name) \
     case DType::name: { \
         auto op = [other](ctype a) -> ctype { \
-            return static_cast<ctype>(a * other.to<ctype>()); \
+            return mul_scalar_element(a, other); \
         }; \
         apply_unary_op_recursive<ctype>(self.data_ptr<ctype>(), self.strides(), \
                                        self, self.strides(), \
@@ -3770,12 +4174,10 @@ Tensor& div_scalar_inplace_kernel(Tensor& self, const Scalar& other) {
 #endif
 
 #if defined(__x86_64__)
-    if (self.dtype() == DType::BFloat16 && !other.isComplex() &&
-        self.is_contiguous()) {
-        bf16_scalar_contiguous(BIN_DIV, self.data_ptr<BFloat16>(),
-                               self.data_ptr<BFloat16>(), self.numel(),
-                               other.to<float>());
-        return self;
+    if (narrow_scalar_pair(self, self.dtype()) && !other.isComplex()) {
+        if (narrow_scalar_fill(self, self, BIN_DIV, other.to<float>())) {
+            return self;
+        }
     }
 #endif
 
