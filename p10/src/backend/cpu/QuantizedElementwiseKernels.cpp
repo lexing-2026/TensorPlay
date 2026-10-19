@@ -1548,15 +1548,37 @@ void embedding_impl(const uint8_t* w, const int64_t* indices, const int64_t* off
     }
 }
 
+// Both affine grids hold for the whole call, so each of the 256 input codes has
+// exactly one output code. Deciding them up front with the double to float path
+// fixes the half way cases a float vector round could land on either side of,
+// and turns every element of every row into one lookup.
+void fill_cat_code_table(int8_t* table, int64_t input_zero_point, double input_scale,
+        double output_scale, int64_t output_zero_point, bool relu) {
+    const float inverse = 1.f / static_cast<float>(output_scale);
+    const int8_t zero = static_cast<int8_t>(output_zero_point);
+    for (int64_t i = 0; i < 256; ++i) {
+        const int8_t code = static_cast<int8_t>(i - 128);
+        const float value = static_cast<float>(
+            (static_cast<double>(code) - input_zero_point) * input_scale);
+        const float rounded = std::nearbyintf(value * inverse) +
+            static_cast<float>(output_zero_point);
+        int8_t entry = static_cast<int8_t>(std::clamp(
+            static_cast<int64_t>(rounded), int64_t(-128), int64_t(127)));
+        if (relu) entry = std::max(entry, zero);
+        table[i] = entry;
+    }
+}
+
 void cat_rows_impl(const int8_t* input, int8_t* output, int64_t rows,
         int64_t chunk, int64_t width, int64_t offset, double input_scale,
         int64_t input_zero_point, double output_scale, int64_t output_zero_point,
         bool same_qparams, bool relu) {
     using QV = vec::Vectorized<qint8>;
-    using FV = vec::Vectorized<float>;
     const int8_t zero = static_cast<int8_t>(output_zero_point);
     const int64_t vector_end = chunk - chunk % QV::size();
-    const bool vector_rounding = std::fegetround() == FE_TONEAREST;
+    alignas(64) int8_t table[256];
+    fill_cat_code_table(table, input_zero_point, input_scale, output_scale,
+                        output_zero_point, relu);
     parallel::parallel_for(0, rows, 1, [&](int64_t first, int64_t last) {
         for (int64_t row = first; row < last; ++row) {
             const int8_t* src = input + row * chunk;
@@ -1575,61 +1597,8 @@ void cat_rows_impl(const int8_t* input, int8_t* output, int64_t rows,
                 }
                 continue;
             }
-            int64_t col = 0;
-            if (vector_rounding) {
-                const float input_scale_f = static_cast<float>(input_scale);
-                const float inverse_output_scale_f = 1.f / static_cast<float>(output_scale);
-                for (; col < vector_end; col += QV::size()) {
-                    auto values = QV::loadu(src + col).dequantize(
-                        FV(input_scale_f),
-                        FV(static_cast<float>(input_zero_point)));
-                    if (relu) {
-                        for (auto& value : values)
-                            value = vec::maximum(value, FV(0.f));
-                    }
-                    QV::quantize(values, static_cast<float>(output_scale),
-                            static_cast<int32_t>(output_zero_point),
-                            inverse_output_scale_f)
-                        .store(dst + col);
-
-                    alignas(64) float approximations[QV::size()];
-                    int value_offset = 0;
-                    for (const auto& value : values) {
-                        const int count = std::min<int>(FV::size(), QV::size() - value_offset);
-                        value.store(approximations + value_offset, count);
-                        value_offset += count;
-                    }
-                    for (int lane = 0; lane < QV::size(); ++lane) {
-                        const float scaled = approximations[lane] * inverse_output_scale_f;
-                        if (scaled < -512.f || scaled > 512.f) continue;
-                        const float fraction = std::fabs(scaled - std::floor(scaled));
-                        const float tolerance = 8.f * std::numeric_limits<float>::epsilon() *
-                            (std::fabs(scaled) + 1.f);
-                        if (fraction < 0.5f - tolerance || fraction > 0.5f + tolerance)
-                            continue;
-
-                        const float exact_value = static_cast<float>(
-                            (static_cast<double>(src[col + lane]) - input_zero_point) * input_scale);
-                        const float rounded = std::nearbyintf(exact_value * inverse_output_scale_f) +
-                            static_cast<float>(output_zero_point);
-                        int8_t code = static_cast<int8_t>(std::clamp(
-                            static_cast<int64_t>(rounded), int64_t(-128), int64_t(127)));
-                        if (relu) code = std::max(code, zero);
-                        dst[col + lane] = code;
-                    }
-                }
-            }
-            const float inverse_output_scale = 1.f / static_cast<float>(output_scale);
-            for (; col < chunk; ++col) {
-                const float value = static_cast<float>(
-                    (static_cast<double>(src[col]) - input_zero_point) * input_scale);
-                const float rounded = std::nearbyintf(
-                    value * inverse_output_scale) + static_cast<float>(output_zero_point);
-                int8_t code = static_cast<int8_t>(std::clamp(
-                    static_cast<int64_t>(rounded), int64_t(-128), int64_t(127)));
-                if (relu) code = std::max(code, zero);
-                dst[col] = code;
-            }
+            for (int64_t column = 0; column < chunk; ++column)
+                dst[column] = table[static_cast<int64_t>(src[column]) + 128];
         }
     });
 }
