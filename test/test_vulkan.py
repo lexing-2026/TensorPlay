@@ -4946,5 +4946,183 @@ class TestVulkanScatterValue(unittest.TestCase):
             payload.scatter_(1, self._device(np.zeros((2, 2), np.float32)), 1.0)
 
 
+class TestVulkanScatterSrc(unittest.TestCase):
+    # Moving a payload differs from writing a constant in one respect: the entry
+    # that names a destination carries its own number, read at the entry's own
+    # position in the list.  The mark pass of a constant write already records
+    # that position, so the same two passes run with the payload bound beside
+    # the marks and the apply pass takes a value instead of a uniform.
+
+    LENGTHS = (100001, 100003)
+
+    @staticmethod
+    def _device(payload):
+        return tensorplay.from_numpy(np.ascontiguousarray(payload)).to("vulkan")
+
+    @staticmethod
+    def _values(count):
+        # Numbers that differ from each other and from zero, so a lane that kept
+        # its own value or took a neighbour's cannot pass for the one asked for.
+        return (np.arange(count, dtype=np.float32) % 23) - 11.0
+
+    @staticmethod
+    def _permutation(shape, axis, order):
+        # Codes that name each destination at most once along the scattered axis:
+        # two entries naming one destination leave the winner to whichever store
+        # lands last, which is what a scattered write of a payload answers to.
+        rng = np.random.default_rng(order)
+        out = np.empty(shape, np.int64)
+        for at in np.ndindex(
+                *[size for index, size in enumerate(shape) if index != axis]):
+            view = list(at)
+            view.insert(axis, slice(None))
+            out[tuple(view)] = rng.permutation(shape[axis])
+        return out
+
+    def _move(self, payload, dim, codes, values):
+        out = payload.copy()
+        axis = dim if dim >= 0 else dim + payload.ndim
+        held = np.ascontiguousarray(
+            np.broadcast_to(np.asarray(values), codes.shape)).reshape(-1)
+        position = 0
+        for at in np.ndindex(codes.shape):
+            destination = list(at)
+            destination[axis] = int(codes[at])
+            out[tuple(destination)] = held[position]
+            position += 1
+        return out
+
+    def _check_moved(self, base_np, codes, dim, values, dtype=np.float32):
+        payload = base_np.astype(dtype)
+        want = self._move(payload, dim, codes,
+                          np.asarray(values).astype(dtype))
+        kept = self._device(payload)
+        got = kept.scatter_(
+            dim, self._device(codes), self._device(values)).cpu().numpy()
+        np.testing.assert_allclose(
+            got.astype(np.float32), want.astype(np.float32), rtol=1e-3,
+            atol=1e-3,
+            err_msg=f"moved into a {payload.shape} destination along axis {dim}")
+        # Out-of-place leaves the destination alone and answers with the copy.
+        held = self._device(payload)
+        moved = tensorplay.scatter(
+            held, dim, self._device(codes), self._device(values))
+        np.testing.assert_allclose(
+            moved.cpu().numpy().astype(np.float32), want.astype(np.float32),
+            rtol=1e-3, atol=1e-3, err_msg="moved out-of-place")
+        np.testing.assert_allclose(
+            held.cpu().numpy().astype(np.float32), payload.astype(np.float32),
+            rtol=1e-3, atol=1e-3, err_msg="the destination left alone")
+
+    def test_each_entry_carries_its_own_number(self):
+        # Along the width a code names one lane of a four-lane group, so the
+        # value of the entry has to reach that lane and no other.
+        self._check_moved(
+            np.zeros((2, 6), np.float32),
+            np.array([[0, 2, 4], [1, 3, 5]], np.int64), 1,
+            self._values(6).reshape(2, 3))
+        self._check_moved(
+            np.ones((4, 7), np.float32),
+            np.array([[0, 6], [1, 5], [2, 4], [3, 0]], np.int32), 1,
+            self._values(8).reshape(4, 2))
+        # A negative axis counts from the back.
+        self._check_moved(
+            np.ones((3, 4), np.float32),
+            np.array([[0, 1], [2, 3], [0, 2]], np.int64), -1,
+            self._values(6).reshape(3, 2))
+        # A width that is not a multiple of four ends in a partly used group.
+        self._check_moved(
+            np.zeros((3, 5), np.float32),
+            self._permutation((3, 4), 1, 41), 1, self._values(12).reshape(3, 4))
+
+    def test_an_entry_moves_a_whole_inner_span(self):
+        # An axis other than the last has a code stand for a row of the
+        # destination, so the entries of one span carry consecutive values while
+        # the spans nobody names keep theirs.
+        self._check_moved(
+            np.zeros((2, 5, 3), np.float32),
+            np.array([[[0, 1], [2, 3]], [[1, 0], [3, 2]]], np.int64), 1,
+            self._values(8).reshape(2, 2, 2))
+        # A list narrower than the destination along an outer axis still has to
+        # reach the rows of the plane it covers.
+        self._check_moved(
+            np.zeros((2, 3, 4, 5), np.float32),
+            self._permutation((1, 3, 4, 5), 1, 42), 1,
+            self._values(60).reshape(1, 3, 4, 5))
+        for axis in (0, 1, 2):
+            self._check_moved(
+                np.zeros((3, 5, 4), np.float32),
+                self._permutation((3, 5, 4), axis, 43 + axis), axis,
+                self._values(60).reshape(3, 5, 4))
+
+    def test_a_half_payload_moves_between_halves(self):
+        # Two halves share a word and four share a texel, so a value that changed
+        # width on its way in or out of the group would show up as a neighbour
+        # rewritten rather than a lane missed.
+        self._check_moved(
+            np.zeros((2, 6), np.float32),
+            np.array([[0, 2, 4], [1, 3, 5]], np.int64), 1,
+            self._values(6).reshape(2, 3), dtype=np.float16)
+        self._check_moved(
+            np.zeros((3, 5, 4), np.float32),
+            self._permutation((3, 5, 4), 2, 44), 2,
+            self._values(60).reshape(3, 5, 4), dtype=np.float16)
+
+    def test_a_long_destination_moves_through_linear_storage(self):
+        # Past the reach of an image both passes count elements of the flat
+        # payload, and a ragged count ends in a partly used word.
+        for width in self.LENGTHS:
+            codes = np.array(
+                [[0, 1, width - 3, width - 2, width - 1],
+                 [3, 4, 5, 6, 7]], np.int64)
+            self._check_moved(
+                np.zeros((2, width), np.float32), codes, 1,
+                self._values(10).reshape(2, 5))
+            self._check_moved(
+                np.zeros((2, width), np.float32), codes, 1,
+                self._values(10).reshape(2, 5), dtype=np.float16)
+        self._check_moved(
+            np.ones((1, 100001), np.float32) * 0.5,
+            np.array([[0, 50000, 100000]], np.int64), 1, self._values(3))
+
+    def test_the_payload_may_reach_the_list_from_further_off(self):
+        # A single number repeats over every entry, a number per row repeats over
+        # the entries of that row, an axis the payload leaves out stands for the
+        # outer ones, and a payload of the narrower width is read as the width the
+        # destination carries.
+        codes = np.array([[0, 2, 4], [1, 3, 5]], np.int64)
+        base = np.zeros((2, 6), np.float32)
+        self._check_moved(base, codes, 1, np.array([[7.0]], np.float32))
+        self._check_moved(base, codes, 1, np.array([[3.0], [5.0]], np.float32))
+        self._check_moved(base, codes, 1, self._values(3))
+        self._check_moved(
+            base, codes, 1, self._values(6).reshape(2, 3).astype(np.float16))
+
+    def test_a_source_taken_from_the_plane_being_written_keeps_its_values(self):
+        # Reading rows out of the very destination the stores rewrite would bind
+        # one allocation in both directions at once, so the pass could answer for
+        # a lane out of the bytes it had just changed.
+        base = np.arange(24, dtype=np.float32).reshape(4, 6)
+        codes = np.array(
+            [[5, 4, 3], [0, 1, 2], [2, 3, 4], [5, 0, 1]], np.int64)
+        payload = self._device(base.copy())
+        got = payload.scatter_(
+            1, self._device(codes), payload[:, :3]).cpu().numpy()
+        np.testing.assert_allclose(
+            got, self._move(base, 1, codes, base[:, :3]), rtol=0, atol=1e-6,
+            err_msg="a source read out of the plane being written")
+
+    def test_a_payload_that_cannot_cover_the_list_is_refused(self):
+        payload = self._device(np.zeros((2, 4), np.float32))
+        with self.assertRaisesRegex(RuntimeError, "more axes than the list"):
+            payload.scatter_(
+                1, self._device(np.zeros((2, 3), np.int64)),
+                self._device(np.zeros((2, 3, 1), np.float32)))
+        with self.assertRaisesRegex(RuntimeError, "reach the list at dimension"):
+            payload.scatter_(
+                1, self._device(np.zeros((2, 3), np.int64)),
+                self._device(np.zeros((2, 2), np.float32)))
+
+
 if __name__ == "__main__":
     unittest.main()
