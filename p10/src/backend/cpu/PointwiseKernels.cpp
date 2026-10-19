@@ -1918,6 +1918,48 @@ void clamp_f64_avx512(const double* src, double* dst, int64_t n,
         dst[i] = v;
     }
 }
+
+// 256-bit twins.  The bound stays the first operand of max/min, so a NaN
+// lane is returned unchanged exactly like the scalar tail.
+__attribute__((target("avx2")))
+void clamp_f32_avx2(const float* src, float* dst, int64_t n,
+                    float lo, float hi) {
+    const __m256 vlo = _mm256_set1_ps(lo);
+    const __m256 vhi = _mm256_set1_ps(hi);
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 v = _mm256_loadu_ps(src + i);
+        v = _mm256_max_ps(vlo, v);
+        v = _mm256_min_ps(vhi, v);
+        _mm256_storeu_ps(dst + i, v);
+    }
+    for (; i < n; ++i) {
+        float v = src[i];
+        if (v < lo) v = lo;
+        if (v > hi) v = hi;
+        dst[i] = v;
+    }
+}
+
+__attribute__((target("avx2")))
+void clamp_f64_avx2(const double* src, double* dst, int64_t n,
+                    double lo, double hi) {
+    const __m256d vlo = _mm256_set1_pd(lo);
+    const __m256d vhi = _mm256_set1_pd(hi);
+    int64_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        __m256d v = _mm256_loadu_pd(src + i);
+        v = _mm256_max_pd(vlo, v);
+        v = _mm256_min_pd(vhi, v);
+        _mm256_storeu_pd(dst + i, v);
+    }
+    for (; i < n; ++i) {
+        double v = src[i];
+        if (v < lo) v = lo;
+        if (v > hi) v = hi;
+        dst[i] = v;
+    }
+}
 } // namespace
 #endif
 
@@ -1927,42 +1969,54 @@ Tensor clamp_kernel(const Tensor& self, const std::optional<Scalar>& min, const 
     Tensor self_contig = self.contiguous();
 
 #if defined(__x86_64__)
-    if (vecunary::avx512_available() &&
+    if ((vecunary::avx512_available() || vecunary::avx2_available()) &&
         (self.dtype() == DType::Float32 || self.dtype() == DType::Float64)) {
         const double lo = min.has_value()
             ? min->toDouble() : -std::numeric_limits<double>::infinity();
         const double hi = max.has_value()
             ? max->toDouble() : std::numeric_limits<double>::infinity();
+        const bool use512 = vecunary::avx512_available();
         if (self.dtype() == DType::Float32) {
             const float* src = self_contig.data_ptr<float>();
             float* dst = result.data_ptr<float>();
             parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-                clamp_f32_avx512(src + begin, dst + begin, end - begin,
-                                 static_cast<float>(lo), static_cast<float>(hi));
+                if (use512)
+                    clamp_f32_avx512(src + begin, dst + begin, end - begin,
+                                     static_cast<float>(lo), static_cast<float>(hi));
+                else
+                    clamp_f32_avx2(src + begin, dst + begin, end - begin,
+                                   static_cast<float>(lo), static_cast<float>(hi));
             });
         } else {
             const double* src = self_contig.data_ptr<double>();
             double* dst = result.data_ptr<double>();
             parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-                clamp_f64_avx512(src + begin, dst + begin, end - begin,
-                                 lo, hi);
+                if (use512)
+                    clamp_f64_avx512(src + begin, dst + begin, end - begin,
+                                     lo, hi);
+                else
+                    clamp_f64_avx2(src + begin, dst + begin, end - begin,
+                                   lo, hi);
             });
         }
         return result;
     }
 #endif
 
+    const bool has_min = min.has_value();
+    const bool has_max = max.has_value();
+
     #define OP_CASE(ctype, name) \
     case DType::name: { \
         const ctype* src = self_contig.data_ptr<ctype>(); \
         ctype* dst = result.data_ptr<ctype>(); \
-        ctype min_val = min.has_value() ? min->to<ctype>() : std::numeric_limits<ctype>::lowest(); \
-        ctype max_val = max.has_value() ? max->to<ctype>() : std::numeric_limits<ctype>::max(); \
+        ctype min_val = has_min ? min->to<ctype>() : std::numeric_limits<ctype>::lowest(); \
+        ctype max_val = has_max ? max->to<ctype>() : std::numeric_limits<ctype>::max(); \
         parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) { \
         for(int64_t i=begin; i<end; ++i) { \
             ctype val = src[i]; \
-            if (min.has_value() && val < min_val) val = min_val; \
-            if (max.has_value() && val > max_val) val = max_val; \
+            if (has_min && val < min_val) val = min_val; \
+            if (has_max && val > max_val) val = max_val; \
             dst[i] = val; \
         } \
         }); \
