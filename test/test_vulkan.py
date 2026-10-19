@@ -4651,6 +4651,106 @@ class TestVulkanPowerLanes(unittest.TestCase):
                 (2 ** self._host(row)).cpu().numpy(),
                 err_msg=f"count exponents at {count}")
 
+    # Counts for both operands, and the numbers a power names where the
+    # hardware answer runs out: a base of nothing, an exponent of nothing, and
+    # the two bases that are their own reciprocals against an exponent that has
+    # no end.
+
+    COUNT_BASES = np.array([1, -1, 2, -2, 3, -3, 10, -7, 5, -6],
+                           dtype=np.int32)
+    COUNT_POWERS = np.array([0, 0, 2, -1, 3, -2, 7, 3, 4, 5], dtype=np.int32)
+
+    def test_a_pair_of_counts_stays_whole_the_whole_way_up(self):
+        # An estimate of the answer in single precision is already half a count
+        # away from it by the time the exponent reaches the top of a word, so
+        # the exponent is spent over the word itself.
+        bases = np.array([2, 2, 3, 3, 5, 10, 10, -6, 7], dtype=np.int32)
+        powers = np.array([30, 15, 19, 12, 13, 7, 6, 5, 4], dtype=np.int32)
+        counts = (bases.size,) + self.LENGTHS
+        for count in counts:
+            row_b = np.resize(bases, count).astype(np.int32)
+            row_e = np.resize(powers, count).astype(np.int32)
+            np.testing.assert_array_equal(
+                tensorplay.pow(self._device(row_b),
+                               self._device(row_e)).cpu().numpy(),
+                tensorplay.pow(self._host(row_b),
+                               self._host(row_e)).cpu().numpy(),
+                err_msg=f"count pair at {count}")
+
+        # One count raised to a whole row of them, and the same pair written
+        # back over the base.
+        np.testing.assert_array_equal(
+            tensorplay.pow(self._device(self.COUNT_BASES),
+                           3).cpu().numpy(),
+            tensorplay.pow(self._host(self.COUNT_BASES), 3).cpu().numpy(),
+            err_msg="count base with a count uniform")
+
+        written = self._device(self.COUNT_BASES.copy())
+        written.pow_(self._device(self.COUNT_POWERS))
+        np.testing.assert_array_equal(
+            written.cpu().numpy(),
+            tensorplay.pow(self._host(self.COUNT_BASES),
+                           self._host(self.COUNT_POWERS)).cpu().numpy(),
+            err_msg="count pair written back")
+
+    def test_a_fraction_of_a_count_keeps_only_its_own_reciprocal(self):
+        # Below nothing the answer is a fraction, and only the two bases that
+        # are their own reciprocals have a value to keep: the one word stays
+        # itself, the negative one turns with whether the exponent is odd or
+        # even, and everything wider -- a nothing base included -- is nothing.
+        bases = np.array([1, -1, -1, -1, 2, -2, 10, 0, 0, 1], dtype=np.int32)
+        powers = np.array([-3, -1, -2, -3, -1, -3, -2, -1, -3, -4],
+                          dtype=np.int32)
+        want = np.array([1, -1, 1, -1, 0, 0, 0, 0, 0, 1], dtype=np.int32)
+        for count in (bases.size,) + self.LENGTHS:
+            row_b = np.resize(bases, count).astype(np.int32)
+            row_e = np.resize(powers, count).astype(np.int32)
+            np.testing.assert_array_equal(
+                tensorplay.pow(self._device(row_b),
+                               self._device(row_e)).cpu().numpy(),
+                np.resize(want, count).astype(np.int32),
+                err_msg=f"count fractions at {count}")
+
+    def test_a_power_names_what_its_edge_of_a_word_means(self):
+        bases = np.array([0.0, 0.0, 0.0, np.nan, np.inf, 1.0, 1.0, -1.0, -1.0,
+                          2.0, 0.5, -2.0], dtype=np.float32)
+        powers = np.array([0.0, 2.0, -1.0, 0.0, 0.0, np.inf, -np.inf, np.inf,
+                           -np.inf, np.inf, np.inf, 0.0], dtype=np.float32)
+        for dtype in (np.float32, np.float16):
+            for count in (bases.size,) + self.LENGTHS:
+                row_b = np.resize(bases, count).astype(dtype)
+                row_e = np.resize(powers, count).astype(dtype)
+                np.testing.assert_allclose(
+                    tensorplay.pow(self._device(row_b),
+                                   self._device(row_e)).cpu().numpy(),
+                    tensorplay.pow(self._host(row_b),
+                                   self._host(row_e)).cpu().numpy(),
+                    rtol=1e-3, atol=1e-3, err_msg=f"power corners at {count}")
+
+        # The same corners once the base and once the exponent is the number
+        # carried as a uniform, which reaches the reflected and the linear
+        # twins of both orders.
+        for dtype in (np.float32, np.float16):
+            row_e = self._device(np.resize(powers, 100001).astype(dtype))
+            np.testing.assert_allclose(
+                tensorplay.pow(0.0, row_e).cpu().numpy(),
+                tensorplay.pow(0.0, self._host(np.resize(powers, 100001)
+                                               .astype(dtype))).cpu().numpy(),
+                rtol=1e-3, atol=1e-3, err_msg="a nothing base as a uniform")
+            row_b = self._device(np.resize(bases, 100001).astype(dtype))
+            np.testing.assert_allclose(
+                tensorplay.pow(row_b, 0.0).cpu().numpy(),
+                tensorplay.pow(self._host(np.resize(bases, 100001)
+                                          .astype(dtype)), 0.0).cpu().numpy(),
+                rtol=1e-3, atol=1e-3, err_msg="a nothing exponent as a uniform")
+
+        written = self._device(bases.copy())
+        written.pow_(self._device(powers))
+        np.testing.assert_allclose(
+            written.cpu().numpy(),
+            tensorplay.pow(self._host(bases), self._host(powers)).cpu().numpy(),
+            rtol=1e-3, atol=1e-3, err_msg="corners written back")
+
 
 if __name__ == "__main__":
     unittest.main()
