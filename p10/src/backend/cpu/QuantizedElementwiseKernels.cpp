@@ -1540,11 +1540,13 @@ void binary_codes(const void* aa, const void* bb, void* yy, int64_t size,
     using FV = vec::Vectorized<float>;
     const T* a = static_cast<const T*>(aa); const T* b = static_cast<const T*>(bb); T* y = static_cast<T*>(yy);
     const FV asc(as), bsc(bs);
+    const FV azf(static_cast<float>(az)), bzf(static_cast<float>(bz));
     // A code stands for scale*(code - zero_point), whose two terms share the
     // scale factor; folding it leaves one multiply-add per lane instead of a
     // subtraction and a multiply.
     const FV ashift(-static_cast<float>(as) * static_cast<float>(az));
     const FV bshift(-static_cast<float>(bs) * static_cast<float>(bz));
+    const float inv_ys = 1.f / static_cast<float>(ys);
     const FV lower((std::numeric_limits<T>::lowest() - yz) * static_cast<float>(ys));
     const FV upper((std::numeric_limits<T>::max() - yz) * static_cast<float>(ys));
     // The grid's lowest code sits at or below zero, so a relu floor already
@@ -1552,16 +1554,21 @@ void binary_codes(const void* aa, const void* bb, void* yy, int64_t size,
     const FV at_least = Relu ? FV(0.f) : lower;
     int64_t i = 0;
     for (; i + QV::size() <= size; i += QV::size()) {
-        auto av = QV::loadu(a + i).dequantize(asc, FV(static_cast<float>(az)), ashift);
-        auto bv = QV::loadu(b + i).dequantize(bsc, FV(static_cast<float>(bz)), bshift);
+        auto av = QV::loadu(a + i).dequantize(asc, azf, ashift);
+        auto bv = QV::loadu(b + i).dequantize(bsc, bzf, bshift);
         for (size_t j = 0; j < av.size(); ++j) {
             if constexpr (Op == 0) av[j] = av[j] + bv[j];
             else if constexpr (Op == 1) av[j] = av[j] - bv[j];
             else if constexpr (Op == 2) av[j] = av[j] * bv[j];
             else av[j] = av[j] / bv[j];
-            av[j] = vec::minimum(vec::maximum(av[j], at_least), upper);
+            // Keeping a value inside the grid is the pair of compares that a
+            // single instruction each already performs; the wider form that
+            // also carries a NaN into the result spends an extra compare and
+            // blend per bound, and a NaN is turned into a boundary code by the
+            // conversion below regardless of which bound reached it.
+            av[j] = vec::clamp_max(vec::clamp_min(av[j], at_least), upper);
         }
-        QV::quantize(av, ys, yz, 1.f / static_cast<float>(ys)).store(y + i);
+        QV::quantize(av, ys, yz, inv_ys).store(y + i);
     }
     for (; i < size; ++i) {
         const float av = static_cast<float>(static_cast<int64_t>(a[i]) - az) * static_cast<float>(as);
