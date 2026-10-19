@@ -8,6 +8,7 @@
 #include <TypeProperties.h>
 #include <Utils.h>
 
+#include <utility>
 #include <vector>
 
 namespace tensorplay {
@@ -19,8 +20,7 @@ namespace {
 /*
  * Branch payload vocabulary: float planes sample through the float shader,
  * Int32 planes ride the `where_i32` twin with iimage loads.  Both operands
- * share one vocabulary, so mixed float/int branches stage the Int32 side to
- * Float32 on the host first.
+ * share one vocabulary, so a mixed pair is converted to the type that holds it.
  */
 void validate_operand(const Tensor& t, const char* name) {
   TP_CHECK(
@@ -29,15 +29,72 @@ void validate_operand(const Tensor& t, const char* name) {
       std::string("Vulkan ") + name +
           " supports Float32, Float16 and Int32 tensors only");
   TP_CHECK(
-      t.dim() >= 1 && t.dim() <= 4,
-      std::string("Vulkan ") + name + " supports 1d to 4d tensors");
+      t.dim() <= 4, std::string("Vulkan ") + name + " supports up to 4d tensors");
 }
 
+// Texel metadata: the output extents plus each plane's own sizes, since a plane
+// narrower than the output is addressed through them.
 struct WhereBlock final {
   ivec4 out_sizes;
+  ivec4 cond_sizes;
+  ivec4 input_sizes;
+  ivec4 other_sizes;
   int c_depth;
   int fill;
 };
+
+// Linear metadata: the output's stride vector plus sizes and strides per plane,
+// and a mask naming the planes that are not already at the output shape.
+struct WhereBufferBlock final {
+  uint32_t buf_length;
+  uint32_t fill0;
+  int32_t broadcast;
+  uint32_t fill1;
+  ivec4 out_strides;
+  ivec4 cond_sizes;
+  ivec4 cond_strides;
+  ivec4 input_sizes;
+  ivec4 input_strides;
+  ivec4 other_sizes;
+  ivec4 other_strides;
+};
+
+// Row-major strides of an output shape: outer dimensions first, zero-filled
+// past the rank, so the linear remap stops at the last real stride.
+ivec4 where_out_strides(const std::vector<int64_t>& out_sizes) {
+  ivec4 strides{0, 0, 0, 0};
+  int64_t acc = 1;
+  for (int d = static_cast<int>(out_sizes.size()) - 1; d >= 0; --d) {
+    strides[d] = static_cast<int32_t>(acc);
+    acc *= out_sizes[d];
+  }
+  return strides;
+}
+
+// Broadcast metadata of one plane: its shape right-aligned to the output rank,
+// because broadcasting aligns trailing dimensions, with a zero stride on every
+// singleton so the remap repeats that dimension.  A dimension the plane lacks
+// keeps a size of one, which repeats the whole plane.
+std::pair<ivec4, ivec4> where_broadcast_meta(
+    const std::vector<int64_t>& out_sizes,
+    const std::vector<int64_t>& op_sizes) {
+  const int ndim_out = static_cast<int>(out_sizes.size());
+  const int ndim_op = static_cast<int>(op_sizes.size());
+  TP_CHECK(
+      ndim_op <= ndim_out,
+      "Vulkan where: an operand rank exceeds the output rank");
+  const int leading = ndim_out - ndim_op;
+  ivec4 sizes{1, 1, 1, 1};
+  ivec4 strides{0, 0, 0, 0};
+  int64_t acc = 1;
+  for (int d = ndim_op - 1; d >= 0; --d) {
+    const int slot = leading + d;
+    sizes[slot] = static_cast<int32_t>(op_sizes[d]);
+    strides[slot] = static_cast<int32_t>(acc);
+    acc *= op_sizes[d];
+  }
+  return {sizes, strides};
+}
 
 } // namespace
 
@@ -70,10 +127,24 @@ Tensor where_kernel(
   validate_operand(self_branch, "where");
   validate_operand(other_branch, "where");
   TP_CHECK(
-      condition.shape() == self_branch.shape() &&
-          self_branch.shape() == other_branch.shape(),
-      "Vulkan where requires equal-shaped operands (broadcast at the "
-      "caller)");
+      condition.dim() <= 4, "Vulkan where supports up to 4d tensors");
+
+  // The three planes are merged into one output shape; a plane that is not
+  // already there is repeated inside the kernel rather than materialized.
+  const std::vector<int64_t> cond_shape =
+      static_cast<std::vector<int64_t>>(condition.shape());
+  const std::vector<int64_t> self_shape =
+      static_cast<std::vector<int64_t>>(self_branch.shape());
+  const std::vector<int64_t> other_shape =
+      static_cast<std::vector<int64_t>>(other_branch.shape());
+  const std::vector<int64_t> out_sizes = tensorplay::broadcast_shapes(
+      cond_shape, self_shape, other_shape);
+  TP_CHECK(
+      out_sizes.size() <= 4, "Vulkan where supports up to 4d tensors");
+
+  const int32_t broadcast =
+      (cond_shape != out_sizes ? 1 : 0) | (self_shape != out_sizes ? 2 : 0) |
+      (other_shape != out_sizes ? 4 : 0);
 
   // An Int32 branch pair keeps word precision; anything else travels as a
   // float plane.
@@ -88,16 +159,27 @@ Tensor where_kernel(
   // Linear payloads (shapes beyond the 3-D image axis limit) select through
   // buffer-to-buffer variants: the Bool condition is one byte per element and
   // rides a packed-word buffer, the operands are plain row-major memory.
-  // Texel-stored operands are gathered into dense buffers first, because a
+  // Texel-stored planes are gathered into dense buffers first, because a
   // texel's lanes are not adjacent in the logical order a buffer reader walks.
-  if (v_input.storage_type() == api::StorageType::BUFFER) {
-    v_cond = to_buffer_storage_dispatch(context, v_cond);
-    v_other = to_buffer_storage_dispatch(context, v_other);
-    // A buffer-stored input needs a buffer-stored output: the default
+  const bool is_buffer =
+      v_cond.storage_type() == api::StorageType::BUFFER ||
+      v_input.storage_type() == api::StorageType::BUFFER ||
+      v_other.storage_type() == api::StorageType::BUFFER;
+  if (is_buffer) {
+    if (v_cond.storage_type() != api::StorageType::BUFFER) {
+      v_cond = to_buffer_storage_dispatch(context, v_cond);
+    }
+    if (v_input.storage_type() != api::StorageType::BUFFER) {
+      v_input = to_buffer_storage_dispatch(context, v_input);
+    }
+    if (v_other.storage_type() != api::StorageType::BUFFER) {
+      v_other = to_buffer_storage_dispatch(context, v_other);
+    }
+    // A buffer-stored branch needs a buffer-stored output: the default
     // allocation is a texture, whose image the linear variant cannot write.
     api::vTensor v_output{
         context,
-        v_input.sizes(),
+        out_sizes,
         vocabulary,
         api::StorageType::BUFFER,
         api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
@@ -117,12 +199,23 @@ Tensor where_kernel(
           NotImplementedError,
           "Vulkan where over buffer supports Float32, Float16 and Int32 only");
     }
-    const uint32_t n = static_cast<uint32_t>(v_input.numel());
-    const struct WhereBufferBlock {
-      uint32_t buf_length;
-      uint32_t fill0;
-      int32_t fill;
-    } block{n, 0u, 0};
+    const uint32_t n =
+        static_cast<uint32_t>(multiply_integers(out_sizes));
+    const auto cond_meta = where_broadcast_meta(out_sizes, cond_shape);
+    const auto input_meta = where_broadcast_meta(out_sizes, self_shape);
+    const auto other_meta = where_broadcast_meta(out_sizes, other_shape);
+    const WhereBufferBlock block{
+        n,
+        0u,
+        broadcast,
+        0u,
+        where_out_strides(out_sizes),
+        cond_meta.first,
+        cond_meta.second,
+        input_meta.first,
+        input_meta.second,
+        other_meta.first,
+        other_meta.second};
     api::UniformParamsBuffer params(context, block);
     api::PipelineBarrier pipeline_barrier{};
     context->submit_compute_job(
@@ -149,11 +242,14 @@ Tensor where_kernel(
     return convert(v_output);
   }
 
-  api::vTensor v_output{context, v_input.sizes(), vocabulary};
+  api::vTensor v_output{context, out_sizes, vocabulary};
 
-  const struct WhereBlock block{
-      make_whcn_ivec4(v_output.sizes()),
-      c_depth_of(v_output.sizes()),
+  const WhereBlock block{
+      make_whcn_ivec4(out_sizes),
+      make_whcn_ivec4(cond_shape),
+      make_whcn_ivec4(self_shape),
+      make_whcn_ivec4(other_shape),
+      c_depth_of(out_sizes),
       0,
   };
 
@@ -176,27 +272,20 @@ Tensor where_kernel(
   return convert(v_output);
 }
 
-// Scalar variants fold into full tensors and reuse the tensor form.  The
-// folded tensor takes the branch dtype so the pair stays in one vocabulary.
+// A scalar branch is a plane of one element that the selection repeats, so
+// folding it does not have to fill the output's shape; the folded plane takes
+// the other branch's dtype, which is the type that holds the pair.
 Tensor where_scalar_self_kernel(
     const Tensor& condition, const Scalar& self, const Tensor& other) {
-  Tensor folded = full_kernel(
-      static_cast<std::vector<int64_t>>(other.shape()),
-      self,
-      other.dtype(),
-      other.device(),
-      false);
+  Tensor folded =
+      full_kernel({1}, self, other.dtype(), other.device(), false);
   return where_kernel(condition, folded, other);
 }
 
 Tensor where_scalar_other_kernel(
     const Tensor& condition, const Tensor& self, const Scalar& other) {
-  Tensor folded = full_kernel(
-      static_cast<std::vector<int64_t>>(self.shape()),
-      other,
-      self.dtype(),
-      self.device(),
-      false);
+  Tensor folded =
+      full_kernel({1}, other, self.dtype(), self.device(), false);
   return where_kernel(condition, self, folded);
 }
 

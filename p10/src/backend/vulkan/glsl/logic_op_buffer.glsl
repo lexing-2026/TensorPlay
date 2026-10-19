@@ -7,6 +7,8 @@
 
 layout(std430) buffer;
 
+#include "broadcast_index.h"
+
 /*
  * Elementwise logic over Bool payloads in linear storage.
  *
@@ -23,27 +25,6 @@ layout(std430) buffer;
  * element's flat index is recomputed from row-major strides, so a dimension of
  * one repeats without the operand being materialized at the output shape.
  */
-uint remap_index(
-    uint i,
-    ivec4 out_strides,
-    ivec4 sizes,
-    ivec4 strides) {
-  uint rem = i;
-  uint acc = 0u;
-  for (int d = 0; d < 4; ++d) {
-    const uint s = uint(out_strides[d]);
-    if (s == 0u) {
-      break;
-    }
-    const uint coord = rem / s;
-    rem = rem % s;
-    if (uint(sizes[d]) > 1u) {
-      acc += coord * uint(strides[d]);
-    }
-  }
-  return acc;
-}
-
 // The four lanes of one word, each reduced to whether its byte is nonzero.
 ivec4 unpack_lanes(const uint word) {
   return ivec4(
