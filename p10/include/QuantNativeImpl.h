@@ -282,6 +282,34 @@ struct CatRows {
     }
 };
 
+// A byte holds 256 codes, so one grid pair fixes the answer for every position
+// of every row and a row copy becomes a walk through that table. The entries go
+// through the same float round as the element wise form above, which keeps the
+// two bit identical.
+template<class T>
+std::array<T, 256> row_code_table(int64_t xz, float scale, float inverse, int64_t yz, bool relu) {
+    std::array<T, 256> table{};
+    for (int64_t i = 0; i < 256; ++i) {
+        const T code = static_cast<T>(i + std::numeric_limits<T>::lowest());
+        float value = static_cast<float>(static_cast<int64_t>(code) - xz) * scale;
+        if (relu) value = ::fmaxf(value, 0.f);
+        table[static_cast<size_t>(i)] = encode<T>(value, inverse, yz);
+    }
+    return table;
+}
+
+template<class T>
+struct CatRowCodes {
+    const T* x; T* y; int64_t chunk, width, offset; const T* table;
+    void operator()(int64_t row) const {
+        const T* source = x + row * chunk;
+        T* destination = y + row * width + offset;
+        for (int64_t column = 0; column < chunk; ++column)
+            destination[column] = table[static_cast<int64_t>(source[column]) -
+                                        std::numeric_limits<T>::lowest()];
+    }
+};
+
 Tensor cat(const std::vector<Tensor>& inputs, int64_t dim, std::optional<double> scale,
            std::optional<int64_t> zp, bool relu) {
     TP_CHECK(!inputs.empty(), "Concatenation requires at least one operand");
@@ -319,6 +347,12 @@ Tensor cat(const std::vector<Tensor>& inputs, int64_t dim, std::optional<double>
                         outer, src.size(dim), shape[dim], offset,
                         quantized::q_scale(src), quantized::q_zero_point(src),
                         ys, yz, same_qparams, relu);
+                } else if constexpr (sizeof(T) == 1) {
+                    const auto table = row_code_table<T>(quantized::q_zero_point(src),
+                        static_cast<float>(quantized::q_scale(src)),
+                        1.f / static_cast<float>(ys), yz, relu);
+                    apply(outer, CatRowCodes<T>{x.data_ptr<T>(), y.data_ptr<T>(), src.size(dim),
+                        shape[dim], offset, table.data()}, chunk_grain(src.size(dim)));
                 } else {
                     apply(outer, CatRows<T>{x.data_ptr<T>(), y.data_ptr<T>(), src.size(dim),
                         shape[dim], offset, quantized::q_zero_point(src), yz,
