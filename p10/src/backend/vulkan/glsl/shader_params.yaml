@@ -1274,6 +1274,24 @@ gather_buffer_half:
   parameter_names_with_default_values: {}
   shader_variants:
   - NAME: gather_buffer_half
+scatter_mark:
+  parameter_names_with_default_values: {}
+  shader_variants:
+  - NAME: scatter_mark
+scatter_value:
+  parameter_names_with_default_values: {}
+  shader_variants:
+  - NAME: scatter_value
+  - NAME: scatter_value_f16
+    FORMAT: rgba16f
+buffer_scatter_value:
+  parameter_names_with_default_values: {}
+  shader_variants:
+  - NAME: buffer_scatter_value
+buffer_scatter_value_half:
+  parameter_names_with_default_values: {}
+  shader_variants:
+  - NAME: buffer_scatter_value_half
 conv2d:
   parameter_names_with_default_values:
     HAS_BIAS: true

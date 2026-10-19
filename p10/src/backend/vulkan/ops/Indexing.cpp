@@ -750,6 +750,210 @@ Tensor gather_kernel(const Tensor& self, int64_t dim, const Tensor& index) {
   return convert(v_output);
 }
 
+//
+// Scatter of one repeated number: the codes of the index list name elements of
+// the destination, and each of those takes the number in place of what it held.
+//
+// The write cannot be a single pass, because a destination element is a lane of
+// a texel or of a packed word, and an image or word store always replaces the
+// whole group.  Two invocations that each own one lane of the same group would
+// hand each other's lane back as stale, so the pass is split the way the row
+// lookups of this backend split a request that outgrows one store:
+//
+//   1. a mark pass over the index list, which records in a word of its own
+//      which entry names each element of the destination;
+//   2. an apply pass over the destination, where one invocation owns one whole
+//      texel or word and rewrites the lanes its marks name.
+//
+// The mark payload is one 32-bit word per element, which a whole-word store
+// reaches without disturbing a neighbour, and it holds the position of the
+// entry plus one so that the clearing pass can leave "nothing names me" as
+// zero.  Recording a position rather than a bare hit is what lets the same mark
+// pass serve a source payload later, where the number written differs per entry.
+//
+// Both passes address the destination in its row-major logical order: the mark
+// pass runs the gather mapping backwards from an entry of the list, the apply
+// pass walks the texel or word layout of the payload it rewrites.  A code that
+// names no row marks nothing, which is the answer a row lookup already gives to
+// a request outside its rows.
+//
+
+// Words of the mark payload, one per element of the destination, cleared on the
+// device: an upload of the same size would cross the host twice over.
+api::vTensor zeroed_marks(api::Context* const context, const int64_t elements) {
+  api::vTensor v{
+      context,
+      {elements},
+      DType::Int32,
+      api::StorageType::BUFFER,
+      api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+  const uint32_t count = safe_downcast_to_u32(elements);
+  const struct MarksZero final {
+    uint32_t buf_length;
+  } block{count};
+  api::UniformParamsBuffer params(context, block);
+  api::PipelineBarrier pipeline_barrier{};
+  context->submit_compute_job(
+      VK_KERNEL(buffer_zero), pipeline_barrier, {count, 1u, 1u},
+      {256u, 1u, 1u}, VK_NULL_HANDLE,
+      v.buffer(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::WRITE),
+      params.buffer());
+  return v;
+}
+
+// Addressing shared by both passes: the rank and axis checks a gather already
+// makes, since the index list of a scatter has the geometry of the destination
+// it writes.
+void check_scatter_geometry(
+    const Tensor& self,
+    int64_t wrapped,
+    const Tensor& index) {
+  TP_CHECK(
+      index.dim() == self.dim(),
+      "Vulkan scatter: index must have the same rank as the destination");
+  for (int64_t axis = 0; axis < self.dim(); ++axis) {
+    TP_CHECK(
+        axis == wrapped || index.size(axis) <= self.size(axis),
+        "Vulkan scatter: index is wider than the destination at dimension ",
+        axis);
+  }
+}
+
+Tensor& scatter_value_inplace_kernel(
+    Tensor& self,
+    int64_t dim,
+    const Tensor& index,
+    const Scalar& value) {
+  NoGradGuard no_grad;
+  validate_gather_operand(self, "scatter");
+  TP_CHECK(
+      index.dtype() == DType::Int32 || index.dtype() == DType::Int64,
+      "Vulkan scatter: index must be Int32 or Int64");
+  const int64_t rank = self.dim();
+  int64_t wrapped = dim < 0 ? dim + rank : dim;
+  TP_CHECK(
+      wrapped >= 0 && wrapped < rank,
+      "Vulkan scatter: dimension out of range");
+  check_scatter_geometry(self, wrapped, index);
+
+  if (self.numel() == 0 || index.numel() == 0) {
+    return self;
+  }
+
+  api::Context* const context = api::context();
+  api::vTensor v_self = convert(self);
+  api::vTensor v_marks = zeroed_marks(context, self.numel());
+  // The list is walked by its own flat order in both passes, so it always rides
+  // linear storage; the upload narrows a wider code to the word the pass reads.
+  api::vTensor v_indices =
+      upload_index_payload(index, api::StorageType::BUFFER);
+
+  const ivec4 index_strides =
+      padded_strides(static_cast<std::vector<int64_t>>(index.shape()));
+  const ivec4 self_strides =
+      padded_strides(static_cast<std::vector<int64_t>>(self.shape()));
+  const struct MarkBlock final {
+    ivec4 index_strides;
+    ivec4 self_strides;
+    int32_t axis; // the scattered axis of the padded four-axis shape
+    int32_t self_rows; // entries available along that axis
+    int32_t count; // entries of the index list
+    int32_t fill;
+  } mark_block{
+      index_strides,
+      self_strides,
+      static_cast<int32_t>(wrapped + 4 - rank),
+      static_cast<int32_t>(self.size(wrapped)),
+      static_cast<int32_t>(index.numel()),
+      0};
+
+  api::UniformParamsBuffer mark_params(context, mark_block);
+  api::PipelineBarrier pipeline_barrier{};
+  const uint32_t entries = safe_downcast_to_u32(index.numel());
+
+  context->submit_compute_job(
+      VK_KERNEL(scatter_mark), pipeline_barrier, {entries, 1u, 1u},
+      {256u, 1u, 1u}, VK_NULL_HANDLE,
+      v_marks.buffer(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::WRITE),
+      v_indices.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+      mark_params.buffer());
+
+  const float written = static_cast<float>(value.toDouble());
+
+  if (v_self.storage_type() == api::StorageType::BUFFER) {
+    const struct ValueBufferBlock final {
+      int32_t count; // elements of the destination
+      float value;
+      int32_t fill;
+      int32_t fill2;
+    } block{static_cast<int32_t>(self.numel()), written, 0, 0};
+    api::UniformParamsBuffer params(context, block);
+    context->submit_compute_job(
+        VK_KERNEL_FROM_STR(buffer_shader_for_dtype(
+            "buffer_scatter_value", self.dtype())),
+        pipeline_barrier,
+        {buffer_dispatch_count(
+             safe_downcast_to_u32(self.numel()), self.dtype(), 4u),
+         1u,
+         1u},
+        {256u, 1u, 1u}, VK_NULL_HANDLE,
+        // The apply pass reads the lanes it leaves alone, so the destination is
+        // bound in both directions.
+        v_self.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::READ | api::MemoryAccessType::WRITE),
+        v_marks.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+        params.buffer());
+    return self;
+  }
+
+  const ivec4 self_sizes = make_whcn_ivec4(
+      static_cast<std::vector<int64_t>>(self.shape()));
+  const struct ValueBlock final {
+    ivec4 self_sizes; // (width, height, channels, batch)
+    int32_t planes_per_batch; // channel groups of four stacked per batch
+    float value;
+    int32_t fill;
+    int32_t fill2;
+  } block{
+      self_sizes,
+      static_cast<int32_t>((self_sizes[2] + 3) / 4),
+      written,
+      0,
+      0};
+  api::UniformParamsBuffer params(context, block);
+  const api::utils::uvec3 grid = v_self.extents();
+
+  context->submit_compute_job(
+      kernel_for("scatter_value", self.dtype()), pipeline_barrier, grid,
+      adaptive_work_group_size(grid), VK_NULL_HANDLE,
+      v_self.image(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::READ | api::MemoryAccessType::WRITE),
+      v_marks.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+      params.buffer());
+
+  return self;
+}
+
+Tensor scatter_value_kernel(
+    const Tensor& self,
+    int64_t dim,
+    const Tensor& index,
+    const Scalar& value) {
+  Tensor out = self.clone();
+  scatter_value_inplace_kernel(out, dim, index, value);
+  return out;
+}
+
 } // namespace ops
 } // namespace vulkan
 } // namespace tensorplay
@@ -760,6 +964,10 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, IndexingKernels) {
   m.impl("gather", &tensorplay::vulkan::ops::gather_kernel);
   m.impl("index_copy_", &tensorplay::vulkan::ops::index_copy__kernel);
   m.impl("index_copy", &tensorplay::vulkan::ops::index_copy_kernel);
+  m.impl("scatter.value", &tensorplay::vulkan::ops::scatter_value_kernel);
+  m.impl(
+      "scatter_.value",
+      &tensorplay::vulkan::ops::scatter_value_inplace_kernel);
 }
 
 #endif /* USE_VULKAN */
