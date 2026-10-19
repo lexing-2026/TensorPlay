@@ -191,3 +191,31 @@ def test_w4a16_linear_from_an_uploaded_weight(n, k):
     ).astype(np.float16)
     assert tuple(out.shape) == (3, n)
     np.testing.assert_array_equal(out.cpu().numpy(), expected)
+
+
+# A reduction axis longer than an image axis leaves the activation no texel form
+# while the product it reduces into still has one, so the fold runs over words
+# and stores its result as a texel.  Codes and activations stay at one unit and
+# the scales at one, which keeps every running sum a whole number a half payload
+# names exactly at these magnitudes.
+@pytest.mark.parametrize("m,n,k", [(1, 8, 16384), (17, 5, 16385), (2, 8, 20000)])
+def test_w4a16_linear_of_a_long_weight_row(m, n, k):
+    rng = np.random.default_rng(m * 13 + n * 17 + k)
+    codes = rng.integers(-1, 2, (n, k)).astype(np.int8)
+    act_codes = rng.integers(-1, 2, (m, k)).astype(np.float32)
+    bias_values = rng.integers(-2, 3, n).astype(np.float32)
+
+    weight = tp._C._make_per_tensor_quantized_tensor(
+        tp.from_numpy(codes.copy()).to("vulkan"), 1.0, 0)
+    act = tp.tensor(act_codes, dtype=tp.float32).to("vulkan").to(tp.float16)
+    out = tp._C.w4a16_linear(
+        act,
+        weight,
+        tp.tensor(np.ones(n, dtype=np.float32), dtype=tp.float32),
+        tp.tensor(bias_values, dtype=tp.float32),
+    )
+    expected = (act_codes @ codes.T.astype(np.float32) + bias_values).astype(
+        np.float16
+    )
+    assert tuple(out.shape) == (m, n)
+    np.testing.assert_array_equal(out.cpu().numpy(), expected)
