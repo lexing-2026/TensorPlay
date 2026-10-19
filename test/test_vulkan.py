@@ -3477,5 +3477,164 @@ class TestVulkanWidePayload(unittest.TestCase):
                 device="vulkan").to(tensorplay.int64)
 
 
+class TestVulkanGather(unittest.TestCase):
+    # A gather reads one code per output element, so the output shape is the index
+    # shape and the source keeps its own.  Which route runs depends on where the
+    # gathered axis falls in the texel layout: the two innermost axes are the width
+    # and the height, along which a code moves a fetch, while the channel and batch
+    # axes live in the lanes and the depth planes and gather over linear storage.
+
+    @staticmethod
+    def _reference(table_np, dim, codes_np):
+        # Every output coordinate is the index's own except the gathered one,
+        # which the code at that position names.
+        coords = np.indices(codes_np.shape)
+        coords[dim] = codes_np
+        return table_np[tuple(coords)]
+
+    @staticmethod
+    def _device(payload):
+        return tensorplay.from_numpy(np.ascontiguousarray(payload)).to("vulkan")
+
+    @staticmethod
+    def _table(sizes, dtype=np.float32):
+        r = np.arange(int(np.prod(sizes)), dtype=np.float32).reshape(sizes)
+        return (r % 97 - 48).astype(dtype)
+
+    def test_gather_follows_the_code_at_each_position(self):
+        # The shapes a decode step gathers through: a per-row pick out of a logits
+        # table, a pick of whole rows, and a pick out of a flat payload.
+        rng = np.random.default_rng(11)
+        cases = [
+            (24, 40, 1, 6),            # [rows, vocabulary] -> [rows, 6]
+            (24, 40, 0, 7),            # gathered along the height axis
+            (129, 5, 1, 3),            # a row width that is not a multiple of four
+            (60, 1, 1, 17),            # rank 1, gathered along the only axis
+        ]
+        for rows, cols, dim, picks in cases:
+            table_np = self._table((rows, cols) if cols > 1 else (rows,))
+            if cols == 1:
+                dim = 0
+            shape = list(table_np.shape)
+            shape[dim] = picks
+            codes = rng.integers(0, table_np.shape[dim], shape).astype(np.int64)
+            want = self._reference(table_np, dim, codes)
+            got = tensorplay.gather(
+                self._device(table_np), dim, self._device(codes)).cpu().numpy()
+            np.testing.assert_allclose(
+                got, want, rtol=0, atol=1e-6,
+                err_msg=f"gather of a {table_np.shape} table along axis {dim}")
+
+    def test_a_lane_axis_gathers_over_linear_storage(self):
+        # The channel and batch axes are the lanes and the depth planes of a
+        # texel, so a code there would have to move a value between lanes of
+        # different texels: those axes cross into a dense payload and back.
+        rng = np.random.default_rng(12)
+        table_np = self._table((3, 5, 4, 6))
+        for dim in (0, 1, 2, 3):
+            shape = list(table_np.shape)
+            shape[dim] = 2
+            codes = rng.integers(0, table_np.shape[dim], shape).astype(np.int32)
+            want = self._reference(table_np, dim, codes)
+            got = tensorplay.gather(
+                self._device(table_np), dim, self._device(codes)).cpu().numpy()
+            np.testing.assert_allclose(
+                got, want, rtol=0, atol=1e-6,
+                err_msg=f"gather of a 4-d table along axis {dim}")
+
+    def test_an_index_narrower_than_the_source_names_its_own_planes(self):
+        # The depth axis stacks each payload's own channel groups, so a plane of an
+        # output with fewer channels than the source sits at a different depth in
+        # the source: reusing the output's plane number would read another channel
+        # of an earlier batch and still return plausible values.
+        rng = np.random.default_rng(13)
+        table_np = self._table((2, 5, 3, 4))
+        for channels, dim in ((2, 3), (1, 2), (5, 3), (2, 2), (3, 3)):
+            shape = [2, channels, 3, 4]
+            shape[dim] = 2
+            codes = rng.integers(
+                0, table_np.shape[dim], shape).astype(np.int32)
+            want = self._reference(table_np, dim, codes)
+            got = tensorplay.gather(
+                self._device(table_np), dim, self._device(codes)).cpu().numpy()
+            self.assertEqual(tuple(got.shape), tuple(shape))
+            np.testing.assert_allclose(
+                got, want, rtol=0, atol=1e-6,
+                err_msg=f"index with {channels} channels gathered along axis "
+                        f"{dim}")
+
+    def test_half_gather_keeps_every_bit(self):
+        # A half payload packs two lanes into a word, so an odd element count
+        # leaves the last word shared with nothing: it must still land whole.
+        rng = np.random.default_rng(14)
+        table_np = self._table((3, 5), dtype=np.float16)
+        codes = rng.integers(0, 5, (3, 3)).astype(np.int64)
+        want = self._reference(table_np, 1, codes)
+        got = tensorplay.gather(
+            self._device(table_np), 1, self._device(codes)).cpu().numpy()
+        np.testing.assert_array_equal(
+            got.view(np.uint16), want.view(np.uint16),
+            err_msg="texel gather of a half payload")
+        # A 3-d table gathered along its batch axis crosses into linear storage
+        # with an odd element count.
+        table_np = self._table((2, 3, 5), dtype=np.float16)
+        codes = rng.integers(0, 2, (1, 3, 5)).astype(np.int64)
+        want = self._reference(table_np, 0, codes)
+        got = tensorplay.gather(
+            self._device(table_np), 0, self._device(codes)).cpu().numpy()
+        np.testing.assert_array_equal(
+            got.view(np.uint16), want.view(np.uint16),
+            err_msg="linear gather of an odd half payload")
+
+    def test_an_out_of_range_code_contributes_a_zero(self):
+        # The answer the other row lookups of this backend already give: a code
+        # naming no row writes zeros rather than reading outside the payload, so a
+        # bad pick never has to be caught on the host.
+        def expected(table_np, dim, codes):
+            valid = (codes >= 0) & (codes < table_np.shape[dim])
+            ref = self._reference(table_np, dim, np.where(valid, codes, 0))
+            return np.where(valid, ref, 0)
+
+        table_np = self._table((4, 6))
+        codes = np.array(
+            [[0, -1, 3, 6], [1, 2, -7, 4], [5, 5, 9, 0], [-1, -1, 2, 7]],
+            dtype=np.int32)
+        got = tensorplay.gather(
+            self._device(table_np), 1, self._device(codes)).cpu().numpy()
+        np.testing.assert_array_equal(
+            got, expected(table_np, 1, codes),
+            err_msg="texel gather of an out-of-range code")
+
+        rng = np.random.default_rng(15)
+        table_np = self._table((2, 5, 3, 4))
+        codes = rng.integers(-6, 9, (2, 3, 3, 4)).astype(np.int32)
+        got = tensorplay.gather(
+            self._device(table_np), 1, self._device(codes)).cpu().numpy()
+        np.testing.assert_array_equal(
+            got, expected(table_np, 1, codes),
+            err_msg="linear gather of an out-of-range code")
+
+    def test_gather_stops_at_an_index_it_cannot_address(self):
+        table = self._device(self._table((4, 6)))
+        with self.assertRaisesRegex(RuntimeError, "same rank"):
+            tensorplay.gather(table, 1, self._device(np.zeros((3,), np.int64)))
+        # Along the gathered axis the index may be any width - that width is the
+        # output.  Along another axis it may only be narrower.
+        self.assertEqual(
+            tuple(tensorplay.gather(
+                table, 1, self._device(np.zeros((4, 9), np.int64))).shape),
+            (4, 9))
+        with self.assertRaisesRegex(RuntimeError, "wider than the source"):
+            tensorplay.gather(
+                table, 1, self._device(np.zeros((5, 3), np.int64)))
+        with self.assertRaisesRegex(RuntimeError, "dimension out of range"):
+            tensorplay.gather(table, 2, self._device(np.zeros((4, 6), np.int64)))
+        # An index with no codes has no output to write; the result keeps the
+        # index shape and stays empty.
+        empty = tensorplay.gather(
+            table, 1, self._device(np.zeros((4, 0), np.int64)))
+        self.assertEqual(tuple(empty.shape), (4, 0))
+
+
 if __name__ == "__main__":
     unittest.main()
