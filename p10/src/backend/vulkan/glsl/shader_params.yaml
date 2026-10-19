@@ -150,15 +150,22 @@ binary_op_scalar:
   # The exponent is the payload and the base the broadcast number, so the
   # operand order of the template is reversed here.  A whole-number exponent
   # keeps a negative base signed: pow() itself refuses a negative base, so the
-  # magnitude is raised and an even exponent puts the sign back.
+  # magnitude is raised and an even exponent puts the sign back.  A texel holds
+  # exponents of all kinds, so whether the answer is whole and which sign it
+  # carries is decided lane by lane.
   - NAME: pow_scalar_tensor
-    OPERATOR: '(fract(X) == vec4(0.0)) ? (mod(X, vec4(2.0)) == vec4(0.0) ? pow(abs(Y), X) : sign(Y) * pow(abs(Y), X)) : pow(Y, X)'
-  # The magnitude is rounded before it is read back into a word: the power
-  # itself lands an ulp under the whole number it names for some bases, and a
-  # count truncated from there sits one below the answer.
+    OPERATOR: 'mix(pow(Y, X), pow(abs(Y), X) * mix(vec4(1.0), sign(Y), notEqual(mod(X, vec4(2.0)), vec4(0.0))), equal(fract(X), vec4(0.0)))'
+  # Above zero the power names a whole number, so the magnitude is rounded
+  # before it is read back into a word: the power itself lands an ulp under the
+  # number it names for some bases, and a count truncated from there sits one
+  # below the answer.  Below zero the answer is a fraction with no lane to hold
+  # it, and the narrowing conversion that reads it back takes the whole part,
+  # so there it is truncated -- rounding a half up would name a count no
+  # division ever gives.  A texel mixes exponents of both kinds, so each
+  # decision is taken lane by lane rather than for the whole word.
   - NAME: pow_scalar_tensor_i32
     DTYPE: int
-    OPERATOR: 'ivec4((mod(vec4(X), vec4(2.0)) == vec4(0.0)) ? floor(pow(abs(vec4(Y)), vec4(X)) + vec4(0.5)) : sign(vec4(Y)) * floor(pow(abs(vec4(Y)), vec4(X)) + vec4(0.5)))'
+    OPERATOR: 'ivec4(mix(trunc(pow(abs(vec4(Y)), vec4(X))), floor(pow(abs(vec4(Y)), vec4(X)) + vec4(0.5)), step(vec4(0.0), vec4(X))) * mix(vec4(1.0), sign(vec4(Y)), notEqual(mod(vec4(X), vec4(2.0)), vec4(0.0))))'
     FORMAT: rgba32i
   - NAME: pow_tensor_scalar_i32
     DTYPE: int
@@ -234,8 +241,12 @@ binary_op_tensor:
     IS_DIV: true
     OPERATOR: X / Y
     FORMAT: rgba32i
+  # A negative base has no power in the shader's own arithmetic: the magnitude
+  # is raised and an odd exponent puts the sign back.  One texel carries
+  # exponents of several kinds, so both the whole-number test and the odd-or-
+  # even one are taken lane by lane.
   - NAME: pow
-    OPERATOR: '(fract(Y) == vec4(0.0)) ? (mod(Y, vec4(2.0)) == vec4(0.0) ? pow(abs(X), Y) : sign(X) * pow(abs(X), Y)) : pow(X, Y)'
+    OPERATOR: 'mix(pow(X, Y), pow(abs(X), Y) * mix(vec4(1.0), sign(X), notEqual(mod(Y, vec4(2.0)), vec4(0.0))), equal(fract(Y), vec4(0.0)))'
   - NAME: floor_divide
     IS_DIV: true
     OPERATOR: floor(X / Y)
@@ -447,8 +458,10 @@ buffer_binary_op_tensor:
   - NAME: buffer_div_i32
     DTYPE: int
     OPERATOR: X / Y
+  # The linear writer covers four exponents per word, so the whole-number test
+  # and the sign an odd exponent restores are both taken lane by lane.
   - NAME: buffer_pow
-    OPERATOR: '(fract(Y) == vec4(0.0)) ? (mod(Y, vec4(2.0)) == vec4(0.0) ? pow(abs(X), Y) : sign(X) * pow(abs(X), Y)) : pow(X, Y)'
+    OPERATOR: 'mix(pow(X, Y), pow(abs(X), Y) * mix(vec4(1.0), sign(X), notEqual(mod(Y, vec4(2.0)), vec4(0.0))), equal(fract(Y), vec4(0.0)))'
   - NAME: buffer_floor_divide
     OPERATOR: floor(X / Y)
   - NAME: buffer_floor_divide_i32
@@ -514,7 +527,7 @@ buffer_binary_op_scalar:
     OPERATOR: '(fract(X) == 0.0) ? (mod(X, 2.0) == 0.0 ? pow(abs(Y), X) : sign(Y) * pow(abs(Y), X)) : pow(Y, X)'
   - NAME: buffer_pow_scalar_tensor_i32
     DTYPE: int
-    OPERATOR: 'int((mod(float(X), 2.0) == 0.0) ? floor(pow(abs(float(Y)), float(X)) + 0.5) : sign(float(Y)) * floor(pow(abs(float(Y)), float(X)) + 0.5))'
+    OPERATOR: 'int((float(X) >= 0.0 ? floor(pow(abs(float(Y)), float(X)) + 0.5) : trunc(pow(abs(float(Y)), float(X)))) * (mod(float(X), 2.0) == 0.0 ? 1.0 : sign(float(Y))))'
   - NAME: buffer_rsub_scalar
     OPERATOR: Y - X
   - NAME: buffer_rsub_scalar_i32
