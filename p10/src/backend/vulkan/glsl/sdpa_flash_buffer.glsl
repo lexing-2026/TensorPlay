@@ -7,9 +7,10 @@
 // unroll every loop below.
 #define ROWS 8
 #define KV 16
-#define THREADS 32
+#define THREADS 128
 #define DMAX 128
-#define DPAD (DMAX + 1)
+#define DQMAX (DMAX / 4)
+#define DQPAD (DQMAX + 1)
 #define KVPAD (KV + 1)
 #define DOTS (ROWS * KV / THREADS)
 
@@ -18,7 +19,7 @@ layout(std430) buffer;
 /*
  * Attention over linear storage, without a score matrix.
  *
- * A workgroup of 32 lanes owns ROWS query rows of one (batch, head) pair and
+ * A workgroup of four warps owns ROWS query rows of one (batch, head) pair and
  * walks the key sequence in chunks of KV.  Each chunk stages its key block
  * into shared memory, forms the ROWS x KV scores out of shared memory alone,
  * and folds them into the row's running maximum, exponential sum and weighted
@@ -35,6 +36,11 @@ layout(std430) buffer;
  * makes a long prefill window affordable: its score block alone would run to
  * gigabytes.
  *
+ * The shared rows are four wide, since a score is a dot product of two of them
+ * and a value row enters the accumulator at the same width: one step of either
+ * walk carries four dimensions, and a row padded by a whole quad keeps the
+ * lanes of a workgroup off one bank column.
+ *
  * Entries a row may not attend carry a value far below any real score, so
  * exponentiating one against a pivot that the row does have underflows to zero
  * and it drops out of both sums.  A row with nothing to attend keeps its
@@ -46,9 +52,9 @@ layout(std430) buffer;
  * the mask rides the same rule with zero strides on the axes it broadcasts
  * over, and an absent mask leaves its binding unused.  Grouped query heads map
  * a query head onto key/value head h / group directly.  The shared footprint
- * is (2 * ROWS + KV) * DPAD + ROWS * KVPAD + 4 * ROWS floats, under 17 KB, and
- * the kernel needs no subgroup operation, no image operand and no 16-bit
- * storage.
+ * is (2 * ROWS + KV) * DQPAD quads plus ROWS * KVPAD + 4 * ROWS floats, under
+ * 18 KB, and the kernel needs no subgroup operation, no image operand and no
+ * 16-bit storage.
  */
 layout(set = 0, binding = 0) buffer PRECISION restrict writeonly OutBuffer {
   float data[];
@@ -85,7 +91,7 @@ layout(set = 0, binding = 5) uniform PRECISION restrict Block {
   float scale;        // multiplier of every score
   int is_causal;      // 1: query row t attends the keys up to t
   int has_mask;       // 1: add the mask entry of each score
-  int fill1;
+  int row_tiles;      // div_up(seq_q, ROWS) tiles of the dispatch's y axis
   int fill2;
 }
 uBlock;
@@ -98,9 +104,9 @@ const float REJECT = -1.0e30f;
 // The state of a running maximum before any score has been seen.
 const float NO_SCORE = -1.0e38f;
 
-shared float sQ[ROWS][DPAD];
-shared float sK[KV][DPAD];
-shared float sO[ROWS][DPAD];
+shared vec4 sQ[ROWS][DQPAD];
+shared vec4 sK[KV][DQPAD];
+shared vec4 sO[ROWS][DQPAD];
 shared float sS[ROWS][KVPAD];
 shared float sM[ROWS];
 shared float sL[ROWS];
@@ -109,14 +115,81 @@ shared float sC[ROWS];
 
 layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
 
-// Dot product of a staged query row with a staged key row.  Both run one
-// element per shared slot, so the walk covers the head dimension only.
+// Dot product of a staged query row with a staged key row.  Both hold whole
+// quads, and the quad past the last dimension of the row carries zeros, so the
+// walk covers ceil(dim / 4) steps and nothing more.
 float dot_qk(const int r, const int kk) {
   float acc = 0.0;
-  for (int d = 0; d < uBlock.dim; ++d) {
-    acc += sQ[r][d] * sK[kk][d];
+  for (int dq = 0; dq < uBlock.d_quads; ++dq) {
+    acc += dot(sQ[r][dq], sK[kk][dq]);
   }
   return acc;
+}
+
+// Four consecutive elements of a payload row, or the remainder of one where the
+// head dimension does not fill the quad.  The wide arm is the one every whole
+// dimension takes; the other only ever runs for the last quad of a row.
+vec4 payload_quad(const int src, const int d0, const int d_last) {
+  if (d0 + 3 <= d_last) {
+    return vec4(
+        uValue.data[src],
+        uValue.data[src + 1],
+        uValue.data[src + 2],
+        uValue.data[src + 3]);
+  }
+  vec4 tail = vec4(0.0);
+  if (d0 <= d_last) {
+    tail.x = uValue.data[src];
+  }
+  if (d0 + 1 <= d_last) {
+    tail.y = uValue.data[src + 1];
+  }
+  if (d0 + 2 <= d_last) {
+    tail.z = uValue.data[src + 2];
+  }
+  return tail;
+}
+
+vec4 query_quad(const int src, const int d0, const int d_last) {
+  if (d0 + 3 <= d_last) {
+    return vec4(
+        uQuery.data[src],
+        uQuery.data[src + 1],
+        uQuery.data[src + 2],
+        uQuery.data[src + 3]);
+  }
+  vec4 tail = vec4(0.0);
+  if (d0 <= d_last) {
+    tail.x = uQuery.data[src];
+  }
+  if (d0 + 1 <= d_last) {
+    tail.y = uQuery.data[src + 1];
+  }
+  if (d0 + 2 <= d_last) {
+    tail.z = uQuery.data[src + 2];
+  }
+  return tail;
+}
+
+vec4 key_quad(const int src, const int d0, const int d_last) {
+  if (d0 + 3 <= d_last) {
+    return vec4(
+        uKey.data[src],
+        uKey.data[src + 1],
+        uKey.data[src + 2],
+        uKey.data[src + 3]);
+  }
+  vec4 tail = vec4(0.0);
+  if (d0 <= d_last) {
+    tail.x = uKey.data[src];
+  }
+  if (d0 + 1 <= d_last) {
+    tail.y = uKey.data[src + 1];
+  }
+  if (d0 + 2 <= d_last) {
+    tail.z = uKey.data[src + 2];
+  }
+  return tail;
 }
 
 void main() {
@@ -126,7 +199,10 @@ void main() {
   const ivec3 pos = ivec3(gl_GlobalInvocationID);
   const int tid = pos.x;
 
-  const int row0 = pos.y * ROWS;
+  // A causal tile walks down to its own last row, so the tiles at the head of
+  // the sequence are the shortest jobs.  They take the end of the launch, where
+  // they fill the wave a long tile would otherwise leave half idle.
+  const int row0 = (uBlock.row_tiles - 1 - pos.y) * ROWS;
   const int batch = pos.z / uBlock.hq;
   const int head = pos.z - batch * uBlock.hq;
   const int kv_head = head / uBlock.group;
@@ -134,18 +210,15 @@ void main() {
   const int d_quads = uBlock.d_quads;
   const int d_last = uBlock.dim - 1;
 
-  const int q_base =
-      batch * uBlock.q_strides.x + head * uBlock.q_strides.y;
+  const int q_base = batch * uBlock.q_strides.x + head * uBlock.q_strides.y;
   const int kv_base =
       batch * uBlock.kv_strides.x + kv_head * uBlock.kv_strides.y;
-  const int o_base =
-      batch * uBlock.out_strides.x + head * uBlock.out_strides.y;
-  const int m_base =
-      batch * uBlock.mask_strides.x + head * uBlock.mask_strides.y;
+  const int o_base = batch * uBlock.out_strides.x + head * uBlock.out_strides.y;
+  const int m_base = batch * uBlock.mask_strides.x + head * uBlock.mask_strides.y;
 
-  // Stage the query tile and clear the accumulator.  Lanes past the head
-  // dimension stay zero, which is what keeps a width that is not a multiple of
-  // four from contributing anything.
+  // Stage the query tile and clear the accumulator.  A row past the query
+  // range stages nothing, which is what keeps a tile that overhangs the
+  // sequence from contributing scores.
   for (int i = tid; i < ROWS * d_quads; i += THREADS) {
     const int r = i / d_quads;
     const int dq = i - r * d_quads;
@@ -153,28 +226,11 @@ void main() {
     const int row = row0 + r;
     vec4 qv = vec4(0.0);
     if (row < uBlock.seq_q) {
-      const int src = q_base + row * uBlock.q_strides.z + d0;
-      if (d0 <= d_last) {
-        qv.x = uQuery.data[src];
-      }
-      if (d0 + 1 <= d_last) {
-        qv.y = uQuery.data[src + 1];
-      }
-      if (d0 + 2 <= d_last) {
-        qv.z = uQuery.data[src + 2];
-      }
-      if (d0 + 3 <= d_last) {
-        qv.w = uQuery.data[src + 3];
-      }
+      qv = query_quad(
+          q_base + row * uBlock.q_strides.z + d0, d0, d_last);
     }
-    sQ[r][d0] = qv.x;
-    sQ[r][d0 + 1] = qv.y;
-    sQ[r][d0 + 2] = qv.z;
-    sQ[r][d0 + 3] = qv.w;
-    sO[r][d0] = 0.0;
-    sO[r][d0 + 1] = 0.0;
-    sO[r][d0 + 2] = 0.0;
-    sO[r][d0 + 3] = 0.0;
+    sQ[r][dq] = qv;
+    sO[r][dq] = vec4(0.0);
   }
   if (tid < ROWS) {
     sM[tid] = NO_SCORE;
@@ -182,7 +238,16 @@ void main() {
   }
   barrier();
 
-  for (int chunk = 0; chunk < uBlock.chunks; ++chunk) {
+  // A causal row tile can attend no key past its own last row, so the walk
+  // stops at that chunk: everything beyond it would only ever be rejected, and
+  // a triangular window is half the chunks of the rectangular one it reads.
+  int chunks = uBlock.chunks;
+  if (uBlock.is_causal != 0) {
+    const int reach = min(row0 + ROWS, uBlock.seq_q);
+    chunks = min(chunks, (reach + KV - 1) / KV);
+  }
+
+  for (int chunk = 0; chunk < chunks; ++chunk) {
     const int k0 = chunk * KV;
 
     // One key block per chunk: read from the payload once however many rows
@@ -194,24 +259,10 @@ void main() {
       const int key = k0 + kk;
       vec4 kv = vec4(0.0);
       if (key < uBlock.seq_kv) {
-        const int src = kv_base + key * uBlock.kv_strides.z + d0;
-        if (d0 <= d_last) {
-          kv.x = uKey.data[src];
-        }
-        if (d0 + 1 <= d_last) {
-          kv.y = uKey.data[src + 1];
-        }
-        if (d0 + 2 <= d_last) {
-          kv.z = uKey.data[src + 2];
-        }
-        if (d0 + 3 <= d_last) {
-          kv.w = uKey.data[src + 3];
-        }
+        kv = key_quad(
+            kv_base + key * uBlock.kv_strides.z + d0, d0, d_last);
       }
-      sK[kk][d0] = kv.x;
-      sK[kk][d0 + 1] = kv.y;
-      sK[kk][d0 + 2] = kv.z;
-      sK[kk][d0 + 3] = kv.w;
+      sK[kk][dq] = kv;
     }
     barrier();
 
@@ -264,41 +315,22 @@ void main() {
     }
     barrier();
 
-    // Rescale what the walk kept so far and add the chunk, then normalize the
-    // sums.  A weight of zero means the key is unattended or past the
-    // sequence, and no value element is read for it.
+    // Rescale what the walk kept so far and add the chunk.  A weight of zero
+    // means the key is unattended or past the sequence, and no value element
+    // is read for it.
     for (int i = tid; i < ROWS * d_quads; i += THREADS) {
       const int r = i / d_quads;
       const int dq = i - r * d_quads;
       const int d0 = dq * 4;
-      const float w = sW[r];
-      vec4 acc = vec4(
-          sO[r][d0] * w,
-          sO[r][d0 + 1] * w,
-          sO[r][d0 + 2] * w,
-          sO[r][d0 + 3] * w);
+      vec4 acc = sO[r][dq] * sW[r];
       for (int kk = 0; kk < KV; ++kk) {
         const float p = sS[r][kk];
         if (p != 0.0) {
-          const int src = kv_base + (k0 + kk) * uBlock.kv_strides.z + d0;
-          if (d0 <= d_last) {
-            acc.x += p * uValue.data[src];
-          }
-          if (d0 + 1 <= d_last) {
-            acc.y += p * uValue.data[src + 1];
-          }
-          if (d0 + 2 <= d_last) {
-            acc.z += p * uValue.data[src + 2];
-          }
-          if (d0 + 3 <= d_last) {
-            acc.w += p * uValue.data[src + 3];
-          }
+          acc += p * payload_quad(
+              kv_base + (k0 + kk) * uBlock.kv_strides.z + d0, d0, d_last);
         }
       }
-      sO[r][d0] = acc.x;
-      sO[r][d0 + 1] = acc.y;
-      sO[r][d0 + 2] = acc.z;
-      sO[r][d0 + 3] = acc.w;
+      sO[r][dq] = acc;
     }
     if (tid < ROWS) {
       sL[tid] = sL[tid] * sW[tid] + sC[tid];
@@ -318,18 +350,19 @@ void main() {
     }
     const float total = sL[r];
     const float inv = total == 0.0 ? 0.0 : 1.0 / total;
+    const vec4 value = sO[r][dq] * inv;
     const int dst = o_base + row * uBlock.out_strides.z + d0;
     if (d0 <= d_last) {
-      uOutput.data[dst] = sO[r][d0] * inv;
+      uOutput.data[dst] = value.x;
     }
     if (d0 + 1 <= d_last) {
-      uOutput.data[dst + 1] = sO[r][d0 + 1] * inv;
+      uOutput.data[dst + 1] = value.y;
     }
     if (d0 + 2 <= d_last) {
-      uOutput.data[dst + 2] = sO[r][d0 + 2] * inv;
+      uOutput.data[dst + 2] = value.z;
     }
     if (d0 + 3 <= d_last) {
-      uOutput.data[dst + 3] = sO[r][d0 + 3] * inv;
+      uOutput.data[dst + 3] = value.w;
     }
   }
 }

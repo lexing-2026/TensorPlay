@@ -1223,18 +1223,18 @@ Tensor sdpa_composed(
 constexpr int32_t kFlashRowTile = 8;
 constexpr int32_t kFlashKeyChunk = 16;
 constexpr int32_t kFlashMaxHeadDim = 128;
-constexpr int32_t kFlashThreads = 32;
+constexpr int32_t kFlashThreads = 128;
 
 // Shared bytes the walk reserves whatever the head dimension: the query tile,
-// the key chunk and the accumulator all span the widest row, each padded by a
-// slot so consecutive rows miss each other's banks, plus the score block and
-// four running values per row.  A device whose shared pool is below this cannot
-// back the pipeline at all, so the walk stays off such hardware.
+// the key chunk and the accumulator all span the widest row in four-wide
+// steps, each row padded by a whole quad so the lanes of a workgroup miss each
+// other's bank columns, plus the score block and four running values per row.
+// A device whose shared pool is below this cannot back the pipeline at all, so
+// the walk stays off such hardware.
 constexpr int64_t kFlashSharedBytes =
     (int64_t(2 * kFlashRowTile + kFlashKeyChunk) *
-         (kFlashMaxHeadDim + 1) +
-     int64_t(kFlashRowTile) * (kFlashKeyChunk + 1) + 4 * kFlashRowTile) *
-    4;
+         (kFlashMaxHeadDim / 4 + 1) * 16 +
+     (int64_t(kFlashRowTile) * (kFlashKeyChunk + 1) + 4 * kFlashRowTile) * 4);
 
 // Element index range a 32-bit offset in a buffer kernel can reach.
 constexpr int64_t kLinearIndexLimit = 2147483647;
@@ -1378,6 +1378,20 @@ Tensor sdpa_flash(
   const int32_t d_quads = static_cast<int32_t>(
       api::utils::div_up(api::utils::safe_downcast_to_u32(D), 4u));
 
+  // One workgroup per row tile of one (batch, head) pair.  The launch counts
+  // invocations, so the lane axis carries exactly a workgroup's worth and the
+  // two axes above it number the tiles and the planes.
+  const uint32_t row_tiles = api::utils::safe_downcast_to_u32(
+      api::utils::div_up(
+          api::utils::safe_downcast_to_u32(Sq),
+          static_cast<uint32_t>(kFlashRowTile)));
+  const uint32_t planes = api::utils::safe_downcast_to_u32(B * Hq);
+  TP_CHECK(
+      static_cast<int64_t>(row_tiles) <= kLinearDispatchAxisLimit &&
+          static_cast<int64_t>(planes) <= kLinearDispatchAxisLimit,
+      "Vulkan sdpa over linear storage needs the row tiles and the head planes "
+      "within the two dispatch axes");
+
   const struct SdpaFlashBlock final {
     ivec4 q_strides; // element steps of the query payload
     ivec4 kv_strides; // steps shared by the key and value payloads
@@ -1393,7 +1407,7 @@ Tensor sdpa_flash(
     float scale; // multiplier of every score
     int32_t is_causal;
     int32_t has_mask;
-    int32_t fill1;
+    int32_t row_tiles; // tiles the y axis counts, so a tile can number itself
     int32_t fill2;
   } block{
       dense_strides(Hq, Sq, D),
@@ -1410,7 +1424,7 @@ Tensor sdpa_flash(
       static_cast<float>(scale),
       is_causal ? 1 : 0,
       mask.has_value() ? 1 : 0,
-      0,
+      static_cast<int32_t>(row_tiles),
       0};
 
   api::vTensor v_output{
@@ -1419,20 +1433,6 @@ Tensor sdpa_flash(
       DType::Float32,
       api::StorageType::BUFFER,
       api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
-
-  // One workgroup of 32 lanes per row tile of one (batch, head) pair.  The
-  // launch counts invocations, so the lane axis carries exactly a workgroup's
-  // worth and the two axes above it number the tiles and the planes.
-  const uint32_t row_tiles = api::utils::safe_downcast_to_u32(
-      api::utils::div_up(
-          api::utils::safe_downcast_to_u32(Sq),
-          static_cast<uint32_t>(kFlashRowTile)));
-  const uint32_t planes = api::utils::safe_downcast_to_u32(B * Hq);
-  TP_CHECK(
-      static_cast<int64_t>(row_tiles) <= kLinearDispatchAxisLimit &&
-          static_cast<int64_t>(planes) <= kLinearDispatchAxisLimit,
-      "Vulkan sdpa over linear storage needs the row tiles and the head planes "
-      "within the two dispatch axes");
 
   api::UniformParamsBuffer params(context, block);
   api::PipelineBarrier barrier{};
