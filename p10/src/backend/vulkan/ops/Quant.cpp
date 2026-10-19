@@ -266,6 +266,58 @@ Tensor dequantize_per_tensor_kernel(
   api::Context* const context = api::context();
 
   api::vTensor v_input = convert(self);
+
+  // A code payload in linear storage keeps four lanes to a 32-bit word, so the
+  // affine undo reads and writes whole words instead of sampling texels.  The
+  // result stays in the storage its payload drew: a weight whose row count has
+  // no image form is converted where it already sits.
+  if (v_input.storage_type() == api::StorageType::BUFFER) {
+    api::vTensor v_output{
+        context,
+        v_input.sizes(),
+        DType::Float32,
+        api::StorageType::BUFFER,
+        api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+
+    const struct DequantizeLinearBlock final {
+      float scale;
+      int32_t zero_point;
+      uint32_t buf_length; // element count, shared by both payloads
+      int32_t fill;
+    } block{
+        static_cast<float>(scale),
+        static_cast<int32_t>(zero_point),
+        static_cast<uint32_t>(v_output.numel()),
+        0};
+
+    api::UniformParamsBuffer params(context, block);
+    api::PipelineBarrier pipeline_barrier{};
+
+    // One invocation owns one word of four lanes.
+    const api::utils::uvec3 grid{
+        api::utils::div_up(
+            api::utils::safe_downcast_to_u32(
+                static_cast<int64_t>(v_output.numel())),
+            4u),
+        1u,
+        1u};
+
+    context->submit_compute_job(
+        VK_KERNEL_FROM_STR("dequantize_per_tensor_buffer"),
+        pipeline_barrier,
+        grid,
+        adaptive_work_group_size(grid),
+        VK_NULL_HANDLE,
+        v_output.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::WRITE),
+        v_input.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+        params.buffer());
+
+    return convert(v_output);
+  }
+
   if (v_input.storage_type() != api::StorageType::TEXTURE_3D) {
     TP_THROW(
         NotImplementedError, "Vulkan dequantize requires texture storage");
