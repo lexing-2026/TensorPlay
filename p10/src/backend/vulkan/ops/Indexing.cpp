@@ -768,8 +768,9 @@ Tensor gather_kernel(const Tensor& self, int64_t dim, const Tensor& index) {
 // The mark payload is one 32-bit word per element, which a whole-word store
 // reaches without disturbing a neighbour, and it holds the position of the
 // entry plus one so that the clearing pass can leave "nothing names me" as
-// zero.  Recording a position rather than a bare hit is what lets the same mark
-// pass serve a source payload later, where the number written differs per entry.
+// zero.  Recording a position rather than a bare hit is what lets one mark pass
+// serve both rewrites: a constant needs only the mark, a source payload reads
+// the entry it points at.
 //
 // Both passes address the destination in its row-major logical order: the mark
 // pass runs the gather mapping backwards from an entry of the list, the apply
@@ -822,6 +823,51 @@ void check_scatter_geometry(
   }
 }
 
+// The mark pass of a scatter: one word per element of the destination, holding
+// the position of the entry that names it plus one.  Both rewrites share it,
+// because a position is what a payload needs to find its value and a constant
+// simply ignores it.
+void mark_scatter_destinations(
+    api::Context* const context,
+    api::PipelineBarrier& pipeline_barrier,
+    const Tensor& self,
+    const Tensor& index,
+    int64_t wrapped,
+    api::vTensor& v_marks,
+    api::vTensor& v_indices) {
+  const int64_t rank = self.dim();
+  const ivec4 index_strides =
+      padded_strides(static_cast<std::vector<int64_t>>(index.shape()));
+  const ivec4 self_strides =
+      padded_strides(static_cast<std::vector<int64_t>>(self.shape()));
+  const struct MarkBlock final {
+    ivec4 index_strides;
+    ivec4 self_strides;
+    int32_t axis; // the scattered axis of the padded four-axis shape
+    int32_t self_rows; // entries available along that axis
+    int32_t count; // entries of the index list
+    int32_t fill;
+  } mark_block{
+      index_strides,
+      self_strides,
+      static_cast<int32_t>(wrapped + 4 - rank),
+      static_cast<int32_t>(self.size(wrapped)),
+      static_cast<int32_t>(index.numel()),
+      0};
+
+  api::UniformParamsBuffer mark_params(context, mark_block);
+  context->submit_compute_job(
+      VK_KERNEL(scatter_mark), pipeline_barrier,
+      {safe_downcast_to_u32(index.numel()), 1u, 1u}, {256u, 1u, 1u},
+      VK_NULL_HANDLE,
+      v_marks.buffer(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::WRITE),
+      v_indices.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+      mark_params.buffer());
+}
+
 Tensor& scatter_value_inplace_kernel(
     Tensor& self,
     int64_t dim,
@@ -851,38 +897,9 @@ Tensor& scatter_value_inplace_kernel(
   api::vTensor v_indices =
       upload_index_payload(index, api::StorageType::BUFFER);
 
-  const ivec4 index_strides =
-      padded_strides(static_cast<std::vector<int64_t>>(index.shape()));
-  const ivec4 self_strides =
-      padded_strides(static_cast<std::vector<int64_t>>(self.shape()));
-  const struct MarkBlock final {
-    ivec4 index_strides;
-    ivec4 self_strides;
-    int32_t axis; // the scattered axis of the padded four-axis shape
-    int32_t self_rows; // entries available along that axis
-    int32_t count; // entries of the index list
-    int32_t fill;
-  } mark_block{
-      index_strides,
-      self_strides,
-      static_cast<int32_t>(wrapped + 4 - rank),
-      static_cast<int32_t>(self.size(wrapped)),
-      static_cast<int32_t>(index.numel()),
-      0};
-
-  api::UniformParamsBuffer mark_params(context, mark_block);
   api::PipelineBarrier pipeline_barrier{};
-  const uint32_t entries = safe_downcast_to_u32(index.numel());
-
-  context->submit_compute_job(
-      VK_KERNEL(scatter_mark), pipeline_barrier, {entries, 1u, 1u},
-      {256u, 1u, 1u}, VK_NULL_HANDLE,
-      v_marks.buffer(
-          pipeline_barrier,
-          api::PipelineStage::COMPUTE,
-          api::MemoryAccessType::WRITE),
-      v_indices.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
-      mark_params.buffer());
+  mark_scatter_destinations(
+      context, pipeline_barrier, self, index, wrapped, v_marks, v_indices);
 
   const float written = static_cast<float>(value.toDouble());
 
@@ -954,6 +971,156 @@ Tensor scatter_value_kernel(
   return out;
 }
 
+// The values a scatter moves are read at the flat position of the entry that
+// names a destination, so the payload has to be walkable by position: whatever
+// storage it arrived in, it is brought to dense linear order here, which is
+// already the row-major order its entries are counted in.
+//
+// A payload that lives in the very storage being written would have to be bound
+// in both directions at once, and the apply pass reads a lane it was not asked
+// to change as well as the one it stores.  Copying such a source out first is
+// what keeps the two bindings apart; the usual separate payload copies nothing.
+api::vTensor scatter_source_payload(
+    api::Context* const context,
+    const Tensor& self,
+    const Tensor& src) {
+  const bool shares_storage = self.impl()->storage().unsafeGetStorageImpl() ==
+      src.impl()->storage().unsafeGetStorageImpl();
+  api::vTensor v_src = convert(shares_storage ? src.clone() : src);
+  if (v_src.storage_type() == api::StorageType::BUFFER) {
+    return v_src;
+  }
+  return to_buffer_storage_dispatch(context, v_src);
+}
+
+Tensor& scatter_src_inplace_kernel(
+    Tensor& self,
+    int64_t dim,
+    const Tensor& index,
+    const Tensor& src) {
+  NoGradGuard no_grad;
+  validate_gather_operand(self, "scatter");
+  validate_gather_operand(src, "scatter");
+  TP_CHECK(
+      index.dtype() == DType::Int32 || index.dtype() == DType::Int64,
+      "Vulkan scatter: index must be Int32 or Int64");
+  const int64_t rank = self.dim();
+  int64_t wrapped = dim < 0 ? dim + rank : dim;
+  TP_CHECK(
+      wrapped >= 0 && wrapped < rank,
+      "Vulkan scatter: dimension out of range");
+  check_scatter_geometry(self, wrapped, index);
+
+  // The values are read at the position of the entry that names a destination,
+  // so the payload has to cover the list: fewer axes than the list has take the
+  // outer ones as they stand, one value repeats over every entry, a payload
+  // narrower along an axis is read again for the entries below it, and a
+  // narrower element type widens to the one the destination carries.
+  const std::vector<int64_t> list_shape(
+      static_cast<std::vector<int64_t>>(index.shape()));
+  const int64_t depth = static_cast<int64_t>(list_shape.size());
+  TP_CHECK(
+      src.dim() <= depth,
+      "Vulkan scatter: the source must not have more axes than the list");
+  // The axes the list carries that the payload does not spell out stand at the
+  // front of it, each with one value to reach the entries below.
+  const int64_t lead = depth - src.dim();
+  std::vector<int64_t> held_shape(static_cast<size_t>(lead), 1);
+  for (int64_t axis = 0; axis < src.dim(); ++axis) {
+    TP_CHECK(
+        src.size(axis) == 1 || src.size(axis) == list_shape[lead + axis],
+        "Vulkan scatter: the source must reach the list at dimension ", axis);
+    held_shape.push_back(src.size(axis));
+  }
+  Tensor payload =
+      src.dtype() == self.dtype() ? src : src.to(self.dtype());
+  if (held_shape != list_shape) {
+    payload = payload.reshape(held_shape).expand(list_shape).contiguous();
+  }
+
+  if (self.numel() == 0 || index.numel() == 0) {
+    return self;
+  }
+
+  api::Context* const context = api::context();
+  api::vTensor v_self = convert(self);
+  api::vTensor v_marks = zeroed_marks(context, self.numel());
+  api::vTensor v_indices =
+      upload_index_payload(index, api::StorageType::BUFFER);
+  api::vTensor v_src = scatter_source_payload(context, self, payload);
+
+  api::PipelineBarrier pipeline_barrier{};
+  mark_scatter_destinations(
+      context, pipeline_barrier, self, index, wrapped, v_marks, v_indices);
+
+  if (v_self.storage_type() == api::StorageType::BUFFER) {
+    const struct SrcBufferBlock final {
+      int32_t count; // elements of the destination
+      int32_t fill;
+      int32_t fill2;
+      int32_t fill3;
+    } block{static_cast<int32_t>(self.numel()), 0, 0, 0};
+    api::UniformParamsBuffer params(context, block);
+    context->submit_compute_job(
+        VK_KERNEL_FROM_STR(buffer_shader_for_dtype(
+            "buffer_scatter_src", self.dtype())),
+        pipeline_barrier,
+        {buffer_dispatch_count(
+             safe_downcast_to_u32(self.numel()), self.dtype(), 4u),
+         1u,
+         1u},
+        {256u, 1u, 1u}, VK_NULL_HANDLE,
+        // The apply pass reads the lanes it leaves alone, so the destination is
+        // bound in both directions.
+        v_self.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::READ | api::MemoryAccessType::WRITE),
+        v_marks.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+        v_src.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+        params.buffer());
+    return self;
+  }
+
+  const ivec4 self_sizes = make_whcn_ivec4(
+      static_cast<std::vector<int64_t>>(self.shape()));
+  const struct SrcBlock final {
+    ivec4 self_sizes; // (width, height, channels, batch)
+    int32_t planes_per_batch; // channel groups of four stacked per batch
+    int32_t fill;
+    int32_t fill2;
+  } block{
+      self_sizes,
+      static_cast<int32_t>((self_sizes[2] + 3) / 4),
+      0,
+      0};
+  api::UniformParamsBuffer params(context, block);
+  const api::utils::uvec3 grid = v_self.extents();
+
+  context->submit_compute_job(
+      kernel_for("scatter_src", self.dtype()), pipeline_barrier, grid,
+      adaptive_work_group_size(grid), VK_NULL_HANDLE,
+      v_self.image(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::READ | api::MemoryAccessType::WRITE),
+      v_marks.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+      v_src.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+      params.buffer());
+
+  return self;
+}
+
+Tensor scatter_src_kernel(
+    const Tensor& self,
+    int64_t dim,
+    const Tensor& index,
+    const Tensor& src) {
+  Tensor out = self.clone();
+  scatter_src_inplace_kernel(out, dim, index, src);
+  return out;
+}
+
 } // namespace ops
 } // namespace vulkan
 } // namespace tensorplay
@@ -968,6 +1135,10 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, IndexingKernels) {
   m.impl(
       "scatter_.value",
       &tensorplay::vulkan::ops::scatter_value_inplace_kernel);
+  m.impl("scatter.src", &tensorplay::vulkan::ops::scatter_src_kernel);
+  m.impl(
+      "scatter_.src",
+      &tensorplay::vulkan::ops::scatter_src_inplace_kernel);
 }
 
 #endif /* USE_VULKAN */
