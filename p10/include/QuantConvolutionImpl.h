@@ -10,6 +10,7 @@ struct ConvGeometry {
 template<class X, class Y>
 struct ConvCodes {
     const X* x; const int8_t* w; const float *scales, *bias; const int64_t* zero_points; Y* y; ConvGeometry g;
+    const int32_t* taps;
     TP_QN_DEVICE void operator()(int64_t i) const {
         const int64_t out_pos = i % g.output_spatial, oc = i / g.output_spatial % g.outputs;
         const int64_t batch = i / (g.outputs * g.output_spatial), group = oc / (g.outputs / g.groups);
@@ -17,19 +18,26 @@ struct ConvCodes {
         const int64_t wz = g.channel_grid ? zero_points[oc] : g.wz;
         int64_t sum = 0;
         for (int64_t kp = 0; kp < g.kernel_spatial; ++kp) {
-            int64_t p = out_pos, k = kp, pos = 0, multiplier = 1; bool inside = true;
-            for (int d = 2; d >= 0; --d) {
-                const int64_t out_coord = p % g.out[d], kernel_coord = k % g.kernel[d]; p /= g.out[d]; k /= g.kernel[d];
-                int64_t coordinate;
-                if (g.transposed) {
-                    const int64_t numerator = out_coord + g.pad[d] - kernel_coord * g.dilation[d];
-                    inside = inside && numerator % g.stride[d] == 0;
-                    coordinate = numerator / g.stride[d];
-                } else coordinate = out_coord * g.stride[d] - g.pad[d] + kernel_coord * g.dilation[d];
-                inside = inside && coordinate >= 0 && coordinate < g.in[d];
-                pos += coordinate * multiplier; multiplier *= g.in[d];
+            int64_t pos;
+            if (taps) {
+                const int32_t entry = taps[out_pos * g.kernel_spatial + kp];
+                if (entry < 0) continue;
+                pos = entry;
+            } else {
+                int64_t p = out_pos, k = kp, multiplier = 1; bool inside = true; pos = 0;
+                for (int d = 2; d >= 0; --d) {
+                    const int64_t out_coord = p % g.out[d], kernel_coord = k % g.kernel[d]; p /= g.out[d]; k /= g.kernel[d];
+                    int64_t coordinate;
+                    if (g.transposed) {
+                        const int64_t numerator = out_coord + g.pad[d] - kernel_coord * g.dilation[d];
+                        inside = inside && numerator % g.stride[d] == 0;
+                        coordinate = numerator / g.stride[d];
+                    } else coordinate = out_coord * g.stride[d] - g.pad[d] + kernel_coord * g.dilation[d];
+                    inside = inside && coordinate >= 0 && coordinate < g.in[d];
+                    pos += coordinate * multiplier; multiplier *= g.in[d];
+                }
+                if (!inside) continue;
             }
-            if (!inside) continue;
             for (int64_t c = 0; c < inputs_per_group; ++c) {
                 const int64_t ic = group * inputs_per_group + c;
                 const int64_t weight_index = g.transposed
@@ -46,6 +54,44 @@ struct ConvCodes {
         else y[i] = encode<Y>(value, g.inverse, g.yz);
     }
 };
+
+#ifndef TP_QUANT_CUDA
+// A tap answers to one input address fixed by the output location and the tap,
+// never by the batch, the group or the output channel, so a table row serves
+// every element that lands on that location. The build is only worth its own
+// coordinate work where several of them do, and is dropped for shapes whose
+// location and tap counts would outgrow a sane scratch size.
+constexpr int64_t kConvGatherLimit = 1 << 20;
+
+std::vector<int32_t> build_conv_taps(const ConvGeometry& g, int64_t reuse) {
+    std::vector<int32_t> table;
+    if (reuse <= 1 || g.output_spatial * g.kernel_spatial > kConvGatherLimit ||
+        g.input_spatial > (1LL << 31) - 1) return table;
+    table.resize(g.output_spatial * g.kernel_spatial);
+    parallel::parallel_for(0, g.output_spatial, 1024, [&](int64_t first, int64_t last) {
+        for (int64_t out_pos = first; out_pos < last; ++out_pos) {
+            int64_t p = out_pos, coordinate[3]{};
+            for (int d = 2; d >= 0; --d) { coordinate[d] = p % g.out[d]; p /= g.out[d]; }
+            for (int64_t kp = 0; kp < g.kernel_spatial; ++kp) {
+                int64_t k = kp, pos = 0, multiplier = 1; bool inside = true;
+                for (int d = 2; d >= 0; --d) {
+                    const int64_t kernel_coord = k % g.kernel[d]; k /= g.kernel[d];
+                    int64_t address;
+                    if (g.transposed) {
+                        const int64_t numerator = coordinate[d] + g.pad[d] - kernel_coord * g.dilation[d];
+                        inside = inside && numerator % g.stride[d] == 0;
+                        address = numerator / g.stride[d];
+                    } else address = coordinate[d] * g.stride[d] - g.pad[d] + kernel_coord * g.dilation[d];
+                    inside = inside && address >= 0 && address < g.in[d];
+                    pos += address * multiplier; multiplier *= g.in[d];
+                }
+                table[out_pos * g.kernel_spatial + kp] = inside ? static_cast<int32_t>(pos) : -1;
+            }
+        }
+    });
+    return table;
+}
+#endif
 
 Tensor convolution(const Tensor& input, const Tensor& weight, const std::optional<Tensor>& bias,
         double scale, int64_t zp, const std::vector<int64_t>& strides,
@@ -99,14 +145,20 @@ Tensor convolution(const Tensor& input, const Tensor& weight, const std::optiona
     // channels, so the chunk has to shrink by that many visits or the shape
     // never reaches the thread pool.
     const int64_t visits = g.kernel_spatial * (g.channels / g.groups);
+#ifdef TP_QUANT_CUDA
+    const int32_t* tap_table = nullptr;
+#else
+    const std::vector<int32_t> taps = build_conv_taps(g, y.numel() / g.output_spatial);
+    const int32_t* tap_table = taps.empty() ? nullptr : taps.data();
+#endif
     codes(input.dtype(), [&]<class T>() {
         if (output_float) apply(y.numel(), ConvCodes<T,float>{x.data_ptr<T>(),w.data_ptr<int8_t>(),
             g.channel_grid ? scales.data_ptr<float>() : nullptr, bias ? b.data_ptr<float>() : nullptr,
-            g.channel_grid ? zps.data_ptr<int64_t>() : nullptr,y.data_ptr<float>(),g},
+            g.channel_grid ? zps.data_ptr<int64_t>() : nullptr,y.data_ptr<float>(),g,tap_table},
             chunk_grain(visits));
         else apply(y.numel(), ConvCodes<T,T>{x.data_ptr<T>(),w.data_ptr<int8_t>(),
             g.channel_grid ? scales.data_ptr<float>() : nullptr,bias ? b.data_ptr<float>() : nullptr,
-            g.channel_grid ? zps.data_ptr<int64_t>() : nullptr,y.data_ptr<T>(),g},
+            g.channel_grid ? zps.data_ptr<int64_t>() : nullptr,y.data_ptr<T>(),g,tap_table},
             chunk_grain(visits));
     });
     return y;
