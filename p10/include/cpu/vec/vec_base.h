@@ -575,6 +575,9 @@ struct Vectorized {
   T reduce_max() const {
     return reduce([](T x, T y) { return std::max(x, y); });
   }
+  T reduce_min() const {
+    return reduce([](T x, T y) { return std::min(x, y); });
+  }
 
  private:
   template <typename Op>

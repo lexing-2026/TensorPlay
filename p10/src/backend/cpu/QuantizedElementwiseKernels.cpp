@@ -1685,12 +1685,17 @@ float rowwise_loss(const float* x, int64_t size, float lo, float hi, int bits) {
     return ::sqrtf(sum);
 }
 
-void rowwise_pack_impl(const float* input, const float* ranges, uint8_t* output,
-        int64_t rows, int64_t columns, int64_t width, int64_t bins, int bits,
+// The width of a row's codes is decided before any row is looked at, so it
+// arrives as a template argument: the packing loops then divide a column count
+// by a constant rather than by a register, and a row of whole bytes carries
+// none of the shifting that only a sub-byte width needs.
+template<int Bits>
+void rowwise_pack_rows(const float* input, const float* ranges, uint8_t* output,
+        int64_t rows, int64_t columns, int64_t width, int64_t bins,
         bool optimized, float ratio) {
     using V = vec::Vectorized<float>;
     constexpr int lanes = V::size();
-    const int values_per_byte = 8 / bits;
+    constexpr int values_per_byte = 8 / Bits;
     // Rounding cannot change while the rows are being packed, so it is read once
     // for the whole call instead of on every row.
     const bool nearest = std::fegetround() == FE_TONEAREST;
@@ -1702,10 +1707,12 @@ void rowwise_pack_impl(const float* input, const float* ranges, uint8_t* output,
             if (ranges && !optimized) {
                 lo = ranges[2 * row]; hi = ranges[2 * row + 1];
             } else if (nearest && columns >= lanes) {
-                // A single accumulator waits for its own previous step, and each
-                // step here is three instructions wide, so the row is folded by
-                // four independent chains that are merged at the end. Propagating
-                // NaN is associative, so the merged value is the same one.
+                // A single accumulator waits for its own previous step, so the row
+                // is folded by four independent chains that are merged at the end.
+                // A bound only moves toward the value that overtakes it, which is
+                // what a compare-and-select does in one instruction; the form that
+                // also carries a NaN through the result costs two more per step to
+                // preserve a value that the cross-lane fold below drops anyway.
                 const float infinity = std::numeric_limits<float>::infinity();
                 V low_a(infinity), low_b(infinity), low_c(infinity), low_d(infinity);
                 V high_a(-infinity), high_b(-infinity), high_c(-infinity), high_d(-infinity);
@@ -1713,24 +1720,24 @@ void rowwise_pack_impl(const float* input, const float* ranges, uint8_t* output,
                 for (; col + 4 * lanes <= columns; col += 4 * lanes) {
                     const V a = V::loadu(src + col), b = V::loadu(src + col + lanes);
                     const V c = V::loadu(src + col + 2 * lanes), d = V::loadu(src + col + 3 * lanes);
-                    low_a = vec::minimum(low_a, a); high_a = vec::maximum(high_a, a);
-                    low_b = vec::minimum(low_b, b); high_b = vec::maximum(high_b, b);
-                    low_c = vec::minimum(low_c, c); high_c = vec::maximum(high_c, c);
-                    low_d = vec::minimum(low_d, d); high_d = vec::maximum(high_d, d);
+                    low_a = vec::clamp_max(low_a, a); high_a = vec::clamp_min(high_a, a);
+                    low_b = vec::clamp_max(low_b, b); high_b = vec::clamp_min(high_b, b);
+                    low_c = vec::clamp_max(low_c, c); high_c = vec::clamp_min(high_c, c);
+                    low_d = vec::clamp_max(low_d, d); high_d = vec::clamp_min(high_d, d);
                 }
                 for (; col + lanes <= columns; col += lanes) {
                     const V values = V::loadu(src + col);
-                    low_a = vec::minimum(low_a, values);
-                    high_a = vec::maximum(high_a, values);
+                    low_a = vec::clamp_max(low_a, values);
+                    high_a = vec::clamp_min(high_a, values);
                 }
-                const V minimum = vec::minimum(vec::minimum(low_a, low_b), vec::minimum(low_c, low_d));
-                const V maximum = vec::maximum(vec::maximum(high_a, high_b), vec::maximum(high_c, high_d));
-                alignas(64) float minima[lanes], maxima[lanes];
-                minimum.store(minima); maximum.store(maxima);
-                lo = minima[0]; hi = maxima[0];
-                for (int lane = 1; lane < lanes; ++lane) {
-                    lo = std::min(lo, minima[lane]); hi = std::max(hi, maxima[lane]);
-                }
+                const V minimum = vec::clamp_max(vec::clamp_max(low_a, low_b), vec::clamp_max(low_c, low_d));
+                const V maximum = vec::clamp_min(vec::clamp_min(high_a, high_b), vec::clamp_min(high_c, high_d));
+                // The scale of a row is derived from these two values, so a store
+                // followed by eight lane reads would put a memory round trip in
+                // front of every code of the row. A narrow row offers no other
+                // work to fill that gap, so the fold stays in registers.
+                lo = minimum.reduce_min();
+                hi = maximum.reduce_max();
                 for (; col < columns; ++col) { lo = std::min(lo, src[col]); hi = std::max(hi, src[col]); }
             } else {
                 lo = src[0]; hi = src[0];
@@ -1738,14 +1745,14 @@ void rowwise_pack_impl(const float* input, const float* ranges, uint8_t* output,
                     lo = ::fminf(lo, src[col]); hi = ::fmaxf(hi, src[col]);
                 }
             }
-            if (optimized && bits != 8 && hi > lo) {
+            if (optimized && Bits != 8 && hi > lo) {
                 const float step = (hi - lo) / static_cast<float>(bins);
                 const float threshold = static_cast<float>(bins) * (1.f - ratio) * step;
-                float best = rowwise_loss(src, columns, lo, hi, bits), current = best;
+                float best = rowwise_loss(src, columns, lo, hi, Bits), current = best;
                 float left = lo, right = hi;
                 while (left + threshold < right) {
-                    const float loss_left = rowwise_loss(src, columns, left + step, right, bits);
-                    const float loss_right = rowwise_loss(src, columns, left, right - step, bits);
+                    const float loss_left = rowwise_loss(src, columns, left + step, right, Bits);
+                    const float loss_right = rowwise_loss(src, columns, left, right - step, Bits);
                     if (current < loss_left && current < loss_right && current < best) {
                         best = current; lo = left; hi = right;
                     }
@@ -1759,17 +1766,17 @@ void rowwise_pack_impl(const float* input, const float* ranges, uint8_t* output,
                 }
             }
             float scale, inverse;
-            if (bits == 8) {
+            if (Bits == 8) {
                 scale = (hi - lo) / 255.f;
                 inverse = 255.f / (hi - lo + 1.e-8f);
             } else {
                 lo = static_cast<float>(Half(lo));
-                scale = hi == lo ? 1.f : static_cast<float>(Half((hi - lo) / ((1 << bits) - 1)));
+                scale = hi == lo ? 1.f : static_cast<float>(Half((hi - lo) / ((1 << Bits) - 1)));
                 inverse = scale == 0.f ? 1.f : 1.f / scale;
                 if (scale == 0.f || std::isinf(inverse)) scale = inverse = 1.f;
             }
             int64_t col = 0;
-            if (bits == 8 && nearest) {
+            if (Bits == 8 && nearest) {
                 // One byte per value asks for no decision per lane: a whole vector
                 // of codes leaves through a single byte store instead of being
                 // shifted into place one lane at a time.
@@ -1784,22 +1791,22 @@ void rowwise_pack_impl(const float* input, const float* ranges, uint8_t* output,
             if (nearest && lanes >= values_per_byte && lanes % values_per_byte == 0) {
                 alignas(64) float codes[lanes];
 #if defined(CPU_CAPABILITY_AVX2)
-                if (bits == 4) {
+                if (Bits == 4) {
                     for (; col + 2 * lanes <= columns; col += 2 * lanes)
                         pack_row_chunk<4>(src, col, lo, inverse, dst + col / 2);
-                } else if (bits == 2) {
+                } else if (Bits == 2) {
                     for (; col + 2 * lanes <= columns; col += 2 * lanes)
                         pack_row_chunk<2>(src, col, lo, inverse, dst + col / 4);
                 }
 #endif
                 for (; col + lanes <= columns; col += lanes) {
                     V values = ((V::loadu(src + col) - V(lo)) * V(inverse)).round();
-                    values = vec::minimum(V(static_cast<float>((1 << bits) - 1)), vec::maximum(V(0.f), values));
+                    values = vec::minimum(V(static_cast<float>((1 << Bits) - 1)), vec::maximum(V(0.f), values));
                     values.store(codes);
                     for (int lane = 0; lane < lanes; lane += values_per_byte) {
                         uint8_t packed = 0;
                         for (int v = 0; v < values_per_byte; ++v)
-                            packed |= static_cast<uint8_t>(codes[lane + v]) << (v * bits);
+                            packed |= static_cast<uint8_t>(codes[lane + v]) << (v * Bits);
                         dst[(col + lane) / values_per_byte] = packed;
                     }
                 }
@@ -1808,18 +1815,34 @@ void rowwise_pack_impl(const float* input, const float* ranges, uint8_t* output,
                 uint8_t packed = 0;
                 for (int v = 0; v < values_per_byte; ++v) {
                     const float code = ::nearbyintf((src[col + v] - lo) * inverse);
-                    const uint8_t quantized = static_cast<uint8_t>(::fmaxf(0.f, ::fminf((1 << bits) - 1, code)));
-                    packed |= quantized << (v * bits);
+                    const uint8_t quantized = static_cast<uint8_t>(::fmaxf(0.f, ::fminf((1 << Bits) - 1, code)));
+                    packed |= quantized << (v * Bits);
                 }
                 dst[col / values_per_byte] = packed;
             }
-            if (bits == 8) {
+            if (Bits == 8) {
                 quant::put_float(dst + width - 8, scale); quant::put_float(dst + width - 4, lo);
             } else {
                 quant::put_half(dst + width - 4, scale); quant::put_half(dst + width - 2, lo);
             }
         }
     });
+}
+
+void rowwise_pack_impl(const float* input, const float* ranges, uint8_t* output,
+        int64_t rows, int64_t columns, int64_t width, int64_t bins, int bits,
+        bool optimized, float ratio) {
+    switch (bits) {
+        case 8:
+            rowwise_pack_rows<8>(input, ranges, output, rows, columns, width, bins, optimized, ratio);
+            break;
+        case 4:
+            rowwise_pack_rows<4>(input, ranges, output, rows, columns, width, bins, optimized, ratio);
+            break;
+        default:
+            rowwise_pack_rows<2>(input, ranges, output, rows, columns, width, bins, optimized, ratio);
+            break;
+    }
 }
 
 void fp16_linear_impl(const float* x, const Half* w, const float* bias, float* y,
