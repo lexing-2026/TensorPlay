@@ -1687,6 +1687,9 @@ void rowwise_pack_impl(const float* input, const float* ranges, uint8_t* output,
     using V = vec::Vectorized<float>;
     constexpr int lanes = V::size();
     const int values_per_byte = 8 / bits;
+    // Rounding cannot change while the rows are being packed, so it is read once
+    // for the whole call instead of on every row.
+    const bool nearest = std::fegetround() == FE_TONEAREST;
     parallel::parallel_for(0, rows, 1, [&](int64_t first, int64_t last) {
         for (int64_t row = first; row < last; ++row) {
             const float* src = input + row * columns;
@@ -1694,15 +1697,30 @@ void rowwise_pack_impl(const float* input, const float* ranges, uint8_t* output,
             float lo, hi;
             if (ranges && !optimized) {
                 lo = ranges[2 * row]; hi = ranges[2 * row + 1];
-            } else if (std::fegetround() == FE_TONEAREST && columns >= lanes) {
-                V minimum(std::numeric_limits<float>::infinity());
-                V maximum(-std::numeric_limits<float>::infinity());
+            } else if (nearest && columns >= lanes) {
+                // A single accumulator waits for its own previous step, and each
+                // step here is three instructions wide, so the row is folded by
+                // four independent chains that are merged at the end. Propagating
+                // NaN is associative, so the merged value is the same one.
+                const float infinity = std::numeric_limits<float>::infinity();
+                V low_a(infinity), low_b(infinity), low_c(infinity), low_d(infinity);
+                V high_a(-infinity), high_b(-infinity), high_c(-infinity), high_d(-infinity);
                 int64_t col = 0;
+                for (; col + 4 * lanes <= columns; col += 4 * lanes) {
+                    const V a = V::loadu(src + col), b = V::loadu(src + col + lanes);
+                    const V c = V::loadu(src + col + 2 * lanes), d = V::loadu(src + col + 3 * lanes);
+                    low_a = vec::minimum(low_a, a); high_a = vec::maximum(high_a, a);
+                    low_b = vec::minimum(low_b, b); high_b = vec::maximum(high_b, b);
+                    low_c = vec::minimum(low_c, c); high_c = vec::maximum(high_c, c);
+                    low_d = vec::minimum(low_d, d); high_d = vec::maximum(high_d, d);
+                }
                 for (; col + lanes <= columns; col += lanes) {
                     const V values = V::loadu(src + col);
-                    minimum = vec::minimum(minimum, values);
-                    maximum = vec::maximum(maximum, values);
+                    low_a = vec::minimum(low_a, values);
+                    high_a = vec::maximum(high_a, values);
                 }
+                const V minimum = vec::minimum(vec::minimum(low_a, low_b), vec::minimum(low_c, low_d));
+                const V maximum = vec::maximum(vec::maximum(high_a, high_b), vec::maximum(high_c, high_d));
                 alignas(64) float minima[lanes], maxima[lanes];
                 minimum.store(minima); maximum.store(maxima);
                 lo = minima[0]; hi = maxima[0];
@@ -1747,7 +1765,7 @@ void rowwise_pack_impl(const float* input, const float* ranges, uint8_t* output,
                 if (scale == 0.f || std::isinf(inverse)) scale = inverse = 1.f;
             }
             int64_t col = 0;
-            if (bits == 8 && std::fegetround() == FE_TONEAREST) {
+            if (bits == 8 && nearest) {
                 // One byte per value asks for no decision per lane: a whole vector
                 // of codes leaves through a single byte store instead of being
                 // shifted into place one lane at a time.
@@ -1759,7 +1777,7 @@ void rowwise_pack_impl(const float* input, const float* ranges, uint8_t* output,
                     QV::quantize(shifted, 1.f, 0, 1.f).store(dst + col);
                 }
             }
-            if (std::fegetround() == FE_TONEAREST && lanes >= values_per_byte && lanes % values_per_byte == 0) {
+            if (nearest && lanes >= values_per_byte && lanes % values_per_byte == 0) {
                 alignas(64) float codes[lanes];
 #if defined(CPU_CAPABILITY_AVX2)
                 if (bits == 4) {
