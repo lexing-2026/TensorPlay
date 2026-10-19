@@ -1890,9 +1890,16 @@ reduce_int64:
   parameter_names_with_default_values:
     DTYPE: int
     PRODUCT: false
+    COUNT: true
   shader_variants:
   - NAME: prod_int64
     PRODUCT: true
+    COUNT: false
+  - NAME: sum_int64
+    COUNT: false
+  - NAME: sum_int64_float
+    DTYPE: float
+    COUNT: false
   - NAME: count_int64_i32
   - NAME: count_int64_float
     DTYPE: float

@@ -925,7 +925,77 @@ Tensor reduce_int64(
   return convert(output);
 }
 
+//
+// A payload that counts rather than measures has no reduced type to carry its
+// own total: the answer to a sum of truth lanes, or of lanes holding whole
+// numbers, is named by the caller's request or defaults to the wide word.
+//
+// Only a lane that fits single precision exactly can be added up here: a truth
+// lane, a byte, or a signed word is, while a lane already wide enough to hold a
+// number past that reach has no walk that carries it without rounding.
+//
+bool totals_in_singles(DType dtype) {
+  return dtype == DType::Bool || dtype == DType::Int8 ||
+      dtype == DType::UInt8 || dtype == DType::Int32;
+}
+
+//
+// The walk that adds lanes into a wide word reads a texture, so a plane whose
+// shape has one is reduced in a single pass.  A signed word is read as itself,
+// since a lane past the exact reach of single precision must not be rounded on
+// the way in; every narrower code (a truth lane, a byte) is exact in single
+// precision, so it steps through that width to reach the walk.  A payload with
+// no texture form has no such walk: it sums through the single-precision row
+// walk, exact while the running total stays inside the reach of a float, and
+// the total then crosses to the wide word by way of the signed one.
+//
+Tensor integral_total(
+    const Tensor& self,
+    const std::vector<int64_t>& dims_in,
+    bool keepdim,
+    DType wanted) {
+  std::vector<int64_t> dims = dims_in;
+  if (dims.empty()) {
+    dims.reserve(static_cast<size_t>(self.dim()));
+    for (int64_t d = 0; d < self.dim(); ++d) {
+      dims.push_back(d);
+    }
+  }
+  dims = normalized_dims(self, dims);
+  TP_CHECK(!dims.empty(), "Vulkan reductions require at least one dim");
+  TP_CHECK(
+      self.numel() > 0, "Vulkan reductions do not support empty tensors");
+
+  const bool wide = wanted == DType::Undefined || wanted == DType::Int64;
+  TP_CHECK(
+      wide || wanted == DType::Float32 || wanted == DType::Float16 ||
+          wanted == DType::Int32,
+      "Vulkan sums of a counted payload answer in Int64, Float32, Float16 "
+      "or Int32");
+
+  const Tensor singles = self.to(DType::Float32);
+
+  if (!wide) {
+    Tensor total = reduce_impl(singles, dims, keepdim, false, false, 0);
+    return wanted == DType::Float32 ? total : total.to(wanted);
+  }
+
+  if (convert(self).storage_type() == api::StorageType::TEXTURE_3D) {
+    return self.dtype() == DType::Int32
+        ? reduce_int64(self, dims, keepdim, "sum_int64")
+        : reduce_int64(singles, dims, keepdim, "sum_int64_float");
+  }
+  return reduce_impl(singles, dims, keepdim, false, false, 0)
+      .to(DType::Int32)
+      .to(DType::Int64);
+}
+
 Tensor count_impl(const Tensor& self, const std::vector<int64_t>& dims) {
+  if (self.dtype() == DType::Bool) {
+    // A truth lane holds 0 or 1, so the lanes a count asks for are exactly the
+    // lanes a total adds up.
+    return integral_total(self, dims, false, DType::Int64);
+  }
   TP_CHECK(self.dtype() == DType::Float32 || self.dtype() == DType::Int32,
            "Vulkan count_nonzero supports Float32 and Int32 tensors only");
   return reduce_int64(self, dims, false,
@@ -949,7 +1019,9 @@ Tensor sum_dim_kernel(
     const std::vector<int64_t>& dims,
     bool keepdim,
     DType dtype) {
-  (void)dtype;
+  if (totals_in_singles(self.dtype())) {
+    return integral_total(self, dims, keepdim, dtype);
+  }
   return reduce_impl(self, dims, keepdim, false, false, 0);
 }
 
@@ -967,6 +1039,17 @@ Tensor mean_dim_kernel(
 // axis in one call, exactly like the dim-listed entry points do.
 //
 Tensor sum_kernel(const Tensor& self, DType dtype) {
+  if (totals_in_singles(self.dtype())) {
+    if (self.numel() == 0) {
+      // Nothing adds to nothing: the width the total was asked to carry still
+      // names the answer.
+      return full_kernel(
+          {}, Scalar(0),
+          dtype == DType::Undefined ? DType::Int64 : dtype,
+          self.device(), false);
+    }
+    return integral_total(self, {}, false, dtype);
+  }
   TP_CHECK(
       self.dtype() == DType::Float32 || self.dtype() == DType::Float16,
       "Vulkan reductions support Float32 and Float16 tensors only");

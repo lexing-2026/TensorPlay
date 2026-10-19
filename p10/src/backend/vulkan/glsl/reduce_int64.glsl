@@ -48,11 +48,19 @@ void main() {
       }
     }
     ivec3 pos = ivec3(p.x, p.y, p.w * ((uBlock.sizes.z + 3) / 4) + p.z / 4);
-    $if PRODUCT:
-      int v = texelFetch(src, pos, 0)[p.z % 4];
-      uvec2 value = uvec2(uint(v), v < 0 ? 0xffffffffu : 0u);
-    $else:
+    $if COUNT:
+      // A count asks which lanes are set, so a lane answers with one bit and
+      // the walk never carries its number.
       uvec2 value = uvec2(uint(texelFetch(src, pos, 0)[p.z % 4] != 0), 0);
+    $else:
+      // A total carries the lane's own number, widened to a signed word.  A
+      // number that came through single precision is whole, so reading it back
+      // as one loses nothing.
+      $if DTYPE == "float":
+        int v = int(texelFetch(src, pos, 0)[p.z % 4]);
+      $else:
+        int v = texelFetch(src, pos, 0)[p.z % 4];
+      uvec2 value = uvec2(uint(v), v < 0 ? 0xffffffffu : 0u);
     accum = combine(accum, value);
   }
   partial[lane] = accum;
