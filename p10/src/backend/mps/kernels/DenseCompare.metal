@@ -87,9 +87,9 @@ kernel void compare_scalar_dense(device bool* out [[buffer(0)]],
 // 16-byte aligned, and the storage type is float; anything else stays with the
 // scalar forms above.
 //
-// Each thread takes one vector per grid-wide stride rather than a run of
-// consecutive vectors, so the lanes of a SIMD group address adjacent vectors on
-// every access and one instruction covers a contiguous span.
+// Each thread handles one vector: the host sizes the grid to the vector count,
+// and the lanes of a SIMD group address adjacent vectors, so one instruction
+// covers a contiguous span.
 template <typename Op>
 inline uchar4 apply_compare4(float4 lhs, float4 rhs) {
   return uchar4(static_cast<uchar>(Op::apply(lhs.x, rhs.x)),
@@ -103,29 +103,9 @@ kernel void compare_vec(device uchar4* out [[buffer(0)]],
                         constant float4* lhs [[buffer(1)]],
                         constant float4* rhs [[buffer(2)]],
                         constant uint& nvec [[buffer(3)]],
-                        uint tid [[thread_position_in_grid]],
-                        uint grid [[threads_per_grid]]) {
-  if (tid + (ILP_PER_THREAD - 1) * grid < nvec) {
-    array<float4, ILP_PER_THREAD> left;
-    array<float4, ILP_PER_THREAD> right;
-#pragma unroll
-    for (uint j = 0; j < ILP_PER_THREAD; ++j) {
-      left[j] = lhs[tid + j * grid];
-    }
-#pragma unroll
-    for (uint j = 0; j < ILP_PER_THREAD; ++j) {
-      right[j] = rhs[tid + j * grid];
-    }
-#pragma unroll
-    for (uint j = 0; j < ILP_PER_THREAD; ++j) {
-      out[tid + j * grid] = apply_compare4<Op>(left[j], right[j]);
-    }
-  } else {
-    // The threads whose last stride lands past the end, and the whole grid,
-    // when the operand holds fewer vectors than it has threads.
-    for (uint i = tid; i < nvec; i += grid) {
-      out[i] = apply_compare4<Op>(lhs[i], rhs[i]);
-    }
+                        uint tid [[thread_position_in_grid]]) {
+  if (tid < nvec) {
+    out[tid] = apply_compare4<Op>(lhs[tid], rhs[tid]);
   }
 }
 
@@ -136,23 +116,10 @@ kernel void compare_scalar_vec(device uchar4* out [[buffer(0)]],
                                constant float4* lhs [[buffer(1)]],
                                constant float* rhs [[buffer(2)]],
                                constant uint& nvec [[buffer(3)]],
-                               uint tid [[thread_position_in_grid]],
-                               uint grid [[threads_per_grid]]) {
+                               uint tid [[thread_position_in_grid]]) {
   const float4 scalar = float4(rhs[0]);
-  if (tid + (ILP_PER_THREAD - 1) * grid < nvec) {
-    array<float4, ILP_PER_THREAD> values;
-#pragma unroll
-    for (uint j = 0; j < ILP_PER_THREAD; ++j) {
-      values[j] = lhs[tid + j * grid];
-    }
-#pragma unroll
-    for (uint j = 0; j < ILP_PER_THREAD; ++j) {
-      out[tid + j * grid] = apply_compare4<Op>(values[j], scalar);
-    }
-  } else {
-    for (uint i = tid; i < nvec; i += grid) {
-      out[i] = apply_compare4<Op>(lhs[i], scalar);
-    }
+  if (tid < nvec) {
+    out[tid] = apply_compare4<Op>(lhs[tid], scalar);
   }
 }
 
@@ -192,8 +159,7 @@ kernel void compare_scalar_vec(device uchar4* out [[buffer(0)]],
       constant float4* lhs [[buffer(1)]],             \
       constant float4* rhs [[buffer(2)]],             \
       constant uint& nvec [[buffer(3)]],              \
-      uint tid [[thread_position_in_grid]],           \
-      uint grid [[threads_per_grid]]);
+      uint tid [[thread_position_in_grid]]);
 
 #define REGISTER_COMPARE_VEC_SCALAR(OP)                      \
   template [[host_name("compare_vec_" #OP "_scalar_float")]] \
@@ -202,8 +168,7 @@ kernel void compare_scalar_vec(device uchar4* out [[buffer(0)]],
       constant float4* lhs [[buffer(1)]],                    \
       constant float* rhs [[buffer(2)]],                     \
       constant uint& nvec [[buffer(3)]],                     \
-      uint tid [[thread_position_in_grid]],                  \
-      uint grid [[threads_per_grid]]);
+      uint tid [[thread_position_in_grid]]);
 
 REGISTER_COMPARE_DTYPES(eq)
 REGISTER_COMPARE_DTYPES(ne)

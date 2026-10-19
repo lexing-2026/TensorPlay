@@ -185,16 +185,11 @@ kernel void unary_elementwise(device T* out [[buffer(0)]],
 // The same work over four-wide vectors. Without an alignment the compiler has
 // to assume the base pointer may be arbitrary, so the scalar form above costs
 // four separate 4-byte accesses each way. Stating the vector type turns each
-// access into one 16-byte load or store. The host only takes this path when
-// both buffers are 16-byte aligned and the operand holds whole vectors.
-//
-// A thread takes one vector per grid-wide stride rather than a block of
-// consecutive vectors: the lanes of a SIMD group then touch consecutive
-// 16-byte vectors on every access, so one instruction covers a contiguous
-// span. Consecutive vectors per thread would instead spread each instruction
-// across four times as many cache lines while leaving three quarters of each
-// line for a later instruction. The host sizes the grid to the vector count,
-// so the whole grid takes the loop below for its single vector.
+// access into one 16-byte load or store. The host sizes the grid to the vector
+// count and takes this form only when both buffers are 16-byte aligned and the
+// operand holds whole vectors, so a thread handles exactly one vector: the
+// lanes of a SIMD group touch consecutive 16-byte vectors and one instruction
+// covers a contiguous span.
 template <typename Op>
 inline float4 apply_unary4(float4 v) {
   return float4(Op::apply(v.x), Op::apply(v.y), Op::apply(v.z),
@@ -205,28 +200,9 @@ template <typename Op>
 kernel void unary_elementwise_vec(device float4* out [[buffer(0)]],
                                   constant float4* src [[buffer(1)]],
                                   constant uint& nvec [[buffer(2)]],
-                                  uint tid [[thread_position_in_grid]],
-                                  uint grid [[threads_per_grid]]) {
-  if (tid + (ILP_PER_THREAD - 1) * grid < nvec) {
-    array<float4, ILP_PER_THREAD> values;
-#pragma unroll
-    for (uint j = 0; j < ILP_PER_THREAD; ++j) {
-      values[j] = src[tid + j * grid];
-    }
-#pragma unroll
-    for (uint j = 0; j < ILP_PER_THREAD; ++j) {
-      values[j] = apply_unary4<Op>(values[j]);
-    }
-#pragma unroll
-    for (uint j = 0; j < ILP_PER_THREAD; ++j) {
-      out[tid + j * grid] = values[j];
-    }
-  } else {
-    // The threads whose last stride lands past the end, and the whole grid,
-    // when the operand holds fewer vectors than it has threads.
-    for (uint i = tid; i < nvec; i += grid) {
-      out[i] = apply_unary4<Op>(src[i]);
-    }
+                                  uint tid [[thread_position_in_grid]]) {
+  if (tid < nvec) {
+    out[tid] = apply_unary4<Op>(src[tid]);
   }
 }
 
@@ -236,8 +212,7 @@ kernel void unary_elementwise_vec(device float4* out [[buffer(0)]],
       device float4* out [[buffer(0)]],              \
       constant float4* src [[buffer(1)]],            \
       constant uint& nvec [[buffer(2)]],             \
-      uint tid [[thread_position_in_grid]],          \
-      uint grid [[threads_per_grid]]);
+      uint tid [[thread_position_in_grid]]);
 
 // Clamps a contiguous operand into [lo, hi]. The lower bound is applied first
 // and the upper bound to its result, so a lower bound above the upper bound
@@ -285,9 +260,9 @@ kernel void clamp_elementwise<float>(device float* out [[buffer(0)]],
                                      uint tid [[thread_position_in_grid]]);
 
 // Four-wide clamp: each component takes the same two native bound operations,
-// and the vector moves by one 16-byte access each way. A thread takes one
-// vector per grid-wide stride so every load and store of a SIMD group covers a
-// contiguous span.
+// and the vector moves by one 16-byte access each way. The grid covers the
+// vector count, so each thread clamps one vector and the lanes of a SIMD group
+// cover a contiguous span.
 inline float4 clamp4(float4 v, float lo, float hi) {
   return float4(clamp_scalar(v.x, lo, hi), clamp_scalar(v.y, lo, hi),
                 clamp_scalar(v.z, lo, hi), clamp_scalar(v.w, lo, hi));
@@ -298,26 +273,9 @@ kernel void clamp_elementwise_vec_float(device float4* out [[buffer(0)]],
                                         constant uint& nvec [[buffer(2)]],
                                         constant float& lo [[buffer(3)]],
                                         constant float& hi [[buffer(4)]],
-                                        uint tid [[thread_position_in_grid]],
-                                        uint grid [[threads_per_grid]]) {
-  if (tid + (ILP_PER_THREAD - 1) * grid < nvec) {
-    array<float4, ILP_PER_THREAD> values;
-#pragma unroll
-    for (uint j = 0; j < ILP_PER_THREAD; ++j) {
-      values[j] = src[tid + j * grid];
-    }
-#pragma unroll
-    for (uint j = 0; j < ILP_PER_THREAD; ++j) {
-      values[j] = clamp4(values[j], lo, hi);
-    }
-#pragma unroll
-    for (uint j = 0; j < ILP_PER_THREAD; ++j) {
-      out[tid + j * grid] = values[j];
-    }
-  } else {
-    for (uint i = tid; i < nvec; i += grid) {
-      out[i] = clamp4(src[i], lo, hi);
-    }
+                                        uint tid [[thread_position_in_grid]]) {
+  if (tid < nvec) {
+    out[tid] = clamp4(src[tid], lo, hi);
   }
 }
 
