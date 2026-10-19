@@ -41,16 +41,8 @@ unary_op:
     OPERATOR: floor(X)
   - NAME: sin
     OPERATOR: sin(X)
-  - NAME: sin_i32
-    DTYPE: int
-    OPERATOR: X
-    FORMAT: rgba32i
   - NAME: cos
     OPERATOR: cos(X)
-  - NAME: cos_i32
-    DTYPE: int
-    OPERATOR: X
-    FORMAT: rgba32i
   - NAME: relu
     OPERATOR: max(X, 0.0f)
   - NAME: relu_i32
@@ -69,6 +61,11 @@ unary_op:
     OPERATOR: ceil(X)
   - NAME: round
     OPERATOR: round(X)
+  # Rounding a count is the count itself: there is no fraction to take away.
+  - NAME: round_i32
+    DTYPE: int
+    OPERATOR: X
+    FORMAT: rgba32i
   - NAME: round_half_even
     OPERATOR: roundEven(X)
   - NAME: trunc
@@ -101,10 +98,6 @@ unary_op:
     OPERATOR: 1.0f / X
   - NAME: erf
     OPERATOR: sign(X) * (1.0f - ((((1.061405429f * (1.0f / (1.0f + 0.3275911f * abs(X))) - 1.453152027f) * (1.0f / (1.0f + 0.3275911f * abs(X))) + 1.421413741f) * (1.0f / (1.0f + 0.3275911f * abs(X))) - 0.284496736f) * (1.0f / (1.0f + 0.3275911f * abs(X))) + 0.254829592f) * (1.0f / (1.0f + 0.3275911f * abs(X))) * exp(-X * X))
-  - NAME: sqrt_i32
-    DTYPE: int
-    OPERATOR: ivec4(sqrt(vec4(X)))
-    FORMAT: rgba32i
   - NAME: ceil_i32
     DTYPE: int
     OPERATOR: X
@@ -120,14 +113,6 @@ unary_op:
   - NAME: square_i32
     DTYPE: int
     OPERATOR: X * X
-    FORMAT: rgba32i
-  - NAME: reciprocal_i32
-    DTYPE: int
-    OPERATOR: ivec4(1.0f / vec4(X))
-    FORMAT: rgba32i
-  - NAME: sigmoid_i32
-    DTYPE: int
-    OPERATOR: ivec4(1.0f / (1.0f + exp(-vec4(X))))
     FORMAT: rgba32i
 binary_op_scalar:
   parameter_names_with_default_values:
@@ -372,6 +357,10 @@ buffer_unary_op:
     OPERATOR: X
   - NAME: buffer_round
     OPERATOR: round(X)
+  # Rounding a count is the count itself: there is no fraction to take away.
+  - NAME: buffer_round_i32
+    DTYPE: int
+    OPERATOR: X
   - NAME: buffer_trunc
     OPERATOR: trunc(X)
   - NAME: buffer_trunc_i32
@@ -408,12 +397,6 @@ buffer_unary_op:
     OPERATOR: 1.0f / X
   - NAME: buffer_erf
     OPERATOR: sign(X) * (1.0f - ((((1.061405429f * (1.0f / (1.0f + 0.3275911f * abs(X))) - 1.453152027f) * (1.0f / (1.0f + 0.3275911f * abs(X))) + 1.421413741f) * (1.0f / (1.0f + 0.3275911f * abs(X))) - 0.284496736f) * (1.0f / (1.0f + 0.3275911f * abs(X))) + 0.254829592f) * (1.0f / (1.0f + 0.3275911f * abs(X))) * exp(-X * X))
-  - NAME: buffer_reciprocal_i32
-    DTYPE: int
-    OPERATOR: int(1.0f / float(X))
-  - NAME: buffer_sigmoid_i32
-    DTYPE: int
-    OPERATOR: int(1.0f / (1.0f + exp(-float(X))))
 upload_buffer:
   parameter_names_with_default_values: {}
   shader_variants:

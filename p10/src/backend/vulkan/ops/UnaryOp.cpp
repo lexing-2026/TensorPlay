@@ -208,17 +208,26 @@ Tensor& unary_op_(
 }
 
 // Out-of-place unary with dtype-keyed kernel resolution.
+//
+// The flag says whether the formula keeps a count integral.  A series or a
+// ratio has fractions in it, so its answer is not a count and the payload is
+// read in the width the result names; rounding, sign and magnitude work keep
+// the count and ride its own kernel.  In place the destination keeps the width
+// it was allocated in, so such a formula is refused there by the missing twin.
 Tensor unary_op_typed(
     const Tensor& self_arg,
     const char* shader_name,
     const char* buffer_shader_name,
     bool int_capable,
     const char* name) {
-  const UnaryVocab vocab = unary_vocab(self_arg, name);
-  (void)int_capable;
+  const Tensor operand =
+      (int_capable || self_arg.dtype() != DType::Int32)
+      ? self_arg
+      : self_arg.to(DType::Float32);
+  const UnaryVocab vocab = unary_vocab(operand, name);
   return unary_op(
-      self_arg,
-      kernel_for(unary_variant(shader_name, vocab, name).c_str(), self_arg),
+      operand,
+      kernel_for(unary_variant(shader_name, vocab, name).c_str(), operand),
       unary_variant(buffer_shader_name, vocab, name).c_str());
 }
 
@@ -285,7 +294,7 @@ Tensor& floor_inplace_kernel(Tensor& self) {
 }
 
 Tensor sin_kernel(const Tensor& self) {
-  return unary_op_typed(self, "sin", "buffer_sin", true, "unary sin");
+  return unary_op_typed(self, "sin", "buffer_sin", false, "unary sin");
 }
 
 Tensor& sin_inplace_kernel(Tensor& self) {
@@ -293,7 +302,7 @@ Tensor& sin_inplace_kernel(Tensor& self) {
 }
 
 Tensor cos_kernel(const Tensor& self) {
-  return unary_op_typed(self, "cos", "buffer_cos", true, "unary cos");
+  return unary_op_typed(self, "cos", "buffer_cos", false, "unary cos");
 }
 
 Tensor& cos_inplace_kernel(Tensor& self) {
@@ -309,7 +318,8 @@ Tensor& tanh_inplace_kernel(Tensor& self) {
 }
 
 Tensor sigmoid_kernel(const Tensor& self) {
-  return unary_op_typed(self, "sigmoid", "buffer_sigmoid", true, "unary sigmoid");
+  return unary_op_typed(
+      self, "sigmoid", "buffer_sigmoid", false, "unary sigmoid");
 }
 
 Tensor& sigmoid_inplace_kernel(Tensor& self) {
@@ -346,7 +356,7 @@ Tensor& ceil_inplace_kernel(Tensor& self) {
 }
 
 Tensor round_kernel(const Tensor& self) {
-  return unary_op_typed(self, "round", "buffer_round", false, "unary round");
+  return unary_op_typed(self, "round", "buffer_round", true, "unary round");
 }
 
 Tensor& round_inplace_kernel(Tensor& self) {
@@ -460,12 +470,9 @@ Tensor& square_inplace_kernel(Tensor& self) {
       self, "squareinplace", "buffer_squareinplace", "unary square");
 }
 
-// One over a count is not a count: the quotients a count or a truth produces
-// need fractions, so such a payload is read in single precision.
 Tensor reciprocal_kernel(const Tensor& self) {
   return unary_op_typed(
-      isFloatingType(self.dtype()) ? self : self.to(DType::Float32),
-      "reciprocal", "buffer_reciprocal", true, "unary reciprocal");
+      self, "reciprocal", "buffer_reciprocal", false, "unary reciprocal");
 }
 
 Tensor& reciprocal_inplace_kernel(Tensor& self) {
