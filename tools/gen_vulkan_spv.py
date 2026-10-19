@@ -50,16 +50,19 @@ def extract_leading_whitespace(line: str) -> str:
 
 # https://github.com/google/XNNPACK/blob/master/tools/xngen.py
 def escape(line: str) -> str:
+    def quote(text: str) -> str:
+        return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
     output_parts = []
     while "${" in line:
         start_pos = line.index("${")
         end_pos = line.index("}", start_pos + 2)
         if start_pos != 0:
-            output_parts.append('"' + line[:start_pos].replace('"', '\\"') + '"')
+            output_parts.append(quote(line[:start_pos]))
         output_parts.append("str(" + line[start_pos + 2 : end_pos] + ")")
         line = line[end_pos + 1 :]
     if line:
-        output_parts.append('"' + line.replace('"', '\\"') + '"')
+        output_parts.append(quote(line))
     return " + ".join(output_parts)
 
 
