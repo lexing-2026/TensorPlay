@@ -36,25 +36,30 @@ __device__ inline double rsqrt(double value) {
 } // namespace math_compat
 
 // CUDA 13 guarantees a 32 KiB device-kernel argument space; older toolkits
-// cap device-kernel arguments at 4 KiB.  Per-launch tensor capacity follows
-// that split: the wide branch packs far more tensors into one grouped
-// launch, which cuts the launch count on optimizer-style lists of many
-// small tensors; the narrow branch keeps the fixed batch that fits the
-// small budget.  ILP=4 loop below: a 512-thread block covers a 64K chunk in
+// cap device-kernel arguments at 4 KiB.  Per-launch capacity follows that
+// split: the wide branch packs far more tensors and blocks into one grouped
+// launch, which cuts the launch count on optimizer-style lists; the narrow
+// branch keeps fixed batches that fit the small budget.  The merged metadata
+// carries the scalar arrays for every op, so the tensors-per-launch caps are
+// chosen to fit the argument space together with the block tables.
+// ILP=4 loop below: a 512-thread block covers a 64K chunk in
 // 32 iterations instead of 256 scalar iterations with a 256-thread kernel.
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 13000
 template <int Depth>
 constexpr int kMaxTensorsForDepth =
-    Depth == 1 ? 770 :
+    Depth == 1 ? 672 :
     (Depth == 2 ? 448 :
      (Depth == 3 ? 336 :
       (Depth == 4 ? 252 :
        (Depth == 5 ? 210 : 0))));
+constexpr int32_t kMaxBlocksPerLaunch = 2240;
+using BlockTensorIndex = uint16_t;
 #else
 template <int Depth>
 constexpr int kMaxTensorsForDepth = 32;
-#endif
 constexpr int32_t kMaxBlocksPerLaunch = 320;
+using BlockTensorIndex = int32_t;
+#endif
 constexpr int64_t kChunkSize = 65536;
 constexpr int32_t kILP = 4;
 constexpr int32_t kBlockSize = 512;
@@ -160,7 +165,7 @@ struct TensorListMetadata {
     static constexpr int kMaxTensors = kMaxTensorsForDepth<Depth>;
     const void* addresses[Depth][kMaxTensors]{};
     int64_t numel_for_tensor[kMaxTensors]{};
-    int32_t block_to_tensor[kMaxBlocksPerLaunch]{};
+    BlockTensorIndex block_to_tensor[kMaxBlocksPerLaunch]{};
     int32_t block_to_chunk[kMaxBlocksPerLaunch]{};
     // Used only by ScalarList overloads.  Keeping it in the same metadata
     float scalar_values_float[kMaxTensors]{};
@@ -171,7 +176,8 @@ struct TensorListMetadata {
 template <int Depth, int OutputIndex, typename T, typename M, typename Op>
 __global__ void multi_tensor_kernel(TensorListMetadata<Depth> metadata, Op op) {
     const int32_t block_index = static_cast<int32_t>(blockIdx.x);
-    const int32_t tensor_index = metadata.block_to_tensor[block_index];
+    const int32_t tensor_index =
+        static_cast<int32_t>(metadata.block_to_tensor[block_index]);
     const int64_t begin = static_cast<int64_t>(metadata.block_to_chunk[block_index]) *
                           kChunkSize;
     const int64_t end = metadata.numel_for_tensor[tensor_index];
@@ -241,7 +247,8 @@ template <int Depth, int OutputIndex, typename T, typename M, typename Op>
 __global__ void multi_tensor_scalar_list_kernel(
         TensorListMetadata<Depth> metadata, Op op) {
     const int32_t block_index = static_cast<int32_t>(blockIdx.x);
-    const int32_t tensor_index = metadata.block_to_tensor[block_index];
+    const int32_t tensor_index =
+        static_cast<int32_t>(metadata.block_to_tensor[block_index]);
     const int64_t begin = static_cast<int64_t>(metadata.block_to_chunk[block_index]) *
                           kChunkSize;
     const int64_t end = metadata.numel_for_tensor[tensor_index];
@@ -375,7 +382,8 @@ void launch_impl(const std::array<const std::vector<Tensor>*, Depth>& lists,
             const int32_t remaining = chunks - next_chunk;
             const int32_t take = available < remaining ? available : remaining;
             for (int32_t chunk = 0; chunk < take; ++chunk) {
-                metadata.block_to_tensor[block_count + chunk] = tensor_slots - 1;
+                metadata.block_to_tensor[block_count + chunk] =
+                    static_cast<BlockTensorIndex>(tensor_slots - 1);
                 metadata.block_to_chunk[block_count + chunk] = next_chunk + chunk;
             }
             block_count += take;
