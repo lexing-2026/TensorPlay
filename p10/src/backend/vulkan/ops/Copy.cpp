@@ -213,11 +213,12 @@ void transfer_vulkan_to_cpu(api::vTensor& v_src, Tensor& dst) {
 }
 
 // Device-side dtype conversions.  Float32 is the hub: every payload type the
-// backend stores has a direct route to and from it, and anything else has no
-// kernel.  Byte-packed payloads agree on the read path, since a Bool lane is
-// already 0 or 1 and an integer lane converts exactly, and split on the write
-// path: Int8 and UInt8 destinations take the wrapped value, a Bool one only
-// ever stores 0 or 1.
+// backend stores has a direct route to and from it.  The narrow float and the
+// signed word also pair directly, since a mixed select is decided in the width
+// that holds both branches and that width can be the half one.  Byte-packed
+// payloads agree on the read path, since a Bool lane is already 0 or 1 and an
+// integer lane converts exactly, and split on the write path: Int8 and UInt8
+// destinations take the wrapped value, a Bool one only ever stores 0 or 1.
 const char* texture_cast_shader(const DType from, const DType to) {
   if (to == DType::Float32) {
     switch (from) {
@@ -249,6 +250,12 @@ const char* texture_cast_shader(const DType from, const DType to) {
       default:
         return nullptr;
     }
+  }
+  if (to == DType::Float16 && from == DType::Int32) {
+    return "cast_i32_float16";
+  }
+  if (from == DType::Float16 && to == DType::Int32) {
+    return "cast_float16_i32";
   }
   return nullptr;
 }
@@ -286,10 +293,19 @@ const char* linear_cast_shader(const DType from, const DType to) {
         return nullptr;
     }
   }
+  // The narrow float and the signed word share no word layout, so each
+  // direction owns the denser side's grouping: two lanes when the half payload
+  // is read, two lanes when it is written.
+  if (to == DType::Float16 && from == DType::Int32) {
+    return "cast_i32_float16_buffer";
+  }
+  if (from == DType::Float16 && to == DType::Int32) {
+    return "cast_float16_i32_buffer";
+  }
   // A 64-bit code shares an element with the word above it, so both directions
-  // between it and a 32-bit one move whole pairs.  Nothing converts into or out
-  // of a half payload: two lanes already share a word there, and a wide element
-  // would need three of them.
+  // between it and a 32-bit one move whole pairs.  Nothing pairs it with a half
+  // payload: two lanes already share a word there, and a wide element would
+  // need three of them.
   if (from == DType::Int64) {
     switch (to) {
       case DType::Int32:
