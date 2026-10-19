@@ -1059,7 +1059,12 @@ std::optional<Tensor> clampShader(const Tensor& self,
   if (numel <= 0 || numel > std::numeric_limits<uint32_t>::max()) {
     return std::nullopt;
   }
-  MTLComputePipelineState_t pso = shaderPipelineNamed("clamp_elementwise_float");
+  static thread_local PipelineMemo memo;
+  const PipelinePair pipelines = resolvePipelines(
+      memo, "clamp", self.dtype(),
+      [] { return shaderPipelineNamed("clamp_elementwise_float"); },
+      [] { return shaderPipelineNamed("clamp_elementwise_vec_float"); });
+  MTLComputePipelineState_t pso = pipelineFromMemo(pipelines.plain);
   if (!pso) {
     return std::nullopt;
   }
@@ -1082,23 +1087,29 @@ std::optional<Tensor> clampShader(const Tensor& self,
                        ? max->to<float>()
                        : std::numeric_limits<float>::infinity();
   const uint32_t elements = static_cast<uint32_t>(numel);
-  // One element per thread: a four-wide form would leave a quarter of the
-  // threads in flight, which at a size that is already bandwidth-bound costs
-  // more than the wider access saves.
-  const uint32_t total = elements;
+  MTLComputePipelineState_t vec_pso =
+      wholeFloatVectors(self.dtype(), elements,
+                        {self.data_ptr(), output.data_ptr()})
+          ? pipelineFromMemo(pipelines.vec)
+          : nil;
+  MTLComputePipelineState_t active_pso = vec_pso ? vec_pso : pso;
+  // The vector form counts 16-byte vectors, the scalar form elements.
+  const uint32_t span = vec_pso ? elements / 4 : elements;
+  const uint32_t total = denseSpanThreads(span, elements, vec_pso != nil);
   const uint32_t per_group = denseThreadsPerGroup(
       total, elements,
-      static_cast<uint32_t>([pso maxTotalThreadsPerThreadgroup]));
+      static_cast<uint32_t>([active_pso maxTotalThreadsPerThreadgroup]));
 
   MPSStream* stream = getCurrentMPSStream();
   dispatch_sync_with_rethrow(stream->queue(), ^() {
     @autoreleasepool {
       auto encoder = stream->commandEncoder();
-      [encoder setComputePipelineState:pso];
+      [encoder setComputePipelineState:active_pso];
       [encoder setBuffer:(__bridge id<MTLBuffer>)out_buf offset:0 atIndex:0];
       [encoder setBuffer:(__bridge id<MTLBuffer>)in_buf offset:0 atIndex:1];
-      [encoder setBytes:&lo length:sizeof(lo) atIndex:2];
-      [encoder setBytes:&hi length:sizeof(hi) atIndex:3];
+      [encoder setBytes:&span length:sizeof(span) atIndex:2];
+      [encoder setBytes:&lo length:sizeof(lo) atIndex:3];
+      [encoder setBytes:&hi length:sizeof(hi) atIndex:4];
       [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(per_group, 1, 1)];
     }
