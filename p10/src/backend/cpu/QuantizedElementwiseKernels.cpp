@@ -1795,29 +1795,103 @@ void fp16_linear_impl(const float* x, const Half* w, const float* bias, float* y
     }
 }
 
-void embedding_impl(const uint8_t* w, const int64_t* indices, const int64_t* offsets,
+// A packed row keeps its codes in bytes, nibbles or pairs of bits, so a block of
+// them can be widened straight into float lanes: a byte is read as it stands, a
+// nibble stream splits into the two halves of its bytes, and a bit stream into the
+// four shifts of its words.
+template <int Bits>
+inline vec::Vectorized<float> row_codes(const uint8_t* row, int64_t first) {
+    using FV = vec::Vectorized<float>;
+    constexpr int lanes = FV::size();
+#if defined(CPU_CAPABILITY_AVX2)
+    if constexpr (Bits == 8) {
+        const auto bytes = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(row + first));
+        return FV(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(bytes)));
+    } else if constexpr (Bits == 4) {
+        int32_t stream_words;
+        std::memcpy(&stream_words, row + first / 2, sizeof(stream_words));
+        const auto stream = _mm_cvtsi32_si128(stream_words);
+        const auto low = _mm_and_si128(stream, _mm_set1_epi8(0x0F));
+        const auto high = _mm_and_si128(_mm_srli_epi16(stream, 4), _mm_set1_epi8(0x0F));
+        return FV(_mm256_cvtepi32_ps(
+            _mm256_cvtepu8_epi32(_mm_unpacklo_epi8(low, high))));
+    } else {
+        int32_t stream_words;
+        std::memcpy(&stream_words, row + first / 4, sizeof(stream_words));
+        const auto stream = _mm_cvtsi32_si128(stream_words);
+        const auto mask = _mm_set1_epi8(0x03);
+        const auto pair = _mm_unpacklo_epi8(_mm_and_si128(stream, mask),
+            _mm_and_si128(_mm_srli_epi16(stream, 2), mask));
+        const auto quad = _mm_unpacklo_epi8(_mm_and_si128(_mm_srli_epi16(stream, 4), mask),
+            _mm_and_si128(_mm_srli_epi16(stream, 6), mask));
+        return FV(_mm256_cvtepi32_ps(
+            _mm256_cvtepu8_epi32(_mm_unpacklo_epi16(pair, quad))));
+    }
+#else
+    alignas(64) float codes[lanes];
+    for (int c = 0; c < lanes; ++c) codes[c] = static_cast<float>(quant::row_code(row, first + c, Bits));
+    return FV::loadu(codes);
+#endif
+}
+
+template <int Bits>
+void embedding_rows(const uint8_t* w, const int64_t* indices, const int64_t* offsets,
         const int64_t* mapping, const float* weights, float* y, int64_t first_bag, int64_t last_bag,
-        int64_t bags, int64_t count, int64_t fixed, int64_t columns, int64_t width, int64_t bits, bool embedding) {
+        int64_t bags, int64_t count, int64_t fixed, int64_t columns, int64_t width, bool embedding) {
     using FV = vec::Vectorized<float>;
     constexpr int lanes = FV::size();
     for (int64_t bag = first_bag; bag < last_bag; ++bag) {
         const int64_t first = embedding ? bag : (offsets ? offsets[bag] : bag * fixed);
         const int64_t last = embedding ? bag + 1 : (offsets ? (bag + 1 < bags ? offsets[bag+1] : count) : first + fixed);
-        for (int64_t col = 0; col < columns; col += lanes) {
-            FV sum(0.f); const int take = static_cast<int>(std::min<int64_t>(lanes, columns - col));
+        int64_t col = 0;
+        // A row's affine grid and weight hold for every column of it, so the index
+        // walk sits inside a fixed number of column blocks rather than repeating
+        // once per block.
+        for (; col + lanes <= columns;) {
+            const int grouped = static_cast<int>(std::min<int64_t>(4, (columns - col) / lanes));
+            FV sums[4]{FV(0.f), FV(0.f), FV(0.f), FV(0.f)};
             for (int64_t j = first; j < last; ++j) {
                 const int64_t row_index = mapping ? mapping[indices[j]] : indices[j];
                 if (row_index == -1) continue;
-                const uint8_t* row = w + row_index * width; float scale, bias;
-                quant::row_grid(row, width, bits, scale, bias);
+                const uint8_t* row = w + row_index * width;
+                float scale, bias;
+                quant::row_grid(row, width, Bits, scale, bias);
+                const float weight = weights ? weights[j] : 1.f;
+                const FV gradient(scale * weight), shift(bias * weight);
+                for (int t = 0; t < grouped; ++t)
+                    sums[t] = vec::fmadd(row_codes<Bits>(row, col + t * lanes), gradient, sums[t] + shift);
+            }
+            for (int t = 0; t < grouped; ++t) sums[t].store(y + bag * columns + col + t * lanes);
+            col += grouped * lanes;
+        }
+        if (col < columns) {
+            FV sum(0.f);
+            const int take = static_cast<int>(columns - col);
+            for (int64_t j = first; j < last; ++j) {
+                const int64_t row_index = mapping ? mapping[indices[j]] : indices[j];
+                if (row_index == -1) continue;
+                const uint8_t* row = w + row_index * width;
+                float scale, bias;
+                quant::row_grid(row, width, Bits, scale, bias);
                 const float weight = weights ? weights[j] : 1.f;
                 alignas(64) float codes[lanes]{};
-                for (int c = 0; c < take; ++c) codes[c] = quant::row_code(row, col + c, bits);
+                for (int c = 0; c < take; ++c) codes[c] = static_cast<float>(quant::row_code(row, col + c, Bits));
                 sum = vec::fmadd(FV::loadu(codes), FV(scale * weight), sum + FV(bias * weight));
             }
             sum.store(y + bag * columns + col, take);
         }
     }
+}
+
+void embedding_impl(const uint8_t* w, const int64_t* indices, const int64_t* offsets,
+        const int64_t* mapping, const float* weights, float* y, int64_t first_bag, int64_t last_bag,
+        int64_t bags, int64_t count, int64_t fixed, int64_t columns, int64_t width, int64_t bits, bool embedding) {
+    if (bits == 8) embedding_rows<8>(w, indices, offsets, mapping, weights, y, first_bag, last_bag,
+        bags, count, fixed, columns, width, embedding);
+    else if (bits == 4) embedding_rows<4>(w, indices, offsets, mapping, weights, y, first_bag, last_bag,
+        bags, count, fixed, columns, width, embedding);
+    else embedding_rows<2>(w, indices, offsets, mapping, weights, y, first_bag, last_bag,
+        bags, count, fixed, columns, width, embedding);
 }
 
 // Both affine grids hold for the whole call, so each of the 256 input codes has
