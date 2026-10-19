@@ -17,6 +17,11 @@
 //   fall back to the scalar std::lgamma, which handles the reflection domain).
 //   PointwiseKernels.cpp element-for-element, including multiplication order,
 //   so vector and fallback paths produce identical values.
+// * Bounded clamps are always written min(hi, max(lo, x)) — the clamped value
+//   stays the *second* operand of both instructions.  On x86 VMAXPS/VMINPS
+//   return the second operand when either side is NaN (and on a -0.0/+0.0
+//   tie), so the reversed form would replace NaN with the lower bound and
+//   normalize -0.0 to +0.0.  The scalar ops keep NaN, so both paths agree.
 
 #include "cpu/vec/intrinsics.h"
 #include <cmath>
@@ -450,14 +455,14 @@ inline __m256 apply_f32(VOp op, VParams prm, __m256 x) {
             const __m256 three = _mm256_set1_ps(3.0f);
             const __m256 six = _mm256_set1_ps(6.0f);
             __m256 y = _mm256_add_ps(x, three);
-            y = _mm256_min_ps(_mm256_max_ps(y, zero), six);
+            y = _mm256_min_ps(six, _mm256_max_ps(zero, y));
             return _mm256_div_ps(_mm256_mul_ps(x, y), six);
         }
         case VOp::Hardsigmoid: {
             const __m256 three = _mm256_set1_ps(3.0f);
             const __m256 six = _mm256_set1_ps(6.0f);
             __m256 y = _mm256_add_ps(x, three);
-            y = _mm256_min_ps(_mm256_max_ps(y, zero), six);
+            y = _mm256_min_ps(six, _mm256_max_ps(zero, y));
             return _mm256_div_ps(y, six);
         }
         case VOp::LeakyRelu: {
@@ -468,10 +473,10 @@ inline __m256 apply_f32(VOp op, VParams prm, __m256 x) {
         case VOp::Hardtanh: {
             const __m256 lo = _mm256_set1_ps(static_cast<float>(prm.p0));
             const __m256 hi = _mm256_set1_ps(static_cast<float>(prm.p1));
-            return _mm256_min_ps(_mm256_max_ps(x, lo), hi);
+            return _mm256_min_ps(hi, _mm256_max_ps(lo, x));
         }
         case VOp::Relu6:
-            return _mm256_min_ps(_mm256_max_ps(x, zero), _mm256_set1_ps(6.0f));
+            return _mm256_min_ps(_mm256_set1_ps(6.0f), _mm256_max_ps(zero, x));
         case VOp::Celu: {
             const __m256 a = _mm256_set1_ps(static_cast<float>(prm.p0));
             __m256 neg = _mm256_mul_ps(a, tensorplay::tpsleef::expm1(_mm256_div_ps(x, a)));
@@ -560,7 +565,7 @@ static void f32_chunk_avx2(VOp op, VParams prm, const float* src, float* dst, in
         case VOp::Hardtanh: {
             const __m256 lo = _mm256_set1_ps(static_cast<float>(prm.p0));
             const __m256 hi = _mm256_set1_ps(static_cast<float>(prm.p1));
-            TP_F32_SIMPLE_LOOP_8(_mm256_min_ps(_mm256_max_ps(x, lo), hi));
+            TP_F32_SIMPLE_LOOP_8(_mm256_min_ps(hi, _mm256_max_ps(lo, x)));
             break;
         }
         default:
@@ -675,14 +680,14 @@ inline __m256d apply_f64(VOp op, VParams prm, __m256d x) {
             const __m256d three = _mm256_set1_pd(3.0);
             const __m256d six = _mm256_set1_pd(6.0);
             __m256d y = _mm256_add_pd(x, three);
-            y = _mm256_min_pd(_mm256_max_pd(y, zero), six);
+            y = _mm256_min_pd(six, _mm256_max_pd(zero, y));
             return _mm256_div_pd(_mm256_mul_pd(x, y), six);
         }
         case VOp::Hardsigmoid: {
             const __m256d three = _mm256_set1_pd(3.0);
             const __m256d six = _mm256_set1_pd(6.0);
             __m256d y = _mm256_add_pd(x, three);
-            y = _mm256_min_pd(_mm256_max_pd(y, zero), six);
+            y = _mm256_min_pd(six, _mm256_max_pd(zero, y));
             return _mm256_div_pd(y, six);
         }
         case VOp::LeakyRelu: {
@@ -693,10 +698,10 @@ inline __m256d apply_f64(VOp op, VParams prm, __m256d x) {
         case VOp::Hardtanh: {
             const __m256d lo = _mm256_set1_pd(prm.p0);
             const __m256d hi = _mm256_set1_pd(prm.p1);
-            return _mm256_min_pd(_mm256_max_pd(x, lo), hi);
+            return _mm256_min_pd(hi, _mm256_max_pd(lo, x));
         }
         case VOp::Relu6:
-            return _mm256_min_pd(_mm256_max_pd(x, zero), _mm256_set1_pd(6.0));
+            return _mm256_min_pd(_mm256_set1_pd(6.0), _mm256_max_pd(zero, x));
         case VOp::Celu: {
             const __m256d a = _mm256_set1_pd(prm.p0);
             __m256d neg = _mm256_mul_pd(a, tensorplay::tpsleef::expm1(_mm256_div_pd(x, a)));
@@ -781,7 +786,7 @@ static void f64_chunk_avx2(VOp op, VParams prm, const double* src, double* dst, 
         case VOp::Hardtanh: {
             const __m256d lo = _mm256_set1_pd(prm.p0);
             const __m256d hi = _mm256_set1_pd(prm.p1);
-            TP_F64_SIMPLE_LOOP_4(_mm256_min_pd(_mm256_max_pd(x, lo), hi));
+            TP_F64_SIMPLE_LOOP_4(_mm256_min_pd(hi, _mm256_max_pd(lo, x)));
             break;
         }
         default:
@@ -1053,14 +1058,14 @@ inline __m512 apply16_f32(VOp op, VParams prm, __m512 x) {
             const __m512 three = _mm512_set1_ps(3.0f);
             const __m512 six = _mm512_set1_ps(6.0f);
             __m512 y = _mm512_add_ps(x, three);
-            y = _mm512_min_ps(_mm512_max_ps(y, zero), six);
+            y = _mm512_min_ps(six, _mm512_max_ps(zero, y));
             return _mm512_div_ps(_mm512_mul_ps(x, y), six);
         }
         case VOp::Hardsigmoid: {
             const __m512 three = _mm512_set1_ps(3.0f);
             const __m512 six = _mm512_set1_ps(6.0f);
             __m512 y = _mm512_add_ps(x, three);
-            y = _mm512_min_ps(_mm512_max_ps(y, zero), six);
+            y = _mm512_min_ps(six, _mm512_max_ps(zero, y));
             return _mm512_div_ps(y, six);
         }
         case VOp::LeakyRelu: {
@@ -1071,10 +1076,10 @@ inline __m512 apply16_f32(VOp op, VParams prm, __m512 x) {
         case VOp::Hardtanh: {
             const __m512 lo = _mm512_set1_ps(static_cast<float>(prm.p0));
             const __m512 hi = _mm512_set1_ps(static_cast<float>(prm.p1));
-            return _mm512_min_ps(_mm512_max_ps(x, lo), hi);
+            return _mm512_min_ps(hi, _mm512_max_ps(lo, x));
         }
         case VOp::Relu6:
-            return _mm512_min_ps(_mm512_max_ps(x, zero), _mm512_set1_ps(6.0f));
+            return _mm512_min_ps(_mm512_set1_ps(6.0f), _mm512_max_ps(zero, x));
         case VOp::Celu: {
             const __m512 a = _mm512_set1_ps(static_cast<float>(prm.p0));
             __m512 neg = _mm512_mul_ps(a, tensorplay::tpsleef::expm1(_mm512_div_ps(x, a)));
@@ -1161,7 +1166,7 @@ static void f32_chunk_avx512(VOp op, VParams prm, const float* src, float* dst, 
         case VOp::Hardtanh: {
             const __m512 lo = _mm512_set1_ps(static_cast<float>(prm.p0));
             const __m512 hi = _mm512_set1_ps(static_cast<float>(prm.p1));
-            TP_F32_SIMPLE_LOOP_16(_mm512_min_ps(_mm512_max_ps(x, lo), hi));
+            TP_F32_SIMPLE_LOOP_16(_mm512_min_ps(hi, _mm512_max_ps(lo, x)));
             break;
         }
         default:
@@ -1273,23 +1278,23 @@ inline __m512d apply16_f64(VOp op, VParams prm, __m512d x) {
             const __m512d three = _mm512_set1_pd(3.0);
             const __m512d six = _mm512_set1_pd(6.0);
             __m512d y = _mm512_add_pd(x, three);
-            y = _mm512_min_pd(_mm512_max_pd(y, zero), six);
+            y = _mm512_min_pd(six, _mm512_max_pd(zero, y));
             return _mm512_div_pd(_mm512_mul_pd(x, y), six);
         }
         case VOp::Hardsigmoid: {
             const __m512d three = _mm512_set1_pd(3.0);
             const __m512d six = _mm512_set1_pd(6.0);
             __m512d y = _mm512_add_pd(x, three);
-            y = _mm512_min_pd(_mm512_max_pd(y, zero), six);
+            y = _mm512_min_pd(six, _mm512_max_pd(zero, y));
             return _mm512_div_pd(y, six);
         }
         case VOp::Hardtanh: {
             const __m512d lo = _mm512_set1_pd(prm.p0);
             const __m512d hi = _mm512_set1_pd(prm.p1);
-            return _mm512_min_pd(_mm512_max_pd(x, lo), hi);
+            return _mm512_min_pd(hi, _mm512_max_pd(lo, x));
         }
         case VOp::Relu6:
-            return _mm512_min_pd(_mm512_max_pd(x, zero), _mm512_set1_pd(6.0));
+            return _mm512_min_pd(_mm512_set1_pd(6.0), _mm512_max_pd(zero, x));
         default: return x;
     }
 }
@@ -1369,7 +1374,7 @@ static void f64_chunk_avx512(VOp op, VParams prm, const double* src, double* dst
         case VOp::Hardtanh: {
             const __m512d lo = _mm512_set1_pd(prm.p0);
             const __m512d hi = _mm512_set1_pd(prm.p1);
-            TP_F64_SIMPLE_LOOP_8(_mm512_min_pd(_mm512_max_pd(x, lo), hi));
+            TP_F64_SIMPLE_LOOP_8(_mm512_min_pd(hi, _mm512_max_pd(lo, x)));
             break;
         }
         default:
