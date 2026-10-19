@@ -467,9 +467,43 @@ __global__ void nonzero_count_kernel(int64_t n, const T* x, int32_t* total,
     }
 }
 
+// First level of the offset scan: each block scans one contiguous chunk of
+// the per-block counts, leaves the chunk-local prefix in place and publishes
+// the chunk total.  The single-block second level below then only has to walk
+// one entry per chunk instead of the whole array.
+template <int BLOCK>
+__global__ void nonzero_block_scan(int32_t blocks, int32_t* per_block,
+                                   int32_t* segment_totals) {
+    __shared__ int32_t warp_sums[BLOCK / 32];
+    const int32_t at = static_cast<int32_t>(blockIdx.x) * BLOCK +
+                       static_cast<int32_t>(threadIdx.x);
+    const int32_t v = at < blocks ? per_block[at] : 0;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    int32_t inclusive = v;
+#pragma unroll
+    for (int off = 1; off < 32; off <<= 1) {
+        const int32_t other = __shfl_up_sync(0xffffffffffffffffull, inclusive, off);
+        if (lane >= off) inclusive += other;
+    }
+    if (lane == 31) warp_sums[warp] = inclusive;
+    __syncthreads();
+    int32_t warp_prefix = 0;
+#pragma unroll
+    for (int w = 0; w < BLOCK / 32; ++w) {
+        if (w == warp) break;
+        warp_prefix += warp_sums[w];
+    }
+    if (at < blocks) per_block[at] = warp_prefix + inclusive - v;
+    if (threadIdx.x == BLOCK - 1) {
+        segment_totals[blockIdx.x] = warp_prefix + warp_sums[BLOCK / 32 - 1];
+    }
+}
+
 // Turns the per-block counts into the base slot of each block, so the scan
 // pass can write straight into the final positions without a second pass over
-// the input.
+// the input.  Runs over the chunk totals produced by nonzero_block_scan and
+// leaves their global bases in place.
 template <int BLOCK>
 __global__ void nonzero_block_offsets(int32_t blocks, int32_t* per_block) {
     __shared__ int32_t carry;
@@ -509,13 +543,19 @@ __global__ void nonzero_block_offsets(int32_t blocks, int32_t* per_block) {
 template <typename T, int BLOCK, int ITEMS>
 __global__ void nonzero_flag_kernel(int64_t n, const T* x, int64_t ndim,
                                     const int64_t* dim_sizes, int64_t* out,
-                                    const int32_t* block_base) {
+                                    const int32_t* block_base,
+                                    const int32_t* segment_base,
+                                    int32_t seg_shift) {
     using Vec = NonZeroVec<T, ITEMS>;
     constexpr int kWarps = BLOCK / 32;
     __shared__ int warp_totals[kWarps];
     __shared__ int block_total;
     const int64_t tile_span = static_cast<int64_t>(gridDim.x) * (BLOCK * ITEMS);
-    int64_t slot_base = block_base[blockIdx.x];
+    // The base of a block is its segment's global base plus the block's offset
+    // inside the segment (the two levels of the offset scan).
+    int64_t slot_base =
+        static_cast<int64_t>(block_base[blockIdx.x]) +
+        static_cast<int64_t>(segment_base[blockIdx.x >> seg_shift]);
     for (int64_t tile = static_cast<int64_t>(blockIdx.x) * (BLOCK * ITEMS);
          tile < n; tile += tile_span) {
     const int64_t at = tile + static_cast<int64_t>(threadIdx.x) * ITEMS;
@@ -894,7 +934,13 @@ Tensor nonzero_cuda(const Tensor& self) {
     // block's elements are adjacent.  The 1-D grid reaches 2^31-1 blocks, so
     // the launch limit never forces a block to straddle tiles.
     constexpr int64_t kMaxBlocks = 2147483647;
+    // Chunk size of the two-level offset scan and its log2, used to index the
+    // segment bases from a flat block index.
+    constexpr int kScanChunk = 256;
+    constexpr int kScanShift = 8;
+    static_assert((1 << kScanShift) == kScanChunk, "scan chunk must be a power of two");
     Tensor block_counts;
+    Tensor segment_bases;
 #define TP_NZC_COUNT(ctype, name)                                                 \
     case DType::name:                                                            \
         {                                                                    \
@@ -908,8 +954,15 @@ Tensor nonzero_cuda(const Tensor& self) {
         <<<blocks, kCountBlock, 0, stream>>>(                                  \
             n, self_c.data_ptr<ctype>(), count_d.data_ptr<int32_t>(),           \
             block_counts.data_ptr<int32_t>());                                   \
-        nonzero_block_offsets<256><<<1, 256, 0, stream>>>(                      \
-            static_cast<int32_t>(blocks), block_counts.data_ptr<int32_t>());    \
+        const int64_t segments =                                                \
+            (static_cast<int64_t>(blocks) + kScanChunk - 1) / kScanChunk;       \
+        segment_bases = Tensor::empty({segments}, DType::Int32, self.device()); \
+        nonzero_block_scan<kScanChunk>                                          \
+        <<<static_cast<unsigned>(segments), kScanChunk, 0, stream>>>(           \
+            static_cast<int32_t>(blocks), block_counts.data_ptr<int32_t>(),     \
+            segment_bases.data_ptr<int32_t>());                                 \
+        nonzero_block_offsets<kScanChunk><<<1, kScanChunk, 0, stream>>>(        \
+            static_cast<int32_t>(segments), segment_bases.data_ptr<int32_t>()); \
         break;                                                                   \
     }
     switch (self_c.dtype()) {
@@ -949,7 +1002,8 @@ Tensor nonzero_cuda(const Tensor& self) {
         nonzero_flag_kernel<ctype, kFlagBlock, kItems>                        \
         <<<blocks, kFlagBlock, 0, stream>>>(                                  \
             n, self_c.data_ptr<ctype>(), nd, sizes_d.data_ptr<int64_t>(),      \
-            result.data_ptr<int64_t>(), block_counts.data_ptr<int32_t>());    \
+            result.data_ptr<int64_t>(), block_counts.data_ptr<int32_t>(),     \
+            segment_bases.data_ptr<int32_t>(), kScanShift);                    \
         break;                                                             \
     }
     switch (self_c.dtype()) {
