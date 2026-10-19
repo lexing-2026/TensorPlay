@@ -5,7 +5,10 @@ The published bench-data snapshot keeps a per-hardware history of the most
 recent MPS benchmark runs (arch "mps").  This gate compares the current run
 against the median of the matching history and fails when a shared
 measurement is slower than the baseline by more than a configured factor.
-A run with no matching history records the baseline instead of gating.
+History timings are first projected onto the current host's speed scale by
+the comparison runtime's own shift between the two runs, so a busy or slow
+runner instance does not read as a regression.  A run with no matching
+history records the baseline instead of gating.
 
 The MPS benchmark has no thread-count dimension (device timing is
 independent of host thread settings), so runs are matched on the device
@@ -58,9 +61,70 @@ def load_history(path):
     return payload if isinstance(payload, dict) else {}
 
 
-def median_baseline(current, runs):
+def load_reference(path):
+    """Load the same-run timings of the comparison runtime, keyed by case.
+
+    A missing, unparsable or non-reference file leaves the calibration off,
+    which falls back to comparing raw timings."""
+    if path is None or not Path(path).exists():
+        return {}
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    if payload.get("benchmark") != "mps-operator-reference":
+        return {}
+    reference = {}
+    for item in payload.get("measurements", []):
+        if not isinstance(item, dict) or not item.get("name"):
+            continue
+        value = item.get("seconds")
+        if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+            and value > 0
+        ):
+            reference[item["name"]] = value
+    return reference
+
+
+def measurement_seconds(payload, name):
+    """The finite positive `seconds` of `name` in `payload`, or None."""
+    if not isinstance(payload, dict):
+        return None
+    for item in payload.get("measurements", []):
+        if item.get("name") != name:
+            continue
+        value = item.get("seconds")
+        if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+            and value > 0
+        ):
+            return value
+        return None
+    return None
+
+
+def median_baseline(current, runs, reference=None):
     """Build a comparison baseline as the per-measurement median over the
-    matching runs of the same hardware history."""
+    matching runs of the same hardware history.
+
+    The history spans runner instances whose fixed launch and drain costs
+    differ by several times, so raw timings from different runs are not
+    comparable. The comparison runtime is timed in the same pass as each run,
+    and its own shift between a history run and the current run measures the
+    host's speed change. Scaling each history timing by that shift expresses
+    it on the current host's scale:
+
+        expected = ours_then * reference_now / reference_then
+
+    Without same-run reference timings, either for the current pass or for
+    every history run, the baseline stays the raw median."""
     matching = []
     for run in runs:
         payload = run.get("suites", {}).get("mps-operator")
@@ -74,25 +138,28 @@ def median_baseline(current, runs):
             continue
         if payload.get("device") != current.get("device"):
             continue
-        matching.append(payload)
+        prior_reference = run.get("suites", {}).get("mps-operator-reference")
+        matching.append((payload, prior_reference))
     if not matching:
         return None
     base = dict(current)
     base["measurements"] = []
     for current_item in current["measurements"]:
+        name = current_item["name"]
         baseline_item = dict(current_item)
         values = []
-        for payload in matching:
-            for item in payload["measurements"]:
-                if item.get("name") == current_item["name"]:
-                    value = item.get("seconds")
-                    if (
-                        isinstance(value, (int, float))
-                        and not isinstance(value, bool)
-                        and math.isfinite(value)
-                        and value > 0
-                    ):
-                        values.append(value)
+        now = reference.get(name) if reference else None
+        if now:
+            for payload, prior_reference in matching:
+                before = measurement_seconds(payload, name)
+                prior = measurement_seconds(prior_reference, name)
+                if before is not None and prior is not None:
+                    values.append(before * now / prior)
+        if not values:
+            for payload, _ in matching:
+                before = measurement_seconds(payload, name)
+                if before is not None:
+                    values.append(before)
         if values:
             baseline_item["seconds"] = statistics.median(values)
         base["measurements"].append(baseline_item)
@@ -183,6 +250,9 @@ def write_summary(path, count, violations, note=None):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--operator-json", type=Path, required=True)
+    parser.add_argument("--operator-reference-json", type=Path, default=None,
+                        help="same-run reference timings used to express the "
+                             "history baseline on this host's scale")
     parser.add_argument("--history", type=Path, required=True,
                         help="published bench-data snapshot (latest.json)")
     parser.add_argument("--host-probe", type=Path, required=True)
@@ -205,7 +275,8 @@ def main():
     if not isinstance(runs, list):
         runs = []
 
-    baseline = median_baseline(current, runs)
+    baseline = median_baseline(current, runs,
+                               load_reference(args.operator_reference_json))
     violations = []
     note = None
     if baseline is None:

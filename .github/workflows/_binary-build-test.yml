@@ -937,6 +937,7 @@ jobs:
           python benchmark/test_mps_reference_speedup.py
           python benchmark/check_mps_performance_regression.py \
             --operator-json benchmark-results/mps-operator.json \
+            --operator-reference-json benchmark-results/mps-operator-reference.json \
             --history bench-data-history/latest.json \
             --host-probe benchmark-results/host-probe.json \
             --operator-max-slowdown 0.30 \
