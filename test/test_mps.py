@@ -141,6 +141,20 @@ class TestMPSArithmetic(unittest.TestCase):
         full = tp.arange(32 * 16 * 64, dtype=tp.float32).reshape(32, 16, 64) / 128.0
         self.assertTrue(tp.allclose(tp.add(full.to("mps"), bm).cpu(), full + b))
 
+    def test_addcmul_addcdiv_broadcast(self):
+        # An innermost size that is a multiple of the run width takes the run
+        # form, with one operand expanded along a different axis on each side.
+        a = tp.arange(4 * 8, dtype=tp.float32).reshape(4, 1, 8) - 3.0
+        b = tp.arange(3 * 8, dtype=tp.float32).reshape(1, 3, 8) + 1.0
+        c = tp.arange(4 * 3 * 8, dtype=tp.float32).reshape(4, 3, 8) / 8.0 + 0.5
+        am, bm, cm = a.to("mps"), b.to("mps"), c.to("mps")
+        self.assertTrue(tp.allclose(
+            tp.addcmul(am, bm, cm, value=0.5).cpu(),
+            tp.addcmul(a, b, c, value=0.5)))
+        self.assertTrue(tp.allclose(
+            tp.addcdiv(am, bm, cm, value=0.5).cpu(),
+            tp.addcdiv(a, b, c, value=0.5)))
+
     def test_broadcast_ops_other_inner_size(self):
         # An innermost size that is not a multiple of the run width takes the
         # per-element form; a broadcast along the innermost axis exercises a
