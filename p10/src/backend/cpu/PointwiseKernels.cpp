@@ -97,10 +97,13 @@ void onednn_eltwise(const Tensor& src, Tensor& dst, dnnl::algorithm algo, float 
 #endif
 
 namespace {
-// Only f32/f64 have vector kernels.  Templating the dispatch (instead of
-// if-constexpr at the macro site) matters: the switch below expands with a
-// concrete ctype inside this non-template function, and a discarded
-// constexpr branch there would still be fully type-checked.
+// The vec chain covers the four floating storages: f32/f64 run their own
+// kernels, f16/bf16 widen to f32, compute, and narrow back with
+// round-to-nearest-even.  Templating the dispatch (instead of if-constexpr at
+// the macro site) matters: the switch below expands with a concrete ctype
+// inside this non-template function, and a discarded constexpr branch there
+// would still be fully type-checked.  Every other ctype must stay off this
+// path -- the vec_ok gate next to each call site lists exactly these dtypes.
 template <typename T>
 inline void vec_run(vecunary::VOp op, const vecunary::VParams& prm,
                     const T* src, T* dst, int64_t begin, int64_t end) {
@@ -108,6 +111,12 @@ inline void vec_run(vecunary::VOp op, const vecunary::VParams& prm,
         vecunary::run_f32(op, prm, src, dst, begin, end);
     } else if constexpr (std::is_same_v<T, double>) {
         vecunary::run_f64(op, prm, src, dst, begin, end);
+    } else if constexpr (std::is_same_v<T, tensorplay::Half>) {
+        vecunary::run_f16(op, prm, reinterpret_cast<const uint16_t*>(src),
+                          reinterpret_cast<uint16_t*>(dst), begin, end);
+    } else if constexpr (std::is_same_v<T, tensorplay::BFloat16>) {
+        vecunary::run_bf16(op, prm, reinterpret_cast<const uint16_t*>(src),
+                           reinterpret_cast<uint16_t*>(dst), begin, end);
     }
 }
 } // namespace
@@ -261,8 +270,9 @@ static bool strided_unary_loop(const Tensor& self, Tensor& result,
 }
 
 // Helper for operations that preserve dtype (e.g. abs, neg, square).
-// vec_op selects the AVX2 fast path (see cpu/VecUnary.h) for float/double;
-// the scalar lambda stays as the fallback for other dtypes and non-AVX2 hosts.
+// vec_op selects the AVX2 fast path (see cpu/VecUnary.h) for the floating
+// storages; the scalar lambda stays as the fallback for the other dtypes and
+// for hosts without the vector kernels.
 template<typename Func>
 Tensor unary_op_kernel(const Tensor& self, Func func,
                        vecunary::VOp vec_op = vecunary::VOp::None,
@@ -270,10 +280,13 @@ Tensor unary_op_kernel(const Tensor& self, Func func,
     Tensor result = empty_like_in_input_order(self, self.dtype());
     int64_t n = self.numel();
 
-    // Vector fast paths exist only for f32/f64; other dtypes take the
-    // scalar-lambda fallback and must never instantiate the vec calls.
+    // f16 needs F16C for its widen/narrow pair; bf16 shifts, so plain AVX2
+    // suffices.  Anything outside these four dtypes takes the scalar lambda.
+    const DType dt = self.dtype();
     const bool vec_ok = vecunary::vec_ready() && vec_op != vecunary::VOp::None
-        && (self.dtype() == DType::Float32 || self.dtype() == DType::Float64);
+        && (dt == DType::Float32 || dt == DType::Float64
+            || (dt == DType::Float16 && vecunary::f16c_available())
+            || dt == DType::BFloat16);
     const bool contiguous_path = flat_layout_pair(self, result);
 
     #define OP_CASE(ctype, name) \
@@ -981,7 +994,7 @@ Tensor relu_kernel(const Tensor& self) {
         } else {
             return x < static_cast<T>(0) ? static_cast<T>(0) : x;
         }
-    });
+    }, vecunary::VOp::Relu);
 }
 
 Tensor& relu_inplace_kernel(Tensor& self) {
@@ -1554,8 +1567,8 @@ Tensor softplus_backward_kernel_impl(const Tensor& grad_output, const Tensor& se
 }
 
 // ---------------------------------------------------------------------------
-// log_sigmoid_cpu_kernel): out = min(x, 0) - log1p(exp(-|x|)).  The branch
-// split keeps exp() bounded for both large-positive and large-negative inputs.
+// log_sigmoid: out = min(x, 0) - log1p(exp(-|x|)).  The branch split keeps
+// exp() bounded for both large-positive and large-negative inputs.
 // ---------------------------------------------------------------------------
 Tensor log_sigmoid_kernel_impl(const Tensor& self) {
     return unary_float_op_kernel(self, [](auto x) {
