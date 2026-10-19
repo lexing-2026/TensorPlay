@@ -1523,7 +1523,7 @@ Tensor selu_kernel_impl(const Tensor& self) {
     }, vecunary::VOp::Selu);
 }
 
-Tensor celu_kernel_impl(const Tensor& self, Scalar alpha) {
+Tensor celu_kernel_impl(const Tensor& self, const Scalar& alpha) {
     double a = alpha.toDouble();
     if (a == 0.0) {
         TP_THROW(RuntimeError, "ZeroDivisionError: alpha cannot be 0 for CELU");
