@@ -385,6 +385,37 @@ int64_t dot(const X* x, const int8_t* w, int64_t K) {
     return dot_scalar(x, w, K);
 }
 
+// A tap reads one input address that depends solely on the output position and
+// the tap itself, never on the batch, the group or the output channel, so the
+// mixed-radix coordinate walk can be answered once per position and reused by
+// every row and channel that visits it. The table is held back only when the
+// position and tap counts would outgrow a sane scratch size.
+constexpr int64_t kPackedGatherLimit = 1 << 20;
+
+std::vector<int32_t> build_gather_table(const quant::PackedGeometry& g) {
+    std::vector<int32_t> table;
+    if (g.linear || g.spatial * g.kernel_elements > kPackedGatherLimit ||
+        g.input_spatial > (1LL << 31) - 1) return table;
+    table.resize(g.spatial * g.kernel_elements);
+    for (int64_t pos = 0; pos < g.spatial; ++pos) {
+        int64_t rest = pos, coord[3]{};
+        for (int64_t d = g.rank - 1; d >= 0; --d) { coord[d] = rest % g.out[d]; rest /= g.out[d]; }
+        for (int64_t kp = 0; kp < g.kernel_elements; ++kp) {
+            int64_t q = kp, index = 0, multiplier = 1;
+            bool inside = true;
+            for (int64_t d = g.rank - 1; d >= 0; --d) {
+                const int64_t coordinate =
+                    coord[d] * g.stride[d] - g.padding[d] + (q % g.kernel[d]) * g.dilation[d];
+                q /= g.kernel[d];
+                inside = inside && coordinate >= 0 && coordinate < g.in[d];
+                index += coordinate * multiplier; multiplier *= g.in[d];
+            }
+            table[pos * g.kernel_elements + kp] = inside ? static_cast<int32_t>(index) : -1;
+        }
+    }
+    return table;
+}
+
 template<class X>
 void run(const Tensor& input, const Tensor& packed, const Tensor& offsets,
          const Tensor& scales, const Tensor& zps, const std::optional<Tensor>& bias,
@@ -421,6 +452,8 @@ void run(const Tensor& input, const Tensor& packed, const Tensor& offsets,
         ? std::max<int64_t>(1, std::min<int64_t>(32, (g.rows + workers - 1) / workers))
         : 32;
     const int64_t tiles = (g.rows + tile_rows - 1) / tile_rows;
+    const std::vector<int32_t> gather = build_gather_table(g);
+    const int64_t channels_per_group = g.channels / g.groups;
     parallel::parallel_for(0, tiles * g.groups, 1, [&](int64_t begin, int64_t end) {
         std::vector<X> columns(g.linear ? 0 : tile_rows * g.K);
         for (int64_t task = begin; task < end; ++task) {
@@ -430,19 +463,31 @@ void run(const Tensor& input, const Tensor& packed, const Tensor& offsets,
             for (int64_t row = start; row < stop; ++row) {
                 X* column = g.linear ? nullptr : columns.data() + (row - start) * g.K;
                 if (!g.linear) {
-                    const int64_t batch = row / g.spatial;
-                    for (int64_t k = 0; k < g.K; ++k) {
-                        int64_t kp = k % g.kernel_elements, pos = row % g.spatial;
-                        int64_t index = 0, multiplier = 1;
-                        bool inside = true;
-                        for (int64_t d = g.rank - 1; d >= 0; --d) {
-                            const int64_t coordinate = (pos % g.out[d]) * g.stride[d] - g.padding[d] + (kp % g.kernel[d]) * g.dilation[d];
-                            pos /= g.out[d]; kp /= g.kernel[d];
-                            inside = inside && coordinate >= 0 && coordinate < g.in[d];
-                            index += coordinate * multiplier; multiplier *= g.in[d];
+                    const int64_t batch = row / g.spatial, pos = row % g.spatial;
+                    const int32_t* taps = gather.empty()
+                        ? nullptr : gather.data() + pos * g.kernel_elements;
+                    const X* base = xp + (batch * g.channels + group * channels_per_group) * g.input_spatial;
+                    int64_t k = 0;
+                    for (int64_t c = 0; c < channels_per_group; ++c, base += g.input_spatial) {
+                        if (taps) {
+                            for (int64_t kp = 0; kp < g.kernel_elements; ++kp, ++k) {
+                                const int32_t offset = taps[kp];
+                                column[k] = offset >= 0 ? base[offset] : static_cast<X>(xz);
+                            }
+                        } else {
+                            for (int64_t tap = 0; tap < g.kernel_elements; ++tap, ++k) {
+                                int64_t kp = tap, walk = pos, index = 0, multiplier = 1;
+                                bool inside = true;
+                                for (int64_t d = g.rank - 1; d >= 0; --d) {
+                                    const int64_t coordinate = (walk % g.out[d]) * g.stride[d]
+                                        - g.padding[d] + (kp % g.kernel[d]) * g.dilation[d];
+                                    walk /= g.out[d]; kp /= g.kernel[d];
+                                    inside = inside && coordinate >= 0 && coordinate < g.in[d];
+                                    index += coordinate * multiplier; multiplier *= g.in[d];
+                                }
+                                column[k] = inside ? base[index] : static_cast<X>(xz);
+                            }
                         }
-                        const int64_t channel = group * (g.channels / g.groups) + k / g.kernel_elements;
-                        column[k] = inside ? xp[(batch * g.channels + channel) * g.input_spatial + index] : static_cast<X>(xz);
                     }
                 }
                 const X* xr = g.linear ? xp + row * g.K : column;
