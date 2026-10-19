@@ -173,6 +173,13 @@ struct TensorListMetadata {
     int32_t scalar_value_kind = 0;
 };
 
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 13000
+// The widest instantiation has to stay inside the 32 KiB argument space; the
+// tensors-per-launch caps above are chosen with this check in mind.
+static_assert(sizeof(TensorListMetadata<1>) <= 32764,
+              "grouped foreach metadata exceeds the kernel argument space");
+#endif
+
 template <int Depth, int OutputIndex, typename T, typename M, typename Op>
 __global__ void multi_tensor_kernel(TensorListMetadata<Depth> metadata, Op op) {
     const int32_t block_index = static_cast<int32_t>(blockIdx.x);
