@@ -912,27 +912,41 @@ void normalize_run(const typename Q::underlying* source, typename Q::underlying*
 // Each row is normalized by its own moments, so the pair of sums runs over a
 // dense byte run, and the second pass feeds the shifted codes straight through
 // the vector round. A wide row is one run; a group whose affine coefficients
-// repeat per channel splits into one run per channel instead.
+// repeat per channel splits into one run per channel instead. A group held
+// channel innermost occupies one short run per spatial position, so both walks
+// step by the channel count rather than decode an element's location again.
 template<class Q>
 void normalize_codes(const void* input, const float* gamma, const float* beta, void* output,
-                     int64_t count, int64_t rows, bool affine_per_channel, int64_t channels,
-                     int64_t channel_groups, float x_scale, int64_t x_zp, float y_scale,
-                     int64_t y_zp, double eps) {
+                     int64_t count, int64_t rows, bool affine_per_channel, bool channels_last,
+                     int64_t channels, int64_t channel_groups, float x_scale, int64_t x_zp,
+                     float y_scale, int64_t y_zp, double eps) {
     using T = typename Q::underlying;
     using QV = vec::Vectorized<Q>;
     using FV = vec::Vectorized<float>;
     const auto* x = static_cast<const T*>(input);
     auto* y = static_cast<T*>(output);
     const float inverse = 1.f / y_scale, shift = static_cast<float>(x_zp);
-    const int64_t spans = affine_per_channel ? channels / channel_groups : 1;
+    const int64_t spans = channels_last ? channels / channel_groups
+        : (affine_per_channel ? channels / channel_groups : 1);
     const int64_t span = count / spans;
     parallel::parallel_for(0, rows, 1, [&](int64_t first, int64_t last) {
         for (int64_t row = first; row < last; ++row) {
-            const T* values = x + row * count;
-            T* codes = y + row * count;
+            const int64_t slice = channels_last ? (row % channel_groups) * spans : 0;
+            const int64_t base = channels_last
+                ? (row / channel_groups) * count * channel_groups + slice : row * count;
+            const T* values = x + base;
+            T* codes = y + base;
             int64_t sum = 0;
             double square_sum = 0.;
-            if constexpr (sizeof(T) == 1) {
+            if (channels_last) {
+                for (int64_t plane = 0; plane < span; ++plane) {
+                    const T* run = values + plane * channels;
+                    for (int64_t c = 0; c < spans; ++c) {
+                        sum += run[c];
+                        square_sum += static_cast<double>(run[c]) * run[c];
+                    }
+                }
+            } else if constexpr (sizeof(T) == 1) {
                 sum = byte_sum(values, count);
                 square_sum = static_cast<double>(byte_square_sum(values, count));
             } else {
@@ -946,6 +960,22 @@ void normalize_codes(const void* input, const float* gamma, const float* beta, v
             const float variance = std::max(static_cast<float>(square_sum) / count
                                             - mean_code * mean_code, 0.f);
             const float scale_div_std = x_scale / std::sqrt(variance * x_scale * x_scale + eps);
+            if (channels_last) {
+                for (int64_t plane = 0; plane < span; ++plane) {
+                    const T* run = values + plane * channels;
+                    T* write = codes + plane * channels;
+                    for (int64_t c = 0; c < spans; ++c) {
+                        const int64_t channel = affine_per_channel ? slice + c
+                                                                   : plane * spans + c;
+                        const float code = static_cast<float>(run[c]) - shift;
+                        const float value = (code - mean_div_scale)
+                            * (scale_div_std * (gamma ? gamma[channel] : 1.f))
+                            + (beta ? beta[channel] : 0.f);
+                        write[c] = quant::encode<T>(value, inverse, y_zp);
+                    }
+                }
+                continue;
+            }
             if (affine_per_channel) {
                 for (int64_t part = 0; part < spans; ++part) {
                     const int64_t channel = (row % channel_groups) * spans + part;
@@ -979,16 +1009,16 @@ void normalize_codes(const void* input, const float* gamma, const float* beta, v
 }
 
 void normalize_impl(const void* x, const float* gamma, const float* beta, void* y, DType dtype,
-                    int64_t count, int64_t rows, bool affine_per_channel, int64_t channels,
-                    int64_t channel_groups, float x_scale, int64_t x_zp, float y_scale,
-                    int64_t y_zp, double eps) {
+                    int64_t count, int64_t rows, bool affine_per_channel, bool channels_last,
+                    int64_t channels, int64_t channel_groups, float x_scale, int64_t x_zp,
+                    float y_scale, int64_t y_zp, double eps) {
     switch (dtype) {
         case DType::QInt8: normalize_codes<qint8>(x,gamma,beta,y,count,rows,affine_per_channel,
-            channels,channel_groups,x_scale,x_zp,y_scale,y_zp,eps); break;
+            channels_last,channels,channel_groups,x_scale,x_zp,y_scale,y_zp,eps); break;
         case DType::QUInt8: normalize_codes<quint8>(x,gamma,beta,y,count,rows,affine_per_channel,
-            channels,channel_groups,x_scale,x_zp,y_scale,y_zp,eps); break;
+            channels_last,channels,channel_groups,x_scale,x_zp,y_scale,y_zp,eps); break;
         case DType::QInt32: normalize_codes<qint32>(x,gamma,beta,y,count,rows,affine_per_channel,
-            channels,channel_groups,x_scale,x_zp,y_scale,y_zp,eps); break;
+            channels_last,channels,channel_groups,x_scale,x_zp,y_scale,y_zp,eps); break;
         default: break;
     }
 }

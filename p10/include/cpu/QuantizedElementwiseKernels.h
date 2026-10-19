@@ -79,6 +79,6 @@ using quantized_cat_rows_fn = void (*)(const int8_t*, int8_t*, int64_t, int64_t,
     int64_t, int64_t, double, int64_t, double, int64_t, bool, bool);
 DECLARE_DISPATCH(quantized_cat_rows_fn, quantized_cat_rows_stub)
 using quantized_normalize_fn = void (*)(const void*, const float*, const float*, void*,
-    DType, int64_t, int64_t, bool, int64_t, int64_t, float, int64_t, float, int64_t, double);
+    DType, int64_t, int64_t, bool, bool, int64_t, int64_t, float, int64_t, float, int64_t, double);
 DECLARE_DISPATCH(quantized_normalize_fn, quantized_normalize_stub)
 }
