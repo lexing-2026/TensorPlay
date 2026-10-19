@@ -156,25 +156,56 @@ binary_op_scalar:
     FORMAT: rgba32i
   - NAME: pow_tensor_scalar
     OPERATOR: '(fract(Y) == vec4(0.0)) ? (mod(Y, vec4(2.0)) == vec4(0.0) ? pow(abs(X), Y) : sign(X) * pow(abs(X), Y)) : pow(X, Y)'
-  - NAME: floor_mul_scalar
-    OPERATOR: floor(X * Y)
-  - NAME: floor_mul_scalar_i32
-    DTYPE: int
-    OPERATOR: ivec4(floor(vec4(X) * vec4(Y)))
-    FORMAT: rgba32i
   - NAME: rsub_scalar
     OPERATOR: Y - X
   - NAME: rsub_scalar_i32
     DTYPE: int
     OPERATOR: Y - X
     FORMAT: rgba32i
+  # The exponent is the payload and the base the broadcast number, so the
+  # operand order of the template is reversed here.  A whole-number exponent
+  # keeps a negative base signed: pow() itself refuses a negative base, so the
+  # magnitude is raised and an even exponent puts the sign back.
+  - NAME: pow_scalar_tensor
+    OPERATOR: '(fract(X) == vec4(0.0)) ? (mod(X, vec4(2.0)) == vec4(0.0) ? pow(abs(Y), X) : sign(Y) * pow(abs(Y), X)) : pow(Y, X)'
+  # The magnitude is rounded before it is read back into a word: the power
+  # itself lands an ulp under the whole number it names for some bases, and a
+  # count truncated from there sits one below the answer.
+  - NAME: pow_scalar_tensor_i32
+    DTYPE: int
+    OPERATOR: 'ivec4((mod(vec4(X), vec4(2.0)) == vec4(0.0)) ? floor(pow(abs(vec4(Y)), vec4(X)) + vec4(0.5)) : sign(vec4(Y)) * floor(pow(abs(vec4(Y)), vec4(X)) + vec4(0.5)))'
+    FORMAT: rgba32i
   - NAME: pow_tensor_scalar_i32
     DTYPE: int
-    OPERATOR: 'ivec4((fract(vec4(Y)) == vec4(0.0)) ? (mod(vec4(Y), vec4(2.0)) == vec4(0.0) ? pow(abs(vec4(X)), vec4(Y)) : sign(vec4(X)) * pow(abs(vec4(X)), vec4(Y))) : pow(vec4(X), vec4(Y)))'
+    OPERATOR: 'ivec4((fract(vec4(Y)) == vec4(0.0)) ? (mod(vec4(Y), vec4(2.0)) == vec4(0.0) ? floor(pow(abs(vec4(X)), vec4(Y)) + vec4(0.5)) : sign(vec4(X)) * floor(pow(abs(vec4(X)), vec4(Y)) + vec4(0.5))) : pow(vec4(X), vec4(Y)))'
     FORMAT: rgba32i
   - NAME: div_scalar_i32
     DTYPE: int
     OPERATOR: X / Y
+    FORMAT: rgba32i
+  # The divisor arrives as an operand, not as a rounded reciprocal folded into
+  # a multiply: a quotient that is a whole number has to land on it exactly,
+  # and the fold puts its error right at the boundary the floor is deciding.
+  - NAME: floor_div_scalar
+    OPERATOR: floor(X / Y)
+  - NAME: floor_div_scalar_i32
+    DTYPE: int
+    OPERATOR: ivec4(floor(vec4(X) / vec4(Y)))
+    FORMAT: rgba32i
+  # The remainder carries the sign of the divisor, so it is the difference
+  # against the floored quotient, not the truncated one.  Both operand orders
+  # are declared: a number beside a payload can be the dividend or the divisor.
+  - NAME: mod_scalar
+    OPERATOR: X - Y * floor(X / Y)
+  - NAME: mod_scalar_i32
+    DTYPE: int
+    OPERATOR: X - Y * ivec4(floor(vec4(X) / vec4(Y)))
+    FORMAT: rgba32i
+  - NAME: mod_scalar_tensor
+    OPERATOR: Y - X * floor(Y / X)
+  - NAME: mod_scalar_tensor_i32
+    DTYPE: int
+    OPERATOR: ivec4(Y) - X * ivec4(floor(vec4(Y) / vec4(X)))
     FORMAT: rgba32i
   - NAME: mul_scalar_recip
     OPERATOR: X * Y
@@ -248,7 +279,7 @@ binary_op_tensor:
     OPERATOR: X - Y * floor(X / Y)
   - NAME: remainder_i32
     DTYPE: int
-    OPERATOR: X - Y * (X / Y)
+    OPERATOR: X - Y * ivec4(floor(vec4(X) / vec4(Y)))
     FORMAT: rgba32i
   - NAME: fmod
     OPERATOR: (X - Y * trunc(X / Y)) - Y * step(abs(Y), abs(X - Y * trunc(X / Y))) * sign(X - Y * trunc(X / Y))
@@ -437,6 +468,9 @@ buffer_binary_op_tensor:
     OPERATOR: '(fract(Y) == vec4(0.0)) ? (mod(Y, vec4(2.0)) == vec4(0.0) ? pow(abs(X), Y) : sign(X) * pow(abs(X), Y)) : pow(X, Y)'
   - NAME: buffer_floor_divide
     OPERATOR: floor(X / Y)
+  - NAME: buffer_floor_divide_i32
+    DTYPE: int
+    OPERATOR: ivec4(floor(vec4(X) / vec4(Y)))
   - NAME: buffer_maximum
     OPERATOR: max(X, Y)
   - NAME: buffer_maximum_i32
@@ -451,7 +485,7 @@ buffer_binary_op_tensor:
     OPERATOR: X - Y * floor(X / Y)
   - NAME: buffer_remainder_i32
     DTYPE: int
-    OPERATOR: X - Y * (X / Y)
+    OPERATOR: X - Y * ivec4(floor(vec4(X) / vec4(Y)))
   - NAME: buffer_fmod
     OPERATOR: (X - Y * trunc(X / Y)) - Y * step(abs(Y), abs(X - Y * trunc(X / Y))) * sign(X - Y * trunc(X / Y))
   - NAME: buffer_fmod_i32
@@ -483,13 +517,21 @@ buffer_binary_op_scalar:
   - NAME: buffer_mul_scalar_i32
     DTYPE: int
     OPERATOR: X * Y
-  - NAME: buffer_floor_mul_scalar
-    OPERATOR: floor(X * Y)
-  - NAME: buffer_floor_mul_scalar_i32
-    DTYPE: int
-    OPERATOR: X * Y
   - NAME: buffer_pow_scalar
     OPERATOR: '(fract(Y) == 0.0) ? (mod(Y, 2.0) == 0.0 ? pow(abs(X), Y) : sign(X) * pow(abs(X), Y)) : pow(X, Y)'
+  # A count raised to a whole power is still a count, and the exponent arrives
+  # as a whole uniform: the magnitude is raised and an even exponent puts the
+  # sign back, because pow() itself refuses a negative base.  The magnitude is
+  # rounded before it is read back into a word, since the power lands an ulp
+  # under the whole number it names for some bases.
+  - NAME: buffer_pow_scalar_i32
+    DTYPE: int
+    OPERATOR: 'int((mod(float(Y), 2.0) == 0.0) ? floor(pow(abs(float(X)), float(Y)) + 0.5) : sign(float(X)) * floor(pow(abs(float(X)), float(Y)) + 0.5))'
+  - NAME: buffer_pow_scalar_tensor
+    OPERATOR: '(fract(X) == 0.0) ? (mod(X, 2.0) == 0.0 ? pow(abs(Y), X) : sign(Y) * pow(abs(Y), X)) : pow(Y, X)'
+  - NAME: buffer_pow_scalar_tensor_i32
+    DTYPE: int
+    OPERATOR: 'int((mod(float(X), 2.0) == 0.0) ? floor(pow(abs(float(Y)), float(X)) + 0.5) : sign(float(Y)) * floor(pow(abs(float(Y)), float(X)) + 0.5))'
   - NAME: buffer_rsub_scalar
     OPERATOR: Y - X
   - NAME: buffer_rsub_scalar_i32
@@ -498,6 +540,21 @@ buffer_binary_op_scalar:
   - NAME: buffer_div_scalar_i32
     DTYPE: int
     OPERATOR: X / Y
+  - NAME: buffer_floor_div_scalar
+    OPERATOR: floor(X / Y)
+  - NAME: buffer_floor_div_scalar_i32
+    DTYPE: int
+    OPERATOR: int(floor(float(X) / float(Y)))
+  - NAME: buffer_mod_scalar
+    OPERATOR: X - Y * floor(X / Y)
+  - NAME: buffer_mod_scalar_i32
+    DTYPE: int
+    OPERATOR: X - Y * int(floor(float(X) / float(Y)))
+  - NAME: buffer_mod_scalar_tensor
+    OPERATOR: Y - X * floor(Y / X)
+  - NAME: buffer_mod_scalar_tensor_i32
+    DTYPE: int
+    OPERATOR: Y - X * int(floor(float(Y) / float(X)))
 mm:
   parameter_names_with_default_values: {}
   generate_variant_forall:
@@ -2253,11 +2310,11 @@ buffer_half_binary_op_scalar:
   - NAME: buffer_add_scalar_halfinplace
     OPERATOR: 'X + A * Y'
     INPLACE: true
-  - NAME: buffer_floor_mul_scalar_half
-    OPERATOR: 'floor(X * Y)'
+  - NAME: buffer_floor_div_scalar_half
+    OPERATOR: 'floor(X / Y)'
     INPLACE: false
-  - NAME: buffer_floor_mul_scalar_halfinplace
-    OPERATOR: 'floor(X * Y)'
+  - NAME: buffer_floor_div_scalar_halfinplace
+    OPERATOR: 'floor(X / Y)'
     INPLACE: true
   - NAME: buffer_mul_scalar_half
     OPERATOR: 'X * Y'
@@ -2271,6 +2328,18 @@ buffer_half_binary_op_scalar:
   - NAME: buffer_pow_scalar_halfinplace
     OPERATOR: '(fract(Y) == 0.0) ? (mod(Y, 2.0) == 0.0 ? pow(abs(X), Y) : sign(X) * pow(abs(X), Y)) : pow(X, Y)'
     INPLACE: true
+  - NAME: buffer_pow_scalar_tensor_half
+    OPERATOR: '(fract(X) == 0.0) ? (mod(X, 2.0) == 0.0 ? pow(abs(Y), X) : sign(Y) * pow(abs(Y), X)) : pow(Y, X)'
+    INPLACE: false
+  - NAME: buffer_mod_scalar_half
+    OPERATOR: 'X - Y * floor(X / Y)'
+    INPLACE: false
+  - NAME: buffer_mod_scalar_halfinplace
+    OPERATOR: 'X - Y * floor(X / Y)'
+    INPLACE: true
+  - NAME: buffer_mod_scalar_tensor_half
+    OPERATOR: 'Y - X * floor(Y / X)'
+    INPLACE: false
   - NAME: buffer_rsub_scalar_half
     OPERATOR: 'Y - X'
     INPLACE: false

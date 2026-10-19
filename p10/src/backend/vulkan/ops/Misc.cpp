@@ -41,6 +41,10 @@ Tensor binary_op_scalar_dispatch(
     const Scalar& other,
     const Scalar& alpha,
     const char* name);
+void check_whole_power_destination(
+    const Tensor& base,
+    const Scalar& exponent,
+    const char* name);
 
 namespace {
 
@@ -61,6 +65,20 @@ void validate_float_or_half_1d_to_4d(const Tensor& t, const char* name) {
       t.dtype() == DType::Float32 || t.dtype() == DType::Float16,
       std::string("Vulkan ") + name +
           " supports Float32 and Float16 tensors only");
+  TP_CHECK(
+      t.dim() >= 1 && t.dim() <= 4,
+      std::string("Vulkan ") + name + " supports 1d to 4d tensors");
+}
+
+// A count raised to a whole power is still a count, so the integer planes ride
+// the `_i32` twin of the scalar-exponent kernel; a fractional exponent moves
+// the payload into single precision inside the scalar path.
+void validate_float_half_or_int_1d_to_4d(const Tensor& t, const char* name) {
+  TP_CHECK(
+      t.dtype() == DType::Float32 || t.dtype() == DType::Float16 ||
+          t.dtype() == DType::Int32,
+      std::string("Vulkan ") + name +
+          " supports Float32, Float16 and Int32 tensors only");
   TP_CHECK(
       t.dim() >= 1 && t.dim() <= 4,
       std::string("Vulkan ") + name + " supports 1d to 4d tensors");
@@ -141,12 +159,18 @@ Tensor& addcmul__kernel(
 }
 
 Tensor pow_scalar_kernel(const Tensor& self, const Scalar& exponent) {
-  validate_float_or_half_1d_to_4d(self, "pow");
+  // A truth raised to a power stops being a truth and is not a count any lane
+  // holds either, so it is read in single precision -- the width the scalar path
+  // gives a whole number beside a truth -- before the planes are checked.
+  const Tensor base =
+      self.dtype() == DType::Bool ? self.to(DType::Float32) : self;
+  validate_float_half_or_int_1d_to_4d(base, "pow");
+  check_whole_power_destination(base, exponent, "pow");
   // Delegates to the shared binary op path so buffer-stored payloads use
   // the linear scalar variant; the integer-exponent handling is part of the
   // shader operator.
   return binary_op_scalar_dispatch(
-      "pow_tensor_scalar", "buffer_pow_scalar", self, exponent,
+      "pow_tensor_scalar", "buffer_pow_scalar", base, exponent,
       Scalar(1.0), "pow");
 }
 

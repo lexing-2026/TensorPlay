@@ -9,6 +9,9 @@
 #include "../impl/Common.h"
 #include "../../../../include/Utils.h"
 
+#include <TypeProperties.h>
+#include <TypePromotion.h>
+
 namespace tensorplay {
 namespace vulkan {
 namespace ops {
@@ -282,6 +285,63 @@ BinaryVocab binary_vocab(const Tensor& t, const char* name) {
   return BinaryVocab::kFloat;
 }
 
+// The width a pair of operands is read in is the width that holds both of
+// them.  Sampling a mixed pair instead would address a texel in one element
+// width while its bits were written in another, which reinterprets the payload
+// rather than converting it, and the linear path has no index remapping to
+// hide the mistake either.  A pair that promotes to a width no kernel here
+// stores is named in the refusal rather than guessed at.
+DType pair_vocabulary(
+    const Tensor& self,
+    const Tensor& other,
+    const char* name) {
+  const DType vocabulary = tensorplay::native::result_type(self, other);
+  TP_CHECK(
+      vocabulary == DType::Float32 || vocabulary == DType::Float16 ||
+          vocabulary == DType::Int32,
+      std::string("Vulkan ") + name +
+          " has no kernel for the operand widths it was given");
+  return vocabulary;
+}
+
+Tensor to_vocabulary(const Tensor& t, DType vocabulary) {
+  if (t.dtype() == vocabulary) {
+    return t;
+  }
+  // Single precision is where the widths meet: every other code has an edge
+  // into it and out of it, but a truth read as a word or a narrow float has
+  // none of its own.  Such a payload is stepped through the shared width
+  // rather than asked for a conversion no shader declares.
+  if (t.dtype() == DType::Bool && vocabulary != DType::Float32) {
+    return t.to(DType::Float32).to(vocabulary);
+  }
+  return t.to(vocabulary);
+}
+
+// The width a scalar op computes in is the width of its result, not the width
+// of the payload: a count scaled by a fractional number ends up with fractional
+// lanes, and so does a truth.  Only the step into single precision is taken
+// here -- a result that needs a wider code than a lane holds stays on the
+// payload's own dtype, where the op's dtype check reports it.  The scale factor
+// plays no part: it multiplies the number that is already in the operand slot,
+// so it never decides what the lanes have to hold.
+Tensor scalar_op_operand(const Tensor& self, const Scalar& other) {
+  if (self.dtype() == DType::Float32 || self.dtype() == DType::Float16) {
+    return self;
+  }
+  if (result_type(other, self.dtype()) == DType::Float32) {
+    return self.to(DType::Float32);
+  }
+  if (self.dtype() == DType::Bool) {
+    // A truth counted with a whole number stops being a truth: the pair names
+    // an integral code wider than any lane here, so the count is read in single
+    // precision, which holds each of its values exactly and keeps a quotient of
+    // one representable too.
+    return self.to(DType::Float32);
+  }
+  return self;
+}
+
 // Resolves the variant name against the registry: an Int32 payload needs the
 // `_i32` twin to exist, otherwise the op has no integer kernel and the call
 // fails with an explicit message.  The marker is inserted before the
@@ -319,22 +379,26 @@ Tensor binary_op_tensor(
     const Tensor& other_arg,
     const Scalar& alpha,
     const char* name) {
-  const BinaryVocab vocab = binary_vocab(self_arg, name);
+  const DType vocabulary = pair_vocabulary(self_arg, other_arg, name);
+  const Tensor self = to_vocabulary(self_arg, vocabulary);
+  const Tensor other = to_vocabulary(other_arg, vocabulary);
+
+  const BinaryVocab vocab = binary_vocab(self, name);
   const std::string variant = binary_variant(shader_name, vocab, name);
   const std::string buffer_variant =
       binary_variant(buffer_shader_name, vocab, name);
 
   api::Context* const context = api::context();
 
-  api::vTensor v_self = convert(self_arg);
-  api::vTensor v_other = convert(other_arg);
+  api::vTensor v_self = convert(self);
+  api::vTensor v_other = convert(other);
 
   // Infer the broadcasted output shape. Texture storage supports arbitrary
   // leading-singleton broadcasts through the texel mapping; buffer storage
   // has no per-element index remapping, so it requires matching shapes.
   const std::vector<int64_t> out_sizes = tensorplay::broadcast_shapes(
-      static_cast<std::vector<int64_t>>(self_arg.shape()),
-      static_cast<std::vector<int64_t>>(other_arg.shape()));
+      static_cast<std::vector<int64_t>>(self.shape()),
+      static_cast<std::vector<int64_t>>(other.shape()));
 
   // A buffer-stored operand keeps the whole op on the linear path even when
   // the output shape is small enough for image storage; the image path has
@@ -460,6 +524,28 @@ Tensor& binary_op_tensor_inplace(
     const Scalar& alpha,
     const char* name) {
   const BinaryVocab vocab = binary_vocab(self_arg, name);
+  if (vocab == BinaryVocab::kInt) {
+    // As in the scalar writer: a count is scaled by a whole factor or not at
+    // all, since the packing of the factor into the operand slot truncates.
+    TP_CHECK(
+        alpha.toDouble() == static_cast<double>(alpha.to<int64_t>()),
+        std::string("Vulkan ") + name +
+            " in place over a count refuses a fractional scale factor");
+  }
+
+  // The destination keeps the width it was allocated in, so only the incoming
+  // side moves: it steps to the destination's width when the pair still fits
+  // there.  A pair whose vocabulary is wider than the destination would have
+  // to round the result down on the way in, so it is refused instead.
+  const DType destination = self_arg.dtype();
+  if (other_arg.dtype() != destination) {
+    TP_CHECK(
+        tensorplay::native::result_type(self_arg, other_arg) == destination,
+        std::string("Vulkan ") + name +
+            " in place cannot fold an operand wider than its destination");
+  }
+  const Tensor other = to_vocabulary(other_arg, destination);
+
   const std::string variant = binary_variant(shader_name, vocab, name);
   const std::string buffer_variant =
       binary_variant(buffer_shader_name, vocab, name);
@@ -467,7 +553,7 @@ Tensor& binary_op_tensor_inplace(
   api::Context* const context = api::context();
 
   api::vTensor v_self = convert(self_arg);
-  api::vTensor v_other = convert(other_arg);
+  api::vTensor v_other = convert(other);
 
   if (v_self.storage_type() == api::StorageType::BUFFER) {
     validate_buffer_elementwise_dtype(v_self, name);
@@ -571,14 +657,15 @@ Tensor binary_op_scalar(
     const Scalar& other,
     const Scalar& alpha,
     const char* name) {
-  const BinaryVocab vocab = binary_vocab(self_arg, name);
+  const Tensor operand = scalar_op_operand(self_arg, other);
+  const BinaryVocab vocab = binary_vocab(operand, name);
   const std::string variant = binary_variant(shader_name, vocab, name);
   const std::string buffer_variant =
       binary_variant(buffer_shader_name, vocab, name);
 
   api::Context* const context = api::context();
 
-  api::vTensor v_self = convert(self_arg);
+  api::vTensor v_self = convert(operand);
 
   // A buffer-stored input keeps the whole op on the linear path even when
   // the output shape is small enough for image storage; the image path has
@@ -687,6 +774,17 @@ Tensor& binary_op_scalar_inplace(
     const Scalar& alpha,
     const char* name) {
   const BinaryVocab vocab = binary_vocab(self_arg, name);
+  if (vocab == BinaryVocab::kInt) {
+    // The operand slot of a count holds a whole number, and the destination
+    // keeps its own width, so a fraction arriving here would be rounded on the
+    // way in rather than written.  Each factor is tested where it is packed,
+    // because a product can look whole while one of them is not.
+    TP_CHECK(
+        other.toDouble() == static_cast<double>(other.to<int64_t>()) &&
+            alpha.toDouble() == static_cast<double>(alpha.to<int64_t>()),
+        std::string("Vulkan ") + name +
+            " in place over a count refuses a fractional operand");
+  }
   const std::string variant = binary_variant(shader_name, vocab, name);
   const std::string buffer_variant =
       binary_variant(buffer_shader_name, vocab, name);
@@ -840,8 +938,14 @@ Tensor add_scalar_kernel(const Tensor& self, const Scalar& other, const Scalar& 
 }
 
 Tensor sub_scalar_kernel(const Tensor& self, const Scalar& other, const Scalar& alpha) {
-  return binary_op_scalar("add_scalar", "buffer_add_scalar", self,
-                          Scalar(-other.toDouble()), alpha, "add");
+  // Subtracting runs as adding a negation, and the negation stays in the family
+  // of the number it came from: a whole number subtracted from a count leaves a
+  // count, and that family is what decides the width the lanes need.
+  const Scalar negated = other.isIntegral(true)
+      ? Scalar(-other.to<int64_t>())
+      : Scalar(-other.toDouble());
+  return binary_op_scalar("add_scalar", "buffer_add_scalar", self, negated,
+                          alpha, "add");
 }
 
 Tensor mul_scalar_kernel(const Tensor& self, const Scalar& other) {
@@ -920,14 +1024,20 @@ Tensor floor_divide_scalar_kernel(const Tensor& self, const Scalar& other) {
   TP_CHECK(
       other.toDouble() != 0.0,
       "floor_divide.Scalar: can't divide by zero");
-  return binary_op_scalar("floor_mul_scalar", "buffer_floor_mul_scalar", self,
-                          Scalar(1.0 / other.toDouble()), Scalar(1.0),
-                          "floor_divide");
+  // Rounding a quotient down takes the divisor as an operand instead of as a
+  // rounded reciprocal folded into a multiply: a quotient that is a whole
+  // number has to land on it exactly, and the error of the fold sits right at
+  // the boundary the floor is deciding.  Which width the lanes divide in
+  // follows from the pair -- a count beside a whole number keeps word lanes,
+  // and a fraction moves both operands to a width that has fractions.
+  return binary_op_scalar(
+      "floor_div_scalar", "buffer_floor_div_scalar", self, other,
+      Scalar(1.0), "floor_divide");
 }
 
 Tensor& floor_divide_inplace_kernel(Tensor& self, const Tensor& other) {
   return binary_op_tensor_inplace("floor_divideinplace",
-                                  "floor_divideinplace",
+                                  "buffer_floor_divideinplace",
                                   self, other, Scalar(1.0), "floor_divide");
 }
 
@@ -935,10 +1045,12 @@ Tensor& floor_divide_scalar_inplace_kernel(Tensor& self, const Scalar& other) {
   TP_CHECK(
       other.toDouble() != 0.0,
       "floor_divide_.Scalar: can't divide by zero");
-  return binary_op_scalar_inplace("floor_mul_scalarinplace",
-                                  "buffer_floor_mul_scalarinplace", self,
-                                  Scalar(1.0 / other.toDouble()), Scalar(1.0),
-                                  "floor_divide");
+  // The writer keeps the destination's width, so a payload with no fractions
+  // floors its own quotient; a divisor with fractions cannot be written back
+  // into a count and is refused by the dispatch.
+  return binary_op_scalar_inplace(
+      "floor_div_scalarinplace", "buffer_floor_div_scalarinplace", self, other,
+      Scalar(1.0), "floor_divide");
 }
 
 /*
@@ -947,19 +1059,38 @@ Tensor& floor_divide_scalar_inplace_kernel(Tensor& self, const Scalar& other) {
  */
 Tensor pow_scalar_base_kernel(const Scalar& base, const Tensor& self) {
   return binary_op_scalar(
-      "pow_scalar_tensor", "pow_scalar_tensor", self, base,
+      "pow_scalar_tensor", "buffer_pow_scalar_tensor", self, base,
       Scalar(1.0), "pow");
 }
 
+// A count has no lane for the fraction a negative whole power names: the
+// quotient sits below one, and reading it back into a word answers with a
+// number no division would give.  The float widths take it, so only a count is
+// refused -- and only when the exponent itself is whole, since a fractional
+// exponent already moves the pair into single precision.
+void check_whole_power_destination(
+    const Tensor& base,
+    const Scalar& exponent,
+    const char* name) {
+  if (base.dtype() != DType::Int32 || !exponent.isIntegral(true)) {
+    return;
+  }
+  TP_CHECK(
+      exponent.to<int64_t>() >= 0,
+      std::string("Vulkan ") + name +
+          " refuses a negative exponent written back into a count");
+}
+
 Tensor& pow_tensor_scalar_inplace_kernel(Tensor& self, const Scalar& exponent) {
+  check_whole_power_destination(self, exponent, "pow");
   return binary_op_scalar_inplace(
-      "pow_tensor_scalarinplace", "pow_tensor_scalarinplace", self, exponent,
+      "pow_tensor_scalarinplace", "buffer_pow_scalarinplace", self, exponent,
       Scalar(1.0), "pow");
 }
 
 Tensor& pow_tensor_inplace_kernel(Tensor& self, const Tensor& exponent) {
   return binary_op_tensor_inplace(
-      "powinplace", "powinplace", self, exponent, Scalar(1.0), "pow");
+      "powinplace", "buffer_powinplace", self, exponent, Scalar(1.0), "pow");
 }
 
 //
@@ -980,6 +1111,32 @@ Tensor minimum_kernel(const Tensor& self, const Tensor& other) {
 Tensor remainder_kernel(const Tensor& self, const Tensor& other) {
   return binary_op_tensor("remainder", "buffer_remainder", self, other,
                           Scalar(1.0), "remainder");
+}
+
+Tensor& remainder_inplace_kernel(Tensor& self, const Tensor& other) {
+  return binary_op_tensor_inplace("remainderinplace", "buffer_remainderinplace",
+                                  self, other, Scalar(1.0), "remainder");
+}
+
+// The remainder carries the sign of the divisor, so the difference is taken
+// against the floored quotient: the truncated one answers with the other
+// family's sign whenever the operands disagreed, which is the other op.
+Tensor remainder_scalar_kernel(const Tensor& self, const Scalar& other) {
+  return binary_op_scalar("mod_scalar", "buffer_mod_scalar", self, other,
+                          Scalar(1.0), "remainder");
+}
+
+Tensor& remainder_scalar_inplace_kernel(Tensor& self, const Scalar& other) {
+  return binary_op_scalar_inplace("mod_scalarinplace",
+                                  "buffer_mod_scalarinplace", self, other,
+                                  Scalar(1.0), "remainder");
+}
+
+// A number on the left of the operator keeps the dividend's role: the payload
+// samples the divisor's slot, so the subtraction runs against the tensor.
+Tensor remainder_scalar_tensor_kernel(const Scalar& self, const Tensor& other) {
+  return binary_op_scalar("mod_scalar_tensor", "buffer_mod_scalar_tensor",
+                          other, self, Scalar(1.0), "remainder");
 }
 
 Tensor fmod_kernel(const Tensor& self, const Tensor& other) {
@@ -1074,6 +1231,14 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, BinaryOpKernels) {
   m.impl("maximum", &tensorplay::vulkan::ops::maximum_kernel);
   m.impl("minimum", &tensorplay::vulkan::ops::minimum_kernel);
   m.impl("remainder.Tensor", &tensorplay::vulkan::ops::remainder_kernel);
+  m.impl("remainder_.Tensor",
+         &tensorplay::vulkan::ops::remainder_inplace_kernel);
+  m.impl("remainder.Scalar",
+         &tensorplay::vulkan::ops::remainder_scalar_kernel);
+  m.impl("remainder_.Scalar",
+         &tensorplay::vulkan::ops::remainder_scalar_inplace_kernel);
+  m.impl("remainder.Scalar_Tensor",
+         &tensorplay::vulkan::ops::remainder_scalar_tensor_kernel);
   m.impl("fmod.Tensor", &tensorplay::vulkan::ops::fmod_kernel);
   m.impl("atan2", &tensorplay::vulkan::ops::atan2_kernel);
   m.impl("atan2_", &tensorplay::vulkan::ops::atan2__kernel);

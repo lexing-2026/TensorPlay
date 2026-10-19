@@ -460,9 +460,12 @@ Tensor& square_inplace_kernel(Tensor& self) {
       self, "squareinplace", "buffer_squareinplace", "unary square");
 }
 
+// One over a count is not a count: the quotients a count or a truth produces
+// need fractions, so such a payload is read in single precision.
 Tensor reciprocal_kernel(const Tensor& self) {
   return unary_op_typed(
-      self, "reciprocal", "buffer_reciprocal", true, "unary reciprocal");
+      isFloatingType(self.dtype()) ? self : self.to(DType::Float32),
+      "reciprocal", "buffer_reciprocal", true, "unary reciprocal");
 }
 
 Tensor& reciprocal_inplace_kernel(Tensor& self) {

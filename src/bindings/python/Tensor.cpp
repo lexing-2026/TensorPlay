@@ -2969,19 +2969,20 @@ void init_tensor(py::module_& m) {
         .def("__radd__", [](const Tensor& t, int64_t s) { return t.add(Scalar(s)); })
         .def("__rmul__", [](const Tensor& t, int64_t s) { return t.mul(Scalar(s)); })
         .def("__radd__", [](const Tensor& t, double s) { return t.add(Scalar(s)); })
-        // Reflected sub/div need the scalar in the left operand slot, so the
-        // scalar materializes as a wrapped 0-dim tensor on the tensor's
-        // device with its own natural dtype and rides the ordinary kernel:
-        // the wrapped-number marker keeps it out of the result dtype unless
-        // no tensor operand exists, and the CUDA kernels fold a CPU scalar
-        // into the functor instead of materializing it on device.
+        // Reflected sub/div need the number in the left operand slot.  A real
+        // kernel takes the number as an argument instead of storing it: a
+        // device holds payloads it computes on, and the width a Python number
+        // arrives in (a double, an int64) is usually wider than any lane it
+        // will be combined with.  So the number stays a Scalar and rides the
+        // scalar overload; division goes through the reciprocal, since a
+        // quotient's width follows the divisor's formula, not the numerator's
+        // storage.  A complex number has no scalar overload to ride, so it
+        // still materializes.
         .def("__rsub__", [](const Tensor& t, int64_t s) {
-            Tensor s_t = tensorplay::native::wrapped_scalar_tensor(Scalar(s), t.device());
-            return s_t.sub(t);
+            return tensorplay::tpx::ops::rsub(t, Scalar(s));
         })
         .def("__rsub__", [](const Tensor& t, double s) {
-            Tensor s_t = tensorplay::native::wrapped_scalar_tensor(Scalar(s), t.device());
-            return s_t.sub(t);
+            return tensorplay::tpx::ops::rsub(t, Scalar(s));
         })
         .def("__rmul__", [](const Tensor& t, double s) { return t.mul(Scalar(s)); })
         .def("__radd__", [](const Tensor& t, std::complex<double> s) { return t.add(Scalar(s)); })
@@ -2995,8 +2996,7 @@ void init_tensor(py::module_& m) {
         // convertible to complex<double>; otherwise every `1.0 / real_tensor`
         // silently promoted to complex (broke linalg.pinv et al).
         .def("__rtruediv__", [](const Tensor& t, double s) {
-            Tensor s_t = tensorplay::native::wrapped_scalar_tensor(Scalar(s), t.device());
-            return s_t.div(t);
+            return t.reciprocal().mul(Scalar(s));
         })
         .def("__rtruediv__", [](const Tensor& t, std::complex<double> s) {
             Tensor s_t = tensorplay::native::wrapped_scalar_tensor(Scalar(s), t.device());
@@ -3081,9 +3081,12 @@ void init_tensor(py::module_& m) {
         // Pointwise ops
                                                                                                                 .def("__pow__", [](const Tensor& self, Scalar exponent) { return self.pow(exponent); }, "exponent"_a)
         .def("__pow__", [](const Tensor& self, const Tensor& exponent) { return self.pow(exponent); }, "exponent"_a)
+        // A base on the left of a power rides the scalar-base overload, which
+        // reads the exponent's width and materializes only what the result
+        // needs: the base itself never has to become a payload of the device
+        // the exponents live on.
         .def("__rpow__", [](const Tensor& self, Scalar base) {
-            Tensor base_t = tensorplay::native::wrapped_scalar_tensor(base, self.device());
-            return base_t.pow(self);
+            return tensorplay::tpx::ops::pow(base, self);
         })
         // Plain Python numbers are matched by exact type here: the catch-all
         // below accepts any object without conversion, so it would otherwise
@@ -3091,12 +3094,10 @@ void init_tensor(py::module_& m) {
         .def("__pow__", [](const Tensor& self, int64_t exponent) { return self.pow(Scalar(exponent)); })
         .def("__pow__", [](const Tensor& self, double exponent) { return self.pow(Scalar(exponent)); })
         .def("__rpow__", [](const Tensor& self, int64_t base) {
-            Tensor base_t = tensorplay::native::wrapped_scalar_tensor(Scalar(base), self.device());
-            return base_t.pow(self);
+            return tensorplay::tpx::ops::pow(Scalar(base), self);
         })
         .def("__rpow__", [](const Tensor& self, double base) {
-            Tensor base_t = tensorplay::native::wrapped_scalar_tensor(Scalar(base), self.device());
-            return base_t.pow(self);
+            return tensorplay::tpx::ops::pow(Scalar(base), self);
         })
         .def("__pow__", [](const Tensor&, py::object) { return not_implemented(); })
         .def("__rpow__", [](const Tensor&, py::object) { return not_implemented(); })

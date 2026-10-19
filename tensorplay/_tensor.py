@@ -355,20 +355,34 @@ def _cf(name):
     return getattr(_composite_funcs, name)
 
 
-def _as_tensor(x, device=None):
+def _as_tensor(x, device=None, dtype=None):
     from . import as_tensor
-    return as_tensor(x, device=device)
+    return as_tensor(x, dtype=dtype, device=device)
 
 
 # floor_divide/remainder/fmod/true_divide are native methods; only the
 # reflected forms need a wrapper, since the left operand arrives as a plain
-# Python number.  The materialized number joins the right operand's device.
+# Python number.  The materialized number joins the right operand's device, and
+# a plain number takes the width that holds the pair rather than the width a
+# bare number defaults to: a whole number beside a count stays a count, and a
+# real number beside one moves both to the real width.  Defaulting to a wide
+# integer code would ask for something some backends do not store.
+def _reflected_operand(number, target):
+    # bool needs no separate entry: it is an int subclass.
+    if isinstance(number, (_builtins.int, _builtins.float, _builtins.complex)):
+        return _as_tensor(
+            number,
+            device=target.device,
+            dtype=_cf("result_type")(number, target))
+    return _as_tensor(number, device=target.device)
+
+
 def __rfloordiv__(self, other):
-    return _as_tensor(other, device=self.device).floor_divide(self)
+    return _reflected_operand(other, self).floor_divide(self)
 
 
 def __rmod__(self, other):
-    return _as_tensor(other, device=self.device).remainder(self)
+    return _reflected_operand(other, self).remainder(self)
 
 
 Tensor.__rfloordiv__ = __rfloordiv__
