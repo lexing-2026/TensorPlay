@@ -3866,5 +3866,161 @@ class TestVulkanFencedReadback(unittest.TestCase):
                 err_msg=f"linear readback at round {i} saw a stale payload")
 
 
+class TestVulkanMaskLogic(unittest.TestCase):
+    # A mask is combined before it reaches attention: a padding row ands a
+    # causal triangle, an inverse padding mask negates a row, and a numeric one
+    # enters the connectives through the test against zero.  A Bool payload
+    # carries one byte per element and counts any nonzero byte as true, so the
+    # connectives are arithmetic over reduced lanes.  Both storages hold the
+    # same decision: a texel reads four lanes of one plane, a linear word packs
+    # four bytes and one invocation owns the whole word it writes.
+
+    SHAPES = (
+        ((2, 3, 5, 7), (2, 3, 5, 7)),
+        ((4, 6, 8), (6, 8)),
+        ((2, 3, 4, 5), (1, 1, 4, 5)),
+        ((4, 8), (8,)),
+        ((3, 1, 6), (3, 5, 6)),
+        ((2, 4, 3, 5), (2, 1, 3, 5)),
+        ((1, 1, 1), (2, 3, 5, 7)),
+    )
+    LENGTHS = (100000, 100001, 100003)
+
+    def _bools(self, shape, seed):
+        rng = np.random.default_rng(seed)
+        return tensorplay.tensor(rng.random(shape) > 0.5)
+
+    def _compare(self, name, host_a, host_b=None):
+        import tensorplay.functional as F
+        op = getattr(F, name)
+        if host_b is None:
+            got = op(host_a.to("vulkan")).cpu().numpy()
+            want = op(host_a).numpy()
+        else:
+            got = op(host_a.to("vulkan"), host_b.to("vulkan")).cpu().numpy()
+            want = op(host_a, host_b).numpy()
+        self.assertEqual(got.dtype, np.bool_, f"{name} lost the Bool result")
+        np.testing.assert_array_equal(
+            got.astype(np.int8), want.astype(np.int8),
+            err_msg=f"{name} over {tuple(want.shape)}")
+
+    def test_bitwise_connectives_broadcast_over_planes(self):
+        for index, (shape_a, shape_b) in enumerate(self.SHAPES):
+            a = self._bools(shape_a, index)
+            b = self._bools(shape_b, 100 + index)
+            for name in ("bitwise_and", "bitwise_or", "bitwise_xor"):
+                self._compare(name, a, b)
+            self._compare("bitwise_not", a)
+
+    def test_logical_connectives_broadcast_over_planes(self):
+        for index, (shape_a, shape_b) in enumerate(self.SHAPES):
+            a = self._bools(shape_a, index)
+            b = self._bools(shape_b, 100 + index)
+            for name in ("logical_and", "logical_or", "logical_xor"):
+                self._compare(name, a, b)
+            self._compare("logical_not", a)
+
+    def test_operators_match_the_functions(self):
+        # The dunder forms reach the same kernels, so an inverted mask written
+        # as `~mask` behaves as the function call does.
+        a = self._bools((3, 4, 5), 3)
+        b = self._bools((3, 4, 5), 4)
+        va, vb = a.to("vulkan"), b.to("vulkan")
+        for got, want in ((va & vb, a & b), (va | vb, a | b),
+                          (va ^ vb, a ^ b), (~va, ~a)):
+            np.testing.assert_array_equal(
+                got.cpu().numpy().astype(np.int8),
+                want.numpy().astype(np.int8))
+
+    def test_linear_payloads_pack_four_lanes_per_word(self):
+        # A row longer than the image axis limit lives in a buffer.  The last
+        # word of a length that is not a multiple of four is only partly real,
+        # and its neighbour plane may be a texture that had to be copied in, so
+        # every length carries a broadcast case as well.
+        for length in self.LENGTHS:
+            a = self._bools((length,), length)
+            b = self._bools((length,), length + 1)
+            one = self._bools((1,), length + 2)
+            for name in ("bitwise_and", "bitwise_or", "bitwise_xor",
+                         "logical_and", "logical_xor"):
+                self._compare(name, a, b)
+            self._compare("bitwise_not", a)
+            self._compare("logical_not", a)
+            self._compare("bitwise_and", a, one)
+            self._compare("bitwise_or", one, b)
+            self._compare("logical_xor", a, one)
+
+    def test_numeric_operands_enter_through_the_test_against_zero(self):
+        # A logical connective decides by nonzero in the operand's own domain,
+        # so a float, half, int or byte plane is first reduced to Bool.  A lane
+        # that is not a number counts as true, and two of them cancel in an
+        # exclusive or.
+        rng = np.random.default_rng(21)
+        cases = {
+            tensorplay.float32: (rng.standard_normal((2, 3, 4)) * 2.0).astype(
+                np.float32),
+            tensorplay.float16: (rng.standard_normal((2, 3, 4)) * 2.0).astype(
+                np.float16),
+            tensorplay.int32: rng.integers(-3, 4, (2, 3, 4)).astype(np.int32),
+            tensorplay.uint8: rng.integers(0, 4, (2, 3, 4)).astype(np.uint8),
+        }
+        for dtype, values in cases.items():
+            a = tensorplay.tensor(values, dtype=dtype)
+            b = tensorplay.tensor(values[::-1].copy(), dtype=dtype)
+            for name in ("logical_and", "logical_or", "logical_xor"):
+                self._compare(name, a, b)
+            self._compare("logical_not", a)
+        lanes = [np.nan, -0.0, 0.0, 1.0, np.inf, np.nan]
+        specials = tensorplay.tensor(lanes, dtype=tensorplay.float32)
+        reversed_specials = tensorplay.tensor(
+            lanes[::-1], dtype=tensorplay.float32)
+        for name in ("logical_and", "logical_or", "logical_xor"):
+            self._compare(name, specials, reversed_specials)
+        self._compare("logical_not", specials)
+
+    def test_a_combined_mask_reaches_attention(self):
+        import tensorplay.functional as F
+        import tensorplay.nn.functional as NF
+        tensorplay.manual_seed(3210)
+        B, H, Sq, Skv, D = 2, 4, 6, 10, 8
+        q = tensorplay.randn((B, H, Sq, D))
+        k = tensorplay.randn((B, H, Skv, D))
+        v = tensorplay.randn((B, H, Skv, D))
+        keep = np.random.default_rng(7).random((B, 1, 1, Skv)) > 0.2
+        # Keep the first key of every batch visible so no query row loses every
+        # candidate; a row with nothing to attend to is a separate question.
+        keep[:, :, :, 0] = True
+        padding = tensorplay.tensor(keep)
+        causal = tensorplay.tensor(np.tril(np.ones((Sq, Skv), dtype=bool)))
+        # A padding row ands a causal triangle, and the whole mask is then
+        # negated once to exercise the inverse form a decoder uses.
+        host_mask = F.bitwise_and(padding, causal)
+        device_mask = F.bitwise_and(padding.to("vulkan"), causal.to("vulkan"))
+        np.testing.assert_array_equal(
+            device_mask.cpu().numpy(), host_mask.numpy())
+        got = NF.scaled_dot_product_attention(
+            q.to("vulkan"), k.to("vulkan"), v.to("vulkan"),
+            attn_mask=device_mask).cpu().numpy()
+        want = _sdpa_reference(
+            q.numpy(), k.numpy(), v.numpy(), mask=host_mask.numpy())
+        np.testing.assert_allclose(
+            got.astype(np.float64), want, rtol=1.0e-3, atol=4.0e-3)
+        inverted = F.logical_not(host_mask)
+        device_inverted = F.logical_not(device_mask)
+        np.testing.assert_array_equal(
+            device_inverted.cpu().numpy(), inverted.numpy())
+
+    def test_bitwise_needs_a_bool_payload(self):
+        import tensorplay.functional as F
+        # An integral plane wants the bitwise operation of its own width, which
+        # no kernel carries: the request is refused instead of being decided by
+        # the nonzero test that spells the connectives for a Bool.
+        ints = tensorplay.tensor([1, 2, 3], dtype=tensorplay.int32).to("vulkan")
+        with self.assertRaisesRegex(RuntimeError, "connects Bool payloads"):
+            F.bitwise_and(ints, ints)
+        with self.assertRaisesRegex(RuntimeError, "connects Bool payloads"):
+            F.bitwise_not(ints)
+
+
 if __name__ == "__main__":
     unittest.main()
