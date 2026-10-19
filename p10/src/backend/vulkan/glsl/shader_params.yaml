@@ -1061,6 +1061,37 @@ compare_scalar_buffer:
     OPERATOR: greaterThan(X, Y)
   - NAME: ge_scalar_buffer
     OPERATOR: greaterThanEqual(X, Y)
+logic_op:
+  parameter_names_with_default_values:
+    OPERATOR: X * Y
+    UNARY: false
+  shader_variants:
+  # Both operands arrive reduced to 0 or 1, so the connectives are arithmetic:
+  # a product keeps the lanes both hold, a maximum keeps either, an absolute
+  # difference keeps exactly one, and negation flips the reduced lane.
+  - NAME: logic_and
+    OPERATOR: X * Y
+  - NAME: logic_or
+    OPERATOR: max(X, Y)
+  - NAME: logic_xor
+    OPERATOR: abs(X - Y)
+  - NAME: logic_not
+    UNARY: true
+    OPERATOR: ivec4(1) - X
+logic_op_buffer:
+  parameter_names_with_default_values:
+    OPERATOR: X * Y
+    UNARY: false
+  shader_variants:
+  - NAME: logic_and_buffer
+    OPERATOR: X * Y
+  - NAME: logic_or_buffer
+    OPERATOR: max(X, Y)
+  - NAME: logic_xor_buffer
+    OPERATOR: abs(X - Y)
+  - NAME: logic_not_buffer
+    UNARY: true
+    OPERATOR: ivec4(1) - X
 cast_i8_float:
   parameter_names_with_default_values: {}
   shader_variants:
