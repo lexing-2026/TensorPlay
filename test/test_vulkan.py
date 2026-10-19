@@ -4129,5 +4129,145 @@ class TestVulkanWhereBranches(unittest.TestCase):
             F.where(condition, flags, flags)
 
 
+class TestVulkanWhereBroadcast(unittest.TestCase):
+    # The condition and the two branches merge into one output shape, and a
+    # plane narrower than it is repeated inside the kernel instead of being
+    # materialized at the output shape.  Both storages need the arithmetic: a
+    # row beyond the image-axis limit lives in buffers, where a singleton costs
+    # one element rather than one texel.
+
+    SHAPES = (
+        ((2, 3, 4, 5), (2, 1, 1, 5), (2, 3, 4, 5)),  # condition across heads
+        ((2, 3, 4, 5), (2, 3, 4, 5), (1, 1, 4, 5)),  # one branch is shared
+        ((2, 3, 4, 5), (4, 5), (2, 3, 4, 5)),  # rank left-padded
+        ((2, 3, 4, 5), (2, 3, 1, 5), (2, 3, 4, 5)),  # one channel repeats
+        ((3, 5, 6), (3, 5, 6), (1, 1, 1)),
+        ((2, 4, 3, 5), (1, 1, 1, 1), (2, 4, 3, 5)),
+    )
+    LENGTHS = (100000, 100001, 100003)
+
+    def _check(self, condition, host_a, host_b, label):
+        import tensorplay.functional as F
+        want = F.where(condition, host_a, host_b)
+        got = F.where(
+            condition.to("vulkan"), host_a.to("vulkan"), host_b.to("vulkan"))
+        self.assertEqual(got.dtype, want.dtype, msg=label)
+        np.testing.assert_array_equal(
+            got.cpu().numpy(), want.cpu().numpy(), err_msg=label)
+
+    def _planes(self, out_shape, cond_shape, branch_shape, seed):
+        rng = np.random.default_rng(seed)
+        return (
+            tensorplay.tensor(rng.random(cond_shape) > 0.4),
+            tensorplay.tensor(
+                (rng.standard_normal(branch_shape) * 7).astype(np.float32)),
+            tensorplay.tensor(
+                (rng.standard_normal(out_shape) * 7).astype(np.float32)))
+
+    def test_texel_planes_broadcast_to_the_output_shape(self):
+        for i, (out, cond, branch) in enumerate(self.SHAPES):
+            condition, host_a, host_b = self._planes(out, cond, branch, 11 + i)
+            self._check(condition, host_a, host_b, f"{out} {cond} {branch}")
+            # Swapping the branches swaps which plane repeats.
+            self._check(condition, host_b, host_a, f"{out} swapped")
+
+    def test_a_zero_dim_branch_repeats(self):
+        import tensorplay as tp
+        rng = np.random.default_rng(19)
+        condition = tensorplay.tensor(rng.random((2, 3, 4, 5)) > 0.5)
+        dense = tensorplay.tensor(
+            (rng.standard_normal((2, 3, 4, 5)) * 7).astype(np.float32))
+        self._check(condition, tensorplay.tensor(3.25, dtype=tp.float32), dense,
+                    "0-d self branch")
+        self._check(condition, dense, tensorplay.tensor(-1.5, dtype=tp.float32),
+                    "0-d other branch")
+
+    def test_a_scalar_branch_keeps_the_other_branch_kind(self):
+        import tensorplay as tp
+        import tensorplay.functional as F
+        rng = np.random.default_rng(29)
+        condition = tensorplay.tensor(rng.random((3, 4, 6)) > 0.5)
+        halves = tensorplay.tensor(
+            (rng.standard_normal((3, 4, 6)) * 4).astype(np.float16),
+            dtype=tp.float16)
+        # The folded branch is one element that the selection repeats, so the
+        # pair stays in the half width and the scalar follows it.
+        want = F.where(condition, halves, 7)
+        got = F.where(
+            condition.to("vulkan"), halves.to("vulkan"), 7)
+        self.assertEqual(got.dtype, want.dtype)
+        np.testing.assert_array_equal(
+            got.cpu().numpy(), want.cpu().numpy(), err_msg="scalar other")
+        want = F.where(condition, -3, halves)
+        got = F.where(
+            condition.to("vulkan"), -3, halves.to("vulkan"))
+        self.assertEqual(got.dtype, want.dtype)
+        np.testing.assert_array_equal(
+            got.cpu().numpy(), want.cpu().numpy(), err_msg="scalar self")
+
+    def test_linear_planes_broadcast_across_every_vocabulary(self):
+        import tensorplay as tp
+        rng = np.random.default_rng(23)
+        for count in self.LENGTHS:
+            condition = tensorplay.tensor(rng.random((count,)) > 0.4)
+            floats = tensorplay.tensor(
+                (rng.standard_normal((count,)) * 7).astype(np.float32))
+            halves = tensorplay.tensor(
+                (rng.standard_normal((count,)) * 4).astype(np.float16),
+                dtype=tp.float16)
+            ints = tensorplay.tensor(
+                rng.integers(-9, 10, (count,)).astype(np.int32),
+                dtype=tp.int32)
+            # A one-element plane of each kind, in either branch position, so
+            # both the shared word layout and the singleton read get used.
+            single_floats = tensorplay.tensor(
+                np.array([2.5], dtype=np.float32))
+            single_halves = tensorplay.tensor(
+                np.array([-3.5], dtype=np.float16), dtype=tp.float16)
+            single_ints = tensorplay.tensor(
+                np.array([7], dtype=np.int32), dtype=tp.int32)
+            self._check(
+                condition, floats, single_floats, f"float tail at {count}")
+            self._check(
+                condition, single_halves, halves, f"half self at {count}")
+            self._check(
+                condition, halves, single_ints, f"half against int at {count}")
+            self._check(
+                condition, ints, single_ints, f"int at {count}")
+            # A condition of one element decides the whole row.
+            self._check(
+                tensorplay.tensor(np.array([True])), floats,
+                tensorplay.tensor(
+                    (rng.standard_normal((count,)) * 7).astype(np.float32)),
+                f"single condition at {count}")
+
+    def test_a_padding_mask_selects_a_whole_attention_row(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(31)
+        B, H, Sq, Skv = 2, 4, 5, 9
+        keep = rng.random((B, 1, 1, Skv)) > 0.35
+        keep[:, :, :, 0] = True
+        scores = (rng.standard_normal((B, H, Sq, Skv)) * 4).astype(np.float32)
+        masked = np.where(keep, scores, -1e4)
+        condition = tensorplay.tensor(keep)
+        host_scores = tensorplay.tensor(scores)
+        bias = tensorplay.tensor(
+            np.full((B, 1, 1, Skv), -1.0e4, dtype=np.float32))
+        self._check(condition, host_scores, bias, "mask across heads")
+        want = F.where(condition, host_scores, bias)
+        np.testing.assert_array_equal(
+            masked, want.cpu().numpy(), err_msg="reference agrees with host")
+
+    def test_shapes_that_do_not_broadcast_are_refused(self):
+        import tensorplay.functional as F
+        condition = tensorplay.tensor(
+            np.ones((2, 3, 4, 5), dtype=bool)).to("vulkan")
+        a = tensorplay.tensor(np.zeros((2, 3, 4, 5), dtype=np.float32))
+        b = tensorplay.tensor(np.zeros((3, 4), dtype=np.float32)).to("vulkan")
+        with self.assertRaisesRegex(
+                RuntimeError, "must match the size of tensor"):
+            F.where(condition, a.to("vulkan"), b)
+
+
 if __name__ == "__main__":
     unittest.main()
