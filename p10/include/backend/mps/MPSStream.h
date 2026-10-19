@@ -80,6 +80,11 @@ class P10_API MPSStream {
   MPSCommandBuffer_t commandBuffer();
   MTLComputeCommandEncoder_t commandEncoder();
   void endKernelCoalescing();
+  /// Closes the current encoder and submits the work encoded so far, leaving
+  /// the stream ready to encode the next call. The submission runs on the
+  /// device while the caller still holds the host, so a later wait covers work
+  /// that has already started.
+  void submitEncodedWork();
   void synchronize(SyncType syncType);
 
   /// Device buffer a kernel can use to report an asynchronous validation

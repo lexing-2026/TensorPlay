@@ -613,6 +613,7 @@ std::optional<Tensor> broadcastBinaryShader(
                    static_cast<uint32_t>([pso maxTotalThreadsPerThreadgroup]));
       [encoder dispatchThreads:MTLSizeMake(threads, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(per_group, 1, 1)];
+      stream->submitEncodedWork();
     }
   });
   return output;
@@ -748,6 +749,7 @@ std::optional<Tensor> denseBinaryShader(const std::string& op,
       [encoder setBytes:&span length:sizeof(span) atIndex:3];
       [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(per_group, 1, 1)];
+      stream->submitEncodedWork();
     }
   });
   return output;
@@ -847,6 +849,7 @@ std::optional<Tensor> denseScalarBinaryShader(const std::string& op,
       [encoder setBytes:&span length:sizeof(span) atIndex:3];
       [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(per_group, 1, 1)];
+      stream->submitEncodedWork();
     }
   });
   return output;
@@ -975,6 +978,7 @@ std::optional<Tensor> broadcastTernaryShader(
                    static_cast<uint32_t>([pso maxTotalThreadsPerThreadgroup]));
       [encoder dispatchThreads:MTLSizeMake(threads, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(per_group, 1, 1)];
+      stream->submitEncodedWork();
     }
   });
   return output;
@@ -1042,6 +1046,7 @@ std::optional<Tensor> unaryShader(const std::string& op, const Tensor& self) {
       [encoder setBytes:&span length:sizeof(span) atIndex:2];
       [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(per_group, 1, 1)];
+      stream->submitEncodedWork();
     }
   });
   return output;
@@ -1123,6 +1128,7 @@ std::optional<Tensor> clampShader(const Tensor& self,
       [encoder setBytes:&hi length:sizeof(hi) atIndex:4];
       [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(per_group, 1, 1)];
+      stream->submitEncodedWork();
     }
   });
   return output;
@@ -1726,6 +1732,7 @@ std::optional<Tensor> compareShader(const std::string& op, const Tensor& self,
       }
       [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(per_group, 1, 1)];
+      stream->submitEncodedWork();
     }
   });
   return output;
@@ -1837,6 +1844,7 @@ Tensor whereOp(const Tensor& condition, const Tensor& self,
                              [pso maxTotalThreadsPerThreadgroup]));
               [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
                   threadsPerThreadgroup:MTLSizeMake(per_group, 1, 1)];
+              stream->submitEncodedWork();
             }
           });
           return output;
@@ -1910,6 +1918,7 @@ Tensor whereOp(const Tensor& condition, const Tensor& self,
                              [pso maxTotalThreadsPerThreadgroup]));
               [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
                   threadsPerThreadgroup:MTLSizeMake(per_group, 1, 1)];
+              stream->submitEncodedWork();
             }
           });
           return output;

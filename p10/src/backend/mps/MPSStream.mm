@@ -172,6 +172,11 @@ void MPSStream::endKernelCoalescing() {
   }
 }
 
+void MPSStream::submitEncodedWork() {
+  endKernelCoalescing();
+  commit();
+}
+
 void MPSStream::flush() {
   if (_commandBuffer) {
     [_commandBuffer commit];
