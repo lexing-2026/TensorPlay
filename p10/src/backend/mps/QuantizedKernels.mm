@@ -84,63 +84,6 @@ void quantize_host(const float* input, code_t* codes, int64_t numel,
   }
 }
 
-// Shader dtype suffix used to select int4/int8 kernels.
-std::string scalarToMetalTypeString(DType dtype) {
-  switch (dtype) {
-    case DType::Float32:
-      return "float";
-    case DType::Float16:
-      return "half";
-    case DType::BFloat16:
-      return "bfloat";
-    default:
-      TP_THROW(RuntimeError, "unsupported dtype for Metal shader: ",
-               toString(dtype));
-  }
-}
-
-// Binds a contiguous, offset-0 tensor's storage to a shader buffer slot.
-void set_shader_arg(id<MTLComputeCommandEncoder> encoder, const Tensor& t,
-                    unsigned idx) {
-  const Tensor c = (t.is_contiguous() && t.storage_offset() == 0)
-      ? t : materializeForGraph(t);
-  void* buf = getMTLBufferFromPointer(c.data_ptr());
-  if (!buf) {
-    TP_THROW(RuntimeError,
-             "MPS tensor storage is not managed by the MPS allocator");
-  }
-  [encoder setBuffer:(__bridge id<MTLBuffer>)buf offset:0 atIndex:idx];
-}
-
-void set_shader_arg(id<MTLComputeCommandEncoder> encoder, id<MTLBuffer> val,
-                    unsigned idx) {
-  [encoder setBuffer:val offset:0 atIndex:idx];
-}
-
-template <typename T>
-void set_shader_arg(id<MTLComputeCommandEncoder> encoder, const T& val,
-                     unsigned idx) {
-  [encoder setBytes:&val length:sizeof(T) atIndex:idx];
-}
-
-template <typename T, size_t N>
-void set_shader_arg(id<MTLComputeCommandEncoder> encoder,
-                    const std::array<T, N>& values, unsigned idx) {
-  [encoder setBytes:values.data() length:sizeof(T) * values.size() atIndex:idx];
-}
-
-template <unsigned idx = 0, typename T>
-void mtl_setArgs(id<MTLComputeCommandEncoder> encoder, const T& val) {
-  set_shader_arg(encoder, val, idx);
-}
-
-template <unsigned idx = 0, typename T, typename... Args>
-void mtl_setArgs(id<MTLComputeCommandEncoder> encoder, const T& val,
-                 Args&&... args) {
-  set_shader_arg(encoder, val, idx);
-  mtl_setArgs<idx + 1>(encoder, std::forward<Args>(args)...);
-}
-
 } // namespace
 
 Tensor weight_int8pack_mm_kernel(const Tensor& self, const Tensor& mat2,
