@@ -1536,7 +1536,7 @@ Tensor softplus_kernel_impl(const Tensor& self, const Scalar& beta, const Scalar
         T beta_in_t = static_cast<T>(beta_in);
         return a * beta_in_t > static_cast<T>(threshold_in)
             ? a
-            : static_cast<T>(std::log1p(std::exp(static_cast<M>(a * beta_in_t))) / beta_in);
+            : static_cast<T>(std::log1p(std::exp(static_cast<M>(a * beta_in_t))) / beta_in_t);
     }, vecunary::VOp::Softplus, prm);
 }
 

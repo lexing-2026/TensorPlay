@@ -193,7 +193,7 @@ inline T scalar_apply(VOp op, VParams prm, T x) {
             const T threshold = static_cast<T>(prm.p1);
             return x * beta > threshold
                 ? x
-                : static_cast<T>(std::log1p(std::exp(static_cast<T>(x * beta))) / prm.p0);
+                : static_cast<T>(std::log1p(std::exp(static_cast<T>(x * beta))) / beta);
         }
         case VOp::Hardswish: {
             T xf = x;
@@ -345,6 +345,16 @@ inline __m256 v_elu_f32(__m256 negcoef, __m256 poscoef, __m256 negipt, __m256 x)
     return _mm256_blendv_ps(neg, pos, _mm256_cmp_ps(x, zero, _CMP_GE_OQ));
 }
 
+// softplus takes beta and threshold pre-broadcast for the same reason as
+// v_elu_f32.  The divide stays in the input's own width, which is also what
+// scalar_apply does, so a chunk and its scalar tail agree bit for bit.
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256 v_softplus_f32(__m256 beta, __m256 threshold, __m256 x) {
+    __m256 bx = _mm256_mul_ps(x, beta);
+    __m256 sp = _mm256_div_ps(tensorplay::tpsleef::log1p(tensorplay::tpsleef::exp(bx)), beta);
+    return _mm256_blendv_ps(sp, x, _mm256_cmp_ps(bx, threshold, _CMP_GT_OQ));
+}
+
 // Applies op to one AVX2 float vector.  Always-inline: only ever folded into
 // target-attributed callers below.
 __attribute__((target("avx2,fma"), always_inline))
@@ -442,20 +452,9 @@ inline __m256 apply_f32(VOp op, VParams prm, __m256 x) {
             return v_elu_f32(_mm256_set1_ps(static_cast<float>(prm.p0)),
                              _mm256_set1_ps(static_cast<float>(prm.p1)),
                              _mm256_set1_ps(static_cast<float>(prm.p2)), x);
-        case VOp::Softplus: {
-            // Scalar path: numerator computed in float (log1p(exp(float(x*beta)))),
-            // division by beta in double, one final round back to T.
-            const __m256 beta = _mm256_set1_ps(static_cast<float>(prm.p0));
-            const __m256 threshold = _mm256_set1_ps(static_cast<float>(prm.p1));
-            const __m256d beta_d = _mm256_set1_pd(prm.p0);
-            __m256 bx = _mm256_mul_ps(x, beta);
-            __m256 numf = tensorplay::tpsleef::log1p(tensorplay::tpsleef::exp(bx));
-            __m256d lo_d = _mm256_div_pd(_mm256_cvtps_pd(_mm256_castps256_ps128(numf)), beta_d);
-            __m256d hi_d = _mm256_div_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(numf, 1)), beta_d);
-            __m256 sp = _mm256_insertf128_ps(_mm256_castps128_ps256(_mm256_cvtpd_ps(lo_d)),
-                                             _mm256_cvtpd_ps(hi_d), 1);
-            return _mm256_blendv_ps(sp, x, _mm256_cmp_ps(bx, threshold, _CMP_GT_OQ));
-        }
+        case VOp::Softplus:
+            return v_softplus_f32(_mm256_set1_ps(static_cast<float>(prm.p0)),
+                                  _mm256_set1_ps(static_cast<float>(prm.p1)), x);
         case VOp::Hardswish: {
             const __m256 three = _mm256_set1_ps(3.0f);
             const __m256 six = _mm256_set1_ps(6.0f);
@@ -576,6 +575,15 @@ static void f32_chunk_avx2(VOp op, VParams prm, const float* src, float* dst, in
             }
             break;
         }
+        case VOp::Softplus: {
+            const __m256 beta = _mm256_set1_ps(static_cast<float>(prm.p0));
+            const __m256 threshold = _mm256_set1_ps(static_cast<float>(prm.p1));
+            for (; i + 8 <= n; i += 8) {
+                __m256 x = _mm256_loadu_ps(s + i);
+                _mm256_storeu_ps(d + i, v_softplus_f32(beta, threshold, x));
+            }
+            break;
+        }
         default:
             for (; i + 8 <= n; i += 8) {
                 __m256 x = _mm256_loadu_ps(s + i);
@@ -600,6 +608,13 @@ inline __m256d v_elu_f64(__m256d negcoef, __m256d poscoef, __m256d negipt, __m25
     __m256d neg = _mm256_mul_pd(tensorplay::tpsleef::expm1(scaled), negcoef);
     __m256d pos = _mm256_mul_pd(x, poscoef);
     return _mm256_blendv_pd(neg, pos, _mm256_cmp_pd(x, zero, _CMP_GE_OQ));
+}
+
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256d v_softplus_f64(__m256d beta, __m256d threshold, __m256d x) {
+    __m256d bx = _mm256_mul_pd(x, beta);
+    __m256d sp = _mm256_div_pd(tensorplay::tpsleef::log1p(tensorplay::tpsleef::exp(bx)), beta);
+    return _mm256_blendv_pd(sp, x, _mm256_cmp_pd(bx, threshold, _CMP_GT_OQ));
 }
 
 __attribute__((target("avx2,fma"), always_inline))
@@ -679,14 +694,8 @@ inline __m256d apply_f64(VOp op, VParams prm, __m256d x) {
         case VOp::Elu:
             return v_elu_f64(_mm256_set1_pd(prm.p0), _mm256_set1_pd(prm.p1),
                              _mm256_set1_pd(prm.p2), x);
-        case VOp::Softplus: {
-            const __m256d beta = _mm256_set1_pd(prm.p0);
-            const __m256d threshold = _mm256_set1_pd(prm.p1);
-            __m256d bt = _mm256_mul_pd(x, beta);
-            __m256d num = tensorplay::tpsleef::log1p(tensorplay::tpsleef::exp(bt));
-            __m256d sp = _mm256_div_pd(num, beta);
-            return _mm256_blendv_pd(sp, x, _mm256_cmp_pd(bt, threshold, _CMP_GT_OQ));
-        }
+        case VOp::Softplus:
+            return v_softplus_f64(_mm256_set1_pd(prm.p0), _mm256_set1_pd(prm.p1), x);
         case VOp::Hardswish: {
             const __m256d three = _mm256_set1_pd(3.0);
             const __m256d six = _mm256_set1_pd(6.0);
@@ -803,6 +812,15 @@ static void f64_chunk_avx2(VOp op, VParams prm, const double* src, double* dst, 
             }
             break;
         }
+        case VOp::Softplus: {
+            const __m256d beta = _mm256_set1_pd(prm.p0);
+            const __m256d threshold = _mm256_set1_pd(prm.p1);
+            for (; i + 4 <= n; i += 4) {
+                __m256d x = _mm256_loadu_pd(s + i);
+                _mm256_storeu_pd(d + i, v_softplus_f64(beta, threshold, x));
+            }
+            break;
+        }
         default:
             for (; i + 4 <= n; i += 4) {
                 __m256d x = _mm256_loadu_pd(s + i);
@@ -889,17 +907,6 @@ inline __m512d v_lgamma_pos_f64_512(__m512d x) {
     return _mm512_sub_pd(res, _mm512_maskz_mov_pd(small, tensorplay::tpsleef::log(x)));
 }
 
-// Softplus: numerator stays float; the /beta happens in double with one
-// final round back to float, matching scalar_apply's mixed precision.
-__attribute__((target("avx512f,avx512dq"), always_inline))
-inline __m256 softplus_div_beta_8(__m256 v8, double beta) {
-    const __m512d beta_d8 = _mm512_set1_pd(beta);
-    __m512d w8 = _mm512_div_pd(_mm512_cvtps_pd(v8), beta_d8);
-    __m128 flo = _mm256_cvtpd_ps(_mm512_castpd512_pd256(w8));
-    __m128 fhi = _mm256_cvtpd_ps(_mm512_extractf64x4_pd(w8, 1));
-    return _mm256_insertf128_ps(_mm256_castps128_ps256(flo), fhi, 1);
-}
-
 // rcp14 seeds at <=2^-14; one NR step reaches ~2^-28, i.e. float-exact for
 // the sigmoid/silu denominators seen here.
 __attribute__((target("avx512f"), always_inline))
@@ -967,6 +974,14 @@ inline __m512 v_elu_f32_512(__m512 negcoef, __m512 poscoef, __m512 negipt, __m51
     __m512 neg = _mm512_mul_ps(tensorplay::tpsleef::expm1(scaled), negcoef);
     __m512 pos = _mm512_mul_ps(x, poscoef);
     return _mm512_mask_mov_ps(neg, _mm512_cmp_ps_mask(x, zero, _CMP_GE_OQ), pos);
+}
+
+// 512-bit twin of v_softplus_f32; same reason for the coefficient arguments.
+__attribute__((target("avx512f,avx512dq"), always_inline))
+inline __m512 v_softplus_f32_512(__m512 beta, __m512 threshold, __m512 x) {
+    __m512 bx = _mm512_mul_ps(x, beta);
+    __m512 sp = _mm512_div_ps(tensorplay::tpsleef::log1p(tensorplay::tpsleef::exp(bx)), beta);
+    return _mm512_mask_mov_ps(sp, _mm512_cmp_ps_mask(bx, threshold, _CMP_GT_OQ), x);
 }
 
 __attribute__((target("avx512f,avx512dq"), always_inline))
@@ -1061,18 +1076,9 @@ inline __m512 apply16_f32(VOp op, VParams prm, __m512 x) {
             return v_elu_f32_512(_mm512_set1_ps(static_cast<float>(prm.p0)),
                                  _mm512_set1_ps(static_cast<float>(prm.p1)),
                                  _mm512_set1_ps(static_cast<float>(prm.p2)), x);
-        case VOp::Softplus: {
-            // Scalar path: numerator computed in float (log1p(exp(float(x*beta)))),
-            // division by beta in double, one final round back to T.
-            const __m512 beta = _mm512_set1_ps(static_cast<float>(prm.p0));
-            const __m512 threshold = _mm512_set1_ps(static_cast<float>(prm.p1));
-            __m512 bx = _mm512_mul_ps(x, beta);
-            __m512 numf = tensorplay::tpsleef::log1p(tensorplay::tpsleef::exp(bx));
-            __m256 sp_lo = softplus_div_beta_8(_mm512_castps512_ps256(numf), prm.p0);
-            __m256 sp_hi = softplus_div_beta_8(_mm512_extractf32x8_ps(numf, 1), prm.p0);
-            __m512 sp = _mm512_insertf32x8(_mm512_castps256_ps512(sp_lo), sp_hi, 1);
-            return _mm512_mask_mov_ps(sp, _mm512_cmp_ps_mask(bx, threshold, _CMP_GT_OQ), x);
-        }
+        case VOp::Softplus:
+            return v_softplus_f32_512(_mm512_set1_ps(static_cast<float>(prm.p0)),
+                                      _mm512_set1_ps(static_cast<float>(prm.p1)), x);
         case VOp::Hardswish: {
             const __m512 three = _mm512_set1_ps(3.0f);
             const __m512 six = _mm512_set1_ps(6.0f);
@@ -1188,6 +1194,15 @@ static void f32_chunk_avx512(VOp op, VParams prm, const float* src, float* dst, 
             for (; i + 16 <= n; i += 16) {
                 __m512 x = _mm512_loadu_ps(s + i);
                 _mm512_storeu_ps(d + i, v_elu_f32_512(negcoef, poscoef, negipt, x));
+            }
+            break;
+        }
+        case VOp::Softplus: {
+            const __m512 beta = _mm512_set1_ps(static_cast<float>(prm.p0));
+            const __m512 threshold = _mm512_set1_ps(static_cast<float>(prm.p1));
+            for (; i + 16 <= n; i += 16) {
+                __m512 x = _mm512_loadu_ps(s + i);
+                _mm512_storeu_ps(d + i, v_softplus_f32_512(beta, threshold, x));
             }
             break;
         }
