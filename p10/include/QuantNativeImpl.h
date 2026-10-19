@@ -1230,7 +1230,6 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, QuantNative) {
     m.impl("quantized_cat", TP_QN_DETAIL::cat_plain);
     m.impl("quantized_cat_relu", TP_QN_DETAIL::cat_rectified);
     m.impl("quantized_max_pool1d", TP_QN_DETAIL::max_pool);
-    m.impl("quantized_max_pool3d", TP_QN_DETAIL::max_pool);
 #else
 TENSORPLAY_LIBRARY_IMPL(CPU, QuantNative) {
     m.impl("fbgemm_pack_quantized_matrix.KN", TP_QN_DETAIL::legacy_integer_pack_sizes);
