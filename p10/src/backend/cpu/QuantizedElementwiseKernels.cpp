@@ -111,7 +111,7 @@ void subbyte_pack(const float* input,uint8_t* output,int64_t size,float inverse,
         alignas(64) float codes[lanes];
         const V code=(V::loadu(input+i)*inv).round()+zero_point;
         const V valid=(code>=limit.neg())&(code<limit);
-        V::blendv(lo,vec::minimum(hi,vec::maximum(lo,code)),valid).store(codes);
+        V::blendv(lo,vec::clamp_max(vec::clamp_min(code,lo),hi),valid).store(codes);
         for (int c=0;c<lanes;c+=pack) {
             uint8_t value=0;
             for (int j=0;j<pack;++j) value|=static_cast<uint8_t>(codes[c+j])<<(j*Bits);
@@ -275,8 +275,9 @@ void linear_epilogue_codes(const int32_t* raw, const int64_t* offsets,
                 * vec::convert<double>(FV::loadu(scales + n, lanes));
             if (bias) value = value + vec::convert<double>(FV::loadu(bias + n, lanes));
             if (activation == 1) value = DV::blendv(value * negative_slope, value, value >= zero);
-            if (relu) value = vec::maximum(value, zero);
-            const DV codes = vec::minimum(maximum, vec::maximum(minimum, (value / output_scale).round() + output_zero));
+            if (relu) value = vec::clamp_min(value, zero);
+            const DV rounded = (value / output_scale).round() + output_zero;
+            const DV codes = vec::clamp_min(vec::clamp_max(rounded, maximum), minimum);
             alignas(64) double values[lanes];
             codes.store(values);
             for (int lane = 0; lane < lanes; ++lane) code_output[n + lane] = static_cast<X>(values[lane]);
@@ -337,7 +338,7 @@ void recurrent_step_impl(const float* input,const float* recurrent,const float* 
                 value=(V::loadu(hidden+state+col,count)-candidate)*update+candidate;
             } else {
                 value=a(0)+b(0);
-                value=mode==0 ? vec::maximum(value,zero) : value.tanh();
+                value=mode==0 ? vec::clamp_min(value,zero) : value.tanh();
             }
             value.store(hy+state+col,count);
         }
@@ -743,7 +744,7 @@ void batch_norm_codes(const void* xx, void* yy, int64_t channels,
         for (size_t j = 0; j < values.size(); ++j) {
             const int64_t offset = c + j * FV::size();
             values[j] = vec::fmadd(FV::loadu(alpha+offset), values[j], FV::loadu(beta+offset));
-            if (relu) values[j] = vec::maximum(values[j], zero);
+            if (relu) values[j] = vec::clamp_min(values[j], zero);
         }
         QV::quantize(values, 1.f, yz, 1.f).store(y+c);
     }
@@ -1136,7 +1137,7 @@ void pool_channels_last_codes(const void* input, void* output, int64_t first, in
                     }
             alignas(64) float codes[block];
             for (int v = 0; v < vectors; ++v)
-                vec::minimum(hi, vec::maximum(lo, (vec::convert<float>(sums[v]) * inverse + zero).round())).store(codes + v * lanes);
+                vec::clamp_max(vec::clamp_min((vec::convert<float>(sums[v]) * inverse + zero).round(), lo), hi).store(codes + v * lanes);
             for (int c = 0; c < vectors * lanes; ++c) dst[channel + c] = static_cast<T>(codes[c]);
             channel += vectors * lanes;
         }
@@ -1267,7 +1268,7 @@ void spatial_mean_codes(const void* input, void* output, int64_t count, int64_t 
     };
     auto store = [&](int64_t channel, V total) {
         alignas(64) float values[lanes];
-        vec::maximum(lower, vec::minimum(upper, ((total / divisor) * inverse + zero).round())).store(values);
+        vec::clamp_min(vec::clamp_max(((total / divisor) * inverse + zero).round(), upper), lower).store(values);
         for (int lane = 0; lane < lanes; ++lane) y[channel + lane] = static_cast<T>(values[lane]);
     };
     auto scalar_load = [&](int64_t spatial, int64_t channel) {
@@ -1473,7 +1474,7 @@ void float_prelu_codes(const void* input, const float* weight, uint8_t* y, int64
         const V slope = scalar_weight ? V(weight[0]) : V::loadu(weight + i);
         const V value = V::blendv(input_value * slope, input_value, input_value > zero);
         const V rounded = (value * inv + offset).round();
-        V::blendv(vec::minimum(V(255.f), vec::maximum(zero, rounded)), V(255.f),
+        V::blendv(vec::clamp_max(vec::clamp_min(rounded, zero), V(255.f)), V(255.f),
                   rounded != rounded).store(result);
         for (int lane = 0; lane < V::size(); ++lane) y[i + lane] = static_cast<uint8_t>(result[lane]);
     }
@@ -1808,7 +1809,7 @@ void rowwise_pack_rows(const float* input, const float* ranges, uint8_t* output,
 #endif
                 for (; col + lanes <= columns; col += lanes) {
                     V values = ((V::loadu(src + col) - V(lo)) * V(inverse)).round();
-                    values = vec::minimum(V(static_cast<float>((1 << Bits) - 1)), vec::maximum(V(0.f), values));
+                    values = vec::clamp_max(vec::clamp_min(values, V(0.f)), V(static_cast<float>((1 << Bits) - 1)));
                     values.store(codes);
                     for (int lane = 0; lane < lanes; lane += values_per_byte) {
                         uint8_t packed = 0;
