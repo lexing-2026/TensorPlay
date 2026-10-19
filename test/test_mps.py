@@ -148,12 +148,15 @@ class TestMPSArithmetic(unittest.TestCase):
         b = tp.arange(3 * 8, dtype=tp.float32).reshape(1, 3, 8) + 1.0
         c = tp.arange(4 * 3 * 8, dtype=tp.float32).reshape(4, 3, 8) / 8.0 + 0.5
         am, bm, cm = a.to("mps"), b.to("mps"), c.to("mps")
+        # One element cancels to exact zero in the reference evaluation, and
+        # the shader's fast-math rounding leaves a float-wide residue there, so
+        # the comparison allows one float epsilon at these magnitudes.
         self.assertTrue(tp.allclose(
             tp.addcmul(am, bm, cm, value=0.5).cpu(),
-            tp.addcmul(a, b, c, value=0.5)))
+            tp.addcmul(a, b, c, value=0.5), rtol=1e-5, atol=1e-5))
         self.assertTrue(tp.allclose(
             tp.addcdiv(am, bm, cm, value=0.5).cpu(),
-            tp.addcdiv(a, b, c, value=0.5)))
+            tp.addcdiv(a, b, c, value=0.5), rtol=1e-5, atol=1e-5))
 
     def test_broadcast_ops_other_inner_size(self):
         # An innermost size that is not a multiple of the run width takes the
