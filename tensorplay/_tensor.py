@@ -447,8 +447,8 @@ Tensor.amin = amin
 
 
 def count_nonzero(self, dim=None):
-    nz = self.ne(0).to(_C.DType.int64)
-    return nz.sum() if dim is None else nz.sum(dim=dim)
+    from . import functional
+    return functional.count_nonzero(self, [] if dim is None else dim)
 
 
 Tensor.count_nonzero = count_nonzero
