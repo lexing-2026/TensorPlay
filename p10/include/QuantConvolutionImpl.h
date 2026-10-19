@@ -63,29 +63,57 @@ struct ConvCodes {
 // location and tap counts would outgrow a sane scratch size.
 constexpr int64_t kConvGatherLimit = 1 << 20;
 
+// One thread-pool chunk should hold roughly this many table entries.
+constexpr int64_t kConvTapChunkEntries = 4096;
+
+// An axis contributes an offset set only by its own output coordinate and its
+// own kernel position, so resolving all of those once leaves each tap a sum of
+// three loads instead of a fresh coordinate derivation. A coordinate outside the
+// input keeps -1, a value no in-range offset can take because every one of them
+// is non-negative, and a tap lies inside exactly when none of its three axes do.
 std::vector<int32_t> build_conv_taps(const ConvGeometry& g, int64_t reuse) {
     std::vector<int32_t> table;
     if (reuse <= 1 || g.output_spatial * g.kernel_spatial > kConvGatherLimit ||
         g.input_spatial > (1LL << 31) - 1) return table;
+    std::vector<int32_t> axis[3];
+    int64_t multiplier = 1;
+    for (int d = 2; d >= 0; --d) {
+        axis[d].resize(g.out[d] * g.kernel[d]);
+        for (int64_t coordinate = 0; coordinate < g.out[d]; ++coordinate)
+            for (int64_t place = 0; place < g.kernel[d]; ++place) {
+                int64_t address;
+                if (g.transposed) {
+                    const int64_t numerator = coordinate + g.pad[d] - place * g.dilation[d];
+                    address = numerator % g.stride[d] == 0 ? numerator / g.stride[d] : -1;
+                } else address = coordinate * g.stride[d] - g.pad[d] + place * g.dilation[d];
+                axis[d][coordinate * g.kernel[d] + place] =
+                    address >= 0 && address < g.in[d] ? static_cast<int32_t>(address * multiplier) : -1;
+            }
+        multiplier *= g.in[d];
+    }
     table.resize(g.output_spatial * g.kernel_spatial);
-    parallel::parallel_for(0, g.output_spatial, 1024, [&](int64_t first, int64_t last) {
+    // A chunk spans locations, each holding one entry per tap, so a small layout
+    // stays on one thread instead of splitting into rows of a handful of entries.
+    parallel::parallel_for(0, g.output_spatial,
+        std::max<int64_t>(1, kConvTapChunkEntries / g.kernel_spatial), [&](int64_t first, int64_t last) {
         for (int64_t out_pos = first; out_pos < last; ++out_pos) {
-            int64_t p = out_pos, coordinate[3]{};
-            for (int d = 2; d >= 0; --d) { coordinate[d] = p % g.out[d]; p /= g.out[d]; }
-            for (int64_t kp = 0; kp < g.kernel_spatial; ++kp) {
-                int64_t k = kp, pos = 0, multiplier = 1; bool inside = true;
-                for (int d = 2; d >= 0; --d) {
-                    const int64_t kernel_coord = k % g.kernel[d]; k /= g.kernel[d];
-                    int64_t address;
-                    if (g.transposed) {
-                        const int64_t numerator = coordinate[d] + g.pad[d] - kernel_coord * g.dilation[d];
-                        inside = inside && numerator % g.stride[d] == 0;
-                        address = numerator / g.stride[d];
-                    } else address = coordinate[d] * g.stride[d] - g.pad[d] + kernel_coord * g.dilation[d];
-                    inside = inside && address >= 0 && address < g.in[d];
-                    pos += address * multiplier; multiplier *= g.in[d];
+            int64_t p = out_pos;
+            const int32_t* row[3];
+            for (int d = 2; d >= 0; --d) {
+                const int64_t coordinate = p % g.out[d]; p /= g.out[d];
+                row[d] = axis[d].data() + coordinate * g.kernel[d];
+            }
+            int32_t* write = table.data() + out_pos * g.kernel_spatial;
+            for (int64_t a = 0; a < g.kernel[0]; ++a) {
+                const int32_t outer = row[0][a];
+                for (int64_t b = 0; b < g.kernel[1]; ++b) {
+                    const int32_t middle = row[1][b];
+                    const int32_t pair = (outer | middle) < 0 ? -1 : outer + middle;
+                    for (int64_t c = 0; c < g.kernel[2]; ++c) {
+                        const int32_t inner = row[2][c];
+                        *write++ = (pair | inner) < 0 ? -1 : pair + inner;
+                    }
                 }
-                table[out_pos * g.kernel_spatial + kp] = inside ? static_cast<int32_t>(pos) : -1;
             }
         }
     });
