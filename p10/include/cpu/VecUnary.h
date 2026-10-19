@@ -483,23 +483,101 @@ inline __m256 apply_f32(VOp op, VParams prm, __m256 x) {
     }
 }
 
+// One branch per chunk instead of one per vector.  The cheap ops are one or
+// two instructions wide, so an op test inside the loop costs more than their
+// arithmetic; transcendentals and composites keep the generic loop, where the
+// polynomial work dominates the dispatch either way.
+#define TP_F32_SIMPLE_LOOP_8(EXPR)                                       \
+    {                                                                    \
+        for (; i + 32 <= n; i += 32) {                                   \
+            __m256 x = _mm256_loadu_ps(s + i);                           \
+            _mm256_storeu_ps(d + i, (EXPR));                             \
+            x = _mm256_loadu_ps(s + i + 8);                              \
+            _mm256_storeu_ps(d + i + 8, (EXPR));                          \
+            x = _mm256_loadu_ps(s + i + 16);                             \
+            _mm256_storeu_ps(d + i + 16, (EXPR));                         \
+            x = _mm256_loadu_ps(s + i + 24);                             \
+            _mm256_storeu_ps(d + i + 24, (EXPR));                         \
+        }                                                                \
+        for (; i + 8 <= n; i += 8) {                                     \
+            __m256 x = _mm256_loadu_ps(s + i);                           \
+            _mm256_storeu_ps(d + i, (EXPR));                             \
+        }                                                                \
+    }
+
 __attribute__((target("avx2,fma"), noinline))
 static void f32_chunk_avx2(VOp op, VParams prm, const float* src, float* dst, int64_t b, int64_t e) {
-    src += b;
-    dst += b;
-    int64_t n = e - b;
+    const float* s = src + b;
+    float* d = dst + b;
+    const int64_t n = e - b;
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 zero = _mm256_setzero_ps();
+    const __m256 signbit = _mm256_set1_ps(kSignBitF);
     int64_t i = 0;
-    for (; i + 8 <= n; i += 8) {
-        __m256 x = _mm256_loadu_ps(src + i);
-        if (op == VOp::Lgamma && _mm256_movemask_ps(_mm256_cmp_ps(x, _mm256_setzero_ps(), _CMP_LE_OQ))) {
-            // Non-positive lane (or NaN): scalar fallback keeps the exact
-            // reflection-domain behaviour of std::lgamma.
-            for (int64_t j = i; j < i + 8; ++j) dst[j] = scalar_apply(op, prm, src[j]);
-        } else {
-            _mm256_storeu_ps(dst + i, apply_f32(op, prm, x));
+    switch (op) {
+        case VOp::Abs:
+            TP_F32_SIMPLE_LOOP_8(_mm256_andnot_ps(signbit, x));
+            break;
+        case VOp::Neg:
+            TP_F32_SIMPLE_LOOP_8(_mm256_xor_ps(x, signbit));
+            break;
+        case VOp::Sign:
+            TP_F32_SIMPLE_LOOP_8(
+                _mm256_sub_ps(_mm256_and_ps(_mm256_cmp_ps(x, zero, _CMP_GT_OQ), one),
+                              _mm256_and_ps(_mm256_cmp_ps(x, zero, _CMP_LT_OQ), one)));
+            break;
+        case VOp::Square:
+            TP_F32_SIMPLE_LOOP_8(_mm256_mul_ps(x, x));
+            break;
+        case VOp::Reciprocal:
+            TP_F32_SIMPLE_LOOP_8(_mm256_div_ps(one, x));
+            break;
+        case VOp::Sqrt:
+            TP_F32_SIMPLE_LOOP_8(_mm256_sqrt_ps(x));
+            break;
+        case VOp::Rsqrt:
+            TP_F32_SIMPLE_LOOP_8(_mm256_div_ps(one, _mm256_sqrt_ps(x)));
+            break;
+        case VOp::Floor:
+            TP_F32_SIMPLE_LOOP_8(_mm256_floor_ps(x));
+            break;
+        case VOp::Ceil:
+            TP_F32_SIMPLE_LOOP_8(_mm256_ceil_ps(x));
+            break;
+        case VOp::Trunc:
+            TP_F32_SIMPLE_LOOP_8(_mm256_round_ps(x, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC));
+            break;
+        case VOp::Round:
+            TP_F32_SIMPLE_LOOP_8(_mm256_round_ps(x, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+            break;
+        case VOp::Frac:
+            TP_F32_SIMPLE_LOOP_8(
+                _mm256_sub_ps(x, _mm256_round_ps(x, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC)));
+            break;
+        case VOp::Relu:
+            TP_F32_SIMPLE_LOOP_8(_mm256_max_ps(zero, x));  // NaN propagates (second operand wins)
+            break;
+        case VOp::Hardtanh: {
+            const __m256 lo = _mm256_set1_ps(static_cast<float>(prm.p0));
+            const __m256 hi = _mm256_set1_ps(static_cast<float>(prm.p1));
+            TP_F32_SIMPLE_LOOP_8(_mm256_min_ps(_mm256_max_ps(x, lo), hi));
+            break;
         }
+        default:
+            for (; i + 8 <= n; i += 8) {
+                __m256 x = _mm256_loadu_ps(s + i);
+                if (op == VOp::Lgamma && _mm256_movemask_ps(_mm256_cmp_ps(x, zero, _CMP_LE_OQ))) {
+                    // Non-positive lane (or NaN): scalar fallback keeps the exact
+                    // reflection-domain behaviour of std::lgamma.
+                    for (int64_t j = i; j < i + 8; ++j) d[j] = scalar_apply(op, prm, s[j]);
+                } else {
+                    _mm256_storeu_ps(d + i, apply_f32(op, prm, x));
+                }
+            }
+            break;
     }
-    for (; i < n; ++i) dst[i] = scalar_apply(op, prm, src[i]);
+#undef TP_F32_SIMPLE_LOOP_8
+    for (; i < n; ++i) d[i] = scalar_apply(op, prm, s[i]);
 }
 
 __attribute__((target("avx2,fma"), always_inline))
@@ -630,21 +708,95 @@ inline __m256d apply_f64(VOp op, VParams prm, __m256d x) {
     }
 }
 
+#define TP_F64_SIMPLE_LOOP_4(EXPR)                                        \
+    {                                                                     \
+        for (; i + 16 <= n; i += 16) {                                    \
+            __m256d x = _mm256_loadu_pd(s + i);                           \
+            _mm256_storeu_pd(d + i, (EXPR));                              \
+            x = _mm256_loadu_pd(s + i + 4);                               \
+            _mm256_storeu_pd(d + i + 4, (EXPR));                          \
+            x = _mm256_loadu_pd(s + i + 8);                               \
+            _mm256_storeu_pd(d + i + 8, (EXPR));                          \
+            x = _mm256_loadu_pd(s + i + 12);                              \
+            _mm256_storeu_pd(d + i + 12, (EXPR));                         \
+        }                                                                 \
+        for (; i + 4 <= n; i += 4) {                                      \
+            __m256d x = _mm256_loadu_pd(s + i);                           \
+            _mm256_storeu_pd(d + i, (EXPR));                              \
+        }                                                                 \
+    }
+
 __attribute__((target("avx2,fma"), noinline))
 static void f64_chunk_avx2(VOp op, VParams prm, const double* src, double* dst, int64_t b, int64_t e) {
-    src += b;
-    dst += b;
-    int64_t n = e - b;
+    const double* s = src + b;
+    double* d = dst + b;
+    const int64_t n = e - b;
+    const __m256d one = _mm256_set1_pd(1.0);
+    const __m256d zero = _mm256_setzero_pd();
+    const __m256d signbit = _mm256_set1_pd(-0.0);
     int64_t i = 0;
-    for (; i + 4 <= n; i += 4) {
-        __m256d x = _mm256_loadu_pd(src + i);
-        if (op == VOp::Lgamma && _mm256_movemask_pd(_mm256_cmp_pd(x, _mm256_setzero_pd(), _CMP_LE_OQ))) {
-            for (int64_t j = i; j < i + 4; ++j) dst[j] = scalar_apply(op, prm, src[j]);
-        } else {
-            _mm256_storeu_pd(dst + i, apply_f64(op, prm, x));
+    switch (op) {
+        case VOp::Abs:
+            TP_F64_SIMPLE_LOOP_4(_mm256_andnot_pd(signbit, x));
+            break;
+        case VOp::Neg:
+            TP_F64_SIMPLE_LOOP_4(_mm256_xor_pd(x, signbit));
+            break;
+        case VOp::Sign:
+            TP_F64_SIMPLE_LOOP_4(
+                _mm256_sub_pd(_mm256_and_pd(_mm256_cmp_pd(x, zero, _CMP_GT_OQ), one),
+                              _mm256_and_pd(_mm256_cmp_pd(x, zero, _CMP_LT_OQ), one)));
+            break;
+        case VOp::Square:
+            TP_F64_SIMPLE_LOOP_4(_mm256_mul_pd(x, x));
+            break;
+        case VOp::Reciprocal:
+            TP_F64_SIMPLE_LOOP_4(_mm256_div_pd(one, x));
+            break;
+        case VOp::Sqrt:
+            TP_F64_SIMPLE_LOOP_4(_mm256_sqrt_pd(x));
+            break;
+        case VOp::Rsqrt:
+            TP_F64_SIMPLE_LOOP_4(_mm256_div_pd(one, _mm256_sqrt_pd(x)));
+            break;
+        case VOp::Floor:
+            TP_F64_SIMPLE_LOOP_4(_mm256_floor_pd(x));
+            break;
+        case VOp::Ceil:
+            TP_F64_SIMPLE_LOOP_4(_mm256_ceil_pd(x));
+            break;
+        case VOp::Trunc:
+            TP_F64_SIMPLE_LOOP_4(_mm256_round_pd(x, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC));
+            break;
+        case VOp::Round:
+            TP_F64_SIMPLE_LOOP_4(_mm256_round_pd(x, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+            break;
+        case VOp::Frac:
+            TP_F64_SIMPLE_LOOP_4(
+                _mm256_sub_pd(x, _mm256_round_pd(x, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC)));
+            break;
+        case VOp::Relu:
+            TP_F64_SIMPLE_LOOP_4(_mm256_max_pd(zero, x));
+            break;
+        case VOp::Hardtanh: {
+            const __m256d lo = _mm256_set1_pd(prm.p0);
+            const __m256d hi = _mm256_set1_pd(prm.p1);
+            TP_F64_SIMPLE_LOOP_4(_mm256_min_pd(_mm256_max_pd(x, lo), hi));
+            break;
         }
+        default:
+            for (; i + 4 <= n; i += 4) {
+                __m256d x = _mm256_loadu_pd(s + i);
+                if (op == VOp::Lgamma && _mm256_movemask_pd(_mm256_cmp_pd(x, zero, _CMP_LE_OQ))) {
+                    for (int64_t j = i; j < i + 4; ++j) d[j] = scalar_apply(op, prm, s[j]);
+                } else {
+                    _mm256_storeu_pd(d + i, apply_f64(op, prm, x));
+                }
+            }
+            break;
     }
-    for (; i < n; ++i) dst[i] = scalar_apply(op, prm, src[i]);
+#undef TP_F64_SIMPLE_LOOP_4
+    for (; i < n; ++i) d[i] = scalar_apply(op, prm, s[i]);
 }
 
 // Reduced-precision dtypes widen to f32, run the same kernels, narrow back.
@@ -934,35 +1086,109 @@ inline __m512 apply16_f32(VOp op, VParams prm, __m512 x) {
     }
 }
 
+#define TP_F32_SIMPLE_LOOP_16(EXPR)                                       \
+    {                                                                     \
+        for (; i + 64 <= n; i += 64) {                                    \
+            __m512 x = _mm512_loadu_ps(s + i);                            \
+            _mm512_storeu_ps(d + i, (EXPR));                              \
+            x = _mm512_loadu_ps(s + i + 16);                              \
+            _mm512_storeu_ps(d + i + 16, (EXPR));                         \
+            x = _mm512_loadu_ps(s + i + 32);                              \
+            _mm512_storeu_ps(d + i + 32, (EXPR));                         \
+            x = _mm512_loadu_ps(s + i + 48);                              \
+            _mm512_storeu_ps(d + i + 48, (EXPR));                         \
+        }                                                                 \
+        for (; i + 16 <= n; i += 16) {                                    \
+            __m512 x = _mm512_loadu_ps(s + i);                            \
+            _mm512_storeu_ps(d + i, (EXPR));                              \
+        }                                                                 \
+    }
+
 __attribute__((target("avx512f,avx512dq"), noinline))
 static void f32_chunk_avx512(VOp op, VParams prm, const float* src, float* dst, int64_t b, int64_t e) {
-    src += b;
-    dst += b;
-    int64_t n = e - b;
+    const float* s = src + b;
+    float* d = dst + b;
+    const int64_t n = e - b;
+    const __m512 one = _mm512_set1_ps(1.0f);
+    const __m512 zero = _mm512_setzero_ps();
+    const __m512 signbit = _mm512_set1_ps(kSignBitF512);
+    const __m512 minus_one = _mm512_set1_ps(-1.0f);
     int64_t i = 0;
-    for (; i + 16 <= n; i += 16) {
-        __m512 x = _mm512_loadu_ps(src + i);
-        if (op == VOp::Lgamma && _mm512_cmplt_ps_mask(x, _mm512_setzero_ps())) {
-            for (int64_t j = i; j < i + 16; ++j) dst[j] = scalar_apply(op, prm, src[j]);
-        } else if (op == VOp::Square) {
-            _mm512_storeu_ps(dst + i, _mm512_mul_ps(x, x));
-        } else if (op == VOp::GeluNone) {
-            const __m512 z = _mm512_mul_ps(
-                _mm512_set1_ps(0.7071067811865476f), x);
-            const __m512 az = _mm512_andnot_ps(
-                _mm512_set1_ps(kSignBitF512), z);
-            const __mmask16 core = _mm512_cmp_ps_mask(
-                az, _mm512_set1_ps(1.5f), _CMP_LE_OQ);
-            if (core == static_cast<__mmask16>(0xffff)) {
-                _mm512_storeu_ps(dst + i, gelu_poly_f32_512(x));
-            } else {
-                _mm512_storeu_ps(dst + i, apply16_f32(op, prm, x));
-            }
-        } else {
-            _mm512_storeu_ps(dst + i, apply16_f32(op, prm, x));
+    switch (op) {
+        case VOp::Abs:
+            TP_F32_SIMPLE_LOOP_16(_mm512_andnot_ps(signbit, x));
+            break;
+        case VOp::Neg:
+            TP_F32_SIMPLE_LOOP_16(_mm512_xor_ps(x, signbit));
+            break;
+        case VOp::Sign:
+            TP_F32_SIMPLE_LOOP_16(
+                _mm512_mask_mov_ps(
+                    _mm512_mask_mov_ps(zero, _mm512_cmp_ps_mask(x, zero, _CMP_LT_OQ), minus_one),
+                    _mm512_cmp_ps_mask(x, zero, _CMP_GT_OQ), one));
+            break;
+        case VOp::Square:
+            TP_F32_SIMPLE_LOOP_16(_mm512_mul_ps(x, x));
+            break;
+        case VOp::Reciprocal:
+            TP_F32_SIMPLE_LOOP_16(_mm512_div_ps(one, x));
+            break;
+        case VOp::Sqrt:
+            TP_F32_SIMPLE_LOOP_16(_mm512_sqrt_ps(x));
+            break;
+        case VOp::Rsqrt:
+            TP_F32_SIMPLE_LOOP_16(_mm512_div_ps(one, _mm512_sqrt_ps(x)));
+            break;
+        case VOp::Floor:
+            TP_F32_SIMPLE_LOOP_16(_mm512_floor_ps(x));
+            break;
+        case VOp::Ceil:
+            TP_F32_SIMPLE_LOOP_16(_mm512_ceil_ps(x));
+            break;
+        case VOp::Trunc:
+            TP_F32_SIMPLE_LOOP_16(_mm512_roundscale_ps(x, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC));
+            break;
+        case VOp::Round:
+            TP_F32_SIMPLE_LOOP_16(_mm512_roundscale_ps(x, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+            break;
+        case VOp::Frac:
+            TP_F32_SIMPLE_LOOP_16(
+                _mm512_sub_ps(x, _mm512_roundscale_ps(x, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC)));
+            break;
+        case VOp::Relu:
+            TP_F32_SIMPLE_LOOP_16(_mm512_max_ps(zero, x));
+            break;
+        case VOp::Hardtanh: {
+            const __m512 lo = _mm512_set1_ps(static_cast<float>(prm.p0));
+            const __m512 hi = _mm512_set1_ps(static_cast<float>(prm.p1));
+            TP_F32_SIMPLE_LOOP_16(_mm512_min_ps(_mm512_max_ps(x, lo), hi));
+            break;
         }
+        default:
+            for (; i + 16 <= n; i += 16) {
+                __m512 x = _mm512_loadu_ps(s + i);
+                if (op == VOp::Lgamma && _mm512_cmplt_ps_mask(x, zero)) {
+                    for (int64_t j = i; j < i + 16; ++j) d[j] = scalar_apply(op, prm, s[j]);
+                } else if (op == VOp::GeluNone) {
+                    const __m512 z = _mm512_mul_ps(
+                        _mm512_set1_ps(0.7071067811865476f), x);
+                    const __m512 az = _mm512_andnot_ps(
+                        _mm512_set1_ps(kSignBitF512), z);
+                    const __mmask16 core = _mm512_cmp_ps_mask(
+                        az, _mm512_set1_ps(1.5f), _CMP_LE_OQ);
+                    if (core == static_cast<__mmask16>(0xffff)) {
+                        _mm512_storeu_ps(d + i, gelu_poly_f32_512(x));
+                    } else {
+                        _mm512_storeu_ps(d + i, apply16_f32(op, prm, x));
+                    }
+                } else {
+                    _mm512_storeu_ps(d + i, apply16_f32(op, prm, x));
+                }
+            }
+            break;
     }
-    for (; i < n; ++i) dst[i] = scalar_apply(op, prm, src[i]);
+#undef TP_F32_SIMPLE_LOOP_16
+    for (; i < n; ++i) d[i] = scalar_apply(op, prm, s[i]);
 }
 
 __attribute__((target("avx512f,avx512dq"), always_inline))
@@ -1068,23 +1294,97 @@ inline __m512d apply16_f64(VOp op, VParams prm, __m512d x) {
     }
 }
 
+#define TP_F64_SIMPLE_LOOP_8(EXPR)                                        \
+    {                                                                     \
+        for (; i + 32 <= n; i += 32) {                                    \
+            __m512d x = _mm512_loadu_pd(s + i);                           \
+            _mm512_storeu_pd(d + i, (EXPR));                              \
+            x = _mm512_loadu_pd(s + i + 8);                               \
+            _mm512_storeu_pd(d + i + 8, (EXPR));                          \
+            x = _mm512_loadu_pd(s + i + 16);                              \
+            _mm512_storeu_pd(d + i + 16, (EXPR));                         \
+            x = _mm512_loadu_pd(s + i + 24);                              \
+            _mm512_storeu_pd(d + i + 24, (EXPR));                         \
+        }                                                                 \
+        for (; i + 8 <= n; i += 8) {                                      \
+            __m512d x = _mm512_loadu_pd(s + i);                           \
+            _mm512_storeu_pd(d + i, (EXPR));                              \
+        }                                                                 \
+    }
+
 __attribute__((target("avx512f,avx512dq"), noinline))
 static void f64_chunk_avx512(VOp op, VParams prm, const double* src, double* dst, int64_t b, int64_t e) {
-    src += b;
-    dst += b;
-    int64_t n = e - b;
+    const double* s = src + b;
+    double* d = dst + b;
+    const int64_t n = e - b;
+    const __m512d one = _mm512_set1_pd(1.0);
+    const __m512d zero = _mm512_setzero_pd();
+    const __m512d signbit = _mm512_set1_pd(-0.0);
+    const __m512d minus_one = _mm512_set1_pd(-1.0);
     int64_t i = 0;
-    for (; i + 8 <= n; i += 8) {
-        __m512d x = _mm512_loadu_pd(src + i);
-        if (op == VOp::Lgamma && _mm512_cmplt_pd_mask(x, _mm512_setzero_pd())) {
-            for (int64_t j = i; j < i + 8; ++j) dst[j] = scalar_apply(op, prm, src[j]);
-        } else if (op == VOp::Square) {
-            _mm512_storeu_pd(dst + i, _mm512_mul_pd(x, x));
-        } else {
-            _mm512_storeu_pd(dst + i, apply16_f64(op, prm, x));
+    switch (op) {
+        case VOp::Abs:
+            TP_F64_SIMPLE_LOOP_8(_mm512_andnot_pd(signbit, x));
+            break;
+        case VOp::Neg:
+            TP_F64_SIMPLE_LOOP_8(_mm512_xor_pd(x, signbit));
+            break;
+        case VOp::Sign:
+            TP_F64_SIMPLE_LOOP_8(
+                _mm512_mask_mov_pd(
+                    _mm512_mask_mov_pd(zero, _mm512_cmp_pd_mask(x, zero, _CMP_LT_OQ), minus_one),
+                    _mm512_cmp_pd_mask(x, zero, _CMP_GT_OQ), one));
+            break;
+        case VOp::Square:
+            TP_F64_SIMPLE_LOOP_8(_mm512_mul_pd(x, x));
+            break;
+        case VOp::Reciprocal:
+            TP_F64_SIMPLE_LOOP_8(_mm512_div_pd(one, x));
+            break;
+        case VOp::Sqrt:
+            TP_F64_SIMPLE_LOOP_8(_mm512_sqrt_pd(x));
+            break;
+        case VOp::Rsqrt:
+            TP_F64_SIMPLE_LOOP_8(_mm512_div_pd(one, _mm512_sqrt_pd(x)));
+            break;
+        case VOp::Floor:
+            TP_F64_SIMPLE_LOOP_8(_mm512_floor_pd(x));
+            break;
+        case VOp::Ceil:
+            TP_F64_SIMPLE_LOOP_8(_mm512_ceil_pd(x));
+            break;
+        case VOp::Trunc:
+            TP_F64_SIMPLE_LOOP_8(_mm512_roundscale_pd(x, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC));
+            break;
+        case VOp::Round:
+            TP_F64_SIMPLE_LOOP_8(_mm512_roundscale_pd(x, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+            break;
+        case VOp::Frac:
+            TP_F64_SIMPLE_LOOP_8(
+                _mm512_sub_pd(x, _mm512_roundscale_pd(x, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC)));
+            break;
+        case VOp::Relu:
+            TP_F64_SIMPLE_LOOP_8(_mm512_max_pd(zero, x));
+            break;
+        case VOp::Hardtanh: {
+            const __m512d lo = _mm512_set1_pd(prm.p0);
+            const __m512d hi = _mm512_set1_pd(prm.p1);
+            TP_F64_SIMPLE_LOOP_8(_mm512_min_pd(_mm512_max_pd(x, lo), hi));
+            break;
         }
+        default:
+            for (; i + 8 <= n; i += 8) {
+                __m512d x = _mm512_loadu_pd(s + i);
+                if (op == VOp::Lgamma && _mm512_cmplt_pd_mask(x, zero)) {
+                    for (int64_t j = i; j < i + 8; ++j) d[j] = scalar_apply(op, prm, s[j]);
+                } else {
+                    _mm512_storeu_pd(d + i, apply16_f64(op, prm, x));
+                }
+            }
+            break;
     }
-    for (; i < n; ++i) dst[i] = scalar_apply(op, prm, src[i]);
+#undef TP_F64_SIMPLE_LOOP_8
+    for (; i < n; ++i) d[i] = scalar_apply(op, prm, s[i]);
 }
 
 __attribute__((target("avx2,fma"), noinline))
