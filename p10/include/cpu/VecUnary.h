@@ -330,6 +330,21 @@ inline __m256 v_erf_f32(__m256 x) {
         _mm256_cmp_ps(abs_x, _mm256_set1_ps(poly::kErfSplit), _CMP_LT_OQ));
 }
 
+// elu takes its three coefficients as arguments instead of reading prm itself.
+// The chunk loops below broadcast the parameters once per chunk; deriving them
+// inside the vector loop means a double load, a narrowing convert and a
+// broadcast per vector, and each of the three also needs a store plus a reload
+// around the SLEEF call.  That bookkeeping costs more than the expm1
+// polynomial it feeds.  apply_f32 keeps the one-vector form.
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256 v_elu_f32(__m256 negcoef, __m256 poscoef, __m256 negipt, __m256 x) {
+    const __m256 zero = _mm256_setzero_ps();
+    __m256 scaled = _mm256_mul_ps(x, negipt);
+    __m256 neg = _mm256_mul_ps(tensorplay::tpsleef::expm1(scaled), negcoef);
+    __m256 pos = _mm256_mul_ps(x, poscoef);
+    return _mm256_blendv_ps(neg, pos, _mm256_cmp_ps(x, zero, _CMP_GE_OQ));
+}
+
 // Applies op to one AVX2 float vector.  Always-inline: only ever folded into
 // target-attributed callers below.
 __attribute__((target("avx2,fma"), always_inline))
@@ -423,15 +438,10 @@ inline __m256 apply_f32(VOp op, VParams prm, __m256 x) {
             __m256 neg = _mm256_mul_ps(alphalambda, tensorplay::tpsleef::expm1(x));
             return _mm256_blendv_ps(neg, pos, _mm256_cmp_ps(x, zero, _CMP_GT_OQ));
         }
-        case VOp::Elu: {
-            const __m256 negcoef = _mm256_set1_ps(static_cast<float>(prm.p0)); // alpha*scale
-            const __m256 poscoef = _mm256_set1_ps(static_cast<float>(prm.p1)); // scale
-            const __m256 negipt = _mm256_set1_ps(static_cast<float>(prm.p2));  // input_scale
-            __m256 scaled = _mm256_mul_ps(x, negipt);
-            __m256 neg = _mm256_mul_ps(tensorplay::tpsleef::expm1(scaled), negcoef);
-            __m256 pos = _mm256_mul_ps(x, poscoef);
-            return _mm256_blendv_ps(neg, pos, _mm256_cmp_ps(x, zero, _CMP_GE_OQ));
-        }
+        case VOp::Elu:
+            return v_elu_f32(_mm256_set1_ps(static_cast<float>(prm.p0)),
+                             _mm256_set1_ps(static_cast<float>(prm.p1)),
+                             _mm256_set1_ps(static_cast<float>(prm.p2)), x);
         case VOp::Softplus: {
             // Scalar path: numerator computed in float (log1p(exp(float(x*beta)))),
             // division by beta in double, one final round back to T.
@@ -556,6 +566,16 @@ static void f32_chunk_avx2(VOp op, VParams prm, const float* src, float* dst, in
             TP_F32_SIMPLE_LOOP_8(_mm256_min_ps(hi, _mm256_max_ps(lo, x)));
             break;
         }
+        case VOp::Elu: {
+            const __m256 negcoef = _mm256_set1_ps(static_cast<float>(prm.p0)); // alpha*scale
+            const __m256 poscoef = _mm256_set1_ps(static_cast<float>(prm.p1)); // scale
+            const __m256 negipt = _mm256_set1_ps(static_cast<float>(prm.p2));  // input_scale
+            for (; i + 8 <= n; i += 8) {
+                __m256 x = _mm256_loadu_ps(s + i);
+                _mm256_storeu_ps(d + i, v_elu_f32(negcoef, poscoef, negipt, x));
+            }
+            break;
+        }
         default:
             for (; i + 8 <= n; i += 8) {
                 __m256 x = _mm256_loadu_ps(s + i);
@@ -571,6 +591,15 @@ static void f32_chunk_avx2(VOp op, VParams prm, const float* src, float* dst, in
     }
 #undef TP_F32_SIMPLE_LOOP_8
     for (; i < n; ++i) d[i] = scalar_apply(op, prm, s[i]);
+}
+
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256d v_elu_f64(__m256d negcoef, __m256d poscoef, __m256d negipt, __m256d x) {
+    const __m256d zero = _mm256_setzero_pd();
+    __m256d scaled = _mm256_mul_pd(x, negipt);
+    __m256d neg = _mm256_mul_pd(tensorplay::tpsleef::expm1(scaled), negcoef);
+    __m256d pos = _mm256_mul_pd(x, poscoef);
+    return _mm256_blendv_pd(neg, pos, _mm256_cmp_pd(x, zero, _CMP_GE_OQ));
 }
 
 __attribute__((target("avx2,fma"), always_inline))
@@ -647,15 +676,9 @@ inline __m256d apply_f64(VOp op, VParams prm, __m256d x) {
             __m256d neg = _mm256_mul_pd(alphalambda, tensorplay::tpsleef::expm1(x));
             return _mm256_blendv_pd(neg, pos, _mm256_cmp_pd(x, zero, _CMP_GT_OQ));
         }
-        case VOp::Elu: {
-            const __m256d negcoef = _mm256_set1_pd(prm.p0);
-            const __m256d poscoef = _mm256_set1_pd(prm.p1);
-            const __m256d negipt = _mm256_set1_pd(prm.p2);
-            __m256d scaled = _mm256_mul_pd(x, negipt);
-            __m256d neg = _mm256_mul_pd(tensorplay::tpsleef::expm1(scaled), negcoef);
-            __m256d pos = _mm256_mul_pd(x, poscoef);
-            return _mm256_blendv_pd(neg, pos, _mm256_cmp_pd(x, _mm256_setzero_pd(), _CMP_GE_OQ));
-        }
+        case VOp::Elu:
+            return v_elu_f64(_mm256_set1_pd(prm.p0), _mm256_set1_pd(prm.p1),
+                             _mm256_set1_pd(prm.p2), x);
         case VOp::Softplus: {
             const __m256d beta = _mm256_set1_pd(prm.p0);
             const __m256d threshold = _mm256_set1_pd(prm.p1);
@@ -768,6 +791,16 @@ static void f64_chunk_avx2(VOp op, VParams prm, const double* src, double* dst, 
             const __m256d lo = _mm256_set1_pd(prm.p0);
             const __m256d hi = _mm256_set1_pd(prm.p1);
             TP_F64_SIMPLE_LOOP_4(_mm256_min_pd(hi, _mm256_max_pd(lo, x)));
+            break;
+        }
+        case VOp::Elu: {
+            const __m256d negcoef = _mm256_set1_pd(prm.p0); // alpha*scale
+            const __m256d poscoef = _mm256_set1_pd(prm.p1); // scale
+            const __m256d negipt = _mm256_set1_pd(prm.p2);  // input_scale
+            for (; i + 4 <= n; i += 4) {
+                __m256d x = _mm256_loadu_pd(s + i);
+                _mm256_storeu_pd(d + i, v_elu_f64(negcoef, poscoef, negipt, x));
+            }
             break;
         }
         default:
@@ -926,6 +959,16 @@ inline __m512 gelu_poly_f32_512(__m512 x) {
     return _mm512_mul_ps(_mm512_mul_ps(half, x), cdf);
 }
 
+// 512-bit twin of v_elu_f32; same reason for the coefficient arguments.
+__attribute__((target("avx512f,avx512dq"), always_inline))
+inline __m512 v_elu_f32_512(__m512 negcoef, __m512 poscoef, __m512 negipt, __m512 x) {
+    const __m512 zero = _mm512_setzero_ps();
+    __m512 scaled = _mm512_mul_ps(x, negipt);
+    __m512 neg = _mm512_mul_ps(tensorplay::tpsleef::expm1(scaled), negcoef);
+    __m512 pos = _mm512_mul_ps(x, poscoef);
+    return _mm512_mask_mov_ps(neg, _mm512_cmp_ps_mask(x, zero, _CMP_GE_OQ), pos);
+}
+
 __attribute__((target("avx512f,avx512dq"), always_inline))
 inline __m512 apply16_f32(VOp op, VParams prm, __m512 x) {
     const __m512 one = _mm512_set1_ps(1.0f);
@@ -1014,15 +1057,10 @@ inline __m512 apply16_f32(VOp op, VParams prm, __m512 x) {
             __m512 neg = _mm512_mul_ps(alphalambda, tensorplay::tpsleef::expm1(x));
             return _mm512_mask_mov_ps(neg, _mm512_cmp_ps_mask(x, zero, _CMP_GT_OQ), pos);
         }
-        case VOp::Elu: {
-            const __m512 negcoef = _mm512_set1_ps(static_cast<float>(prm.p0));
-            const __m512 poscoef = _mm512_set1_ps(prm.p1);
-            const __m512 negipt = _mm512_set1_ps(prm.p2);
-            __m512 scaled = _mm512_mul_ps(x, negipt);
-            __m512 neg = _mm512_mul_ps(tensorplay::tpsleef::expm1(scaled), negcoef);
-            __m512 pos = _mm512_mul_ps(x, poscoef);
-            return _mm512_mask_mov_ps(neg, _mm512_cmp_ps_mask(x, zero, _CMP_GE_OQ), pos);
-        }
+        case VOp::Elu:
+            return v_elu_f32_512(_mm512_set1_ps(static_cast<float>(prm.p0)),
+                                 _mm512_set1_ps(static_cast<float>(prm.p1)),
+                                 _mm512_set1_ps(static_cast<float>(prm.p2)), x);
         case VOp::Softplus: {
             // Scalar path: numerator computed in float (log1p(exp(float(x*beta)))),
             // division by beta in double, one final round back to T.
@@ -1141,6 +1179,16 @@ static void f32_chunk_avx512(VOp op, VParams prm, const float* src, float* dst, 
             const __m512 lo = _mm512_set1_ps(static_cast<float>(prm.p0));
             const __m512 hi = _mm512_set1_ps(static_cast<float>(prm.p1));
             TP_F32_SIMPLE_LOOP_16(_mm512_min_ps(hi, _mm512_max_ps(lo, x)));
+            break;
+        }
+        case VOp::Elu: {
+            const __m512 negcoef = _mm512_set1_ps(static_cast<float>(prm.p0)); // alpha*scale
+            const __m512 poscoef = _mm512_set1_ps(static_cast<float>(prm.p1)); // scale
+            const __m512 negipt = _mm512_set1_ps(static_cast<float>(prm.p2));  // input_scale
+            for (; i + 16 <= n; i += 16) {
+                __m512 x = _mm512_loadu_ps(s + i);
+                _mm512_storeu_ps(d + i, v_elu_f32_512(negcoef, poscoef, negipt, x));
+            }
             break;
         }
         default:
