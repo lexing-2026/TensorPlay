@@ -2436,6 +2436,51 @@ class TestVulkanDtypeConversion(unittest.TestCase):
                 device.to(tp.float16).cpu().numpy(), values.astype(np.float16),
                 err_msg=f"float32 -> float16 rounding at {count} elements")
 
+    def test_the_narrow_float_and_the_signed_word_convert_directly(self):
+        import tensorplay as tp
+        # A select between a half plane and a signed-word plane is decided in
+        # the half width, so the pair needs its own kernel in both directions.
+        # Values beyond the largest finite half become infinities, exactly as a
+        # host cast of the same code does.
+        rng = np.random.default_rng(41)
+        codes = np.concatenate([
+            rng.integers(-4096, 4096, 64),
+            np.array([65504, 65505, 65520, 65536, -65504, -65505, -70000,
+                      2 ** 31 - 1, -(2 ** 31), 0, 1, -1], dtype=np.int64),
+        ]).astype(np.int32)
+        for count in self.LENGTHS:
+            values = np.resize(codes, count).astype(np.int32)
+            device = tensorplay.from_numpy(values.copy()).to("vulkan")
+            np.testing.assert_array_equal(
+                device.to(tp.float16).cpu().numpy(), values.astype(np.float16),
+                err_msg=f"int32 -> float16 at {count} elements")
+            # The codes a half lane holds exactly round-trip to the value they
+            # came from; above 2048 the spacing is wider than one, so the
+            # nearest half is a different number, and an infinity has no
+            # integer form on either side.
+            exact = np.abs(values) <= 2048
+            back = device.to(tp.float16).to(tp.int32).cpu().numpy()
+            np.testing.assert_array_equal(
+                back[exact], values[exact],
+                err_msg=f"int32 -> float16 -> int32 at {count} elements")
+
+    def test_half_to_signed_word_truncates_toward_zero(self):
+        import tensorplay as tp
+        # Every half is an integer multiple of a power of two that single
+        # precision holds, so widening first keeps the magnitude exact and only
+        # the truncation decides the code.  Infinities and a not-a-number have
+        # no integer reading on either side, so they stay out of the samples.
+        values = np.array(
+            [0.0, -0.0, 1.5, -1.5, 2.5, -2.5, 3.999, -3.999, 0.999,
+             2047.9, -2048.1, 65504.0, -65504.0, 1.0 / 2048, -1.0 / 2048],
+            dtype=np.float16)
+        for count in (16, 200016):
+            lane = np.resize(values, count).astype(np.float16)
+            device = tensorplay.from_numpy(lane.copy()).to("vulkan")
+            np.testing.assert_array_equal(
+                device.to(tp.int32).cpu().numpy(), lane.astype(np.int32),
+                err_msg=f"float16 -> int32 truncation at {count} elements")
+
     def test_conversion_rejects_pairs_without_a_kernel(self):
         import tensorplay as tp
         # Two narrow types share no kernel: a conversion between them has to be
@@ -4020,6 +4065,68 @@ class TestVulkanMaskLogic(unittest.TestCase):
             F.bitwise_and(ints, ints)
         with self.assertRaisesRegex(RuntimeError, "connects Bool payloads"):
             F.bitwise_not(ints)
+
+
+class TestVulkanWhereBranches(unittest.TestCase):
+    # A select reads both branches in one element width.  Pairing a single
+    # precision plane with a signed-word plane therefore cannot read the word as
+    # a float: the bits survive and the number does not, so the pair is first
+    # promoted to the type that holds both.
+
+    def _mixed(self, host_a, host_b, condition):
+        import tensorplay.functional as F
+        want = F.where(condition, host_a, host_b)
+        got = F.where(
+            condition.to("vulkan"), host_a.to("vulkan"), host_b.to("vulkan"))
+        return got.cpu(), want
+
+    def test_a_mixed_branch_pair_selects_in_the_wider_kind(self):
+        rng = np.random.default_rng(23)
+        condition = tensorplay.tensor(rng.random((2, 3, 4, 5)) > 0.5)
+        floats = tensorplay.tensor(
+            (rng.standard_normal((2, 3, 4, 5)) * 8).astype(np.float32))
+        halves = tensorplay.tensor(
+            (rng.standard_normal((2, 3, 4, 5)) * 8).astype(np.float16))
+        ints = tensorplay.tensor(
+            rng.integers(-9, 10, (2, 3, 4, 5)).astype(np.int32))
+        for host_a, host_b in [(floats, ints), (ints, floats),
+                               (halves, ints), (ints, halves),
+                               (floats, halves), (halves, floats)]:
+            for a, b in [(host_a, host_b), (host_b, host_a)]:
+                got, want = self._mixed(a, b, condition)
+                self.assertEqual(
+                    got.dtype, want.dtype,
+                    msg=f"{a.dtype} against {b.dtype} changed the result kind")
+                np.testing.assert_array_equal(
+                    got.numpy(), want.numpy(),
+                    err_msg=f"{a.dtype} against {b.dtype}")
+
+    def test_a_rejected_branch_cannot_poison_the_result(self):
+        # The lane that loses the selection must not reach the arithmetic at
+        # all: a recombination multiplies it by zero, and zero times an
+        # infinity or a not-a-number is a not-a-number that lands on the lane
+        # that won.
+        import tensorplay.functional as F
+        condition = tensorplay.tensor([True, False, True, False])
+        floats = tensorplay.tensor(
+            [1.0, np.nan, np.inf, -np.inf], dtype=tensorplay.float32)
+        ints = tensorplay.tensor([7, 7, 7, 7], dtype=tensorplay.int32)
+        got = F.where(condition.to("vulkan"), floats.to("vulkan"),
+                      ints.to("vulkan")).cpu().numpy()
+        np.testing.assert_array_equal(got, np.array([1.0, 7.0, np.inf, 7.0]))
+        got = F.where(condition.to("vulkan"), ints.to("vulkan"),
+                      floats.to("vulkan")).cpu().numpy()
+        np.testing.assert_array_equal(got, np.array([7.0, np.nan, 7.0, -np.inf]))
+
+    def test_branches_outside_the_kernel_vocabulary_are_refused(self):
+        import tensorplay.functional as F
+        # A Bool pair has no float or word width to promote to, and the select
+        # would read byte lanes as one of those: refuse instead.
+        condition = tensorplay.tensor([True, False]).to("vulkan")
+        flags = tensorplay.tensor([True, False]).to("vulkan")
+        with self.assertRaisesRegex(
+                RuntimeError, "selects between Float32, Float16 and Int32"):
+            F.where(condition, flags, flags)
 
 
 if __name__ == "__main__":
