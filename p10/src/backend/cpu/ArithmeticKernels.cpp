@@ -1575,14 +1575,27 @@ Tensor add_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha) 
             Tensor result = Tensor::empty(sizes, self.dtype(), self.device());
             result = result.as_strided(sizes, strides, 0);
             const int64_t n = self.numel();
+            // One unit-stride pass over the whole extent still has to be cut
+            // into per-thread ranges: the flat loop saturates a single core's
+            // share of the memory system well before the part is busy.
             if (self.dtype() == DType::Float32) {
-                binary_f32_vec(BIN_ADD, self.data_ptr<float>(),
-                               other.data_ptr<float>(),
-                               result.data_ptr<float>(), n, alpha.to<float>());
+                const float alpha_val = alpha.to<float>();
+                const float* self_ptr = self.data_ptr<float>();
+                const float* other_ptr = other.data_ptr<float>();
+                float* result_ptr = result.data_ptr<float>();
+                parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                    binary_f32_vec(BIN_ADD, self_ptr + begin, other_ptr + begin,
+                                   result_ptr + begin, end - begin, alpha_val);
+                });
             } else {
-                binary_f64_vec(BIN_ADD, self.data_ptr<double>(),
-                               other.data_ptr<double>(),
-                               result.data_ptr<double>(), n, alpha.to<double>());
+                const double alpha_val = alpha.toDouble();
+                const double* self_ptr = self.data_ptr<double>();
+                const double* other_ptr = other.data_ptr<double>();
+                double* result_ptr = result.data_ptr<double>();
+                parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                    binary_f64_vec(BIN_ADD, self_ptr + begin, other_ptr + begin,
+                                   result_ptr + begin, end - begin, alpha_val);
+                });
             }
             return result;
         }
@@ -2232,13 +2245,21 @@ Tensor mul_kernel(const Tensor& self, const Tensor& other) {
             result = result.as_strided(sizes, strides, 0);
             const int64_t n = self.numel();
             if (self.dtype() == DType::Float32) {
-                binary_f32_vec(BIN_MUL, self.data_ptr<float>(),
-                               other.data_ptr<float>(),
-                               result.data_ptr<float>(), n, 1.0f);
+                const float* self_ptr = self.data_ptr<float>();
+                const float* other_ptr = other.data_ptr<float>();
+                float* result_ptr = result.data_ptr<float>();
+                parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                    binary_f32_vec(BIN_MUL, self_ptr + begin, other_ptr + begin,
+                                   result_ptr + begin, end - begin, 1.0f);
+                });
             } else {
-                binary_f64_vec(BIN_MUL, self.data_ptr<double>(),
-                               other.data_ptr<double>(),
-                               result.data_ptr<double>(), n, 1.0);
+                const double* self_ptr = self.data_ptr<double>();
+                const double* other_ptr = other.data_ptr<double>();
+                double* result_ptr = result.data_ptr<double>();
+                parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                    binary_f64_vec(BIN_MUL, self_ptr + begin, other_ptr + begin,
+                                   result_ptr + begin, end - begin, 1.0);
+                });
             }
             return result;
         }
@@ -2430,13 +2451,21 @@ Tensor div_kernel(const Tensor& self, const Tensor& other) {
             result = result.as_strided(sizes, strides, 0);
             const int64_t n = self.numel();
             if (self.dtype() == DType::Float32) {
-                binary_f32_vec(BIN_DIV, self.data_ptr<float>(),
-                               other.data_ptr<float>(),
-                               result.data_ptr<float>(), n, 1.0f);
+                const float* self_ptr = self.data_ptr<float>();
+                const float* other_ptr = other.data_ptr<float>();
+                float* result_ptr = result.data_ptr<float>();
+                parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                    binary_f32_vec(BIN_DIV, self_ptr + begin, other_ptr + begin,
+                                   result_ptr + begin, end - begin, 1.0f);
+                });
             } else {
-                binary_f64_vec(BIN_DIV, self.data_ptr<double>(),
-                               other.data_ptr<double>(),
-                               result.data_ptr<double>(), n, 1.0);
+                const double* self_ptr = self.data_ptr<double>();
+                const double* other_ptr = other.data_ptr<double>();
+                double* result_ptr = result.data_ptr<double>();
+                parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                    binary_f64_vec(BIN_DIV, self_ptr + begin, other_ptr + begin,
+                                   result_ptr + begin, end - begin, 1.0);
+                });
             }
             return result;
         }
