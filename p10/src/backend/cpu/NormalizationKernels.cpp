@@ -773,37 +773,15 @@ static Tensor layer_norm_cpu_impl(
                 int64_t offset = i * inner_size;
                 const float* row = in_ptr + offset;
                 float* orow = out_ptr + offset;
-#if defined(__x86_64__)
-                if (norm_row::avx512_ok() && inner_size >= 16) {
-                    float mean, rstd;
-                    norm_row::stats_f32_512(row, inner_size, static_cast<float>(eps), &mean, &rstd);
-                    if (mean_out) normalization_stats_write(*mean_out, i, mean);
-                    if (rstd_out) normalization_stats_write(*rstd_out, i, rstd);
-                    if (w_ptr && b_ptr) norm_row::apply_f32_512<true, true>(row, orow, inner_size, mean, rstd, w_ptr, b_ptr);
-                    else if (w_ptr) norm_row::apply_f32_512<true, false>(row, orow, inner_size, mean, rstd, w_ptr, b_ptr);
-                    else if (b_ptr) norm_row::apply_f32_512<false, true>(row, orow, inner_size, mean, rstd, w_ptr, b_ptr);
-                    else norm_row::apply_f32_512<false, false>(row, orow, inner_size, mean, rstd, w_ptr, b_ptr);
-                    continue;
-                }
-#endif
-                float sum = 0.0f;
-                float sq_sum = 0.0f;
-                for (int64_t j = 0; j < inner_size; ++j) {
-                    float val = row[j];
-                    sum += val;
-                    sq_sum += val * val;
-                }
-                float mean = sum / inner_size;
-                float var = (sq_sum / inner_size) - (mean * mean);
-                float inv_std = 1.0f / std::sqrt(var + (float)eps);
+                float mean, inv_std;
+                norm_row::stats_f32(row, inner_size, static_cast<float>(eps),
+                                    &mean, &inv_std);
                 if (mean_out) normalization_stats_write(*mean_out, i, mean);
                 if (rstd_out) normalization_stats_write(*rstd_out, i, inv_std);
-                for (int64_t j = 0; j < inner_size; ++j) {
-                    float normalized = (row[j] - mean) * inv_std;
-                    if (w_ptr) normalized *= w_ptr[j];
-                    if (b_ptr) normalized += b_ptr[j];
-                    orow[j] = normalized;
-                }
+                if (w_ptr && b_ptr) norm_row::apply_f32<true, true>(row, orow, inner_size, mean, inv_std, w_ptr, b_ptr);
+                else if (w_ptr) norm_row::apply_f32<true, false>(row, orow, inner_size, mean, inv_std, w_ptr, b_ptr);
+                else if (b_ptr) norm_row::apply_f32<false, true>(row, orow, inner_size, mean, inv_std, w_ptr, b_ptr);
+                else norm_row::apply_f32<false, false>(row, orow, inner_size, mean, inv_std, w_ptr, b_ptr);
             }
         });
     } else if (input.dtype() == DType::Float64) {
@@ -817,37 +795,14 @@ static Tensor layer_norm_cpu_impl(
                 int64_t offset = i * inner_size;
                 const double* row = in_ptr + offset;
                 double* orow = out_ptr + offset;
-#if defined(__x86_64__)
-                if (norm_row::avx512_ok() && inner_size >= 8) {
-                    double mean, rstd;
-                    norm_row::stats_f64_512(row, inner_size, eps, &mean, &rstd);
-                    if (mean_out) normalization_stats_write(*mean_out, i, mean);
-                    if (rstd_out) normalization_stats_write(*rstd_out, i, rstd);
-                    if (w_ptr && b_ptr) norm_row::apply_f64_512<true, true>(row, orow, inner_size, mean, rstd, w_ptr, b_ptr);
-                    else if (w_ptr) norm_row::apply_f64_512<true, false>(row, orow, inner_size, mean, rstd, w_ptr, b_ptr);
-                    else if (b_ptr) norm_row::apply_f64_512<false, true>(row, orow, inner_size, mean, rstd, w_ptr, b_ptr);
-                    else norm_row::apply_f64_512<false, false>(row, orow, inner_size, mean, rstd, w_ptr, b_ptr);
-                    continue;
-                }
-#endif
-                double sum = 0.0;
-                double sq_sum = 0.0;
-                for (int64_t j = 0; j < inner_size; ++j) {
-                    double val = row[j];
-                    sum += val;
-                    sq_sum += val * val;
-                }
-                double mean = sum / inner_size;
-                double var = (sq_sum / inner_size) - (mean * mean);
-                double inv_std = 1.0 / std::sqrt(var + eps);
+                double mean, inv_std;
+                norm_row::stats_f64(row, inner_size, eps, &mean, &inv_std);
                 if (mean_out) normalization_stats_write(*mean_out, i, mean);
                 if (rstd_out) normalization_stats_write(*rstd_out, i, inv_std);
-                for (int64_t j = 0; j < inner_size; ++j) {
-                    double normalized = (row[j] - mean) * inv_std;
-                    if (w_ptr) normalized *= w_ptr[j];
-                    if (b_ptr) normalized += b_ptr[j];
-                    orow[j] = normalized;
-                }
+                if (w_ptr && b_ptr) norm_row::apply_f64<true, true>(row, orow, inner_size, mean, inv_std, w_ptr, b_ptr);
+                else if (w_ptr) norm_row::apply_f64<true, false>(row, orow, inner_size, mean, inv_std, w_ptr, b_ptr);
+                else if (b_ptr) norm_row::apply_f64<false, true>(row, orow, inner_size, mean, inv_std, w_ptr, b_ptr);
+                else norm_row::apply_f64<false, false>(row, orow, inner_size, mean, inv_std, w_ptr, b_ptr);
             }
         });
     } else if (input.dtype() == DType::Float16 || input.dtype() == DType::BFloat16) {
@@ -1006,53 +961,26 @@ static Tensor group_norm_cpu_impl(
                 float* group_out = out_ptr + offset;
                 float mean;
                 float inv_std;
-#if defined(__x86_64__)
-                if (norm_row::avx512_ok() && inner_size >= 16) {
-                    norm_row::stats_f32_512(
-                        group, inner_size, static_cast<float>(eps), &mean, &inv_std);
-                    if (mean_out) normalization_stats_write(
-                        *mean_out, row, mean);
-                    if (rstd_out) normalization_stats_write(
-                        *rstd_out, row, inv_std);
-                    if (w_ptr && b_ptr) {
-                        norm_row::apply_group_f32_512<true, true>(
-                            group, group_out, channels_per_group, spatial_size,
-                            mean, inv_std, w_ptr + c_start, b_ptr + c_start);
-                    } else if (w_ptr) {
-                        norm_row::apply_group_f32_512<true, false>(
-                            group, group_out, channels_per_group, spatial_size,
-                            mean, inv_std, w_ptr + c_start, nullptr);
-                    } else if (b_ptr) {
-                        norm_row::apply_group_f32_512<false, true>(
-                            group, group_out, channels_per_group, spatial_size,
-                            mean, inv_std, nullptr, b_ptr + c_start);
-                    } else {
-                        norm_row::apply_group_f32_512<false, false>(
-                            group, group_out, channels_per_group, spatial_size,
-                            mean, inv_std, nullptr, nullptr);
-                    }
-                    continue;
-                }
-#endif
-                float sum = 0.0f;
-                float sq_sum = 0.0f;
-                for (int64_t i = 0; i < inner_size; ++i) {
-                    const float val = group[i];
-                    sum += val;
-                    sq_sum += val * val;
-                }
-                mean = sum / inner_size;
-                const float var = (sq_sum / inner_size) - mean * mean;
-                inv_std = 1.0f / std::sqrt(var + static_cast<float>(eps));
+                norm_row::stats_f32(group, inner_size, static_cast<float>(eps),
+                                    &mean, &inv_std);
                 if (mean_out) normalization_stats_write(*mean_out, row, mean);
                 if (rstd_out) normalization_stats_write(*rstd_out, row, inv_std);
-                for (int64_t c = 0; c < channels_per_group; ++c) {
-                    const float w = w_ptr ? w_ptr[c_start + c] : 1.0f;
-                    const float b = b_ptr ? b_ptr[c_start + c] : 0.0f;
-                    const float* ip = group + c * spatial_size;
-                    float* op = group_out + c * spatial_size;
-                    for (int64_t s = 0; s < spatial_size; ++s)
-                        op[s] = (ip[s] - mean) * inv_std * w + b;
+                if (w_ptr && b_ptr) {
+                    norm_row::apply_group_f32<true, true>(
+                        group, group_out, channels_per_group, spatial_size,
+                        mean, inv_std, w_ptr + c_start, b_ptr + c_start);
+                } else if (w_ptr) {
+                    norm_row::apply_group_f32<true, false>(
+                        group, group_out, channels_per_group, spatial_size,
+                        mean, inv_std, w_ptr + c_start, nullptr);
+                } else if (b_ptr) {
+                    norm_row::apply_group_f32<false, true>(
+                        group, group_out, channels_per_group, spatial_size,
+                        mean, inv_std, nullptr, b_ptr + c_start);
+                } else {
+                    norm_row::apply_group_f32<false, false>(
+                        group, group_out, channels_per_group, spatial_size,
+                        mean, inv_std, nullptr, nullptr);
                 }
             }
         });

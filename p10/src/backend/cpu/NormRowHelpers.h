@@ -1,8 +1,8 @@
 // Shared SIMD row helpers for the normalization kernels (layer/group/instance
 // norm and batch norm).  Every helper is hand-coded with a per-function target
 // attribute so the translation unit can compile for the baseline ISA while the
-// helper body uses AVX-512; call sites gate on avx512_ok() at runtime and fall
-// back to compiler-auto-vectorized scalar loops.
+// helper body uses 512- or 256-bit vectors; call sites gate on avx512_ok() and
+// avx2_ok() at runtime and fall back to compiler-auto-vectorized scalar loops.
 #pragma once
 
 #include <cstdint>
@@ -22,6 +22,11 @@ inline bool avx512_ok() {
     static const bool ok = __builtin_cpu_supports("avx512f") != 0 &&
                            __builtin_cpu_supports("avx512vl") != 0 &&
                            __builtin_cpu_supports("avx512dq") != 0;
+    return ok;
+}
+
+inline bool avx2_ok() {
+    static const bool ok = __builtin_cpu_supports("avx2") != 0;
     return ok;
 }
 
@@ -155,6 +160,144 @@ inline void stats_f64_512(const double* x, int64_t n, double eps,
     _mm512_storeu_pd(qb, q);
     double sum = 0.0, sq = 0.0;
     for (int64_t k = 0; k < 8; ++k) { sum += sb[k]; sq += qb[k]; }
+    for (; i < n; ++i) { double v = x[i]; sum += v; sq += v * v; }
+    double mean = sum / static_cast<double>(n);
+    double var = sq / static_cast<double>(n) - mean * mean;
+    *mean_out = mean;
+    *rstd_out = 1.0 / std::sqrt(var + eps);
+}
+
+// ---------------------------------------------------------------------------
+// 256-bit twins of the four row primitives above.  A part without the 512-bit
+// ISA would otherwise run the scalar row loops, whose serial float reductions
+// the compiler cannot vectorize.
+// ---------------------------------------------------------------------------
+
+template <bool HW, bool HB>
+__attribute__((target("avx2")))
+inline void apply_f32_256(const float* in, float* out, int64_t n,
+                          float mean, float rstd, const float* w, const float* b) {
+    const __m256 vm = _mm256_set1_ps(mean);
+    const __m256 vr = _mm256_set1_ps(rstd);
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 v = _mm256_loadu_ps(in + i);
+        v = _mm256_mul_ps(_mm256_sub_ps(v, vm), vr);
+        if constexpr (HW) v = _mm256_mul_ps(v, _mm256_loadu_ps(w + i));
+        if constexpr (HB) v = _mm256_add_ps(v, _mm256_loadu_ps(b + i));
+        _mm256_storeu_ps(out + i, v);
+    }
+    for (; i < n; ++i) {
+        float t = (in[i] - mean) * rstd;
+        if constexpr (HW) t *= w[i];
+        if constexpr (HB) t += b[i];
+        out[i] = t;
+    }
+}
+
+template <bool HW, bool HB>
+__attribute__((target("avx2")))
+inline void apply_group_f32_256(const float* in, float* out,
+                                int64_t channels, int64_t spatial,
+                                float mean, float rstd,
+                                const float* w, const float* b) {
+    const __m256 vm = _mm256_set1_ps(mean);
+    const __m256 vr = _mm256_set1_ps(rstd);
+    for (int64_t c = 0; c < channels; ++c) {
+        const float wc = HW ? w[c] : 1.0f;
+        const float bc = HB ? b[c] : 0.0f;
+        const __m256 vw = _mm256_set1_ps(wc);
+        const __m256 vb = _mm256_set1_ps(bc);
+        const float* ip = in + c * spatial;
+        float* op = out + c * spatial;
+        int64_t s = 0;
+        for (; s + 8 <= spatial; s += 8) {
+            __m256 v = _mm256_loadu_ps(ip + s);
+            v = _mm256_mul_ps(_mm256_sub_ps(v, vm), vr);
+            if constexpr (HW) v = _mm256_mul_ps(v, vw);
+            if constexpr (HB) v = _mm256_add_ps(v, vb);
+            _mm256_storeu_ps(op + s, v);
+        }
+        for (; s < spatial; ++s) {
+            float v = (ip[s] - mean) * rstd;
+            if constexpr (HW) v *= wc;
+            if constexpr (HB) v += bc;
+            op[s] = v;
+        }
+    }
+}
+
+__attribute__((target("avx2")))
+inline void stats_f32_256(const float* x, int64_t n, float eps,
+                          float* mean_out, float* rstd_out) {
+    __m256 s0 = _mm256_setzero_ps(), s1 = _mm256_setzero_ps();
+    __m256 q0 = _mm256_setzero_ps(), q1 = _mm256_setzero_ps();
+    int64_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m256 v0 = _mm256_loadu_ps(x + i);
+        __m256 v1 = _mm256_loadu_ps(x + i + 8);
+        s0 = _mm256_add_ps(s0, v0);
+        s1 = _mm256_add_ps(s1, v1);
+        q0 = _mm256_add_ps(q0, _mm256_mul_ps(v0, v0));
+        q1 = _mm256_add_ps(q1, _mm256_mul_ps(v1, v1));
+    }
+    __m256 s = _mm256_add_ps(s0, s1);
+    __m256 q = _mm256_add_ps(q0, q1);
+    alignas(32) float sb[8], qb[8];
+    _mm256_storeu_ps(sb, s);
+    _mm256_storeu_ps(qb, q);
+    float sum = 0.f, sq = 0.f;
+    for (int64_t k = 0; k < 8; ++k) { sum += sb[k]; sq += qb[k]; }
+    for (; i < n; ++i) { float v = x[i]; sum += v; sq += v * v; }
+    float mean = sum / static_cast<float>(n);
+    float var = sq / static_cast<float>(n) - mean * mean;
+    *mean_out = mean;
+    *rstd_out = 1.0f / std::sqrt(var + eps);
+}
+
+template <bool HW, bool HB>
+__attribute__((target("avx2")))
+inline void apply_f64_256(const double* in, double* out, int64_t n,
+                          double mean, double rstd, const double* w, const double* b) {
+    const __m256d vm = _mm256_set1_pd(mean);
+    const __m256d vr = _mm256_set1_pd(rstd);
+    int64_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        __m256d v = _mm256_loadu_pd(in + i);
+        v = _mm256_mul_pd(_mm256_sub_pd(v, vm), vr);
+        if constexpr (HW) v = _mm256_mul_pd(v, _mm256_loadu_pd(w + i));
+        if constexpr (HB) v = _mm256_add_pd(v, _mm256_loadu_pd(b + i));
+        _mm256_storeu_pd(out + i, v);
+    }
+    for (; i < n; ++i) {
+        double t = (in[i] - mean) * rstd;
+        if constexpr (HW) t *= w[i];
+        if constexpr (HB) t += b[i];
+        out[i] = t;
+    }
+}
+
+__attribute__((target("avx2")))
+inline void stats_f64_256(const double* x, int64_t n, double eps,
+                          double* mean_out, double* rstd_out) {
+    __m256d s0 = _mm256_setzero_pd(), s1 = _mm256_setzero_pd();
+    __m256d q0 = _mm256_setzero_pd(), q1 = _mm256_setzero_pd();
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256d v0 = _mm256_loadu_pd(x + i);
+        __m256d v1 = _mm256_loadu_pd(x + i + 4);
+        s0 = _mm256_add_pd(s0, v0);
+        s1 = _mm256_add_pd(s1, v1);
+        q0 = _mm256_add_pd(q0, _mm256_mul_pd(v0, v0));
+        q1 = _mm256_add_pd(q1, _mm256_mul_pd(v1, v1));
+    }
+    __m256d s = _mm256_add_pd(s0, s1);
+    __m256d q = _mm256_add_pd(q0, q1);
+    alignas(32) double sb[4], qb[4];
+    _mm256_storeu_pd(sb, s);
+    _mm256_storeu_pd(qb, q);
+    double sum = 0.0, sq = 0.0;
+    for (int64_t k = 0; k < 4; ++k) { sum += sb[k]; sq += qb[k]; }
     for (; i < n; ++i) { double v = x[i]; sum += v; sq += v * v; }
     double mean = sum / static_cast<double>(n);
     double var = sq / static_cast<double>(n) - mean * mean;
@@ -381,6 +524,108 @@ inline void gn_bwd_plane_f32_512(const float* x, const float* dy, float* out,
 }
 
 #endif  // __x86_64__
+
+// ---------------------------------------------------------------------------
+// Width-agnostic entries for the row primitives.  A call site uses these so it
+// names no instruction set: the widest vector body the part supports runs, and
+// below that the same arithmetic happens in a plain loop.
+// ---------------------------------------------------------------------------
+
+inline void stats_f32(const float* x, int64_t n, float eps,
+                      float* mean_out, float* rstd_out) {
+#if defined(__x86_64__)
+    if (avx512_ok()) { stats_f32_512(x, n, eps, mean_out, rstd_out); return; }
+    if (avx2_ok()) { stats_f32_256(x, n, eps, mean_out, rstd_out); return; }
+#endif
+    float sum = 0.f, sq = 0.f;
+    for (int64_t i = 0; i < n; ++i) {
+        const float v = x[i];
+        sum += v;
+        sq += v * v;
+    }
+    const float mean = sum / static_cast<float>(n);
+    const float var = sq / static_cast<float>(n) - mean * mean;
+    *mean_out = mean;
+    *rstd_out = 1.0f / std::sqrt(var + eps);
+}
+
+template <bool HW, bool HB>
+inline void apply_f32(const float* in, float* out, int64_t n,
+                      float mean, float rstd, const float* w, const float* b) {
+#if defined(__x86_64__)
+    if (avx512_ok()) { apply_f32_512<HW, HB>(in, out, n, mean, rstd, w, b); return; }
+    if (avx2_ok()) { apply_f32_256<HW, HB>(in, out, n, mean, rstd, w, b); return; }
+#endif
+    for (int64_t i = 0; i < n; ++i) {
+        float t = (in[i] - mean) * rstd;
+        if constexpr (HW) t *= w[i];
+        if constexpr (HB) t += b[i];
+        out[i] = t;
+    }
+}
+
+template <bool HW, bool HB>
+inline void apply_group_f32(const float* in, float* out,
+                            int64_t channels, int64_t spatial,
+                            float mean, float rstd,
+                            const float* w, const float* b) {
+#if defined(__x86_64__)
+    if (avx512_ok()) {
+        apply_group_f32_512<HW, HB>(in, out, channels, spatial, mean, rstd, w, b);
+        return;
+    }
+    if (avx2_ok()) {
+        apply_group_f32_256<HW, HB>(in, out, channels, spatial, mean, rstd, w, b);
+        return;
+    }
+#endif
+    for (int64_t c = 0; c < channels; ++c) {
+        const float wc = HW ? w[c] : 1.0f;
+        const float bc = HB ? b[c] : 0.0f;
+        const float* ip = in + c * spatial;
+        float* op = out + c * spatial;
+        for (int64_t s = 0; s < spatial; ++s) {
+            float v = (ip[s] - mean) * rstd;
+            if constexpr (HW) v *= wc;
+            if constexpr (HB) v += bc;
+            op[s] = v;
+        }
+    }
+}
+
+inline void stats_f64(const double* x, int64_t n, double eps,
+                      double* mean_out, double* rstd_out) {
+#if defined(__x86_64__)
+    if (avx512_ok()) { stats_f64_512(x, n, eps, mean_out, rstd_out); return; }
+    if (avx2_ok()) { stats_f64_256(x, n, eps, mean_out, rstd_out); return; }
+#endif
+    double sum = 0.0, sq = 0.0;
+    for (int64_t i = 0; i < n; ++i) {
+        const double v = x[i];
+        sum += v;
+        sq += v * v;
+    }
+    const double mean = sum / static_cast<double>(n);
+    const double var = sq / static_cast<double>(n) - mean * mean;
+    *mean_out = mean;
+    *rstd_out = 1.0 / std::sqrt(var + eps);
+}
+
+template <bool HW, bool HB>
+inline void apply_f64(const double* in, double* out, int64_t n,
+                      double mean, double rstd, const double* w, const double* b) {
+#if defined(__x86_64__)
+    if (avx512_ok()) { apply_f64_512<HW, HB>(in, out, n, mean, rstd, w, b); return; }
+    if (avx2_ok()) { apply_f64_256<HW, HB>(in, out, n, mean, rstd, w, b); return; }
+#endif
+    for (int64_t i = 0; i < n; ++i) {
+        double t = (in[i] - mean) * rstd;
+        if constexpr (HW) t *= w[i];
+        if constexpr (HB) t += b[i];
+        out[i] = t;
+    }
+}
+
 
 }  // namespace norm_row
 }  // namespace cpu
