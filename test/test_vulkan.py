@@ -4269,5 +4269,206 @@ class TestVulkanWhereBroadcast(unittest.TestCase):
             F.where(condition, a.to("vulkan"), b)
 
 
+class TestVulkanScalarVocabulary(unittest.TestCase):
+    # Element-wise arithmetic names the width it computes in after the operands
+    # it was given: a count beside a whole number stays a count, a count beside
+    # a fraction moves to a width that has fractions, and a pair written in two
+    # codes is read in the one that holds both.  A number on the left of the
+    # operator has to reach the slot of the formula it belongs to, since a texel
+    # and a word disagree about what the same bits mean.
+
+    LENGTHS = (100001, 200003)
+
+    @staticmethod
+    def _device(values):
+        return tensorplay.from_numpy(np.array(values)).to("vulkan")
+
+    def test_a_whole_number_beside_a_count_stays_a_count(self):
+        import tensorplay as tp
+        counts = np.array([-5, -3, -2, 1, 2, 4, 5, 7, 8], dtype=np.int32)
+        cases = (
+            ("add", lambda t, n: t + n, lambda n: counts + n),
+            ("sub", lambda t, n: t - n, lambda n: counts - n),
+            ("mul", lambda t, n: t * n, lambda n: counts * n),
+            ("floordiv", lambda t, n: t // n,
+             lambda n: np.floor_divide(counts, n)),
+            ("mod", lambda t, n: t % n, lambda n: np.mod(counts, n)),
+            ("pow", lambda t, n: t ** n, lambda n: np.power(counts, n)),
+        )
+        for name, on_device, on_numbers in cases:
+            for number in ((2, -3) if name != "pow" else (2, 3)):
+                got = on_device(self._device(counts), number)
+                self.assertEqual(got.dtype, tp.int32, msg=f"{name} by {number}")
+                np.testing.assert_array_equal(
+                    got.cpu().numpy(), on_numbers(number).astype(np.int32),
+                    err_msg=f"{name} by {number}")
+
+    def test_a_payload_beside_a_number_takes_the_width_the_pair_needs(self):
+        import tensorplay as tp
+        counts = np.array([-5, -3, -2, 1, 2, 4, 5, 7, 8], dtype=np.int32)
+        reals = counts.astype(np.float32)
+        cases = (
+            ("add", lambda t: t + 2.5, reals + 2.5),
+            ("mul", lambda t: t * 2.5, reals * 2.5),
+            # A quotient that is a whole number has to land on it: the divisor
+            # is an operand, so no reciprocal error sits at the boundary the
+            # floor is deciding.
+            ("floordiv", lambda t: t // 2.5, np.floor(reals / 2.5)),
+            ("mod", lambda t: t % 2.5, np.mod(reals, 2.5)),
+        )
+        for name, on_device, want in cases:
+            got = on_device(self._device(counts))
+            self.assertEqual(got.dtype, tp.float32, msg=name)
+            np.testing.assert_allclose(
+                got.cpu().numpy(), want, rtol=1e-3, atol=1e-3, err_msg=name)
+
+        truth = np.array([True, False, True, True])
+        for name, on_device, want in (
+                ("add", lambda t: t + 2, truth.astype(np.float32) + 2),
+                ("floordiv", lambda t: t // 2, np.floor_divide(truth, 2)),
+                ("pow", lambda t: t ** 2, np.power(truth, 2))):
+            got = on_device(self._device(truth))
+            self.assertEqual(got.dtype, tp.float32, msg=f"truth {name}")
+            np.testing.assert_allclose(
+                got.cpu().numpy(), want, rtol=1e-3, atol=1e-3,
+                err_msg=f"truth {name}")
+
+    def test_a_reflected_number_reaches_the_slot_its_formula_needs(self):
+        import tensorplay as tp
+        counts = np.array([-5, -3, -2, 1, 2, 4, 5, 7, 8], dtype=np.int32)
+        reals = counts.astype(np.float32)
+        cases = (
+            ("rsub", lambda t: 5 - t, 5 - counts, tp.int32),
+            ("rfloordiv", lambda t: 10 // t, np.floor_divide(10, counts),
+             tp.int32),
+            ("rmod", lambda t: 10 % t, np.mod(10, counts), tp.int32),
+            ("rdiv", lambda t: 6 / t, 6 / reals, tp.float32),
+        )
+        for name, on_device, want, dtype in cases:
+            got = on_device(self._device(counts))
+            self.assertEqual(got.dtype, dtype, msg=name)
+            np.testing.assert_allclose(
+                got.cpu().numpy(), want, rtol=1e-3, atol=1e-3, err_msg=name)
+
+        for name, on_device, want in (
+                ("rfloordiv", lambda t: 10.0 // t, np.floor(10.0 / reals)),
+                ("rmod", lambda t: 10.0 % t, np.mod(10.0, reals)),
+                ("rpow", lambda t: 2.0 ** t, np.power(2.0, reals))):
+            got = on_device(self._device(reals))
+            self.assertEqual(got.dtype, tp.float32, msg=f"real {name}")
+            np.testing.assert_allclose(
+                got.cpu().numpy(), want, rtol=2e-2, atol=2e-2,
+                err_msg=f"real {name}")
+
+    def test_the_remainder_takes_the_sign_of_its_divisor(self):
+        # The difference is taken against the floored quotient, so a lane keeps
+        # the sign of the number it was divided by rather than its own.
+        counts = np.array([-7, -3, -1, 1, 2, 4, 8], dtype=np.int32)
+        for number in (2, -2, 3, -3, 5):
+            got = self._device(counts) % number
+            np.testing.assert_array_equal(
+                got.cpu().numpy(), np.mod(counts, number),
+                err_msg=f"count mod {number}")
+            written = self._device(counts)
+            written.remainder_(number)
+            np.testing.assert_array_equal(
+                written.cpu().numpy(), np.mod(counts, number),
+                err_msg=f"count mod {number} written back")
+
+        divisors = np.array([2, -3, 4, -5, 2, 3, -4], dtype=np.int32)
+        got = self._device(counts) % self._device(divisors)
+        np.testing.assert_array_equal(
+            got.cpu().numpy(), np.mod(counts, divisors),
+            err_msg="count mod count")
+
+        rng = np.random.default_rng(19)
+        for count in self.LENGTHS:
+            row = rng.integers(-9, 10, count).astype(np.int32)
+            step = rng.integers(1, 6, count).astype(np.int32)
+            if count % 2:
+                step = -step
+            got = self._device(row) % self._device(step)
+            np.testing.assert_array_equal(
+                got.cpu().numpy(), np.mod(row, step),
+                err_msg=f"linear remainder at {count} elements")
+
+    def test_a_negative_base_keeps_its_sign_through_a_whole_exponent(self):
+        # A power has no value defined for a negative base in the shader's own
+        # arithmetic, so the magnitude is raised and an even exponent puts the
+        # sign back.
+        reals = np.array([-3.0, -2.0, 4.0, -5.0], dtype=np.float32)
+        for exponent in (2, 3, 4, 5):
+            np.testing.assert_allclose(
+                (self._device(reals) ** exponent).cpu().numpy(),
+                np.power(reals, exponent),
+                rtol=1e-3, atol=1e-3, err_msg=f"real base to {exponent}")
+        counts = np.array([-3, -2, 4, -5], dtype=np.int32)
+        for exponent in (2, 3):
+            got = self._device(counts) ** exponent
+            np.testing.assert_array_equal(
+                got.cpu().numpy(), np.power(counts, exponent),
+                err_msg=f"count to {exponent}")
+        exponents = np.array([2.0, 3.0, 4.0, 5.0], dtype=np.float32)
+        # The base has to be parenthesized: a minus written beside a power binds
+        # looser than the operator, so `-2.0 ** t` negates a positive base
+        # instead of naming a negative one.
+        np.testing.assert_allclose(
+            ((-2.0) ** self._device(exponents)).cpu().numpy(),
+            np.power(-2.0, exponents),
+            rtol=1e-3, atol=1e-3, err_msg="negative base reflected")
+        # Past the image edge the same exponent payload rides the linear writer,
+        # where the sign rule is spelled against a whole uniform instead of a
+        # vector lane.
+        wide = (np.arange(self.LENGTHS[0], dtype=np.float32) % 6) + 2.0
+        np.testing.assert_allclose(
+            ((-2.0) ** self._device(wide)).cpu().numpy(),
+            np.power(-2.0, wide),
+            rtol=1e-2, atol=1e-2, err_msg="negative base reflected, linear")
+
+    def test_operands_of_two_widths_are_read_in_the_one_that_holds_both(self):
+        import tensorplay as tp
+        kinds = (tp.float32, tp.float16, tp.int32, tp.bool)
+        rng = np.random.default_rng(41)
+        for count in (24,) + self.LENGTHS:
+            planes = {
+                tp.float32: (rng.standard_normal(count) * 6).astype(np.float32),
+                tp.float16: (rng.standard_normal(count) * 6).astype(np.float16),
+                tp.int32: rng.integers(-9, 10, count).astype(np.int32),
+                tp.bool: rng.random(count) > 0.4,
+            }
+            for first in kinds:
+                for second in kinds:
+                    if first == second:
+                        continue
+                    host_a = tensorplay.from_numpy(planes[first].copy())
+                    host_b = tensorplay.from_numpy(planes[second].copy())
+                    for op in ("add", "multiply"):
+                        want = getattr(host_a, op)(host_b)
+                        got = getattr(self._device(planes[first]), op)(
+                            self._device(planes[second]))
+                        label = f"{first} {op} {second} at {count}"
+                        self.assertEqual(got.dtype, want.dtype, msg=label)
+                        np.testing.assert_allclose(
+                            got.cpu().numpy().astype(np.float64),
+                            want.cpu().numpy().astype(np.float64),
+                            rtol=1e-3, atol=1e-3, err_msg=label)
+
+    def test_a_pair_that_no_kernel_can_write_is_named(self):
+        counts = self._device(np.array([1, 2], dtype=np.int32))
+        with self.assertRaisesRegex(
+                RuntimeError, "wider than its destination"):
+            counts.add_(
+                self._device(np.array([1.0, 2.0], dtype=np.float32)))
+        with self.assertRaisesRegex(RuntimeError, "fractional operand"):
+            counts.add_(2.5)
+        # A negative whole power of a count names a fraction, and no word holds
+        # it: the answer would be a rounded quotient rather than a refusal.
+        with self.assertRaisesRegex(RuntimeError, "negative exponent"):
+            counts ** -1
+        with self.assertRaisesRegex(
+                RuntimeError, "Float32, Float16 and Int32"):
+            self._device(np.array([1, 2], dtype=np.int8)) + 2
+
+
 if __name__ == "__main__":
     unittest.main()
