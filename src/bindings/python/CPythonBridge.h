@@ -57,12 +57,14 @@ bool tpx_py_kwnames_has(PyObject* kwnames, const char* name);
 // supplied positional parameter is checked whether it was passed by position or
 // by name; a keyword naming a keyword-only parameter is carried by name and does
 // not fill a slot.  kwlist is the parameter names in schema order, excluding
-// the receiver of a method, arity is how many of them are positional, and kinds
-// is the per-position kind constant of each positional parameter.
+// the receiver of a method, arity is how many of them are positional, kinds is
+// the per-position kind constant of each positional parameter, and
+// required_kw_mask marks the keyword-only slots that must be delivered by name
+// for the candidate to serve the call at all.
 int tpx_py_probe_match(PyObject* const* args, Py_ssize_t nargs,
                        PyObject* kwnames, const char* const* kwlist,
                        Py_ssize_t nkws, const unsigned char* kinds,
-                       Py_ssize_t arity);
+                       Py_ssize_t arity, unsigned long long required_kw_mask);
 
 // Give Python Tensor subclasses the first chance to handle an operator.
 // Returns 1 when result is owned by the caller, 0 when native parsing should

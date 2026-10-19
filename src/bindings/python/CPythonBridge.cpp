@@ -1175,7 +1175,8 @@ bool tpx_py_kwnames_has(PyObject* kwnames, const char* name) {
 int tpx_py_probe_match(PyObject* const* args, Py_ssize_t nargs,
                        PyObject* kwnames, const char* const* kwlist,
                        Py_ssize_t nkws, const unsigned char* kinds,
-                       Py_ssize_t arity) {
+                       Py_ssize_t arity,
+                       unsigned long long required_kw_mask) {
     // Whether a call serves this candidate and, when it does, how many of the
     // candidate's positional parameters it fills.  A return of -1 means the
     // call is not this candidate's to serve; 0 means it is but a supplied
@@ -1192,9 +1193,13 @@ int tpx_py_probe_match(PyObject* const* args, Py_ssize_t nargs,
     //
     // A keyword naming no parameter of this candidate at all is a call this
     // candidate cannot serve, so it is reported as unservable and the candidate
-    // is settled by trying it.
+    // is settled by trying it.  Likewise a candidate whose required keyword-only
+    // parameter is missing cannot serve the call: the count of filled positional
+    // slots says nothing about a name the call did not deliver.
     if (kwnames == nullptr) {
         if (nargs > arity) return -1;
+        // A required keyword-only parameter cannot be delivered positionally.
+        if (required_kw_mask != 0) return -1;
         for (Py_ssize_t i = 0; i < nargs; ++i) {
             if (!tpx_py_obj_matches_kind(args[i], kinds[i])) return 0;
         }
@@ -1203,6 +1208,7 @@ int tpx_py_probe_match(PyObject* const* args, Py_ssize_t nargs,
     const Py_ssize_t nkw = PyTuple_GET_SIZE(kwnames);
     if (nargs > arity) return -1;
     int supplied = static_cast<int>(nargs);
+    unsigned long long delivered_kw_mask = 0;
     for (Py_ssize_t i = 0; i < nkw; ++i) {
         PyObject* key = PyTuple_GET_ITEM(kwnames, i);
         if (!PyUnicode_Check(key)) return -1;
@@ -1215,12 +1221,14 @@ int tpx_py_probe_match(PyObject* const* args, Py_ssize_t nargs,
             }
         }
         if (slot < 0 || slot < nargs) return -1;
+        if (slot < 64) delivered_kw_mask |= 1ull << slot;
         if (slot < arity) {
             PyObject* value = args[nargs + i];
             if (!tpx_py_obj_matches_kind(value, kinds[slot])) return 0;
             ++supplied;
         }
     }
+    if ((delivered_kw_mask & required_kw_mask) != required_kw_mask) return -1;
     for (Py_ssize_t i = 0; i < nargs; ++i) {
         if (!tpx_py_obj_matches_kind(args[i], kinds[i])) return 0;
     }

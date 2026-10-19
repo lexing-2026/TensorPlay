@@ -455,8 +455,8 @@ def _probe_info(f, variant: str):
     is_method = variant == "method"
     # The probe works on user arguments; the receiver's `self` slot sits
     # wherever the schema places it, so exclude it by name.
-    pos = [a for a in f.args if not (is_method and a.name == "self")
-           and not a.kwonly]
+    user = [a for a in f.args if not (is_method and a.name == "self")]
+    pos = [a for a in user if not a.kwonly]
     if pos and pos[-1].type.is_list:
         return None                       # splat folding: nargs not comparable
     kinds = [_KIND_CONST.get(cpp_arg_type(a.type)) for a in pos]
@@ -467,7 +467,15 @@ def _probe_info(f, variant: str):
     if kinds and any(k is None for k in kinds):
         return None
     required = sum(1 for a in pos if a.default is None)
-    return {"arity": len(pos), "required": required, "kinds": kinds}
+    # A keyword-only parameter with no default also has to be delivered by
+    # name.  Its slot lies past the positional arity, so the count of filled
+    # positional slots cannot tell whether it was supplied; the mask carries
+    # that, and a candidate missing one of its required names is not a match.
+    required_kw_mask = sum(
+        1 << i for i, a in enumerate(user)
+        if a.kwonly and a.default is None)
+    return {"arity": len(pos), "required": required,
+            "required_kw_mask": required_kw_mask, "kinds": kinds}
 
 
 def _first_of_each_probe_shape(user_args, probes) -> list:
@@ -485,7 +493,8 @@ def _first_of_each_probe_shape(user_args, probes) -> list:
     marks = []
     for k, (args_k, p) in enumerate(zip(user_args, probes)):
         shape = (tuple(a.name for a in args_k), tuple(p["kinds"]),
-                 len(args_k), p["arity"], p["required"])
+                 len(args_k), p["arity"], p["required"],
+                 p["required_kw_mask"])
         marks.append(first.setdefault(shape, k) == k)
     return marks
 
@@ -1201,7 +1210,8 @@ def _gen_python_capi(ctx: CodegenContext) -> None:
                         f"        const int tpx_probe_{k} = "
                         f"tpx_py_probe_match(args, nargs, "
                         f"kwnames, tpx_kwlist_{k}, {len(user_args[k])}, "
-                        f"tpx_kinds_{k}, {p['arity']});")
+                        f"tpx_kinds_{k}, {p['arity']}, "
+                        f"{p['required_kw_mask']}ull);")
                 for k, p in enumerate(probes):
                     if not counting[k]:
                         continue
