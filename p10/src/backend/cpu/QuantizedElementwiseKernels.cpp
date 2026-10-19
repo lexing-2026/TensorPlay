@@ -40,6 +40,62 @@ void unsigned_pack_impl(const float* input, uint8_t* output, int64_t size, float
     for (; i < size; ++i) output[i] = quant::encode<uint8_t>(input[i], inverse, zp);
 }
 
+#if defined(CPU_CAPABILITY_AVX2)
+// A code no wider than its slot needs no decision per lane: the two neighbours
+// sharing a byte merge inside their own 128-bit half by shifting one byte of each
+// pair over the other, and a byte gather keeps the positions that are now whole.
+// Running the same merge again folds four codes into a byte, so the halves only
+// have to be brought together once per level.
+__attribute__((always_inline)) inline __m256i codes_to_items(__m256i lower, __m256i upper) {
+    __m256i wide = _mm256_packs_epi32(lower, upper);
+    wide = _mm256_permute4x64_epi64(wide, 0xD8);
+    return _mm256_packus_epi16(wide, wide);
+}
+
+template <int Shift>
+__attribute__((always_inline)) inline __m256i merge_pairs(__m256i items) {
+    const __m256i whole = _mm256_or_si256(items,
+        _mm256_slli_epi16(_mm256_srli_si256(items, 1), Shift));
+    // Bytes 0, 2, 4 and 6 of each half hold a finished byte of codes.
+    return _mm256_shuffle_epi8(whole,
+        _mm256_set1_epi64x(static_cast<long long>(0xFFFFFFFF06040200ULL)));
+}
+
+inline __m256i join_halves(__m256i packed) {
+    return _mm256_permutevar8x32_epi32(packed, _mm256_setr_epi32(0, 4, 0, 0, 0, 0, 0, 0));
+}
+
+// Sixteen clamped codes leave as the bytes that hold them: eight for a nibble,
+// four for a pair of bits.
+template <int Bits>
+__attribute__((always_inline)) inline void pack_sixteen(__m256 lower, __m256 upper,
+                                                        uint8_t* output) {
+    const __m256i items = codes_to_items(_mm256_cvtps_epi32(lower), _mm256_cvtps_epi32(upper));
+    if constexpr (Bits == 4) {
+        _mm_storel_epi64(reinterpret_cast<__m128i*>(output),
+                         _mm256_castsi256_si128(join_halves(merge_pairs<4>(items))));
+    } else {
+        const __m256i halves = join_halves(merge_pairs<2>(items));
+        _mm_storeu_si32(output, _mm256_castsi256_si128(merge_pairs<4>(halves)));
+    }
+}
+
+// The codes of a packed row are its values scaled onto the grid and clipped to
+// the width, so two vectors of them are all the packer needs.
+template <int Bits>
+void pack_row_chunk(const float* source, int64_t first, float lo, float inverse,
+                    uint8_t* output) {
+    using V = vec::Vectorized<float>;
+    constexpr int lanes = V::size();
+    const V base(lo), step(inverse), floor(0.f), ceiling(static_cast<float>((1 << Bits) - 1));
+    const auto codes = [&](int64_t at) {
+        return vec::minimum(ceiling,
+                            vec::maximum(floor, ((V::loadu(source + at) - base) * step).round()));
+    };
+    pack_sixteen<Bits>(codes(first), codes(first + lanes), output);
+}
+#endif
+
 template<int Bits>
 void subbyte_pack(const float* input,uint8_t* output,int64_t size,float inverse,float zp) {
     using V=vec::Vectorized<float>;
@@ -1620,6 +1676,15 @@ void rowwise_pack_impl(const float* input, const float* ranges, uint8_t* output,
             }
             if (std::fegetround() == FE_TONEAREST && lanes >= values_per_byte && lanes % values_per_byte == 0) {
                 alignas(64) float codes[lanes];
+#if defined(CPU_CAPABILITY_AVX2)
+                if (bits == 4) {
+                    for (; col + 2 * lanes <= columns; col += 2 * lanes)
+                        pack_row_chunk<4>(src, col, lo, inverse, dst + col / 2);
+                } else if (bits == 2) {
+                    for (; col + 2 * lanes <= columns; col += 2 * lanes)
+                        pack_row_chunk<2>(src, col, lo, inverse, dst + col / 4);
+                }
+#endif
                 for (; col + lanes <= columns; col += lanes) {
                     V values = ((V::loadu(src + col) - V(lo)) * V(inverse)).round();
                     values = vec::minimum(V(static_cast<float>((1 << bits) - 1)), vec::maximum(V(0.f), values));
