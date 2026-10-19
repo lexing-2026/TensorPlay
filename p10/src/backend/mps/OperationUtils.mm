@@ -1106,11 +1106,7 @@ std::optional<Tensor> clampShader(const Tensor& self,
   MTLComputePipelineState_t active_pso = vec_pso ? vec_pso : pso;
   // The vector form counts 16-byte vectors, the scalar form elements.
   const uint32_t span = vec_pso ? elements / 4 : elements;
-  // Bounds do the least arithmetic per byte of any pass, so the launch wins
-  // from having many small threadgroups to fill: keep the 16-byte access and
-  // give every thread one vector instead of a run of four.
-  const uint32_t total =
-      vec_pso ? span : denseSpanThreads(span, elements, /*grid_stride=*/false);
+  const uint32_t total = denseSpanThreads(span, elements, vec_pso != nil);
   const uint32_t per_group = denseThreadsPerGroup(
       total, elements,
       static_cast<uint32_t>([active_pso maxTotalThreadsPerThreadgroup]));
