@@ -1884,51 +1884,86 @@ inline vec::Vectorized<float> row_codes(const uint8_t* row, int64_t first) {
 #endif
 }
 
+// A run of blocks, one per column vector, holds its sums in registers while the
+// rows of the bag pass through: a block count fixed here is what keeps the
+// accumulators out of memory, and every column adds its own rows in order
+// whichever way the blocks are gathered.
+template <int Bits, int Blocks>
+__attribute__((always_inline)) inline void hold_blocks(const uint8_t* const* rows,
+        const float* gradients, const float* shifts, int held, int64_t columns, int64_t col,
+        float* y, int64_t bag, bool carried) {
+    using FV = vec::Vectorized<float>;
+    constexpr int lanes = FV::size();
+    FV sums[Blocks];
+    for (int t = 0; t < Blocks; ++t)
+        sums[t] = carried ? FV::loadu(y + bag * columns + col + t * lanes) : FV(0.f);
+    for (int k = 0; k < held; ++k) {
+        const FV gradient(gradients[k]), shift(shifts[k]);
+        for (int t = 0; t < Blocks; ++t)
+            sums[t] = vec::fmadd(row_codes<Bits>(rows[k], col + t * lanes), gradient, sums[t] + shift);
+    }
+    for (int t = 0; t < Blocks; ++t) sums[t].store(y + bag * columns + col + t * lanes);
+}
+
 template <int Bits>
 void embedding_rows(const uint8_t* w, const int64_t* indices, const int64_t* offsets,
         const int64_t* mapping, const float* weights, float* y, int64_t first_bag, int64_t last_bag,
         int64_t bags, int64_t count, int64_t fixed, int64_t columns, int64_t width, bool embedding) {
     using FV = vec::Vectorized<float>;
     constexpr int lanes = FV::size();
+    constexpr int held_rows = 32;
+    // A row's grid and weight hold for every column of it, and reading them apart
+    // from the codes costs four byte loads each, so a run of rows is resolved once
+    // into arrays that the column walk only reads.
+    const uint8_t* rows[held_rows];
+    float gradients[held_rows], shifts[held_rows];
+    alignas(64) float codes[lanes]{};
     for (int64_t bag = first_bag; bag < last_bag; ++bag) {
         const int64_t first = embedding ? bag : (offsets ? offsets[bag] : bag * fixed);
         const int64_t last = embedding ? bag + 1 : (offsets ? (bag + 1 < bags ? offsets[bag+1] : count) : first + fixed);
-        int64_t col = 0;
-        // A row's affine grid and weight hold for every column of it, so the index
-        // walk sits inside a fixed number of column blocks rather than repeating
-        // once per block.
-        for (; col + lanes <= columns;) {
-            const int grouped = static_cast<int>(std::min<int64_t>(4, (columns - col) / lanes));
-            FV sums[4]{FV(0.f), FV(0.f), FV(0.f), FV(0.f)};
-            for (int64_t j = first; j < last; ++j) {
-                const int64_t row_index = mapping ? mapping[indices[j]] : indices[j];
-                if (row_index == -1) continue;
-                const uint8_t* row = w + row_index * width;
-                float scale, bias;
-                quant::row_grid(row, width, Bits, scale, bias);
-                const float weight = weights ? weights[j] : 1.f;
-                const FV gradient(scale * weight), shift(bias * weight);
-                for (int t = 0; t < grouped; ++t)
-                    sums[t] = vec::fmadd(row_codes<Bits>(row, col + t * lanes), gradient, sums[t] + shift);
-            }
-            for (int t = 0; t < grouped; ++t) sums[t].store(y + bag * columns + col + t * lanes);
-            col += grouped * lanes;
+        if (first >= last) {
+            // A bag that gathers no row still owns an output row, and it holds zeros.
+            for (int64_t col = 0; col < columns; col += lanes)
+                FV(0.f).store(y + bag * columns + col,
+                              static_cast<int>(std::min<int64_t>(lanes, columns - col)));
+            continue;
         }
-        if (col < columns) {
-            FV sum(0.f);
-            const int take = static_cast<int>(columns - col);
-            for (int64_t j = first; j < last; ++j) {
+        for (int64_t start = first; start < last; start += held_rows) {
+            const int64_t stop = std::min(start + held_rows, last);
+            const bool carried = start > first;
+            int held = 0;
+            for (int64_t j = start; j < stop; ++j) {
                 const int64_t row_index = mapping ? mapping[indices[j]] : indices[j];
                 if (row_index == -1) continue;
                 const uint8_t* row = w + row_index * width;
                 float scale, bias;
                 quant::row_grid(row, width, Bits, scale, bias);
                 const float weight = weights ? weights[j] : 1.f;
-                alignas(64) float codes[lanes]{};
-                for (int c = 0; c < take; ++c) codes[c] = static_cast<float>(quant::row_code(row, col + c, Bits));
-                sum = vec::fmadd(FV::loadu(codes), FV(scale * weight), sum + FV(bias * weight));
+                rows[held] = row;
+                gradients[held] = scale * weight;
+                shifts[held] = bias * weight;
+                ++held;
             }
-            sum.store(y + bag * columns + col, take);
+            int64_t col = 0;
+            for (; col + 8 * lanes <= columns; col += 8 * lanes)
+                hold_blocks<Bits, 8>(rows, gradients, shifts, held, columns, col, y, bag, carried);
+            for (; col + 4 * lanes <= columns; col += 4 * lanes)
+                hold_blocks<Bits, 4>(rows, gradients, shifts, held, columns, col, y, bag, carried);
+            for (; col + 2 * lanes <= columns; col += 2 * lanes)
+                hold_blocks<Bits, 2>(rows, gradients, shifts, held, columns, col, y, bag, carried);
+            for (; col + lanes <= columns; col += lanes)
+                hold_blocks<Bits, 1>(rows, gradients, shifts, held, columns, col, y, bag, carried);
+            if (col < columns) {
+                const int take = static_cast<int>(columns - col);
+                float tail[lanes]{};
+                if (carried) for (int c = 0; c < take; ++c) tail[c] = y[bag * columns + col + c];
+                FV sum = FV::loadu(tail);
+                for (int k = 0; k < held; ++k) {
+                    for (int c = 0; c < take; ++c) codes[c] = static_cast<float>(quant::row_code(rows[k], col + c, Bits));
+                    sum = vec::fmadd(FV::loadu(codes), FV(gradients[k]), sum + FV(shifts[k]));
+                }
+                sum.store(y + bag * columns + col, take);
+            }
         }
     }
 }

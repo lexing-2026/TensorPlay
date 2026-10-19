@@ -8,6 +8,10 @@
 
 namespace tensorplay::quant::TP_QN_DETAIL {
 
+// Weighted codes a bag walk has to carry before sharing it with the pool beats
+// finishing it on the calling thread.
+constexpr int64_t kEmbeddingChunkSteps = 131072;
+
 TP_QN_DEVICE inline float quant_loss(const float* x, int64_t size, float lo, float hi, int bits) {
     lo = static_cast<float>(Half(lo));
     const float range = hi - lo, qmax = static_cast<float>((1 << bits) - 1);
@@ -276,7 +280,17 @@ Tensor embedding_lookup(const Tensor& packed, const Tensor& indices, int64_t bit
     apply(y.numel(), EmbeddingLookup{w.data_ptr<uint8_t>(), ind.data_ptr<int64_t>(), po, pm, pp,
         y.data_ptr<float>(), columns, width, bags, count, fixed, static_cast<int>(bits), embedding});
 #else
-    parallel::parallel_for(0, bags, 1, [&](int64_t first, int64_t last) {
+    // A walk of a bag decodes a code per column of it, and a code of less than a
+    // byte takes several steps more to unfold than a byte does, so the work of a
+    // bag is its codes weighted by the width they arrive in. Below the cost of a
+    // handoff the walk stays whole on the calling thread; above it the walk splits
+    // one bag per chunk, because fewer chunks than threads leave workers idle and
+    // the bags are alike enough that no finer bound is needed.
+    const int64_t per_bag = embedding ? 1
+        : (indices.dim() == 2 ? fixed : (bags > 0 ? count / bags : 1));
+    const int64_t steps = std::max<int64_t>(1, per_bag * columns) * (8 + bits) / bits;
+    const int64_t grain = bags > kEmbeddingChunkSteps / steps ? 1 : std::max<int64_t>(1, bags);
+    parallel::parallel_for(0, bags, grain, [&](int64_t first, int64_t last) {
         tensorplay::cpu::quantized_embedding_stub(DeviceType::CPU, w.data_ptr<uint8_t>(), ind.data_ptr<int64_t>(),
             po, pm, pp, y.data_ptr<float>(), first, last, bags, count, fixed, columns, width, bits, embedding);
     });
