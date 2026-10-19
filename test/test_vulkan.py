@@ -3495,9 +3495,13 @@ class TestVulkanWidePayload(unittest.TestCase):
             self.assertEqual(
                 classes, [classes[0]] * 3,
                 f"an index list routed the {name} lookup differently")
-            self.assertIs(
-                classes[0], name == "texel",
-                f"a {name} table released its result in the wrong class")
+            # Whichever route read the table, the rows come back in an image: a
+            # consumer picks its route from what it was handed, and a lookup
+            # result is usually narrow enough that a texture-only kernel is the
+            # only one that can read it at all.
+            self.assertEqual(
+                classes, [True] * 3,
+                f"a {name} table released its rows outside an image")
 
     def test_wide_payloads_stop_at_the_ops_that_read_one_word_per_element(self):
         values = np.array([0, 5, 2, 7, 1], dtype=np.int64)
@@ -3679,6 +3683,42 @@ class TestVulkanGather(unittest.TestCase):
         empty = tensorplay.gather(
             table, 1, self._device(np.zeros((4, 0), np.int64)))
         self.assertEqual(tuple(empty.shape), (4, 0))
+
+
+class TestVulkanFencedReadback(unittest.TestCase):
+    # The transfer that carries a payload to the host waits on a fence of its
+    # own.  A queue starts a batch only after the one before it has finished, so
+    # that fence also covers every dispatch recorded into the same command batch
+    # beforehand, and it is the only evidence a readback needs to hand the
+    # command and descriptor pools back for reuse.
+
+    def test_a_compute_step_and_a_readback_share_the_fence(self):
+        import tensorplay.functional as F
+        # Each round records a dispatch that no one submits on its own, then a
+        # readback that ends and hands over the batch.  The payload is freshly
+        # built every round, so the retired one waits in the clear list while
+        # the next transfer recycles the pools it was recorded against.
+        rounds = 120
+        acc = tensorplay.zeros((37,), device="vulkan")
+        step = tensorplay.ones((37,), device="vulkan")
+        for i in range(1, rounds + 1):
+            acc = F.add(acc, step)
+            np.testing.assert_array_equal(
+                acc.cpu().numpy(), np.full((37,), float(i), dtype=np.float32),
+                err_msg=f"image readback at round {i} saw a stale payload")
+
+    def test_an_upload_and_a_readback_share_the_fence(self):
+        # A wide element has no image form on any device, so this round trips
+        # the other fenced transfer: one that streams a linear payload into a
+        # host-visible buffer with a copy command.
+        rounds = 120
+        shape = (41,)
+        acc = tensorplay.zeros(shape, dtype=tensorplay.int64, device="vulkan")
+        for i in range(1, rounds + 1):
+            acc.copy_(tensorplay.from_numpy(np.full(shape, i, dtype=np.int64)))
+            np.testing.assert_array_equal(
+                acc.cpu().numpy(), np.full(shape, i, dtype=np.int64),
+                err_msg=f"linear readback at round {i} saw a stale payload")
 
 
 if __name__ == "__main__":
