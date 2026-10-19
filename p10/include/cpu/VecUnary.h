@@ -1433,6 +1433,14 @@ __attribute__((target("avx2,fma"), noinline))
 static void bf16_chunk_avx2(VOp op, VParams prm, const uint16_t* src, uint16_t* dst, int64_t b, int64_t e) {
     const __m256i shift = _mm256_set1_epi32(16);
     (void)shift;
+    // Narrowing picks the low half of every 32-bit result.  Byte indices are
+    // lane-local, so each 128-bit lane contributes four bf16 values and the
+    // -1 selectors zero the rest of the lane; the two halves are then
+    // concatenated.  Keeping this in registers matters: a stack round trip
+    // per vector costs more than the widen/compute pair it follows.
+    const __m256i pack_pick = _mm256_setr_epi8(
+        0, 1, 4, 5, 8, 9, 12, 13, -1, -1, -1, -1, -1, -1, -1, -1,
+        0, 1, 4, 5, 8, 9, 12, 13, -1, -1, -1, -1, -1, -1, -1, -1);
     src += b;
     dst += b;
     int64_t n = e - b;
@@ -1447,9 +1455,10 @@ static void bf16_chunk_avx2(VOp op, VParams prm, const uint16_t* src, uint16_t* 
             _mm256_set1_epi32(0x7FFFu),
             _mm256_srli_epi32(_mm256_and_si256(u, _mm256_set1_epi32(0x10000u)), 16));
         __m256i r = _mm256_srli_epi32(_mm256_add_epi32(u, rounding), 16);
-        alignas(32) uint32_t lanes[8];
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(lanes), r);
-        for (int64_t j = 0; j < 8; ++j) dst[i + j] = static_cast<uint16_t>(lanes[j]);
+        __m256i p = _mm256_shuffle_epi8(r, pack_pick);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i),
+                         _mm_unpacklo_epi64(_mm256_castsi256_si128(p),
+                                            _mm256_extracti128_si256(p, 1)));
     }
     for (; i < n; ++i) {
         uint32_t bits = static_cast<uint32_t>(src[i]) << 16;
