@@ -911,11 +911,15 @@ Tensor reduce_int64(
       {static_cast<int32_t>(output.numel()), static_cast<int32_t>(span), 0, 0}};
   api::UniformParamsBuffer params(context, block);
   api::PipelineBarrier barrier{};
+  // One workgroup per answer, and a group is exactly as wide as the tree that
+  // folds the sixty-four strides of the walk back into one number.  The launch
+  // extent counts invocations, so an answer costs a whole group of sixty-four
+  // of them.
   const uint32_t groups = std::min<uint32_t>(output.numel(), 65535u);
   context->submit_compute_job(
       VK_KERNEL_FROM_STR(shader), barrier,
       {groups * 64u, api::utils::div_up(static_cast<uint32_t>(output.numel()), groups), 1u},
-      {256u, 1u, 1u}, VK_NULL_HANDLE,
+      {64u, 1u, 1u}, VK_NULL_HANDLE,
       output.buffer(barrier, api::PipelineStage::COMPUTE, api::MemoryAccessType::WRITE),
       input.image(barrier, api::PipelineStage::COMPUTE), params.buffer());
   return convert(output);
