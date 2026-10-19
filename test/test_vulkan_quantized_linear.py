@@ -219,3 +219,23 @@ def test_w4a16_linear_of_a_long_weight_row(m, n, k):
     )
     assert tuple(out.shape) == (m, n)
     np.testing.assert_array_equal(out.cpu().numpy(), expected)
+
+
+# A code payload whose row count passes the image axis limit has no texel form,
+# so the affine undo reads the four byte lanes of every code word instead of
+# sampling an image, and the result keeps that linear storage.  An element count
+# that does not divide by four leaves a partly used word on both sides, which the
+# run must stop before.  The scale stays a power of two while the codes and the
+# zero point stay whole, so every result is one single precision names exactly.
+@pytest.mark.parametrize("n,k", [(16384, 8), (16385, 13), (20000, 8), (16385, 3)])
+@pytest.mark.parametrize("zero_point", [0, -3])
+def test_dequantize_of_an_uploaded_weight(n, k, zero_point):
+    rng = np.random.default_rng(n * 5 + k + abs(zero_point))
+    codes = rng.integers(-8, 8, (n, k)).astype(np.int8)
+    weight = tp._C._make_per_tensor_quantized_tensor(
+        tp.from_numpy(codes.copy()).to("vulkan"), 0.25, zero_point)
+    out = tp.dequantize(weight)
+    expected = 0.25 * (codes.astype(np.float32) - zero_point)
+    assert out.dtype == tp.float32
+    assert tuple(out.shape) == (n, k)
+    np.testing.assert_array_equal(out.cpu().numpy(), expected)
