@@ -3,6 +3,7 @@
 #include "Blocks.h"
 #include "Common.h"
 #include "Convert.h"
+#include "Factory.h"
 #include "Utils.h"
 
 #include <Utils.h>
@@ -43,6 +44,31 @@ struct IndexSelectBlock final {
   int count;
   int fill;
 };
+
+// A shape left-padded to four axes with ones, outermost first - the form the
+// row lookups address a 1-d to 4-d payload with.
+ivec4 padded_sizes(const std::vector<int64_t>& sizes) {
+  ivec4 padded{1, 1, 1, 1};
+  const int rank = static_cast<int>(sizes.size());
+  const int offset = 4 - rank;
+  for (int axis = 0; axis < rank; ++axis) {
+    padded[offset + axis] = static_cast<int32_t>(sizes[static_cast<size_t>(axis)]);
+  }
+  return padded;
+}
+
+// Contiguous strides of that padded shape.  A padded axis has size one and
+// inherits the stride of the axis below it, and every element of the payload
+// sits below that stride, so its coordinate comes out zero.
+ivec4 padded_strides(const std::vector<int64_t>& sizes) {
+  const ivec4 padded = padded_sizes(sizes);
+  ivec4 strides{1, 1, 1, 1};
+  strides[3] = 1;
+  for (int axis = 2; axis >= 0; --axis) {
+    strides[axis] = strides[axis + 1] * padded[axis + 1];
+  }
+  return strides;
+}
 
 // Builds the Int32 payload a lookup walks: one code per entry of a flat 1-D
 // list, in the storage class the looked-up rows live in.  Following the model
@@ -557,6 +583,162 @@ Tensor index_select_kernel(
   return flat_out.reshape(out_sizes);
 }
 
+//
+// Per-position row selection: output element e stands for the source element at
+// e's own coordinates with the gathered coordinate replaced by the e-th code.
+// The index tensor has the source's rank and is no wider than it along any other
+// axis, so the output has exactly the index shape.  Which route runs depends on
+// where the gathered axis sits in the texel layout: the two innermost axes are
+// the width and the height, so a code moves the fetch along a texel axis and one
+// invocation can write a whole output texel; the channel and batch axes live in
+// the lanes and the depth planes, where a code would have to move a value
+// between lanes of different texels, so those gathers run over linear storage.
+// A code naming no row of the source contributes a zero, the answer the other row
+// lookups of this backend already give.
+Tensor gather_kernel(const Tensor& self, int64_t dim, const Tensor& index) {
+  validate_gather_operand(self, "gather");
+  TP_CHECK(
+      index.dtype() == DType::Int32 || index.dtype() == DType::Int64,
+      "Vulkan gather: index must be Int32 or Int64");
+  const int64_t wrapped = dim < 0 ? dim + self.dim() : dim;
+  TP_CHECK(
+      wrapped >= 0 && wrapped < self.dim(),
+      "Vulkan gather: dimension out of range");
+  TP_CHECK(
+      index.dim() == self.dim(),
+      "Vulkan gather: index must have the same rank as the source");
+  for (int64_t axis = 0; axis < self.dim(); ++axis) {
+    TP_CHECK(
+        axis == wrapped || index.size(axis) <= self.size(axis),
+        "Vulkan gather: index is wider than the source at dimension ",
+        axis);
+  }
+
+  const std::vector<int64_t> out_sizes(
+      static_cast<std::vector<int64_t>>(index.shape()));
+  const int64_t out_count = index.numel();
+  if (out_count == 0) {
+    return empty_kernel(out_sizes, self.dtype(), self.device(), false);
+  }
+
+  api::Context* const context = api::context();
+
+  // Both routes read a row-major payload, so a strided source is laid out flat
+  // first; the index list is flattened by its own upload.
+  Tensor src = self.is_contiguous() ? self : self.contiguous();
+  api::vTensor v_self = convert(src);
+
+  // The gathered axis counted in the padded four-axis shape the mapping walks.
+  const int32_t axis = static_cast<int32_t>(wrapped + 4 - self.dim());
+  const bool texel_axis =
+      wrapped == self.dim() - 1 || wrapped == self.dim() - 2;
+  const bool texture_gather =
+      texel_axis && v_self.storage_type() != api::StorageType::BUFFER &&
+      image_storage_supported(context, out_sizes) &&
+      image_storage_supported(context, {out_count});
+
+  api::vTensor v_indices = upload_index_payload(
+      index,
+      texture_gather ? api::StorageType::TEXTURE_3D
+                     : api::StorageType::BUFFER);
+
+  if (!texture_gather) {
+    api::vTensor v_input_buf =
+        v_self.storage_type() == api::StorageType::BUFFER
+        ? v_self
+        : to_buffer_storage_dispatch(context, v_self);
+    api::vTensor v_indices_buf =
+        to_buffer_storage_dispatch(context, v_indices);
+    api::vTensor v_out_buf{
+        context, {out_count}, self.dtype(), api::StorageType::BUFFER,
+        api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+    const uint32_t lanes = self.dtype() == DType::Float16 ? 2u : 4u;
+    const ivec4 out_strides = padded_strides(out_sizes);
+    const ivec4 self_strides = padded_strides(
+        static_cast<std::vector<int64_t>>(self.shape()));
+    const struct GatherBufferBlock {
+      ivec4 out_strides;
+      ivec4 self_strides;
+      int32_t axis;
+      int32_t self_rows;
+      int32_t count;
+      int32_t fill;
+    } block{
+        out_strides,
+        self_strides,
+        axis,
+        static_cast<int32_t>(self.size(wrapped)),
+        static_cast<int32_t>(out_count),
+        0};
+    api::UniformParamsBuffer params(context, block);
+    api::PipelineBarrier pipeline_barrier{};
+    context->submit_compute_job(
+        VK_KERNEL_FROM_STR(self.dtype() == DType::Float16 ? "gather_buffer_half"
+                                                          : "gather_buffer"),
+        pipeline_barrier,
+        {api::utils::div_up(static_cast<uint32_t>(out_count), lanes), 1u, 1u},
+        {256u, 1u, 1u}, VK_NULL_HANDLE,
+        v_out_buf.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::WRITE),
+        v_input_buf.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::READ),
+        v_indices_buf.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::READ),
+        params.buffer());
+    Tensor flat_out = convert(v_out_buf);
+    return flat_out.reshape(out_sizes);
+  }
+
+  // The texel route: one invocation per output texel, four channel lanes at a
+  // time.  The depth axis stacks each payload's own channel groups, so the plane
+  // a code is read from is counted with the source's groups per batch - the index
+  // tensor may hold fewer channels than the source.
+  api::vTensor v_output{context, out_sizes, self.dtype()};
+
+  const ivec4 out_padded = padded_sizes(out_sizes);
+  const ivec4 self_padded =
+      padded_sizes(static_cast<std::vector<int64_t>>(self.shape()));
+  const struct GatherBlock {
+    ivec4 out_sizes; // (width, height, channel, batch) of the output
+    int32_t self_planes_per_batch;
+    int32_t gather_width;
+    int32_t self_rows;
+    int32_t fill;
+  } block{
+      ivec4{
+          out_padded[3],
+          out_padded[2],
+          out_padded[1],
+          out_padded[0]},
+      (self_padded[1] + 3) / 4,
+      wrapped == self.dim() - 1 ? 1 : 0,
+      static_cast<int32_t>(self.size(wrapped)),
+      0};
+
+  api::UniformParamsBuffer params(context, block);
+  api::PipelineBarrier pipeline_barrier{};
+  const api::utils::uvec3 grid = v_output.extents();
+
+  context->submit_compute_job(
+      VK_KERNEL(gather), pipeline_barrier, grid,
+      adaptive_work_group_size(grid), VK_NULL_HANDLE,
+      v_output.image(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::WRITE),
+      v_self.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+      v_indices.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+      params.buffer());
+
+  return convert(v_output);
+}
+
 } // namespace ops
 } // namespace vulkan
 } // namespace tensorplay
@@ -564,6 +746,7 @@ Tensor index_select_kernel(
 TENSORPLAY_LIBRARY_IMPL(Vulkan, IndexingKernels) {
   m.impl("embedding", &tensorplay::vulkan::ops::embedding_kernel);
   m.impl("index_select", &tensorplay::vulkan::ops::index_select_kernel);
+  m.impl("gather", &tensorplay::vulkan::ops::gather_kernel);
   m.impl("index_copy_", &tensorplay::vulkan::ops::index_copy__kernel);
   m.impl("index_copy", &tensorplay::vulkan::ops::index_copy_kernel);
 }

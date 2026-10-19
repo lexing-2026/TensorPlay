@@ -1171,6 +1171,18 @@ index_select_buffer_half:
   parameter_names_with_default_values: {}
   shader_variants:
   - NAME: index_select_buffer_half
+gather:
+  parameter_names_with_default_values: {}
+  shader_variants:
+  - NAME: gather
+gather_buffer:
+  parameter_names_with_default_values: {}
+  shader_variants:
+  - NAME: gather_buffer
+gather_buffer_half:
+  parameter_names_with_default_values: {}
+  shader_variants:
+  - NAME: gather_buffer_half
 conv2d:
   parameter_names_with_default_values:
     HAS_BIAS: true
