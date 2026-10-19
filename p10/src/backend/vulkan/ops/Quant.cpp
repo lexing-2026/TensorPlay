@@ -1503,6 +1503,31 @@ Tensor int_repr_kernel(const Tensor& self) {
   return quantized::strip_quantizer(self).clone();
 }
 
+//
+// A code payload that reached the device as plain integers names a quantized
+// tensor once the affine parameters that read it are attached.  The naming
+// happens where the codes already sit: the payload is copied on the device, so
+// a weight uploaded once never crosses back over the host, and the copy keeps
+// the quantized tensor independent of the integer tensor it was made from.
+//
+Tensor make_per_tensor_quantized_tensor_kernel(
+    const Tensor& self,
+    double scale,
+    int64_t zero_point) {
+  TP_CHECK(
+      scale > 0.0,
+      "Vulkan _make_per_tensor_quantized_tensor: scale must be positive");
+  const DType quantized_dtype = toQIntType(self.dtype());
+  TP_CHECK(
+      isQuantizedType(quantized_dtype),
+      "Vulkan _make_per_tensor_quantized_tensor: expected an Int8, UInt8 or "
+      "Int32 code payload to name");
+  return quantized::make_qtensor(
+      clone_kernel(self),
+      make_per_tensor_affine_quantizer(scale, zero_point, quantized_dtype),
+      quantized_dtype);
+}
+
 // Defined in BinaryOp.cpp; copies a texture payload into a dense buffer.
 api::vTensor to_buffer_storage_dispatch(
     api::Context* context,
@@ -1992,6 +2017,9 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, QuantKernels) {
   m.impl("q_zero_point", &tensorplay::vulkan::ops::q_zero_point_kernel);
   m.impl("qscheme", &tensorplay::vulkan::ops::qscheme_kernel);
   m.impl("int_repr", &tensorplay::vulkan::ops::int_repr_kernel);
+  m.impl(
+      "_make_per_tensor_quantized_tensor",
+      &tensorplay::vulkan::ops::make_per_tensor_quantized_tensor_kernel);
   m.impl("dequantize.self", &tensorplay::vulkan::ops::dequantize_self_kernel);
 }
 
