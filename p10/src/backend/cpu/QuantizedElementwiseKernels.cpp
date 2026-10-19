@@ -1149,6 +1149,56 @@ void pool_channels_last_codes(const void* input, void* output, int64_t first, in
     }
 }
 
+// The largest code of a window is the largest value it stands for, so a maximum
+// window never leaves integer space: no scale, no rounding, no clamp beyond the
+// storage type. Channels sit next to each other in a channel-innermost tensor, so
+// a window's taps are strided vectors and the running maximum is one instruction
+// per tap; a pixel covered only by padding keeps the lowest code.
+template<class T>
+void pool_max_channels_last_codes(const void* input, void* output, int64_t first, int64_t last,
+                                  const quant::PoolGeometry& g) {
+    using QV = vec::Vectorized<T>;
+    constexpr int lanes = QV::size();
+    const auto* x = static_cast<const T*>(input);
+    auto* y = static_cast<T*>(output);
+    const QV lowest(std::numeric_limits<T>::lowest());
+    for (int64_t location = first; location < last; ++location) {
+        int64_t start[3]{}, end[3]{1,1,1};
+        int64_t p = location % g.out_size;
+        for (int d = 2; d >= 0; --d) {
+            const int64_t o = p % g.out[d]; p /= g.out[d];
+            start[d] = o * g.stride[d] - g.pad[d];
+            end[d] = start[d] + (g.kernel[d] - 1) * g.dilation[d] + 1;
+            while (start[d] < 0) start[d] += g.dilation[d];
+            end[d] = std::min(end[d], g.in[d]);
+        }
+        const T* row = x + location / g.out_size * g.batch_stride;
+        T* dst = y + location * g.channels;
+        int64_t channel = 0;
+        for (; channel + lanes <= g.channels; channel += lanes) {
+            QV largest = lowest;
+            for (int64_t d = start[0]; d < end[0]; d += g.dilation[0])
+                for (int64_t h = start[1]; h < end[1]; h += g.dilation[1])
+                    for (int64_t w = start[2]; w < end[2]; w += g.dilation[2])
+                        largest = vec::maximum(largest, QV::loadu(row +
+                            d * g.spatial_strides[0] + h * g.spatial_strides[1] +
+                            w * g.spatial_strides[2] + channel));
+            largest.store(dst + channel);
+        }
+        for (; channel < g.channels; ++channel) {
+            T largest = std::numeric_limits<T>::lowest();
+            for (int64_t d = start[0]; d < end[0]; d += g.dilation[0])
+                for (int64_t h = start[1]; h < end[1]; h += g.dilation[1])
+                    for (int64_t w = start[2]; w < end[2]; w += g.dilation[2]) {
+                        const T code = row[d * g.spatial_strides[0] + h * g.spatial_strides[1] +
+                                           w * g.spatial_strides[2] + channel];
+                        if (code > largest) largest = code;
+                    }
+            dst[channel] = largest;
+        }
+    }
+}
+
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC push_options
 #pragma GCC optimize ("fp-contract=off")
@@ -1317,6 +1367,13 @@ void pool_impl(const void* input, void* output, int64_t first, int64_t last, DTy
             case DType::QInt32: pool_spatial_codes<int32_t>(input,output,first,last,g,windows); break;
             default: break;
         }
+        return;
+    }
+    if (g.mode == 2) {
+        if (dtype == DType::QInt8)
+            pool_max_channels_last_codes<int8_t>(input, output, first, last, g);
+        else
+            pool_max_channels_last_codes<uint8_t>(input, output, first, last, g);
         return;
     }
     if (dtype == DType::QInt8) pool_channels_last_codes<int8_t>(input, output, first, last, g);

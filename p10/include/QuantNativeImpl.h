@@ -523,8 +523,8 @@ Tensor pool(const Tensor& input, const std::vector<int64_t>& kernel,
         formatted.impl()->set_quantizer(y.impl()->quantizer()); y = formatted;
     }
 #ifndef TP_QUANT_CUDA
-    if (g.channels_last && g.channel_stride == 1 && g.mode != 2 && g.channels > 0 &&
-        input.itemsize() == 1 && g.in_size <= INT32_MAX / 255) {
+    if (g.channels_last && g.channel_stride == 1 && g.channels > 0 &&
+        input.itemsize() == 1 && (g.mode == 2 || g.in_size <= INT32_MAX / 255)) {
         const int64_t window_work = g.mode == 1 ? std::max<int64_t>(1, g.in_size / std::max<int64_t>(g.out_size, 1))
             : g.kernel[0] * g.kernel[1] * g.kernel[2];
         parallel::parallel_for(0, y.numel() / g.channels, std::max<int64_t>(1, 32768 / g.channels / window_work),
