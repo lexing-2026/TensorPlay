@@ -17,8 +17,16 @@ from tensorplay.ao.nn.quantized.packed import PackedWeight
 
 
 def measure(fn, synchronize, repetitions):
-    for _ in range(10):
-        fn()
+    # A process begins on idle cores, and the first timed region pays for the ramp
+    # to the clocks every later region runs at. Warming for a span of time rather
+    # than a fixed number of calls puts each case on the same footing.
+    warmed = time.perf_counter() + 0.03
+    while True:
+        for _ in range(repetitions):
+            fn()
+        synchronize()
+        if time.perf_counter() >= warmed:
+            break
     samples=[]
     for _ in range(7):
         synchronize()
