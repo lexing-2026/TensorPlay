@@ -95,13 +95,19 @@ Tensor convolution(const Tensor& input, const Tensor& weight, const std::optiona
         b = bias->to(DType::Float32).contiguous();
     }
     Tensor y = output_float ? Tensor::empty(shape, DType::Float32, input.device()) : output(input, shape, scale, zp);
+    // One output element folds every tap of the window over its slice of input
+    // channels, so the chunk has to shrink by that many visits or the shape
+    // never reaches the thread pool.
+    const int64_t visits = g.kernel_spatial * (g.channels / g.groups);
     codes(input.dtype(), [&]<class T>() {
         if (output_float) apply(y.numel(), ConvCodes<T,float>{x.data_ptr<T>(),w.data_ptr<int8_t>(),
             g.channel_grid ? scales.data_ptr<float>() : nullptr, bias ? b.data_ptr<float>() : nullptr,
-            g.channel_grid ? zps.data_ptr<int64_t>() : nullptr,y.data_ptr<float>(),g});
+            g.channel_grid ? zps.data_ptr<int64_t>() : nullptr,y.data_ptr<float>(),g},
+            chunk_grain(visits));
         else apply(y.numel(), ConvCodes<T,T>{x.data_ptr<T>(),w.data_ptr<int8_t>(),
             g.channel_grid ? scales.data_ptr<float>() : nullptr,bias ? b.data_ptr<float>() : nullptr,
-            g.channel_grid ? zps.data_ptr<int64_t>() : nullptr,y.data_ptr<T>(),g});
+            g.channel_grid ? zps.data_ptr<int64_t>() : nullptr,y.data_ptr<T>(),g},
+            chunk_grain(visits));
     });
     return y;
 }
