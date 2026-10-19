@@ -5,6 +5,7 @@
 #include "Convert.h"
 #include "Factory.h"
 
+#include <TypeProperties.h>
 #include <Utils.h>
 
 #include <vector>
@@ -49,26 +50,40 @@ Tensor where_kernel(
     const Tensor& condition,
     const Tensor& self,
     const Tensor& other) {
-  validate_operand(self, "where");
-  validate_operand(other, "where");
   TP_CHECK(
       condition.dtype() == DType::Bool,
       "Vulkan where expects a Bool condition");
+
+  // Both branches move through one element vocabulary: the type that holds the
+  // pair decides, and a side narrower than it is converted first.  Leaving the
+  // pair mixed would read a texel in the wrong element width, which
+  // reinterprets its bits instead of converting them.
+  const DType vocabulary = tensorplay::native::result_type(self, other);
   TP_CHECK(
-      condition.shape() == self.shape() && self.shape() == other.shape(),
+      vocabulary == DType::Float32 || vocabulary == DType::Float16 ||
+          vocabulary == DType::Int32,
+      "Vulkan where selects between Float32, Float16 and Int32 branches");
+  const Tensor self_branch =
+      self.dtype() == vocabulary ? self : self.to(vocabulary);
+  const Tensor other_branch =
+      other.dtype() == vocabulary ? other : other.to(vocabulary);
+  validate_operand(self_branch, "where");
+  validate_operand(other_branch, "where");
+  TP_CHECK(
+      condition.shape() == self_branch.shape() &&
+          self_branch.shape() == other_branch.shape(),
       "Vulkan where requires equal-shaped operands (broadcast at the "
       "caller)");
 
-  // One shared element vocabulary for both branches; an Int32 branch pair
-  // keeps word precision, anything mixed casts the int side to Float32.
-  const bool int_branches =
-      self.dtype() == DType::Int32 && other.dtype() == DType::Int32;
+  // An Int32 branch pair keeps word precision; anything else travels as a
+  // float plane.
+  const bool int_branches = vocabulary == DType::Int32;
 
   api::Context* const context = api::context();
 
   api::vTensor v_cond = convert(condition);
-  api::vTensor v_input = convert(self);
-  api::vTensor v_other = convert(other);
+  api::vTensor v_input = convert(self_branch);
+  api::vTensor v_other = convert(other_branch);
 
   // Linear payloads (shapes beyond the 3-D image axis limit) select through
   // buffer-to-buffer variants: the Bool condition is one byte per element and
@@ -83,16 +98,16 @@ Tensor where_kernel(
     api::vTensor v_output{
         context,
         v_input.sizes(),
-        self.dtype(),
+        vocabulary,
         api::StorageType::BUFFER,
         api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
     const char* buffer_shader = nullptr;
     uint32_t lanes_per_word = 4u;
-    if (self.dtype() == DType::Int32) {
+    if (vocabulary == DType::Int32) {
       buffer_shader = "where_i32_buffer";
-    } else if (self.dtype() == DType::Float32) {
+    } else if (vocabulary == DType::Float32) {
       buffer_shader = "where_buffer";
-    } else if (self.dtype() == DType::Float16) {
+    } else if (vocabulary == DType::Float16) {
       // Half lanes pack two to a word, so a dispatch covers half as many
       // words as the four-lane vocabularies do.
       buffer_shader = "where_half_buffer";
@@ -134,7 +149,7 @@ Tensor where_kernel(
     return convert(v_output);
   }
 
-  api::vTensor v_output{context, v_input.sizes(), self.dtype()};
+  api::vTensor v_output{context, v_input.sizes(), vocabulary};
 
   const struct WhereBlock block{
       make_whcn_ivec4(v_output.sizes()),
