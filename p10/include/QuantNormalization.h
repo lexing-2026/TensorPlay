@@ -135,12 +135,21 @@ template <typename Storage>
 TP_NORM_HD Storage normalization_requantize(float value, float inv_scale,
                                            int64_t zero_point) {
     // Clamp before converting to storage, including the positive Int32 endpoint
-    // which cannot be represented exactly in Float32.
-    const double rounded = static_cast<double>(::nearbyintf(value * inv_scale))
-                           + static_cast<double>(zero_point);
-    constexpr double lower = static_cast<double>(std::numeric_limits<Storage>::min());
-    constexpr double upper = static_cast<double>(std::numeric_limits<Storage>::max());
-    return static_cast<Storage>(rounded < lower ? lower : rounded > upper ? upper : rounded);
+    // which cannot be represented exactly in Float32. Byte codes and their zero
+    // points are exact in Float32, so only wide storage needs the double sum.
+    if constexpr (sizeof(Storage) > 1) {
+        const double rounded = static_cast<double>(::nearbyintf(value * inv_scale))
+                               + static_cast<double>(zero_point);
+        constexpr double lower = static_cast<double>(std::numeric_limits<Storage>::min());
+        constexpr double upper = static_cast<double>(std::numeric_limits<Storage>::max());
+        return static_cast<Storage>(rounded < lower ? lower : rounded > upper ? upper : rounded);
+    } else {
+        const float rounded = ::nearbyintf(value * inv_scale)
+                              + static_cast<float>(zero_point);
+        constexpr float lower = static_cast<float>(std::numeric_limits<Storage>::min());
+        constexpr float upper = static_cast<float>(std::numeric_limits<Storage>::max());
+        return static_cast<Storage>(rounded < lower ? lower : rounded > upper ? upper : rounded);
+    }
 }
 
 #undef TP_NORM_HD
