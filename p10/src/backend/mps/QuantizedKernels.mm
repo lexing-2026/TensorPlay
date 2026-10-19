@@ -8,6 +8,7 @@
 #include "backend/mps/MPSAllocator.h"
 #include "backend/mps/MPSDevice.h"
 #include "backend/mps/MetalShaderLibrary.h"
+#include "backend/mps/MetalUtils.h"
 #include "backend/mps/MPSStream.h"
 
 #include <Metal/Metal.h>
