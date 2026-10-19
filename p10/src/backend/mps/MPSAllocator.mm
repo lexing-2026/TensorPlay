@@ -1,7 +1,6 @@
 #include "backend/mps/MPSAllocator.h"
 
 #include "Exception.h"
-#include "backend/mps/DiagTimer.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -98,11 +97,9 @@ class MPSAllocatorImpl final : public IMPSAllocator {
   // bytes and returns its BufferBlock. The block stays owned by the pool
   // until freeBuffer() is called.
   BufferBlock* malloc(size_t size) {
-    const unsigned long long diag_t0 = diagNowNs();
     std::lock_guard<std::mutex> lock(m_mutex);
     const size_t aligned = alignUp(size);
     BufferBlock* block = findReusableBlock(aligned);
-    const bool reused = block != nullptr;
     if (!block) {
       block = createBlock(aligned, size);
     }
@@ -110,20 +107,6 @@ class MPSAllocatorImpl final : public IMPSAllocator {
     block->in_use = true;
     m_current_allocated_memory += block->size;
     m_ptr_to_block[block->cpu_ptr] = block;
-    {
-      static thread_local DiagTimer timer{"alloc malloc"};
-      static thread_local unsigned long long fresh_calls = 0;
-      static thread_local unsigned long long fresh_count = 0;
-      timer.record(diagNowNs() - diag_t0);
-      ++fresh_calls;
-      if (!reused) {
-        ++fresh_count;
-      }
-      if (fresh_calls % 512 == 0) {
-        std::fprintf(stderr, "[mps-t] alloc fresh n=%llu fresh=%llu\n",
-                     fresh_calls, fresh_count);
-      }
-    }
     return block;
   }
 
@@ -133,7 +116,6 @@ class MPSAllocatorImpl final : public IMPSAllocator {
     if (!ptr) {
       return;
     }
-    const unsigned long long diag_t0 = diagNowNs();
     std::lock_guard<std::mutex> lock(m_mutex);
     auto it = m_ptr_to_block.find(ptr);
     if (it == m_ptr_to_block.end()) {
@@ -148,8 +130,6 @@ class MPSAllocatorImpl final : public IMPSAllocator {
     block->in_use = false;
     m_current_allocated_memory -= block->size;
     m_available_buffers.insert(block);
-    static thread_local DiagTimer timer{"alloc free"};
-    timer.record(diagNowNs() - diag_t0);
   }
 
   void emptyCache() override {

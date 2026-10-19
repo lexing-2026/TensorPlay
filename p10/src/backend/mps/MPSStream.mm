@@ -1,6 +1,5 @@
 #include "backend/mps/MPSStream.h"
 
-#include "backend/mps/DiagTimer.h"
 #include "backend/mps/MetalUtils.h"
 #include "backend/mps/MPSAllocator.h"
 #include "Exception.h"
@@ -97,7 +96,6 @@ id<MTLComputeCommandEncoder> MPSStream::commandEncoder() {
 }
 
 void MPSStream::synchronize(SyncType syncType) {
-  const unsigned long long diag_t0 = diagNowNs();
   endKernelCoalescing();
   switch (syncType) {
     case SyncType::NONE:
@@ -122,8 +120,6 @@ void MPSStream::synchronize(SyncType syncType) {
       commitAndContinue();
       break;
   }
-  static thread_local DiagTimer timer{"stream sync"};
-  timer.record(diagNowNs() - diag_t0);
 }
 
 void MPSStream::commit() {
