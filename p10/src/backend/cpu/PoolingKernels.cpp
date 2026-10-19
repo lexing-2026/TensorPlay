@@ -562,6 +562,11 @@ Tensor adaptive_max_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& 
 }
 
 Tensor max_pool2d_backward_cpu(const Tensor& grad_output, const Tensor& input, const std::vector<int64_t>& kernel_size, const std::vector<int64_t>& stride, const std::vector<int64_t>& padding, const std::vector<int64_t>& dilation, bool ceil_mode) {
+    if (input.dim() == 3) {
+        return max_pool2d_backward_cpu(
+                   grad_output.unsqueeze(0), input.unsqueeze(0), kernel_size,
+                   stride, padding, dilation, ceil_mode).squeeze(0);
+    }
     if (grad_output.dim() != 4 || input.dim() != 4) TP_THROW(RuntimeError, "max_pool2d_backward: Expected 4D input and grad_output");
     const Tensor input_c = input.contiguous();
     const Tensor grad_output_c = grad_output.contiguous();

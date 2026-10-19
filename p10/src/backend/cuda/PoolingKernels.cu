@@ -147,6 +147,13 @@ Tensor avg_pool2d_backward_native_cuda(const Tensor& grad_output,
                                        const std::vector<int64_t>& padding_arg,
                                        bool ceil_mode, bool count_include_pad,
                                        std::optional<int64_t> divisor_override);
+Tensor max_pool2d_backward_native_cuda(const Tensor& grad_output,
+                                       const Tensor& input,
+                                       const std::vector<int64_t>& kernel_size_arg,
+                                       const std::vector<int64_t>& stride_arg,
+                                       const std::vector<int64_t>& padding_arg,
+                                       const std::vector<int64_t>& dilation_arg,
+                                       bool ceil_mode);
 
 // The DNN library takes float and double only, counts its windows rounding
 // down, and takes the full window as the divisor, so an explicit divisor, a
@@ -207,7 +214,11 @@ Tensor avg_pool2d_cuda(const Tensor& input, const std::vector<int64_t>& kernel_s
 }
 
 Tensor max_pool2d_backward_cuda(const Tensor& grad_output, const Tensor& input, const std::vector<int64_t>& kernel_size_arg, const std::vector<int64_t>& stride_arg, const std::vector<int64_t>& padding_arg, const std::vector<int64_t>& dilation_arg, bool ceil_mode) {
-#ifdef USE_CUDNN
+    if (input.dim() == 3) {
+        return max_pool2d_backward_cuda(
+                   grad_output.unsqueeze(0), input.unsqueeze(0), kernel_size_arg,
+                   stride_arg, padding_arg, dilation_arg, ceil_mode).squeeze(0);
+    }
     auto kernel_size = expand_param_if_needed(kernel_size_arg, 2, 0);
     auto stride = stride_arg;
     if (stride.empty()) stride = kernel_size;
@@ -215,10 +226,18 @@ Tensor max_pool2d_backward_cuda(const Tensor& grad_output, const Tensor& input, 
     auto padding = expand_param_if_needed(padding_arg, 2, 0);
     auto dilation = expand_param_if_needed(dilation_arg, 2, 1);
 
-    if (dilation[0] != 1 || dilation[1] != 1) {
-        TP_THROW(NotImplementedError, "max_pool2d_backward_cuda: dilation not supported by cuDNN");
+    // The DNN-library path is fixed to floor-mode window counts with unit
+    // dilation over row-major buffers, and recomputes the forward output for
+    // its own backward call. Any case outside that shape goes through the
+    // native kernels, which rebuild the argmax positions themselves.
+    if (dilation[0] != 1 || dilation[1] != 1 || ceil_mode ||
+        !input.is_contiguous() || !grad_output.is_contiguous()) {
+        return max_pool2d_backward_native_cuda(
+            grad_output, input, kernel_size_arg, stride_arg, padding_arg,
+            dilation_arg, ceil_mode);
     }
-    
+
+#ifdef USE_CUDNN
     cudnnHandle_t handle = CUDAContext::getCudnnHandle();
     TensorDesc x_desc; x_desc.set(input);
     TensorDesc dy_desc; dy_desc.set(grad_output);
