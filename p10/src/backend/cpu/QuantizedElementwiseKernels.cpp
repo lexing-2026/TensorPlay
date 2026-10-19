@@ -1606,6 +1606,18 @@ void rowwise_pack_impl(const float* input, const float* ranges, uint8_t* output,
                 if (scale == 0.f || std::isinf(inverse)) scale = inverse = 1.f;
             }
             int64_t col = 0;
+            if (bits == 8 && std::fegetround() == FE_TONEAREST) {
+                // One byte per value asks for no decision per lane: a whole vector
+                // of codes leaves through a single byte store instead of being
+                // shifted into place one lane at a time.
+                using QV = vec::Vectorized<quint8>;
+                for (; col + QV::size() <= columns; col += QV::size()) {
+                    typename QV::float_vec_return_type shifted;
+                    for (size_t part = 0; part < shifted.size(); ++part)
+                        shifted[part] = (V::loadu(src + col + part * lanes) - V(lo)) * V(inverse);
+                    QV::quantize(shifted, 1.f, 0, 1.f).store(dst + col);
+                }
+            }
             if (std::fegetround() == FE_TONEAREST && lanes >= values_per_byte && lanes % values_per_byte == 0) {
                 alignas(64) float codes[lanes];
                 for (; col + lanes <= columns; col += lanes) {
