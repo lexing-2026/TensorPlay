@@ -5124,5 +5124,82 @@ class TestVulkanScatterSrc(unittest.TestCase):
                 self._device(np.zeros((2, 2), np.float32)))
 
 
+class TestVulkanWhereScalars(unittest.TestCase):
+    # With both branches numbers, the condition is the only payload and its own
+    # shape answers for the result.  A mask built this way is what a causal or a
+    # padded attention window turns into the additive form, so the fraction the
+    # lane takes has to arrive at the plane the logits are read in.
+
+    LENGTHS = (100001, 100003)
+
+    @staticmethod
+    def _device(payload):
+        return tensorplay.from_numpy(np.ascontiguousarray(payload)).to("vulkan")
+
+    @staticmethod
+    def _mask(shape, order):
+        return np.random.default_rng(order).random(shape) > 0.5
+
+    def test_a_fraction_is_taken_where_the_truth_is(self):
+        for shape in ((3, 8), (7,), (2, 3, 4, 5)):
+            condition = self._mask(shape, 51)
+            want = np.where(condition, 2.5, -1.5)
+            got = tensorplay.where(self._device(condition), 2.5, -1.5)
+            self.assertEqual(str(got.dtype), "tensorplay.float32")
+            np.testing.assert_array_equal(
+                got.cpu().numpy(), want.astype(np.float32),
+                err_msg=f"a fraction pair over {shape}")
+
+    def test_a_rejected_lane_carries_the_number_that_bans_it(self):
+        # The shape a causal mask turns into: one lane takes zero, the other a
+        # number no softmax can raise above the rest.
+        condition = self._mask((2, 4, 6, 6), 52)
+        got = tensorplay.where(self._device(condition), 0.0, -float("inf"))
+        want = np.where(condition, 0.0, -np.inf).astype(np.float32)
+        read = got.cpu().numpy()
+        self.assertTrue(np.array_equal(np.isinf(read), np.isinf(want)),
+                        msg="which lanes were banned")
+        self.assertTrue(np.array_equal(np.isneginf(read), np.isneginf(want)),
+                        msg="which side of infinity")
+        np.testing.assert_array_equal(
+            np.nan_to_num(read, neginf=-1e30),
+            np.nan_to_num(want, neginf=-1e30), err_msg="a banned lane")
+
+    def test_a_count_pair_is_carried_as_an_integer_plane(self):
+        condition = self._mask((4, 9), 53)
+        got = tensorplay.where(self._device(condition), 7, 3)
+        self.assertEqual(str(got.dtype), "tensorplay.int32")
+        np.testing.assert_array_equal(
+            got.cpu().numpy(), np.where(condition, 7, 3).astype(np.int32),
+            err_msg="a count pair")
+
+    def test_a_mixed_pair_is_carried_as_the_wider_of_the_two(self):
+        # A count beside a fraction has no integer answer, so the plane the
+        # numbers land in is the one that can hold both.
+        condition = self._mask((5, 6), 54)
+        got = tensorplay.where(self._device(condition), 1, 2.0)
+        self.assertEqual(str(got.dtype), "tensorplay.float32")
+        np.testing.assert_array_equal(
+            got.cpu().numpy(),
+            np.where(condition, 1, 2.0).astype(np.float32),
+            err_msg="a count and a fraction")
+
+    def test_a_long_condition_selects_through_linear_storage(self):
+        # Past the reach of an image the lanes live in words of four, so a lane
+        # has to take its own number out of the pair rather than the group's.
+        for width in self.LENGTHS:
+            condition = self._mask((2, width), 55)
+            got = tensorplay.where(self._device(condition), 4.5, -6.5)
+            np.testing.assert_array_equal(
+                got.cpu().numpy(),
+                np.where(condition, 4.5, -6.5).astype(np.float32),
+                err_msg=f"a fraction pair over {width} lanes")
+
+    def test_a_single_lane_answers_for_itself(self):
+        for condition in (np.array([True]), np.array([False])):
+            got = tensorplay.where(self._device(condition), 1.0, 0.0)
+            self.assertEqual(float(got.cpu().numpy()[0]), 1.0 if condition[0] else 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()
