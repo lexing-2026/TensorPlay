@@ -885,6 +885,114 @@ void moment_impl(const void* x, void* y, int64_t count, int64_t rows, DType dtyp
     }
 }
 
+// A run whose affine coefficients are fixed for every element needs neither an
+// index walk nor a per-element decision: one slope and one shift ride through
+// the vector lanes next to the codes.
+template<class Q>
+void normalize_run(const typename Q::underlying* source, typename Q::underlying* destination,
+                   int64_t length, float x_zp, float mean_div_scale, float slope, float bias,
+                   float y_scale, float inverse, int64_t y_zp) {
+    using T = typename Q::underlying;
+    using QV = vec::Vectorized<Q>;
+    using FV = vec::Vectorized<float>;
+    const FV one(1.f), shift(x_zp), mean(mean_div_scale), gradient(slope), offset(bias);
+    int64_t i = 0;
+    for (; i + QV::size() <= length; i += QV::size()) {
+        auto values = QV::loadu(source + i).dequantize(one, shift);
+        for (size_t lane = 0; lane < values.size(); ++lane)
+            values[lane] = (values[lane] - mean) * gradient + offset;
+        QV::quantize(values, y_scale, static_cast<int32_t>(y_zp), inverse).store(destination + i);
+    }
+    for (; i < length; ++i) {
+        const float code = static_cast<float>(source[i]) - x_zp;
+        destination[i] = quant::encode<T>((code - mean_div_scale) * slope + bias, inverse, y_zp);
+    }
+}
+
+// Each row is normalized by its own moments, so the pair of sums runs over a
+// dense byte run, and the second pass feeds the shifted codes straight through
+// the vector round. A wide row is one run; a group whose affine coefficients
+// repeat per channel splits into one run per channel instead.
+template<class Q>
+void normalize_codes(const void* input, const float* gamma, const float* beta, void* output,
+                     int64_t count, int64_t rows, bool affine_per_channel, int64_t channels,
+                     int64_t channel_groups, float x_scale, int64_t x_zp, float y_scale,
+                     int64_t y_zp, double eps) {
+    using T = typename Q::underlying;
+    using QV = vec::Vectorized<Q>;
+    using FV = vec::Vectorized<float>;
+    const auto* x = static_cast<const T*>(input);
+    auto* y = static_cast<T*>(output);
+    const float inverse = 1.f / y_scale, shift = static_cast<float>(x_zp);
+    const int64_t spans = affine_per_channel ? channels / channel_groups : 1;
+    const int64_t span = count / spans;
+    parallel::parallel_for(0, rows, 1, [&](int64_t first, int64_t last) {
+        for (int64_t row = first; row < last; ++row) {
+            const T* values = x + row * count;
+            T* codes = y + row * count;
+            int64_t sum = 0;
+            double square_sum = 0.;
+            if constexpr (sizeof(T) == 1) {
+                sum = byte_sum(values, count);
+                square_sum = static_cast<double>(byte_square_sum(values, count));
+            } else {
+                for (int64_t k = 0; k < count; ++k) {
+                    sum += values[k];
+                    square_sum += static_cast<double>(values[k]) * values[k];
+                }
+            }
+            const float mean_code = static_cast<float>(sum) / count;
+            const float mean_div_scale = mean_code - shift;
+            const float variance = std::max(static_cast<float>(square_sum) / count
+                                            - mean_code * mean_code, 0.f);
+            const float scale_div_std = x_scale / std::sqrt(variance * x_scale * x_scale + eps);
+            if (affine_per_channel) {
+                for (int64_t part = 0; part < spans; ++part) {
+                    const int64_t channel = (row % channel_groups) * spans + part;
+                    normalize_run<Q>(values + part * span, codes + part * span, span, shift,
+                        mean_div_scale, scale_div_std * (gamma ? gamma[channel] : 1.f),
+                        beta ? beta[channel] : 0.f, y_scale, inverse, y_zp);
+                }
+                continue;
+            }
+            const FV one(1.f), zp(shift), mean(mean_div_scale), gradient(scale_div_std), zero(0.f);
+            int64_t k = 0;
+            for (; k + QV::size() <= count; k += QV::size()) {
+                auto normalized = QV::loadu(values + k).dequantize(one, zp);
+                for (size_t lane = 0; lane < normalized.size(); ++lane) {
+                    const int64_t at = k + static_cast<int64_t>(lane) * FV::size();
+                    const FV weight = gamma ? FV::loadu(gamma + at) : one;
+                    const FV offset = beta ? FV::loadu(beta + at) : zero;
+                    normalized[lane] = ((normalized[lane] - mean) * gradient) * weight + offset;
+                }
+                QV::quantize(normalized, y_scale, static_cast<int32_t>(y_zp), inverse)
+                    .store(codes + k);
+            }
+            for (; k < count; ++k) {
+                const float code = static_cast<float>(values[k]) - shift;
+                const float value = ((code - mean_div_scale) * scale_div_std) *
+                    (gamma ? gamma[k] : 1.f) + (beta ? beta[k] : 0.f);
+                codes[k] = quant::encode<T>(value, inverse, y_zp);
+            }
+        }
+    });
+}
+
+void normalize_impl(const void* x, const float* gamma, const float* beta, void* y, DType dtype,
+                    int64_t count, int64_t rows, bool affine_per_channel, int64_t channels,
+                    int64_t channel_groups, float x_scale, int64_t x_zp, float y_scale,
+                    int64_t y_zp, double eps) {
+    switch (dtype) {
+        case DType::QInt8: normalize_codes<qint8>(x,gamma,beta,y,count,rows,affine_per_channel,
+            channels,channel_groups,x_scale,x_zp,y_scale,y_zp,eps); break;
+        case DType::QUInt8: normalize_codes<quint8>(x,gamma,beta,y,count,rows,affine_per_channel,
+            channels,channel_groups,x_scale,x_zp,y_scale,y_zp,eps); break;
+        case DType::QInt32: normalize_codes<qint32>(x,gamma,beta,y,count,rows,affine_per_channel,
+            channels,channel_groups,x_scale,x_zp,y_scale,y_zp,eps); break;
+        default: break;
+    }
+}
+
 template<class T>
 void pool_channels_last_codes(const void* input, void* output, int64_t first, int64_t last,
                              const quant::PoolGeometry& g) {
@@ -1633,6 +1741,7 @@ REGISTER_DISPATCH(quantized_binary_stub, &binary_impl);
 REGISTER_DISPATCH(quantized_embedding_stub, &embedding_impl);
 REGISTER_DISPATCH(quantized_fp16_linear_stub, &fp16_linear_impl);
 REGISTER_DISPATCH(quantized_cat_rows_stub, &cat_rows_impl);
+REGISTER_DISPATCH(quantized_normalize_stub, &normalize_impl);
 #else
 ALSO_REGISTER_AVX512_DISPATCH(quantized_subbyte_pack_stub, &subbyte_pack_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_subbyte_unpack_stub, &subbyte_unpack_impl);
@@ -1660,5 +1769,6 @@ ALSO_REGISTER_AVX512_DISPATCH(quantized_binary_stub, &binary_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_embedding_stub, &embedding_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_fp16_linear_stub, &fp16_linear_impl);
 ALSO_REGISTER_AVX512_DISPATCH(quantized_cat_rows_stub, &cat_rows_impl);
+ALSO_REGISTER_AVX512_DISPATCH(quantized_normalize_stub, &normalize_impl);
 #endif
 }

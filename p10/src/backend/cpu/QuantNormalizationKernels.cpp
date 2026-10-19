@@ -1,5 +1,6 @@
 #include "QuantKernels.h"
 #include "QuantNormalization.h"
+#include "cpu/QuantizedElementwiseKernels.h"
 #include "Parallel.h"
 
 #include <type_traits>
@@ -66,6 +67,18 @@ Tensor normalize(const Tensor& input, const std::optional<Tensor>& weight,
         ? MemoryFormat::ChannelsLast : MemoryFormat::Contiguous));
     const Tensor gamma = weight.has_value() ? weight->contiguous() : Tensor();
     const Tensor beta = bias.has_value() ? bias->contiguous() : Tensor();
+    if (!geometry.channels_last) {
+        // Every group is one dense run, so the whole normalization can be handed
+        // to the kernel that carries the vectorized byte sums.
+        quantized_normalize_stub(DeviceType::CPU, in.data_ptr(),
+            gamma.defined() ? gamma.data_ptr<float>() : nullptr,
+            beta.defined() ? beta.data_ptr<float>() : nullptr, out.data_ptr(),
+            input.dtype(), geometry.elements, geometry.groups, geometry.affine_per_channel,
+            geometry.channels, geometry.channel_groups,
+            static_cast<float>(quantized::q_scale(in)), quantized::q_zero_point(in),
+            static_cast<float>(quantized::q_scale(out)), quantized::q_zero_point(out), eps);
+        return out;
+    }
     switch (input.dtype()) {
         case DType::QInt8: normalize_codes<int8_t>(in, gamma, beta, geometry, eps, out); break;
         case DType::QUInt8: normalize_codes<uint8_t>(in, gamma, beta, geometry, eps, out); break;
