@@ -239,3 +239,162 @@ def test_dequantize_of_an_uploaded_weight(n, k, zero_point):
     assert out.dtype == tp.float32
     assert tuple(out.shape) == (n, k)
     np.testing.assert_array_equal(out.cpu().numpy(), expected)
+
+
+# A block-wise affine payload carries one parameter pair per block of the grid
+# that block_size names, so reading it means finding the block that spans each
+# element.  The grid is numbered in the row-major order of the blocks themselves
+# and an entry that does not tile its axis leaves a short block at the end, so
+# the expected value below walks the block grid element by element.
+def _affine_operands(shape, block_size, seed, unsigned=False):
+    rng = np.random.default_rng(seed)
+    codes = (
+        rng.integers(0, 256, shape).astype(np.uint8)
+        if unsigned
+        else rng.integers(-128, 128, shape).astype(np.int8)
+    )
+    counts = [int(np.ceil(s / b)) for s, b in zip(shape, block_size)]
+    n_blocks = int(np.prod(counts))
+    scales = (rng.random(n_blocks) * 0.1).astype(np.float32)
+    zero_points = rng.integers(-3, 4, n_blocks).astype(np.int32)
+    return codes, scales, zero_points
+
+
+def _affine_expect(codes, block_size, scales, zero_points):
+    counts = [int(np.ceil(s / b)) for s, b in zip(codes.shape, block_size)]
+    strides = [1] * codes.ndim
+    acc = 1
+    for d in range(codes.ndim - 1, -1, -1):
+        strides[d] = acc
+        acc *= counts[d]
+    expect = np.empty(codes.shape, dtype=np.float32)
+    for idx in np.ndindex(codes.shape):
+        block = sum((c // b) * s for c, b, s in zip(idx, block_size, strides))
+        z = 0 if zero_points is None else int(zero_points[block])
+        expect[idx] = (int(codes[idx]) - z) * float(scales[block])
+    return expect
+
+
+@pytest.mark.parametrize(
+    "shape,block_size,seed",
+    [
+        ((8, 16), (1, 4), 11),
+        ((8, 16), (8, 16), 12),
+        ((5, 17), (1, 5), 13),
+        ((5, 17), (3, 5), 14),
+        ((2, 6, 8), (1, 1, 4), 15),
+        ((2, 3, 5, 7), (1, 1, 5, 7), 16),
+        ((5,), (2,), 17),
+        ((4, 4), (1, 1), 18),
+    ],
+)
+@pytest.mark.parametrize("with_zero_points", [False, True])
+def test_dequantize_affine_reads_the_block_that_spans_each_element(
+    shape, block_size, seed, with_zero_points
+):
+    codes, scales, zero_points = _affine_operands(shape, block_size, seed)
+    weight = tp._C._make_per_tensor_quantized_tensor(
+        tp.from_numpy(codes.copy()).to("vulkan"), 1.0, 0
+    )
+    zeros = None
+    if with_zero_points:
+        zeros = tp.from_numpy(zero_points.copy()).to("vulkan")
+    out = tp.dequantize_affine(
+        weight,
+        list(block_size),
+        tp.from_numpy(scales.copy()).to("vulkan"),
+        zeros,
+    )
+    expect = _affine_expect(
+        codes, block_size, scales, zero_points if with_zero_points else None
+    )
+    assert out.dtype == tp.float32
+    assert tuple(out.shape) == tuple(shape)
+    np.testing.assert_allclose(out.cpu().numpy(), expect, rtol=1e-6, atol=1e-7)
+
+
+# A code payload whose row count passes the image axis limit has no texel form,
+# so the block is found from the linear position of each element and the result
+# keeps the linear storage.  The groups tile each row here, so one reshape names
+# them, and the whole payload still has to be covered by the run.
+@pytest.mark.parametrize(
+    "n,k,g", [(20000, 128, 64), (17000, 64, 64), (16385, 512, 128)]
+)
+def test_dequantize_affine_of_a_weight_with_no_image_form(n, k, g):
+    codes, scales, zero_points = _affine_operands((n, k), (1, g), n + k + g)
+    weight = tp._C._make_per_tensor_quantized_tensor(
+        tp.from_numpy(codes.copy()).to("vulkan"), 1.0, 0
+    )
+    out = tp.dequantize_affine(
+        weight,
+        [1, g],
+        tp.from_numpy(scales.copy()).to("vulkan"),
+        tp.from_numpy(zero_points.copy()).to("vulkan"),
+    )
+    expect = (
+        (
+            codes.reshape(n, k // g, g).astype(np.float32)
+            - zero_points.reshape(n, k // g, 1)
+        )
+        * scales.reshape(n, k // g, 1)
+    ).reshape(n, k)
+    np.testing.assert_allclose(out.cpu().numpy(), expect, rtol=1e-6, atol=1e-7)
+
+
+# An unsigned payload keeps its codes in the same eight bits as a signed one, so
+# the undo has to read them without folding the high bit into a sign.
+def test_dequantize_affine_of_an_unsigned_payload():
+    codes, scales, zero_points = _affine_operands(
+        (8, 16), (1, 4), 21, unsigned=True
+    )
+    weight = tp._C._make_per_tensor_quantized_tensor(
+        tp.from_numpy(codes.copy()).to("vulkan"), 1.0, 0
+    )
+    out = tp.dequantize_affine(
+        weight,
+        [1, 4],
+        tp.from_numpy(scales.copy()).to("vulkan"),
+        tp.from_numpy(zero_points.copy()).to("vulkan"),
+    )
+    expect = _affine_expect(codes, (1, 4), scales, zero_points)
+    np.testing.assert_allclose(out.cpu().numpy(), expect, rtol=1e-6, atol=1e-7)
+
+
+# One parameter of each kind covers the whole payload, so the block an element
+# belongs to stops selecting anything: the grid still numbers the codes, while
+# both reads collapse to the first slot.
+def test_dequantize_affine_with_one_parameter_of_each_kind():
+    rng = np.random.default_rng(22)
+    codes = rng.integers(-128, 128, (8, 16)).astype(np.int8)
+    weight = tp._C._make_per_tensor_quantized_tensor(
+        tp.from_numpy(codes.copy()).to("vulkan"), 1.0, 0
+    )
+    out = tp.dequantize_affine(
+        weight,
+        [1, 4],
+        tp.from_numpy(np.array([0.0625], dtype=np.float32)).to("vulkan"),
+        tp.from_numpy(np.array([-2], dtype=np.int32)).to("vulkan"),
+    )
+    expect = (codes.astype(np.float32) + 2.0) * 0.0625
+    np.testing.assert_array_equal(out.cpu().numpy(), expect)
+
+
+def test_dequantize_affine_refuses_operands_it_cannot_read():
+    rng = np.random.default_rng(23)
+    codes = rng.integers(-128, 128, (8, 16)).astype(np.int8)
+    scales = (rng.random(32) * 0.1).astype(np.float32)
+    weight = tp._C._make_per_tensor_quantized_tensor(
+        tp.from_numpy(codes.copy()).to("vulkan"), 1.0, 0
+    )
+    on_device = tp.from_numpy(scales.copy()).to("vulkan")
+
+    with pytest.raises(RuntimeError):
+        # Parameters that stayed on the host would have to be fetched per block.
+        tp.dequantize_affine(weight, [1, 4], tp.from_numpy(scales.copy()), None)
+    with pytest.raises(RuntimeError):
+        tp.dequantize_affine(weight, [1, 4, 1], on_device, None)
+    with pytest.raises(RuntimeError):
+        tp.dequantize_affine(weight, [1, 0], on_device, None)
+    with pytest.raises(RuntimeError):
+        short = tp.from_numpy(scales[:8].copy()).to("vulkan")
+        tp.dequantize_affine(weight, [1, 4], short, None)
