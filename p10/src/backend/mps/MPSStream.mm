@@ -70,6 +70,10 @@ MPSStream::~MPSStream() {
     [_commandEncoder release];
     _commandEncoder = nil;
   }
+  if (_serialQueue) {
+    delete static_cast<std::mutex*>(dispatch_get_context(_serialQueue));
+    dispatch_set_context(_serialQueue, nullptr);
+  }
 }
 
 MPSCommandBuffer* MPSStream::commandBuffer() {
