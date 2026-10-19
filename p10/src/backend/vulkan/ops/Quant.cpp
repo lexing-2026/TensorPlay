@@ -10,6 +10,7 @@
 
 #include <Utils.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -349,6 +350,265 @@ Tensor dequantize_per_tensor_kernel(
           api::PipelineStage::COMPUTE,
           api::MemoryAccessType::WRITE),
       v_input.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+      params.buffer());
+
+  return convert(v_output);
+}
+
+// Defined in BinaryOp.cpp; copies a texture payload into a dense buffer.
+api::vTensor to_buffer_storage_dispatch(
+    api::Context* context,
+    const api::vTensor& src);
+
+namespace {
+
+/*
+ * The block grid a block_size names over a logical shape: one parameter per
+ * block, numbered in the same row-major order as the elements it covers.  An
+ * entry that reaches the end of its axis collapses that axis to a single block,
+ * so a block_size of the whole shape is the per-tensor case and an entry of one
+ * makes every element its own block.
+ *
+ * Axes are held outermost first and padded to four with ones, which is how the
+ * shaders walk them: a padded axis always names coordinate zero.
+ */
+struct AffineGrid final {
+  api::utils::uvec4 sizes;
+  api::utils::uvec4 size_strides;
+  api::utils::uvec4 blocks;
+  api::utils::uvec4 block_strides;
+  uint32_t num_blocks;
+};
+
+AffineGrid affine_grid(
+    const std::vector<int64_t>& sizes,
+    const std::vector<int64_t>& block_size) {
+  const int rank = static_cast<int>(sizes.size());
+  const int offset = 4 - rank;
+  uint32_t extents[4] = {1u, 1u, 1u, 1u};
+  uint32_t spans[4] = {1u, 1u, 1u, 1u};
+  for (int axis = 0; axis < rank; ++axis) {
+    const int padded = offset + axis;
+    extents[padded] = api::utils::safe_downcast_to_u32(sizes[axis]);
+    spans[padded] = api::utils::safe_downcast_to_u32(
+        std::min(block_size[axis], sizes[axis]));
+  }
+
+  uint32_t strides[4] = {1u, 1u, 1u, 1u};
+  for (int axis = 2; axis >= 0; --axis) {
+    strides[axis] = strides[axis + 1] * extents[axis + 1];
+  }
+  uint32_t block_strides[4] = {1u, 1u, 1u, 1u};
+  uint32_t blocks_after = 1u;
+  for (int axis = 3; axis >= 0; --axis) {
+    block_strides[axis] = blocks_after;
+    blocks_after *= api::utils::div_up(extents[axis], spans[axis]);
+  }
+
+  AffineGrid grid;
+  grid.sizes = api::utils::uvec4(extents[0], extents[1], extents[2], extents[3]);
+  grid.size_strides =
+      api::utils::uvec4(strides[0], strides[1], strides[2], strides[3]);
+  grid.blocks = api::utils::uvec4(spans[0], spans[1], spans[2], spans[3]);
+  grid.block_strides = api::utils::uvec4(
+      block_strides[0], block_strides[1], block_strides[2], block_strides[3]);
+  grid.num_blocks = blocks_after;
+  return grid;
+}
+
+} // namespace
+
+//
+// Block-wise (group-wise) affine dequantization: the payload keeps one affine
+// parameter pair per block of the grid a block_size names, so a quantized
+// weight recovers its values without the parameters crossing back over the host.
+// Both the parameters and the codes are read where they already sit, and the
+// result is written in the storage the code payload drew -- a weight too long
+// for an image is converted in linear storage, one that fits stays in texels.
+//
+Tensor dequantize_affine_kernel(
+    const Tensor& self,
+    const std::vector<int64_t>& block_size,
+    const Tensor& scales,
+    const std::optional<Tensor>& zero_points) {
+  TP_CHECK(
+      self.dtype() == DType::QInt8 || self.dtype() == DType::QUInt8,
+      "Vulkan dequantize_affine(): expected a QInt8 or QUInt8 payload");
+  TP_CHECK(
+      self.dim() >= 1 && self.dim() <= 4,
+      "Vulkan dequantize_affine(): supports 1d to 4d payloads");
+  TP_CHECK(
+      static_cast<int64_t>(block_size.size()) == self.dim(),
+      "Vulkan dequantize_affine(): block_size rank must match the input rank");
+  for (const auto entry : block_size) {
+    TP_CHECK(
+        entry > 0,
+        "Vulkan dequantize_affine(): block_size entries must be positive");
+  }
+
+  // An owning copy: the block grid reads the shape twice, and shape() hands
+  // back a fresh value object each call.
+  const std::vector<int64_t> sizes = self.shape();
+  const AffineGrid affine = affine_grid(sizes, block_size);
+  TP_CHECK(
+      scales.numel() == static_cast<int64_t>(affine.num_blocks) ||
+          scales.numel() == 1,
+      "Vulkan dequantize_affine(): scales must have one entry per block");
+  TP_CHECK(
+      scales.device() == self.device(),
+      "Vulkan dequantize_affine(): scales and zero_points must be on the input "
+      "device");
+  const bool has_zeros =
+      zero_points.has_value() && zero_points->numel() > 0;
+  if (has_zeros) {
+    TP_CHECK(
+        zero_points->numel() == static_cast<int64_t>(affine.num_blocks) ||
+            zero_points->numel() == 1,
+        "Vulkan dequantize_affine(): zero_points must have one entry per block, "
+        "or be a scalar");
+    TP_CHECK(
+        zero_points->device() == self.device(),
+        "Vulkan dequantize_affine(): scales and zero_points must be on the "
+        "input device");
+  }
+
+  api::Context* const context = api::context();
+  const Tensor codes = self.is_contiguous() ? self : self.contiguous();
+  if (codes.numel() == 0) {
+    return empty_like_kernel(codes, DType::Float32, std::nullopt);
+  }
+
+  // Both parameter payloads are named: the descriptor binds the storage they
+  // own, so a cast that lived only inside the call expression would release its
+  // buffer back to the pool while the kernel still reads it.
+  const Tensor scale_values = scales.to(DType::Float32).contiguous();
+  const Tensor zero_values = has_zeros
+      ? zero_points->to(DType::Float32).contiguous()
+      : scale_values;
+  api::vTensor v_scales =
+      to_buffer_storage_dispatch(context, convert(scale_values));
+  // A call without addends reads nothing from the second parameter binding, but
+  // the descriptor still needs memory behind it.
+  const api::vTensor v_zeros =
+      to_buffer_storage_dispatch(context, convert(zero_values));
+
+  const uint32_t element_count =
+      api::utils::safe_downcast_to_u32(codes.numel());
+  const uint32_t scale_count =
+      api::utils::safe_downcast_to_u32(scale_values.numel());
+  const uint32_t zero_count =
+      has_zeros
+      ? api::utils::safe_downcast_to_u32(zero_points->numel())
+      : 0u;
+  // One byte of the payload names a signed code for QInt8 and an unsigned one
+  // for QUInt8; both share the eight bits the shaders fetch.
+  const uint32_t unsigned_payload = self.dtype() == DType::QUInt8 ? 1u : 0u;
+
+  api::vTensor v_codes = convert(codes);
+
+  if (v_codes.storage_type() == api::StorageType::BUFFER) {
+    api::vTensor v_output{
+        context,
+        v_codes.sizes(),
+        DType::Float32,
+        api::StorageType::BUFFER,
+        api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+
+    const struct DequantizeAffineLinearBlock final {
+      api::utils::uvec4 sizes;
+      api::utils::uvec4 size_strides;
+      api::utils::uvec4 blocks;
+      api::utils::uvec4 block_strides;
+      api::utils::uvec4 grid; // unused; a linear run has no texel extents
+      api::utils::uvec4 flags;
+    } block{
+        affine.sizes,
+        affine.size_strides,
+        affine.blocks,
+        affine.block_strides,
+        api::utils::uvec4(0u, 0u, 0u, 1u),
+        api::utils::uvec4(
+            element_count,
+            unsigned_payload,
+            scale_count,
+            zero_count)};
+
+    api::UniformParamsBuffer params(context, block);
+    api::PipelineBarrier pipeline_barrier{};
+    const api::utils::uvec3 grid{api::utils::div_up(element_count, 4u), 1u, 1u};
+
+    context->submit_compute_job(
+        VK_KERNEL_FROM_STR("dequantize_affine_buffer"),
+        pipeline_barrier,
+        grid,
+        adaptive_work_group_size(grid),
+        VK_NULL_HANDLE,
+        v_output.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::WRITE),
+        v_codes.buffer(
+            pipeline_barrier, api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::READ),
+        v_scales.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+        v_zeros.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+        params.buffer());
+
+    return convert(v_output);
+  }
+
+  if (v_codes.storage_type() != api::StorageType::TEXTURE_3D) {
+    TP_THROW(
+        NotImplementedError,
+        "Vulkan dequantize_affine(): requires texture or buffer storage");
+  }
+
+  api::vTensor v_output{context, v_codes.sizes(), DType::Float32};
+  // A texel's four lanes are four channels, so the depth of the channel groups
+  // splits the image's z axis back into a batch and a group within it.
+  const uint32_t channels = api::utils::safe_downcast_to_u32(
+      self.dim() >= 3 ? self.size(self.dim() - 3) : 1);
+  const api::utils::uvec3 extents = v_output.extents();
+
+  const struct DequantizeAffineBlock final {
+    api::utils::uvec4 sizes;
+    api::utils::uvec4 size_strides;
+    api::utils::uvec4 blocks;
+    api::utils::uvec4 block_strides;
+    api::utils::uvec4 grid; // (texel x, texel y, texel z, channel groups)
+    api::utils::uvec4 flags;
+  } block{
+      affine.sizes,
+      affine.size_strides,
+      affine.blocks,
+      affine.block_strides,
+      api::utils::uvec4(
+          extents[0u],
+          extents[1u],
+          extents[2u],
+          api::utils::div_up(channels, 4u)),
+      api::utils::uvec4(
+          element_count,
+          unsigned_payload,
+          scale_count,
+          zero_count)};
+
+  api::UniformParamsBuffer params(context, block);
+  api::PipelineBarrier pipeline_barrier{};
+
+  context->submit_compute_job(
+      VK_KERNEL_FROM_STR("dequantize_affine"),
+      pipeline_barrier,
+      extents,
+      adaptive_work_group_size(extents),
+      VK_NULL_HANDLE,
+      v_output.image(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::WRITE),
+      v_codes.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+      v_scales.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+      v_zeros.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
       params.buffer());
 
   return convert(v_output);
@@ -2073,6 +2333,8 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, QuantKernels) {
       "_make_per_tensor_quantized_tensor",
       &tensorplay::vulkan::ops::make_per_tensor_quantized_tensor_kernel);
   m.impl("dequantize.self", &tensorplay::vulkan::ops::dequantize_self_kernel);
+  m.impl("dequantize_affine",
+         &tensorplay::vulkan::ops::dequantize_affine_kernel);
 }
 
 #endif /* USE_VULKAN */

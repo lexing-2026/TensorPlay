@@ -224,6 +224,12 @@ Tensor quantize_per_tensor_kernel(const Tensor& self, double scale,
                                   int64_t zero_point, DType dtype);
 Tensor dequantize_per_tensor_kernel(const Tensor& self, double scale,
                                     int64_t zero_point, DType dtype);
+// Block-wise (group-wise) affine dequantization of a code payload that already
+// sits on the device; the affine parameters are read where they sit too.
+Tensor dequantize_affine_kernel(const Tensor& self,
+                                const std::vector<int64_t>& block_size,
+                                const Tensor& scales,
+                                const std::optional<Tensor>& zero_points);
 
 // Runs a pre-packed quantized convolution on the Vulkan compute path; the
 // packing layout and shader selection follow the quantized convolution
