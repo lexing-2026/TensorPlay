@@ -8,6 +8,7 @@
 // clang-format on
 
 layout(std430) buffer;
+#include "pow_ext.h"
 
 $if DTYPE == "int":
   // Signed-word storage buffers with an integer scalar operand.

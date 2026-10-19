@@ -639,9 +639,12 @@ if(USE_VULKAN)
     # its dependency list has to track newly added sources. Without re-globbing
     # at build time a kernel added since the last configure never enters the
     # list, the generator reports nothing to do, and a relinked library
-    # silently predates the .glsl files on disk.
+    # silently predates the .glsl files on disk.  Inlined headers are spliced
+    # during generation and belong to the same list: a template that reads one
+    # rebuilds only when the header itself is watched.
     file(GLOB_RECURSE TP_VULKAN_GLSL CONFIGURE_DEPENDS
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/vulkan/glsl/*.glsl")
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/vulkan/glsl/*.glsl"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/vulkan/glsl/*.h")
     list(APPEND TP_VULKAN_GLSL
         "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/vulkan/glsl/shader_params.yaml")
     add_custom_command(

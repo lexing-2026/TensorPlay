@@ -7,6 +7,7 @@
 // clang-format on
 
 layout(std430) buffer;
+#include "pow_ext.h"
 
 /*
  * Element-wise binary op over two half-precision linear payloads:

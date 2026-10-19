@@ -175,8 +175,10 @@ Tensor pow_scalar_kernel(const Tensor& self, const Scalar& exponent) {
 }
 
 Tensor pow_tensor_kernel(const Tensor& self, const Tensor& exponent) {
-  validate_float_or_half_1d_to_4d(self, "pow");
-  validate_float_or_half_1d_to_4d(exponent, "pow");
+  // Counts ride their own twin: a whole exponent keeps the answer a count, so
+  // the pair needs no wider word than the one it was given in.
+  validate_float_half_or_int_1d_to_4d(self, "pow");
+  validate_float_half_or_int_1d_to_4d(exponent, "pow");
   // Delegates to the shared binary op path: the tensor variant gets
   // broadcast handling and the linear buffer twin for buffer-stored
   // payloads.

@@ -8,6 +8,7 @@
 // clang-format on
 
 layout(std430) buffer;
+#include "pow_ext.h"
 
 #include "texel_access.h"
 $if DTYPE == "int":

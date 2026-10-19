@@ -8,6 +8,7 @@
 // clang-format on
 
 layout(std430) buffer;
+#include "pow_ext.h"
 
 $if DTYPE == "int":
   // Signed-word storage buffers for the integer variants.  Data is laid out

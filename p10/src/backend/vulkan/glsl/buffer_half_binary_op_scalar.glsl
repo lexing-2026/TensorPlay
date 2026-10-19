@@ -7,6 +7,7 @@
 // clang-format on
 
 layout(std430) buffer;
+#include "pow_ext.h"
 
 #include "math_ext.h"
 
