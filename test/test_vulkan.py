@@ -322,6 +322,67 @@ def _sdpa_check(
         got.astype(np.float64), want, rtol=1.0e-3, atol=atol)
 
 
+# Reference for one window of query rows only.  A key range wide enough that no
+# two-product chain can hold its scores needs a reference that stays as narrow
+# as the kernel: one float64 row per (query row, key) pair over the whole range
+# would ask for more memory than the comparison is checking.
+def _sdpa_window_reference(
+    q, k, v, causal=False, scale=None, rows=(0, 8)):
+    q = q.astype(np.float64)
+    k = k.astype(np.float64)
+    v = v.astype(np.float64)
+    hq = q.shape[1]
+    hkv = k.shape[1]
+    if hkv != hq:
+        g = hq // hkv
+        k = np.repeat(k, g, axis=1)
+        v = np.repeat(v, g, axis=1)
+    r0, r1 = rows
+    s = np.einsum("bhqd,bhkd->bhqk", q[:, :, r0:r1], k)
+    s = s * (1.0 / np.sqrt(q.shape[-1]) if scale is None else scale)
+    if causal:
+        keys = np.arange(k.shape[2])[None, None, None, :]
+        queries = np.arange(r0, r1)[None, None, :, None]
+        s = np.where(keys <= queries, s, -2.0 ** 31)
+    s = s.astype(np.float32).astype(np.float64)
+    row = np.where(
+        np.isneginf(s.max(-1, keepdims=True)), 0.0, s.max(-1, keepdims=True))
+    e = np.exp(s - row)
+    denom = e.sum(-1, keepdims=True)
+    p = np.divide(e, denom, out=np.zeros_like(e), where=(denom != 0))
+    return np.einsum("bhqk,bhkd->bhqd", p, v)
+
+
+def _sdpa_window_check(
+    self,
+    B,
+    Hq,
+    Hkv,
+    Sq,
+    Skv,
+    D,
+    rows,
+    causal=False,
+    gqa=False,
+    *_,
+):
+    tensorplay.manual_seed(1234)
+    q = tensorplay.randn((B, Hq, Sq, D), device="cpu")
+    k = tensorplay.randn((B, Hkv, Skv, D), device="cpu")
+    v = tensorplay.randn((B, Hkv, Skv, D), device="cpu")
+    got = tensorplay.nn.functional.scaled_dot_product_attention(
+        q.to("vulkan"),
+        k.to("vulkan"),
+        v.to("vulkan"),
+        is_causal=causal,
+        enable_gqa=gqa).cpu().numpy()
+    want = _sdpa_window_reference(
+        q.numpy(), k.numpy(), v.numpy(), causal=causal, rows=rows)
+    np.testing.assert_allclose(
+        got[:, :, rows[0]:rows[1]].astype(np.float64),
+        want, rtol=1.0e-3, atol=4.0e-3)
+
+
 class TestVulkanScaledDotProductAttention(unittest.TestCase):
     def test_plain_mha(self):
         _sdpa_check(self, B=1, Hq=8, Hkv=8, Sq=16, Skv=16, D=32, causal=False)
@@ -498,6 +559,68 @@ class TestVulkanScaledDotProductAttention(unittest.TestCase):
         _sdpa_check(
             self, B=1, Hq=1, Hkv=1, Sq=4, Skv=LONG, D=8,
             mask=tensorplay.tensor(dead))
+
+    def test_long_prefill_single_walk(self):
+        # Above four million score lanes the score matrix is never written
+        # down: one workgroup owns eight query rows and rescales its running
+        # maximum, exponential sum and value accumulator as it reads the keys.
+        _sdpa_check(self, B=1, Hq=8, Hkv=8, Sq=1024, Skv=600, D=16)
+        _sdpa_check(
+            self, B=1, Hq=8, Hkv=8, Sq=1024, Skv=1024, D=32, causal=True)
+        _sdpa_check(
+            self, B=1, Hq=16, Hkv=4, Sq=512, Skv=600, D=8, causal=True,
+            gqa=True)
+        # A query range that is not a whole number of row tiles, an odd head
+        # dimension, and a half payload the walk widens on the way in.
+        _sdpa_check(self, B=1, Hq=16, Hkv=16, Sq=511, Skv=601, D=5)
+        _sdpa_check(
+            self, B=1, Hq=16, Hkv=16, Sq=512, Skv=600, D=8,
+            dtype=tensorplay.float16, causal=True)
+
+    def test_long_prefill_masks(self):
+        Sq, Skv = 512, 601
+        rng = np.random.default_rng(31)
+        shared = rng.random((Sq, Skv)) > 0.3
+        shared[0] = True  # keep the first row visible
+        _sdpa_check(
+            self, B=1, Hq=16, Hkv=16, Sq=Sq, Skv=Skv, D=8,
+            mask=tensorplay.tensor(shared))
+        per_head = rng.random((16, Sq, Skv)) > 0.35
+        per_head[:, 0, :] = True
+        _sdpa_check(
+            self, B=1, Hq=16, Hkv=16, Sq=Sq, Skv=Skv, D=8,
+            mask=tensorplay.tensor(per_head))
+        full = rng.random((2, 16, Sq, Skv)) > 0.35
+        full[:, :, 0, :] = True
+        _sdpa_check(
+            self, B=2, Hq=16, Hkv=16, Sq=Sq, Skv=Skv, D=8,
+            mask=tensorplay.tensor(full))
+        _sdpa_check(
+            self, B=1, Hq=16, Hkv=4, Sq=Sq, Skv=Skv, D=8, gqa=True,
+            mask=tensorplay.tensor(
+                rng.random((Sq, Skv)).astype(np.float32) - 0.5))
+        # A row the mask rejects entirely normalizes to zeros here too.
+        killed = np.ones((Sq, Skv), dtype=bool)
+        killed[7] = False
+        killed[300] = False
+        _sdpa_check(
+            self, B=1, Hq=16, Hkv=16, Sq=Sq, Skv=Skv, D=8,
+            mask=tensorplay.tensor(killed))
+
+    def test_wide_window_without_a_score_matrix(self):
+        # The tail rows carry the widest softmax window a causal prefill has.
+        _sdpa_window_check(
+            self, B=1, Hq=8, Hkv=8, Sq=2048, Skv=2048, D=64,
+            rows=(2040, 2048), causal=True)
+        # Thirty-two heads over an eight thousand key range is 2^31 score
+        # lanes: an element offset in a linear payload cannot even number them,
+        # yet the walk needs only the operands and their running sums.
+        _sdpa_window_check(
+            self, B=1, Hq=32, Hkv=32, Sq=8192, Skv=8192, D=8,
+            rows=(0, 8), causal=True)
+        _sdpa_window_check(
+            self, B=1, Hq=32, Hkv=1, Sq=8192, Skv=8192, D=8,
+            rows=(4096, 4100), causal=True, gqa=True)
 
 
 def _rope_tables(head_dim, rows):
