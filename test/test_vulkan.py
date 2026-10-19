@@ -725,12 +725,34 @@ class TestVulkanIndexCopy(unittest.TestCase):
             want[:, :, idx, :] = src.cpu().numpy().astype(got.dtype)
             np.testing.assert_array_equal(got, want)
 
-    def test_index_copy_rejects_out_of_range(self):
-        buf = tensorplay.randn((1, 2, 8, 4), device="cpu").to("vulkan")
-        src = tensorplay.randn((1, 2, 1, 4), device="cpu").to("vulkan")
-        with self.assertRaises(RuntimeError):
-            tensorplay.index_copy_(
-                buf, 2, tensorplay.tensor([8], dtype=tensorplay.int64), src)
+    def test_index_copy_writes_nothing_for_a_row_it_cannot_name(self):
+        # Nothing asserts on the device, and folding a list onto the host to
+        # check its range would cost a queue sync per call.  Both scatter
+        # shaders settle it themselves: a code naming no row of the destination
+        # writes nothing, the way a lookup returns zeros for such a code.  The
+        # second case pushes the destination past the image axis limit, so the
+        # row it skips is addressed in linear storage instead of a texel.
+        tensorplay.manual_seed(1234)
+        for S in (8, 20000):
+            buf = tensorplay.randn((1, 2, S, 4), device="cpu").to("vulkan")
+            snapshot = buf.cpu().numpy()
+            src = tensorplay.randn((1, 2, 3, 4), device="cpu").to("vulkan")
+            want = snapshot.copy()
+            want[:, :, 3, :] = src.cpu().numpy()[:, :, 0, :]
+            codes = [3, S, -1]
+            for on_device in (False, True):
+                buf.copy_(tensorplay.from_numpy(snapshot))
+                positions = tensorplay.tensor(codes, dtype=tensorplay.int64)
+                if on_device:
+                    positions = positions.to("vulkan")
+                tensorplay.index_copy_(buf, 2, positions, src)
+                np.testing.assert_array_equal(
+                    buf.cpu().numpy(), want,
+                    err_msg=f"an unaddressable row wrote anyway at S={S}, "
+                    f"index on device={on_device}")
+            # The destination keeps every row the scatter did not name.
+            np.testing.assert_array_equal(buf.cpu().numpy()[:, :, 4:, :],
+                                          snapshot[:, :, 4:, :])
 
     def test_index_copy_out_of_place(self):
         buf = tensorplay.randn((1, 2, 8, 4), device="cpu").to("vulkan")
