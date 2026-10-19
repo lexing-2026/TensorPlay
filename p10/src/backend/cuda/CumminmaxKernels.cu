@@ -55,21 +55,40 @@ __device__ inline void cum_extremum_running_update(const T lhs, T& rhs,
 }
 
 
+// One thread drives one column of the scan.  The row loop issues kBatch
+// independent loads before the first update, so the serial compare/store chain
+// overlaps kBatch memory round trips instead of paying one full latency per
+// row; the restrict qualifiers let the compiler keep those loads ahead of the
+// stores, which is what makes the batch overlap possible.
 template <typename T, bool kIsMax>
 __global__ void cummaxmin_scan_kernel(int64_t n_slices, int64_t d_size, int64_t inner,
-                                      const T* in, T* vals, int64_t* idxs) {
+                                      const T* __restrict__ in, T* __restrict__ vals,
+                                      int64_t* __restrict__ idxs) {
+    constexpr int kBatch = 8;
     int64_t si = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
     for (; si < n_slices; si += stride) {
-        int64_t o = si / inner, in2 = si % inner;
-        const T* s2p = in + o * d_size * inner + in2;
-        T* vp = vals + o * d_size * inner + in2;
-        int64_t* ip = idxs + o * d_size * inner + in2;
+        const int64_t o = si / inner, in2 = si % inner;
+        const T* __restrict__ s2p = in + o * d_size * inner + in2;
+        T* __restrict__ vp = vals + o * d_size * inner + in2;
+        int64_t* __restrict__ ip = idxs + o * d_size * inner + in2;
         T best = s2p[0];
         int64_t bi = 0;
         vp[0] = best;
         ip[0] = 0;
-        for (int64_t j = 1; j < d_size; ++j) {
+        int64_t j = 1;
+        for (; j + kBatch <= d_size; j += kBatch) {
+            T batch[kBatch];
+#pragma unroll
+            for (int k = 0; k < kBatch; ++k) batch[k] = s2p[(j + k) * inner];
+#pragma unroll
+            for (int k = 0; k < kBatch; ++k) {
+                cum_extremum_running_update<T, kIsMax>(batch[k], best, j + k, bi);
+                vp[(j + k) * inner] = best;
+                ip[(j + k) * inner] = bi;
+            }
+        }
+        for (; j < d_size; ++j) {
             const T current = s2p[j * inner];
             cum_extremum_running_update<T, kIsMax>(current, best, j, bi);
             vp[j * inner] = best;
@@ -242,7 +261,9 @@ std::tuple<Tensor, Tensor> cummax_cuda(const Tensor& self, int64_t dim) {
         if (dim == nd - 1) {
             launch_cummaxmin_innermost(sc, vals, idxs, outer, d_size, true, stream);
         } else {
-            dim3 grid = make_grid(slices), block(kThreads);
+            const int threads = static_cast<int>(std::min<int64_t>(512, slices));
+            dim3 grid(static_cast<unsigned>((slices + threads - 1) / threads)),
+                block(threads);
 #define TP_CM(ctype, name_) \
     case DType::name_: \
         cummaxmin_scan_kernel<ctype, true><<<grid, block, 0, stream>>>( \
@@ -280,7 +301,9 @@ std::tuple<Tensor, Tensor> cummin_cuda(const Tensor& self, int64_t dim) {
         if (dim == nd - 1) {
             launch_cummaxmin_innermost(sc, vals, idxs, outer, d_size, false, stream);
         } else {
-            dim3 grid = make_grid(slices), block(kThreads);
+            const int threads = static_cast<int>(std::min<int64_t>(512, slices));
+            dim3 grid(static_cast<unsigned>((slices + threads - 1) / threads)),
+                block(threads);
 #define TP_CMIN(ctype, name_) \
     case DType::name_: \
     cummaxmin_scan_kernel<ctype, false><<<grid, block, 0, stream>>>( \
