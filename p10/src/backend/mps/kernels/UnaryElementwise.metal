@@ -193,7 +193,8 @@ kernel void unary_elementwise(device T* out [[buffer(0)]],
 // 16-byte vectors on every access, so one instruction covers a contiguous
 // span. Consecutive vectors per thread would instead spread each instruction
 // across four times as many cache lines while leaving three quarters of each
-// line for a later instruction.
+// line for a later instruction. The host sizes the grid to the vector count,
+// so the whole grid takes the loop below for its single vector.
 template <typename Op>
 inline float4 apply_unary4(float4 v) {
   return float4(Op::apply(v.x), Op::apply(v.y), Op::apply(v.z),

@@ -644,19 +644,19 @@ bool denseScaleIsOne(const std::optional<Scalar>& alpha) {
          (!alpha->isComplex() && alpha->toDouble() == 1.0);
 }
 
-// A grid no wider than one threadgroup keeps the whole call on one core, so a
-// small span is dispatched one unit per thread with its groups capped well
-// below the device maximum: the launch then spreads over several cores the way
-// a larger span already does. Above the cutoff the ILP form's shorter grid
-// already fills multiple groups.
+// A small span is dispatched with its groups capped well below the device
+// maximum, so the launch spreads over several cores.
 constexpr uint32_t kSmallDenseElements = 1u << 14;
 constexpr uint32_t kSmallDenseThreads = 256;
 
 // `span` counts the units a thread reads: vectors for the four-wide form,
-// elements for the scalar-indexed one. Only the four-wide kernels accept any
-// grid width; the scalar-indexed ones always take ILP_PER_THREAD in one run.
-uint32_t denseSpanThreads(uint32_t span, uint32_t elements, bool grid_stride) {
-  if (elements <= kSmallDenseElements && grid_stride) {
+// elements for the scalar-indexed one. The four-wide form already moves its
+// widest access, so it dispatches one vector per thread: the grid covers the
+// span without a per-thread loop and every thread holds a single vector, which
+// keeps occupancy at its highest. The scalar-indexed kernels take
+// ILP_PER_THREAD elements in one run instead.
+uint32_t denseSpanThreads(uint32_t span, bool vector_form) {
+  if (vector_form) {
     return span;
   }
   return static_cast<uint32_t>(
@@ -733,7 +733,7 @@ std::optional<Tensor> denseBinaryShader(const std::string& op,
   MTLComputePipelineState_t active_pso = vec_pso ? vec_pso : pso;
   // The vector form counts 16-byte vectors, the scalar form elements.
   const uint32_t span = vec_pso ? elements / 4 : elements;
-  const uint32_t total = denseSpanThreads(span, elements, vec_pso != nil);
+  const uint32_t total = denseSpanThreads(span, vec_pso != nil);
   const uint32_t per_group = denseThreadsPerGroup(
       total, elements,
       static_cast<uint32_t>([active_pso maxTotalThreadsPerThreadgroup]));
@@ -808,7 +808,7 @@ std::optional<Tensor> denseScalarBinaryShader(const std::string& op,
   MTLComputePipelineState_t active_pso = vec_pso ? vec_pso : pso;
   // The vector form counts 16-byte vectors, the scalar form elements.
   const uint32_t span = vec_pso ? elements / 4 : elements;
-  const uint32_t total = denseSpanThreads(span, elements, vec_pso != nil);
+  const uint32_t total = denseSpanThreads(span, vec_pso != nil);
   const uint32_t per_group = denseThreadsPerGroup(
       total, elements,
       static_cast<uint32_t>([active_pso maxTotalThreadsPerThreadgroup]));
@@ -1027,7 +1027,7 @@ std::optional<Tensor> unaryShader(const std::string& op, const Tensor& self) {
   MTLComputePipelineState_t active_pso = vec_pso ? vec_pso : pso;
   // The vector form counts 16-byte vectors, the scalar form elements.
   const uint32_t span = vec_pso ? elements / 4 : elements;
-  const uint32_t total = denseSpanThreads(span, elements, vec_pso != nil);
+  const uint32_t total = denseSpanThreads(span, vec_pso != nil);
   const uint32_t per_group = denseThreadsPerGroup(
       total, elements,
       static_cast<uint32_t>([active_pso maxTotalThreadsPerThreadgroup]));
@@ -1106,7 +1106,7 @@ std::optional<Tensor> clampShader(const Tensor& self,
   MTLComputePipelineState_t active_pso = vec_pso ? vec_pso : pso;
   // The vector form counts 16-byte vectors, the scalar form elements.
   const uint32_t span = vec_pso ? elements / 4 : elements;
-  const uint32_t total = denseSpanThreads(span, elements, vec_pso != nil);
+  const uint32_t total = denseSpanThreads(span, vec_pso != nil);
   const uint32_t per_group = denseThreadsPerGroup(
       total, elements,
       static_cast<uint32_t>([active_pso maxTotalThreadsPerThreadgroup]));
@@ -1708,8 +1708,7 @@ std::optional<Tensor> compareShader(const std::string& op, const Tensor& self,
   // The vector form counts 16-byte vectors, the scalar form elements.
   const uint32_t span = vec_pso ? elements / 4 : elements;
   const uint32_t total =
-      vec_pso ? denseSpanThreads(span, elements, /*grid_stride=*/true)
-              : elements;
+      vec_pso ? denseSpanThreads(span, /*vector_form=*/true) : elements;
   const uint32_t per_group = denseThreadsPerGroup(
       total, elements,
       static_cast<uint32_t>([active_pso maxTotalThreadsPerThreadgroup]));
