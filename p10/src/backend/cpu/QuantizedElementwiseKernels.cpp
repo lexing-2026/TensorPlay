@@ -1884,6 +1884,38 @@ inline vec::Vectorized<float> row_codes(const uint8_t* row, int64_t first) {
 #endif
 }
 
+// Two codes share a byte, so sixteen bytes carry thirty-two of them and one split
+// serves four vectors: taking a byte apart into its low and its high nibble gives
+// every code a byte of its own, and interleaving the two streams puts the codes
+// back in the order of their columns because the low nibble of a byte is its
+// earlier column.
+template <int Groups>
+inline void nibble_codes(const uint8_t* row, int64_t first, vec::Vectorized<float>* codes) {
+    using FV = vec::Vectorized<float>;
+    constexpr int lanes = FV::size();
+    for (int g = 0; g < Groups; ++g) {
+#if defined(CPU_CAPABILITY_AVX2)
+        const auto stream = _mm_loadu_si128(
+            reinterpret_cast<const __m128i*>(row + (first + g * 4 * lanes) / 2));
+        const auto low = _mm_and_si128(stream, _mm_set1_epi8(0x0F));
+        const auto high = _mm_and_si128(_mm_srli_epi16(stream, 4), _mm_set1_epi8(0x0F));
+        const auto lead = _mm_unpacklo_epi8(low, high);
+        const auto after = _mm_unpackhi_epi8(low, high);
+        codes[g * 4 + 0] = FV(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(lead)));
+        codes[g * 4 + 1] = FV(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(lead, 8))));
+        codes[g * 4 + 2] = FV(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(after)));
+        codes[g * 4 + 3] = FV(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(after, 8))));
+#else
+        float unpacked[4 * lanes];
+        for (int c = 0; c < 4 * lanes; ++c) {
+            unpacked[c] = static_cast<float>(
+                quant::row_code(row, first + g * 4 * lanes + c, 4));
+        }
+        for (int t = 0; t < 4; ++t) codes[g * 4 + t] = FV::loadu(unpacked + t * lanes);
+#endif
+    }
+}
+
 // A run of blocks, one per column vector, holds its sums in registers while the
 // rows of the bag pass through: a block count fixed here is what keeps the
 // accumulators out of memory, and every column adds its own rows in order
@@ -1899,8 +1931,15 @@ __attribute__((always_inline)) inline void hold_blocks(const uint8_t* const* row
         sums[t] = carried ? FV::loadu(y + bag * columns + col + t * lanes) : FV(0.f);
     for (int k = 0; k < held; ++k) {
         const FV gradient(gradients[k]), shift(shifts[k]);
-        for (int t = 0; t < Blocks; ++t)
-            sums[t] = vec::fmadd(row_codes<Bits>(rows[k], col + t * lanes), gradient, sums[t] + shift);
+        if constexpr (Bits == 4 && Blocks >= 4) {
+            FV codes[Blocks];
+            nibble_codes<Blocks / 4>(rows[k], col, codes);
+            for (int t = 0; t < Blocks; ++t)
+                sums[t] = vec::fmadd(codes[t], gradient, sums[t] + shift);
+        } else {
+            for (int t = 0; t < Blocks; ++t)
+                sums[t] = vec::fmadd(row_codes<Bits>(rows[k], col + t * lanes), gradient, sums[t] + shift);
+        }
     }
     for (int t = 0; t < Blocks; ++t) sums[t].store(y + bag * columns + col + t * lanes);
 }
