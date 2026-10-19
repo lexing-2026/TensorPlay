@@ -178,6 +178,94 @@ Tensor avg_pool2d_kernel(const Tensor& input,
 }
 
 // ---------------------------------------------------------------------------
+// max_pool2d
+//
+// Values-only twin of max_pool2d_with_indices: the graph pools without the
+// index outputs, so no index tensor is written and no integer cast is encoded.
+// ---------------------------------------------------------------------------
+
+Tensor max_pool2d_kernel(const Tensor& input,
+                         const std::vector<int64_t>& kernel_size,
+                         const std::vector<int64_t>& stride,
+                         const std::vector<int64_t>& padding,
+                         const std::vector<int64_t>& dilation,
+                         bool ceil_mode) {
+  if (!input.device().is_mps()) {
+    TP_THROW(RuntimeError, "max_pool2d(): input must be on the MPS device");
+  }
+  if (input.dim() != 3 && input.dim() != 4) {
+    TP_THROW(RuntimeError, "max_pool2d(): Expected 3D or 4D input");
+  }
+  const bool batched = input.dim() == 4;
+  Tensor x = batched ? input : input.unsqueeze(0);
+  const int64_t N = x.size(0), C = x.size(1), H = x.size(2), W = x.size(3);
+
+  int64_t kH = 0, kW = 0, dH = 0, dW = 0, padH = 0, padW = 0;
+  int64_t dilH = 1, dilW = 1;
+  normalize_pool_params(kernel_size, stride, padding, kH, kW, dH, dW, padH,
+                        padW);
+  if (!dilation.empty()) {
+    dilH = dilation[0];
+    dilW = dilation.size() == 2 ? dilation[1] : dilation[0];
+  }
+  const int64_t outH = pool_output_size(H, kH, dH, padH, ceil_mode);
+  const int64_t outW = pool_output_size(W, kW, dW, padW, ceil_mode);
+
+  std::vector<int64_t> out_shape = {N, C, outH, outW};
+  Tensor output = Tensor(out_shape, x.dtype(), x.device());
+  if (output.numel() == 0) {
+    return batched ? output : output.squeeze(0);
+  }
+
+  Tensor x_c = materializeForGraph(x);
+  const std::vector<int64_t> x_shape =
+      static_cast<std::vector<int64_t>>(x.shape());
+  const std::string key = graphKey(
+      "max_pool2d_values",
+      {shapeKey(x_shape), dtypeKey(x_c.dtype()),
+       std::to_string(kH), std::to_string(kW), std::to_string(dH),
+       std::to_string(dW), std::to_string(dilH), std::to_string(dilW),
+       std::to_string(padH), std::to_string(padW),
+       std::string(ceil_mode ? "ceil" : "floor")});
+  @autoreleasepool {
+    MPSShape* inShape = getMPSShape(x_shape);
+    MPSShape* outShape = getMPSShape(out_shape);
+    const MPSDataType dt = getMPSDataType(x_c.dtype());
+
+    CachedGraph* entry = findCachedGraph(key);
+    if (!entry) {
+      MPSGraph* graph = [[MPSGraph alloc] init];
+      MPSGraphTensor* xt = [graph placeholderWithShape:inShape
+                                             dataType:dt
+                                                  name:@"x"];
+      MPSGraphPooling2DOpDescriptor* desc = poolingDescriptor(
+          kH, kW, dH, dW, padH, padW, ceil_mode, false);
+      MPSGraphTensor* pooled =
+          [graph maxPooling2DWithSourceTensor:xt descriptor:desc name:nil];
+      entry = new CachedGraph{graph, [xt retain], nil, nil, [pooled retain]};
+      storeCachedGraph(key, entry);
+      entry = findCachedGraph(key);
+    }
+
+    id<MTLBuffer> inBuf = mtlBufferOf(x_c);
+    id<MTLBuffer> outBuf = mtlBufferOf(output);
+    MPSGraphTensorData* inData =
+        [[[MPSGraphTensorData alloc] initWithMTLBuffer:inBuf
+                                                shape:inShape
+                                             dataType:dt] autorelease];
+    MPSGraphTensorData* outData =
+        [[[MPSGraphTensorData alloc] initWithMTLBuffer:outBuf
+                                                shape:outShape
+                                             dataType:dt] autorelease];
+    NSDictionary* feeds = @{entry->input0 : inData};
+    NSDictionary* results = @{entry->result : outData};
+    getCurrentMPSStream()->executeMPSGraph(entry->graph, feeds, results,
+                                          SyncType::COMMIT_ADAPTIVE);
+  }
+  return batched ? output : output.squeeze(0);
+}
+
+// ---------------------------------------------------------------------------
 // max_pool2d_with_indices
 // ---------------------------------------------------------------------------
 
@@ -316,6 +404,7 @@ Tensor adaptive_avg_pool2d_kernel(const Tensor& input,
 
 TENSORPLAY_LIBRARY_IMPL(MPS, PoolingKernels) {
   m.impl("avg_pool2d", avg_pool2d_kernel);
+  m.impl("max_pool2d", max_pool2d_kernel);
   m.impl("max_pool2d_with_indices", max_pool2d_with_indices_kernel);
   m.impl("adaptive_avg_pool2d", adaptive_avg_pool2d_kernel);
 }
