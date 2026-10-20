@@ -13,11 +13,29 @@
 #endif
 #include <vector>
 #include <cmath>
+#include <cstring>
 #include <algorithm>
 #include <type_traits>
 
 namespace tensorplay {
 namespace cpu {
+
+// One tag per ordering, so the predicate is fixed before the loop and the
+// compare folds into a single instruction instead of a branch per vector.
+enum class NarrowCmp { Eq, Ne, Lt, Le, Gt, Ge };
+
+template <NarrowCmp C>
+inline bool narrow_cmp(float x, float y) {
+    switch (C) {
+        case NarrowCmp::Eq: return x == y;
+        case NarrowCmp::Ne: return x != y;
+        case NarrowCmp::Lt: return x < y;
+        case NarrowCmp::Le: return x <= y;
+        case NarrowCmp::Gt: return x > y;
+        case NarrowCmp::Ge: return x >= y;
+    }
+    return false;
+}
 
 #if defined(__x86_64__) || defined(__i386__)
 namespace {
@@ -62,6 +80,92 @@ inline void where_f64_avx512(const bool* condition, const double* self,
     }
 }
 
+// Half's widening to float walks a branchy subnormal path, so a comparison
+// written over the storage never vectorizes: every lane of it stays scalar.
+// Widening a whole vector at a time and comparing in float reaches the same
+// domain the per-element loop does, and costs one convert pair per eight lanes.
+// Only the Half side needs the convert instruction itself; BFloat16 widens with
+// a shift.
+inline bool narrow_compare_ready(bool half) {
+    if (!vecunary::avx2_available()) return false;
+    return !half || vecunary::f16c_available();
+}
+
+// Equality is ordered-and-equal, so a NaN answers false; the inequality has to
+// count unordered pairs as unequal for the same NaN to answer true.  The
+// predicate is picked as an immediate, so the compare itself stays inside the
+// function that carries the vector target.
+template <NarrowCmp C>
+constexpr int narrow_cmp_imm() {
+    switch (C) {
+        case NarrowCmp::Eq: return _CMP_EQ_OQ;
+        case NarrowCmp::Ne: return _CMP_NEQ_UQ;
+        case NarrowCmp::Lt: return _CMP_LT_OQ;
+        case NarrowCmp::Le: return _CMP_LE_OQ;
+        case NarrowCmp::Gt: return _CMP_GT_OQ;
+        case NarrowCmp::Ge: return _CMP_GE_OQ;
+    }
+    return _CMP_EQ_OQ;
+}
+
+// Eight storages widened into the float domain the comparison runs in.  Half
+// converts through f16c; the other narrow type only needs its bits moved up,
+// which is a zero-extend plus a shift rather than the branchy per-element
+// widening that kept the loop scalar.
+template <bool kHalf>
+__attribute__((target("avx2,fma,f16c"), always_inline))
+inline __m256 narrow_widen8(const uint16_t* p) {
+    if (kHalf) {
+        return _mm256_cvtph_ps(
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(p)));
+    }
+    return _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(
+        _mm_loadu_si128(reinterpret_cast<const __m128i*>(p))), 16));
+}
+
+template <bool kHalf>
+__attribute__((target("avx2,fma,f16c"), always_inline))
+inline float narrow_widen1(const uint16_t p) {
+    if (kHalf) return _cvtsh_ss(p);
+    const uint32_t bits = static_cast<uint32_t>(p) << 16;
+    float f;
+    std::memcpy(&f, &bits, 4);
+    return f;
+}
+
+template <NarrowCmp C, bool kHalf, bool kBcastB>
+__attribute__((target("avx2,fma,f16c")))
+inline void narrow_compare_avx2(const uint16_t* a, const uint16_t* b, bool* out,
+                                int64_t begin, int64_t end) {
+    // A compare lane answers all-zero or all-one, so its low byte is already
+    // the 0 or 1 the Bool storage holds; gathering the four low bytes of each
+    // half and concatenating them writes eight answers.
+    const __m256i pack_pick = _mm256_setr_epi8(
+        0, 4, 8, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        0, 4, 8, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+    // A single-element right operand is read once and carried in every lane.
+    const __m256 vb = kBcastB ? _mm256_set1_ps(narrow_widen1<kHalf>(b[0]))
+                              : _mm256_setzero_ps();
+    int64_t i = begin;
+    for (; i + 8 <= end; i += 8) {
+        const __m256 x = narrow_widen8<kHalf>(a + i);
+        const __m256 y = kBcastB ? vb : narrow_widen8<kHalf>(b + i);
+        const __m256i answers = _mm256_and_si256(
+            _mm256_castps_si256(_mm256_cmp_ps(x, y, narrow_cmp_imm<C>())),
+            _mm256_set1_epi32(1));
+        const __m256i packed = _mm256_shuffle_epi8(answers, pack_pick);
+        _mm_storel_epi64(
+            reinterpret_cast<__m128i*>(out + i),
+            _mm_unpacklo_epi32(_mm256_castsi256_si128(packed),
+                               _mm256_extracti128_si256(packed, 1)));
+    }
+    const float only = kBcastB ? narrow_widen1<kHalf>(b[0]) : 0.f;
+    for (; i < end; ++i) {
+        out[i] = narrow_cmp<C>(narrow_widen1<kHalf>(a[i]),
+                               kBcastB ? only : narrow_widen1<kHalf>(b[i]));
+    }
+}
+
 } // namespace
 #endif
 
@@ -87,14 +191,62 @@ static DType result_type_with_scalar(const Tensor& t, const Scalar& s) {
 // kEquality=false: ordering ops (lt/le/gt/ge) are undefined over complex.
 Tensor dequantize_self_cpu(const Tensor& self);
 
+// A flat, contiguous narrow storage compared against a same-shape storage or
+// against one broadcast value takes one masked compare per eight lanes.
+// Everything else -- a shaped broadcast, a strided storage, a host without the
+// convert pair -- reports failure and stays with the iterator.
+template <NarrowCmp C>
+bool narrow_compare_path(const Tensor& result, const Tensor& a, const Tensor& b,
+                         DType common) {
+#if defined(__x86_64__) || defined(__i386__)
+    const bool half = common == DType::Float16;
+    if (!half && common != DType::BFloat16) return false;
+    if (!narrow_compare_ready(half)) return false;
+    if (!a.is_contiguous() || !result.is_contiguous()) return false;
+    const bool bcast = (b.numel() == 1);
+    if (!bcast && (!b.is_contiguous() || b.sizes() != result.sizes())) {
+        return false;
+    }
+    if (a.sizes() != result.sizes()) return false;
+    const int64_t n = result.numel();
+    bool* out = result.data_ptr<bool>();
+    if (half) {
+        const uint16_t* pa = reinterpret_cast<const uint16_t*>(a.data_ptr<Half>());
+        const uint16_t* pb = reinterpret_cast<const uint16_t*>(b.data_ptr<Half>());
+        tensorplay::parallel::parallel_for(0, n, 8192, [&](int64_t lo, int64_t hi) {
+            if (bcast) {
+                narrow_compare_avx2<C, true, true>(pa, pb, out, lo, hi);
+            } else {
+                narrow_compare_avx2<C, true, false>(pa, pb, out, lo, hi);
+            }
+        });
+    } else {
+        const uint16_t* pa =
+            reinterpret_cast<const uint16_t*>(a.data_ptr<BFloat16>());
+        const uint16_t* pb =
+            reinterpret_cast<const uint16_t*>(b.data_ptr<BFloat16>());
+        tensorplay::parallel::parallel_for(0, n, 8192, [&](int64_t lo, int64_t hi) {
+            if (bcast) {
+                narrow_compare_avx2<C, false, true>(pa, pb, out, lo, hi);
+            } else {
+                narrow_compare_avx2<C, false, false>(pa, pb, out, lo, hi);
+            }
+        });
+    }
+    return true;
+#else
+    return false;
+#endif
+}
+
 // Comparator ops accept quantized tensors by dequantizing both operands into
 // the float domain; the comparison itself runs on the dequantized values.
-template<bool kEquality, typename Op>
+template<bool kEquality, NarrowCmp C, typename Op>
 Tensor comparison_kernel_impl(const Tensor& self, const Tensor& other, Op op) {
     if (isQuantizedType(self.dtype()) || isQuantizedType(other.dtype())) {
         Tensor self_f = isQuantizedType(self.dtype()) ? dequantize_self_cpu(self) : self;
         Tensor other_f = isQuantizedType(other.dtype()) ? dequantize_self_cpu(other) : other;
-        return comparison_kernel_impl<kEquality>(self_f, other_f, op);
+        return comparison_kernel_impl<kEquality, C>(self_f, other_f, op);
     }
     std::vector<int64_t> out_shape = broadcast_shapes(self.sizes(), other.sizes());
 
@@ -112,7 +264,12 @@ Tensor comparison_kernel_impl(const Tensor& self, const Tensor& other, Op op) {
     Tensor other_casted = (other.dtype() == common_dtype) ? other : other.to(common_dtype);
 
     // TensorIterator owns broadcast/reorder/coalesce/parallelism; no
-    // materialized expansion needed.
+    // materialized expansion needed.  The narrow storages go through the masked
+    // compare first, because their widening to float is not something the
+    // per-element loop can run several lanes at a time.
+    if (narrow_compare_path<C>(result, self_casted, other_casted, common_dtype)) {
+        return result;
+    }
     if constexpr (kEquality) {
         ti_apply_equality(result, self_casted, other_casted, common_dtype, op);
     } else {
@@ -123,27 +280,27 @@ Tensor comparison_kernel_impl(const Tensor& self, const Tensor& other, Op op) {
 }
 
 Tensor eq_tensor_kernel(const Tensor& self, const Tensor& other) {
-    return comparison_kernel_impl<true>(self, other, [](auto a, auto b) { return a == b; });
+    return comparison_kernel_impl<true, NarrowCmp::Eq>(self, other, [](auto a, auto b) { return a == b; });
 }
 
 Tensor ne_tensor_kernel(const Tensor& self, const Tensor& other) {
-    return comparison_kernel_impl<true>(self, other, [](auto a, auto b) { return a != b; });
+    return comparison_kernel_impl<true, NarrowCmp::Ne>(self, other, [](auto a, auto b) { return a != b; });
 }
 
 Tensor lt_tensor_kernel(const Tensor& self, const Tensor& other) {
-    return comparison_kernel_impl<false>(self, other, [](auto a, auto b) { return a < b; });
+    return comparison_kernel_impl<false, NarrowCmp::Lt>(self, other, [](auto a, auto b) { return a < b; });
 }
 
 Tensor le_tensor_kernel(const Tensor& self, const Tensor& other) {
-    return comparison_kernel_impl<false>(self, other, [](auto a, auto b) { return a <= b; });
+    return comparison_kernel_impl<false, NarrowCmp::Le>(self, other, [](auto a, auto b) { return a <= b; });
 }
 
 Tensor gt_tensor_kernel(const Tensor& self, const Tensor& other) {
-    return comparison_kernel_impl<false>(self, other, [](auto a, auto b) { return a > b; });
+    return comparison_kernel_impl<false, NarrowCmp::Gt>(self, other, [](auto a, auto b) { return a > b; });
 }
 
 Tensor ge_tensor_kernel(const Tensor& self, const Tensor& other) {
-    return comparison_kernel_impl<false>(self, other, [](auto a, auto b) { return a >= b; });
+    return comparison_kernel_impl<false, NarrowCmp::Ge>(self, other, [](auto a, auto b) { return a >= b; });
 }
 
 // Scalar versions: promote the scalar with weak-scalar rules instead of
