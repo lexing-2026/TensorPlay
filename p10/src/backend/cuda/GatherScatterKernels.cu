@@ -110,6 +110,35 @@ inline bool scatter_gather_contig_eligible(int64_t outer, int64_t idx_dim_size,
            idx_inner >= kContigThreads * kContigWork;
 }
 
+// Gather along the trailing dimension: every output element of a row picks one
+// source slot, so the row rides on grid.y and the column index comes straight
+// from the thread id. No per-element division, and each thread keeps
+// kContigWork reads in flight.
+template <typename T, typename IndexT>
+__global__ void gather_tail_kernel(int64_t idx_dim_size, int64_t self_dim_size,
+                                   int64_t self_inner, const T* __restrict__ s,
+                                   const IndexT* __restrict__ ip, T* __restrict__ d) {
+    const int64_t row = static_cast<int64_t>(blockIdx.y);
+    const int64_t out_base = row * idx_dim_size;
+    const int64_t in_base = row * self_dim_size * self_inner;
+    const int64_t t0 = static_cast<int64_t>(blockIdx.x) * kContigThreads + threadIdx.x;
+    const int64_t step = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    IndexT idxv[kContigWork];
+#pragma unroll
+    for (int k = 0; k < kContigWork; ++k) {
+        const int64_t t = t0 + static_cast<int64_t>(k) * step;
+        if (t < idx_dim_size) idxv[k] = ip[out_base + t];
+    }
+#pragma unroll
+    for (int k = 0; k < kContigWork; ++k) {
+        const int64_t t = t0 + static_cast<int64_t>(k) * step;
+        if (t >= idx_dim_size) continue;
+        int64_t idx = static_cast<int64_t>(idxv[k]);
+        if (idx < 0) idx += self_dim_size;
+        d[out_base + t] = s[in_base + idx * self_inner];
+    }
+}
+
 template <typename IndexT, typename T>
 void launch_gather_typed(bool contig, int64_t n, int64_t outer, int64_t idx_dim_size,
                          int64_t idx_inner, int64_t self_dim_size, int64_t self_inner,
@@ -122,6 +151,15 @@ void launch_gather_typed(bool contig, int64_t n, int64_t outer, int64_t idx_dim_
                         static_cast<unsigned>(outer));
         gather_contig_kernel<T, IndexT><<<grid, kContigThreads, 0, stream>>>(
             idx_dim_size, idx_inner, self_dim_size, self_inner, s, ip, d);
+        return;
+    }
+    if (idx_inner == 1 && idx_dim_size >= kContigThreads && outer <= 65535) {
+        const dim3 grid(static_cast<unsigned>(
+                            (idx_dim_size + kContigThreads * kContigWork - 1) /
+                            (kContigThreads * kContigWork)),
+                        static_cast<unsigned>(outer));
+        gather_tail_kernel<T, IndexT><<<grid, kContigThreads, 0, stream>>>(
+            idx_dim_size, self_dim_size, self_inner, s, ip, d);
         return;
     }
     const int blocks = static_cast<int>((n + kThreads - 1) / kThreads);
