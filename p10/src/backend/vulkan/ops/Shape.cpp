@@ -305,8 +305,8 @@ Tensor slice_kernel(
     int64_t step) {
   TP_CHECK(
       self.dtype() == DType::Float32 || self.dtype() == DType::Float16 ||
-          self.dtype() == DType::Int32,
-      "Vulkan slice supports Float32, Float16 and Int32 tensors only");
+          self.dtype() == DType::Int32 || self.dtype() == DType::Int64,
+      "Vulkan slice supports Float32, Float16, Int32 and Int64 tensors only");
   TP_CHECK(
       self.dim() >= 1 && self.dim() <= 4,
       "Vulkan slice supports 1d to 4d tensors");
@@ -342,7 +342,9 @@ Tensor slice_kernel(
     // whether the dense result lands in buffer or image storage: the
     // sliced axis keeps out_len elements and its stride is scaled by the
     // step, while the storage offset advances by clamped_start elements along
-    // that axis.
+    // that axis.  A code wider than a word has no image to be sliced into, so
+    // this is the only route it takes, and the gather moves each of its
+    // elements as the pair of words it is.
     const std::vector<int64_t> self_strides = self.strides();
     std::vector<int64_t> out_strides(
         self_strides.begin(), self_strides.end());
@@ -391,9 +393,13 @@ Tensor slice_kernel(
 }
 
 Tensor select_kernel(const Tensor& self, int64_t dim, int64_t index) {
+  // A single-precision payload can be picked out of an image or out of linear
+  // storage; a code wider than a word only ever has the second of those, so its
+  // selection is the strided view below.  The types in between keep an image the
+  // line below reads and have no linear one yet.
   TP_CHECK(
-      self.dtype() == DType::Float32,
-      "Vulkan select supports Float32 tensors only");
+      self.dtype() == DType::Float32 || self.dtype() == DType::Int64,
+      "Vulkan select supports Float32 and Int64 tensors only");
   TP_CHECK(
       self.dim() >= 1 && self.dim() <= 4,
       "Vulkan select supports 1d to 4d tensors");

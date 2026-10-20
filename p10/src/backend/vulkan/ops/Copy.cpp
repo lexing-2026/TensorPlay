@@ -282,6 +282,8 @@ const char* linear_cast_shader(const DType from, const DType to) {
     switch (to) {
       case DType::Int32:
         return "cast_float_i32_buffer";
+      case DType::Int64:
+        return "cast_float_i64_buffer";
       case DType::Float16:
         return "cast_float_float16_buffer";
       case DType::Int8:
@@ -303,8 +305,10 @@ const char* linear_cast_shader(const DType from, const DType to) {
     return "cast_float16_i32_buffer";
   }
   // A 64-bit code shares an element with the word above it, so both directions
-  // between it and a 32-bit one move whole pairs.  Nothing pairs it with a half
-  // payload: two lanes already share a word there, and a wide element would
+  // between it and a 32-bit one move whole pairs; a single-precision source
+  // widens in its own block above, where the pair is named by splitting the
+  // magnitude at two to the thirty-second.  Nothing pairs the wide code with a
+  // half payload: two lanes already share a word there, and a wide element would
   // need three of them.
   if (from == DType::Int64) {
     switch (to) {

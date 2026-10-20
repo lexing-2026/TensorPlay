@@ -55,11 +55,15 @@ Tensor gather_view(
   TP_CHECK(
       input.dtype() == DType::Float32 || input.dtype() == DType::Float16 ||
           input.dtype() == DType::Int8 || input.dtype() == DType::Int32 ||
-          input.dtype() == DType::Bool,
-      "Vulkan view materialization supports Float32, Float16, Int8, Int32 and Bool tensors only");
+          input.dtype() == DType::Int64 || input.dtype() == DType::Bool,
+      "Vulkan view materialization supports Float32, Float16, Int8, Int32, "
+      "Int64 and Bool tensors only");
   const bool is_int8 = input.dtype() == DType::Int8 || input.dtype() == DType::Bool;
   const bool is_int32 = input.dtype() == DType::Int32;
   const bool is_half = input.dtype() == DType::Float16;
+  // A code wider than a word has no texel format to name it, so both sides of
+  // its gather are linear and one element is a pair of words.
+  const bool is_wide = input.dtype() == DType::Int64;
 
   api::Context* const context = api::context();
   api::vTensor v_input = convert(input);
@@ -138,7 +142,9 @@ Tensor gather_view(
     // gather reads through the linear binding and writes the dense output
     // in one pass.
     if (v_input.storage_type() == api::StorageType::BUFFER) {
-      const api::ShaderInfo shader = is_int32
+      const api::ShaderInfo shader = is_wide
+          ? VK_KERNEL(view_gather_i64_buffer_to_buffer)
+          : is_int32
           ? VK_KERNEL(view_gather_int32_buffer_to_buffer)
           : is_half
           ? VK_KERNEL_FROM_STR("view_gather_buffer_to_buffer_half")
