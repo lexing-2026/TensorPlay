@@ -244,12 +244,17 @@ Tensor embedding_lookup(const Tensor& packed, const Tensor& indices, int64_t bit
     }
     // Bounds are checked before issuing device work so malformed inputs raise
     // a recoverable exception without poisoning a device execution context.
+    // The row domain and the count of indices hold for every index, so each is read
+    // once: a scan that reaches back for the tensor it is guarding turns every index
+    // into calls the walk cannot fold away, and the scan is as long as the indices.
     Tensor host_ind = ind.to(Device(DeviceType::CPU)), host_map;
     if (sparse) host_map = map.to(Device(DeviceType::CPU));
     const int64_t* ids = host_ind.data_ptr<int64_t>();
-    for (int64_t i = 0; i < ind.numel(); ++i) {
-        TP_CHECK(ids[i] >= 0 && ids[i] < (sparse ? map.numel() : packed.size(0)), "Embedding index exceeds its row domain");
-        if (sparse) TP_CHECK(host_map.data_ptr<int64_t>()[ids[i]] >= -1 && host_map.data_ptr<int64_t>()[ids[i]] < packed.size(0), "Compressed mapping exceeds its stored row domain");
+    const int64_t rows = packed.size(0), limit = sparse ? map.numel() : rows;
+    const int64_t* mapped = sparse ? host_map.data_ptr<int64_t>() : nullptr;
+    for (int64_t i = 0, id_count = ind.numel(); i < id_count; ++i) {
+        TP_CHECK(ids[i] >= 0 && ids[i] < limit, "Embedding index exceeds its row domain");
+        if (sparse) TP_CHECK(mapped[ids[i]] >= -1 && mapped[ids[i]] < rows, "Compressed mapping exceeds its stored row domain");
     }
     int64_t bags = indices.numel(), count = indices.numel(), fixed = 1;
     std::vector<int64_t> shape;
@@ -264,9 +269,10 @@ Tensor embedding_lookup(const Tensor& packed, const Tensor& indices, int64_t bit
         TP_CHECK(!include_last || off.numel() >= 1, "Offsets must include a terminal position");
         bags = off.numel() - (include_last ? 1 : 0); shape = {bags, columns};
         Tensor host = off.to(Device(DeviceType::CPU)); const int64_t* values = host.data_ptr<int64_t>();
-        if (off.numel()) TP_CHECK(values[0] == 0, "First bag offset must be zero");
-        for (int64_t i = 0; i < off.numel(); ++i) TP_CHECK(values[i] >= 0 && values[i] <= count && (i == 0 || values[i] >= values[i-1]), "Bag offsets must be ordered positions in the index vector");
-        if (include_last) count = values[off.numel() - 1];
+        const int64_t marks = off.numel();
+        if (marks) TP_CHECK(values[0] == 0, "First bag offset must be zero");
+        for (int64_t i = 0; i < marks; ++i) TP_CHECK(values[i] >= 0 && values[i] <= count && (i == 0 || values[i] >= values[i-1]), "Bag offsets must be ordered positions in the index vector");
+        if (include_last) count = values[marks - 1];
     }
     if (per_sample) {
         TP_CHECK(per_sample->device() == packed.device() && per_sample->dtype() == DType::Float32 && per_sample->shape() == indices.shape(), "Per-sample weights must be float values with the index shape and device");
