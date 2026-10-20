@@ -6340,5 +6340,320 @@ class TestVulkanRowFill(unittest.TestCase):
                 0, self._codes([0]), 1.0)
 
 
+class TestVulkanScatterAdd(unittest.TestCase):
+    # An accumulating scatter hands every entry of a list to the element it names
+    # and grows that element by the entry's value.  Several entries can name one
+    # element, so nothing may be dropped on the way: the request records which
+    # element each entry names and then walks the destination, adding the entries
+    # that reach a word in the order the list states them.  One invocation owns
+    # one word, so the total of a repeated element does not depend on who won a
+    # race, and the same call answers the same number twice over.
+
+    SHAPES = ((5,), (5, 4), (2, 5, 3), (2, 3, 5, 2))
+
+    @staticmethod
+    def _device(payload):
+        arr = np.asarray(payload)
+        if arr.ndim and not arr.flags["C_CONTIGUOUS"]:
+            arr = np.ascontiguousarray(arr)
+        return tensorplay.from_numpy(arr).to("vulkan")
+
+    @staticmethod
+    def _codes(values, dtype=np.int64):
+        return TestVulkanScatterAdd._device(np.asarray(values, dtype=dtype))
+
+    @staticmethod
+    def _canvas(shape, dtype=np.float32, seed=0):
+        # Small whole numbers keep either element type exact, so an entry added
+        # to the wrong element shows up as a wrong number rather than as
+        # rounding.
+        rng = np.random.default_rng([len(shape), seed, *shape])
+        return rng.integers(-3, 4, size=shape).astype(dtype)
+
+    @classmethod
+    def _spread(cls, src, list_shape, dtype):
+        # The axes the list carries that the payload does not spell out stand at
+        # the front of it, each with one value to reach the entries below.
+        held = np.asarray(src, dtype=dtype)
+        lead = len(list_shape) - held.ndim
+        return np.broadcast_to(
+            held.reshape([1] * lead + list(held.shape)), list_shape)
+
+    @classmethod
+    def _want(cls, base, dim, codes, src):
+        axis = dim if dim >= 0 else dim + base.ndim
+        rows = base.shape[axis]
+        codes = np.asarray(codes)
+        # A half total is kept at full width and rounded on the way out.
+        acc = base.astype(
+            np.float32 if base.dtype == np.float16 else base.dtype)
+        values = cls._spread(src, codes.shape, base.dtype)
+        for flat in range(codes.size):
+            code = int(codes.flat[flat])
+            if code < 0 or code >= rows:
+                continue
+            coord = list(np.unravel_index(flat, codes.shape))
+            slot = list(coord)
+            slot[axis] = code
+            acc[tuple(slot)] = acc[tuple(slot)] + values[tuple(coord)]
+        return acc.astype(base.dtype)
+
+    def _scattered(self, shape, dim, codes, src, dtype=np.float32, label=""):
+        base = self._canvas(shape, dtype)
+        list_shape = np.asarray(codes).shape
+        values = np.asarray(src, dtype=dtype)
+        if values.shape != list_shape:
+            values = np.broadcast_to(values, list_shape).copy()
+        name = (f"{label} shape={shape} dim={dim} codes_shape={list_shape} "
+                f"dtype={np.dtype(dtype).name}")
+        got = self._device(base).scatter_add_(
+            dim, self._codes(codes), self._device(values)).cpu().numpy()
+        np.testing.assert_array_equal(
+            got, self._want(base, dim, codes, src), err_msg=name)
+        return base, got
+
+    def test_every_element_a_list_names_holds_its_values_added_on(self):
+        for shape in self.SHAPES:
+            for dim in range(-len(shape), len(shape)):
+                axis = dim if dim >= 0 else dim + len(shape)
+                codes = (np.arange(int(np.prod(shape)))
+                         % shape[axis]).reshape(shape)
+                for dtype in (np.float32, np.float16):
+                    self._scattered(shape, dim, codes,
+                                    np.ones(shape, dtype), dtype)
+
+    def test_a_table_that_names_each_element_once_moves_the_values_it_carries(
+            self):
+        base = self._canvas((6, 5), np.float32, seed=1)
+        codes = np.tile(np.arange(6).reshape(6, 1), (1, 5))
+        src = np.arange(30, dtype=np.float32).reshape(6, 5)
+        got = self._device(base).scatter_add_(
+            0, self._codes(codes), self._device(src)).cpu().numpy()
+        np.testing.assert_array_equal(got, self._want(base, 0, codes, src))
+
+    def test_an_element_several_entries_name_holds_the_sum_they_all_give(self):
+        # A rewrite would let the last entry to reach an element win; a total
+        # keeps every one of them, each at the coordinates its own entry carries.
+        base = np.zeros((4, 5), np.float32)
+        codes = np.array([[1, 1, 1, 3, 0], [1, 2, 1, 0, 0]], np.int64)
+        src = np.array([[1.0, 2.0, 4.0, 5.0, 7.0],
+                        [8.0, 0.0, 16.0, 0.0, 0.0]], np.float32)
+        got = self._device(base).scatter_add_(
+            0, self._codes(codes), self._device(src)).cpu().numpy()
+        np.testing.assert_array_equal(got, self._want(base, 0, codes, src))
+        self.assertEqual(got[1, 0], 1.0 + 8.0)
+        self.assertEqual(got[1, 2], 4.0 + 16.0)
+        self.assertEqual(got[1, 1], 2.0)
+        self.assertEqual(got[3, 3], 5.0)
+        self.assertEqual(got[0, 4], 7.0)
+        self.assertEqual(got[2, 1], 0.0)
+
+    def test_the_entries_are_added_in_the_order_the_list_states_them(self):
+        # A total whose terms cancel only comes out as it does here when the
+        # middle term is kept before the last one is added: read in another
+        # order, the wide terms would meet each other first and the small one
+        # would be lost to the rounding.
+        base = np.zeros((4,), np.float32)
+        codes = np.array([1, 1, 1], np.int64)
+        src = np.array([1e30, 1e23, -1e30], np.float32)
+        got = self._device(base).scatter_add_(
+            0, self._codes(codes), self._device(src)).cpu().numpy()
+        np.testing.assert_array_equal(got, self._want(base, 0, codes, src))
+        self.assertNotEqual(got[1], np.float32(1e23))
+
+    def test_a_walk_of_the_list_on_the_host_answers_the_same_number(self):
+        # Only where every code fits the rows it names: the host walk answers a
+        # code beyond them with an error rather than by adding nothing.
+        for shape in self.SHAPES:
+            for dim in range(-len(shape), len(shape)):
+                base = self._canvas(shape, np.float32, seed=2)
+                axis = dim if dim >= 0 else dim + len(shape)
+                codes = (np.arange(base.size) % base.shape[axis]).reshape(shape)
+                src = self._canvas(shape, np.float32, seed=5)
+                host = tensorplay.scatter_add(
+                    tensorplay.from_numpy(base.copy()), dim,
+                    tensorplay.from_numpy(codes),
+                    tensorplay.from_numpy(src)).cpu().numpy()
+                np.testing.assert_array_equal(
+                    host, self._want(base, dim, codes, src),
+                    err_msg=f"host: shape={shape} dim={dim}")
+
+    def test_a_code_outside_the_rows_it_names_adds_nothing(self):
+        # The last row is never named here, so it stands as it did on a canvas
+        # nothing reached.
+        base = np.zeros((5, 4), np.float32)
+        codes = np.array([[9, -1, 0, 0], [-9, 7, 1, 1], [2, 2, -3, 0],
+                          [0, 1, 1, 2], [3, 3, 3, -4]], np.int64)
+        src = np.arange(20, dtype=np.float32).reshape(5, 4)
+        got = self._device(base).scatter_add_(
+            0, self._codes(codes), self._device(src)).cpu().numpy()
+        np.testing.assert_array_equal(got, self._want(base, 0, codes, src))
+        self.assertTrue((got[4] == 0.0).all())
+
+    def test_a_code_given_from_the_end_names_no_element(self):
+        # The list of a scatter counts positions, not rows from the end, so a
+        # code below zero names nothing - which is what the rewrites above answer
+        # the same list with.  The second list differs only in that its codes that
+        # name nothing are given from the other end.
+        base = np.zeros((4, 3), np.float32)
+        src = np.arange(12, dtype=np.float32).reshape(4, 3)
+        from_the_end = np.array([[-1, 0, 1], [2, -2, 3], [0, 1, -4], [3, 2, 1]],
+                                np.int64)
+        beyond = np.array([[4, 0, 1], [2, 5, 3], [0, 1, 7], [3, 2, 1]], np.int64)
+        first = self._device(base).scatter_add_(
+            0, self._codes(from_the_end), self._device(src)).cpu().numpy()
+        second = self._device(base).scatter_add_(
+            0, self._codes(beyond), self._device(src)).cpu().numpy()
+        np.testing.assert_array_equal(first, second)
+        np.testing.assert_array_equal(
+            first, self._want(base, 0, from_the_end, src))
+
+    def test_a_payload_that_reaches_the_list_through_fewer_axes_is_read_again(
+            self):
+        for shape, dim, src_shape in (((2, 5, 3), 1, (5, 3)),
+                                      ((2, 3, 5, 2), 2, (5, 2)),
+                                      ((5, 4), 0, (4,))):
+            codes = np.zeros(shape, np.int64)
+            self._scattered(shape, dim, codes,
+                            np.arange(np.prod(src_shape),
+                                      dtype=np.float32).reshape(src_shape))
+
+    def test_one_number_reaching_the_whole_list_is_added_to_every_element_it_names(
+            self):
+        self._scattered((3, 4), 1, np.zeros((3, 4), np.int64),
+                        np.array([2.5], np.float32))
+        self._scattered((3, 4), 1, np.zeros((2, 4), np.int64),
+                        np.array([-1.5], np.float32))
+
+    def test_a_word_only_partly_named_gives_its_other_lanes_back_as_they_were(
+            self):
+        # A row that does not fill its last word shares it with the elements
+        # below, so an entry that names one lane must hand the rest of the word
+        # back untouched.  One entry names an element; every other code is given
+        # from an end that names nothing.
+        for shape, dim in (((4, 5), 0), ((13,), 0), ((3, 5, 7), 1),
+                           ((5, 3), 1), ((2, 3, 5), 0)):
+            for dtype in (np.float32, np.float16):
+                axis = dim if dim >= 0 else dim + len(shape)
+                codes = np.full(shape, -1, np.int64)
+                codes.flat[0] = 1 % shape[axis]
+                self._scattered(shape, dim, codes,
+                                np.full(shape, 3.0, dtype), dtype)
+
+    def test_a_half_canvas_rounds_its_total_once(self):
+        # Every entry of the list names the first element of its row, so each row
+        # answers one total of the six values it was handed - kept at full width
+        # across the additions and rounded on the way out.
+        base = np.zeros((4, 6), np.float16)
+        codes = np.zeros((4, 6), np.int64)
+        values = np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6], np.float16)
+        payload = np.broadcast_to(values, (4, 6)).copy()
+        got = self._device(base).scatter_add_(
+            1, self._codes(codes), self._device(payload)).cpu().numpy()
+        np.testing.assert_array_equal(got, self._want(base, 1, codes, payload))
+        self.assertEqual(got.dtype, np.float16)
+        total = np.float16(np.float32(values).sum(dtype=np.float32))
+        self.assertTrue((got[:, 0] == total).all(), msg=f"{got[:, 0]} != {total}")
+        self.assertTrue((got[:, 1:] == 0.0).all())
+
+    def test_a_list_of_either_width_names_the_same_elements(self):
+        base = self._canvas((6, 4))
+        codes = (np.arange(24) % 6).reshape(6, 4)
+        src = np.ones((6, 4), np.float32)
+        for dtype in (np.int32, np.int64):
+            got = self._device(base).scatter_add_(
+                0, self._codes(codes, dtype), self._device(src)).cpu().numpy()
+            np.testing.assert_array_equal(
+                got, self._want(base, 0, codes, src),
+                err_msg=np.dtype(dtype).name)
+
+    def test_a_request_with_nothing_in_it_changes_nothing(self):
+        base = self._canvas((5, 4))
+        kept = self._device(base)
+        got = kept.scatter_add_(
+            0, self._codes(np.zeros((2, 0), np.int64)),
+            self._device(np.zeros((2, 0), np.float32))).cpu().numpy()
+        np.testing.assert_array_equal(got, base)
+        empty = self._device(np.zeros((0, 3), np.float32))
+        answer = empty.scatter_add_(
+            0, self._codes(np.zeros((0, 3), np.int64)),
+            self._device(np.zeros((0, 3), np.float32)))
+        self.assertEqual(tuple(answer.cpu().numpy().shape), (0, 3))
+
+    def test_the_out_of_place_answer_leaves_the_canvas_alone(self):
+        base = self._canvas((6, 5), np.float32, seed=4)
+        codes = (np.arange(30) % 6).reshape(6, 5)
+        src = np.ones((6, 5), np.float32)
+        kept = self._device(base)
+        moved = tensorplay.scatter_add(kept, 0, self._codes(codes),
+                                       self._device(src)).cpu().numpy()
+        np.testing.assert_array_equal(moved, self._want(base, 0, codes, src))
+        np.testing.assert_array_equal(kept.cpu().numpy(), base)
+
+    def test_two_calls_answer_the_same_number(self):
+        base = self._canvas((8, 7), np.float32, seed=6)
+        rng = np.random.default_rng(11)
+        codes = rng.integers(0, 8, size=(8, 7))
+        src = rng.integers(-2, 3, size=(8, 7)).astype(np.float32)
+        first = self._device(base).scatter_add_(
+            0, self._codes(codes), self._device(src)).cpu().numpy()
+        second = self._device(base).scatter_add_(
+            0, self._codes(codes), self._device(src)).cpu().numpy()
+        np.testing.assert_array_equal(first, second)
+        np.testing.assert_array_equal(first, self._want(base, 0, codes, src))
+
+    def test_a_routing_shaped_list_totals_a_decoder_canvas(self):
+        # Four experts handing their rows to one canvas, as a mixture of experts
+        # routes them: every token receives the rows its own list names.
+        tokens, hidden, routed = 512, 256, 4
+        rng = np.random.default_rng(13)
+        base = np.zeros((tokens, hidden), np.float16)
+        codes = rng.integers(0, tokens, size=(tokens, routed))
+        src = rng.integers(-2, 3, size=(tokens, routed)).astype(np.float16)
+        got = self._device(base).scatter_add_(
+            0, self._codes(codes), self._device(src)).cpu().numpy()
+        np.testing.assert_array_equal(got, self._want(base, 0, codes, src))
+
+    def test_a_walk_the_destination_and_the_list_both_make_long_is_answered_off_it(
+            self):
+        length = 4000000
+        rng = np.random.default_rng(17)
+        # A list just inside the budget answers instead of refusing.
+        held = self._device(np.zeros((length,), np.float32))
+        held.scatter_add_(0, self._codes(rng.integers(0, 7, size=(60000,))),
+                          self._device(np.ones((60000,), np.float32)))
+        self.assertEqual(held.cpu().numpy().sum(), 60000.0)
+        canvas = self._device(np.zeros((length,), np.float32))
+        with self.assertRaisesRegex(RuntimeError, "budget"):
+            canvas.scatter_add_(0, self._codes(rng.integers(0, 7, size=(200000,))),
+                                self._device(np.ones((200000,), np.float32)))
+
+    def test_operands_that_do_not_line_up_are_answered_off_it(self):
+        payload = self._device(self._canvas((5, 4)))
+        ones = np.ones((5, 4), np.float32)
+        with self.assertRaisesRegex(RuntimeError, "same rank"):
+            payload.scatter_add_(0, self._codes(np.zeros((5,), np.int64)),
+                                 self._device(np.ones((5,), np.float32)))
+        with self.assertRaisesRegex(RuntimeError, "wider than the destination"):
+            payload.scatter_add_(1, self._codes(np.zeros((6, 4), np.int64)),
+                                 self._device(np.zeros((6, 4), np.float32)))
+        with self.assertRaisesRegex(RuntimeError, "dimension out of range"):
+            payload.scatter_add_(2, self._codes(np.zeros((5, 4), np.int64)),
+                                 self._device(ones))
+        with self.assertRaisesRegex(RuntimeError, "Int32 or Int64"):
+            payload.scatter_add_(0, self._codes([[0.0] * 4] * 5, np.float32),
+                                 self._device(ones))
+        with self.assertRaisesRegex(RuntimeError, "Float32 and Float16"):
+            self._device(np.zeros((5, 4), np.int32)).scatter_add_(
+                0, self._codes(np.zeros((5, 4), np.int64)),
+                self._device(np.zeros((5, 4), np.int32)))
+        with self.assertRaisesRegex(RuntimeError, "more axes than the list"):
+            payload.scatter_add_(0, self._codes(np.zeros((5, 4), np.int64)),
+                                 self._device(np.zeros((2, 5, 4), np.float32)))
+        with self.assertRaisesRegex(RuntimeError, "must reach the list"):
+            payload.scatter_add_(0, self._codes(np.zeros((5, 4), np.int64)),
+                                 self._device(np.zeros((3, 4), np.float32)))
+
+
 if __name__ == "__main__":
     unittest.main()
