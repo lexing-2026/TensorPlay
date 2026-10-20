@@ -1,6 +1,7 @@
 #include "Tensor.h"
 #include "Complex.h"
 #include "Dispatcher.h"
+#include "OutWrite.h"
 #include "Scalar.h"
 #include "TypePromotion.h"
 #include "Utils.h"
@@ -242,6 +243,46 @@ bool narrow_compare_path(const Tensor& result, const Tensor& a, const Tensor& b,
 // Comparator ops accept quantized tensors by dequantizing both operands into
 // the float domain; the comparison itself runs on the dequantized values.
 template<bool kEquality, NarrowCmp C, typename Op>
+Tensor comparison_kernel_impl(const Tensor& self, const Tensor& other, Op op);
+
+// The pass once the destination, the operands and their common width are
+// settled.  The narrow storages go through the masked compare first, because
+// their widening to float is not something the per-element loop can run several
+// lanes at a time; everything else is left to the iterator, which owns
+// broadcast, reorder, coalesce, parallelism and the overlap judgment over the
+// destination.
+template<bool kEquality, NarrowCmp C, typename Op>
+void comparison_pass(Tensor& result, const Tensor& self, const Tensor& other,
+                     DType common_dtype, Op op) {
+    Tensor self_casted = (self.dtype() == common_dtype) ? self : self.to(common_dtype);
+    Tensor other_casted = (other.dtype() == common_dtype) ? other : other.to(common_dtype);
+    if (narrow_compare_path<C>(result, self_casted, other_casted, common_dtype)) {
+        return;
+    }
+    if constexpr (kEquality) {
+        ti_apply_equality(result, self_casted, other_casted, common_dtype, op);
+    } else {
+        ti_apply_compare(result, self_casted, other_casted, common_dtype, op);
+    }
+}
+
+// A destination the caller supplied can take the pass when it is the tensor the
+// allocating form would have made for these operands: the device the comparison
+// runs on, the width the answer comes in, and the shape the two broadcast to.
+// A destination that needs a cast or a resize keeps the value the allocating
+// form made.
+static bool destination_takes(const Tensor& out, const Tensor& self, DType want,
+                              const std::vector<int64_t>& shape) {
+    if (!out.defined() || out.device() != self.device()) {
+        return false;
+    }
+    if (out.dtype() != want) {
+        return false;
+    }
+    return static_cast<std::vector<int64_t>>(out.shape()) == shape;
+}
+
+template<bool kEquality, NarrowCmp C, typename Op>
 Tensor comparison_kernel_impl(const Tensor& self, const Tensor& other, Op op) {
     if (isQuantizedType(self.dtype()) || isQuantizedType(other.dtype())) {
         Tensor self_f = isQuantizedType(self.dtype()) ? dequantize_self_cpu(self) : self;
@@ -260,24 +301,38 @@ Tensor comparison_kernel_impl(const Tensor& self, const Tensor& other, Op op) {
         TP_THROW(NotImplementedError, "comparison not implemented for '", toString(common_dtype), "'");
     }
 
-    Tensor self_casted = (self.dtype() == common_dtype) ? self : self.to(common_dtype);
-    Tensor other_casted = (other.dtype() == common_dtype) ? other : other.to(common_dtype);
-
-    // TensorIterator owns broadcast/reorder/coalesce/parallelism; no
-    // materialized expansion needed.  The narrow storages go through the masked
-    // compare first, because their widening to float is not something the
-    // per-element loop can run several lanes at a time.
-    if (narrow_compare_path<C>(result, self_casted, other_casted, common_dtype)) {
-        return result;
-    }
-    if constexpr (kEquality) {
-        ti_apply_equality(result, self_casted, other_casted, common_dtype, op);
-    } else {
-        ti_apply_compare(result, self_casted, other_casted, common_dtype, op);
-    }
-
+    comparison_pass<kEquality, C>(result, self, other, common_dtype, op);
     return result;
 }
+
+template<bool kEquality, NarrowCmp C, typename Op>
+Tensor& comparison_out_kernel(const Tensor& self, const Tensor& other,
+                              Tensor& out, Op op) {
+    const bool plain = !isQuantizedType(self.dtype()) && !isQuantizedType(other.dtype());
+    const DType common_dtype = promoteTypes(self.dtype(), other.dtype());
+    const std::vector<int64_t> out_shape =
+        broadcast_shapes(self.sizes(), other.sizes());
+    if (plain && (kEquality || !isComplexType(common_dtype)) &&
+        destination_takes(out, self, DType::Bool, out_shape)) {
+        comparison_pass<kEquality, C>(out, self, other, common_dtype, op);
+        return out;
+    }
+    return write_out(out, comparison_kernel_impl<kEquality, C>(self, other, op));
+}
+
+#define DEFINE_CMP_TENSOR_OUT_KERNEL(NAME, EQUALITY, ORDER, PREDICATE)              \
+    Tensor& NAME##_tensor_out_kernel(const Tensor& self, const Tensor& other,       \
+                                     Tensor& out) {                                 \
+        return comparison_out_kernel<EQUALITY, ORDER>(self, other, out, PREDICATE); \
+    }
+
+DEFINE_CMP_TENSOR_OUT_KERNEL(eq, true, NarrowCmp::Eq, [](auto a, auto b) { return a == b; })
+DEFINE_CMP_TENSOR_OUT_KERNEL(ne, true, NarrowCmp::Ne, [](auto a, auto b) { return a != b; })
+DEFINE_CMP_TENSOR_OUT_KERNEL(lt, false, NarrowCmp::Lt, [](auto a, auto b) { return a < b; })
+DEFINE_CMP_TENSOR_OUT_KERNEL(le, false, NarrowCmp::Le, [](auto a, auto b) { return a <= b; })
+DEFINE_CMP_TENSOR_OUT_KERNEL(gt, false, NarrowCmp::Gt, [](auto a, auto b) { return a > b; })
+DEFINE_CMP_TENSOR_OUT_KERNEL(ge, false, NarrowCmp::Ge, [](auto a, auto b) { return a >= b; })
+#undef DEFINE_CMP_TENSOR_OUT_KERNEL
 
 Tensor eq_tensor_kernel(const Tensor& self, const Tensor& other) {
     return comparison_kernel_impl<true, NarrowCmp::Eq>(self, other, [](auto a, auto b) { return a == b; });
@@ -320,6 +375,26 @@ DEFINE_CMP_SCALAR_KERNEL(le)
 DEFINE_CMP_SCALAR_KERNEL(gt)
 DEFINE_CMP_SCALAR_KERNEL(ge)
 #undef DEFINE_CMP_SCALAR_KERNEL
+
+// The same promotion for the spelling that answers into a caller's tensor: the
+// scalar becomes a one-element operand and the comparison then judges the
+// destination against the shape of the tensor it was given.
+#define DEFINE_CMP_SCALAR_OUT_KERNEL(NAME)                                        \
+    Tensor& NAME##_scalar_out_kernel(const Tensor& self, const Scalar& other,      \
+                                     Tensor& out) {                                \
+        Tensor self_f = isQuantizedType(self.dtype()) ? dequantize_self_cpu(self) : self; \
+        DType common = result_type_with_scalar(self_f, other);                     \
+        Tensor other_t = Tensor::full({}, other, common, self_f.device());         \
+        return NAME##_tensor_out_kernel(self_f.to(common), other_t, out);          \
+    }
+
+DEFINE_CMP_SCALAR_OUT_KERNEL(eq)
+DEFINE_CMP_SCALAR_OUT_KERNEL(ne)
+DEFINE_CMP_SCALAR_OUT_KERNEL(lt)
+DEFINE_CMP_SCALAR_OUT_KERNEL(le)
+DEFINE_CMP_SCALAR_OUT_KERNEL(gt)
+DEFINE_CMP_SCALAR_OUT_KERNEL(ge)
+#undef DEFINE_CMP_SCALAR_OUT_KERNEL
 
 template <typename Op>
 Tensor where_kernel_impl(const Tensor& condition, const Tensor& self,
@@ -468,6 +543,26 @@ Tensor maximum_minimum_kernel_impl(const Tensor& self, const Tensor& other, Op o
     return result;
 }
 
+// The chooser answers into the caller's tensor whenever that tensor is already
+// the one the allocating form would have made; a destination that needs a cast
+// or a resize, and a complex pair that has no answer at all, still go through
+// that form.
+template <typename Op>
+Tensor& maximum_minimum_out_kernel(const Tensor& self, const Tensor& other,
+                                   Tensor& out, Op op) {
+    const DType common_dtype = promoteTypes(self.dtype(), other.dtype());
+    const std::vector<int64_t> out_shape =
+        broadcast_shapes(self.sizes(), other.sizes());
+    if (!isComplexType(common_dtype) &&
+        destination_takes(out, self, common_dtype, out_shape)) {
+        Tensor a = self.dtype() == common_dtype ? self : self.to(common_dtype);
+        Tensor b = other.dtype() == common_dtype ? other : other.to(common_dtype);
+        ti_apply_binary(out, a, b, op);
+        return out;
+    }
+    return write_out(out, maximum_minimum_kernel_impl(self, other, op));
+}
+
 struct MaximumOp {
     template <typename T>
     T operator()(T a, T b) const {
@@ -525,6 +620,22 @@ Tensor fmin_cpu(const Tensor& self, const Tensor& other) {
     return maximum_minimum_kernel_impl(self, other, FmaxFminOp<false>());
 }
 
+Tensor& maximum_out_cpu(const Tensor& self, const Tensor& other, Tensor& out) {
+    return maximum_minimum_out_kernel(self, other, out, MaximumOp());
+}
+
+Tensor& minimum_out_cpu(const Tensor& self, const Tensor& other, Tensor& out) {
+    return maximum_minimum_out_kernel(self, other, out, MinimumOp());
+}
+
+Tensor& fmax_out_cpu(const Tensor& self, const Tensor& other, Tensor& out) {
+    return maximum_minimum_out_kernel(self, other, out, FmaxFminOp<true>());
+}
+
+Tensor& fmin_out_cpu(const Tensor& self, const Tensor& other, Tensor& out) {
+    return maximum_minimum_out_kernel(self, other, out, FmaxFminOp<false>());
+}
+
 TENSORPLAY_LIBRARY_IMPL(CPU, ComparisonKernels) {
     m.impl("eq.Tensor", eq_tensor_kernel);
     m.impl("eq.Scalar", eq_scalar_kernel);
@@ -546,6 +657,24 @@ TENSORPLAY_LIBRARY_IMPL(CPU, ComparisonKernels) {
     m.impl("minimum", minimum_cpu);
     m.impl("fmax", fmax_cpu);
     m.impl("fmin", fmin_cpu);
+    m.impl("maximum.out", maximum_out_cpu);
+    m.impl("minimum.out", minimum_out_cpu);
+    m.impl("max.out", maximum_out_cpu);
+    m.impl("min.out", minimum_out_cpu);
+    m.impl("fmax.out", fmax_out_cpu);
+    m.impl("fmin.out", fmin_out_cpu);
+    m.impl("eq.Tensor_out", eq_tensor_out_kernel);
+    m.impl("eq.Scalar_out", eq_scalar_out_kernel);
+    m.impl("ne.Tensor_out", ne_tensor_out_kernel);
+    m.impl("ne.Scalar_out", ne_scalar_out_kernel);
+    m.impl("lt.Tensor_out", lt_tensor_out_kernel);
+    m.impl("lt.Scalar_out", lt_scalar_out_kernel);
+    m.impl("le.Tensor_out", le_tensor_out_kernel);
+    m.impl("le.Scalar_out", le_scalar_out_kernel);
+    m.impl("gt.Tensor_out", gt_tensor_out_kernel);
+    m.impl("gt.Scalar_out", gt_scalar_out_kernel);
+    m.impl("ge.Tensor_out", ge_tensor_out_kernel);
+    m.impl("ge.Scalar_out", ge_scalar_out_kernel);
 }
 
 } // namespace cpu
