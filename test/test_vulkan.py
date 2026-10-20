@@ -8436,5 +8436,148 @@ class TestVulkanSearchsorted(unittest.TestCase):
             tensorplay.bucketize(device, self._device(table.reshape(1, 5)))
 
 
+class TestVulkanMultinomial(unittest.TestCase):
+    # A draw answers by ranking: every category gets an independent Exp(1)
+    # wait, is scored by weight over that wait, and the highest scores are the
+    # categories taken.
+
+    @staticmethod
+    def _device(array):
+        return tensorplay.from_numpy(np.asarray(array, np.float32)).to("vulkan")
+
+    @staticmethod
+    def _back(tensor):
+        return tensor.cpu().numpy()
+
+    def test_the_unit_rate_shows_the_right_shape(self):
+        tensorplay.manual_seed(7)
+        waits = tensorplay.zeros((64, 256), device="vulkan")
+        tensorplay.exponential_(waits, 1.0)
+        drawn = self._back(waits)
+        self.assertTrue(bool(np.all(drawn > 0.0)))
+        self.assertTrue(bool(np.all(np.isfinite(drawn))))
+        self.assertAlmostEqual(float(drawn.mean()), 1.0, delta=0.1)
+        self.assertAlmostEqual(float(drawn.var()), 1.0, delta=0.3)
+
+    def test_a_rate_stretches_the_wait(self):
+        tensorplay.manual_seed(11)
+        for rate, expected in ((0.5, 2.0), (4.0, 0.25)):
+            waits = tensorplay.zeros((32, 32, 32), device="vulkan")
+            tensorplay.exponential_(waits, rate)
+            self.assertAlmostEqual(
+                float(self._back(waits).mean()), expected, delta=expected / 4)
+
+    def test_the_fill_reaches_a_long_payload(self):
+        tensorplay.manual_seed(13)
+        waits = tensorplay.zeros((100000,), device="vulkan")
+        tensorplay.exponential_(waits, 1.0)
+        drawn = self._back(waits)
+        self.assertGreater(float(drawn.min()), 0.0)
+        self.assertAlmostEqual(float(drawn.mean()), 1.0, delta=0.05)
+
+    def test_nothing_to_fill_answers_without_a_draw(self):
+        waits = tensorplay.zeros((0,), device="vulkan")
+        tensorplay.exponential_(waits, 1.0)
+        self.assertEqual(tuple(waits.shape), (0,))
+
+    def test_a_seeded_wait_answers_twice(self):
+        tensorplay.manual_seed(17)
+        first = self._back(
+            tensorplay.exponential_(tensorplay.zeros((16, 16), device="vulkan"), 1.0))
+        tensorplay.manual_seed(17)
+        second = self._back(
+            tensorplay.exponential_(tensorplay.zeros((16, 16), device="vulkan"), 1.0))
+        np.testing.assert_array_equal(first, second)
+
+    def test_the_draw_takes_each_category_once(self):
+        tensorplay.manual_seed(19)
+        row = self._device(np.ones(8))
+        drawn = self._back(tensorplay.multinomial(row, 3, replacement=False))
+        self.assertEqual(len(set(drawn.tolist())), 3)
+        whole = self._back(tensorplay.multinomial(row, 8, replacement=False))
+        self.assertEqual(sorted(whole.tolist()), list(range(8)))
+
+    def test_the_draw_follows_the_weights(self):
+        tensorplay.manual_seed(23)
+        weights = np.array([0.5, 0.25, 0.125, 0.125], np.float32)
+        table = self._device(np.tile(weights, (4000, 1)))
+        for replacement in (False, True):
+            drawn = self._back(
+                tensorplay.multinomial(table, 1, replacement=replacement))
+            counted = np.bincount(drawn.ravel(), minlength=4) / drawn.shape[0]
+            np.testing.assert_allclose(counted, weights, atol=0.04)
+
+    def test_an_inclusion_rate_of_its_own(self):
+        tensorplay.manual_seed(29)
+        # Three of a fair row of eight are taken, so every category is drawn
+        # three eighths of the time.
+        table = self._device(np.ones((2000, 8)) / 8.0)
+        batch = self._back(tensorplay.multinomial(table, 3, replacement=False))
+        self.assertEqual(batch.shape, (2000, 3))
+        for row in batch:
+            self.assertEqual(len(set(row.tolist())), 3)
+        counted = np.bincount(batch.ravel(), minlength=8) / batch.shape[0]
+        np.testing.assert_allclose(counted, 3 / 8, atol=0.04)
+
+    def test_a_batch_draws_its_own_row(self):
+        tensorplay.manual_seed(31)
+        rows = self._device([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+        drawn = self._back(tensorplay.multinomial(rows, 1, replacement=False))
+        self.assertEqual(drawn.tolist(), [[0], [1], [2]])
+
+    def test_a_weightless_category_never_wins(self):
+        tensorplay.manual_seed(37)
+        drawn = self._back(
+            tensorplay.multinomial(
+                self._device([1.0, 1.0, 0.0, 0.0]), 2, replacement=False))
+        self.assertEqual(set(drawn.tolist()), {0, 1})
+
+    def test_a_long_row_is_ranked_too(self):
+        tensorplay.manual_seed(41)
+        vocab = tensorplay.ones((50257,), device="vulkan") / 50257.0
+        drawn = self._back(tensorplay.multinomial(vocab, 5, replacement=False))
+        self.assertEqual(len(set(drawn.tolist())), 5)
+        self.assertGreaterEqual(int(drawn.min()), 0)
+        self.assertLess(int(drawn.max()), 50257)
+        replaced = self._back(tensorplay.multinomial(vocab, 5, replacement=True))
+        self.assertEqual(replaced.shape, (5,))
+
+    def test_the_answer_counts_categories_in_the_wide_code(self):
+        tensorplay.manual_seed(43)
+        row = self._device(np.ones(6))
+        drawn = tensorplay.multinomial(row, 2, replacement=False)
+        self.assertEqual(drawn.dtype, tensorplay.int64)
+        self.assertEqual(tuple(drawn.shape), (2,))
+        batch = tensorplay.multinomial(self._device(np.ones((4, 6))), 2)
+        self.assertEqual(batch.dtype, tensorplay.int64)
+        self.assertEqual(tuple(batch.shape), (4, 2))
+        self.assertEqual(tuple(tensorplay.multinomial(row, 0).shape), (0,))
+
+    def test_a_seeded_draw_answers_twice(self):
+        table = self._device(np.ones((64, 8)) / 8.0)
+        tensorplay.manual_seed(47)
+        first = self._back(tensorplay.multinomial(table, 3, replacement=False))
+        tensorplay.manual_seed(47)
+        second = self._back(tensorplay.multinomial(table, 3, replacement=False))
+        np.testing.assert_array_equal(first, second)
+        tensorplay.manual_seed(53)
+        other = self._back(tensorplay.multinomial(table, 3, replacement=False))
+        self.assertFalse(bool((first == other).all()))
+
+    def test_outside_the_supported_surface_refuses(self):
+        row = self._device(np.ones(8))
+        with self.assertRaisesRegex(RuntimeError, "without replacement"):
+            tensorplay.multinomial(row, 9, replacement=False)
+        with self.assertRaisesRegex(RuntimeError, "floating"):
+            tensorplay.multinomial(
+                tensorplay.from_numpy(np.arange(8, dtype=np.int32)).to("vulkan"), 1)
+        with self.assertRaisesRegex(RuntimeError, "Float32"):
+            tensorplay.exponential_(
+                tensorplay.zeros((4, 4), device="vulkan", dtype=tensorplay.int32),
+                1.0)
+        with self.assertRaisesRegex(RuntimeError, "lambda > 0.0"):
+            tensorplay.exponential_(tensorplay.zeros((4, 4), device="vulkan"), 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()
