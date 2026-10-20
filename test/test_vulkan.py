@@ -3206,21 +3206,219 @@ class TestVulkanCumsumStorages(unittest.TestCase):
         import tensorplay.functional as F
         host = self._grid((40000, 3))
         device = tensorplay.from_numpy(host.copy()).to("vulkan")
-        # The scan runs in the payload's own type and the result widens after
-        # it, so the totals round to half on the way out even when asked for a
-        # float result.
-        want = np.cumsum(host.astype(np.float32), axis=0).astype(
-            np.float16).astype(np.float32)
+        # The walk runs in the width the result is asked for, so a float result
+        # carries a float total rather than the payload's own rounded one.
+        want = np.cumsum(host.astype(np.float32), axis=0)
         np.testing.assert_array_equal(
             F.cumsum(device, 0, dtype=tensorplay.float32).cpu().numpy(), want,
             err_msg="half payload scanned into a float result")
 
-    def test_cumsum_rejects_an_integer_payload(self):
+
+class TestVulkanCumsumOfCounts(unittest.TestCase):
+    # A running total of counts needs more range than one count, so a counted
+    # payload answers with the wide code and the walk carries across the pair of
+    # words that holds one element.  A narrower answer is the same total cut to
+    # the width named, which is also what a walk that wrapped inside that width
+    # at every step gives.
+
+    @staticmethod
+    def _device(host):
+        return tensorplay.from_numpy(np.asarray(host).copy()).to("vulkan")
+
+    @staticmethod
+    def _back(payload):
+        return np.asarray(payload.cpu())
+
+    def test_a_count_answers_with_the_wide_code(self):
         import tensorplay.functional as F
-        device = tensorplay.from_numpy(
-            np.arange(24, dtype=np.int32).reshape(4, 6)).to("vulkan")
-        with self.assertRaisesRegex(RuntimeError, "cumsum"):
-            F.cumsum(device, 0)
+        host = np.arange(24, dtype=np.int32).reshape(4, 6) - 8
+        device = self._device(host)
+        for dim in (0, 1):
+            got = F.cumsum(device, dim)
+            self.assertEqual(got.dtype, tensorplay.int64)
+            np.testing.assert_array_equal(
+                self._back(got), np.cumsum(host.astype(np.int64), axis=dim),
+                err_msg=f"int32 scan at dim={dim}")
+        np.testing.assert_array_equal(
+            self._back(F.cumsum(device, -1)),
+            np.cumsum(host.astype(np.int64), axis=1))
+        # The source still holds its own counts.
+        np.testing.assert_array_equal(self._back(device), host)
+
+    def test_a_wide_payload_keeps_its_width(self):
+        import tensorplay.functional as F
+        host = (np.arange(60, dtype=np.int64) * 1000 - 20000).reshape(4, 3, 5)
+        device = self._device(host)
+        for dim in range(3):
+            got = F.cumsum(device, dim)
+            self.assertEqual(got.dtype, tensorplay.int64)
+            np.testing.assert_array_equal(
+                self._back(got), np.cumsum(host, axis=dim),
+                err_msg=f"int64 scan at dim={dim}")
+        grid = (np.arange(2 * 3 * 4 * 5, dtype=np.int32)
+                % 13 - 6).reshape(2, 3, 4, 5)
+        for dim in range(4):
+            np.testing.assert_array_equal(
+                self._back(F.cumsum(self._device(grid), dim)),
+                np.cumsum(grid.astype(np.int64), axis=dim),
+                err_msg=f"rank-4 counts at dim={dim}")
+
+    def test_the_total_reaches_past_one_word(self):
+        import tensorplay.functional as F
+        crossing = np.array([3_000_000_000, 3_000_000_000, 3_000_000_000,
+                             -4_000_000_000, 1], dtype=np.int64)
+        np.testing.assert_array_equal(
+            self._back(F.cumsum(self._device(crossing), 0)),
+            np.cumsum(crossing),
+            err_msg="a sum that leaves one word still counts on")
+        mixed = np.array([2**40, -(2**40), 2**33, -(2**32), 5, 2**50, -(2**50)],
+                         dtype=np.int64)
+        np.testing.assert_array_equal(
+            self._back(F.cumsum(self._device(mixed), 0)), np.cumsum(mixed),
+            err_msg="a borrow out of the high word comes back")
+        past = np.array([np.iinfo(np.int64).max - 3, 2, 2, 2], dtype=np.int64)
+        with np.errstate(over="ignore"):
+            want = np.cumsum(past)
+        np.testing.assert_array_equal(
+            self._back(F.cumsum(self._device(past), 0)), want,
+            err_msg="a total past the signed range lands where the codes land")
+
+    def test_a_narrower_answer_wraps_where_a_short_walk_would(self):
+        import tensorplay.functional as F
+        host = np.array([2_000_000_000, 2_000_000_000, 2_000_000_000,
+                         -2_000_000_000, 1], dtype=np.int32)
+        got = F.cumsum(self._device(host), 0, dtype=tensorplay.int32)
+        self.assertEqual(got.dtype, tensorplay.int32)
+        # Cut once at the end...
+        with np.errstate(over="ignore"):
+            narrowed = np.cumsum(host.astype(np.int64)).astype(np.int32)
+        # ...and the same answer as a walk that wraps inside one word at every
+        # step, which is what a counted result promises.
+        walked = np.zeros(host.shape, dtype=np.int32)
+        total = 0
+        for at, value in enumerate(host):
+            total = (total + int(value)) % (1 << 32)
+            if total >= 1 << 31:
+                total -= 1 << 32
+            walked[at] = total
+        np.testing.assert_array_equal(self._back(got), narrowed)
+        np.testing.assert_array_equal(self._back(got), walked)
+
+    def test_a_mask_counts_its_own_positions(self):
+        import tensorplay.functional as F
+        mask = np.arange(40, dtype=np.int32) % 3 == 0
+        got = F.cumsum(self._device(mask), 0)
+        self.assertEqual(got.dtype, tensorplay.int64)
+        drawn = self._back(got)
+        np.testing.assert_array_equal(drawn, np.cumsum(mask.astype(np.int64)))
+        # The last prefix is the number of positions, which is what a scan of a
+        # mask is asked for.
+        self.assertEqual(int(drawn[-1]), int(mask.sum()))
+        narrow = F.cumsum(self._device(mask), 0, dtype=tensorplay.int32)
+        self.assertEqual(narrow.dtype, tensorplay.int32)
+        np.testing.assert_array_equal(self._back(narrow), drawn.astype(np.int32))
+
+    def test_a_narrow_count_scans_in_the_wide_code(self):
+        import tensorplay.functional as F
+        signed = ((np.arange(24) % 9) - 4).astype(np.int8).reshape(2, 3, 4)
+        unsigned = ((np.arange(24) * 7) % 200).astype(np.uint8).reshape(2, 3, 4)
+        for host in (signed, unsigned):
+            for dim in range(3):
+                got = F.cumsum(self._device(host), dim)
+                self.assertEqual(got.dtype, tensorplay.int64)
+                np.testing.assert_array_equal(
+                    self._back(got),
+                    np.cumsum(host.astype(np.int64), axis=dim),
+                    err_msg=f"{host.dtype} scan at dim={dim}")
+
+    def test_a_count_can_be_asked_for_a_measured_answer(self):
+        import tensorplay.functional as F
+        counts = np.arange(12, dtype=np.int32).reshape(3, 4)
+        drawn = F.cumsum(self._device(counts), 1, dtype=tensorplay.float32)
+        self.assertEqual(drawn.dtype, tensorplay.float32)
+        np.testing.assert_array_equal(
+            self._back(drawn), np.cumsum(counts.astype(np.float32), axis=1))
+        wide = F.cumsum(self._device(counts), 0, dtype=tensorplay.int64)
+        np.testing.assert_array_equal(
+            self._back(wide), np.cumsum(counts.astype(np.int64), axis=0))
+        # The reverse: a measured payload answered with counts.
+        floats = (np.arange(12, dtype=np.float32) / 2).reshape(3, 4)
+        counted = F.cumsum(self._device(floats), 0, dtype=tensorplay.int64)
+        np.testing.assert_array_equal(
+            self._back(counted), np.cumsum(floats.astype(np.int64), axis=0))
+
+    def test_a_view_is_laid_out_before_it_is_walked(self):
+        import tensorplay.functional as F
+        rows = np.arange(24, dtype=np.int64).reshape(4, 6)
+        columns = self._device(rows)[:, 1:6:2]
+        np.testing.assert_array_equal(
+            self._back(F.cumsum(columns, 0)),
+            np.cumsum(rows[:, 1:6:2], axis=0),
+            err_msg="strided counts")
+        grid = np.arange(20, dtype=np.float32).reshape(4, 5)
+        np.testing.assert_array_equal(
+            self._back(F.cumsum(self._device(grid)[1:4], 1)),
+            np.cumsum(grid[1:4], axis=1),
+            err_msg="a cropped row block of a float payload")
+
+    def test_an_axis_beyond_the_image_limit_walks_its_rows(self):
+        import tensorplay.functional as F
+        long = (np.arange(50_001, dtype=np.int64) % 7) - 3
+        np.testing.assert_array_equal(
+            self._back(F.cumsum(self._device(long), 0)), np.cumsum(long),
+            err_msg="a scan row longer than an image axis")
+        grid = (np.arange(40_000 * 3, dtype=np.int32) % 11).reshape(40_000, 3)
+        for dim in (0, 1):
+            np.testing.assert_array_equal(
+                self._back(F.cumsum(self._device(grid), dim)),
+                np.cumsum(grid.astype(np.int64), axis=dim),
+                err_msg=f"wide grid counts at dim={dim}")
+
+    def test_an_empty_count_payload_still_answers_empty(self):
+        import tensorplay.functional as F
+        for sizes, dtype in (((0, 3), np.int32), ((0,), np.int64),
+                             ((0, 2), np.bool_)):
+            host = np.zeros(sizes, dtype=dtype)
+            got = F.cumsum(self._device(host), 0)
+            self.assertEqual(tuple(got.shape), sizes)
+            self.assertEqual(got.dtype, tensorplay.int64)
+            self.assertEqual(self._back(got).shape, sizes)
+        # An axis of zero length with a real axis beside it.
+        host = np.zeros((3, 0), dtype=np.int32)
+        got = F.cumsum(self._device(host), 1)
+        self.assertEqual(tuple(got.shape), (3, 0))
+
+    def test_the_in_place_entry_keeps_the_payload_width(self):
+        import tensorplay.functional as F
+        host = np.arange(12, dtype=np.int32).reshape(3, 4)
+        device = self._device(host)
+        F.cumsum_(device, 1)
+        self.assertEqual(device.dtype, tensorplay.int32)
+        np.testing.assert_array_equal(
+            self._back(device),
+            np.cumsum(host.astype(np.int64), axis=1).astype(np.int32))
+        wide_host = (np.arange(12, dtype=np.int64) * 3000).reshape(3, 4)
+        wide = self._device(wide_host)
+        F.cumsum_(wide, 0)
+        self.assertEqual(wide.dtype, tensorplay.int64)
+        np.testing.assert_array_equal(
+            self._back(wide), np.cumsum(wide_host, axis=0))
+
+    def test_a_payload_or_result_outside_the_surface_refuses(self):
+        import tensorplay.functional as F
+        with self.assertRaisesRegex(RuntimeError, "supported Vulkan dtype"):
+            F.cumsum(self._device(np.arange(6, dtype=np.float64)), 0)
+        with self.assertRaisesRegex(RuntimeError, "supported Vulkan dtype"):
+            F.cumsum(self._device(np.arange(6, dtype=np.int16)), 0)
+        with self.assertRaisesRegex(RuntimeError, "and Int64 results"):
+            F.cumsum(self._device(np.arange(6, dtype=np.int32)), 0,
+                     dtype=tensorplay.uint8)
+        counts = self._device(np.arange(24, dtype=np.int32).reshape(4, 6))
+        for dim in (2, -3):
+            with self.assertRaisesRegex(RuntimeError, "dimension out of range"):
+                F.cumsum(counts, dim)
+        with self.assertRaisesRegex(RuntimeError, "ndim <= 4"):
+            F.cumsum(self._device(np.zeros((1, 1, 1, 1, 2), np.int32)), 0)
 
 
 class TestVulkanDeviceBuiltPayload(unittest.TestCase):
