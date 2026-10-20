@@ -2203,6 +2203,147 @@ Tensor mv_kernel(const Tensor& self, const Tensor& vec) {
   return linear_kernel(vec, self, std::nullopt);
 }
 
+//
+// Vector · vector: the shared axis reduced to a single number, which is what
+// the (1 x 1) case of a wider product already answers.
+//
+Tensor dot_kernel(const Tensor& self, const Tensor& other) {
+  TP_CHECK(
+      self.dim() == 1 && other.dim() == 1,
+      "Vulkan dot: expected two vectors, got a ", self.dim(), "d and a ",
+      other.dim(), "d operand");
+  TP_CHECK(
+      self.dtype() == other.dtype(),
+      "Vulkan dot: expected both vectors to have the same element type");
+  TP_CHECK(
+      self.numel() == other.numel(),
+      "Vulkan dot: expected both vectors to hold ", self.numel(),
+      " entries, got ", other.numel());
+  if (self.numel() == 0) {
+    // Nothing to combine, so the answer is zero; the reduction walk the wider
+    // product would take refuses a payload with no entries at all.
+    return Tensor::zeros({}, self.dtype(), self.device());
+  }
+  return matmul_kernel(self, other);
+}
+
+//
+// Outer: a column against a row, which is the rank-one payload every entry
+// of one vector scaled by every entry of the other.
+//
+Tensor outer_kernel(const Tensor& self, const Tensor& vec2) {
+  TP_CHECK(
+      self.dim() == 1 && vec2.dim() == 1,
+      "Vulkan outer: expected two vectors, got a ", self.dim(), "d and a ",
+      vec2.dim(), "d operand");
+  TP_CHECK(
+      self.dtype() == vec2.dtype(),
+      "Vulkan outer: expected both vectors to have the same element type");
+  return self.unsqueeze(1).mul(vec2.unsqueeze(0));
+}
+
+//
+// Inner product over the last axis of either rank: the axes before it are
+// rows of one wide product against the partner seen through its transpose.
+//
+Tensor inner_kernel(const Tensor& self, const Tensor& other) {
+  TP_CHECK(
+      self.dtype() == other.dtype(),
+      "Vulkan inner: expected both operands to have the same element type");
+  if (self.dim() == 0 || other.dim() == 0) {
+    // No axis is left to contract; the two numbers simply multiply.
+    return self.mul(other);
+  }
+  const int64_t n = self.size(-1);
+  TP_CHECK(
+      other.size(-1) == n,
+      "Vulkan inner: the last axis of both operands must match, got ", n,
+      " and ", other.size(-1));
+  if (self.dim() == 1 && other.dim() == 1) {
+    return dot_kernel(self, other);
+  }
+
+  // Entries ahead of the contracted axis fold into the row axis of one
+  // product; a lone vector folds to a single row.
+  auto leading_entries = [](const Tensor& t) {
+    int64_t rows = 1;
+    const std::vector<int64_t> sizes = shape_of(t);
+    for (size_t i = 0; i + 1 < sizes.size(); ++i) {
+      rows *= sizes[i];
+    }
+    return rows;
+  };
+
+  Tensor a = self.reshape({leading_entries(self), n});
+  Tensor b = other.reshape({leading_entries(other), n});
+
+  std::vector<int64_t> out_shape;
+  const std::vector<int64_t> self_sizes = shape_of(self);
+  const std::vector<int64_t> other_sizes = shape_of(other);
+  for (size_t i = 0; i + 1 < self_sizes.size(); ++i) {
+    out_shape.push_back(self_sizes[i]);
+  }
+  for (size_t i = 0; i + 1 < other_sizes.size(); ++i) {
+    out_shape.push_back(other_sizes[i]);
+  }
+  return matmul_kernel(a, b.transpose(0, 1)).reshape(out_shape);
+}
+
+//
+// A vector plus a matrix against a vector: the reduction the matrix-vector
+// product answers, scaled and seeded with the addend.
+//
+Tensor addmv_kernel(
+    const Tensor& self,
+    const Tensor& mat,
+    const Tensor& vec,
+    const Scalar& beta,
+    const Scalar& alpha) {
+  TP_CHECK(
+      mat.dim() == 2,
+      "Vulkan addmv: the matrix must carry two axes, got ", mat.dim());
+  TP_CHECK(
+      vec.dim() == 1,
+      "Vulkan addmv: the vector must carry one axis, got ", vec.dim());
+  TP_CHECK(
+      self.dim() <= 1,
+      "Vulkan addmv: the addend must be a vector or a number, got ",
+      self.dim(), " axes");
+  const int64_t m = mat.size(0);
+  TP_CHECK(
+      mat.size(1) == vec.size(0),
+      "Vulkan addmv: the reduction axis does not match, mat (", mat.size(0),
+      "x", mat.size(1), ") against vec (", vec.size(0), ")");
+  TP_CHECK(
+      self.numel() == m || self.numel() == 1,
+      "Vulkan addmv: the addend holds ", self.numel(),
+      " entries and cannot reach the ", m, " rows of the matrix");
+  TP_CHECK(
+      self.dtype() == mat.dtype() && mat.dtype() == vec.dtype(),
+      "Vulkan addmv: operands must have the same element type");
+
+  Tensor product = mv_kernel(mat, vec);
+  if (alpha.to<double>() != 1.0) {
+    product = product.mul(alpha);
+  }
+  if (beta.to<double>() == 0.0) {
+    // A zero weight on the addend carries no number of its across, not even
+    // an indeterminate one, so the seed is dropped rather than multiplied.
+    return product;
+  }
+  return self.mul(beta).add(product);
+}
+
+Tensor& addmv_inplace_kernel(
+    Tensor& self,
+    const Tensor& mat,
+    const Tensor& vec,
+    const Scalar& beta,
+    const Scalar& alpha) {
+  self.copy_(addmv_kernel(self, mat, vec, beta, alpha));
+  return self;
+}
+
 } // namespace
 
 } // namespace ops
@@ -2217,6 +2358,11 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, MatmulKernels) {
   m.impl("baddbmm", &tensorplay::vulkan::ops::baddbmm_kernel);
   m.impl("linear", &tensorplay::vulkan::ops::linear_kernel);
   m.impl("mv", &tensorplay::vulkan::ops::mv_kernel);
+  m.impl("dot", &tensorplay::vulkan::ops::dot_kernel);
+  m.impl("outer", &tensorplay::vulkan::ops::outer_kernel);
+  m.impl("inner", &tensorplay::vulkan::ops::inner_kernel);
+  m.impl("addmv", &tensorplay::vulkan::ops::addmv_kernel);
+  m.impl("addmv_", &tensorplay::vulkan::ops::addmv_inplace_kernel);
 }
 
 #endif /* USE_VULKAN */
