@@ -7139,5 +7139,104 @@ class TestVulkanVectorProducts(unittest.TestCase):
                              self._device(np.zeros(4, np.int32)))
 
 
+class TestVulkanRepeatExpansion(unittest.TestCase):
+    """Repeating an axis in place: the count the key-value heads reach the
+    query head count by, and the half-width rotary table doubles."""
+
+    @staticmethod
+    def _device(values):
+        return tensorplay.from_numpy(np.asarray(values)).to("vulkan")
+
+    @staticmethod
+    def _block(shape, seed):
+        rng = np.random.default_rng(seed)
+        return (rng.standard_normal(shape) * 4).astype(np.float32)
+
+    def _expanded(self, data, repeats, axis, label):
+        got = self._device(data).repeat_interleave(repeats, dim=axis).cpu().numpy()
+        want = np.repeat(data, repeats, axis=axis)
+        # Nothing is combined here, only copied, so the device answers the
+        # model entry for entry rather than within a tolerance.
+        np.testing.assert_array_equal(got, want, err_msg=f"expansion at {label}")
+        return got
+
+    def test_every_axis_of_a_tall_payload_expands(self):
+        for shape in [(4,), (3, 5), (2, 3, 5), (2, 3, 4, 5)]:
+            data = self._block(shape, 7)
+            for axis in range(len(shape)):
+                self._expanded(data, 3, axis, f"{shape} axis {axis}")
+            self._expanded(data, 2, -1, f"{shape} negative axis")
+
+    def test_a_grouped_query_cache_reaches_the_query_head_count(self):
+        kv = self._block((1, 2, 5, 64), 8)
+        queries = self._block((1, 8, 3, 64), 9)
+        expanded = self._device(kv).repeat_interleave(4, dim=1)
+        np.testing.assert_array_equal(
+            expanded.cpu().numpy(), np.repeat(kv, 4, axis=1))
+        self.assertEqual(tuple(expanded.shape), (1, 8, 5, 64))
+        got = (self._device(queries) @ expanded.transpose(2, 3)).cpu().numpy()
+        want = queries.astype(np.float64) @ np.repeat(
+            kv, 4, axis=1).astype(np.float64).transpose(0, 1, 3, 2)
+        np.testing.assert_allclose(got.astype(np.float64), want, rtol=1e-4, atol=1e-4)
+
+    def test_a_rotary_table_doubles_across_its_last_axis(self):
+        table = self._block((1, 8, 3, 32), 10)
+        self._expanded(table, 2, -1, "rotary doubling")
+
+    def test_a_view_repeats_what_it_shows(self):
+        wide = self._block((2, 6, 4, 5), 11)
+        self._expanded(wide[:, ::2], 2, 1, "stride two")
+        permuted = np.transpose(self._block((3, 2, 5, 4), 12), (0, 2, 1, 3))
+        self._expanded(permuted, 2, 2, "permuted")
+        self._expanded(self._block((3, 8, 4), 13)[:, 2:6], 3, 1, "storage offset")
+
+    def test_one_and_zero_repeats_and_a_payload_with_no_entries(self):
+        data = self._block((2, 3, 4, 5), 14)
+        np.testing.assert_array_equal(
+            self._device(data).repeat_interleave(1, dim=2).cpu().numpy(), data)
+        for axis in (0, 2, 3):
+            got = self._device(data).repeat_interleave(0, dim=axis).cpu().numpy()
+            np.testing.assert_array_equal(got, np.repeat(data, 0, axis=axis))
+            self.assertEqual(tuple(got.shape), np.repeat(data, 0, axis=axis).shape)
+        self._expanded(self._block((0, 3, 4), 15), 2, 1, "empty payload")
+        self._expanded(self._block((2, 3, 0, 5), 16), 2, 2, "empty repeated axis")
+
+    def test_the_flat_form_matches_the_axis_form(self):
+        data = self._block((2, 3, 4, 5), 17)
+        flat = self._device(data).repeat_interleave(3).cpu().numpy()
+        np.testing.assert_array_equal(flat, np.repeat(data.reshape(-1), 3))
+
+    def test_a_half_payload_keeps_its_element_type(self):
+        half = self._block((1, 2, 8, 64), 18).astype(np.float16)
+        got = self._device(half).repeat_interleave(4, dim=1)
+        np.testing.assert_array_equal(got.cpu().numpy(), np.repeat(half, 4, axis=1))
+        self.assertEqual(got.dtype, tensorplay.float16)
+
+    def test_a_count_payload_keeps_its_width(self):
+        rng = np.random.default_rng(19)
+        wide = rng.integers(-20, 20, size=(2, 3, 4, 5)).astype(np.int64)
+        got = self._device(wide).repeat_interleave(3, dim=2)
+        np.testing.assert_array_equal(got.cpu().numpy(), np.repeat(wide, 3, axis=2))
+        self.assertEqual(got.dtype, tensorplay.int64)
+        narrow = rng.integers(-20, 20, size=(1, 2, 6, 8)).astype(np.int32)
+        got = self._device(narrow).repeat_interleave(4, dim=1)
+        np.testing.assert_array_equal(got.cpu().numpy(), np.repeat(narrow, 4, axis=1))
+
+    def test_a_cache_tall_past_an_image_expands_anyway(self):
+        # The folded walk names a quarter of a million entries across, which no
+        # texel axis can span, so the expansion has to answer from plain memory.
+        kv = self._block((1, 2, 4096, 64), 20)
+        self._expanded(kv, 4, 1, "long cache")
+
+    def test_a_count_that_does_not_fit_refuses(self):
+        data = self._block((2, 3, 4), 21)
+        with self.assertRaisesRegex(RuntimeError, "output_size"):
+            self._device(data).repeat_interleave(3, dim=1, output_size=6)
+        with self.assertRaises(ValueError):
+            self._device(data).repeat_interleave(-1, dim=1)
+        with self.assertRaises(IndexError):
+            self._device(data).repeat_interleave(2, dim=4)
+
+
 if __name__ == "__main__":
     unittest.main()
