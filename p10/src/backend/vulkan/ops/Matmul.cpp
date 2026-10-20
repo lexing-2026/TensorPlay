@@ -1777,6 +1777,10 @@ Tensor baddbmm_kernel(
   return scaled.add(scaled_addend);
 }
 
+// Defined further down; a matrix against a vector folds to the decode
+// product, so the (2,1) case below can reach it before its definition.
+Tensor mv_kernel(const Tensor& self, const Tensor& vec);
+
 Tensor matmul_kernel(const Tensor& self_in, const Tensor& other_in) {
   TP_CHECK(
       (self_in.dtype() == DType::Float32 || self_in.dtype() == DType::Float16) &&
@@ -1793,6 +1797,31 @@ Tensor matmul_kernel(const Tensor& self_in, const Tensor& other_in) {
         "Vulkan matmul: vector dimensions do not match");
     Tensor product = self_in * other_in;
     return product.sum(std::vector<int64_t>{0}, false);
+  }
+
+  // Matrix · vector: the same reduction over one axis, taken through the
+  // decode product rather than a tile whose row axis holds a single lane.
+  if (self_ndim == 2 && other_ndim == 1) {
+    return mv_kernel(self_in, other_in);
+  }
+
+  // Vector · matrix: the vector reads as one row of the product, so the
+  // result keeps the matrix's far axis.
+  if (self_ndim == 1 && other_ndim == 2) {
+    const int64_t K = self_in.size(0);
+    TP_CHECK(
+        K == other_in.size(0),
+        "Vulkan matmul: matrix dimensions do not match");
+    TP_CHECK(
+        self_in.dtype() == other_in.dtype(),
+        "Vulkan matmul: operands must have the same element type");
+    Tensor row = mm_impl(
+        self_in.reshape({1, K}),
+        other_in,
+        std::nullopt,
+        Scalar(1.0),
+        Scalar(1.0));
+    return row.reshape({other_in.size(1)});
   }
 
   // Matrix · matrix: transpose views fold into the pack gathers, so no
@@ -1899,6 +1928,37 @@ Tensor matmul_kernel(const Tensor& self_in, const Tensor& other_in) {
     std::vector<int64_t> out_sizes(self_sizes.begin(), self_sizes.end() - 1);
     out_sizes.push_back(other_in.size(1));
     return out.reshape(out_sizes);
+  }
+
+  // Batch of matrices against a shared vector: fold the batch into the row
+  // axis, take the one reduction, and restore the batch dims.
+  if (self_ndim >= 3 && other_ndim == 1) {
+    const int64_t K = self_in.size(self_ndim - 1);
+    TP_CHECK(
+        K == other_in.size(0),
+        "Vulkan matmul: matrix dimensions do not match");
+    Tensor flat = self_in.reshape({self_in.numel() / K, K});
+    Tensor out = mv_kernel(flat, other_in);
+    const std::vector<int64_t> self_sizes = shape_of(self_in);
+    std::vector<int64_t> out_sizes(self_sizes.begin(), self_sizes.end() - 1);
+    return out.reshape(out_sizes);
+  }
+
+  // A shared vector against a batch of matrices: the vector reads as one row
+  // of every plane, so the batched product runs with a singleton row axis that
+  // drops out of the result.
+  if (self_ndim == 1 && other_ndim >= 3) {
+    const int64_t K = self_in.size(0);
+    TP_CHECK(
+        K == other_in.size(other_ndim - 2),
+        "Vulkan matmul: matrix dimensions do not match");
+    TP_CHECK(
+        self_in.dtype() == other_in.dtype(),
+        "Vulkan matmul: operands must have the same element type");
+    Tensor rows = matmul_kernel(self_in.unsqueeze(0), other_in);
+    std::vector<int64_t> out_sizes = shape_of(rows);
+    out_sizes.erase(out_sizes.end() - 2);
+    return rows.reshape(out_sizes);
   }
 
   // Batched on at least one side: the leading axes broadcast to one result
@@ -2073,6 +2133,76 @@ Tensor linear_kernel(
   return out2.reshape(out_sizes);
 }
 
+//
+// Matrix · vector: y[i] = sum_k A[i][k] * x[k].  One row of the activation
+// against a layer, so the product takes the decode route: the reduction axis
+// splits across invocations and combines once, and a weight too wide for a
+// texture streams straight out of its linear payload.  The pack cache keys on
+// the weight's own storage identity, so a steady loop over a fixed matrix
+// re-streams it without re-packing.
+//
+Tensor mv_kernel(const Tensor& self, const Tensor& vec) {
+  TP_CHECK(
+      self.dim() == 2,
+      "Vulkan mv: expected a matrix and a vector, got a ", self.dim(),
+      "d matrix");
+  TP_CHECK(
+      vec.dim() == 1,
+      "Vulkan mv: expected a matrix and a vector, got a ", vec.dim(),
+      "d vector");
+  TP_CHECK(
+      self.dtype() == vec.dtype(),
+      "Vulkan mv: operands must have the same element type");
+  TP_CHECK(
+      self.dtype() == DType::Float32 || self.dtype() == DType::Float16,
+      "Vulkan mv supports Float32 and Float16 operands only");
+  TP_CHECK(
+      self.size(1) == vec.size(0),
+      "Vulkan mv: size mismatch, mat (", self.size(0), "x", self.size(1),
+      ") against vec (", vec.size(0), ")");
+  TP_CHECK(
+      self.device().is_vulkan() && vec.device().is_vulkan(),
+      "Vulkan mv: operands must live on the Vulkan device");
+
+  const int64_t M = self.size(0);
+  const int64_t K = self.size(1);
+
+  if (M == 0 || K == 0) {
+    // A reduction over no entries answers zero on every row it reaches; a
+    // matrix with no rows has nothing to answer for.
+    api::Context* const context = api::context();
+    api::vTensor v_output{context, {M}, self.dtype()};
+    Tensor out = convert(v_output);
+    if (M != 0) {
+      out.zero_();
+    }
+    return out;
+  }
+
+  // A matrix that sits in memory as its own transpose is read through its
+  // dense twin: the product's packing gather folds the swap, so no transpose
+  // copy is needed.
+  Tensor dense;
+  if (transpose_view_of_dense(self, &dense)) {
+    Tensor row = mm_impl(
+        vec.reshape({1, K}),
+        dense,
+        std::nullopt,
+        Scalar(1.0),
+        Scalar(1.0));
+    return row.reshape({M});
+  }
+  if (!self.is_contiguous()) {
+    // Any other stride pattern has no gather that reads it as a weight, so it
+    // materializes once here.
+    return mv_kernel(self.contiguous(), vec);
+  }
+
+  // The vector is the activation row and the matrix the layer seen through
+  // [out, in]: y = x · A^T, which is exactly A · x.
+  return linear_kernel(vec, self, std::nullopt);
+}
+
 } // namespace
 
 } // namespace ops
@@ -2086,6 +2216,7 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, MatmulKernels) {
   m.impl("bmm", &tensorplay::vulkan::ops::bmm_kernel);
   m.impl("baddbmm", &tensorplay::vulkan::ops::baddbmm_kernel);
   m.impl("linear", &tensorplay::vulkan::ops::linear_kernel);
+  m.impl("mv", &tensorplay::vulkan::ops::mv_kernel);
 }
 
 #endif /* USE_VULKAN */
