@@ -837,18 +837,64 @@ static void f64_chunk_avx2(VOp op, VParams prm, const double* src, double* dst, 
 }
 
 // Reduced-precision dtypes widen to f32, run the same kernels, narrow back.
+// One chunk-wide branch for the parameterised ops, as for float32: a double
+// load, a narrowing convert and a broadcast per vector sit on the same ports
+// as the convert pair, and there they cost more than the arithmetic they feed.
+#define TP_HALF_CHUNK_8(EXPR)                                              \
+    {                                                                      \
+        for (; i + 8 <= n; i += 8) {                                       \
+            __m256 x = _mm256_cvtph_ps(_mm_loadu_si128(                    \
+                reinterpret_cast<const __m128i*>(src + i)));               \
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i),          \
+                             _mm256_cvtps_ph((EXPR),                       \
+                                             _MM_FROUND_TO_NEAREST_INT));  \
+        }                                                                  \
+    }
+
 __attribute__((target("avx2,fma,f16c"), noinline))
 static void half_chunk_avx2(VOp op, VParams prm, const uint16_t* src, uint16_t* dst, int64_t b, int64_t e) {
     src += b;
     dst += b;
     int64_t n = e - b;
     int64_t i = 0;
-    for (; i + 8 <= n; i += 8) {
-        __m256 x = _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(src + i)));
-        __m256 y = apply_f32(op, prm, x);
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i),
-                         _mm256_cvtps_ph(y, _MM_FROUND_TO_NEAREST_INT));
+    switch (op) {
+        case VOp::Hardtanh: {
+            const __m256 lo = _mm256_set1_ps(static_cast<float>(prm.p0));
+            const __m256 hi = _mm256_set1_ps(static_cast<float>(prm.p1));
+            TP_HALF_CHUNK_8(_mm256_min_ps(hi, _mm256_max_ps(lo, x)))
+            break;
+        }
+        case VOp::LeakyRelu: {
+            const __m256 zero = _mm256_setzero_ps();
+            const __m256 slope = _mm256_set1_ps(static_cast<float>(prm.p0));
+            TP_HALF_CHUNK_8(_mm256_blendv_ps(
+                x, _mm256_mul_ps(slope, x), _mm256_cmp_ps(x, zero, _CMP_LT_OQ)))
+            break;
+        }
+        case VOp::Elu: {
+            const __m256 negcoef = _mm256_set1_ps(static_cast<float>(prm.p0));
+            const __m256 poscoef = _mm256_set1_ps(static_cast<float>(prm.p1));
+            const __m256 negipt = _mm256_set1_ps(static_cast<float>(prm.p2));
+            TP_HALF_CHUNK_8(v_elu_f32(negcoef, poscoef, negipt, x))
+            break;
+        }
+        case VOp::Softplus: {
+            const __m256 beta = _mm256_set1_ps(static_cast<float>(prm.p0));
+            const __m256 threshold = _mm256_set1_ps(static_cast<float>(prm.p1));
+            TP_HALF_CHUNK_8(v_softplus_f32(beta, threshold, x))
+            break;
+        }
+        default:
+            for (; i + 8 <= n; i += 8) {
+                __m256 x = _mm256_cvtph_ps(_mm_loadu_si128(
+                    reinterpret_cast<const __m128i*>(src + i)));
+                _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i),
+                                 _mm256_cvtps_ph(apply_f32(op, prm, x),
+                                                 _MM_FROUND_TO_NEAREST_INT));
+            }
+            break;
     }
+#undef TP_HALF_CHUNK_8
     for (; i < n; ++i) {
         float xf = _cvtsh_ss(src[i]);
         dst[i] = _cvtss_sh(scalar_apply(op, prm, xf), _MM_FROUND_TO_NEAREST_INT);
@@ -1429,6 +1475,29 @@ static void f64_chunk_avx512(VOp op, VParams prm, const double* src, double* dst
     for (; i < n; ++i) d[i] = scalar_apply(op, prm, s[i]);
 }
 
+// Same one-branch-per-chunk split as the Half loop: only the ops that read
+// runtime parameters need it, the rest keep the generic body.
+#define TP_BF16_CHUNK_8(EXPR)                                             \
+    {                                                                     \
+        for (; i + 8 <= n; i += 8) {                                      \
+            __m256 x = _mm256_castsi256_ps(_mm256_slli_epi32(             \
+                _mm256_cvtepu16_epi32(_mm_loadu_si128(                    \
+                    reinterpret_cast<const __m128i*>(src + i))),          \
+                16));                                                     \
+            __m256 y = (EXPR);                                            \
+            __m256i u = _mm256_castps_si256(y);                           \
+            __m256i rounding = _mm256_add_epi32(                          \
+                _mm256_set1_epi32(0x7FFFu),                               \
+                _mm256_srli_epi32(                                        \
+                    _mm256_and_si256(u, _mm256_set1_epi32(0x10000u)), 16));\
+            __m256i r = _mm256_srli_epi32(_mm256_add_epi32(u, rounding), 16); \
+            __m256i p = _mm256_shuffle_epi8(r, pack_pick);                \
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i),         \
+                             _mm_unpacklo_epi64(_mm256_castsi256_si128(p), \
+                                                _mm256_extracti128_si256(p, 1))); \
+        }                                                                 \
+    }
+
 __attribute__((target("avx2,fma"), noinline))
 static void bf16_chunk_avx2(VOp op, VParams prm, const uint16_t* src, uint16_t* dst, int64_t b, int64_t e) {
     const __m256i shift = _mm256_set1_epi32(16);
@@ -1445,21 +1514,38 @@ static void bf16_chunk_avx2(VOp op, VParams prm, const uint16_t* src, uint16_t* 
     dst += b;
     int64_t n = e - b;
     int64_t i = 0;
-    for (; i + 8 <= n; i += 8) {
-        __m128i h = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + i));
-        __m256i w = _mm256_slli_epi32(_mm256_cvtepu16_epi32(h), 16);
-        __m256 y = apply_f32(op, prm, _mm256_castsi256_ps(w));
-        // Round-to-nearest-even back to bf16, matching BFloat16(float).
-        __m256i u = _mm256_castps_si256(y);
-        __m256i rounding = _mm256_add_epi32(
-            _mm256_set1_epi32(0x7FFFu),
-            _mm256_srli_epi32(_mm256_and_si256(u, _mm256_set1_epi32(0x10000u)), 16));
-        __m256i r = _mm256_srli_epi32(_mm256_add_epi32(u, rounding), 16);
-        __m256i p = _mm256_shuffle_epi8(r, pack_pick);
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i),
-                         _mm_unpacklo_epi64(_mm256_castsi256_si128(p),
-                                            _mm256_extracti128_si256(p, 1)));
+    switch (op) {
+        case VOp::Hardtanh: {
+            const __m256 lo = _mm256_set1_ps(static_cast<float>(prm.p0));
+            const __m256 hi = _mm256_set1_ps(static_cast<float>(prm.p1));
+            TP_BF16_CHUNK_8(_mm256_min_ps(hi, _mm256_max_ps(lo, x)))
+            break;
+        }
+        case VOp::LeakyRelu: {
+            const __m256 zero = _mm256_setzero_ps();
+            const __m256 slope = _mm256_set1_ps(static_cast<float>(prm.p0));
+            TP_BF16_CHUNK_8(_mm256_blendv_ps(
+                x, _mm256_mul_ps(slope, x), _mm256_cmp_ps(x, zero, _CMP_LT_OQ)))
+            break;
+        }
+        case VOp::Elu: {
+            const __m256 negcoef = _mm256_set1_ps(static_cast<float>(prm.p0));
+            const __m256 poscoef = _mm256_set1_ps(static_cast<float>(prm.p1));
+            const __m256 negipt = _mm256_set1_ps(static_cast<float>(prm.p2));
+            TP_BF16_CHUNK_8(v_elu_f32(negcoef, poscoef, negipt, x))
+            break;
+        }
+        case VOp::Softplus: {
+            const __m256 beta = _mm256_set1_ps(static_cast<float>(prm.p0));
+            const __m256 threshold = _mm256_set1_ps(static_cast<float>(prm.p1));
+            TP_BF16_CHUNK_8(v_softplus_f32(beta, threshold, x))
+            break;
+        }
+        default:
+            TP_BF16_CHUNK_8(apply_f32(op, prm, x))
+            break;
     }
+#undef TP_BF16_CHUNK_8
     for (; i < n; ++i) {
         uint32_t bits = static_cast<uint32_t>(src[i]) << 16;
         float xf;
