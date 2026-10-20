@@ -756,6 +756,75 @@ int64_t wrap_dim_checked(int64_t dim, int64_t ndim) {
 } // namespace
 
 /*
+ * A constant pad leaves the payload where it sits and frames it: a negative
+ * count crops that end of its axis, a positive one joins a slab of the fill
+ * value.  Every slab joins through the concat walk, which copies both of its
+ * inputs, so a padded result is never written through a view.  The cost is one
+ * full copy per joined slab, which is why a pad of a single axis and a single
+ * side costs one pass.
+ */
+Tensor constant_pad_nd_kernel(
+    const Tensor& self,
+    const std::vector<int64_t>& pad,
+    const Scalar& value) {
+  TP_CHECK(
+      pad.size() % 2 == 0,
+      "Vulkan pad: the pad list must be pairs of counts, got ", pad.size());
+  const int64_t axes = self.dim();
+  const int64_t padded = static_cast<int64_t>(pad.size()) / 2;
+  TP_CHECK(
+      axes >= 1 && axes <= 4, "Vulkan pad supports 1d to 4d tensors");
+  TP_CHECK(
+      padded <= axes,
+      "Vulkan pad: the pad list covers ", pad.size(), " ends but the tensor "
+      "has ", axes, " axes");
+  // The list counts from the last axis inwards, so axis a reads the pair at
+  // 2 * (axes - a - 1).
+  for (int64_t axis = axes - padded; axis < axes; ++axis) {
+    const int64_t at = 2 * (axes - axis - 1);
+    TP_CHECK(
+        self.size(axis) + pad[at] + pad[at + 1] >= 0,
+        "Vulkan pad: axis ", axis, " of size ", self.size(axis),
+        " cannot take ", pad[at], " and ", pad[at + 1]);
+  }
+
+  Tensor drawn = self;
+  for (int64_t axis = axes - padded; axis < axes; ++axis) {
+    const int64_t at = 2 * (axes - axis - 1);
+    if (pad[at] < 0) {
+      drawn = drawn.slice(axis, -pad[at], drawn.size(axis));
+    }
+    if (pad[at + 1] < 0) {
+      drawn = drawn.slice(axis, 0, drawn.size(axis) + pad[at + 1]);
+    }
+  }
+  if (std::none_of(pad.begin(), pad.end(), [](int64_t count) {
+        return count > 0;
+      })) {
+    return drawn.clone();
+  }
+  // The concat walk reads dense payloads, so the cropped view is laid out
+  // before any slab joins it.
+  drawn = drawn.clone();
+  const auto slab = [&drawn, &value, &self](int64_t axis, int64_t count) {
+    std::vector<int64_t> frame = shape_vector(drawn);
+    frame[static_cast<size_t>(axis)] = count;
+    return full_kernel(
+        frame, value, self.dtype(), self.device(), false);
+  };
+  for (int64_t axis = axes - padded; axis < axes; ++axis) {
+    const int64_t at = 2 * (axes - axis - 1);
+    if (pad[at] > 0) {
+      drawn = cat_kernel({slab(axis, pad[at]), drawn}, axis);
+    }
+    if (pad[at + 1] > 0) {
+      drawn = cat_kernel({drawn, slab(axis, pad[at + 1])}, axis);
+    }
+  }
+  return drawn;
+}
+
+/*
  * Chunking is repeated slicing; unbinding is repeated selection.  Both ride
  * the strided-view materialization the slice/select entries own.
  */
@@ -1155,6 +1224,7 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, ShapeKernels) {
   m.impl("diagonal", &tensorplay::vulkan::ops::diagonal_kernel);
   m.impl("select.int", &tensorplay::vulkan::ops::select_kernel);
   m.impl("cat", &tensorplay::vulkan::ops::cat_kernel);
+  m.impl("constant_pad_nd", &tensorplay::vulkan::ops::constant_pad_nd_kernel);
   m.impl("stack", &tensorplay::vulkan::ops::stack_kernel);
   m.impl("repeat", &tensorplay::vulkan::ops::repeat_kernel);
   m.impl("tile", &tensorplay::vulkan::ops::tile_kernel);
