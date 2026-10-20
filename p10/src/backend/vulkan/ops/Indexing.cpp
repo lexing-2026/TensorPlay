@@ -318,6 +318,10 @@ Tensor embedding_kernel(
 // on the texture's y extent and packs the rest of the row into texels and lanes,
 // so only that axis names whole texels; a row straddling the packed axis would
 // have to be copied lane by lane and stays composite-side.
+//
+// Two codes naming the same row race for it texel by texel, so which source row
+// survives is unspecified; nothing reads a row back mid-scatter, so the race
+// costs no correctness beyond that freedom.
 Tensor& index_copy_rows_inplace(Tensor& self, int64_t dim, const Tensor& index, const Tensor& source) {
   NoGradGuard no_grad;
   TP_CHECK(
