@@ -436,6 +436,25 @@ std::vector<Tensor> tensor_split_cuda(const Tensor& self, int64_t sections, int6
     return outs;
 }
 
+namespace {
+
+// Reversing the innermost dimension is a row-wise reversal: the row index
+// rides on the grid, so the kernel needs no per-element division. Each thread
+// walks a strided slice of its row, mirroring the column index.
+template <typename T>
+__global__ void flip_last_dim_kernel(int64_t size, const T* __restrict__ in,
+                                     T* __restrict__ out) {
+    const int64_t row = static_cast<int64_t>(blockIdx.y);
+    const int64_t base = row * size;
+    const int64_t step = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    for (int64_t col = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         col < size; col += step) {
+        out[base + col] = in[base + size - 1 - col];
+    }
+}
+
+} // anonymous namespace
+
 Tensor flip_cuda(const Tensor& self, const std::vector<int64_t>& dims) {
     if (isQuantizedType(self.dtype())) return quantized::with_quantizer(flip_cuda(quantized::storage_view(self), dims), self);
 
@@ -466,6 +485,31 @@ Tensor flip_cuda(const Tensor& self, const std::vector<int64_t>& dims) {
         const int64_t dim = wrap_dim_scalar(dims[0], nd);
         const int64_t size = sc.size(dim);
         const int64_t stride = sc.stride(dim);
+        // A trailing flip only reverses each row, so the row base and the
+        // mirrored column come straight from the launch geometry.
+        const int64_t rows = size > 0 ? n / size : 0;
+        if (stride == 1 && rows > 0 && rows <= 65535) {
+            constexpr int64_t kFlipWork = 4;
+            const dim3 block(kThreads);
+            const dim3 grid(
+                static_cast<unsigned>((size + kThreads * kFlipWork - 1) /
+                                      (kThreads * kFlipWork)),
+                static_cast<unsigned>(rows));
+            const cudaStream_t stream = getCurrentCUDAStream().stream();
+#define TP_FL0(ctype, name_) \
+        case DType::name_: \
+            flip_last_dim_kernel<ctype><<<grid, block, 0, stream>>>( \
+                size, sc.data_ptr<ctype>(), out.data_ptr<ctype>()); \
+            break;
+            switch (sc.dtype()) {
+                TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_FL0)
+                TENSORPLAY_FORALL_QINT_TYPES(TP_FL0)
+                default: TP_THROW(TypeError, "flip: unsupported dtype");
+            }
+#undef TP_FL0
+            CUDA_CHECK(cudaGetLastError());
+            return out;
+        }
 #define TP_FL1(ctype, name_) \
         case DType::name_: { \
             const ctype* source = sc.data_ptr<ctype>(); \
