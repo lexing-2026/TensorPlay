@@ -169,10 +169,10 @@ static bool flat_layout_pair(const Tensor& t, const Tensor& result) {
 //
 // Two things have to hold.  The destination must carry what the compute produces
 // -- the caller's device, that dtype, those sizes -- and it must be laid out so
-// that one storage place holds one element, which is the shape the allocating
-// helper would have handed the pass anyway; a destination with holes would be
-// written as though it were packed.  And the pass must not read bytes it is also
-// writing: the loops pair element i of the source with element i of the
+// that the pass's flat loops meet one element at each storage place: packed, or
+// permuted exactly the way the operand is, which is the layout the allocating
+// helper would have handed the pass anyway.  And the pass must not read bytes it
+// is also writing: the loops pair element i of the source with element i of the
 // destination, so two views of one block that step differently would leave
 // whichever value the chunks stored last.  A destination that fails either test
 // is served the old way, by computing and handing the result over.
@@ -182,12 +182,12 @@ static bool destination_writable(const Tensor& self, const Tensor& out,
     if (out.dtype() != want) return false;
     const auto sizes = static_cast<std::vector<int64_t>>(self.shape());
     if (static_cast<std::vector<int64_t>>(out.shape()) != sizes) return false;
-    if (!out.is_contiguous()) {
-        const std::vector<int64_t> out_strides = out.strides();
-        if (!SizesAndStrides::is_non_overlapping_and_dense(sizes, out_strides)) {
-            return false;
-        }
-    }
+    // A packed destination every pass can walk.  A permutation of one is only
+    // safe when the operand carries that very permutation, because then the two
+    // flat loops step through the same storage order; a run whose destination
+    // stride is not one would be written as though it were packed, leaving the
+    // places between the steps untouched.
+    if (!out.is_contiguous() && !flat_layout_pair(self, out)) return false;
     auto self_impl = self.unsafeGetTensorImpl();
     auto out_impl = out.unsafeGetTensorImpl();
     const bool one_block = self_impl && out_impl &&
@@ -2319,9 +2319,16 @@ Tensor clamp_max_kernel(const Tensor& self, const Scalar& max) {
 // writes.  A destination that cannot be reached element for element -- a cast, a
 // different shape, a view of the input's own block at another step -- is served
 // by computing and handing the result over, as before.
+//
+// The pass makes its operand contiguous before walking it, so it pairs the
+// operand's *logical* order with the destination's storage order: only a packed
+// destination answers that, and a permutation the operand happens to carry is not
+// enough.  That is a stricter judgement than the one the strided passes accept.
 Tensor& clamp_out_kernel(const Tensor& self, const std::optional<Scalar>& min,
                          const std::optional<Scalar>& max, Tensor& out) {
-    if (destination_writable(self, out, self.dtype())) {
+    if (destination_takes_flat(out, self.device(), self.dtype(),
+                               static_cast<std::vector<int64_t>>(self.shape()),
+                               self)) {
         clamp_write(self, min, max, out);
         return out;
     }
@@ -2344,7 +2351,9 @@ Tensor& clip_out_cpu(const Tensor& self, const std::optional<Scalar>& min,
 }
 
 Tensor& clamp_min__kernel(Tensor& self, const Scalar& min) {
-    if (destination_writable(self, self, self.dtype())) {
+    if (destination_takes_flat(self, self.device(), self.dtype(),
+                               static_cast<std::vector<int64_t>>(self.shape()),
+                               self)) {
         clamp_write(self, min, std::nullopt, self);
         return self;
     }
@@ -2352,7 +2361,9 @@ Tensor& clamp_min__kernel(Tensor& self, const Scalar& min) {
     return self;
 }
 Tensor& clamp_max__kernel(Tensor& self, const Scalar& max) {
-    if (destination_writable(self, self, self.dtype())) {
+    if (destination_takes_flat(self, self.device(), self.dtype(),
+                               static_cast<std::vector<int64_t>>(self.shape()),
+                               self)) {
         clamp_write(self, std::nullopt, max, self);
         return self;
     }
