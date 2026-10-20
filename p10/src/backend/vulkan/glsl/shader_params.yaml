@@ -1266,6 +1266,14 @@ index_select_buffer_half:
   parameter_names_with_default_values: {}
   shader_variants:
   - NAME: index_select_buffer_half
+mask_mark:
+  parameter_names_with_default_values: {}
+  shader_variants:
+  - NAME: mask_mark
+mask_compact:
+  parameter_names_with_default_values: {}
+  shader_variants:
+  - NAME: mask_compact
 gather:
   parameter_names_with_default_values: {}
   shader_variants:

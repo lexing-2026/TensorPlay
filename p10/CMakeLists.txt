@@ -692,6 +692,7 @@ if(USE_VULKAN)
         src/backend/vulkan/ops/Matmul.cpp
         src/backend/vulkan/ops/Misc.cpp
         src/backend/vulkan/ops/Normalization.cpp
+        src/backend/vulkan/ops/Nonzero.cpp
         src/backend/vulkan/ops/ParamCache.cpp
         src/backend/vulkan/ops/Comparison.cpp
         src/backend/vulkan/ops/Indexing.cpp
