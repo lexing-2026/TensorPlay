@@ -624,10 +624,12 @@ Tensor unary_float_op_kernel(const Tensor& self, Func func,
 // is copied; everywhere else -- a cast, a different shape, a destination that
 // reaches the source's bytes by another step, a dtype the allocating kernel
 // handles by some other route (complex, quantized) -- the value is computed by
-// that same kernel and handed over.
-template<typename Func>
+// that same kernel and handed over.  `allocating` is whatever spells the same
+// map in the form that fills a fresh tensor, so a map carrying parameters can
+// hand its own bound values to both spellings.
+template<typename Func, typename Alloc>
 Tensor& unary_float_out_kernel(const Tensor& self, Tensor& out,
-                               Tensor (*allocating)(const Tensor&), Func func,
+                               Alloc allocating, Func func,
                                vecunary::VOp vec_op,
                                vecunary::VParams vec_prm = {}) {
     const DType want =
@@ -646,9 +648,9 @@ Tensor& unary_float_out_kernel(const Tensor& self, Tensor& out,
 // where it is not -- an integral input that floor leaves alone, a complex input,
 // a destination the judge rejects -- the value comes from that kernel and is
 // handed over.
-template<typename Func>
+template<typename Func, typename Alloc>
 Tensor& unary_out_kernel(const Tensor& self, Tensor& out,
-                         Tensor (*allocating)(const Tensor&), Func func,
+                         Alloc allocating, Func func,
                          vecunary::VOp vec_op,
                          vecunary::VParams vec_prm = {},
                          bool straight = true) {
@@ -659,6 +661,44 @@ Tensor& unary_out_kernel(const Tensor& self, Tensor& out,
         return out;
     }
     return write_out(out, allocating(self));
+}
+
+// The same judgment for the maps whose composite keeps the answer's width: a
+// destination of another dtype or on another device is refused there rather than
+// cast, and only a destination of another shape is grown.  The single pass is
+// offered first; a destination it cannot take is served this hand-over, so the
+// refusals stay what the composite made.
+template<typename Func, typename Alloc>
+Tensor& unary_float_strict_out_kernel(const Tensor& self, Tensor& out,
+                                      const char* op, Alloc allocating, Func func,
+                                      vecunary::VOp vec_op,
+                                      vecunary::VParams vec_prm = {}) {
+    const DType want =
+        isIntegralType(self.dtype()) ? DType::Float32 : self.dtype();
+    const bool plain_float =
+        !isComplexType(self.dtype()) && !isQuantizedType(self.dtype());
+    if (plain_float && destination_writable(self, out, want)) {
+        unary_float_op_kernel(self, func, vec_op, vec_prm, &out);
+        return out;
+    }
+    Tensor value = allocating(self);
+    if (!out.defined()) {
+        out = std::move(value);
+        return out;
+    }
+    if (out.dtype() != value.dtype()) {
+        TP_THROW(TypeError, op, ": output dtype must match input dtype");
+    }
+    if (out.device() != value.device()) {
+        TP_THROW(DeviceMismatchError,
+                 op, ": output device must match input device");
+    }
+    const auto target = static_cast<std::vector<int64_t>>(value.shape());
+    if (static_cast<std::vector<int64_t>>(out.shape()) != target) {
+        out.resize_(target);
+    }
+    out.copy_(value);
+    return out;
 }
 
 // corresponding real dtype (hypot(re, im)).
@@ -1255,6 +1295,13 @@ Tensor& relu_inplace_kernel(Tensor& self) {
 Tensor gelu_tanh_impl(const Tensor& self);
 Tensor gelu_backward_impl(const Tensor& grad_output, const Tensor& self, const std::string& approximate);
 
+// GELU's exact form: 0.5 * x * (1 + erf(x * M_SQRT1_2)).
+static constexpr auto gelu_none_map = [](auto x) {
+    using T = decltype(x);
+    constexpr T kAlpha = static_cast<T>(0.70710678118654752440); // M_SQRT1_2
+    return static_cast<T>(0.5) * x * (static_cast<T>(1) + std::erf(x * kAlpha));
+};
+
 Tensor gelu_kernel(const Tensor& self, const std::string& approximate) {
     if (isQuantizedType(self.dtype())) { TP_CHECK(approximate == "none" || approximate == "tanh", "GELU approximation must be none or tanh"); return quantized::activation(self, approximate == "tanh" ? 9 : 8); }
 
@@ -1264,43 +1311,70 @@ Tensor gelu_kernel(const Tensor& self, const std::string& approximate) {
     } else if (approximate != "none") {
         TP_THROW(ValueError, "approximate argument must be either none or tanh, but got " + approximate);
     }
-    return unary_float_op_kernel(self, [](auto x) {
-        using T = decltype(x);
-        constexpr T kAlpha = static_cast<T>(0.70710678118654752440); // M_SQRT1_2
-        return static_cast<T>(0.5) * x * (static_cast<T>(1) + std::erf(x * kAlpha));
-    }, vecunary::VOp::GeluNone);
+    return unary_float_op_kernel(self, gelu_none_map, vecunary::VOp::GeluNone);
 }
 
 Tensor gelu_backward_kernel(const Tensor& grad_output, const Tensor& self, const std::string& approximate) {
     return gelu_backward_impl(grad_output, self, approximate);
 }
 
-Tensor silu_kernel(const Tensor& self) {
-    // SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
+// SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
+static constexpr auto silu_map = [](auto x) {
+    using T = decltype(x);
+    return x / (static_cast<T>(1) + std::exp(-x));
+};
+
+// The hand-written body the two packed float widths keep.  `dst` is whatever
+// buffer the caller already judged: the fresh one the allocating form made, or
+// the destination an out call handed in.
+static void silu_stub_body(const Tensor& self, Tensor& dst) {
+    const int64_t n = self.numel();
+    if (self.dtype() == DType::Float32) {
+        const float* src = self.data_ptr<float>();
+        float* out = dst.data_ptr<float>();
+        parallel_for(0, n, kUnaryGrain, [&](int64_t b, int64_t e) {
+            silu_f32_stub(DeviceType::CPU, src + b, out + b, e - b);
+        });
+    } else {
+        const double* src = self.data_ptr<double>();
+        double* out = dst.data_ptr<double>();
+        parallel_for(0, n, kUnaryGrain, [&](int64_t b, int64_t e) {
+            silu_f64_stub(DeviceType::CPU, src + b, out + b, e - b);
+        });
+    }
+}
+
+static bool silu_keeps_stub(const Tensor& self) {
     const DType dt = self.dtype();
-    if (self.is_contiguous() &&
-        (dt == DType::Float32 || dt == DType::Float64)) {
-        Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), dt, self.device());
-        const int64_t n = self.numel();
-        if (dt == DType::Float32) {
-            const float* src = self.data_ptr<float>();
-            float* dst = result.data_ptr<float>();
-            parallel_for(0, n, kUnaryGrain, [&](int64_t b, int64_t e) {
-                silu_f32_stub(DeviceType::CPU, src + b, dst + b, e - b);
-            });
-        } else {
-            const double* src = self.data_ptr<double>();
-            double* dst = result.data_ptr<double>();
-            parallel_for(0, n, kUnaryGrain, [&](int64_t b, int64_t e) {
-                silu_f64_stub(DeviceType::CPU, src + b, dst + b, e - b);
-            });
-        }
+    return self.is_contiguous() &&
+           (dt == DType::Float32 || dt == DType::Float64);
+}
+
+Tensor silu_kernel(const Tensor& self) {
+    if (silu_keeps_stub(self)) {
+        Tensor result = Tensor::empty(
+            static_cast<std::vector<int64_t>>(self.shape()), self.dtype(),
+            self.device());
+        silu_stub_body(self, result);
         return result;
     }
-    return unary_float_op_kernel(self, [](auto x) {
-        using T = decltype(x);
-        return x / (static_cast<T>(1) + std::exp(-x));
-    }, vecunary::VOp::Silu);
+    return unary_float_op_kernel(self, silu_map, vecunary::VOp::Silu);
+}
+
+Tensor& silu_out_cpu(const Tensor& self, Tensor& out) {
+    const DType want =
+        isIntegralType(self.dtype()) ? DType::Float32 : self.dtype();
+    // The stub walks both buffers in element order, so the destination has to be
+    // packed and free of any overlap with the operand it reads.
+    if (silu_keeps_stub(self) &&
+        destination_takes_flat(out, self.device(), want,
+                               static_cast<std::vector<int64_t>>(self.shape()),
+                               self)) {
+        silu_stub_body(self, out);
+        return out;
+    }
+    return unary_float_out_kernel(self, out, silu_kernel, silu_map,
+                                  vecunary::VOp::Silu);
 }
 
 // Fused gated activation primitives.  These belong with the existing SiLU
@@ -1536,11 +1610,32 @@ static inline float gelu_backward_tanh_scalar(float dy, float x) {
     return dy * (left_derivative + right_derivative);
 }
 
+// The tanh approximation of GELU, evaluated in the widening math type the
+// vector lanes use.
+static constexpr auto gelu_tanh_map = [](auto x) {
+    using T = decltype(x);
+    return static_cast<T>(gelu_tanh_scalar(static_cast<activation_math_t<T>>(x)));
+};
+
 Tensor gelu_tanh_impl(const Tensor& self) {
-    return unary_float_op_kernel(self, [](auto x) {
-        using T = decltype(x);
-        return static_cast<T>(gelu_tanh_scalar(static_cast<activation_math_t<T>>(x)));
-    }, vecunary::VOp::GeluTanh);
+    return unary_float_op_kernel(self, gelu_tanh_map, vecunary::VOp::GeluTanh);
+}
+
+// The destination-writing pair of gelu: whichever approximation the caller
+// asked for, the same map is what the allocating kernel runs.
+Tensor& gelu_out_cpu(const Tensor& self, const std::string& approximate,
+                     Tensor& out) {
+    const std::string approx = approximate;
+    auto allocating = [approx](const Tensor& v) { return gelu_kernel(v, approx); };
+    if (approximate == "none") {
+        return unary_float_out_kernel(self, out, allocating, gelu_none_map,
+                                      vecunary::VOp::GeluNone);
+    }
+    if (approximate == "tanh") {
+        return unary_float_out_kernel(self, out, allocating, gelu_tanh_map,
+                                      vecunary::VOp::GeluTanh);
+    }
+    return write_out(out, allocating(self));
 }
 
 Tensor gelu_backward_impl(const Tensor& grad_output, const Tensor& self, const std::string& approximate) {
@@ -1554,18 +1649,43 @@ Tensor gelu_backward_impl(const Tensor& grad_output, const Tensor& self, const s
     TP_THROW(ValueError, "approximate argument must be either none or tanh, but got " + approximate);
 }
 
+// Every element outside [min, max] is pulled to the nearer bound; inside it the
+// operand passes through.  The bounds are read back through the element's own
+// width, as the vector lanes hold them.
+struct HardtanhAt {
+    double lo;
+    double hi;
+
+    template <typename T>
+    inline T operator()(T x) const {
+        const T low = static_cast<T>(lo);
+        const T high = static_cast<T>(hi);
+        return x < low ? low : (x > high ? high : x);
+    }
+};
+
 Tensor hardtanh_kernel_impl(const Tensor& self, const Scalar& min_val, const Scalar& max_val) {
     if (isQuantizedType(self.dtype())) return quantized::activation(self, 7, min_val.toDouble(), max_val.toDouble());
 
     vecunary::VParams prm;
     prm.p0 = min_val.toDouble();
     prm.p1 = max_val.toDouble();
-    return unary_float_op_kernel(self, [min_val, max_val](auto x) {
-        using T = decltype(x);
-        T lo = static_cast<T>(min_val.toDouble());
-        T hi = static_cast<T>(max_val.toDouble());
-        return x < lo ? lo : (x > hi ? hi : x);
-    }, vecunary::VOp::Hardtanh, prm);
+    return unary_float_op_kernel(self, HardtanhAt{min_val.toDouble(), max_val.toDouble()},
+                                 vecunary::VOp::Hardtanh, prm);
+}
+
+Tensor& hardtanh_out_cpu(const Tensor& self, const Scalar& min_val,
+                         const Scalar& max_val, Tensor& out) {
+    const double lo = min_val.toDouble();
+    const double hi = max_val.toDouble();
+    vecunary::VParams prm;
+    prm.p0 = lo;
+    prm.p1 = hi;
+    return unary_float_out_kernel(
+        self, out, [lo, hi](const Tensor& v) {
+            return hardtanh_kernel_impl(v, Scalar(lo), Scalar(hi));
+        },
+        HardtanhAt{lo, hi}, vecunary::VOp::Hardtanh, prm);
 }
 
 Tensor hardtanh_backward_kernel_impl(const Tensor& grad_output, const Tensor& self, const Scalar& min_val, const Scalar& max_val) {
@@ -1579,13 +1699,23 @@ Tensor relu6_kernel_impl(const Tensor& self) {
     return hardtanh_kernel_impl(self, Scalar(0.0), Scalar(6.0));
 }
 
+// x * relu6(x + 3) / 6, with the clamp taken in the widening math type the
+// vector lanes use.
+static constexpr auto hardswish_map = [](auto x) {
+    using T = decltype(x);
+    T xf = static_cast<T>(static_cast<activation_math_t<T>>(x));
+    T clamped = (xf + T(3) < T(0)) ? T(0) : (xf + T(3) > T(6)) ? T(6) : xf + T(3);
+    return xf * clamped / T(6);
+};
+
 Tensor hardswish_kernel_impl(const Tensor& self) {
-    return unary_float_op_kernel(self, [](auto x) {
-        using T = decltype(x);
-        T xf = static_cast<T>(static_cast<activation_math_t<T>>(x));
-        T clamped = (xf + T(3) < T(0)) ? T(0) : (xf + T(3) > T(6)) ? T(6) : xf + T(3);
-        return xf * clamped / T(6);
-    }, vecunary::VOp::Hardswish);
+    return unary_float_op_kernel(self, hardswish_map, vecunary::VOp::Hardswish);
+}
+
+Tensor& hardswish_out_cpu(const Tensor& self, Tensor& out) {
+    return unary_float_strict_out_kernel(self, out, "hardswish",
+                                         hardswish_kernel_impl, hardswish_map,
+                                         vecunary::VOp::Hardswish);
 }
 
 Tensor hardswish_backward_kernel_impl(const Tensor& grad_output, const Tensor& self) {
@@ -1610,16 +1740,25 @@ Tensor silu_backward_kernel_impl(const Tensor& grad_output, const Tensor& self) 
         });
 }
 
+// relu6(x + 3) / 6
+static constexpr auto hardsigmoid_map = [](auto x) {
+    using T = decltype(x);
+    T xf = static_cast<T>(static_cast<activation_math_t<T>>(x));
+    T v = xf + T(3);
+    v = v < T(0) ? T(0) : (v > T(6) ? T(6) : v);
+    return v / T(6);
+};
+
 Tensor hardsigmoid_kernel_impl(const Tensor& self) {
     if (isQuantizedType(self.dtype())) return quantized::activation(self, 3);
 
-    return unary_float_op_kernel(self, [](auto x) {
-        using T = decltype(x);
-        T xf = static_cast<T>(static_cast<activation_math_t<T>>(x));
-        T v = xf + T(3);
-        v = v < T(0) ? T(0) : (v > T(6) ? T(6) : v);
-        return v / T(6);
-    }, vecunary::VOp::Hardsigmoid);
+    return unary_float_op_kernel(self, hardsigmoid_map, vecunary::VOp::Hardsigmoid);
+}
+
+Tensor& hardsigmoid_out_cpu(const Tensor& self, Tensor& out) {
+    return unary_float_strict_out_kernel(self, out, "hardsigmoid",
+                                         hardsigmoid_kernel_impl, hardsigmoid_map,
+                                         vecunary::VOp::Hardsigmoid);
 }
 
 Tensor hardsigmoid_backward_kernel_impl(const Tensor& grad_output, const Tensor& self) {
@@ -1632,17 +1771,37 @@ Tensor hardsigmoid_backward_kernel_impl(const Tensor& grad_output, const Tensor&
         });
 }
 
+// Below zero the element is scaled by the slope; at or above it the operand
+// passes through.  The slope is read back through the element's own width.
+struct LeakyAt {
+    double slope;
+
+    template <typename T>
+    inline T operator()(T x) const {
+        const T xf = static_cast<T>(static_cast<activation_math_t<T>>(x));
+        return xf < T(0) ? static_cast<T>(slope) * xf : xf;
+    }
+};
+
 Tensor leaky_relu_kernel_impl(const Tensor& self, const Scalar& negative_slope) {
     if (isQuantizedType(self.dtype())) return quantized::activation(self, 0, negative_slope.toDouble());
 
     double slope = negative_slope.toDouble();
     vecunary::VParams prm;
     prm.p0 = slope;
-    return unary_float_op_kernel(self, [slope](auto x) {
-        using T = decltype(x);
-        T xf = static_cast<T>(static_cast<activation_math_t<T>>(x));
-        return xf < T(0) ? static_cast<T>(slope) * xf : xf;
-    }, vecunary::VOp::LeakyRelu, prm);
+    return unary_float_op_kernel(self, LeakyAt{slope}, vecunary::VOp::LeakyRelu, prm);
+}
+
+Tensor& leaky_relu_out_cpu(const Tensor& self, const Scalar& negative_slope,
+                           Tensor& out) {
+    const double slope = negative_slope.toDouble();
+    vecunary::VParams prm;
+    prm.p0 = slope;
+    return unary_float_out_kernel(
+        self, out, [slope](const Tensor& v) {
+            return leaky_relu_kernel_impl(v, Scalar(slope));
+        },
+        LeakyAt{slope}, vecunary::VOp::LeakyRelu, prm);
 }
 
 Tensor leaky_relu_backward_kernel_impl(const Tensor& grad_output, const Tensor& self, const Scalar& negative_slope, bool self_is_result) {
@@ -1655,8 +1814,24 @@ Tensor leaky_relu_backward_kernel_impl(const Tensor& grad_output, const Tensor& 
         });
 }
 
+//   a < 0 ? expm1(a * input_scale) * negcoef : a * poscoef
+struct EluAt {
+    double negcoef;
+    double poscoef;
+    double negiptcoef;
+
+    template <typename T>
+    inline T operator()(T x) const {
+        using M = activation_math_t<T>;
+        const T a = static_cast<T>(static_cast<M>(x));
+        return a < T(0)
+            ? static_cast<T>(std::expm1(static_cast<M>(a) * static_cast<M>(negiptcoef)) *
+                             static_cast<M>(negcoef))
+            : a * static_cast<T>(poscoef);
+    }
+};
+
 Tensor elu_kernel_impl(const Tensor& self, const Scalar& alpha, const Scalar& scale, const Scalar& input_scale) {
-    //   a < 0 ? expm1(a * input_scale) * negcoef : a * poscoef
     double negcoef = alpha.toDouble() * scale.toDouble();
     double poscoef = scale.toDouble();
     double negiptcoef = input_scale.toDouble();
@@ -1664,14 +1839,31 @@ Tensor elu_kernel_impl(const Tensor& self, const Scalar& alpha, const Scalar& sc
     prm.p0 = negcoef;
     prm.p1 = poscoef;
     prm.p2 = negiptcoef;
-    return unary_float_op_kernel(self, [negcoef, poscoef, negiptcoef](auto x) {
-        using T = decltype(x);
-        using M = activation_math_t<T>;
-        T a = static_cast<T>(static_cast<M>(x));
-        return a < T(0)
-            ? static_cast<T>(std::expm1(static_cast<M>(a) * static_cast<M>(negiptcoef)) * static_cast<M>(negcoef))
-            : a * static_cast<T>(poscoef);
-    }, vecunary::VOp::Elu, prm);
+    return unary_float_op_kernel(self, EluAt{negcoef, poscoef, negiptcoef},
+                                 vecunary::VOp::Elu, prm);
+}
+
+Tensor& elu_out_cpu(const Tensor& self, const Scalar& alpha, const Scalar& scale,
+                    const Scalar& input_scale, Tensor& out) {
+    // The three derived coefficients are what both spellings need; the
+    // allocating one is asked through its own parameters, so those are kept
+    // beside the derived values rather than rebuilt from them.
+    const double alpha_in = alpha.toDouble();
+    const double scale_in = scale.toDouble();
+    const double input_scale_in = input_scale.toDouble();
+    const double negcoef = alpha_in * scale_in;
+    const double poscoef = scale_in;
+    const double negiptcoef = input_scale_in;
+    vecunary::VParams prm;
+    prm.p0 = negcoef;
+    prm.p1 = poscoef;
+    prm.p2 = negiptcoef;
+    return unary_float_out_kernel(
+        self, out, [=](const Tensor& v) {
+            return elu_kernel_impl(v, Scalar(alpha_in), Scalar(scale_in),
+                                   Scalar(input_scale_in));
+        },
+        EluAt{negcoef, poscoef, negiptcoef}, vecunary::VOp::Elu, prm);
 }
 
 Tensor elu_backward_kernel_impl(const Tensor& grad_output, const Scalar& alpha, const Scalar& scale, const Scalar& input_scale, bool is_result, const Tensor& self_or_result) {
@@ -1691,13 +1883,21 @@ Tensor elu_backward_kernel_impl(const Tensor& grad_output, const Scalar& alpha, 
         });
 }
 
+// x * tanh(softplus(x))
+static constexpr auto mish_map = [](auto x) {
+    using T = decltype(x);
+    T xf = static_cast<T>(static_cast<activation_math_t<T>>(x));
+    T sp = std::log(T(1) + std::exp(xf));
+    return xf * std::tanh(sp);
+};
+
 Tensor mish_kernel_impl(const Tensor& self) {
-    return unary_float_op_kernel(self, [](auto x) {
-        using T = decltype(x);
-        T xf = static_cast<T>(static_cast<activation_math_t<T>>(x));
-        T sp = std::log(T(1) + std::exp(xf));
-        return xf * std::tanh(sp);
-    }, vecunary::VOp::Mish);
+    return unary_float_op_kernel(self, mish_map, vecunary::VOp::Mish);
+}
+
+Tensor& mish_out_cpu(const Tensor& self, Tensor& out) {
+    return unary_float_out_kernel(self, out, mish_kernel_impl, mish_map,
+                                  vecunary::VOp::Mish);
 }
 
 Tensor mish_backward_kernel_impl(const Tensor& grad_output, const Tensor& self) {
@@ -1739,22 +1939,44 @@ Tensor celu_kernel_impl(const Tensor& self, const Scalar& alpha) {
     return elu_kernel_impl(self, alpha, Scalar(1.0), Scalar(1.0 / a));
 }
 
+//   beta_in * a > threshold ? a : log1p(exp(beta_in * a)) / beta_in
+struct SoftplusAt {
+    double beta;
+    double threshold;
+
+    template <typename T>
+    inline T operator()(T x) const {
+        using M = activation_math_t<T>;
+        const T a = static_cast<T>(static_cast<M>(x));
+        const T beta_in_t = static_cast<T>(beta);
+        return a * beta_in_t > static_cast<T>(threshold)
+            ? a
+            : static_cast<T>(std::log1p(std::exp(static_cast<M>(a * beta_in_t))) / beta_in_t);
+    }
+};
+
 Tensor softplus_kernel_impl(const Tensor& self, const Scalar& beta, const Scalar& threshold) {
-    //   beta_in * a > threshold ? a : log1p(exp(beta_in * a)) / beta_in
     double beta_in = beta.toDouble();
     double threshold_in = threshold.toDouble();
     vecunary::VParams prm; // p0=beta_in, p1=threshold_in
     prm.p0 = beta_in;
     prm.p1 = threshold_in;
-    return unary_float_op_kernel(self, [beta_in, threshold_in](auto x) {
-        using T = decltype(x);
-        using M = activation_math_t<T>;
-        T a = static_cast<T>(static_cast<M>(x));
-        T beta_in_t = static_cast<T>(beta_in);
-        return a * beta_in_t > static_cast<T>(threshold_in)
-            ? a
-            : static_cast<T>(std::log1p(std::exp(static_cast<M>(a * beta_in_t))) / beta_in_t);
-    }, vecunary::VOp::Softplus, prm);
+    return unary_float_op_kernel(self, SoftplusAt{beta_in, threshold_in},
+                                 vecunary::VOp::Softplus, prm);
+}
+
+Tensor& softplus_out_cpu(const Tensor& self, const Scalar& beta,
+                         const Scalar& threshold, Tensor& out) {
+    const double beta_in = beta.toDouble();
+    const double threshold_in = threshold.toDouble();
+    vecunary::VParams prm;
+    prm.p0 = beta_in;
+    prm.p1 = threshold_in;
+    return unary_float_out_kernel(
+        self, out, [=](const Tensor& v) {
+            return softplus_kernel_impl(v, Scalar(beta_in), Scalar(threshold_in));
+        },
+        SoftplusAt{beta_in, threshold_in}, vecunary::VOp::Softplus, prm);
 }
 
 Tensor softplus_backward_kernel_impl(const Tensor& grad_output, const Tensor& self, const Scalar& beta, const Scalar& threshold) {
@@ -2014,6 +2236,12 @@ Tensor pow_scalar_kernel(const Tensor& self, const Scalar& exponent) {
 
 
 
+// The angle of a real number: zero at or above zero, pi below it.
+static constexpr auto angle_real_map = [](auto x) {
+    if (x >= 0) return 0.0;
+    return 3.14159265358979323846;
+};
+
 Tensor angle_kernel(const Tensor& self) {
     if (isComplexType(self.dtype())) {
         if ((self.dtype() == DType::ComplexFloat ||
@@ -2087,10 +2315,12 @@ Tensor angle_kernel(const Tensor& self) {
         return result;
     }
     // For real numbers, angle is 0 if >=0, pi if <0
-    return unary_float_op_kernel(self, [](auto x) {
-        if (x >= 0) return 0.0;
-        return 3.14159265358979323846;
-    });
+    return unary_float_op_kernel(self, angle_real_map);
+}
+
+Tensor& angle_out_cpu(const Tensor& self, Tensor& out) {
+    return unary_float_out_kernel(self, out, angle_kernel, angle_real_map,
+                                  vecunary::VOp::None);
 }
 
 // --- Binary/Ternary Kernels ---
@@ -3703,16 +3933,20 @@ TENSORPLAY_LIBRARY_IMPL(CPU, PointwiseKernels) {
     m.impl("relu", relu_kernel);
     m.impl("relu_", relu_inplace_kernel);
     m.impl("gelu", gelu_kernel);
+    m.impl("gelu.out", gelu_out_cpu);
     m.impl("gelu_backward", gelu_backward_kernel);
     m.impl("silu", silu_kernel);
+    m.impl("silu.out", silu_out_cpu);
     m.impl("silu_backward", silu_backward_kernel_impl);
     m.impl("silu_mul", silu_mul_cpu);
     m.impl("fused_swiglu", fused_swiglu_cpu);
     m.impl("silu_and_mul", silu_and_mul_cpu);
     m.impl("hardtanh", hardtanh_kernel_impl);
+    m.impl("hardtanh.out", hardtanh_out_cpu);
     m.impl("hardtanh_backward", hardtanh_backward_kernel_impl);
     m.impl("relu6", relu6_kernel_impl);
     m.impl("hardswish", hardswish_kernel_impl);
+    m.impl("hardswish.out", hardswish_out_cpu);
     m.impl("hardswish_backward", hardswish_backward_kernel_impl);
     m.impl("sec", sec_kernel_impl);
     m.impl("csc", csc_kernel_impl);
@@ -3721,22 +3955,28 @@ TENSORPLAY_LIBRARY_IMPL(CPU, PointwiseKernels) {
     m.impl("squared_difference", squared_difference_kernel_impl);
     m.impl("swish", silu_kernel);
     m.impl("hardsigmoid", hardsigmoid_kernel_impl);
+    m.impl("hardsigmoid.out", hardsigmoid_out_cpu);
     m.impl("hardsigmoid_backward", hardsigmoid_backward_kernel_impl);
     m.impl("leaky_relu", leaky_relu_kernel_impl);
+    m.impl("leaky_relu.out", leaky_relu_out_cpu);
     m.impl("leaky_relu_backward", leaky_relu_backward_kernel_impl);
     m.impl("elu", elu_kernel_impl);
+    m.impl("elu.out", elu_out_cpu);
     m.impl("elu_backward", elu_backward_kernel_impl);
     m.impl("selu", selu_kernel_impl);
     m.impl("celu", celu_kernel_impl);
     m.impl("mish", mish_kernel_impl);
+    m.impl("mish.out", mish_out_cpu);
     m.impl("mish_backward", mish_backward_kernel_impl);
     m.impl("softplus", softplus_kernel_impl);
+    m.impl("softplus.out", softplus_out_cpu);
     m.impl("softplus_backward", softplus_backward_kernel_impl);
     m.impl("log_sigmoid", log_sigmoid_kernel_impl);
     m.impl("log_sigmoid_backward", log_sigmoid_backward_kernel_impl);
     m.impl("rrelu_with_noise_backward", rrelu_with_noise_backward_kernel_impl);
     m.impl("pow.Tensor_Scalar", pow_scalar_kernel);
     m.impl("angle", angle_kernel);
+    m.impl("angle.out", angle_out_cpu);
     m.impl("clamp", clamp_kernel);
     m.impl("clamp.out", clamp_out_kernel);
     m.impl("clip.out", clip_out_cpu);

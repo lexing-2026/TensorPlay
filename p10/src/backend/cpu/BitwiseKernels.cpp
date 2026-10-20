@@ -28,6 +28,7 @@
 #include "DType.h"
 #include "Utils.h"
 #include "Exception.h"
+#include "OutWrite.h"
 #include "Parallel.h"
 #include "TypePromotion.h"
 #include "TypeProperties.h"
@@ -315,6 +316,32 @@ Tensor& bitwise_rshift_scalar_out_cpu(const Tensor& a, const Scalar& b, Tensor& 
     return bitwise_assign_out_cpu(out, bitwise_rshift_scalar_cpu(a, b));
 }
 
+// The complement keeps its operand's width and shape, so a packed destination of
+// that width takes the pass itself.  Anything else -- a cast, a resize, a
+// destination with holes, a second window over the bytes the loop reads -- is
+// served the way the other out forms here are: compute, then hand over.
+Tensor& bitwise_not_out_cpu(const Tensor& self, Tensor& out) {
+    bitwise_check_cpu(self, "bitwise_not");
+    const std::vector<int64_t> sizes =
+        static_cast<std::vector<int64_t>>(self.shape());
+    if (destination_takes_flat(out, self.device(), self.dtype(), sizes, self)) {
+        Tensor sc = self.contiguous();
+        const int64_t n = out.numel();
+        if (self.dtype() == DType::Bool) {
+            const bool* sp = sc.data_ptr<bool>();
+            bool* dp = out.data_ptr<bool>();
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                for (int64_t i = begin; i < end; ++i) dp[i] = !sp[i];
+            });
+            return out;
+        }
+        bitwise_not_stub(DeviceType::CPU, sc.data_ptr(), out.data_ptr(), n,
+                         static_cast<int>(self.dtype()));
+        return out;
+    }
+    return bitwise_assign_out_cpu(out, bitwise_not_cpu(self));
+}
+
 } // anonymous namespace
 
 DEFINE_DISPATCH(bitwise_binary_stub);
@@ -323,6 +350,7 @@ DEFINE_DISPATCH(bitwise_not_stub);
 
 TENSORPLAY_LIBRARY_IMPL(CPU, BitwiseKernels) {
     m.impl("bitwise_not", bitwise_not_cpu);
+    m.impl("bitwise_not.out", bitwise_not_out_cpu);
     m.impl("bitwise_and.Tensor", bitwise_and_tensor_cpu);
     m.impl("bitwise_or.Tensor", bitwise_or_tensor_cpu);
     m.impl("bitwise_xor.Tensor", bitwise_xor_tensor_cpu);
