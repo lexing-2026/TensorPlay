@@ -3522,9 +3522,10 @@ class TestVulkanWidePayload(unittest.TestCase):
     # word has no image form on any device and keeps the plain linear layout
     # whatever its shape.  That is what lets a 64-bit index vector reach the
     # device instead of being narrowed to 32 bits on the host, which costs a
-    # queue sync per call.  Reading such a payload is a transfer rather than a
-    # shader, so the ops that walk a linear payload one word per element still
-    # refuse it, and a range resolves to the widest code they do read.
+    # queue sync per call.  An op that moves a payload keeps to the pair of words
+    # one element is; an op that folds lanes into a total still refuses, because
+    # no 32-bit accumulator can hold the answer.  A range resolves to the widest
+    # code that both routes read.
 
     @staticmethod
     def _weight(sizes=(16, 6)):
@@ -3693,27 +3694,165 @@ class TestVulkanWidePayload(unittest.TestCase):
                 classes, [True] * 3,
                 f"a {name} table released its rows outside an image")
 
-    def test_wide_payloads_stop_at_the_ops_that_read_one_word_per_element(self):
+    def test_wide_payloads_stop_at_the_ops_that_fold_a_code_into_a_word(self):
         values = np.array([0, 5, 2, 7, 1], dtype=np.int64)
         payload = tensorplay.from_numpy(values.copy()).to("vulkan")
-        # Slicing and reducing walk a payload one word per element: they have to
-        # say so rather than read the low word of every code.
-        with self.assertRaisesRegex(RuntimeError, "Vulkan slice supports"):
-            tensorplay.narrow(payload, 0, 1, 3)
+        # A total of wide lanes needs an accumulator wider than one word, and the
+        # walk that adds lane by lane reads a single word per element: it has to
+        # say so rather than add up the low words of every code.
         with self.assertRaisesRegex(
                 RuntimeError, "reductions support Float32 and Float16"):
             payload.sum()
-        # A half payload packs two lanes into one word, so a wide code would
-        # need three of them, and rounding a float into 64 bits needs arithmetic
-        # no 32-bit shader has.
+        # A half payload packs two lanes into one word, so a wide code would need
+        # three of them and the two storages share no word boundary.
         with self.assertRaisesRegex(
                 RuntimeError, "conversion from a wide payload"):
             payload.to(tensorplay.float16)
-        with self.assertRaisesRegex(
-                RuntimeError, "conversion over linear storage"):
-            tensorplay.tensor(
-                np.array([1.5, -2.25], dtype=np.float32),
-                device="vulkan").to(tensorplay.int64)
+
+    def test_views_of_a_wide_payload_move_whole_codes(self):
+        # Every one of these reads a code out of linear storage and writes it
+        # somewhere else in the same layout.  Before a wide element moved as the
+        # pair of words it is, a stride that skipped one skipped only its low
+        # word, and a code with nothing above the truncation looked correct.
+        base = (np.arange(30, dtype=np.int64) << 41) - 7
+        shape = (2, 3, 5)
+        payload = tensorplay.from_numpy(base.reshape(shape).copy()).to(
+            "vulkan")
+        cases = (
+            ("slice", payload[1], base.reshape(shape)[1]),
+            ("narrow", tensorplay.narrow(payload, 1, 1, 2),
+             base.reshape(shape)[:, 1:3, :]),
+            ("select", tensorplay.select(payload, 0, 0),
+             base.reshape(shape)[0]),
+            ("permute", tensorplay.permute(payload, (2, 0, 1)),
+             np.transpose(base.reshape(shape), (2, 0, 1))),
+            ("transpose", tensorplay.transpose(payload, 0, 2),
+             np.transpose(base.reshape(shape), (2, 1, 0))),
+            ("view", payload.view(3, 10), base.reshape(3, 10)),
+            ("flatten", payload.view(-1), base),
+        )
+        for name, got, want in cases:
+            np.testing.assert_array_equal(
+                got.cpu().numpy(), want, err_msg=f"{name} of a wide payload")
+            self.assertEqual(got.dtype, tensorplay.int64, name)
+
+    def test_a_strided_and_broadcast_view_of_a_wide_payload_keeps_its_codes(
+            self):
+        # Neither of these reads contiguously: the first names an element by
+        # offset and stride, the second names one element from several positions.
+        # Both answer from the identity gather, so a code has to arrive whole at
+        # every position that repeats it.
+        base = np.arange(30, dtype=np.int64) * 4_000_000_000 - 3
+        payload = tensorplay.from_numpy(base.copy()).to("vulkan").view(2, 3, 5)
+        np.testing.assert_array_equal(
+            payload.as_strided((2, 2, 2), (5, 15, 1), 1).cpu().numpy(),
+            np.array([[[base[1 + 5 * a + 15 * b + c] for c in range(2)]
+                       for b in range(2)] for a in range(2)]),
+            err_msg="strided view of a wide payload")
+        row = tensorplay.from_numpy(base[:5].copy()).to("vulkan")
+        np.testing.assert_array_equal(
+            row.expand(4, 5).cpu().numpy(),
+            np.broadcast_to(base[:5], (4, 5)),
+            err_msg="broadcast view of a wide payload")
+
+    def test_narrow_codes_drive_a_lookup_of_a_wide_index_payload(self):
+        # The reason the codes stay 64-bit: a decode step takes the codes it still
+        # has to read off the end of its index list, which is a stride that skips a
+        # whole code.  A lookup whose indices are such a view reads each code from
+        # the pair of words it is.
+        host = self._weight((16, 6))
+        ids = np.arange(24, dtype=np.int64) % 16
+        indices = tensorplay.from_numpy(ids.copy()).to("vulkan")
+        weight = tensorplay.from_numpy(host.copy()).to("vulkan")
+        cases = (
+            ("tail", tensorplay.narrow(indices, 0, 20, 4), ids[20:]),
+            ("head", indices[:3], ids[:3]),
+            ("every second", indices[::2], ids[::2]),
+            ("single", tensorplay.select(indices, 0, 7).view(1), ids[7:8]),
+        )
+        for name, used, want in cases:
+            picked = tensorplay.index_select(weight, 0, used)
+            np.testing.assert_allclose(
+                picked.cpu().numpy(), host[want], rtol=0, atol=1e-6,
+                err_msg=f"index_select with a {name} wide index payload")
+            np.testing.assert_allclose(
+                tensorplay.embedding(weight, used).cpu().numpy(), host[want],
+                rtol=0, atol=1e-6,
+                err_msg=f"embedding with a {name} wide index payload")
+
+    def test_a_wide_index_payload_gathers_whole_codes(self):
+        # The gathered axis of the index has to name the axis it replaces, so a
+        # table of six rows is picked at six positions per row: each code is read
+        # from the pair of words it is, and the row it names is a Float32 one.
+        host = self._weight((6, 8))
+        ids = (np.arange(18, dtype=np.int64) % 6).reshape(3, 6)
+        indices = tensorplay.from_numpy(ids.copy()).to("vulkan")
+        table = tensorplay.from_numpy(host.copy()).to("vulkan")
+        coords = np.indices(ids.shape)
+        coords[1] = ids
+        np.testing.assert_allclose(
+            tensorplay.gather(table, 1, indices).cpu().numpy(),
+            host[tuple(coords)], rtol=0, atol=1e-6,
+            err_msg="gather with a wide index payload")
+        coords = np.indices(ids.shape)
+        coords[0] = ids
+        np.testing.assert_allclose(
+            tensorplay.gather(table, 0, indices).cpu().numpy(),
+            host[tuple(coords)], rtol=0, atol=1e-6,
+            err_msg="gather along the other axis with a wide index payload")
+
+    def test_a_single_precision_payload_widens_to_the_whole_it_holds(self):
+        # Truncation is toward zero, and a magnitude too large for 64 bits keeps
+        # the endpoint of its own sign rather than wrapping into the other.  A
+        # float has twenty-four significant bits, so splitting the magnitude at
+        # two to the thirty-second is exact: no rounding is hidden in the pair.
+        values = np.array(
+            [0.0, 1.5, -2.25, 2**31, -(2**31), 2**32, -(2**32), 2**53,
+             4.5e18, -4.5e18],
+            dtype=np.float32)
+        got = tensorplay.tensor(values.copy(), device="vulkan").to(
+            tensorplay.int64)
+        want = np.array([int(float(v)) for v in values], dtype=np.int64)
+        want = np.where(values >= 2**63, 2**63 - 1, want)
+        want = np.where(values < -2**63, -2**63, want)
+        np.testing.assert_array_equal(
+            got.cpu().numpy(), want, err_msg="widened single precision codes")
+        # A value past the endpoint of its sign, and a value with no whole part at
+        # all, are the two answers no arithmetic of the magnitude can give.
+        edges = np.array(
+            [float("inf"), -float("inf"), float("nan"), 9.3e18, -9.3e18],
+            dtype=np.float32)
+        np.testing.assert_array_equal(
+            tensorplay.tensor(edges.copy(), device="vulkan").to(
+                tensorplay.int64).cpu().numpy(),
+            np.array([2**63 - 1, -(2**63), 0, 2**63 - 1, -(2**63)],
+                     dtype=np.int64),
+            err_msg="widened codes past the endpoint")
+
+    def test_a_wide_payload_widens_or_narrows_its_tail_whole(self):
+        # Four lanes share the two 16-byte groups a group-at-a-time move covers,
+        # so a payload of any other length ends inside a group that the source or
+        # the destination allocation still holds.  The codes in that group are the
+        # ones a loop that assumes a multiple of four drops or writes over.
+        for count in (1, 3, 5, 7, 9, 14, 17):
+            wide = (np.arange(count, dtype=np.int64) << 41) - 1
+            # Codes a 32-bit word, and a single-precision value, both hold whole.
+            exact = np.arange(count, dtype=np.int32) * 100_003 - 500_000
+            device_wide = tensorplay.from_numpy(wide.copy()).to("vulkan")
+            np.testing.assert_array_equal(
+                device_wide.to(tensorplay.int32).cpu().numpy(),
+                wide.astype(np.int32),
+                err_msg=f"narrowed wide payload of {count} codes")
+            device_exact = tensorplay.from_numpy(exact.copy()).to("vulkan")
+            np.testing.assert_array_equal(
+                device_exact.to(tensorplay.int64).cpu().numpy(),
+                exact.astype(np.int64),
+                err_msg=f"widened payload of {count} codes")
+            np.testing.assert_array_equal(
+                device_exact.to(tensorplay.float32).to(
+                    tensorplay.int64).cpu().numpy(),
+                exact.astype(np.int64),
+                err_msg=f"single precision payload of {count} codes")
 
 
 class TestVulkanGather(unittest.TestCase):
