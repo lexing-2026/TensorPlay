@@ -2020,17 +2020,23 @@ inline void pair_codes(const uint8_t* row, int64_t first, vec::Vectorized<float>
 // rows of the bag pass through: a block count fixed here is what keeps the
 // accumulators out of memory, and every column adds its own rows in order
 // whichever way the blocks are gathered.
+//
+// The grid bias of a row lands on every column of it, so the whole run shares one
+// bias total and it enters each accumulator before a code is ever multiplied:
+// adding a row's bias where it stands costs a vector add per column vector of the
+// run, which is as many adds as there are fused products.
 template <int Bits, int Blocks>
 __attribute__((always_inline)) inline void hold_blocks(const uint8_t* const* rows,
-        const float* gradients, const float* shifts, int held, int64_t columns, int64_t col,
+        const float* gradients, int held, float biases, int64_t columns, int64_t col,
         float* y, int64_t bag, bool carried) {
     using FV = vec::Vectorized<float>;
     constexpr int lanes = FV::size();
+    const FV bias_total(biases);
     FV sums[Blocks];
     for (int t = 0; t < Blocks; ++t)
-        sums[t] = carried ? FV::loadu(y + bag * columns + col + t * lanes) : FV(0.f);
+        sums[t] = carried ? bias_total + FV::loadu(y + bag * columns + col + t * lanes) : bias_total;
     for (int k = 0; k < held; ++k) {
-        const FV gradient(gradients[k]), shift(shifts[k]);
+        const FV gradient(gradients[k]);
         if constexpr (Bits == 4 && Blocks >= 4) {
             // One split fills four vectors, so a block of eight is folded as two
             // runs: the codes of the whole block never have to stay live at once.
@@ -2038,19 +2044,42 @@ __attribute__((always_inline)) inline void hold_blocks(const uint8_t* const* row
                 FV codes[4];
                 nibble_codes<1>(rows[k], col + t * lanes, codes);
                 for (int u = 0; u < 4; ++u)
-                    sums[t + u] = vec::fmadd(codes[u], gradient, sums[t + u] + shift);
+                    sums[t + u] = vec::fmadd(codes[u], gradient, sums[t + u]);
             }
         } else if constexpr (Bits == 2 && Blocks >= 8) {
             FV codes[Blocks];
             pair_codes<Blocks / 8>(rows[k], col, codes);
             for (int t = 0; t < Blocks; ++t)
-                sums[t] = vec::fmadd(codes[t], gradient, sums[t] + shift);
+                sums[t] = vec::fmadd(codes[t], gradient, sums[t]);
         } else {
             for (int t = 0; t < Blocks; ++t)
-                sums[t] = vec::fmadd(row_codes<Bits>(rows[k], col + t * lanes), gradient, sums[t] + shift);
+                sums[t] = vec::fmadd(row_codes<Bits>(rows[k], col + t * lanes), gradient, sums[t]);
         }
     }
     for (int t = 0; t < Blocks; ++t) sums[t].store(y + bag * columns + col + t * lanes);
+}
+
+// A packed row closes with its grid: two floats when a code is a byte, two halfs
+// when it is narrower.  A half turned into a float in software reads the exponent
+// field and branches on the subnormal case, so a pair of them is assembled into
+// the words of a row and widened by the instruction made for the pair instead.
+inline void row_grid_words(const uint8_t* row, int64_t width, int bits, float& scale, float& bias) {
+    const uint8_t* tail = row + width - (bits == 8 ? 8 : 4);
+#if defined(__F16C__)
+    if (bits != 8) {
+        // The four bytes hold the two halfs in the order of the row, so they go
+        // into the low word of a vector as they stand: the widening reads sixteen
+        // bits at a time, and a half placed every second slot would be skipped.
+        const uint32_t words = static_cast<uint32_t>(tail[0]) | static_cast<uint32_t>(tail[1]) << 8
+                             | static_cast<uint32_t>(tail[2]) << 16 | static_cast<uint32_t>(tail[3]) << 24;
+        alignas(16) float widened[4];
+        _mm_store_ps(widened, _mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(words))));
+        scale = widened[0];
+        bias = widened[1];
+        return;
+    }
+#endif
+    quant::row_grid(row, width, bits, scale, bias);
 }
 
 template <int Bits>
@@ -2062,9 +2091,10 @@ void embedding_rows(const uint8_t* w, const int64_t* indices, const int64_t* off
     constexpr int held_rows = 32;
     // A row's grid and weight hold for every column of it, and reading them apart
     // from the codes costs four byte loads each, so a run of rows is resolved once
-    // into arrays that the column walk only reads.
+    // into an array of gradients that the column walk only reads, with the biases
+    // of the run folded into one total.
     const uint8_t* rows[held_rows];
-    float gradients[held_rows], shifts[held_rows];
+    float gradients[held_rows];
     alignas(64) float codes[lanes]{};
     for (int64_t bag = first_bag; bag < last_bag; ++bag) {
         const int64_t first = embedding ? bag : (offsets ? offsets[bag] : bag * fixed);
@@ -2080,35 +2110,36 @@ void embedding_rows(const uint8_t* w, const int64_t* indices, const int64_t* off
             const int64_t stop = std::min(start + held_rows, last);
             const bool carried = start > first;
             int held = 0;
+            float biases = 0.f;
             for (int64_t j = start; j < stop; ++j) {
                 const int64_t row_index = mapping ? mapping[indices[j]] : indices[j];
                 if (row_index == -1) continue;
                 const uint8_t* row = w + row_index * width;
                 float scale, bias;
-                quant::row_grid(row, width, Bits, scale, bias);
+                row_grid_words(row, width, Bits, scale, bias);
                 const float weight = weights ? weights[j] : 1.f;
                 rows[held] = row;
                 gradients[held] = scale * weight;
-                shifts[held] = bias * weight;
+                biases += bias * weight;
                 ++held;
             }
             int64_t col = 0;
             for (; col + 8 * lanes <= columns; col += 8 * lanes)
-                hold_blocks<Bits, 8>(rows, gradients, shifts, held, columns, col, y, bag, carried);
+                hold_blocks<Bits, 8>(rows, gradients, held, biases, columns, col, y, bag, carried);
             for (; col + 4 * lanes <= columns; col += 4 * lanes)
-                hold_blocks<Bits, 4>(rows, gradients, shifts, held, columns, col, y, bag, carried);
+                hold_blocks<Bits, 4>(rows, gradients, held, biases, columns, col, y, bag, carried);
             for (; col + 2 * lanes <= columns; col += 2 * lanes)
-                hold_blocks<Bits, 2>(rows, gradients, shifts, held, columns, col, y, bag, carried);
+                hold_blocks<Bits, 2>(rows, gradients, held, biases, columns, col, y, bag, carried);
             for (; col + lanes <= columns; col += lanes)
-                hold_blocks<Bits, 1>(rows, gradients, shifts, held, columns, col, y, bag, carried);
+                hold_blocks<Bits, 1>(rows, gradients, held, biases, columns, col, y, bag, carried);
             if (col < columns) {
                 const int take = static_cast<int>(columns - col);
                 float tail[lanes]{};
                 if (carried) for (int c = 0; c < take; ++c) tail[c] = y[bag * columns + col + c];
-                FV sum = FV::loadu(tail);
+                FV sum = FV::loadu(tail) + FV(biases);
                 for (int k = 0; k < held; ++k) {
                     for (int c = 0; c < take; ++c) codes[c] = static_cast<float>(quant::row_code(rows[k], col + c, Bits));
-                    sum = vec::fmadd(FV::loadu(codes), FV(gradients[k]), sum + FV(shifts[k]));
+                    sum = vec::fmadd(FV::loadu(codes), FV(gradients[k]), sum);
                 }
                 sum.store(y + bag * columns + col, take);
             }
