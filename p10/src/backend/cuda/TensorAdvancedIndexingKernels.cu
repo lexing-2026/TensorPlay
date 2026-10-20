@@ -590,7 +590,119 @@ extern Tensor sum_dim_kernel(const Tensor& self,
 // the advanced-indexing scan helpers rather than the reduction kernels.
 namespace {
 
+// A full-tensor count needs no materialized mask: one pass reads the input and
+// accumulates in registers.  Each thread moves one 16-byte packet, the block
+// folds its partials through a warp/shared-memory reduction, and every block
+// issues a single 64-bit atomic add, so no partial sums are written back.
+template <typename scalar_t>
+__device__ __forceinline__ int64_t nonzero_of(scalar_t value) {
+    return value != scalar_t(0) ? 1 : 0;
+}
+
+template <typename scalar_t, int vec_size>
+__global__ void count_nonzero_vec_kernel(const scalar_t* __restrict__ input,
+                                         int64_t n, int64_t* __restrict__ out) {
+    using vec_t = memory::aligned_vector<scalar_t, vec_size>;
+    const vec_t* __restrict__ vectors = reinterpret_cast<const vec_t*>(input);
+    const int64_t nvec = n / vec_size;
+    const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+    int64_t count = 0;
+    for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < nvec; i += stride) {
+        const vec_t value = vectors[i];
+#pragma unroll
+        for (int k = 0; k < vec_size; ++k) {
+            count += nonzero_of(value.val[k]);
+        }
+    }
+    // Elements past the last whole packet are finished by block 0.
+    if (blockIdx.x == 0) {
+        const int64_t tail_start = nvec * vec_size;
+        for (int64_t t = threadIdx.x; t < n - tail_start; t += blockDim.x) {
+            count += nonzero_of(input[tail_start + t]);
+        }
+    }
+
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        count += __shfl_down_sync(0xffffffffu, count, offset);
+    }
+    __shared__ int64_t warp_counts[32];
+    if (lane == 0) warp_counts[warp] = count;
+    __syncthreads();
+    if (warp == 0) {
+        const int warp_count = (blockDim.x + 31) / 32;
+        count = lane < warp_count ? warp_counts[lane] : 0;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            count += __shfl_down_sync(0xffffffffu, count, offset);
+        }
+        if (lane == 0) atomicAdd(reinterpret_cast<unsigned long long*>(out),
+                                 static_cast<unsigned long long>(count));
+    }
+}
+
+template <typename scalar_t, int kVec>
+void launch_count_nonzero_full(const scalar_t* input, int64_t n, int64_t* out,
+                              cudaStream_t stream) {
+    constexpr int kThreads = 256;
+    const int64_t nvec = n / kVec;
+    const int64_t needed = (nvec + static_cast<int64_t>(kThreads) - 1) /
+                         static_cast<int64_t>(kThreads);
+    const int blocks = static_cast<int>(
+        std::max<int64_t>(1, std::min<int64_t>(needed, 2048)));
+    count_nonzero_vec_kernel<scalar_t, kVec><<<blocks, kThreads, 0, stream>>>(
+        input, n, out);
+}
+
+Tensor count_nonzero_full_cuda(const Tensor& self) {
+    const Tensor input = self.is_contiguous() ? self : self.contiguous();
+    const int64_t n = input.numel();
+    Tensor result = Tensor::empty({}, DType::Int64, self.device());
+    const auto stream = getCurrentCUDAStream().stream();
+    int64_t* out = static_cast<int64_t*>(result.data_ptr());
+    CUDA_CHECK(cudaMemsetAsync(out, 0, sizeof(int64_t), stream));
+    // A contiguous view may start at any element offset, so only pointers
+    // that are already 16-byte aligned may use the packed load; anything else
+    // falls back to scalar lanes.
+    const uintptr_t address = reinterpret_cast<uintptr_t>(input.data_ptr());
+    if ((address & 15) == 0) {
+#define COUNT_NONZERO_CASE(ctype, name)                                     \
+    case DType::name:                                                       \
+        launch_count_nonzero_full<ctype,                                   \
+                                  16 / static_cast<int>(sizeof(ctype))>(    \
+            static_cast<const ctype*>(input.data_ptr()), n, out, stream);  \
+        break;
+        switch (input.dtype()) {
+            TENSORPLAY_FORALL_SCALAR_TYPES(COUNT_NONZERO_CASE)
+            default:
+                TP_THROW(NotImplementedError,
+                         "CUDA count_nonzero: unsupported dtype");
+        }
+#undef COUNT_NONZERO_CASE
+    } else {
+#define COUNT_NONZERO_CASE(ctype, name)                                     \
+    case DType::name:                                                       \
+        launch_count_nonzero_full<ctype, 1>(                               \
+            static_cast<const ctype*>(input.data_ptr()), n, out, stream);  \
+        break;
+        switch (input.dtype()) {
+            TENSORPLAY_FORALL_SCALAR_TYPES(COUNT_NONZERO_CASE)
+            default:
+                TP_THROW(NotImplementedError,
+                         "CUDA count_nonzero: unsupported dtype");
+        }
+#undef COUNT_NONZERO_CASE
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return result;
+}
+
 Tensor count_nonzero_cuda2(const Tensor& self, const std::vector<int64_t>& dim) {
+    if (dim.empty() && self.dim() > 0 && self.numel() > 0 &&
+        !isComplexType(self.dtype())) {
+        return count_nonzero_full_cuda(self);
+    }
     Tensor reduce = self.dtype() == DType::Bool
         ? self
         : self.ne(Scalar(0));
