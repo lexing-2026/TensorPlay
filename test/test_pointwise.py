@@ -282,5 +282,67 @@ class TestPointwiseOps(unittest.TestCase):
             self.assertEqual(tp.clamp(grid.t(), -1.0, 1.0)[0].tolist(),
                              [-1.0, -0.5, 0.5, 1.0, -1.0])
 
+    def test_compare_reduced_precision(self):
+        # The comparison runs on values widened out of the storage, so every
+        # operand below is exact in both reduced widths and the answer is a
+        # plain ordering of those reals: a Python float comparison of the same
+        # numbers is the expected bit pattern, with no allowance anywhere.
+        # The grid carries the two infinities, a pair of zeros that differ only
+        # in sign (equal once widened, unequal as raw storage), subnormals that
+        # only the converted path reads correctly, and not-a-number.
+        inf = float('inf')
+        nan = float('nan')
+        inf = float('inf')
+        nan = float('nan')
+        vals = [-inf, -32768.0, -2.0, -0.5, -0.0, 2 ** -24, 3 * 2 ** -24,
+                0.0, 0.5, 2.0, 32768.0, inf, nan]
+        ops = [('eq', lambda p, q: p == q, tp.eq),
+               ('ne', lambda p, q: p != q, tp.ne),
+               ('lt', lambda p, q: p < q, tp.lt),
+               ('le', lambda p, q: p <= q, tp.le),
+               ('gt', lambda p, q: p > q, tp.gt),
+               ('ge', lambda p, q: p >= q, tp.ge)]
+
+        for dt in (tp.float16, tp.bfloat16):
+            x = tp.tensor(vals * 2, dtype=dt)
+            # Rotated by one, so each lane answers for a different pair and the
+            # grid meets itself in both orders across the two copies.
+            rot = vals[1:] + vals[:1] + vals[1:] + vals[:1]
+            y = tp.tensor(rot, dtype=dt)
+            for name, ref, fn in ops:
+                got = fn(x, y)
+                self.assertEqual(got.dtype, tp.bool, name)
+                self.assertEqual(got.tolist(), [ref(a, b) for a, b in zip(vals * 2, rot)],
+                                 '{} {} vs {}'.format(dt, name, 'tensor'))
+            # A single-element right operand is one value read into every lane.
+            half = tp.tensor([0.5], dtype=dt)
+            for name, ref, fn in ops:
+                want = [ref(a, 0.5) for a in vals * 2]
+                self.assertEqual(fn(x, half).tolist(), want,
+                                 '{} {} vs storage'.format(dt, name))
+                self.assertEqual(fn(x, 0.5).tolist(), want,
+                                 '{} {} vs scalar'.format(dt, name))
+            # An operand widened to the common float32 leaves the narrow path;
+            # the ordering is still the same one.
+            wide = tp.tensor([-2.0], dtype=tp.float32)
+            for name, ref, fn in ops:
+                self.assertEqual(fn(x, wide).tolist(),
+                                 [ref(a, -2.0) for a in vals * 2],
+                                 '{} {} vs float32'.format(dt, name))
+
+    def test_compare_reduced_precision_strided(self):
+        # A transposed pair is not contiguous, so the walk over the storage and
+        # the flat compare have to agree with the same compare run before the
+        # transpose.
+        seq = [-2.0, -0.5, 0.5, 2.0, float('nan'), float('inf')]
+        a = [[seq[(r + c) % 6] for c in range(6)] for r in range(5)]
+        b = [[seq[(r * 2 + c) % 6] for c in range(6)] for r in range(5)]
+        for dt in (tp.float16, tp.bfloat16):
+            ga, gb = tp.tensor(a, dtype=dt), tp.tensor(b, dtype=dt)
+            self.assertEqual(tp.lt(ga.t(), gb.t()).tolist(),
+                             tp.lt(ga, gb).t().tolist())
+            self.assertEqual(tp.ge(ga.t(), gb.t()).tolist(),
+                             tp.ge(ga, gb).t().tolist())
+
 if __name__ == '__main__':
     unittest.main()
