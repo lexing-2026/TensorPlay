@@ -6139,5 +6139,206 @@ class TestVulkanRowAccumulation(unittest.TestCase):
                                  self._device(np.ones((2, 4), np.float32)))
 
 
+class TestVulkanRowFill(unittest.TestCase):
+    # A fill hands one number to every row a list of codes names.  Nothing races
+    # for a row here, because the number is the same wherever it lands: the walk
+    # records which rows are named and then rewrites a whole texel or word at a
+    # time, so a code the list repeats costs nothing beyond the first and the
+    # rows it left alone hold what they held before.
+
+    SHAPES = ((5,), (5, 4), (2, 5, 3), (2, 3, 5, 2))
+
+    @staticmethod
+    def _device(payload):
+        arr = np.asarray(payload)
+        if arr.ndim and not arr.flags["C_CONTIGUOUS"]:
+            arr = np.ascontiguousarray(arr)
+        return tensorplay.from_numpy(arr).to("vulkan")
+
+    @staticmethod
+    def _codes(values, dtype=np.int64):
+        return TestVulkanRowFill._device(np.array(values, dtype=dtype))
+
+    @staticmethod
+    def _canvas(shape, dtype=np.float32, seed=0):
+        # Small whole numbers keep either element type exact, so a lane written
+        # in the wrong place shows up as a wrong number rather than as rounding.
+        rng = np.random.default_rng([len(shape), seed, *shape])
+        return rng.integers(-3, 4, size=shape).astype(dtype)
+
+    @classmethod
+    def _want(cls, base, dim, codes, value):
+        axis = dim if dim >= 0 else dim + base.ndim
+        rows = base.shape[axis]
+        out = base.astype(np.float64)
+        for code in codes:
+            slot = int(code)
+            if slot < 0:
+                # A code given from the end names the row that many from it.
+                slot += rows
+            if slot < 0 or slot >= rows:
+                continue
+            take = [slice(None)] * out.ndim
+            take[axis] = slot
+            out[tuple(take)] = value
+        return out
+
+    def _filled(self, shape, dim, codes, value, dtype=np.float32):
+        base = self._canvas(shape, dtype)
+        name = (f"shape={shape} dim={dim} codes={codes} value={value} "
+                f"dtype={np.dtype(dtype).name}")
+        got = self._device(base).index_fill_(
+            dim, self._codes(codes), value).cpu().numpy()
+        np.testing.assert_array_equal(got, self._want(base, dim, codes, value),
+                                      err_msg=f"device: {name}")
+        return base, got
+
+    def test_every_row_a_list_names_takes_the_number_and_no_other_does(self):
+        for shape in self.SHAPES:
+            for dim in range(-len(shape), len(shape)):
+                for dtype in (np.float32, np.float16):
+                    self._filled(shape, dim, [1, 3], 7.0, dtype)
+
+    def test_a_row_named_on_the_host_walk_takes_the_same_number(self):
+        # Only where every code fits the rows it names: the host walk answers a
+        # code beyond them with an error rather than by writing nothing.
+        for shape in self.SHAPES:
+            for dim in range(-len(shape), len(shape)):
+                base = self._canvas(shape)
+                codes = list(range(0, base.shape[dim if dim >= 0 else dim + len(shape)]))
+                if not codes:
+                    continue
+                host = tensorplay.index_fill(
+                    tensorplay.from_numpy(base.copy()),
+                    dim,
+                    tensorplay.from_numpy(np.array(codes, np.int64)),
+                    7.0).cpu().numpy()
+                np.testing.assert_array_equal(
+                    host, self._want(base, dim, codes, 7.0),
+                    err_msg=f"host: shape={shape} dim={dim}")
+
+    def test_an_axis_the_texels_do_not_offer_is_filled_the_same_way(self):
+        # The axes above the one the texture carries as its rows reach the linear
+        # walk, which fills a dense copy and carries it back.
+        for shape, dim in (((2, 3, 5, 2), 0), ((2, 3, 5, 2), 1),
+                           ((2, 5, 3), 0), ((5, 4), 1), ((5,), 0)):
+            self._filled(shape, dim, [0, 2], -3.0)
+
+    def test_a_code_given_from_the_end_names_the_row_that_many_from_it(self):
+        for shape in self.SHAPES:
+            for dim in range(-len(shape), len(shape)):
+                self._filled(shape, dim, [-1, -2], 9.0)
+
+    def test_a_row_that_several_codes_name_holds_the_number_they_all_give(self):
+        base, once = self._filled((4, 5), 0, [2], 5.0)
+        _, repeated = self._filled((4, 5), 0, [2, 2, 2], 5.0)
+        np.testing.assert_array_equal(once, repeated)
+
+    def test_the_number_of_the_last_request_is_the_one_that_stands(self):
+        # Each request records its own rows on a fresh mark, so a second fill
+        # cannot find a row still named by the first.
+        base = self._canvas((6, 4))
+        canvas = self._device(base)
+        canvas.index_fill_(0, self._codes([0, 1, 2]), 1.0)
+        canvas.index_fill_(0, self._codes([3, 4]), 2.0)
+        got = canvas.cpu().numpy()
+        np.testing.assert_array_equal(
+            got, self._want(self._want(base, 0, [0, 1, 2], 1.0), 0, [3, 4], 2.0))
+
+    def test_a_row_of_a_width_that_is_not_a_group_keeps_its_lanes(self):
+        # A row that does not fill its last word shares it with the row below, so
+        # the lanes of an unnamed row have to come back as they were.
+        for shape, dim in (((4, 5), 0), ((13,), 0), ((3, 5, 7), 1),
+                           ((2, 3, 5), 0), ((5, 3), 1)):
+            for dtype in (np.float32, np.float16):
+                self._filled(shape, dim, [1], 6.0, dtype)
+
+    def test_a_half_canvas_keeps_the_rounding_its_storage_asks(self):
+        base = self._canvas((4, 6), np.float16)
+        got = self._device(base).index_fill_(
+            0, self._codes([1, 3]), 0.1).cpu().numpy()
+        named = np.float16(0.1)
+        want = base.astype(np.float16).copy()
+        want[[1, 3]] = named
+        np.testing.assert_array_equal(got, want)
+
+    def test_the_number_may_arrive_in_a_payload_of_one(self):
+        base = self._canvas((5, 4))
+        got = self._device(base).index_fill_(
+            1, self._codes([0, 2]),
+            self._device(np.array(7.0, np.float32))).cpu().numpy()
+        np.testing.assert_array_equal(got, self._want(base, 1, [0, 2], 7.0))
+        with self.assertRaisesRegex(RuntimeError, "single number"):
+            self._device(base).index_fill_(
+                1, self._codes([0]), self._device(np.array([7.0, 8.0], np.float32)))
+
+    def test_the_out_of_place_form_leaves_its_canvas_alone(self):
+        base = self._canvas((2, 5, 3))
+        canvas = self._device(base)
+        answered = canvas.index_fill(0, self._codes([1]), 7.0).cpu().numpy()
+        np.testing.assert_array_equal(answered, self._want(base, 0, [1], 7.0))
+        np.testing.assert_array_equal(canvas.cpu().numpy(), base)
+
+    def test_the_forms_that_name_nothing_answer_with_what_they_hold(self):
+        base = self._canvas((3, 4))
+        np.testing.assert_array_equal(
+            self._device(base).index_fill_(0, self._codes([]), 7.0).cpu().numpy(),
+            base)
+        np.testing.assert_array_equal(
+            self._device(np.zeros((0, 4), np.float32)).index_fill_(
+                0, self._codes([1]), 7.0).cpu().numpy().shape, (0, 4))
+        # A single code that spells out no axis at all names one row.
+        got = self._device(base).index_fill_(
+            0, self._device(np.array(2, np.int64)), 7.0).cpu().numpy()
+        np.testing.assert_array_equal(got, self._want(base, 0, [2], 7.0))
+
+    def test_a_code_beyond_the_rows_the_canvas_offers_changes_nothing(self):
+        base = self._canvas((4, 5))
+        for codes in ([9], [-9], [0, 9, -9]):
+            got = self._device(base).index_fill_(
+                0, self._codes(codes), 7.0).cpu().numpy()
+            np.testing.assert_array_equal(
+                got, self._want(base, 0, codes, 7.0), err_msg=f"codes={codes}")
+
+    def test_a_list_of_counts_in_either_width_fills_alike(self):
+        base = self._canvas((2, 3, 5))
+        for dtype in (np.int32, np.int64):
+            got = self._device(base).index_fill_(
+                1, self._codes([0, 2], dtype), 7.0).cpu().numpy()
+            np.testing.assert_array_equal(
+                got, self._want(base, 1, [0, 2], 7.0), err_msg=f"codes={dtype}")
+
+    def test_a_payload_too_long_for_a_texel_walk_is_filled_flat(self):
+        base = np.arange(200000, dtype=np.float32)
+        codes = [0, 7, 99999, 199999]
+        got = self._device(base).index_fill_(0, self._codes(codes), -1.0).cpu().numpy()
+        np.testing.assert_array_equal(got, self._want(base, 0, codes, -1.0))
+
+    def test_the_rows_a_decoder_blanks_are_written_in_one_request(self):
+        # The padding an autoregressive step drops is a stride of rows of the
+        # token canvas, and every one of them takes the same number.
+        base = self._canvas((2048, 1024), np.float16, seed=3)
+        codes = list(range(0, 2048, 4))
+        got = self._device(base).index_fill_(
+            0, self._codes(codes), 0.0).cpu().numpy()
+        want = self._want(base, 0, codes, 0.0)
+        np.testing.assert_array_equal(got, want)
+        self.assertTrue((got[codes] == 0).all())
+        self.assertTrue((got[np.setdiff1d(np.arange(2048), codes)]
+                        == base[np.setdiff1d(np.arange(2048), codes)]).all())
+
+    def test_operands_that_do_not_line_up_are_answered_off_it(self):
+        payload = self._device(self._canvas((3, 4)))
+        with self.assertRaisesRegex(RuntimeError, "dimension out of range"):
+            payload.index_fill(5, self._codes([0]), 1.0)
+        with self.assertRaisesRegex(RuntimeError, "vector or a single code"):
+            payload.index_fill(0, self._codes(np.arange(6).reshape(2, 3)), 1.0)
+        with self.assertRaisesRegex(RuntimeError, "Int64 or Int32"):
+            payload.index_fill(0, self._codes([0.0, 1.0], np.float32), 1.0)
+        with self.assertRaisesRegex(RuntimeError, "Float32 and Float16"):
+            self._device(np.zeros((3, 4), np.int32)).index_fill(
+                0, self._codes([0]), 1.0)
+
+
 if __name__ == "__main__":
     unittest.main()
