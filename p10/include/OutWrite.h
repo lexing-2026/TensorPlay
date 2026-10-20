@@ -43,4 +43,16 @@ inline Tensor& write_out(Tensor& out, const Tensor& value) {
     return out;
 }
 
+// Whether an out= destination can be written by the pass itself instead of
+// receiving a copy afterwards.  It has to be the tensor the op would have
+// allocated for these operands: the device the answer is produced on, the
+// width the answer comes in, and the shape it comes at.  A destination that
+// needs a cast or a resize is left to write_out(); overlap with an operand is
+// left to whatever runs the pass, which judges an allocation the same way.
+inline bool destination_takes(const Tensor& out, const Device& device, DType want,
+                              const std::vector<int64_t>& shape) {
+    return out.defined() && out.device() == device && out.dtype() == want &&
+           static_cast<std::vector<int64_t>>(out.shape()) == shape;
+}
+
 }  // namespace tensorplay

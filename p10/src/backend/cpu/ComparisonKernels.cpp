@@ -266,22 +266,6 @@ void comparison_pass(Tensor& result, const Tensor& self, const Tensor& other,
     }
 }
 
-// A destination the caller supplied can take the pass when it is the tensor the
-// allocating form would have made for these operands: the device the comparison
-// runs on, the width the answer comes in, and the shape the two broadcast to.
-// A destination that needs a cast or a resize keeps the value the allocating
-// form made.
-static bool destination_takes(const Tensor& out, const Tensor& self, DType want,
-                              const std::vector<int64_t>& shape) {
-    if (!out.defined() || out.device() != self.device()) {
-        return false;
-    }
-    if (out.dtype() != want) {
-        return false;
-    }
-    return static_cast<std::vector<int64_t>>(out.shape()) == shape;
-}
-
 template<bool kEquality, NarrowCmp C, typename Op>
 Tensor comparison_kernel_impl(const Tensor& self, const Tensor& other, Op op) {
     if (isQuantizedType(self.dtype()) || isQuantizedType(other.dtype())) {
@@ -305,6 +289,10 @@ Tensor comparison_kernel_impl(const Tensor& self, const Tensor& other, Op op) {
     return result;
 }
 
+// A destination the caller supplied takes the pass when it is the tensor the
+// allocating form would have made; anything that needs a cast or a resize, a
+// quantized pair and a complex pair the comparator refuses keep the value that
+// form made.
 template<bool kEquality, NarrowCmp C, typename Op>
 Tensor& comparison_out_kernel(const Tensor& self, const Tensor& other,
                               Tensor& out, Op op) {
@@ -313,7 +301,7 @@ Tensor& comparison_out_kernel(const Tensor& self, const Tensor& other,
     const std::vector<int64_t> out_shape =
         broadcast_shapes(self.sizes(), other.sizes());
     if (plain && (kEquality || !isComplexType(common_dtype)) &&
-        destination_takes(out, self, DType::Bool, out_shape)) {
+        destination_takes(out, self.device(), DType::Bool, out_shape)) {
         comparison_pass<kEquality, C>(out, self, other, common_dtype, op);
         return out;
     }
@@ -554,7 +542,7 @@ Tensor& maximum_minimum_out_kernel(const Tensor& self, const Tensor& other,
     const std::vector<int64_t> out_shape =
         broadcast_shapes(self.sizes(), other.sizes());
     if (!isComplexType(common_dtype) &&
-        destination_takes(out, self, common_dtype, out_shape)) {
+        destination_takes(out, self.device(), common_dtype, out_shape)) {
         Tensor a = self.dtype() == common_dtype ? self : self.to(common_dtype);
         Tensor b = other.dtype() == common_dtype ? other : other.to(common_dtype);
         ti_apply_binary(out, a, b, op);
