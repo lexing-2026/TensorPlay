@@ -3,6 +3,7 @@
 import enum
 import math
 import os
+import struct
 import warnings
 from typing import Any, Optional
 
@@ -3448,6 +3449,11 @@ _CPU_FUSED_DTYPES = frozenset(
 # The devices that carry a fused normalization together with its backward.
 _FUSED_RMS_NORM_DEVICES = frozenset(("cuda",))
 
+# Element types the fused cuda attention kernel computes in.  A wider
+# precision has no kernel there and stays on the composed reference.
+_CUDA_FUSED_DTYPES = frozenset(
+    (tensorplay.float16, tensorplay.bfloat16, tensorplay.float32))
+
 
 _AUTOCAST_ELIGIBLE = frozenset((tensorplay.float32, tensorplay.float16, tensorplay.bfloat16))
 
@@ -3465,6 +3471,58 @@ def _attention_dtype(t):
     return t.dtype
 
 
+def _single_precision(value: float) -> float:
+    # The fused kernels compute in single precision; a double that rounds to
+    # the same single-precision value names the same computation.
+    return struct.unpack("f", struct.pack("f", value))[0]
+
+
+def _names_fused_scale(scale, head_dim: int) -> bool:
+    # The fused entry divides the scores by the square root of the head width,
+    # in single precision.  A caller asking for that value asks for the same
+    # computation, so the fused entry answers it and the explicit normaliser
+    # does not send the call to the composed path.
+    if scale is None:
+        return True
+    try:
+        requested = _single_precision(float(scale))
+    except (TypeError, ValueError):
+        return False
+    if head_dim <= 0:
+        return False
+    return requested == _single_precision(1.0 / math.sqrt(head_dim))
+
+
+def _grouped_heads_expandable(query, key, value) -> bool:
+    # The fused entry reads one head count for all three operands, so grouped
+    # heads reach it once the key/value heads are expanded to the query's
+    # count.  The expansion needs a shape it can express: one batch, one head
+    # width, and a query head count the key head count divides.
+    return (
+        query.dim() == 4
+        and key.dim() == 4
+        and value.dim() == 4
+        and query.size(0) == key.size(0) == value.size(0)
+        and key.size(1) == value.size(1)
+        and key.size(-1) == query.size(-1) == value.size(-1)
+        and query.size(1) > 0
+        and key.size(1) > 0
+        and query.size(1) % key.size(1) == 0
+        and _attention_dtype(query) in _CUDA_FUSED_DTYPES
+        and _attention_dtype(key) == _attention_dtype(query) == _attention_dtype(value)
+    )
+
+
+def _grouped_scaled_dot_product_attention(query, key, value, is_causal):
+    # Each key head serves a contiguous block of query heads, which is the
+    # mapping the composed path makes; the expansion reproduces it, so the
+    # two routes answer the same question with the same numbers.
+    groups = query.size(1) // key.size(1)
+    key = key.repeat_interleave(groups, dim=1)
+    value = value.repeat_interleave(groups, dim=1)
+    return _plain_scaled_dot_product_attention(query, key, value, is_causal)
+
+
 def _plain_scaled_dot_product_attention(query, key, value, is_causal):
     # The fused entry point takes a self-attention call with the default
     # normaliser: one head count, one token count, and a head width inside the
@@ -3479,6 +3537,7 @@ def _plain_scaled_dot_product_attention(query, key, value, is_causal):
         and key.dim() == 4
         and value.dim() == 4
         and 0 < query.size(-1) <= _FUSED_MAX_HEAD_DIM
+        and _attention_dtype(query) in _CUDA_FUSED_DTYPES
         and _attention_dtype(key) == _attention_dtype(query) == _attention_dtype(value)
         and key.size(-1) == query.size(-1) == value.size(-1)
         and key.size(0) == query.size(0) == value.size(0)
@@ -3549,15 +3608,30 @@ def scaled_dot_product_attention(
     # object for it; a call that carries none of the extras and whose
     # arguments carry no dispatch hook lands on the same fused kernel, so it
     # is answered before any of that is built.
+    #
+    # A normaliser the fused entry already applies is not an extra: the entry
+    # divides the scores by the square root of the head width, so a caller
+    # asking for that value asks for the same computation.  Grouped heads are
+    # an extra the entry does not state, but the key/value heads can be
+    # expanded to the query's count first, which is the mapping the composed
+    # path makes anyway.
     if (
         attn_mask is None
         and dropout_p == 0.0
-        and scale is None
-        and not enable_gqa
         and backend is None
         and not has_tensorplay_function((query, key, value))
     ):
-        return _plain_scaled_dot_product_attention(query, key, value, is_causal)
+        if _names_fused_scale(scale, query.size(-1)):
+            if enable_gqa:
+                if (
+                    query.device.type == "cuda"
+                    and _grouped_heads_expandable(query, key, value)
+                ):
+                    return _grouped_scaled_dot_product_attention(
+                        query, key, value, is_causal)
+            else:
+                return _plain_scaled_dot_product_attention(
+                    query, key, value, is_causal)
 
     # Attention-bias subclasses intercept the call through the Python
     # function-hook protocol before any backend routing happens.
