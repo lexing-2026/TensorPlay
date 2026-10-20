@@ -5780,7 +5780,7 @@ class TestVulkanAdvancedIndexing(unittest.TestCase):
         payload = self._device(self._table((5, 4)))
         # A mask names rows by counting them, which is a compaction the walk
         # does not do; neither does a tuple of lists that has to be broadcast
-        # against itself, or an add that folds several rows into one.
+        # against itself.
         with self.assertRaisesRegex(RuntimeError, "list of row codes"):
             tensorplay.index(
                 payload, [self._device(np.array([True, False, True, False, False]))])
@@ -5788,9 +5788,6 @@ class TestVulkanAdvancedIndexing(unittest.TestCase):
             tensorplay.index(payload, [self._device(np.ones(2, np.float32))])
         with self.assertRaisesRegex(RuntimeError, "several lists"):
             tensorplay.index(payload, [self._codes([0, 1]), self._codes([0, 1])])
-        with self.assertRaisesRegex(RuntimeError, "adding into"):
-            tensorplay.index_put_(payload, [self._codes([0, 1])],
-                                  self._device(np.ones((2, 4), np.float32)), True)
 
 
 class TestVulkanMaskCompaction(unittest.TestCase):
@@ -5908,6 +5905,238 @@ class TestVulkanMaskCompaction(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Float32 and Float16 payloads"):
             tensorplay.masked_select(self._device(np.arange(6, dtype=np.int32)),
                                      self._device(np.array([True] * 6)))
+
+
+class TestVulkanRowAccumulation(unittest.TestCase):
+    # A list of row codes may name one row several times, and every row it names
+    # has to reach the destination.  Nothing on this device locks a row while it
+    # is being totalled, so the walk runs from the destination instead: the group
+    # that owns a row reads the whole list and adds the rows it names in the
+    # order the list states them.  The answer is therefore the same every time,
+    # not merely close, and it is the answer the host walk gives.  Range is
+    # settled inside the walk, as it is for the reads and writes beside it.
+
+    SHAPES = ((5,), (5, 4), (2, 5, 3), (2, 3, 5, 2))
+
+    @staticmethod
+    def _device(payload):
+        arr = np.asarray(payload)
+        if arr.ndim and not arr.flags["C_CONTIGUOUS"]:
+            arr = np.ascontiguousarray(arr)
+        return tensorplay.from_numpy(arr).to("vulkan")
+
+    @staticmethod
+    def _codes(values, dtype=np.int64):
+        return TestVulkanRowAccumulation._device(np.array(values, dtype=dtype))
+
+    @staticmethod
+    def _operands(shape, dim, codes, dtype):
+        # Small whole numbers keep a sum exact in either element type, so a
+        # wrong lane shows up as a wrong number rather than as rounding.
+        axis = dim if dim >= 0 else dim + len(shape)
+        seed = [len(shape), dim + 4, len(codes), *shape]
+        rng = np.random.default_rng(seed)
+        base = rng.integers(-3, 4, size=shape).astype(dtype)
+        source_shape = list(shape)
+        source_shape[axis] = len(codes)
+        added = rng.integers(-3, 4, size=source_shape).astype(dtype)
+        return base, added
+
+    @classmethod
+    def _want(cls, base, dim, codes, added):
+        axis = dim if dim >= 0 else dim + base.ndim
+        want = base.astype(np.float64).copy()
+        for slot, code in enumerate(codes):
+            take = [slice(None)] * base.ndim
+            take[axis] = code
+            give = [slice(None)] * base.ndim
+            give[axis] = slot
+            want[tuple(take)] += added[tuple(give)]
+        return want
+
+    def _sum_matches(self, shape, dim, codes, dtype=np.float32):
+        base, added = self._operands(shape, dim, codes, dtype)
+        want = self._want(base, dim, codes, added)
+        name = (f"shape={shape} dim={dim} codes={codes} "
+                f"dtype={np.dtype(dtype).name}")
+        got = self._device(base).index_add_(
+            dim, self._codes(codes), self._device(added)).cpu().numpy()
+        np.testing.assert_array_equal(got, want, err_msg=f"device: {name}")
+        host = tensorplay.index_add(
+            tensorplay.from_numpy(base.copy()),
+            dim,
+            tensorplay.from_numpy(np.array(codes, np.int64)),
+            tensorplay.from_numpy(added.copy()),
+        ).cpu().numpy()
+        np.testing.assert_array_equal(host, want, err_msg=f"host: {name}")
+
+    def test_the_rows_a_list_names_total_in_the_order_it_states(self):
+        for shape in self.SHAPES:
+            for dim in range(len(shape)):
+                size = shape[dim]
+                codes = [0, size - 1, size // 2, 1, size - 1]
+                for dtype in (np.float32, np.float16):
+                    self._sum_matches(shape, dim, codes, dtype)
+
+    def test_an_axis_the_texels_do_not_offer_accumulates_the_same_way(self):
+        # The row axis of a texture is the one just above the last, so every
+        # other axis - and a payload of one axis - travels through linear
+        # storage and back.  The walk is the same, so the answer had better be.
+        for shape, dim in (((5, 4), 1), ((2, 5, 3), 2), ((2, 3, 5, 2), 0),
+                           ((2, 3, 5, 2), 3), ((5,), 0)):
+            size = shape[dim]
+            for dtype in (np.float32, np.float16):
+                self._sum_matches(shape, dim, [size - 1, 0, 1, size - 1], dtype)
+
+    def test_a_row_that_several_codes_name_is_added_to_that_many_times(self):
+        for dtype in (np.float32, np.float16):
+            self._sum_matches((6, 4), 0, [2] * 8, dtype)
+            self._sum_matches((3, 7), 1, [3, 3, 0, 3, 6, 6], dtype)
+
+    def test_the_answer_to_a_repeated_row_is_the_same_every_time(self):
+        # A fold that raced would settle differently on two runs; the whole
+        # point of walking from the destination is that it cannot.
+        base, added = self._operands((6, 4), 0, [2, 2, 2, 2], np.float32)
+        codes = self._codes([2, 2, 2, 2])
+        source = self._device(added)
+        first = self._device(base).index_add_(0, codes, source).cpu().numpy()
+        second = self._device(base).index_add_(0, codes, source).cpu().numpy()
+        np.testing.assert_array_equal(
+            first, second, err_msg="two runs of the same fold")
+        np.testing.assert_array_equal(
+            first, self._want(base, 0, [2, 2, 2, 2], added),
+            err_msg="a row named four times")
+
+    def test_a_row_of_a_width_that_is_not_a_group_wide_keeps_its_lanes(self):
+        # Five features is one whole group of four and a leftover, and a half
+        # payload pairs its lanes into words, so the last lane of a row can sit
+        # in the same word as the first of the next.  Each lane must still land
+        # in its own row.
+        for dtype in (np.float32, np.float16):
+            self._sum_matches((4, 5), 0, [0, 2, 0, 3, 1], dtype)
+            self._sum_matches((4, 5), 1, [0, 1, 1, 3], dtype)
+            self._sum_matches((13,), 0, [0, 12, 5, 5, 6], dtype)
+            self._sum_matches((3, 5, 7), 1, [0, 2, 1, 1], dtype)
+
+    def test_a_payload_too_long_for_a_texel_walk_accumulates_flat(self):
+        for dtype in (np.float32, np.float16):
+            self._sum_matches((200000,), 0,
+                              [0, 1, 199999, 100000, 100000, 3], dtype)
+
+    def test_the_out_of_place_form_leaves_its_canvas_alone(self):
+        codes = [0, 3, 3, 1]
+        base, added = self._operands((5, 4), 0, codes, np.float32)
+        canvas = self._device(base)
+        out = tensorplay.index_add(canvas, 0, self._codes(codes),
+                                   self._device(added))
+        np.testing.assert_array_equal(
+            out.cpu().numpy(), self._want(base, 0, codes, added),
+            err_msg="the out-of-place form")
+        np.testing.assert_array_equal(
+            canvas.cpu().numpy(), base, err_msg="a write left its input alone")
+        self.assertEqual(out.dtype, tensorplay.float32)
+
+    def test_the_forms_that_fold_nothing_answer_with_what_they_hold(self):
+        base, _ = self._operands((6, 4), 0, [], np.float32)
+        held = self._device(base).index_add_(
+            0, self._codes([]), self._device(np.zeros((0, 4), np.float32)))
+        np.testing.assert_array_equal(
+            held.cpu().numpy(), base, err_msg="a list of no codes")
+        self._sum_matches((6, 4), 1, [3], np.float32)
+        self._sum_matches((6, 4), 1, [3], np.float16)
+
+    def test_a_code_beyond_the_rows_the_destination_offers_changes_nothing(self):
+        base = np.arange(24, dtype=np.float32).reshape(6, 4)
+        added = np.full((3, 4), 5.0, np.float32)
+        got = self._device(base).index_add_(
+            0, self._codes([0, -1, 6]), self._device(added)).cpu().numpy()
+        np.testing.assert_array_equal(got[0], base[0] + 5.0,
+                                      err_msg="the row an in-range code names")
+        np.testing.assert_array_equal(got[1:], base[1:],
+                                      err_msg="rows no in-range code names")
+
+    def test_a_list_of_counts_in_either_width_accumulates_alike(self):
+        base, added = self._operands((6, 4), 0, [0, 5, 5, 2], np.float32)
+        want = self._want(base, 0, [0, 5, 5, 2], added)
+        for width in (np.int32, np.int64):
+            got = self._device(base).index_add_(
+                0, self._codes([0, 5, 5, 2], width),
+                self._device(added)).cpu().numpy()
+            np.testing.assert_array_equal(
+                got, want, err_msg=f"a list of {np.dtype(width).name} codes")
+
+    def test_a_subscript_write_can_add_the_rows_it_names(self):
+        # Two of these codes name row zero, which a plain write leaves unsettled
+        # and an adding one folds into that row in the order the list states.
+        base = np.zeros((5, 4), np.float32)
+        added = np.array([[1.0, 1.0, 1.0, 1.0],
+                          [2.0, 2.0, 2.0, 2.0],
+                          [4.0, 4.0, 4.0, 4.0]], np.float32)
+        codes = [0, 2, 0]
+        got = tensorplay.index_put_(
+            self._device(base), [self._codes(codes)], self._device(added),
+            True).cpu().numpy()
+        want = self._want(base, 0, codes, added)
+        np.testing.assert_array_equal(
+            got, want, err_msg="a subscript write that adds")
+
+    def test_the_expert_accumulation_a_mixture_of_experts_step_does(self):
+        # One canvas of tokens, and one dispatch per expert adding the rows that
+        # expert was routed to.  Whole tokens repeat across experts, so the
+        # folds are the point of the exercise.
+        tokens, hidden, experts = 256, 1024, 4
+        rng = np.random.default_rng([tokens, hidden, experts])
+        canvas = np.zeros((tokens, hidden), np.float32)
+        routed = rng.integers(-3, 4, size=(experts * 32, hidden)).astype(
+            np.float32)
+        assignment = rng.integers(0, tokens, size=(experts, 32)).astype(np.int64)
+        payload = self._device(canvas)
+        for expert in range(experts):
+            codes = assignment[expert]
+            source = routed[expert * 32:(expert + 1) * 32]
+            payload = payload.index_add_(0, self._codes(codes.tolist()),
+                                         self._device(source))
+        want = canvas.astype(np.float64)
+        for expert in range(experts):
+            for slot, code in enumerate(assignment[expert]):
+                want[code] += routed[expert * 32 + slot]
+        np.testing.assert_array_equal(
+            payload.cpu().numpy(), want, err_msg="four experts into one canvas")
+
+    def test_a_walk_the_destination_and_the_list_both_make_long_is_answered_off_it(
+            self):
+        length = 300000
+        self._sum_matches((length,), 0, [0, 1, length - 1], np.float32)
+        canvas = self._device(np.zeros((length,), np.float32))
+        codes = self._codes(list(range(length)))
+        source = self._device(np.ones((length,), np.float32))
+        with self.assertRaisesRegex(RuntimeError, "budget"):
+            canvas.index_add_(0, codes, source)
+
+    def test_operands_that_do_not_line_up_are_answered_off_it(self):
+        payload = self._device(np.zeros((5, 4), np.float32))
+        with self.assertRaisesRegex(RuntimeError, "same rank"):
+            tensorplay.index_add(payload, 0, self._codes([0, 1]),
+                                 self._device(np.ones(2, np.float32)))
+        with self.assertRaisesRegex(RuntimeError, "match the index length"):
+            tensorplay.index_add(payload, 0, self._codes([0, 1]),
+                                 self._device(np.ones((3, 4), np.float32)))
+        with self.assertRaisesRegex(RuntimeError, "off-axis sizes"):
+            tensorplay.index_add(payload, 0, self._codes([0, 1]),
+                                 self._device(np.ones((2, 6), np.float32)))
+        with self.assertRaisesRegex(RuntimeError, "Float32 and Float16"):
+            tensorplay.index_add(self._device(np.zeros((5, 4), np.int32)),
+                                 0, self._codes([0, 1]),
+                                 self._device(np.ones((2, 4), np.int32)))
+        with self.assertRaisesRegex(RuntimeError, "dtype must match"):
+            tensorplay.index_add(payload, 0, self._codes([0, 1]),
+                                 self._device(np.ones((2, 4), np.float16)))
+        with self.assertRaisesRegex(RuntimeError, "Int64 or Int32"):
+            tensorplay.index_add(payload, 0, self._codes([0.0, 1.0], np.float32),
+                                 self._device(np.ones((2, 4), np.float32)))
+        with self.assertRaisesRegex(RuntimeError, "dimension out of range"):
+            tensorplay.index_add(payload, 2, self._codes([0, 1]),
+                                 self._device(np.ones((2, 4), np.float32)))
 
 
 if __name__ == "__main__":
