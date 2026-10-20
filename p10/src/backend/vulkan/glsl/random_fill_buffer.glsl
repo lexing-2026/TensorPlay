@@ -16,7 +16,7 @@ layout(set = 0, binding = 0) buffer PRECISION restrict writeonly Output {
 uOutput;
 layout(set = 0, binding = 1) uniform PRECISION restrict Block {
   uint buf_length;
-  float from; // uniform lower bound (uniform) / bernoulli probability
+  float from; // uniform lower bound (uniform) / bernoulli probability / rate (exponential)
   float to; // uniform upper bound (uniform) / normal mean
   float std; // normal standard deviation
   uint seed_lo;
@@ -34,6 +34,7 @@ layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
  *                                 draw equal to `to` snapped back to `from`
  *   1: normal_(mean, std)         two Box-Muller draws per uniform pair
  *   2: bernoulli_(p)              (u < p)
+ *   3: exponential_(lambda)       value = -log(u) / lambda
  * Four consecutive linear elements consume one Philox call, one word per
  * element, so no two elements ever share a draw and the sequence is
  * reproducible for a given seed regardless of scheduling.
@@ -69,10 +70,20 @@ void main() {
         word_to_uniform(words.z), word_to_uniform(words.w));
     vec4 value =
         uBlock.to + uBlock.std * vec4(first_pair.x, first_pair.y, second_pair.x, second_pair.y);
-  $else:
+  $elif DIST == 2:
     vec4 value = vec4(
         word_to_uniform(words.x), word_to_uniform(words.y),
         word_to_uniform(words.z), word_to_uniform(words.w));
+  $else:
+    // Inverse-CDF draw: -log(u) / rate.  The draws lie in [0, 1), so the edge
+    // to guard is the one at 0 -- its logarithm is -infinity, and a value of
+    // infinity leaves its category unrankable -- so a draw of no bits is
+    // lifted to the smallest value the lane holds.  The upper edge is open, so
+    // the result is never 0 and a division by it stays defined.
+    vec4 value = -log(max(
+        vec4(word_to_uniform(words.x), word_to_uniform(words.y),
+             word_to_uniform(words.z), word_to_uniform(words.w)),
+        vec4(1.17549435e-38))) / uBlock.from;
   // clang-format on
 
   for (uint lane = 0u; lane < 4u; ++lane) {

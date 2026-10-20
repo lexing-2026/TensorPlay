@@ -24,6 +24,12 @@ std::tuple<Tensor, Tensor> sort_kernel(
 std::tuple<Tensor, Tensor> topk_kernel(
     const Tensor& self, int64_t k, int64_t dim, bool largest, bool sorted,
     int64_t impl);
+Tensor argmax_kernel(
+    const Tensor& self, std::optional<int64_t> dim, bool keepdim);
+Tensor div_kernel(const Tensor& self, const Tensor& other);
+Tensor to_dtype_kernel(
+    const Tensor& self, DType dtype, bool non_blocking, bool copy,
+    std::optional<int64_t> memory_format);
 
 namespace {
 
@@ -114,7 +120,7 @@ void validate_random_target(const Tensor& t, const char* name) {
       std::string("Vulkan ") + name + " supports 1d to 4d tensors");
 }
 
-// Shared dispatch for the three nullary distributions; `from`, `to` and `std`
+// Shared dispatch for the nullary distributions; `from`, `to` and `std`
 // carry whichever parameters the selected variant reads.  `shader` fills
 // texture-stored payloads and `buffer_shader` fills shapes whose extents fall
 // back to buffer storage.
@@ -211,6 +217,27 @@ Tensor& normal_kernel(
   dispatch_random_fill(
       self, VK_KERNEL(normal_fill), VK_KERNEL(buffer_normal_fill), 0.0f,
       static_cast<float>(mean), static_cast<float>(std), generator);
+  return self;
+}
+
+// The exponential family draws its value from a uniform one by inverting the
+// cumulative distribution: -log(u) / rate, so the rate rides in the `from`
+// slot the uniform and bernoulli variants also read.
+Tensor& exponential_kernel(
+    Tensor& self,
+    double lambd,
+    std::optional<Generator> generator) {
+  validate_random_target(self, "exponential_");
+  TP_CHECK(
+      lambd > 0.0,
+      "exponential_ expects lambda > 0.0, but found lambda=", lambd);
+
+  if (self.numel() == 0) {
+    return self;
+  }
+  dispatch_random_fill(
+      self, VK_KERNEL(exponential_fill), VK_KERNEL(buffer_exponential_fill),
+      static_cast<float>(lambd), 0.0f, 0.0f, generator);
   return self;
 }
 
@@ -437,6 +464,10 @@ Tensor multinomial_kernel(
       num_samples >= 0, "multinomial: num_samples must be >= 0");
   TP_CHECK(
       self.dim() <= 2, "Vulkan multinomial: input must be 1D or 2D");
+  TP_CHECK(
+      isFloatingType(self.dtype()),
+      "Vulkan multinomial only supports floating-point dtypes for input, got: ",
+      toString(self.dtype()));
   const bool is_1d = self.dim() == 1;
   const int64_t rows = is_1d ? 1 : self.size(0);
   const int64_t cols = is_1d ? self.numel() : self.size(1);
@@ -444,18 +475,52 @@ Tensor multinomial_kernel(
     TP_THROW(
         RuntimeError, "multinomial: input must have at least one category");
   }
+  // Both paths rank a row by single-precision numbers, and a float keeps only
+  // the first 2^24 integers a bit apart; past that a row could hand two
+  // categories the same rank.
   TP_CHECK(
-      replacement,
-      "Vulkan multinomial currently supports replacement=True only");
+      cols <= (1 << 24),
+      "Vulkan multinomial: number of categories cannot exceed 2^24");
+  // Without replacement a category answers at most once, so a row cannot
+  // yield more distinct draws than it holds entries.
+  TP_CHECK(
+      replacement || num_samples <= cols,
+      "multinomial: cannot sample num_samples > prob_dist.size(-1) samples "
+      "without replacement");
 
   const std::vector<int64_t> out_shape =
       is_1d ? std::vector<int64_t>{num_samples}
             : std::vector<int64_t>{rows, num_samples};
-  if (num_samples == 0) {
+  if (num_samples == 0 || rows == 0) {
     return empty_kernel(out_shape, DType::Int64, self.device(), false);
   }
 
-  Tensor prob = self.dtype() == DType::Float32 ? self : self.to(DType::Float32);
+  Tensor prob =
+      self.dtype() == DType::Float32 ? self.contiguous() : self.to(DType::Float32);
+
+  /*
+   * Ranking answers a draw, however many categories it takes and whether or
+   * not they may repeat: give each category an independent Exp(1) wait, score
+   * it by weight / wait, and take the highest `num_samples` scores.  The best
+   * score is one draw of the distribution (the wait that runs out first is
+   * chosen in proportion to its weight), and the best few are distinct
+   * categories because each row entry holds exactly one score.
+   */
+  if (!replacement || num_samples == 1) {
+    Tensor waits = empty_kernel(
+        static_cast<std::vector<int64_t>>(prob.shape()), DType::Float32,
+        prob.device(), false);
+    exponential_kernel(waits, 1.0, generator);
+    const Tensor scores = div_kernel(prob, waits);
+    const Tensor picks = num_samples == 1
+        ? reshape_kernel(
+              argmax_kernel(scores, scores.dim() - 1, true), out_shape)
+        : std::get<1>(
+              topk_kernel(scores, num_samples, -1, true, true, 0));
+    // The rank is a position in a row, which the ranking kernels keep in the
+    // signed word; the answer counts categories, so it travels in the wide code.
+    return to_dtype_kernel(picks, DType::Int64, false, true, std::nullopt);
+  }
 
   api::Context* const context = api::context();
   api::vTensor v_prob = convert(prob);
@@ -646,6 +711,7 @@ Tensor sample_kernel(
 TENSORPLAY_LIBRARY_IMPL(Vulkan, RandomKernels) {
   m.impl("uniform_", &tensorplay::vulkan::ops::uniform_kernel);
   m.impl("normal_", &tensorplay::vulkan::ops::normal_kernel);
+  m.impl("exponential_", &tensorplay::vulkan::ops::exponential_kernel);
   m.impl("bernoulli_.float", &tensorplay::vulkan::ops::bernoulli_scalar_kernel);
   m.impl("bernoulli_.Tensor", &tensorplay::vulkan::ops::bernoulli_tensor_kernel);
   m.impl("bernoulli", &tensorplay::vulkan::ops::bernoulli_kernel);

@@ -13,7 +13,7 @@ layout(std430) buffer;
 layout(set = 0, binding = 0, FORMAT) uniform PRECISION restrict writeonly image3D uOutput;
 layout(set = 0, binding = 1) uniform PRECISION restrict Block {
   ivec4 extents;
-  float from; // uniform lower bound (uniform) / bernoulli probability
+  float from; // uniform lower bound (uniform) / bernoulli probability / rate (exponential)
   float to; // uniform upper bound (uniform) / normal mean
   float std; // normal standard deviation
   uint seed_lo;
@@ -26,11 +26,12 @@ uBlock;
 layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
 
 /*
- * Nullary random fill for three distributions, selected by DIST:
+ * Nullary random fill for four distributions, selected by DIST:
  *   0: uniform_[from, to)         value = u * (to - from) + from, with a
  *                                 draw equal to `to` snapped back to `from`
  *   1: normal_(mean, std)         two Box-Muller draws per uniform pair
  *   2: bernoulli_(p)              (u < p)
+ *   3: exponential_(lambda)       value = -log(u) / lambda
  * Every invocation derives its random words from (seed, offset, id), so the
  * fill is reproducible for a given seed and independent of scheduling.
  *
@@ -74,12 +75,23 @@ void main() {
     imageStore(
         uOutput, pos,
         uBlock.to + uBlock.std * vec4(first.x, first.y, second.x, second.y));
-  $else:
+  $elif DIST == 2:
     const vec4 u = vec4(
         word_to_uniform(words.x), word_to_uniform(words.y),
         word_to_uniform(words.z), word_to_uniform(words.w));
     imageStore(
         uOutput, pos,
         mix(vec4(0.0f), vec4(1.0f), lessThan(u, vec4(uBlock.from))));
+  $else:
+    // Inverse-CDF draw: -log(u) / rate.  The draws lie in [0, 1), so the edge
+    // to guard is the one at 0 -- its logarithm is -infinity, and a value of
+    // infinity leaves its category unrankable -- so a draw of no bits is
+    // lifted to the smallest value the lane holds.  The upper edge is open, so
+    // the result is never 0 and a division by it stays defined.
+    const vec4 u = max(
+        vec4(word_to_uniform(words.x), word_to_uniform(words.y),
+             word_to_uniform(words.z), word_to_uniform(words.w)),
+        vec4(1.17549435e-38));
+    imageStore(uOutput, pos, -log(u) / uBlock.from);
   // clang-format on
 }
