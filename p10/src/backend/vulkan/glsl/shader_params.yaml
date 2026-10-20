@@ -997,6 +997,10 @@ cumsum_buffer_half:
   parameter_names_with_default_values: {}
   shader_variants:
   - NAME: cumsum_buffer_half
+cumsum_buffer_i64:
+  parameter_names_with_default_values: {}
+  shader_variants:
+  - NAME: cumsum_buffer_i64
 masked_fill:
   parameter_names_with_default_values:
     VALUE_FROM_TENSOR: false
