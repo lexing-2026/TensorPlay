@@ -6,10 +6,12 @@
 #include "Factory.h"
 #include "SizesAndStrides.h"
 #include "Utils.h"
+#include "tensorplay/ops/TPXOpsGenerated.h"
 
 #include <Utils.h>
 
 #include <limits>
+#include <optional>
 
 namespace tensorplay {
 namespace vulkan {
@@ -52,10 +54,13 @@ struct EmbeddingBlock final {
 };
 
 struct IndexSelectBlock final {
-  int inner;
-  int row_stride;
+  // The gathered payload reads as planes x rows x width: the axes above the
+  // gathered one count blocks, the codes name a row of a block and the axes
+  // below it walk along with it.  width is also the stride between rows.
+  int width;
+  int planes;
   int count;
-  int fill;
+  int rows;
 };
 
 // A shape left-padded to four axes with ones, outermost first - the form the
@@ -510,26 +515,35 @@ Tensor index_select_kernel(
   TP_CHECK(
       index.dim() == 1,
       "Vulkan index_select: index should be a vector");
-  const int64_t wrapped = dim < 0 ? dim + self.dim() : dim;
+  const int64_t rank = self.dim();
+  const int64_t wrapped = dim < 0 ? dim + rank : dim;
   TP_CHECK(
-      wrapped >= 0 && wrapped < self.dim(),
+      wrapped >= 0 && wrapped < rank,
       "Vulkan index_select: dimension out of range");
-  // The gather kernel walks a flattened payload with one outer block, so
-  // the selected axis must be the only axis left of the inner span.
-  const int64_t inner =
-      wrapped < self.dim() - 1 ? self.size(wrapped + 1) : 1;
-  const int64_t outer = self.numel() / (self.size(wrapped) * inner);
+  // The payload flattens to planes x rows x width, so a selection runs over
+  // every block the axes above the gathered one name and carries the axes
+  // below it along.  Nothing about that walk depends on where the gathered
+  // axis sits.
+  int64_t planes = 1;
+  int64_t width = 1;
+  for (int64_t axis = 0; axis < wrapped; ++axis) {
+    planes *= self.size(axis);
+  }
+  for (int64_t axis = wrapped + 1; axis < rank; ++axis) {
+    width *= self.size(axis);
+  }
+  const int64_t rows = self.size(wrapped);
+  const int64_t index_count = index.numel();
+  const int64_t out_count = planes * index_count * width;
+  // Both routes address elements as signed words of a four-lane group.
   TP_CHECK(
-      outer == 1,
-      "Vulkan index_select supports a single outer block (1-d tensors and "
-      "row selections of 2-d tensors)");
+      self.numel() <= std::numeric_limits<int32_t>::max() &&
+          out_count <= std::numeric_limits<int32_t>::max(),
+      "Vulkan index_select: the walk holds more than two billion elements");
 
   api::Context* const context = api::context();
 
   api::vTensor v_self = convert(self);
-
-  const int64_t index_count = index.numel();
-  const int64_t out_count = index_count * inner;
 
   // The list is built in the class the gather is going to use, so a source with
   // an image form is not dragged into dense storage just because the codes
@@ -565,15 +579,15 @@ Tensor index_select_kernel(
     const uint32_t lanes = self.dtype() == DType::Float16 ? 2u : 4u;
     const uint32_t n = static_cast<uint32_t>(out_count);
     const struct IndexSelectBufferBlock {
-      int32_t inner;
-      int32_t row_stride;
+      int32_t width;
+      int32_t planes;
       int32_t count;
       int32_t rows;
     } block{
-        static_cast<int32_t>(inner),
-        static_cast<int32_t>(inner),
+        static_cast<int32_t>(width),
+        static_cast<int32_t>(planes),
         static_cast<int32_t>(index_count),
-        static_cast<int32_t>(self.size(wrapped)),
+        static_cast<int32_t>(rows),
     };
     api::UniformParamsBuffer params(context, block);
     api::PipelineBarrier pipeline_barrier{};
@@ -610,23 +624,24 @@ Tensor index_select_kernel(
   api::vTensor v_output{context, {out_count}, self.dtype()};
 
   const struct IndexSelectBlock block{
-      static_cast<int32_t>(inner),
-      static_cast<int32_t>(inner),
+      static_cast<int32_t>(width),
+      static_cast<int32_t>(planes),
       static_cast<int32_t>(index_count),
-      0,
+      static_cast<int32_t>(rows),
   };
 
   api::UniformParamsBuffer params(context, block);
   api::PipelineBarrier pipeline_barrier{};
 
-  // The shader reads invocation (slot inside the gathered row, index), so the
-  // grid spans inner by the index count even though each payload is a flat
-  // 1-D texture: the output's own extents only run over the flat element and
-  // would leave every row past the first slot unwritten.
+  // The shader reads invocation (slot inside the gathered row, index, block),
+  // so the grid spans the row width by the index count by the plane count even
+  // though each payload is a flat 1-D texture: the output's own extents only run
+  // over the flat element and would leave every row past the first slot
+  // unwritten.
   const api::utils::uvec3 grid{
-      static_cast<uint32_t>(inner),
+      static_cast<uint32_t>(width),
       static_cast<uint32_t>(index_count),
-      1u};
+      static_cast<uint32_t>(planes)};
 
   context->submit_compute_job(
       VK_KERNEL(index_select), pipeline_barrier, grid,
@@ -1174,6 +1189,135 @@ Tensor scatter_src_kernel(
   return out;
 }
 
+//
+// Advanced indexing: the read a tuple of indices answers and the write it
+// lands.  Both entry points carry the whole tuple, so the forms a row lookup
+// can drive are decided here.  A tuple with one list of row codes names one
+// axis: the read is that axis's row lookup with the codes' shape spliced in,
+// the write the row scatter the same axis already drives.  The other forms
+// stay refused rather than answered wrong: a mask compacts the axis it covers,
+// which needs a running total of the mask that no kernel here produces, and
+// several lists broadcast against each other and fold more than one axis at
+// once, which no single row lookup describes.
+//
+namespace {
+
+// The axis a lone list of codes names, or -1 when the tuple carries none and
+// means the whole payload.  Anything a row lookup cannot answer throws.
+int64_t checked_code_axis(
+    const Tensor& self,
+    const std::vector<std::optional<Tensor>>& indices,
+    const char* name) {
+  TP_CHECK(
+      indices.size() <= static_cast<size_t>(self.dim()),
+      std::string("Vulkan ") + name +
+          ": the tuple holds more indices than the payload has axes");
+  int64_t axis = -1;
+  for (size_t entry = 0; entry < indices.size(); ++entry) {
+    if (!indices[entry].has_value() || !indices[entry]->defined()) {
+      continue;
+    }
+    TP_CHECK(
+        axis < 0,
+        std::string("Vulkan ") + name +
+            ": a tuple of several lists of codes is not answered on the device");
+    const Tensor& codes = *indices[entry];
+    // A list that arrived from the host is taken along by the row walk, which
+    // uploads it in the same move that narrows a wide code to a word; a list
+    // already on the device never crosses that transfer.
+    TP_CHECK(
+        codes.dtype() == DType::Int32 || codes.dtype() == DType::Int64,
+        std::string("Vulkan ") + name +
+            ": an index has to be a list of row codes");
+    axis = static_cast<int64_t>(entry);
+  }
+  return axis;
+}
+
+// The shape a read answers with: the payload's axes with the one the codes
+// name replaced by the codes' own shape.
+std::vector<int64_t> indexed_shape(
+    const Tensor& self,
+    int64_t axis,
+    const Tensor& codes) {
+  std::vector<int64_t> sizes(
+      static_cast<std::vector<int64_t>>(self.shape()));
+  std::vector<int64_t> code_sizes(
+      static_cast<std::vector<int64_t>>(codes.shape()));
+  sizes.erase(sizes.begin() + axis);
+  sizes.insert(
+      sizes.begin() + axis, code_sizes.begin(), code_sizes.end());
+  return sizes;
+}
+
+} // namespace
+
+Tensor index_tensor_kernel(
+    const Tensor& self,
+    const std::vector<std::optional<Tensor>>& indices) {
+  const int64_t axis = checked_code_axis(self, indices, "index");
+  if (axis < 0) {
+    // Every axis is taken whole, so the answer is the payload itself; a copy
+    // keeps it independent of what the read is taken from.
+    return tpx::ops::clone(self, std::nullopt);
+  }
+  const Tensor codes = *indices[static_cast<size_t>(axis)];
+  const std::vector<int64_t> out_sizes = indexed_shape(self, axis, codes);
+  if (codes.numel() == 0) {
+    // A list of no codes names no row, so the answer holds no element.
+    return tpx::ops::empty(out_sizes, self.dtype(), self.device());
+  }
+  // One code per row, in the order the codes list them; the codes' shape then
+  // splices back onto the axis they walked.
+  Tensor picked = tpx::ops::index_select(
+      self, axis, codes.reshape({codes.numel()}));
+  return picked.reshape(out_sizes);
+}
+
+Tensor& index_put_impl__kernel(
+    Tensor& self,
+    const std::vector<std::optional<Tensor>>& indices,
+    const Tensor& values,
+    bool accumulate,
+    bool unsafe) {
+  (void)unsafe;
+  // Adding would fold the rows several codes name into one destination row,
+  // which needs an atomic the float payloads of this backend do not carry.
+  TP_CHECK(
+      !accumulate,
+      "Vulkan index_put_: adding into the rows a list of codes names is not "
+      "answered on the device");
+  const int64_t axis = checked_code_axis(self, indices, "index_put_");
+  if (axis < 0) {
+    // The whole payload is named, so the write is a plain transfer.
+    self.copy_(values);
+    return self;
+  }
+  const Tensor codes = *indices[static_cast<size_t>(axis)];
+  if (codes.numel() == 0) {
+    return self;
+  }
+  std::vector<int64_t> source_sizes(
+      static_cast<std::vector<int64_t>>(self.shape()));
+  source_sizes[static_cast<size_t>(axis)] = codes.numel();
+  // A lone host scalar is the one value shape that costs nothing to bring
+  // along; a payload that arrived from elsewhere is left where it is, so the
+  // scatter reports the pair of devices rather than copying through the host.
+  Tensor source = values;
+  if (values.device() != self.device() && values.numel() == 1 &&
+      values.dim() == 0) {
+    source = values.to(self.device());
+  }
+  if (static_cast<std::vector<int64_t>>(source.shape()) != source_sizes) {
+    // A narrower source is read once per row it lands in, so the rows it
+    // repeats are written out before the scatter walks them.
+    source = tpx::ops::clone(tpx::ops::expand(source, source_sizes, false));
+  }
+  index_copy_rows_inplace(
+      self, axis, codes.reshape({codes.numel()}), source);
+  return self;
+}
+
 } // namespace ops
 } // namespace vulkan
 } // namespace tensorplay
@@ -1181,6 +1325,10 @@ Tensor scatter_src_kernel(
 TENSORPLAY_LIBRARY_IMPL(Vulkan, IndexingKernels) {
   m.impl("embedding", &tensorplay::vulkan::ops::embedding_kernel);
   m.impl("index_select", &tensorplay::vulkan::ops::index_select_kernel);
+  m.impl("index.Tensor", &tensorplay::vulkan::ops::index_tensor_kernel);
+  m.impl(
+      "_index_put_impl_",
+      &tensorplay::vulkan::ops::index_put_impl__kernel);
   m.impl("gather", &tensorplay::vulkan::ops::gather_kernel);
   m.impl("index_copy_", &tensorplay::vulkan::ops::index_copy__kernel);
   m.impl("index_copy", &tensorplay::vulkan::ops::index_copy_kernel);
