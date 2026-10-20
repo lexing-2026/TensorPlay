@@ -26,6 +26,8 @@ MAPS = [
     ("polygamma of order 3", lambda x: tp._C.polygamma(3, x),
      lambda x, out=None: tp._C.polygamma(3, x, out=out),
      (tp.float32, tp.float64, tp.float16)),
+    ("nextafter", tp._C.nextafter, tp._C.nextafter,
+     (tp.float32, tp.float64, tp.float16, tp.bfloat16)),
 ]
 
 
@@ -153,3 +155,68 @@ def test_out_keeps_the_rules_the_allocating_form_keeps():
         pass
     else:
         raise AssertionError("igamma answered a pair whose shapes do not broadcast")
+
+
+# Every pattern of a 16-bit width, and the number the step toward each infinity
+# has to land on.  The widths hold their values in a sign-and-magnitude layout,
+# so stepping away from zero is one added to the magnitude and stepping toward it
+# is one taken away -- the adjacency below is stated as "the next value the width
+# can hold", read off the width's own ordered list.
+def _grid(dtype):
+    """All 65536 patterns of a 16-bit width, widened losslessly to float32."""
+    bits = np.arange(1 << 16, dtype=np.uint32) << 16
+    if dtype == tp.float16:
+        return np.arange(1 << 16, dtype=np.uint16).view(np.float16).astype(np.float32)
+    return bits.view(np.float32)
+
+
+def _adjacent(grid, toward):
+    """For every value in the grid, the next distinct value in the direction."""
+    ordered = np.unique(grid[np.isfinite(grid)])
+    finite = np.isfinite(grid)
+    got = np.array(grid, copy=True)
+    if toward > 0:
+        index = np.searchsorted(ordered, grid, side="right")
+    else:
+        index = np.searchsorted(ordered, grid, side="left") - 1
+    inside = finite & (index >= 0) & (index < ordered.size)
+    got[inside] = ordered[index[inside]]
+    got[grid == np.inf] = np.inf
+    got[grid == -np.inf] = -np.inf
+    return got, inside
+
+
+def test_nextafter_steps_to_the_adjacent_number_the_width_holds():
+    for dtype in (tp.float16, tp.bfloat16):
+        grid = _grid(dtype)
+        for toward in (np.inf, -np.inf):
+            want, inside = _adjacent(grid, toward)
+            source = tensor_of(grid, dtype)
+            target = tensor_of(np.full(grid.shape, toward, dtype=np.float32), dtype)
+            values_got = tp._C.nextafter(source, target).to(tp.float32).numpy()
+            assert np.array_equal(values_got[inside], want[inside]), (dtype, toward)
+            # A width's own infinity has no neighbour to step to; it answers itself.
+            assert np.all(values_got[grid == toward] == toward), (dtype, toward)
+
+
+def test_nextafter_answers_a_nan_with_a_nan():
+    for dtype in (tp.float16, tp.bfloat16, tp.float32, tp.float64):
+        source = tensor_of(np.array([np.nan, 1.0, np.nan]), dtype)
+        target = tensor_of(np.array([1.0, np.nan, np.nan]), dtype)
+        got = tp._C.nextafter(source, target).to(tp.float32).tolist()
+        assert all(np.isnan(v) for v in got), dtype
+        out = tp.zeros(3, dtype=dtype)
+        tp._C.nextafter(source, target, out=out)
+        assert all(np.isnan(v) for v in out.to(tp.float32).tolist()), dtype
+
+
+def test_nextafter_steps_a_zero_away_from_zero():
+    # The step out of either zero is the width's smallest subnormal, not the
+    # smallest normal number, so a zero destination answers with a value whose
+    # magnitude is one pattern wide.
+    for dtype, tiny in ((tp.float16, 2.0 ** -24), (tp.bfloat16, 2.0 ** -133)):
+        for sign in (1.0, -1.0):
+            source = tensor_of(np.array([sign * 0.0]), dtype)
+            target = tensor_of(np.array([np.inf if sign > 0 else -np.inf]), dtype)
+            got = tp._C.nextafter(source, target).to(tp.float32).tolist()[0]
+            assert got == sign * tiny, (dtype, sign, got)

@@ -12,6 +12,7 @@
 #include "SpecialMath.h"
 #include "Complex.h"
 #include "cpu/ComplexUnary.h"
+#include "cpu/FloatMathLoops.h"
 
 #include <vector>
 #include <algorithm>
@@ -98,87 +99,6 @@ Tensor& binary_same_out_kernel(const Tensor& a_in, const Tensor& b_in, Tensor& o
         Tensor ac = (a_in.dtype() == dt ? a_in : a_in.to(dt));
         Tensor bc = (b_in.dtype() == dt ? b_in : b_in.to(dt));
         ti_apply_binary(out, ac, bc, op);
-        return out;
-    }
-    return write_out(out, allocating(a_in, b_in));
-}
-
-// Binary op whose inputs promote to a FLOATING dtype first (ints -> Float32).
-//
-// `destination` hands the loop a tensor the caller already holds; it only
-// arrives in the width the loop computes at and packed, which is what
-// binary_float_takes checks.
-template <typename F>  // F: (double,double) -> double
-Tensor binary_float_kernel(const Tensor& a_in, const Tensor& b_in, F f, const char* name,
-                           const Tensor* destination = nullptr) {
-    std::vector<int64_t> out_shape = broadcast_shapes(
-        static_cast<std::vector<int64_t>>(a_in.shape()),
-        static_cast<std::vector<int64_t>>(b_in.shape()));
-    DType dt = promoteTypes(a_in.dtype(), b_in.dtype());
-    if (!isFloatingType(dt)) dt = DType::Float32;
-    // Reduced-width inputs are evaluated in Float32 and narrowed once at the
-    // end; the loops below only ever address float or double buffers.
-    DType compute_dt = (dt == DType::Float64) ? DType::Float64 : DType::Float32;
-    Tensor ac = a_in.to(compute_dt).expand(out_shape).contiguous();
-    Tensor bc = b_in.to(compute_dt).expand(out_shape).contiguous();
-    Tensor out = destination != nullptr
-                     ? *destination
-                     : Tensor::empty(out_shape, compute_dt, a_in.device());
-    int64_t n = out.numel();
-    if (compute_dt == DType::Float64) {
-        const double* ap = ac.data_ptr<double>();
-        const double* bp = bc.data_ptr<double>();
-        double* dp = out.data_ptr<double>();
-        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-            for (int64_t i = begin; i < end; ++i) dp[i] = f(ap[i], bp[i]);
-        });
-    } else {
-        const float* ap = ac.data_ptr<float>();
-        const float* bp = bc.data_ptr<float>();
-        float* dp = out.data_ptr<float>();
-        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-            for (int64_t i = begin; i < end; ++i) dp[i] = static_cast<float>(f(ap[i], bp[i]));
-        });
-    }
-    return (dt == compute_dt) ? out : out.to(dt);
-}
-
-// Whether the flat pairwise map can fill the caller's tensor itself instead of
-// making a result that is copied over afterwards.  The loop pairs element i of
-// one packed operand with element i of the other and stores at the same index,
-// so the destination has to be packed and hold the answer in the width the loop
-// computes at -- a Half or BFloat16 answer still needs a narrowing pass of its
-// own -- and neither operand may be a second window over those bytes.
-static bool binary_float_takes(const Tensor& a_in, const Tensor& b_in,
-                               const Tensor& out) {
-    const DType lhs = a_in.dtype(), rhs = b_in.dtype();
-    if (isComplexType(lhs) || isComplexType(rhs) ||
-        isQuantizedType(lhs) || isQuantizedType(rhs)) {
-        return false;
-    }
-    DType dt = promoteTypes(lhs, rhs);
-    if (isComplexType(dt) || isQuantizedType(dt)) {
-        return false;
-    }
-    if (!isFloatingType(dt)) dt = DType::Float32;
-    const DType compute_dt = (dt == DType::Float64) ? DType::Float64 : DType::Float32;
-    if (dt != compute_dt) {
-        return false;
-    }
-    const std::vector<int64_t> shape = broadcast_shapes(
-        static_cast<std::vector<int64_t>>(a_in.shape()),
-        static_cast<std::vector<int64_t>>(b_in.shape()));
-    return destination_takes_flat(out, a_in.device(), compute_dt, shape, a_in, b_in);
-}
-
-// One map, one pass, into the caller's tensor wherever that holds; everywhere
-// else the value comes from the same kernel that answers without a destination.
-template <typename F>
-Tensor& binary_float_out_kernel(const Tensor& a_in, const Tensor& b_in, Tensor& out,
-                                Tensor (*allocating)(const Tensor&, const Tensor&),
-                                F f, const char* name) {
-    if (binary_float_takes(a_in, b_in, out)) {
-        binary_float_kernel(a_in, b_in, f, name, &out);
         return out;
     }
     return write_out(out, allocating(a_in, b_in));
@@ -363,72 +283,6 @@ Tensor dtype_unary_kernel(const Tensor& self, F f, const char* name,
     }
 #undef TP_DU_CASE
     return out;
-}
-
-// integral inputs yield Float32; Half/BFloat16 compute in float and keep
-// their dtype; Float32/Float64 preserved.
-//
-// `destination` hands the loop a tensor the caller already holds; it only
-// arrives in the width the loop computes at and packed, which is what
-// float_math_out_kernel checks.
-template <typename F>
-Tensor float_math_kernel(const Tensor& self, F f, const char* name,
-                         const Tensor* destination = nullptr) {
-    DType in = self.dtype();
-    DType out_dt = isFloatingType(in) ? in : DType::Float32;
-    DType compute_dt = (in == DType::Float64) ? DType::Float64 : DType::Float32;
-    Tensor w = (self.dtype() == compute_dt) ? self.contiguous()
-                                            : self.to(compute_dt).contiguous();
-    Tensor t = destination != nullptr
-                   ? *destination
-                   : Tensor::empty(static_cast<std::vector<int64_t>>(w.shape()), compute_dt, w.device());
-    int64_t n = w.numel();
-    if (compute_dt == DType::Float64) {
-        const double* sp = w.data_ptr<double>();
-        double* dp = t.data_ptr<double>();
-        parallel_for(0, n, GRAIN_SIZE, [&](int64_t b, int64_t e) {
-            for (int64_t i = b; i < e; ++i) dp[i] = f(sp[i]);
-        });
-    } else {
-        const float* sp = w.data_ptr<float>();
-        float* dp = t.data_ptr<float>();
-        parallel_for(0, n, GRAIN_SIZE, [&](int64_t b, int64_t e) {
-            for (int64_t i = b; i < e; ++i) dp[i] = static_cast<float>(f(sp[i]));
-        });
-    }
-    return (out_dt == compute_dt) ? t : t.to(out_dt);
-}
-
-// Whether the flat map over `self` can fill `out` itself instead of making a
-// result that is copied over afterwards.  The loop pairs element i of a packed
-// source with element i of the destination, so the destination has to be packed
-// too and has to carry the answer in the width the loop computes at -- a
-// Half or BFloat16 answer is still narrowed by a conversion of its own, and a
-// complex or quantized operand goes by some other route entirely.
-static bool float_math_takes(const Tensor& self, const Tensor& out) {
-    const DType in = self.dtype();
-    if (isComplexType(in) || isQuantizedType(in)) {
-        return false;
-    }
-    const DType out_dt = isFloatingType(in) ? in : DType::Float32;
-    const DType compute_dt = (in == DType::Float64) ? DType::Float64 : DType::Float32;
-    return out_dt == compute_dt &&
-           destination_takes_flat(out, self.device(), out_dt,
-                                  static_cast<std::vector<int64_t>>(self.shape()),
-                                  self);
-}
-
-// One map, one pass, into the caller's tensor wherever that holds; everywhere
-// else the value comes from the same kernel that answers without a destination.
-template <typename F>
-Tensor& float_math_out_kernel(const Tensor& self, Tensor& out,
-                              Tensor (*allocating)(const Tensor&), F f,
-                              const char* name) {
-    if (float_math_takes(self, out)) {
-        float_math_kernel(self, f, name, &out);
-        return out;
-    }
-    return write_out(out, allocating(self));
 }
 
 // The same handoff for the loops that answer with one byte per element, and for
@@ -1135,9 +989,66 @@ Tensor atan2_cpu(const Tensor& a, const Tensor& b) {
 Tensor& atan2_out_cpu(const Tensor& a, const Tensor& b, Tensor& out) {
     return binary_float_out_kernel(a, b, out, atan2_cpu, Atan2Pair{}, "atan2");
 }
-Tensor nextafter_cpu(const Tensor& a, const Tensor& b) {
-    // The step must happen in the element dtype: a double-precision step from
-    // a Float32 value rounds back to the original number when narrowed.
+// One representable step from `from` toward `to`, taken in the 16-bit layout the
+// reduced widths share.  Clearing the sign bit leaves a pattern that grows with
+// the magnitude, so a step away from zero is one increment of that pattern and a
+// step toward zero one decrement, with the sign carried through.  Stepping such
+// a value at Float32 instead moves it by a float ulp -- a distance no half or
+// bfloat16 value is even that far away from where it started.
+template <typename T>
+inline T step_toward16(T from, T to) {
+    using Bits = uint16_t;
+    static constexpr Bits kSign = static_cast<Bits>(1) << 15;
+    if (std::isnan(static_cast<float>(from)) || std::isnan(static_cast<float>(to))) {
+        return std::numeric_limits<T>::quiet_NaN();
+    }
+    Bits f = from.x;
+    const Bits t = to.x;
+    if (f == t) return from;
+    const Bits abs_f = static_cast<Bits>(f & ~kSign);
+    const Bits abs_t = static_cast<Bits>(t & ~kSign);
+    if (abs_f == 0) {
+        // Two zeros differ only in sign, so the answer is the one the step heads
+        // for; a zero stepping toward a value of either sign leaves by the
+        // smallest subnormal carrying that sign.
+        if (abs_t == 0) return to;
+        return T(static_cast<unsigned short>((t & kSign) | static_cast<Bits>(1)),
+                 T::from_bits());
+    }
+    f = (abs_f > abs_t || ((f ^ t) & kSign)) ? static_cast<Bits>(f - 1)
+                                             : static_cast<Bits>(f + 1);
+    return T(static_cast<unsigned short>(f), T::from_bits());
+}
+
+// The step in whatever width the buffers hold: Float32 and Float64 have one in
+// the library, the reduced widths are stepped bit by bit above.
+template <typename T>
+inline T step_toward(T from, T to) {
+    if constexpr (std::is_same_v<T, Half> || std::is_same_v<T, BFloat16>) {
+        return step_toward16(from, to);
+    } else {
+        return std::nextafter(from, to);
+    }
+}
+
+template <typename T>
+void nextafter_fill(const Tensor& ac, const Tensor& bc, Tensor& out) {
+    const T* ap = ac.data_ptr<T>();
+    const T* bp = bc.data_ptr<T>();
+    T* dp = out.data_ptr<T>();
+    const int64_t n = out.numel();
+    parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        for (int64_t i = begin; i < end; ++i) dp[i] = step_toward<T>(ap[i], bp[i]);
+    });
+}
+
+Tensor nextafter_kernel(const Tensor& a, const Tensor& b,
+                        const Tensor* destination = nullptr) {
+    if (a.device() != b.device()) {
+        TP_THROW(DeviceMismatchError, "nextafter", ": inputs must be on the same device");
+    }
+    // The step happens in the element dtype: one taken at Double rounds a
+    // Float32 value straight back to where it started once the answer narrows.
     std::vector<int64_t> out_shape = broadcast_shapes(
         static_cast<std::vector<int64_t>>(a.shape()),
         static_cast<std::vector<int64_t>>(b.shape()));
@@ -1145,24 +1056,50 @@ Tensor nextafter_cpu(const Tensor& a, const Tensor& b) {
     if (!isFloatingType(dt)) dt = DType::Float32;
     Tensor ac = a.to(dt).expand(out_shape).contiguous();
     Tensor bc = b.to(dt).expand(out_shape).contiguous();
-    Tensor out = Tensor::empty(out_shape, dt, a.device());
-    int64_t n = out.numel();
-    if (dt == DType::Float64) {
-        const double* ap = ac.data_ptr<double>();
-        const double* bp = bc.data_ptr<double>();
-        double* dp = out.data_ptr<double>();
-        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-            for (int64_t i = begin; i < end; ++i) dp[i] = std::nextafter(ap[i], bp[i]);
-        });
-    } else {
-        const float* ap = ac.data_ptr<float>();
-        const float* bp = bc.data_ptr<float>();
-        float* dp = out.data_ptr<float>();
-        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-            for (int64_t i = begin; i < end; ++i) dp[i] = std::nextafter(ap[i], bp[i]);
-        });
+    Tensor out = destination != nullptr
+                     ? *destination
+                     : Tensor::empty(out_shape, dt, a.device());
+    switch (dt) {
+        case DType::Float64: nextafter_fill<double>(ac, bc, out); break;
+        case DType::Float32: nextafter_fill<float>(ac, bc, out); break;
+        case DType::Float16: nextafter_fill<Half>(ac, bc, out); break;
+        case DType::BFloat16: nextafter_fill<BFloat16>(ac, bc, out); break;
+        default: TP_THROW(TypeError, "nextafter: unsupported dtype");
     }
     return out;
+}
+
+// Whether the stepping loop can fill the caller's tensor itself instead of
+// making one that is copied over afterwards.  Every float width is addressable
+// here -- the reduced ones step in their own layout -- so the destination only
+// has to be packed, carry the promoted width, hold the broadcast shape, and not
+// be a second window over the bytes the loop reads.
+static bool nextafter_takes(const Tensor& a, const Tensor& b, const Tensor& out) {
+    const DType lhs = a.dtype(), rhs = b.dtype();
+    if (isComplexType(lhs) || isComplexType(rhs) ||
+        isQuantizedType(lhs) || isQuantizedType(rhs)) {
+        return false;
+    }
+    DType dt = promoteTypes(lhs, rhs);
+    if (isComplexType(dt) || isQuantizedType(dt)) {
+        return false;
+    }
+    if (!isFloatingType(dt)) dt = DType::Float32;
+    const std::vector<int64_t> shape = broadcast_shapes(
+        static_cast<std::vector<int64_t>>(a.shape()),
+        static_cast<std::vector<int64_t>>(b.shape()));
+    return destination_takes_flat(out, a.device(), dt, shape, a, b);
+}
+
+Tensor nextafter_cpu(const Tensor& a, const Tensor& b) {
+    return nextafter_kernel(a, b);
+}
+Tensor& nextafter_out_cpu(const Tensor& a, const Tensor& b, Tensor& out) {
+    if (nextafter_takes(a, b, out)) {
+        nextafter_kernel(a, b, &out);
+        return out;
+    }
+    return write_out(out, nextafter_cpu(a, b));
 }
 // The three integer-pair maps are held once, by both the form that allocates
 // its answer and the form that is handed one.
@@ -1721,6 +1658,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, OpsKernels) {
     m.impl("hypot", hypot_cpu);
     m.impl("atan2", atan2_cpu);
     m.impl("nextafter", nextafter_cpu);
+    m.impl("nextafter.out", nextafter_out_cpu);
     m.impl("gcd", gcd_cpu);
     m.impl("lcm", lcm_cpu);
     m.impl("heaviside", heaviside_cpu);
