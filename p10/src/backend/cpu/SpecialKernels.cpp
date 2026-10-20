@@ -11,6 +11,8 @@
 
 #include <SpecialMath.h>
 
+#include "cpu/FloatMathLoops.h"
+
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -61,66 +63,14 @@ using tensorplay::special_math::shifted_chebyshev_polynomial_w_forward;
 using tensorplay::special_math::spherical_bessel_j0_forward;
 using tensorplay::special_math::zeta;
 
-template <typename F>  // F: double -> double
-Tensor float_math_kernel(const Tensor& self, F f, const char* name) {
-    DType in = self.dtype();
-    DType out_dt = isFloatingType(in) ? in : DType::Float32;
-    DType compute_dt = (in == DType::Float64) ? DType::Float64 : DType::Float32;
-    Tensor w = (self.dtype() == compute_dt) ? self.contiguous()
-                                            : self.to(compute_dt).contiguous();
-    Tensor t = Tensor::empty(static_cast<std::vector<int64_t>>(w.shape()), compute_dt, w.device());
-    int64_t n = w.numel();
-    if (compute_dt == DType::Float64) {
-        const double* sp = w.data_ptr<double>();
-        double* dp = t.data_ptr<double>();
-        parallel_for(0, n, GRAIN_SIZE, [&](int64_t b, int64_t e) {
-            for (int64_t i = b; i < e; ++i) dp[i] = f(sp[i]);
-        });
-    } else {
-        const float* sp = w.data_ptr<float>();
-        float* dp = t.data_ptr<float>();
-        parallel_for(0, n, GRAIN_SIZE, [&](int64_t b, int64_t e) {
-            for (int64_t i = b; i < e; ++i) dp[i] = static_cast<float>(f(sp[i]));
-        });
-    }
-    return (out_dt == compute_dt) ? t : t.to(out_dt);
-}
-
-template <typename F>  // F: (double,double) -> double
-Tensor binary_float_kernel(const Tensor& a_in, const Tensor& b_in, F f, const char* name) {
-    if (a_in.device() != b_in.device()) {
-        TP_THROW(DeviceMismatchError, name,
-                 ": inputs must be on the same device");
-    }
-    std::vector<int64_t> out_shape = broadcast_shapes(
-        static_cast<std::vector<int64_t>>(a_in.shape()),
-        static_cast<std::vector<int64_t>>(b_in.shape()));
-    DType dt = promoteTypes(a_in.dtype(), b_in.dtype());
-    if (!isFloatingType(dt)) dt = DType::Float32;
-    // Reduced-width inputs are evaluated in Float32 and narrowed once at the
-    // end; the loops below only ever address float or double buffers.
-    DType compute_dt = (dt == DType::Float64) ? DType::Float64 : DType::Float32;
-    Tensor ac = a_in.to(compute_dt).expand(out_shape).contiguous();
-    Tensor bc = b_in.to(compute_dt).expand(out_shape).contiguous();
-    Tensor out = Tensor::empty(out_shape, compute_dt, a_in.device());
-    int64_t n = out.numel();
-    if (compute_dt == DType::Float64) {
-        const double* ap = ac.data_ptr<double>();
-        const double* bp = bc.data_ptr<double>();
-        double* dp = out.data_ptr<double>();
-        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-            for (int64_t i = begin; i < end; ++i) dp[i] = f(ap[i], bp[i]);
-        });
-    } else {
-        const float* ap = ac.data_ptr<float>();
-        const float* bp = bc.data_ptr<float>();
-        float* dp = out.data_ptr<float>();
-        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-            for (int64_t i = begin; i < end; ++i) dp[i] = static_cast<float>(f(ap[i], bp[i]));
-        });
-    }
-    return (dt == compute_dt) ? out : out.to(dt);
-}
+// The flat loops that answer a float-math map, and the destination judgement
+// each makes, are shared with the arithmetic kernels in cpu/FloatMathLoops.h:
+// both evaluate in Float32 (Float64 for a double pair) and narrow once at the
+// end, so only a destination already holding that width takes the pass.
+using tensorplay::cpu::binary_float_kernel;
+using tensorplay::cpu::binary_float_out_kernel;
+using tensorplay::cpu::float_math_kernel;
+using tensorplay::cpu::float_math_out_kernel;
 
 // ---------------------------------------------------------------------------
 // Unary specials
@@ -294,22 +244,38 @@ Tensor gammaincc_cpu(const Tensor& a, const Tensor& x) {
         return calc_igammac(p, v);
     }, "gammaincc");
 }
-Tensor polygamma_cpu(int64_t n, const Tensor& x) {
+// The n-th derivative of the log-gamma, held by both the form that allocates
+// its answer and the form that is handed one: order 0 and order 1 have series
+// of their own, so the branch is part of the map rather than of the caller.
+struct PolygammaMap {
+    int64_t n;
+
+    double operator()(double v) const {
+        if (n == 0) return calc_digamma(v);
+        if (n == 1) return trigamma(v);
+        return calc_polygamma(v, static_cast<int>(n));
+    }
+};
+
+// An order the recurrence cannot be run for is refused by both spellings.
+static void require_polygamma_order(int64_t n) {
     if (n < 0) {
         TP_THROW(RuntimeError, "polygamma(n, x) does not support negative n");
     }
     if (n > std::numeric_limits<int>::max()) {
         TP_THROW(RuntimeError, "polygamma order is too large: ", n);
     }
-    if (n == 0) {
-        return float_math_kernel(x, [](double v) { return calc_digamma(v); }, "polygamma");
-    }
-    if (n == 1) {
-        return float_math_kernel(x, [](double v) { return trigamma(v); }, "polygamma");
-    }
-    return float_math_kernel(x, [n](double v) {
-        return calc_polygamma(v, static_cast<int>(n));
-    }, "polygamma");
+}
+
+Tensor polygamma_cpu(int64_t n, const Tensor& x) {
+    require_polygamma_order(n);
+    return float_math_kernel(x, PolygammaMap{n}, "polygamma");
+}
+Tensor& polygamma_out_cpu(int64_t n, const Tensor& x, Tensor& out) {
+    require_polygamma_order(n);
+    return float_math_out_kernel(
+        x, out, [n](const Tensor& v) { return polygamma_cpu(n, v); },
+        PolygammaMap{n}, "polygamma");
 }
 
 }  // namespace
@@ -320,15 +286,26 @@ namespace cpu {
 
 // Public names of the regularized incomplete gamma pair; the same
 // calc_igamma / calc_igammac implementations as gammainc / gammaincc.
+// One map each, held by both the form that allocates its answer and the form
+// that is handed one.
+struct IgammaPair {
+    double operator()(double a, double x) const { return calc_igamma(a, x); }
+};
+struct IgammacPair {
+    double operator()(double a, double x) const { return calc_igammac(a, x); }
+};
+
 Tensor igamma_cpu(const Tensor& a, const Tensor& x) {
-    return binary_float_kernel(a, x, [](double p, double v) {
-        return calc_igamma(p, v);
-    }, "igamma");
+    return binary_float_kernel(a, x, IgammaPair{}, "igamma");
+}
+Tensor& igamma_out_cpu(const Tensor& a, const Tensor& x, Tensor& out) {
+    return binary_float_out_kernel(a, x, out, igamma_cpu, IgammaPair{}, "igamma");
 }
 Tensor igammac_cpu(const Tensor& a, const Tensor& x) {
-    return binary_float_kernel(a, x, [](double p, double v) {
-        return calc_igammac(p, v);
-    }, "igammac");
+    return binary_float_kernel(a, x, IgammacPair{}, "igammac");
+}
+Tensor& igammac_out_cpu(const Tensor& a, const Tensor& x, Tensor& out) {
+    return binary_float_out_kernel(a, x, out, igammac_cpu, IgammacPair{}, "igammac");
 }
 
 // mantissa in [0.5, 1) (or exactly 0), exponent as int32; computed via
@@ -421,10 +398,13 @@ TENSORPLAY_LIBRARY_IMPL(CPU, SpecialKernels) {
     m.impl("gammainc", gammainc_cpu);
     m.impl("gammaincc", gammaincc_cpu);
     m.impl("polygamma", polygamma_cpu);
+    m.impl("polygamma.out", polygamma_out_cpu);
     // Public names of the regularized incomplete gamma pair; the
     // kernels are the same calc_igamma / calc_igammac implementations.
     m.impl("igamma", cpu::igamma_cpu);
     m.impl("igammac", cpu::igammac_cpu);
+    m.impl("igamma.out", cpu::igamma_out_cpu);
+    m.impl("igammac.out", cpu::igammac_out_cpu);
     m.impl("frexp", cpu::frexp_cpu);
 }
 
