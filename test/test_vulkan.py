@@ -7238,5 +7238,153 @@ class TestVulkanRepeatExpansion(unittest.TestCase):
             self._device(data).repeat_interleave(2, dim=4)
 
 
+class TestVulkanTake(unittest.TestCase):
+    """A flat lookup: every code names one entry of the payload's row-major
+    order, and the answer has the list's shape."""
+
+    @staticmethod
+    def _device(values):
+        return tensorplay.from_numpy(np.asarray(values)).to("vulkan")
+
+    def test_every_position_of_the_payload_is_reachable(self):
+        rng = np.random.default_rng(31)
+        payload = (rng.standard_normal((5, 8)) * 10).astype(np.float32)
+        flat = payload.reshape(-1)
+        codes = np.array([0, 7, 39, -1, -40], dtype=np.int64)
+        got = self._device(payload).take(self._device(codes)).cpu().numpy()
+        np.testing.assert_array_equal(got, flat[codes])
+
+    def test_the_answer_keeps_the_list_shape(self):
+        rng = np.random.default_rng(32)
+        payload = (rng.standard_normal((4, 6)) * 10).astype(np.float32)
+        codes = rng.integers(0, 24, (3, 2, 4))
+        got = tensorplay.take(self._device(payload), self._device(codes))
+        self.assertEqual(tuple(got.shape), (3, 2, 4))
+        np.testing.assert_array_equal(got.cpu().numpy(), payload.reshape(-1)[codes])
+
+    def test_a_narrow_list_and_a_wide_one_answer_alike(self):
+        rng = np.random.default_rng(33)
+        payload = (rng.standard_normal((7, 9)) * 10).astype(np.float32)
+        codes = rng.integers(0, 63, 40)
+        wide = self._device(codes.astype(np.int64))
+        narrow = self._device(codes.astype(np.int32))
+        np.testing.assert_array_equal(
+            self._device(payload).take(wide).cpu().numpy(),
+            payload.reshape(-1)[codes])
+        np.testing.assert_array_equal(
+            self._device(payload).take(narrow).cpu().numpy(),
+            payload.reshape(-1)[codes])
+
+    def test_a_half_payload_keeps_its_element_type(self):
+        rng = np.random.default_rng(34)
+        half = (rng.standard_normal((3, 5)) * 10).astype(np.float16)
+        got = self._device(half).take(self._device([1, 4, -1]))
+        np.testing.assert_array_equal(got.cpu().numpy(), half.reshape(-1)[[1, 4, -1]])
+        self.assertEqual(got.dtype, tensorplay.float16)
+
+    def test_a_list_with_no_positions_and_a_payload_with_no_entries(self):
+        payload = self._device(np.zeros((2, 3), np.float32) + 1.0)
+        empty = payload.take(self._device(np.zeros(0, np.int64)))
+        self.assertEqual(tuple(empty.shape), (0,))
+        self.assertEqual(empty.cpu().numpy().size, 0)
+        with self.assertRaisesRegex(RuntimeError, "empty tensor"):
+            tensorplay.take(self._device(np.zeros((0, 3), np.float32)),
+                            self._device([0]))
+
+    def test_a_long_list_over_a_wide_payload(self):
+        rng = np.random.default_rng(35)
+        table = np.arange(4096, dtype=np.float32)
+        codes = rng.integers(0, 4096, 900)
+        np.testing.assert_array_equal(
+            tensorplay.take(self._device(table), self._device(codes)).cpu().numpy(),
+            table[codes])
+        rows = (rng.standard_normal((4, 256)) * 10).astype(np.float32)
+        ids = rng.integers(0, 1024, (2, 3, 4))
+        np.testing.assert_array_equal(
+            tensorplay.take(self._device(rows.reshape(1024)), self._device(ids))
+            .cpu().numpy(),
+            rows.reshape(1024)[ids])
+
+    def test_a_view_is_read_as_it_shows(self):
+        rng = np.random.default_rng(36)
+        payload = (rng.standard_normal((5, 8)) * 10).astype(np.float32)
+        stepped = payload[:, ::2]
+        np.testing.assert_array_equal(
+            tensorplay.take(self._device(stepped), self._device([0, 3, -1]))
+            .cpu().numpy(),
+            stepped.reshape(-1)[[0, 3, -1]])
+
+    def test_a_code_naming_no_entry_contributes_a_zero(self):
+        # The row lookups of this backend answer a code outside the payload with
+        # a zero rather than a host round trip to find it.
+        payload = self._device(np.arange(6, dtype=np.float32) + 1.0)
+        np.testing.assert_array_equal(
+            payload.take(self._device([6, -7])).cpu().numpy(), [0.0, 0.0])
+
+    def test_a_list_that_does_not_count_refuses(self):
+        payload = self._device(np.zeros((3, 3), np.float32))
+        with self.assertRaisesRegex(RuntimeError, "Int32 or Int64"):
+            tensorplay.take(payload, self._device(np.array([1.0], np.float32)))
+
+
+class TestVulkanArgsort(unittest.TestCase):
+    """The permutation half of a selection: which row would be in which place."""
+
+    @staticmethod
+    def _device(values):
+        return tensorplay.from_numpy(np.asarray(values)).to("vulkan")
+
+    def _ordered(self, data, axis, descending=False):
+        got = self._device(data).argsort(dim=axis, descending=descending).cpu().numpy()
+        model = np.argsort(-data if descending else data,
+                           axis=axis, kind="stable")
+        np.testing.assert_array_equal(got, model, err_msg=f"argsort axis {axis}")
+        return got
+
+    def test_each_axis_of_a_row_is_ordered(self):
+        rng = np.random.default_rng(37)
+        data = (rng.standard_normal((5, 9)) * 10).astype(np.float32)
+        for axis in (0, 1, -1):
+            self._ordered(data, axis)
+            self._ordered(data, axis, descending=True)
+
+    def test_a_single_row_and_a_tall_payload(self):
+        rng = np.random.default_rng(38)
+        flat = (rng.standard_normal(45) * 10).astype(np.float32)
+        np.testing.assert_array_equal(
+            self._device(flat).argsort().cpu().numpy(),
+            np.argsort(flat, kind="stable"))
+        tall = (rng.standard_normal((2, 3, 4, 7)) * 10).astype(np.float32)
+        got = self._device(tall).argsort(dim=2)
+        self.assertEqual(tuple(got.shape), (2, 3, 4, 7))
+        np.testing.assert_array_equal(got.cpu().numpy(),
+                                      np.argsort(tall, axis=2, kind="stable"))
+
+    def test_a_row_longer_than_one_sort_tile(self):
+        rng = np.random.default_rng(39)
+        long = (rng.standard_normal((3, 5000)) * 10).astype(np.float32)
+        self._ordered(long, 1)
+        self._ordered(long, 1, descending=True)
+
+    def test_the_permutation_is_a_count_and_agrees_with_sort(self):
+        rng = np.random.default_rng(40)
+        data = (rng.standard_normal((6, 11)) * 10).astype(np.float32)
+        order = self._device(data).argsort(dim=1, descending=True)
+        self.assertEqual(order.dtype, tensorplay.int32)
+        values, indices = tensorplay.sort(self._device(data), dim=1, descending=True)
+        np.testing.assert_array_equal(order.cpu().numpy(), indices.cpu().numpy())
+        # Reading the row back in that order gives the sorted values.
+        np.testing.assert_array_equal(
+            tensorplay.gather(self._device(data), 1, order).cpu().numpy(),
+            values.cpu().numpy())
+
+    def test_an_axis_beyond_the_payload_refuses(self):
+        data = self._device(np.zeros((3, 4), np.float32))
+        with self.assertRaises(RuntimeError):
+            data.argsort(dim=4)
+        with self.assertRaisesRegex(RuntimeError, "Float32"):
+            self._device(np.zeros((3, 4), np.float16)).argsort(dim=1)
+
+
 if __name__ == "__main__":
     unittest.main()
