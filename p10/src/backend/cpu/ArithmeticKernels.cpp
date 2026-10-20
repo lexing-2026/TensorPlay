@@ -1743,12 +1743,74 @@ DType add_result_dtype(DType self_dtype, DType other_dtype,
     return result_dtype;
 }
 
-bool has_output_alias(const Tensor& out, const Tensor& input) {
-    auto out_impl = out.unsafeGetTensorImpl();
-    auto input_impl = input.unsafeGetTensorImpl();
-    return out_impl != nullptr && input_impl != nullptr &&
-           out_impl->storage().defined() && input_impl->storage().defined() &&
-           out_impl->storage().is_same(input_impl->storage());
+// The bytes a view actually reaches into its storage: every dimension's stride
+// times the elements it spans, plus the element at the base.  A packed storage
+// counts one byte per element, which over-claims the range -- the safe direction
+// for a question about whether two views touch the same memory.
+int64_t view_footprint_bytes(const Tensor& t) {
+    int64_t reach = 0;
+    for (int64_t d = 0; d < t.dim(); ++d) {
+        const int64_t len = t.size(d);
+        const int64_t step = t.stride(d);
+        reach += (len > 0 ? len - 1 : 0) * (step < 0 ? -step : step);
+    }
+    return (reach + 1) * static_cast<int64_t>(t.itemsize());
+}
+
+// Whether an operand that shares addresses with the destination keeps the fused
+// loop from writing in place.  Layouts that match element for element let the
+// loop write an element back to the address it was read from, so no value a
+// later iteration still needs is disturbed -- unless the destination spreads two
+// of its indices over one address, where the surviving value would depend on
+// which chunk wrote last.  Any other touch of the same bytes puts a write in
+// front of a read, and only a pass that finishes the result before storing it
+// answers that.
+bool in_place_alias_blocked(const Tensor& out, const Tensor& input) {
+    if (out.numel() == 0 || input.numel() == 0) {
+        return false;
+    }
+    if (out.dtype() == input.dtype() && out.dim() == input.dim() &&
+        out.data_ptr() == input.data_ptr()) {
+        for (int64_t d = 0; d < out.dim(); ++d) {
+            const int64_t len = out.size(d);
+            if (len != input.size(d) || out.stride(d) != input.stride(d) ||
+                (len > 1 && out.stride(d) == 0)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    const char* out_base = static_cast<const char*>(out.data_ptr());
+    const char* input_base = static_cast<const char*>(input.data_ptr());
+    return out_base < input_base + view_footprint_bytes(input) &&
+           input_base < out_base + view_footprint_bytes(out);
+}
+
+// Two views over one allocation, whatever the ranges they address.  This is the
+// test the general iterator runs before it will build, so a caller that hands it
+// a destination cannot claim a fused pass more widely than the iterator itself
+// would allow.
+bool shares_allocation(const Tensor& a, const Tensor& b) {
+    auto impl_a = a.unsafeGetTensorImpl();
+    auto impl_b = b.unsafeGetTensorImpl();
+    if (impl_a == nullptr || impl_b == nullptr) {
+        return false;
+    }
+    const auto& storage_a = impl_a->storage();
+    const auto& storage_b = impl_b->storage();
+    return storage_a.defined() && storage_b.defined() &&
+           storage_a.data() == storage_b.data() &&
+           storage_a.nbytes() == storage_b.nbytes();
+}
+
+// The iterator's guard accepts an operand that shares an allocation with the
+// destination only when the two are one and the same view.  Anything else has to
+// keep the pass that finishes the result before storing it, even when the two
+// address separate ranges.
+bool iterator_overlap_blocks(const Tensor& out, const Tensor& input) {
+    return in_place_alias_blocked(out, input) ||
+           (out.unsafeGetTensorImpl() != input.unsafeGetTensorImpl() &&
+            shares_allocation(out, input));
 }
 
 // The writer for a dense float pair that already has its destination.  Both
@@ -1762,7 +1824,8 @@ bool try_add_float_out(const Tensor& self, const Tensor& other,
         self.shape() != other.shape() || self.shape() != out.shape() ||
         !self.is_contiguous() || !other.is_contiguous() ||
         !out.is_contiguous() ||
-        has_output_alias(out, self) || has_output_alias(out, other)) {
+        in_place_alias_blocked(out, self) ||
+        in_place_alias_blocked(out, other)) {
         return false;
     }
 
@@ -1836,8 +1899,8 @@ bool try_add_narrow_out(const Tensor& self, const Tensor& other, Scalar alpha,
 #if defined(__x86_64__)
     if (!narrow_binary_pair(self, other) || out.dtype() != self.dtype() ||
         self.shape() != out.shape() || !out.is_contiguous() ||
-        alpha.isComplex() || has_output_alias(out, self) ||
-        has_output_alias(out, other)) {
+        alpha.isComplex() || in_place_alias_blocked(out, self) ||
+        in_place_alias_blocked(out, other)) {
         return false;
     }
     return narrow_binary_fill(
@@ -1851,7 +1914,8 @@ bool try_add_narrow_out(const Tensor& self, const Tensor& other, Scalar alpha,
 bool try_add_tensor_iterator_out(const Tensor& self, const Tensor& other,
                                  Scalar alpha, DType result_dtype,
                                  Tensor& out) {
-    if (has_output_alias(out, self) || has_output_alias(out, other)) {
+    if (iterator_overlap_blocks(out, self) ||
+        iterator_overlap_blocks(out, other)) {
         return false;
     }
 
