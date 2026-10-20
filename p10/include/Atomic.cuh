@@ -236,8 +236,16 @@ inline __device__ void gpuAtomicAdd(int64_t* address, int64_t val) {
 }
 
 inline __device__ tensorplay::Half gpuAtomicAdd(tensorplay::Half* address, tensorplay::Half val) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700)
+  // Hardware half reduction: one rounding step on the resolved sum, which is
+  // the same value the compare-and-swap loop below produces.
+  __half* slot = reinterpret_cast<__half*>(address);
+  const __half sum = atomicAdd(slot, *reinterpret_cast<const __half*>(&val));
+  return *reinterpret_cast<const tensorplay::Half*>(&sum);
+#else
   return AtomicFPOp<tensorplay::Half>()(
       address, val, [](tensorplay::Half hsum, tensorplay::Half val) { return hsum + val; });
+#endif
 }
 
 inline __device__ tensorplay::BFloat16 gpuAtomicAdd(

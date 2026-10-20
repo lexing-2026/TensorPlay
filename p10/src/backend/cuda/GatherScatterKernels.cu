@@ -284,29 +284,43 @@ __global__ void scatter_kernel(int64_t total_idx, int64_t idx_dim_size, int64_t 
 // it trades block count against per-thread run length.
 constexpr int kScatterContigMaxWork = 32;
 
-template <typename T, bool Add, typename IndexT>
+template <typename T, bool Add, typename IndexT, int Work>
 __global__ void scatter_contig_kernel(int64_t idx_dim_size, int64_t idx_inner,
                                       int64_t self_dim_size, int64_t self_inner,
-                                      int64_t work, T* d, const IndexT* ip,
-                                      const T* vp) {
+                                      T* d, const IndexT* ip, const T* vp) {
     const int64_t outer_off = blockIdx.z;
     const int64_t row_base = (outer_off * idx_dim_size + blockIdx.y) * idx_inner;
-    int64_t t = static_cast<int64_t>(blockIdx.x) * kContigThreads * work + threadIdx.x;
-#pragma unroll 8
-    for (int64_t k = 0; k < work; ++k) {
-        if (t < idx_inner) {
-            const int64_t flat = row_base + t;
-            int64_t idx = ip[flat];
+    const int64_t t0 =
+        static_cast<int64_t>(blockIdx.x) * kContigThreads * Work + threadIdx.x;
+    if constexpr (Add) {
+        // Stage the whole index strip before issuing the atomics: the scattered
+        // adds then overlap instead of each waiting on its own index load.
+        int64_t idxv[Work];
+#pragma unroll
+        for (int k = 0; k < Work; ++k) {
+            const int64_t t = t0 + static_cast<int64_t>(k) * kContigThreads;
+            if (t < idx_inner) idxv[k] = ip[row_base + t];
+        }
+#pragma unroll
+        for (int k = 0; k < Work; ++k) {
+            const int64_t t = t0 + static_cast<int64_t>(k) * kContigThreads;
+            if (t >= idx_inner) continue;
+            int64_t idx = idxv[k];
             if (idx < 0) idx += self_dim_size;
             const int64_t dst = (outer_off * self_dim_size + idx) * self_inner + t;
-            if constexpr (Add) {
-                if constexpr (scatter_add_supported_v<T>) {
-                    indexed_atomic_add(&d[dst], vp[flat]);
-                }
+            if constexpr (scatter_add_supported_v<T>) {
+                indexed_atomic_add(&d[dst], vp[row_base + t]);
             }
-            else d[dst] = vp[flat];
         }
-        t += kContigThreads;
+    } else {
+#pragma unroll
+        for (int k = 0; k < Work; ++k) {
+            const int64_t t = t0 + static_cast<int64_t>(k) * kContigThreads;
+            if (t >= idx_inner) continue;
+            int64_t idx = ip[row_base + t];
+            if (idx < 0) idx += self_dim_size;
+            d[(outer_off * self_dim_size + idx) * self_inner + t] = vp[row_base + t];
+        }
     }
 }
 
@@ -321,13 +335,23 @@ void launch_scatter_typed(bool contig, int64_t total_idx, int64_t outer,
         int64_t work = (idx_inner + kContigThreads - 1) / kContigThreads;
         if (work < kContigWork) work = kContigWork;
         if (work > kScatterContigMaxWork) work = kScatterContigMaxWork;
+        const int strip = work <= 8 ? 8 : (work <= 16 ? 16 : kScatterContigMaxWork);
         const dim3 grid(static_cast<unsigned>(
-                            (idx_inner + kContigThreads * work - 1) /
-                            (kContigThreads * work)),
+                            (idx_inner + kContigThreads * strip - 1) /
+                            (kContigThreads * strip)),
                         static_cast<unsigned>(idx_dim_size),
                         static_cast<unsigned>(outer));
-        scatter_contig_kernel<T, Add, IndexT><<<grid, kContigThreads, 0, stream>>>(
-            idx_dim_size, idx_inner, self_dim_size, self_inner, work, d, ip, vp);
+#define TP_SC_CONTIG(W) \
+        scatter_contig_kernel<T, Add, IndexT, W><<<grid, kContigThreads, 0, stream>>>( \
+            idx_dim_size, idx_inner, self_dim_size, self_inner, d, ip, vp)
+        if (strip == 8) {
+            TP_SC_CONTIG(8);
+        } else if (strip == 16) {
+            TP_SC_CONTIG(16);
+        } else {
+            TP_SC_CONTIG(kScatterContigMaxWork);
+        }
+#undef TP_SC_CONTIG
         return;
     }
     scatter_kernel<T, Add, IndexT><<<
