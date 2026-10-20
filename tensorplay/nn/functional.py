@@ -12,6 +12,7 @@ import tensorplay._C as _C
 from tensorplay._C import _add_docstr, DType
 from tensorplay import Tensor
 from tensorplay.graph import capture_call as _capture_call
+from tensorplay.graph import capturing as _capturing
 
 def threshold(
     input: Tensor,
@@ -23,11 +24,12 @@ def threshold(
 
     See :class:`~tensorplay.nn.Threshold` for more details.
     """
-    captured = _capture_call(
-        globals()["threshold"], (input, threshold, value), {"inplace": inplace}
-    )
-    if captured is not None:
-        return captured
+    if _capturing():
+        captured = _capture_call(
+            globals()["threshold"], (input, threshold, value), {"inplace": inplace}
+        )
+        if captured is not None:
+            return captured
     if inplace:
         result = _C.threshold_(input, threshold, value)
     else:
@@ -53,9 +55,10 @@ def silu(input: Tensor, inplace: bool = False) -> Tensor:
 
     See :class:`~tensorplay.nn.SiLU` for more details.
     """
-    captured = _capture_call(silu, (input,), {"inplace": inplace})
-    if captured is not None:
-        return captured
+    if _capturing():
+        captured = _capture_call(silu, (input,), {"inplace": inplace})
+        if captured is not None:
+            return captured
     if inplace:
         return tensorplay._C.silu_(input)
     return tensorplay._C.silu(input)
@@ -94,9 +97,10 @@ def linear(input: Tensor, weight: Tensor, bias: Optional[Tensor] = None) -> Tens
 
     See :class:`~tensorplay.nn.Linear` for more details.
     """
-    captured = _capture_call(linear, (input, weight, bias), {})
-    if captured is not None:
-        return captured
+    if _capturing():
+        captured = _capture_call(linear, (input, weight, bias), {})
+        if captured is not None:
+            return captured
 
     distributed = _distributed_tensor_types()
     if distributed is not None and any(
@@ -205,13 +209,14 @@ def bilinear(input1, input2, weight, bias=None):
     return output
 
 def relu(input, inplace=False):
-    captured = _capture_call(
-        relu,
-        (input,),
-        {"inplace": True} if inplace else {},
-    )
-    if captured is not None:
-        return captured
+    if _capturing():
+        captured = _capture_call(
+            relu,
+            (input,),
+            {"inplace": True} if inplace else {},
+        )
+        if captured is not None:
+            return captured
     if inplace:
         return _C.relu_(input)
     return _C.relu(input)
@@ -224,9 +229,10 @@ def softmax(input, dim=None, dtype=None):
     return input.softmax(dim, dtype)
 
 def log_softmax(input, dim=None, dtype=None):
-    captured = _capture_call(log_softmax, (input, dim, dtype), {})
-    if captured is not None:
-        return captured
+    if _capturing():
+        captured = _capture_call(log_softmax, (input, dim, dtype), {})
+        if captured is not None:
+            return captured
     if dim is None:
         dim = -1
     if dtype is None:
@@ -234,9 +240,10 @@ def log_softmax(input, dim=None, dtype=None):
     return _C.log_softmax(input, dim, dtype)
 
 def prelu(input, weight):
-    captured = _capture_call(prelu, (input, weight), {})
-    if captured is not None:
-        return captured
+    if _capturing():
+        captured = _capture_call(prelu, (input, weight), {})
+        if captured is not None:
+            return captured
     # PReLU(x) = max(0, x) + weight * min(0, x), one weight per channel (the
     # input's second axis).  The operator takes the weights as a flat list and
     # lays them along that axis itself.
@@ -254,9 +261,10 @@ def flatten(input, start_dim=0, end_dim=-1):
     return input.flatten(start_dim, end_dim)
 
 def embedding(input, weight, padding_idx=None, max_norm=None, norm_type=2.0, scale_grad_by_freq=False, sparse=False):
-    captured = _capture_call(embedding, (input, weight, padding_idx, max_norm, norm_type, scale_grad_by_freq, sparse), {})
-    if captured is not None:
-        return captured
+    if _capturing():
+        captured = _capture_call(embedding, (input, weight, padding_idx, max_norm, norm_type, scale_grad_by_freq, sparse), {})
+        if captured is not None:
+            return captured
     try:
         from tensorplay.distributed.tensor import DTensor, Shard
     except (ImportError, AttributeError):
@@ -312,9 +320,10 @@ def embedding(input, weight, padding_idx=None, max_norm=None, norm_type=2.0, sca
 # Add more functionals as needed
 
 def dropout(input, p=0.5, training=True, inplace=False):
-    captured = _capture_call(dropout, (input, p, training, inplace), {})
-    if captured is not None:
-        return captured
+    if _capturing():
+        captured = _capture_call(dropout, (input, p, training, inplace), {})
+        if captured is not None:
+            return captured
     if p < 0 or p > 1:
         raise ValueError("dropout probability has to be between 0 and 1, but got {}".format(p))
     if not training or p == 0:
@@ -485,9 +494,10 @@ def conv1d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
         stride = _single(stride)
         dilation = _single(dilation)
         input, padding = _conv_padding_mode(input, padding, stride, dilation, weight, 1)
-    captured = _capture_call(conv1d, (input, weight, bias, stride, padding, dilation, groups), {})
-    if captured is not None:
-        return captured
+    if _capturing():
+        captured = _capture_call(conv1d, (input, weight, bias, stride, padding, dilation, groups), {})
+        if captured is not None:
+            return captured
     stride = _single(stride)
     padding = _single(padding)
     dilation = _single(dilation)
@@ -525,13 +535,14 @@ def conv2d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
         input, padding = _conv_padding_mode(input, padding, stride, dilation, weight, 2)
     else:
         padding = _pair(padding)
-    captured = _capture_call(
-        conv2d,
-        (input, weight, bias, stride, padding, dilation, groups),
-        {},
-    )
-    if captured is not None:
-        return captured
+    if _capturing():
+        captured = _capture_call(
+            conv2d,
+            (input, weight, bias, stride, padding, dilation, groups),
+            {},
+        )
+        if captured is not None:
+            return captured
     if bias is None:
         bias = Tensor()
     return _C.conv2d(input, weight, bias, stride, padding, dilation, groups)
@@ -564,9 +575,10 @@ def conv3d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
         stride = _triple(stride)
         dilation = _triple(dilation)
         input, padding = _conv_padding_mode(input, padding, stride, dilation, weight, 3)
-    captured = _capture_call(conv3d, (input, weight, bias, stride, padding, dilation, groups), {})
-    if captured is not None:
-        return captured
+    if _capturing():
+        captured = _capture_call(conv3d, (input, weight, bias, stride, padding, dilation, groups), {})
+        if captured is not None:
+            return captured
     stride = _triple(stride)
     padding = _triple(padding)
     dilation = _triple(dilation)
@@ -575,9 +587,10 @@ def conv3d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
     return _C.conv3d(input, weight, bias, stride, padding, dilation, groups)
 
 def conv_transpose2d(input, weight, bias=None, stride=1, padding=0, output_padding=0, groups=1, dilation=1):
-    captured = _capture_call(conv_transpose2d, (input, weight, bias, stride, padding, output_padding, groups, dilation), {})
-    if captured is not None:
-        return captured
+    if _capturing():
+        captured = _capture_call(conv_transpose2d, (input, weight, bias, stride, padding, output_padding, groups, dilation), {})
+        if captured is not None:
+            return captured
     stride = _pair(stride)
     padding = _pair(padding)
     output_padding = _pair(output_padding)
@@ -643,13 +656,14 @@ def conv_tbc(input, weight, bias=None, pad=0):
 
 
 def max_pool2d(input, kernel_size, stride=None, padding=0, dilation=1, ceil_mode=False, return_indices=False):
-    captured = _capture_call(
-        max_pool2d,
-        (input, kernel_size, stride, padding, dilation, ceil_mode, return_indices),
-        {},
-    )
-    if captured is not None:
-        return captured
+    if _capturing():
+        captured = _capture_call(
+            max_pool2d,
+            (input, kernel_size, stride, padding, dilation, ceil_mode, return_indices),
+            {},
+        )
+        if captured is not None:
+            return captured
     if return_indices:
         return max_pool2d_with_indices(
             input, kernel_size, stride=stride, padding=padding,
@@ -667,9 +681,10 @@ def max_pool2d(input, kernel_size, stride=None, padding=0, dilation=1, ceil_mode
                          dilation, ceil_mode)
 
 def avg_pool2d(input, kernel_size, stride=None, padding=0, ceil_mode=False, count_include_pad=True, divisor_override=None):
-    captured = _capture_call(avg_pool2d, (input, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override), {})
-    if captured is not None:
-        return captured
+    if _capturing():
+        captured = _capture_call(avg_pool2d, (input, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override), {})
+        if captured is not None:
+            return captured
     kernel_size = _pair(kernel_size)
     if stride is None:
         stride = kernel_size
@@ -681,15 +696,17 @@ def avg_pool2d(input, kernel_size, stride=None, padding=0, ceil_mode=False, coun
 def adaptive_avg_pool2d(input, output_size):
     # output_size can be int or (int, int) or (None, int) etc.
     output_size = _pair(output_size)
-    captured = _capture_call(adaptive_avg_pool2d, (input, output_size), {})
-    if captured is not None:
-        return captured
+    if _capturing():
+        captured = _capture_call(adaptive_avg_pool2d, (input, output_size), {})
+        if captured is not None:
+            return captured
     return _C.adaptive_avg_pool2d(input, output_size)
 
 def adaptive_max_pool2d(input, output_size):
-    captured = _capture_call(adaptive_max_pool2d, (input, output_size), {})
-    if captured is not None:
-        return captured
+    if _capturing():
+        captured = _capture_call(adaptive_max_pool2d, (input, output_size), {})
+        if captured is not None:
+            return captured
     output_size = list(_pair(output_size))
     # Route through the (values, indices) op so autograd saves indices and the
     return _C.adaptive_max_pool2d_with_indices(input, output_size)[0]
@@ -697,26 +714,29 @@ def adaptive_max_pool2d(input, output_size):
 # Normalization functions
 
 def batch_norm(input, running_mean=None, running_var=None, weight=None, bias=None, training=False, momentum=0.1, eps=1e-5):
-    captured = _capture_call(
-        batch_norm,
-        (input, running_mean, running_var, weight, bias, training, momentum, eps),
-        {},
-    )
-    if captured is not None:
-        return captured
+    if _capturing():
+        captured = _capture_call(
+            batch_norm,
+            (input, running_mean, running_var, weight, bias, training, momentum, eps),
+            {},
+        )
+        if captured is not None:
+            return captured
     return _C.batch_norm(input, weight, bias, running_mean, running_var, training, momentum, eps)
 
 def layer_norm(input, normalized_shape, weight=None, bias=None, eps=1e-5):
-    captured = _capture_call(layer_norm, (input, normalized_shape, weight, bias, eps), {})
-    if captured is not None:
-        return captured
+    if _capturing():
+        captured = _capture_call(layer_norm, (input, normalized_shape, weight, bias, eps), {})
+        if captured is not None:
+            return captured
     normalized_shape = _single(normalized_shape)
     return _C.native_layer_norm(input, normalized_shape, weight, bias, eps)[0]
 
 def group_norm(input, num_groups, weight=None, bias=None, eps=1e-5):
-    captured = _capture_call(group_norm, (input, num_groups, weight, bias, eps), {})
-    if captured is not None:
-        return captured
+    if _capturing():
+        captured = _capture_call(group_norm, (input, num_groups, weight, bias, eps), {})
+        if captured is not None:
+            return captured
     if input.dim() < 2 or input.device.type != "cuda":
         return _C.group_norm(input, num_groups, weight, bias, eps)
     spatial = 1
@@ -728,18 +748,20 @@ def group_norm(input, num_groups, weight=None, bias=None, eps=1e-5):
     return output
 
 def instance_norm(input, running_mean=None, running_var=None, weight=None, bias=None, use_input_stats=True, momentum=0.1, eps=1e-5):
-    captured = _capture_call(instance_norm, (input, running_mean, running_var, weight, bias, use_input_stats, momentum, eps), {})
-    if captured is not None:
-        return captured
+    if _capturing():
+        captured = _capture_call(instance_norm, (input, running_mean, running_var, weight, bias, use_input_stats, momentum, eps), {})
+        if captured is not None:
+            return captured
     return _C.instance_norm(input, weight, bias, running_mean, running_var, use_input_stats, momentum, eps)
 
 def pad(input, pad, mode='constant', value=0):
     r"""Pads tensor.  ``pad`` values are described starting from the last
     dimension and may cover any suffix of the input dimensions.
     """
-    captured = _capture_call(globals()["pad"], (input, pad, mode, value), {})
-    if captured is not None:
-        return captured
+    if _capturing():
+        captured = _capture_call(globals()["pad"], (input, pad, mode, value), {})
+        if captured is not None:
+            return captured
     if mode == 'constant':
         return _C.constant_pad_nd(input, list(pad), value)
     ndim = input.dim()
@@ -760,9 +782,10 @@ def pad(input, pad, mode='constant', value=0):
 
 # Loss functions
 def mse_loss(input, target, reduction='mean'):
-    captured = _capture_call(mse_loss, (input, target, reduction), {})
-    if captured is not None:
-        return captured
+    if _capturing():
+        captured = _capture_call(mse_loss, (input, target, reduction), {})
+        if captured is not None:
+            return captured
     if not (target.size() == input.size()):
         print(f"Warning: Using a target size ({target.size()}) that is different to the input size ({input.size()}). "
               "This will likely lead to incorrect results due to broadcasting. "
@@ -791,9 +814,10 @@ def nll_loss(input, target, weight=None, size_average=None, ignore_index=-100,
 
     See :class:`~tensorplay.nn.NLLLoss` for details.
     """
-    captured = _capture_call(nll_loss, (input, target, weight, size_average, ignore_index, reduce, reduction), {})
-    if captured is not None:
-        return captured
+    if _capturing():
+        captured = _capture_call(nll_loss, (input, target, weight, size_average, ignore_index, reduce, reduction), {})
+        if captured is not None:
+            return captured
     if size_average is not None or reduce is not None:
         if size_average is None: size_average = True
         if reduce is None: reduce = True
@@ -843,9 +867,10 @@ def cross_entropy(input, target, weight=None, size_average=None, ignore_index=-1
 
     See :class:`~tensorplay.nn.CrossEntropyLoss` for details.
     """
-    captured = _capture_call(cross_entropy, (input, target, weight, size_average, ignore_index, reduce, reduction, label_smoothing), {})
-    if captured is not None:
-        return captured
+    if _capturing():
+        captured = _capture_call(cross_entropy, (input, target, weight, size_average, ignore_index, reduce, reduction, label_smoothing), {})
+        if captured is not None:
+            return captured
     if size_average is not None or reduce is not None:
         reduction = _legacy_get_string(size_average, reduce)
 
@@ -940,9 +965,10 @@ def gelu(input: Tensor, approximate: str = 'none') -> Tensor:
     When `approximate` is 'none', applies
     :math:`\text{GELU}(x) = x * \Phi(x)`; 'tanh' uses the tanh estimation.
     """
-    captured = _capture_call(gelu, (input,), {"approximate": approximate})
-    if captured is not None:
-        return captured
+    if _capturing():
+        captured = _capture_call(gelu, (input,), {"approximate": approximate})
+        if captured is not None:
+            return captured
     return tensorplay._C.gelu(self=input, approximate=approximate)
 
 
@@ -1135,9 +1161,10 @@ def interpolate(
 
     Routes to the native ``upsample_*`` ops exactly like
     """
-    captured = _capture_call(interpolate, (input, size, scale_factor, mode, align_corners, recompute_scale_factor, antialias), {})
-    if captured is not None:
-        return captured
+    if _capturing():
+        captured = _capture_call(interpolate, (input, size, scale_factor, mode, align_corners, recompute_scale_factor, antialias), {})
+        if captured is not None:
+            return captured
     if input.is_quantized():
         from tensorplay.ao.nn.quantized.functional import interpolate as quantized_interpolate
         return quantized_interpolate(input, size, scale_factor, mode, align_corners,
@@ -1717,9 +1744,10 @@ def avg_pool1d(
     Applies a 1D average pooling over an input signal composed of several
     input planes. Input shape ``(N, C, L)`` or unbatched ``(C, L)``.
     """
-    captured = _capture_call(avg_pool1d, (input, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override), {})
-    if captured is not None:
-        return captured
+    if _capturing():
+        captured = _capture_call(avg_pool1d, (input, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override), {})
+        if captured is not None:
+            return captured
     unbatched = input.dim() == 2
     x = input.unsqueeze(0) if unbatched else input
     k = _single(kernel_size)[0]
@@ -1747,9 +1775,10 @@ def max_pool1d(
     Applies a 1D max pooling over an input signal composed of several input
     planes. Input shape ``(N, C, L)`` or unbatched ``(C, L)``.
     """
-    captured = _capture_call(max_pool1d, (input, kernel_size, stride, padding, dilation, ceil_mode, return_indices), {})
-    if captured is not None:
-        return captured
+    if _capturing():
+        captured = _capture_call(max_pool1d, (input, kernel_size, stride, padding, dilation, ceil_mode, return_indices), {})
+        if captured is not None:
+            return captured
     if return_indices:
         return max_pool1d_with_indices(
             input, kernel_size, stride=stride, padding=padding,
@@ -1857,9 +1886,10 @@ def local_response_norm(
 
     See :class:`~tensorplay.nn.LocalResponseNorm` for details.
     """
-    captured = _capture_call(local_response_norm, (input, size, alpha, beta, k), {})
-    if captured is not None:
-        return captured
+    if _capturing():
+        captured = _capture_call(local_response_norm, (input, size, alpha, beta, k), {})
+        if captured is not None:
+            return captured
     dim = input.dim()
     if dim < 3:
         raise ValueError(
@@ -2264,9 +2294,10 @@ def one_hot(tensor: Tensor, num_classes: int = -1) -> Tensor:
 
     Returns long tensor shaped ``tensor.shape + (num_classes,)`` with a 1 at
     """
-    captured = _capture_call(one_hot, (tensor, num_classes), {})
-    if captured is not None:
-        return captured
+    if _capturing():
+        captured = _capture_call(one_hot, (tensor, num_classes), {})
+        if captured is not None:
+            return captured
     if num_classes < 0:
         if tensor.numel() == 0:
             raise RuntimeError("Cannot infer num classes from empty tensor")
@@ -2409,9 +2440,10 @@ def l1_loss(
     Function that takes the mean element-wise absolute value difference.
     See :class:`~tensorplay.nn.L1Loss` for details.
     """
-    captured = _capture_call(l1_loss, (input, target, size_average, reduce, reduction, weight), {})
-    if captured is not None:
-        return captured
+    if _capturing():
+        captured = _capture_call(l1_loss, (input, target, size_average, reduce, reduction, weight), {})
+        if captured is not None:
+            return captured
     if size_average is not None or reduce is not None:
         reduction = _legacy_get_string(size_average, reduce)
     if target.size() != input.size():
@@ -2807,14 +2839,15 @@ def ctc_loss(
         reduction: ``'none' | 'mean' | 'sum'``.
         zero_infinity: zero out infinite losses (targets too long for T).
     """
-    captured = _capture_call(
-        ctc_loss,
-        (log_probs, targets, input_lengths, target_lengths, blank, reduction,
-         zero_infinity),
-        {},
-    )
-    if captured is not None:
-        return captured
+    if _capturing():
+        captured = _capture_call(
+            ctc_loss,
+            (log_probs, targets, input_lengths, target_lengths, blank, reduction,
+             zero_infinity),
+            {},
+        )
+        if captured is not None:
+            return captured
     if log_probs.dim() == 2:
         log_probs = log_probs.unsqueeze(1)
         unbatched = True
@@ -2892,9 +2925,10 @@ def pixel_shuffle(input: Tensor, upscale_factor: int) -> Tensor:
 
     input[n, c*r^2 + i*r + j, h, w]``.
     """
-    captured = _capture_call(pixel_shuffle, (input, upscale_factor), {})
-    if captured is not None:
-        return captured
+    if _capturing():
+        captured = _capture_call(pixel_shuffle, (input, upscale_factor), {})
+        if captured is not None:
+            return captured
     r = int(upscale_factor)
     if input.dim() != 4:
         raise ValueError(f"pixel_shuffle expects 4D input, got {input.dim()}D")
@@ -2912,9 +2946,10 @@ def pixel_shuffle(input: Tensor, upscale_factor: int) -> Tensor:
 def pixel_unshuffle(input: Tensor, downscale_factor: int) -> Tensor:
     r"""Reverses the :func:`pixel_shuffle` transformation: ``(*, C, H x r,
     W x r) -> (*, C x r^2, H, W)``."""
-    captured = _capture_call(pixel_unshuffle, (input, downscale_factor), {})
-    if captured is not None:
-        return captured
+    if _capturing():
+        captured = _capture_call(pixel_unshuffle, (input, downscale_factor), {})
+        if captured is not None:
+            return captured
     r = int(downscale_factor)
     if input.dim() != 4:
         raise ValueError(f"pixel_unshuffle expects 4D input, got {input.dim()}D")
@@ -3341,14 +3376,15 @@ def embedding_bag(
     exclusion and ``max_norm`` renormalization.
     See :class:`tensorplay.nn.EmbeddingBag` for details.
     """
-    captured = _capture_call(
-        embedding_bag,
-        (input, weight, offsets, max_norm, norm_type, scale_grad_by_freq, mode,
-         sparse, per_sample_weights, include_last_offset, padding_idx),
-        {},
-    )
-    if captured is not None:
-        return captured
+    if _capturing():
+        captured = _capture_call(
+            embedding_bag,
+            (input, weight, offsets, max_norm, norm_type, scale_grad_by_freq, mode,
+             sparse, per_sample_weights, include_last_offset, padding_idx),
+            {},
+        )
+        if captured is not None:
+            return captured
     # Backward compatibility with the old (weight, input) argument order.
     if weight.dtype == DType.int64 and _is_float_dtype(input.dtype):
         warnings.warn(
@@ -4048,9 +4084,10 @@ def max_pool3d(
     Applies a 3D max pooling over an input signal composed of several input
     planes. Input shape ``(N, C, D, H, W)`` or unbatched ``(C, D, H, W)``.
     """
-    captured = _capture_call(max_pool3d, (input, kernel_size, stride, padding, dilation, ceil_mode, return_indices), {})
-    if captured is not None:
-        return captured
+    if _capturing():
+        captured = _capture_call(max_pool3d, (input, kernel_size, stride, padding, dilation, ceil_mode, return_indices), {})
+        if captured is not None:
+            return captured
     if return_indices:
         return max_pool3d_with_indices(
             input, kernel_size, stride=stride, padding=padding,
@@ -4103,9 +4140,10 @@ def avg_pool3d(
     Applies a 3D average pooling over an input signal composed of several
     input planes. Input shape ``(N, C, D, H, W)`` or unbatched ``(C, D, H, W)``.
     """
-    captured = _capture_call(avg_pool3d, (input, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override), {})
-    if captured is not None:
-        return captured
+    if _capturing():
+        captured = _capture_call(avg_pool3d, (input, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override), {})
+        if captured is not None:
+            return captured
     unbatched = input.dim() == 4
     x = input.unsqueeze(0) if unbatched else input
     kd, kh, kw = _triple(kernel_size)
