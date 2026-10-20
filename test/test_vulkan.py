@@ -2460,6 +2460,18 @@ class TestVulkanDtypeConversion(unittest.TestCase):
     # that no read-back reaches.
     LENGTHS = (128, 200003)
 
+    @staticmethod
+    def _bits(array):
+        # A Bool read-back may arrive as bytes or as a numpy bool and a half
+        # arrives as the pattern it is stored in, so the lanes are compared in
+        # the reading that names the bits rather than the one that interprets
+        # them.
+        if array.dtype == np.dtype(np.float16):
+            return array.view(np.uint16)
+        if array.dtype == np.dtype(np.bool_):
+            return array.astype(np.int8)
+        return array
+
     def _payload_cases(self, count):
         import tensorplay as tp
         rng = np.random.default_rng(31)
@@ -2583,13 +2595,108 @@ class TestVulkanDtypeConversion(unittest.TestCase):
 
     def test_conversion_rejects_pairs_without_a_kernel(self):
         import tensorplay as tp
-        # Two narrow types share no kernel: a conversion between them has to be
-        # refused instead of reading a byte lane as something else.
-        device = tensorplay.from_numpy(
-            np.arange(64, dtype=np.int8)).to("vulkan")
-        with self.assertRaisesRegex(
-                RuntimeError, "Unsupported Vulkan dtype conversion"):
-            device.to(tp.float16)
+        # A wide code carries the low bits single precision cannot hold, and a
+        # signed word carries more than a byte's worth of them, so a pair that
+        # needs those bits has no hop to answer it: it has to be refused
+        # instead of answering with a rounded value.
+        word = tensorplay.from_numpy(
+            np.arange(64, dtype=np.int32)).to("vulkan")
+        wide = tensorplay.from_numpy(
+            np.arange(64, dtype=np.int64)).to("vulkan")
+        for target in (tp.int8, tp.uint8):
+            with self.assertRaisesRegex(
+                    RuntimeError, "Unsupported Vulkan dtype conversion"):
+                word.to(target)
+        for target in (tp.int8, tp.uint8, tp.float16):
+            with self.assertRaisesRegex(
+                    RuntimeError, "Unsupported Vulkan dtype conversion"):
+                wide.to(target)
+
+    def test_a_pair_without_a_kernel_hops_through_single_precision(self):
+        import tensorplay as tp
+        # A byte-packed lane - a mask, a signed byte, a quantized code - and a
+        # half lane hold a value single precision represents exactly, so the
+        # pair that shares no kernel still has an answer: widen to the hub in
+        # the storage the payload already sits in, then narrow.  The long row
+        # lives in a buffer and the rank-4 block in an image, and the hop has to
+        # answer in both.
+        cases = [
+            (tp.bool, np.bool_, np.array([True, False, False, True])),
+            (tp.int8, np.int8,
+             np.array([0, -1, 127, -128, 5, -5, 100, -100], dtype=np.int8)),
+            (tp.uint8, np.uint8,
+             np.array([0, 1, 255, 128, 5, 7, 64, 200], dtype=np.uint8)),
+            (tp.float16, np.float16,
+             np.array([0.0, -0.0, 1.5, -2.75, 255.5, -129.0, 100.25, -0.5],
+                      dtype=np.float16)),
+        ]
+        targets = [(tp.bool, np.bool_), (tp.int8, np.int8), (tp.uint8, np.uint8),
+                   (tp.int32, np.int32), (tp.int64, np.int64),
+                   (tp.float16, np.float16), (tp.float32, np.float32)]
+        for dtype, np_dtype, values in cases:
+            for count in self.LENGTHS:
+                lane = np.resize(values, count).astype(np_dtype)
+                device = tensorplay.from_numpy(lane.copy()).to("vulkan")
+                for target, target_np in targets:
+                    np.testing.assert_array_equal(
+                        self._bits(device.to(target).cpu().numpy()),
+                        self._bits(lane.astype(target_np)),
+                        err_msg=f"{np_dtype.__name__} -> {target_np.__name__} "
+                                f"over {count} elements")
+            block = np.resize(values, 12).astype(np_dtype).reshape(1, 2, 2, 3)
+            device = tensorplay.from_numpy(block.copy()).to("vulkan")
+            for target, target_np in targets:
+                np.testing.assert_array_equal(
+                    self._bits(device.to(target).cpu().numpy()),
+                    self._bits(block.astype(target_np)),
+                    err_msg=f"{np_dtype.__name__} -> {target_np.__name__} "
+                            f"in an image")
+            # A hop is still one conversion: the answer keeps the shape the
+            # payload had and nothing else about it changes.
+            self.assertEqual(tuple(device.to(tp.float32).shape), (1, 2, 2, 3))
+
+    def test_the_wide_code_hops_for_the_zero_test_only(self):
+        import tensorplay as tp
+        # Rounding never moves a nonzero onto zero, so a wide code asked whether
+        # each lane is zero reaches the answer through single precision even
+        # where it holds bits the hub cannot name.
+        values = np.array(
+            [0, -1, 1, 255, -(2 ** 31), 2 ** 31, 2 ** 62, -(2 ** 62),
+             2 ** 24 + 1, 2 ** 24], dtype=np.int64)
+        for count in self.LENGTHS:
+            lane = np.resize(values, count).astype(np.int64)
+            device = tensorplay.from_numpy(lane.copy()).to("vulkan")
+            np.testing.assert_array_equal(
+                self._bits(device.to(tp.bool).cpu().numpy()),
+                self._bits(lane.astype(np.bool_)),
+                err_msg=f"int64 -> bool over {count} elements")
+        block = np.resize(values, 12).astype(np.int64).reshape(1, 2, 2, 3)
+        device = tensorplay.from_numpy(block.copy()).to("vulkan")
+        np.testing.assert_array_equal(
+            self._bits(device.to(tp.bool).cpu().numpy()),
+            self._bits(block.astype(np.bool_)),
+            err_msg="int64 -> bool in an image")
+        # The same code answered exactly by its own kernel keeps its reading.
+        np.testing.assert_array_equal(
+            device.to(tp.int32).cpu().numpy(), block.astype(np.int32),
+            err_msg="int64 -> int32 in an image")
+
+    def test_a_hop_answers_a_view_as_the_payload_it_shows(self):
+        import tensorplay as tp
+        # A view is read before it converts, so the hop answers the lanes the
+        # view shows rather than the storage behind it.
+        base = np.array(
+            [0.0, -0.0, 1.5, -2.75, 100.5, -100.5, 7.0, -8.5, 127.0, -128.0],
+            dtype=np.float16)
+        block = np.resize(base, 24).reshape(4, 6)
+        device = tensorplay.from_numpy(block.copy()).to("vulkan")
+        shown = device[:, 1::2]
+        for target, np_dtype in ((tp.int8, np.int8), (tp.int64, np.int64),
+                                 (tp.uint8, np.uint8)):
+            np.testing.assert_array_equal(
+                self._bits(shown.to(target).cpu().numpy()),
+                self._bits(block[:, 1::2].astype(np_dtype)),
+                err_msg=f"a strided half view read as {np_dtype.__name__}")
 
 
 class TestVulkanHalfComparison(unittest.TestCase):
@@ -4002,9 +4109,11 @@ class TestVulkanWidePayload(unittest.TestCase):
                 RuntimeError, "reductions support Float32 and Float16"):
             payload.sum()
         # A half payload packs two lanes into one word, so a wide code would need
-        # three of them and the two storages share no word boundary.
+        # three of them and the two storages share no word boundary.  The hop
+        # through single precision cannot answer either: it drops the bits above
+        # the low word the half narrows, so the pair names itself in the refusal.
         with self.assertRaisesRegex(
-                RuntimeError, "conversion from a wide payload"):
+                RuntimeError, "Unsupported Vulkan dtype conversion from Int64"):
             payload.to(tensorplay.float16)
 
     def test_views_of_a_wide_payload_move_whole_codes(self):
