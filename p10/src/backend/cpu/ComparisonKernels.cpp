@@ -384,6 +384,27 @@ DEFINE_CMP_SCALAR_OUT_KERNEL(gt)
 DEFINE_CMP_SCALAR_OUT_KERNEL(ge)
 #undef DEFINE_CMP_SCALAR_OUT_KERNEL
 
+// The long spellings answer from the same pass as their short counterparts: an
+// out variant here only forwards, so whatever the destination takes in one
+// spelling it takes in the other, and a quantized or complex operand meets the
+// same handling either way.
+#define DEFINE_CMP_OUT_ALIAS(NAME, TARGET)                                    \
+    Tensor& NAME##_tensor_out_kernel(const Tensor& self, const Tensor& other, \
+                                     Tensor& out) {                           \
+        return TARGET##_tensor_out_kernel(self, other, out);                  \
+    }                                                                         \
+    Tensor& NAME##_scalar_out_kernel(const Tensor& self, const Scalar& other, \
+                                     Tensor& out) {                           \
+        return TARGET##_scalar_out_kernel(self, other, out);                  \
+    }
+
+DEFINE_CMP_OUT_ALIAS(not_equal, ne)
+DEFINE_CMP_OUT_ALIAS(less, lt)
+DEFINE_CMP_OUT_ALIAS(less_equal, le)
+DEFINE_CMP_OUT_ALIAS(greater, gt)
+DEFINE_CMP_OUT_ALIAS(greater_equal, ge)
+#undef DEFINE_CMP_OUT_ALIAS
+
 template <typename Op>
 Tensor where_kernel_impl(const Tensor& condition, const Tensor& self,
                          const Tensor& other, Op op) {
@@ -663,6 +684,16 @@ TENSORPLAY_LIBRARY_IMPL(CPU, ComparisonKernels) {
     m.impl("gt.Scalar_out", gt_scalar_out_kernel);
     m.impl("ge.Tensor_out", ge_tensor_out_kernel);
     m.impl("ge.Scalar_out", ge_scalar_out_kernel);
+    m.impl("not_equal.Tensor_out", not_equal_tensor_out_kernel);
+    m.impl("not_equal.Scalar_out", not_equal_scalar_out_kernel);
+    m.impl("less.Tensor_out", less_tensor_out_kernel);
+    m.impl("less.Scalar_out", less_scalar_out_kernel);
+    m.impl("less_equal.Tensor_out", less_equal_tensor_out_kernel);
+    m.impl("less_equal.Scalar_out", less_equal_scalar_out_kernel);
+    m.impl("greater.Tensor_out", greater_tensor_out_kernel);
+    m.impl("greater.Scalar_out", greater_scalar_out_kernel);
+    m.impl("greater_equal.Tensor_out", greater_equal_tensor_out_kernel);
+    m.impl("greater_equal.Scalar_out", greater_equal_scalar_out_kernel);
 }
 
 } // namespace cpu

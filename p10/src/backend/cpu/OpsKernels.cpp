@@ -137,8 +137,12 @@ Tensor binary_bool_kernel(const Tensor& a_in, const Tensor& b_in, Pred pred, con
 }
 
 template <typename Pred>
-Tensor bool_unary_kernel(const Tensor& self, Pred pred, const char* name) {
-    Tensor out = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), DType::Bool, self.device());
+Tensor bool_unary_kernel(const Tensor& self, Pred pred, const char* name,
+                         const Tensor* destination = nullptr) {
+    Tensor out = destination != nullptr
+                     ? *destination
+                     : Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()),
+                                     DType::Bool, self.device());
     Tensor sc = self.contiguous();
     int64_t n = self.numel();
 #define TP_BU_CASE(ctype, name_) \
@@ -170,14 +174,16 @@ inline bool logical_truth_cpu(const complex<T>& value) {
 
 template <typename Pred>
 Tensor logical_binary_kernel(const Tensor& a_in, const Tensor& b_in, Pred pred,
-                             const char* name) {
+                             const char* name, const Tensor* destination = nullptr) {
     std::vector<int64_t> out_shape = broadcast_shapes(
         static_cast<std::vector<int64_t>>(a_in.shape()),
         static_cast<std::vector<int64_t>>(b_in.shape()));
     DType dt = promoteTypes(a_in.dtype(), b_in.dtype());
     Tensor ac = (a_in.dtype() == dt ? a_in : a_in.to(dt)).expand(out_shape).contiguous();
     Tensor bc = (b_in.dtype() == dt ? b_in : b_in.to(dt)).expand(out_shape).contiguous();
-    Tensor out = Tensor::empty(out_shape, DType::Bool, a_in.device());
+    Tensor out = destination != nullptr
+                     ? *destination
+                     : Tensor::empty(out_shape, DType::Bool, a_in.device());
     const int64_t n = out.numel();
 #define TP_LOGICAL_BIN_CASE(ctype, name_) \
     case DType::name_: { \
@@ -215,9 +221,12 @@ Tensor logical_binary_kernel(const Tensor& a_in, const Tensor& b_in, Pred pred,
 }
 
 template <typename Pred>
-Tensor logical_unary_kernel(const Tensor& self, Pred pred, const char* name) {
-    Tensor out = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()),
-                               DType::Bool, self.device());
+Tensor logical_unary_kernel(const Tensor& self, Pred pred, const char* name,
+                            const Tensor* destination = nullptr) {
+    Tensor out = destination != nullptr
+                     ? *destination
+                     : Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()),
+                                     DType::Bool, self.device());
     Tensor sc = self.contiguous();
     const int64_t n = self.numel();
 #define TP_LOGICAL_UNARY_CASE(ctype, name_) \
@@ -255,8 +264,12 @@ Tensor logical_unary_kernel(const Tensor& self, Pred pred, const char* name) {
 
 // Dtype-preserving unary (used by sgn, fix, negative, ...).
 template <typename F>
-Tensor dtype_unary_kernel(const Tensor& self, F f, const char* name) {
-    Tensor out = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
+Tensor dtype_unary_kernel(const Tensor& self, F f, const char* name,
+                          const Tensor* destination = nullptr) {
+    Tensor out = destination != nullptr
+                     ? *destination
+                     : Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()),
+                                     self.dtype(), self.device());
     Tensor sc = self.contiguous();
     int64_t n = self.numel();
 #define TP_DU_CASE(ctype, name_) \
@@ -341,6 +354,106 @@ Tensor& float_math_out_kernel(const Tensor& self, Tensor& out,
     }
     return write_out(out, allocating(self));
 }
+
+// The same handoff for the loops that answer with one byte per element, and for
+// the one that answers in the operand's own width.  A destination takes the pass
+// when it is packed, holds the broadcast shape the flags come at in the width the
+// loop writes, and is not a second window over the bytes the loop reads.
+template <typename Pred>
+Tensor& bool_unary_out_kernel(const Tensor& self, Tensor& out,
+                              Tensor (*allocating)(const Tensor&), Pred pred,
+                              const char* name) {
+    if (destination_takes_flat(out, self.device(), DType::Bool,
+                               static_cast<std::vector<int64_t>>(self.shape()),
+                               self)) {
+        bool_unary_kernel(self, pred, name, &out);
+        return out;
+    }
+    return write_out(out, allocating(self));
+}
+
+template <typename Pred>
+Tensor& logical_unary_out_kernel(const Tensor& self, Tensor& out,
+                                 Tensor (*allocating)(const Tensor&), Pred pred,
+                                 const char* name) {
+    if (destination_takes_flat(out, self.device(), DType::Bool,
+                               static_cast<std::vector<int64_t>>(self.shape()),
+                               self)) {
+        logical_unary_kernel(self, pred, name, &out);
+        return out;
+    }
+    return write_out(out, allocating(self));
+}
+
+template <typename Pred>
+Tensor& logical_binary_out_kernel(const Tensor& self, const Tensor& other, Tensor& out,
+                                 Tensor (*allocating)(const Tensor&, const Tensor&),
+                                 Pred pred, const char* name) {
+    const std::vector<int64_t> shape = broadcast_shapes(
+        static_cast<std::vector<int64_t>>(self.shape()),
+        static_cast<std::vector<int64_t>>(other.shape()));
+    if (destination_takes_flat(out, self.device(), DType::Bool, shape, self, other)) {
+        logical_binary_kernel(self, other, pred, name, &out);
+        return out;
+    }
+    return write_out(out, allocating(self, other));
+}
+
+// A map that keeps the operand's width: the destination has to be packed, that
+// width, and not a second window over the bytes the loop reads.
+template <typename F>
+Tensor& dtype_unary_out_kernel(const Tensor& self, Tensor& out,
+                               Tensor (*allocating)(const Tensor&), F f,
+                               const char* name) {
+    const DType in = self.dtype();
+    if (!isComplexType(in) && !isQuantizedType(in) &&
+        destination_takes_flat(out, self.device(), in,
+                               static_cast<std::vector<int64_t>>(self.shape()), self)) {
+        dtype_unary_kernel(self, f, name, &out);
+        return out;
+    }
+    return write_out(out, allocating(self));
+}
+
+struct SgnScalar {
+    template <typename T>
+    T operator()(T x) const {
+        double d = static_cast<double>(x);
+        if (d != d) return static_cast<T>(x);           // NaN passthrough
+        if (d > 0) return static_cast<T>(1);
+        if (d < 0) return static_cast<T>(-1);
+        return static_cast<T>(0);
+    }
+};
+
+struct SignbitPredicate {
+    template <typename T>
+    bool operator()(T x) const { return static_cast<double>(x) < 0.0; }
+};
+struct IsNeginfPredicate {
+    template <typename T>
+    bool operator()(T x) const {
+        return static_cast<double>(x) == -std::numeric_limits<double>::infinity();
+    }
+};
+struct IsPosinfPredicate {
+    template <typename T>
+    bool operator()(T x) const {
+        return static_cast<double>(x) == std::numeric_limits<double>::infinity();
+    }
+};
+struct LogicalNotPredicate {
+    bool operator()(bool x) const { return !x; }
+};
+struct LogicalAndPredicate {
+    bool operator()(bool x, bool y) const { return x && y; }
+};
+struct LogicalOrPredicate {
+    bool operator()(bool x, bool y) const { return x || y; }
+};
+struct LogicalXorPredicate {
+    bool operator()(bool x, bool y) const { return x != y; }
+};
 
 struct ReciprocalScalar {
     double operator()(double x) const { return 1.0 / x; }
@@ -647,21 +760,38 @@ Tensor not_equal_cpu(const Tensor& a, const Tensor& b) {
     return binary_bool_kernel(a, b, [](auto x, auto y) { return x != y; }, "not_equal");
 }
 Tensor signbit_cpu(const Tensor& self) {
-    return bool_unary_kernel(self, [](auto x) {
-        return static_cast<double>(x) < 0.0;
-    }, "signbit");
+    return bool_unary_kernel(self, SignbitPredicate{}, "signbit");
+}
+Tensor& signbit_out_cpu(const Tensor& self, Tensor& out) {
+    return bool_unary_out_kernel(self, out, signbit_cpu, SignbitPredicate{}, "signbit");
 }
 Tensor logical_not_cpu(const Tensor& self) {
-    return logical_unary_kernel(self, [](bool x) { return !x; }, "logical_not");
+    return logical_unary_kernel(self, LogicalNotPredicate{}, "logical_not");
+}
+Tensor& logical_not_out_cpu(const Tensor& self, Tensor& out) {
+    return logical_unary_out_kernel(self, out, logical_not_cpu,
+                                    LogicalNotPredicate{}, "logical_not");
 }
 Tensor logical_and_cpu(const Tensor& a, const Tensor& b) {
-    return logical_binary_kernel(a, b, [](bool x, bool y) { return x && y; }, "logical_and");
+    return logical_binary_kernel(a, b, LogicalAndPredicate{}, "logical_and");
+}
+Tensor& logical_and_out_cpu(const Tensor& a, const Tensor& b, Tensor& out) {
+    return logical_binary_out_kernel(a, b, out, logical_and_cpu,
+                                     LogicalAndPredicate{}, "logical_and");
 }
 Tensor logical_or_cpu(const Tensor& a, const Tensor& b) {
-    return logical_binary_kernel(a, b, [](bool x, bool y) { return x || y; }, "logical_or");
+    return logical_binary_kernel(a, b, LogicalOrPredicate{}, "logical_or");
+}
+Tensor& logical_or_out_cpu(const Tensor& a, const Tensor& b, Tensor& out) {
+    return logical_binary_out_kernel(a, b, out, logical_or_cpu,
+                                     LogicalOrPredicate{}, "logical_or");
 }
 Tensor logical_xor_cpu(const Tensor& a, const Tensor& b) {
-    return logical_binary_kernel(a, b, [](bool x, bool y) { return x != y; }, "logical_xor");
+    return logical_binary_kernel(a, b, LogicalXorPredicate{}, "logical_xor");
+}
+Tensor& logical_xor_out_cpu(const Tensor& a, const Tensor& b, Tensor& out) {
+    return logical_binary_out_kernel(a, b, out, logical_xor_cpu,
+                                     LogicalXorPredicate{}, "logical_xor");
 }
 Tensor isfinite_cpu(const Tensor& self) {
     return bool_unary_kernel(self, [](auto x) {
@@ -687,14 +817,16 @@ Tensor isnan_cpu(const Tensor& self) {
     }, "isnan");
 }
 Tensor isneginf_cpu(const Tensor& self) {
-    return bool_unary_kernel(self, [](auto x) {
-        return static_cast<double>(x) == -std::numeric_limits<double>::infinity();
-    }, "isneginf");
+    return bool_unary_kernel(self, IsNeginfPredicate{}, "isneginf");
+}
+Tensor& isneginf_out_cpu(const Tensor& self, Tensor& out) {
+    return bool_unary_out_kernel(self, out, isneginf_cpu, IsNeginfPredicate{}, "isneginf");
 }
 Tensor isposinf_cpu(const Tensor& self) {
-    return bool_unary_kernel(self, [](auto x) {
-        return static_cast<double>(x) == std::numeric_limits<double>::infinity();
-    }, "isposinf");
+    return bool_unary_kernel(self, IsPosinfPredicate{}, "isposinf");
+}
+Tensor& isposinf_out_cpu(const Tensor& self, Tensor& out) {
+    return bool_unary_out_kernel(self, out, isposinf_cpu, IsPosinfPredicate{}, "isposinf");
 }
 
 // ===========================================================================
@@ -725,14 +857,10 @@ Tensor sgn_cpu(const Tensor& self) {
             return z / std::hypot(z.real(), z.imag());
         });
     }
-    return dtype_unary_kernel(self, [](auto x) -> decltype(x) {
-        using T = decltype(x);
-        double d = static_cast<double>(x);
-        if (d != d) return static_cast<T>(x);           // NaN passthrough
-        if (d > 0) return static_cast<T>(1);
-        if (d < 0) return static_cast<T>(-1);
-        return static_cast<T>(0);
-    }, "sgn");
+    return dtype_unary_kernel(self, SgnScalar{}, "sgn");
+}
+Tensor& sgn_out_cpu(const Tensor& self, Tensor& out) {
+    return dtype_unary_out_kernel(self, out, sgn_cpu, SgnScalar{}, "sgn");
 }
 Tensor exp2_cpu(const Tensor& self) {
     return float_math_kernel(self, Exp2Scalar{}, "exp2");
@@ -1391,14 +1519,22 @@ TENSORPLAY_LIBRARY_IMPL(CPU, OpsKernels) {
     m.impl("logical_and", logical_and_cpu);
     m.impl("logical_or", logical_or_cpu);
     m.impl("logical_xor", logical_xor_cpu);
+    m.impl("signbit.out", signbit_out_cpu);
+    m.impl("logical_not.out", logical_not_out_cpu);
+    m.impl("logical_and.out", logical_and_out_cpu);
+    m.impl("logical_or.out", logical_or_out_cpu);
+    m.impl("logical_xor.out", logical_xor_out_cpu);
     m.impl("isfinite", isfinite_cpu);
     m.impl("isinf", isinf_cpu);
     m.impl("isnan", isnan_cpu);
     m.impl("isneginf", isneginf_cpu);
     m.impl("isposinf", isposinf_cpu);
+    m.impl("isneginf.out", isneginf_out_cpu);
+    m.impl("isposinf.out", isposinf_out_cpu);
     // Math
     m.impl("reciprocal", reciprocal_cpu);
     m.impl("sgn", sgn_cpu);
+    m.impl("sgn.out", sgn_out_cpu);
     m.impl("exp2", exp2_cpu);
     m.impl("sinc", sinc_cpu);
     m.impl("deg2rad", deg2rad_cpu);
