@@ -61,13 +61,8 @@ def _fused_rope_neox_applies(tensor: Tensor, cos: Tensor, sin: Tensor) -> bool:
     width = tensor.size(-1)
     if width == 0 or width % 2 != 0:
         return False
-    if cos.dim() != 3 or sin.dim() != 3:
-        return False
-    if cos.size(0) != tensor.size(0) or sin.size(0) != tensor.size(0):
-        return False
-    if cos.size(1) != tensor.size(2) or sin.size(1) != tensor.size(2):
-        return False
-    if cos.size(2) != width // 2 or sin.size(2) != width // 2:
+    batch, _heads, tokens, _width = tensor.shape
+    if cos.shape != (batch, tokens, width // 2) or sin.shape != cos.shape:
         return False
     if cos.dtype != sin.dtype or cos.dtype not in _FUSED_ROPE_DTYPES:
         return False

@@ -3552,10 +3552,18 @@ def _grouped_heads_expandable(query, key, value) -> bool:
 def _grouped_scaled_dot_product_attention(query, key, value, is_causal):
     # Each key head serves a contiguous block of query heads, which is the
     # mapping the composed path makes; the expansion reproduces it, so the
-    # two routes answer the same question with the same numbers.
+    # two routes answer the same question with the same numbers.  The
+    # repeated axis gains a companion axis and the block above and below it
+    # fold into a pair of counts, so the copy happens once.
     groups = query.size(1) // key.size(1)
-    key = key.repeat_interleave(groups, dim=1)
-    value = value.repeat_interleave(groups, dim=1)
+    shape = list(key.shape)
+    key = key.unsqueeze(2).expand(
+        shape[0], shape[1], groups, *shape[2:]).reshape(
+            shape[0], shape[1] * groups, *shape[2:])
+    shape = list(value.shape)
+    value = value.unsqueeze(2).expand(
+        shape[0], shape[1], groups, *shape[2:]).reshape(
+            shape[0], shape[1] * groups, *shape[2:])
     return _plain_scaled_dot_product_attention(query, key, value, is_causal)
 
 
