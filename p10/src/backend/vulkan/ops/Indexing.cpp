@@ -10,6 +10,7 @@
 
 #include <Utils.h>
 
+#include <algorithm>
 #include <limits>
 #include <optional>
 
@@ -506,6 +507,227 @@ Tensor& index_copy__kernel(Tensor& self, int64_t dim, const Tensor& index, const
 Tensor index_copy_kernel(const Tensor& self, int64_t dim, const Tensor& index, const Tensor& source) {
   Tensor out = self.clone();
   index_copy_rows_inplace(out, dim, index, source);
+  return out;
+}
+
+// Adds every source row into the destination row the same entry of the index
+// payload names, along any axis.  Where a code repeats, its rows are added one
+// after another in the order the list states them.
+Tensor& index_add_rows_inplace(
+    Tensor& self,
+    int64_t dim,
+    const Tensor& index,
+    const Tensor& source) {
+  NoGradGuard no_grad;
+  TP_CHECK(
+      self.device().is_vulkan() && source.device().is_vulkan(),
+      "Vulkan index_add_: both tensors must be on the device");
+  const int64_t rank = self.dim();
+  const int64_t wrapped = dim < 0 ? dim + rank : dim;
+  TP_CHECK(
+      wrapped >= 0 && wrapped < rank,
+      "Vulkan index_add_: dimension out of range");
+  TP_CHECK(
+      index.dim() < 2,
+      "Vulkan index_add_: index must be a vector or a single code");
+  TP_CHECK(
+      source.dim() == rank,
+      "Vulkan index_add_: source and destination must have the same rank");
+  TP_CHECK(
+      self.dtype() == DType::Float32 || self.dtype() == DType::Float16,
+      "Vulkan index_add_: Float32 and Float16 only");
+  TP_CHECK(
+      source.dtype() == self.dtype(),
+      "Vulkan index_add_: source dtype must match the destination");
+  TP_CHECK(
+      index.dtype() == DType::Int64 || index.dtype() == DType::Int32,
+      "Vulkan index_add_: index must be Int64 or Int32");
+
+  if (self.numel() == 0 || index.numel() == 0) {
+    return self;
+  }
+
+  const int64_t rows = self.size(wrapped);
+  const int64_t n_idx = index.numel();
+  int64_t planes = 1;
+  int64_t width = 1;
+  for (int64_t axis = 0; axis < wrapped; ++axis) {
+    planes *= self.size(axis);
+  }
+  for (int64_t axis = wrapped + 1; axis < rank; ++axis) {
+    width *= self.size(axis);
+  }
+  TP_CHECK(
+      source.size(wrapped) == n_idx,
+      "Vulkan index_add_: source rows must match the index length");
+  for (int64_t axis = 0; axis < rank; ++axis) {
+    TP_CHECK(
+        axis == wrapped || source.size(axis) == self.size(axis),
+        "Vulkan index_add_: source must match off-axis sizes");
+  }
+  // Both walks address elements as signed words of a group, so neither payload
+  // may pass the range that arithmetic represents.
+  TP_CHECK(
+      self.numel() <= std::numeric_limits<int32_t>::max() &&
+          source.numel() <= std::numeric_limits<int32_t>::max(),
+      "Vulkan index_add_: a payload holds more than two billion elements");
+
+  api::Context* const context = api::context();
+  api::vTensor v_self = convert(self);
+  api::vTensor v_source = convert(source);
+
+  const bool image_destination =
+      v_self.storage_type() != api::StorageType::BUFFER;
+  api::vTensor v_indices = upload_index_payload(
+      index,
+      image_destination ? api::StorageType::TEXTURE_3D
+                        : api::StorageType::BUFFER);
+
+  // The texel walk reads a destination row through the texture's y extent, so
+  // it serves an axis just above the last one of a payload whose list and rows
+  // both have a texel form.  Every other case accumulates in linear storage.
+  const bool texel_walk =
+      image_destination && rank >= 2 && wrapped == rank - 2 &&
+      v_indices.storage_type() != api::StorageType::BUFFER &&
+      image_storage_supported(
+          context, static_cast<std::vector<int64_t>>(source.shape()));
+
+  // The payload that owns the source's texels has to outlive the dispatch that
+  // reads them.
+  Tensor source_image;
+  if (texel_walk) {
+    if (v_source.storage_type() == api::StorageType::BUFFER) {
+      const std::vector<int64_t> source_sizes(
+          static_cast<std::vector<int64_t>>(source.shape()));
+      source_image = materialize_view(
+          source,
+          source_sizes,
+          SizesAndStrides::compute_contiguous_strides(source_sizes),
+          0);
+      v_source = convert(source_image);
+    }
+
+    const struct IndexAddBlock final {
+      ivec4 extents; // (texel width, destination rows, texel planes, unused)
+      int n_idx;
+      int fill;
+      int fill2;
+      int fill3;
+    } block{
+        ivec4(
+            static_cast<int32_t>(v_self.extents()[0u]),
+            static_cast<int32_t>(v_self.extents()[1u]),
+            static_cast<int32_t>(v_self.extents()[2u]),
+            0),
+        static_cast<int32_t>(n_idx),
+        0,
+        0,
+        0,
+    };
+
+    api::UniformParamsBuffer params(context, block);
+    api::PipelineBarrier pipeline_barrier{};
+    const api::utils::uvec3 grid{
+        v_self.extents()[0u],
+        safe_downcast_to_u32(rows),
+        v_self.extents()[2u],
+    };
+    context->submit_compute_job(
+        kernel_for("index_add", self.dtype()),
+        pipeline_barrier,
+        grid,
+        adaptive_work_group_size(grid),
+        VK_NULL_HANDLE,
+        v_self.image(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::READ | api::MemoryAccessType::WRITE),
+        v_source.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+        v_indices.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+        params.buffer());
+    return self;
+  }
+
+  // A destination that came out of an image keeps its own storage: the
+  // accumulation runs on a dense copy of it, which travels back through the
+  // copy kernel once the rows are totalled.
+  api::vTensor v_target = image_destination
+      ? to_buffer_storage_dispatch(context, v_self)
+      : v_self;
+  v_source = to_buffer_storage_dispatch(context, v_source);
+  v_indices = to_buffer_storage_dispatch(context, v_indices);
+
+  const uint32_t nf4 = static_cast<uint32_t>((width + 3) / 4);
+  const int64_t invocations = planes * rows * static_cast<int64_t>(nf4);
+  TP_CHECK(
+      invocations <= std::numeric_limits<int32_t>::max(),
+      "Vulkan index_add_: the row walk needs more than two billion "
+      "invocations");
+  // One group of lanes reads the list once, so a walk of this shape costs that
+  // many passes; naming the ceiling keeps a call whose destination and list are
+  // both long from stalling the queue instead of answering.
+  const int64_t passes = (invocations + 255) / 256;
+  TP_CHECK(
+      n_idx <= (int64_t(1) << 28) / std::max<int64_t>(passes, 1),
+      "Vulkan index_add_: this walk would read the list past the budget the "
+      "device gives it");
+  const uint32_t n = static_cast<uint32_t>(invocations);
+  const struct IndexAddBufferBlock {
+    int32_t planes;
+    int32_t rows;
+    int32_t width;
+    int32_t n_idx;
+  } block{
+      static_cast<int32_t>(planes),
+      static_cast<int32_t>(rows),
+      static_cast<int32_t>(width),
+      static_cast<int32_t>(n_idx),
+  };
+  api::UniformParamsBuffer params(context, block);
+  api::PipelineBarrier pipeline_barrier{};
+  context->submit_compute_job(
+      VK_KERNEL_FROM_STR(self.dtype() == DType::Float16
+                             ? "index_add_buffer_half"
+                             : "index_add_buffer"),
+      pipeline_barrier,
+      {n, 1u, 1u},
+      {256u, 1u, 1u},
+      VK_NULL_HANDLE,
+      v_target.buffer(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::READ | api::MemoryAccessType::WRITE),
+      v_source.buffer(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::READ),
+      v_indices.buffer(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::READ),
+      params.buffer());
+  if (image_destination) {
+    Tensor carried = convert(v_target);
+    self.copy_(carried);
+  }
+  return self;
+}
+
+Tensor& index_add__kernel(
+    Tensor& self,
+    int64_t dim,
+    const Tensor& index,
+    const Tensor& source) {
+  return index_add_rows_inplace(self, dim, index, source);
+}
+
+Tensor index_add_kernel(
+    const Tensor& self,
+    int64_t dim,
+    const Tensor& index,
+    const Tensor& source) {
+  Tensor out = self.clone();
+  index_add_rows_inplace(out, dim, index, source);
   return out;
 }
 
@@ -1281,16 +1503,15 @@ Tensor& index_put_impl__kernel(
     bool accumulate,
     bool unsafe) {
   (void)unsafe;
-  // Adding would fold the rows several codes name into one destination row,
-  // which needs an atomic the float payloads of this backend do not carry.
-  TP_CHECK(
-      !accumulate,
-      "Vulkan index_put_: adding into the rows a list of codes names is not "
-      "answered on the device");
   const int64_t axis = checked_code_axis(self, indices, "index_put_");
   if (axis < 0) {
-    // The whole payload is named, so the write is a plain transfer.
-    self.copy_(values);
+    // The whole payload is named, so the write is a plain transfer; adding
+    // hands the whole payload to the elementwise sum.
+    if (accumulate) {
+      tpx::ops::add_(self, values, 1.0);
+    } else {
+      self.copy_(values);
+    }
     return self;
   }
   const Tensor codes = *indices[static_cast<size_t>(axis)];
@@ -1313,6 +1534,13 @@ Tensor& index_put_impl__kernel(
     // repeats are written out before the scatter walks them.
     source = tpx::ops::clone(tpx::ops::expand(source, source_sizes, false));
   }
+  if (accumulate) {
+    // Several codes may name one row; the walk adds those rows one after
+    // another instead of letting the last of them stand alone.
+    index_add_rows_inplace(
+        self, axis, codes.reshape({codes.numel()}), source);
+    return self;
+  }
   index_copy_rows_inplace(
       self, axis, codes.reshape({codes.numel()}), source);
   return self;
@@ -1332,6 +1560,8 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, IndexingKernels) {
   m.impl("gather", &tensorplay::vulkan::ops::gather_kernel);
   m.impl("index_copy_", &tensorplay::vulkan::ops::index_copy__kernel);
   m.impl("index_copy", &tensorplay::vulkan::ops::index_copy_kernel);
+  m.impl("index_add_", &tensorplay::vulkan::ops::index_add__kernel);
+  m.impl("index_add", &tensorplay::vulkan::ops::index_add_kernel);
   m.impl("scatter.value", &tensorplay::vulkan::ops::scatter_value_kernel);
   m.impl(
       "scatter_.value",

@@ -1254,6 +1254,24 @@ index_copy_buffer:
   parameter_names_with_default_values: {}
   shader_variants:
   - NAME: index_copy_buffer
+index_add:
+  parameter_names_with_default_values: {}
+  generate_variant_forall:
+    FORMAT:
+    - VALUE: rgba32f
+      SUFFIX: ''
+    - VALUE: rgba16f
+      SUFFIX: _f16
+  shader_variants:
+  - NAME: index_add
+index_add_buffer:
+  parameter_names_with_default_values: {}
+  shader_variants:
+  - NAME: index_add_buffer
+index_add_buffer_half:
+  parameter_names_with_default_values: {}
+  shader_variants:
+  - NAME: index_add_buffer_half
 index_select:
   parameter_names_with_default_values: {}
   shader_variants:
