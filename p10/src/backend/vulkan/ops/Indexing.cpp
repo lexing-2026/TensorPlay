@@ -1412,6 +1412,237 @@ Tensor scatter_src_kernel(
 }
 
 //
+// Fill of whole rows: the codes of a list name rows of the destination along one
+// axis, and every element of a named row takes the given number in place of what
+// it held.
+//
+// The write cannot be a single pass, because a row is a line of texels or of
+// packed words and a store replaces a whole group: an invocation that owned one
+// lane of a named row would hand the group back as stale to whoever owns the
+// rest of it.  So the request is split the way the row scatter splits it:
+//
+//   1. a mark pass over the list, which records one word per row the axis offers
+//      - not one per element those rows cover, so its cost is the length of the
+//      list alone and a code the list repeats costs nothing beyond the first;
+//   2. an apply pass over the destination, where one invocation owns one whole
+//      texel or word and rewrites the lanes whose row is marked.
+//
+// A code given from the end names the row that many from it, which is the answer
+// a row lookup gives to a negative subscript.  A code beyond the rows the
+// destination offers names no row and marks nothing; asking the host whether the
+// list fits would cost a queue sync per call, and a decode step makes one per
+// token.
+//
+Tensor& index_fill_rows_inplace(
+    Tensor& self,
+    int64_t dim,
+    const Tensor& index,
+    const Scalar& value) {
+  NoGradGuard no_grad;
+  validate_gather_operand(self, "index_fill");
+  TP_CHECK(
+      self.device().is_vulkan(),
+      "Vulkan index_fill_: the destination must be on the device");
+  const int64_t rank = self.dim();
+  const int64_t wrapped = dim < 0 ? dim + rank : dim;
+  TP_CHECK(
+      wrapped >= 0 && wrapped < rank,
+      "Vulkan index_fill_: dimension out of range");
+  TP_CHECK(
+      index.dim() < 2,
+      "Vulkan index_fill_: index must be a vector or a single code");
+  TP_CHECK(
+      index.dtype() == DType::Int64 || index.dtype() == DType::Int32,
+      "Vulkan index_fill_: index must be Int64 or Int32");
+
+  if (self.numel() == 0 || index.numel() == 0) {
+    return self;
+  }
+
+  const int64_t rows = self.size(wrapped);
+  const int64_t n_idx = index.numel();
+
+  api::Context* const context = api::context();
+  api::vTensor v_self = convert(self);
+  // The mark pass walks the list by its own flat order, so the list rides linear
+  // storage whatever the destination does; the upload narrows a wide code to the
+  // word the pass reads and leaves a list already on the device there.
+  api::vTensor v_indices =
+      upload_index_payload(index, api::StorageType::BUFFER);
+  api::vTensor v_marks = zeroed_marks(context, rows);
+
+  api::PipelineBarrier pipeline_barrier{};
+  const struct MarkBlock final {
+    int32_t n_idx; // entries of the code list
+    int32_t rows;  // entries the destination offers along the axis
+    int32_t fill;
+    int32_t fill2;
+  } mark_block{
+      static_cast<int32_t>(n_idx),
+      static_cast<int32_t>(rows),
+      0,
+      0};
+  api::UniformParamsBuffer mark_params(context, mark_block);
+  context->submit_compute_job(
+      VK_KERNEL(index_fill_mark),
+      pipeline_barrier,
+      {safe_downcast_to_u32(n_idx), 1u, 1u},
+      {256u, 1u, 1u},
+      VK_NULL_HANDLE,
+      v_marks.buffer(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::WRITE),
+      v_indices.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+      mark_params.buffer());
+
+  const float written = static_cast<float>(value.toDouble());
+  const bool image_destination =
+      v_self.storage_type() != api::StorageType::BUFFER;
+
+  // Where the axis the codes name is the texture's y extent, a named row is a
+  // line of whole texels and the apply pass rewrites them where they lie.  A
+  // texel's four lanes all stand for elements of that one row, so a mark read
+  // once decides the whole store.
+  if (image_destination && rank >= 2 && wrapped == rank - 2) {
+    const api::utils::uvec3 extents = v_self.extents();
+    const struct FillBlock final {
+      ivec4 extents; // (texel width, destination rows, texel planes, unused)
+      int32_t rows; // entries the destination offers along the axis
+      float value;
+      int32_t fill;
+      int32_t fill2;
+    } block{
+        ivec4(
+            static_cast<int32_t>(extents[0u]),
+            static_cast<int32_t>(extents[1u]),
+            static_cast<int32_t>(extents[2u]),
+            0),
+        static_cast<int32_t>(rows),
+        written,
+        0,
+        0};
+    api::UniformParamsBuffer params(context, block);
+    const api::utils::uvec3 grid{
+        extents[0u],
+        safe_downcast_to_u32(rows),
+        extents[2u]};
+    context->submit_compute_job(
+        kernel_for("index_fill", self.dtype()),
+        pipeline_barrier,
+        grid,
+        adaptive_work_group_size(grid),
+        VK_NULL_HANDLE,
+        v_self.image(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::READ | api::MemoryAccessType::WRITE),
+        v_marks.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+        params.buffer());
+    return self;
+  }
+
+  TP_CHECK(
+      self.numel() <= std::numeric_limits<int32_t>::max(),
+      "Vulkan index_fill_: a payload holds more than two billion elements");
+  // A destination that came out of an image keeps its own storage: the fill runs
+  // on a dense copy of it, which travels back through the copy kernel once the
+  // marked rows are rewritten.
+  api::vTensor v_target = image_destination
+      ? to_buffer_storage_dispatch(context, v_self)
+      : v_self;
+  int64_t width = 1;
+  for (int64_t axis = wrapped + 1; axis < rank; ++axis) {
+    width *= self.size(axis);
+  }
+  const struct FillBufferBlock final {
+    int32_t count; // elements of the destination
+    int32_t width; // elements of one row, and the stride between rows
+    int32_t rows;  // entries the destination offers along the axis
+    float value;
+    int32_t fill;
+  } block{
+      static_cast<int32_t>(self.numel()),
+      static_cast<int32_t>(width),
+      static_cast<int32_t>(rows),
+      written,
+      0};
+  api::UniformParamsBuffer params(context, block);
+  context->submit_compute_job(
+      VK_KERNEL_FROM_STR(
+          buffer_shader_for_dtype("index_fill_buffer", self.dtype())),
+      pipeline_barrier,
+      {buffer_dispatch_count(
+           safe_downcast_to_u32(self.numel()), self.dtype(), 4u),
+       1u,
+       1u},
+      {256u, 1u, 1u},
+      VK_NULL_HANDLE,
+      // The apply pass reads the lanes it leaves alone, so the destination is
+      // bound in both directions.
+      v_target.buffer(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::READ | api::MemoryAccessType::WRITE),
+      v_marks.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+      params.buffer());
+  if (image_destination) {
+    Tensor carried = convert(v_target);
+    self.copy_(carried);
+  }
+  return self;
+}
+
+Tensor& index_fill_scalar__kernel(
+    Tensor& self,
+    int64_t dim,
+    const Tensor& index,
+    const Scalar& value) {
+  return index_fill_rows_inplace(self, dim, index, value);
+}
+
+Tensor index_fill_scalar_kernel(
+    const Tensor& self,
+    int64_t dim,
+    const Tensor& index,
+    const Scalar& value) {
+  Tensor out = self.clone();
+  index_fill_rows_inplace(out, dim, index, value);
+  return out;
+}
+
+// The tensor form carries its number in a payload of one element, so the number
+// is read off it here; a payload spelling out more than one holds more than one
+// number to write, which this fill does not describe.
+Tensor& index_fill_tensor__kernel(
+    Tensor& self,
+    int64_t dim,
+    const Tensor& index,
+    const Tensor& value) {
+  TP_CHECK(
+      value.dim() == 0,
+      "Vulkan index_fill_: the value must hold a single number, it holds ",
+      value.dim(),
+      " dimension(s)");
+  return index_fill_rows_inplace(self, dim, index, value.item());
+}
+
+Tensor index_fill_tensor_kernel(
+    const Tensor& self,
+    int64_t dim,
+    const Tensor& index,
+    const Tensor& value) {
+  TP_CHECK(
+      value.dim() == 0,
+      "Vulkan index_fill: the value must hold a single number, it holds ",
+      value.dim(),
+      " dimension(s)");
+  Tensor out = self.clone();
+  index_fill_rows_inplace(out, dim, index, value.item());
+  return out;
+}
+
+//
 // Advanced indexing: the read a tuple of indices answers and the write it
 // lands.  Both entry points carry the whole tuple, so the forms a row lookup
 // can drive are decided here.  A tuple with one list of row codes names one
@@ -1562,6 +1793,18 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, IndexingKernels) {
   m.impl("index_copy", &tensorplay::vulkan::ops::index_copy_kernel);
   m.impl("index_add_", &tensorplay::vulkan::ops::index_add__kernel);
   m.impl("index_add", &tensorplay::vulkan::ops::index_add_kernel);
+  m.impl(
+      "index_fill_.Scalar",
+      &tensorplay::vulkan::ops::index_fill_scalar__kernel);
+  m.impl(
+      "index_fill.Scalar",
+      &tensorplay::vulkan::ops::index_fill_scalar_kernel);
+  m.impl(
+      "index_fill_.Tensor",
+      &tensorplay::vulkan::ops::index_fill_tensor__kernel);
+  m.impl(
+      "index_fill.Tensor",
+      &tensorplay::vulkan::ops::index_fill_tensor_kernel);
   m.impl("scatter.value", &tensorplay::vulkan::ops::scatter_value_kernel);
   m.impl(
       "scatter_.value",
