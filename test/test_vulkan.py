@@ -5793,5 +5793,122 @@ class TestVulkanAdvancedIndexing(unittest.TestCase):
                                   self._device(np.ones((2, 4), np.float32)), True)
 
 
+class TestVulkanMaskCompaction(unittest.TestCase):
+    # A mask cannot be answered in one pass: the length of the result is only
+    # known once the whole payload has been read, and the device has to be told
+    # it before it writes the coordinates.  The walk is therefore two passes over
+    # one packed payload - a total per workgroup that comes to the host, and a
+    # second pass that writes each workgroup's lanes at the offset the totals add
+    # up to - so both the boundary a workgroup ends at and the boundary of a
+    # packed word have to be pinned, not just a payload that fits inside one.
+
+    SHAPES = ((7,), (3, 4), (2, 3, 5), (2, 2, 3, 2))
+
+    @staticmethod
+    def _device(payload):
+        arr = np.asarray(payload)
+        if arr.ndim and not arr.flags["C_CONTIGUOUS"]:
+            arr = np.ascontiguousarray(arr)
+        return tensorplay.from_numpy(arr).to("vulkan")
+
+    def _nz_matches(self, arr, name):
+        arr = np.asarray(arr)
+        payload = self._device(arr)
+        got = tensorplay.nonzero(payload)
+        self.assertEqual(got.dtype, tensorplay.int64, name)
+        np.testing.assert_array_equal(
+            got.cpu().numpy(), np.argwhere(arr != 0), err_msg=name)
+
+    def test_the_positions_a_mask_names_are_the_row_major_ones(self):
+        for shape in self.SHAPES:
+            for np_dtype in (np.float32, np.float16, np.int32, np.int8):
+                rng = np.random.default_rng(abs(hash((shape, np_dtype))) % 2**32)
+                arr = rng.integers(-2, 3, size=shape).astype(np_dtype)
+                self._nz_matches(arr, f"nonzero of a {shape} {np_dtype.__name__}")
+            flat = np.arange(int(np.prod(shape))).reshape(shape)
+            self._nz_matches(flat % 3 == 0, f"nonzero of a {shape} truth plane")
+
+    def test_a_lane_at_the_edge_of_a_word_a_group_and_a_walk_is_named_exactly(self):
+        # One lane set is the smallest answer there is, so a position that comes
+        # back shifted names a mapping between the packed payload and the walk
+        # that read it wrong: byte 3 and 4 straddle a packed word, 1023 and 1024
+        # straddle a workgroup, and 65535 straddles the boundary where a walk
+        # gives every lane several words.
+        size = 70000
+        for at in (0, 1, 3, 4, 5, 1023, 1024, 1027, 4095, 4096, 4097,
+                   65535, 65536, 69999):
+            arr = np.zeros(size, dtype=np.float32)
+            arr[at] = 1.0
+            self._nz_matches(arr, f"a lane set at {at} of {size}")
+        arr = np.zeros(size, dtype=np.float32)
+        edges = [0, 3, 4, 1024, 65535, 69999]
+        arr[edges] = 1.0
+        self._nz_matches(arr, "every edge of one payload at once")
+
+    def test_a_mask_made_on_the_device_compacts_like_an_uploaded_one(self):
+        # Above a texture's reach a comparison answers in dense storage, and the
+        # payload it writes belongs to the comparison rather than to the caller.
+        # A walk that hands that memory back before its second pass would read
+        # whatever the next allocation wrote over it.
+        for size in (20000, 70000):
+            arr = (np.arange(size, dtype=np.float32) % 7 == 0).astype(np.float32)
+            self._nz_matches(arr, f"a float payload of {size} tested on the device")
+            truth = (np.arange(size) % 11 == 0).astype(np.bool_)
+            self._nz_matches(truth, f"a truth plane of {size} uploaded as it stands")
+
+    def test_no_lanes_and_all_lanes_answer_without_a_walk(self):
+        self._nz_matches(np.zeros((4, 5), np.float32), "a payload that selects none")
+        self._nz_matches(np.ones((6,), np.float32), "a payload that selects all")
+        self._nz_matches(np.zeros((0, 3), np.float32), "a payload with no lanes")
+        for value in (0.0, 2.5):
+            self._nz_matches(np.array(value, dtype=np.float32),
+                             f"a laneless payload of {value}")
+
+    def _select_matches(self, payload, mask, name):
+        payload, mask = np.asarray(payload), np.asarray(mask)
+        got = tensorplay.masked_select(self._device(payload), self._device(mask))
+        want = payload[np.broadcast_to(mask, np.broadcast_shapes(payload.shape,
+                                                                mask.shape)) != 0]
+        np.testing.assert_array_equal(got.cpu().numpy(), want, err_msg=name)
+
+    def test_a_select_pulls_the_lanes_a_mask_holds(self):
+        table = (np.arange(12, dtype=np.float32) % 5).reshape(3, 4)
+        truth = np.arange(12).reshape(3, 4) % 3 == 0
+        self._select_matches(table, truth, "a select over one shape")
+        self._select_matches(table, (np.arange(12).reshape(3, 4) % 4).astype(np.uint8),
+                             "a select over a byte mask")
+        self._select_matches(table.astype(np.float16), table > 1,
+                             "a select of a half payload")
+        self._select_matches(table, np.array([True, False, True, True]),
+                             "a select under a row broadcast")
+        self._select_matches(table, np.array(True), "a select under a scalar mask")
+        self._select_matches(table, np.zeros((3, 4), np.bool_),
+                             "a select that holds nothing")
+        self._select_matches(table, np.ones((3, 4), np.bool_),
+                             "a select that holds every lane")
+
+    def test_a_select_past_one_workgroup_keeps_the_order_of_the_mask(self):
+        payload = np.arange(70000, dtype=np.float32) % 9
+        self._select_matches(payload, payload > 2,
+                             "a long select that walks several words a lane")
+
+    def test_a_mask_the_device_cannot_count_is_answered_off_it(self):
+        # A count is one byte a lane here, so a payload wider than a word has no
+        # walk tested on the device, and neither has a gather of a payload the
+        # select path cannot read.
+        with self.assertRaisesRegex(RuntimeError, "not tested on the device"):
+            tensorplay.nonzero(self._device(np.arange(6, dtype=np.int64)))
+        with self.assertRaisesRegex(RuntimeError, "not tested on the device"):
+            tensorplay.nonzero(self._device((np.arange(6) % 2 == 0).astype(np.int64)))
+        # A payload of five axes has no coordinate the walk can spell out, and
+        # the refusal comes before the walk: which layer names it is not part of
+        # the contract, that it is refused loudly is.
+        with self.assertRaisesRegex(RuntimeError, "4"):
+            tensorplay.nonzero(self._device(np.ones((2, 2, 2, 2, 2), np.float32)))
+        with self.assertRaisesRegex(RuntimeError, "Float32 and Float16 payloads"):
+            tensorplay.masked_select(self._device(np.arange(6, dtype=np.int32)),
+                                     self._device(np.array([True] * 6)))
+
+
 if __name__ == "__main__":
     unittest.main()
