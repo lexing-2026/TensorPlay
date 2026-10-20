@@ -343,12 +343,123 @@ __global__ void softmax_wave_forward(out_t* dst, const scalar_t* src,
   }
 }
 
+// One 8-byte packet of 16-bit elements: four values move per lane and access.
+template <typename T>
+struct alignas(sizeof(T) * 4) SoftmaxWavePacket {
+  T v[4];
+};
+
+// 16-bit rows whose length is a whole number of 128-element wave packets move
+// four elements per lane, so each global access is one 8-byte request instead
+// of four 2-byte ones.  The exponential rescales to base 2 only after the row
+// maximum is subtracted, which keeps the argument in range.
+template <typename scalar_t, typename acc_t, int kGroups, bool LOG_MODE>
+__global__ void softmax_wave_packed_forward(
+    scalar_t* __restrict__ dst, const scalar_t* __restrict__ src,
+    int batch_count, int stride) {
+  constexpr int kVec = 4;
+  constexpr int kPacket = kWaveLanes * kVec;
+
+  const int lane = static_cast<int>(threadIdx.x);
+  const int row = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.y) +
+                  static_cast<int>(threadIdx.y);
+  if (row >= batch_count) return;
+
+  const scalar_t* __restrict__ row_src =
+      src + static_cast<int64_t>(row) * stride;
+  scalar_t* __restrict__ row_dst = dst + static_cast<int64_t>(row) * stride;
+
+  acc_t values[kGroups][kVec];
+#pragma unroll
+  for (int g = 0; g < kGroups; ++g) {
+    const SoftmaxWavePacket<scalar_t> packet =
+        *reinterpret_cast<const SoftmaxWavePacket<scalar_t>*>(
+            row_src + g * kPacket + lane * kVec);
+#pragma unroll
+    for (int k = 0; k < kVec; ++k) {
+      values[g][k] = static_cast<acc_t>(packet.v[k]);
+    }
+  }
+
+  acc_t max_value = values[0][0];
+#pragma unroll
+  for (int g = 0; g < kGroups; ++g) {
+#pragma unroll
+    for (int k = 0; k < kVec; ++k) {
+      max_value = values[g][k] > max_value ? values[g][k] : max_value;
+    }
+  }
+  wave_butterfly_reduce<acc_t, kWaveLanes, 1, true>(&max_value);
+
+  constexpr acc_t kLog2e = static_cast<acc_t>(1.4426950408889634);
+  acc_t sum = acc_t(0);
+#pragma unroll
+  for (int g = 0; g < kGroups; ++g) {
+#pragma unroll
+    for (int k = 0; k < kVec; ++k) {
+      const acc_t e = std::exp2((values[g][k] - max_value) * kLog2e);
+      if (!LOG_MODE) values[g][k] = e;
+      sum += e;
+    }
+  }
+  wave_butterfly_reduce<acc_t, kWaveLanes, 1, false>(&sum);
+
+  const acc_t normalizer = LOG_MODE ? std::log(sum) : sum;
+#pragma unroll
+  for (int g = 0; g < kGroups; ++g) {
+    SoftmaxWavePacket<scalar_t> packet;
+#pragma unroll
+    for (int k = 0; k < kVec; ++k) {
+      packet.v[k] = static_cast<scalar_t>(
+          LOG_MODE ? values[g][k] - max_value - normalizer
+                   : values[g][k] / normalizer);
+    }
+    *reinterpret_cast<SoftmaxWavePacket<scalar_t>*>(
+        row_dst + g * kPacket + lane * kVec) = packet;
+  }
+}
+
 template <typename scalar_t, typename acc_t, bool LOG_MODE, typename out_t>
 void launch_wave_softmax(out_t* dst, const scalar_t* src, int64_t batch_count,
                          int64_t element_count, cudaStream_t stream) {
   const int log2_elements = softmax_log2_ceil(static_cast<int>(element_count));
   const int next_pow2 = 1 << log2_elements;
   const int hw_wave = softmax_wave_size();
+
+  // Packed-lane path: same-type 16-bit rows that split into 2..8 wave packets
+  // with packet-aligned base pointers.
+  if constexpr (sizeof(scalar_t) == 2 && std::is_same_v<scalar_t, out_t>) {
+    constexpr int64_t kPacketElems = kWaveLanes * 4;
+    if (hw_wave == kWaveLanes && element_count >= 2 * kPacketElems &&
+        element_count <= 8 * kPacketElems &&
+        element_count % kPacketElems == 0 && batch_count <= INT32_MAX &&
+        (reinterpret_cast<uintptr_t>(dst) & 7) == 0 &&
+        (reinterpret_cast<uintptr_t>(src) & 7) == 0) {
+      const int rows = static_cast<int>(batch_count);
+      const int groups = static_cast<int>(element_count / kPacketElems);
+      constexpr int kRowsPerBlock = 4;
+      const int blocks = (rows + kRowsPerBlock - 1) / kRowsPerBlock;
+      const dim3 packed_threads(kWaveLanes, kRowsPerBlock, 1);
+#define TP_LAUNCH_PACKED_SOFTMAX(G)                                         \
+  softmax_wave_packed_forward<scalar_t, acc_t, G, LOG_MODE>                 \
+      <<<blocks, packed_threads, 0, stream>>>(                              \
+          dst, src, rows, static_cast<int>(element_count));                 \
+  break
+      switch (groups) {
+        case 2: TP_LAUNCH_PACKED_SOFTMAX(2);
+        case 3: TP_LAUNCH_PACKED_SOFTMAX(3);
+        case 4: TP_LAUNCH_PACKED_SOFTMAX(4);
+        case 5: TP_LAUNCH_PACKED_SOFTMAX(5);
+        case 6: TP_LAUNCH_PACKED_SOFTMAX(6);
+        case 7: TP_LAUNCH_PACKED_SOFTMAX(7);
+        default: TP_LAUNCH_PACKED_SOFTMAX(8);
+      }
+#undef TP_LAUNCH_PACKED_SOFTMAX
+      CUDA_CHECK(cudaGetLastError());
+      return;
+    }
+  }
+
   const int wave_size = next_pow2 < hw_wave ? next_pow2 : hw_wave;
   const int batches_per_wave = (next_pow2 <= 128) ? 2 : 1;
   constexpr int kThreadsPerBlock = 128;
