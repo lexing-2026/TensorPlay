@@ -2059,13 +2059,13 @@ __attribute__((always_inline)) inline void hold_blocks(const uint8_t* const* row
     for (int t = 0; t < Blocks; ++t) sums[t].store(y + bag * columns + col + t * lanes);
 }
 
-// A packed row closes with its grid: two floats when a code is a byte, two halfs
-// when it is narrower.  A half turned into a float in software reads the exponent
-// field and branches on the subnormal case, so a pair of them is assembled into
-// the words of a row and widened by the instruction made for the pair instead.
+// A packed row closes with its grid: two halfs when a code is narrower than a
+// byte.  They are read as the words of the row and widened by the instruction
+// made for the pair, instead of byte by byte through the software conversion that
+// walks the exponent field and branches on the subnormal case.
 inline void row_grid_words(const uint8_t* row, int64_t width, int bits, float& scale, float& bias) {
-    const uint8_t* tail = row + width - (bits == 8 ? 8 : 4);
 #if defined(__F16C__)
+    const uint8_t* tail = row + width - (bits == 8 ? 8 : 4);
     if (bits != 8) {
         // The four bytes hold the two halfs in the order of the row, so they go
         // into the low word of a vector as they stand: the widening reads sixteen
