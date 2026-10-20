@@ -230,6 +230,89 @@ Tensor frac_kernel_cuda(const Tensor& self) {
     return unary_float_op_kernel_v2(self, FracFunctor());
 }
 
+// --- out= entries ---
+// The composite out= wrappers compute a fresh tensor and copy it into the
+// caller's buffer; these run the same body straight into a destination that
+// already matches what the allocating form produces.  A destination that
+// needs a resize, a cast, or that overlaps an operand in an unsafe way keeps
+// the compute-and-hand-over route inside the helpers.
+
+#define TP_KEEP_UNARY_OUT(op, FunctorType)                                    \
+    Tensor& op##_out_cuda(const Tensor& self, Tensor& out) {                  \
+        if (isQuantizedType(self.dtype()) || isComplexType(self.dtype())) {   \
+            return write_out(out, op##_kernel_cuda(self));                    \
+        }                                                                     \
+        return unary_op_kernel_out(self, out, FunctorType());                 \
+    }
+
+#define TP_FLOAT_UNARY_OUT(op, FunctorType)                                   \
+    Tensor& op##_out_cuda(const Tensor& self, Tensor& out) {                  \
+        if (isQuantizedType(self.dtype()) || isComplexType(self.dtype())) {   \
+            return write_out(out, op##_kernel_cuda(self));                    \
+        }                                                                     \
+        return unary_float_op_kernel_out(self, out, FunctorType());           \
+    }
+
+TP_KEEP_UNARY_OUT(abs, AbsFunctor)
+TP_KEEP_UNARY_OUT(neg, NegFunctor)
+TP_KEEP_UNARY_OUT(square, SquareFunctor)
+TP_KEEP_UNARY_OUT(sign, SignFunctor)
+TP_KEEP_UNARY_OUT(trunc, TruncFunctor)
+
+Tensor& frac_out_cuda(const Tensor& self, Tensor& out) {
+    if (isIntegralType(self.dtype()) || isComplexType(self.dtype())) {
+        return write_out(out, frac_kernel_cuda(self));
+    }
+    return unary_float_op_kernel_out(self, out, FracFunctor());
+}
+
+TP_FLOAT_UNARY_OUT(acos, AcosFunctor)
+TP_FLOAT_UNARY_OUT(acosh, AcoshFunctor)
+TP_FLOAT_UNARY_OUT(asin, AsinFunctor)
+TP_FLOAT_UNARY_OUT(asinh, AsinhFunctor)
+TP_FLOAT_UNARY_OUT(atan, AtanFunctor)
+TP_FLOAT_UNARY_OUT(atanh, AtanhFunctor)
+TP_FLOAT_UNARY_OUT(ceil, CeilFunctor)
+TP_FLOAT_UNARY_OUT(cosh, CoshFunctor)
+TP_FLOAT_UNARY_OUT(floor, FloorFunctor)
+TP_FLOAT_UNARY_OUT(round, RoundFunctor)
+TP_FLOAT_UNARY_OUT(sinh, SinhFunctor)
+TP_FLOAT_UNARY_OUT(tan, TanFunctor)
+TP_FLOAT_UNARY_OUT(exp, ExpFunctor)
+TP_FLOAT_UNARY_OUT(expm1, Expm1Functor)
+TP_FLOAT_UNARY_OUT(erf, ErfFunctor)
+TP_FLOAT_UNARY_OUT(erfc, ErfcFunctor)
+TP_FLOAT_UNARY_OUT(log, LogFunctor)
+TP_FLOAT_UNARY_OUT(log10, Log10Functor)
+TP_FLOAT_UNARY_OUT(log1p, Log1pFunctor)
+TP_FLOAT_UNARY_OUT(log2, Log2Functor)
+TP_FLOAT_UNARY_OUT(lgamma, LgammaFunctor)
+TP_FLOAT_UNARY_OUT(sqrt, SqrtFunctor)
+TP_FLOAT_UNARY_OUT(rsqrt, RsqrtFunctor)
+TP_FLOAT_UNARY_OUT(sin, SinFunctor)
+TP_FLOAT_UNARY_OUT(cos, CosFunctor)
+TP_FLOAT_UNARY_OUT(angle, AngleFunctor)
+
+// tanh and sigmoid carry a second registration that serves quantized and
+// complex inputs, so the cases the direct path does not cover go back through
+// the dispatcher and land on whichever implementation the operator resolves to.
+Tensor& tanh_out_cuda(const Tensor& self, Tensor& out) {
+    if (isQuantizedType(self.dtype()) || isComplexType(self.dtype())) {
+        return write_out(out, ops::tanh(self));
+    }
+    return unary_float_op_kernel_out(self, out, TanhFunctor());
+}
+
+Tensor& sigmoid_out_cuda(const Tensor& self, Tensor& out) {
+    if (isQuantizedType(self.dtype()) || isComplexType(self.dtype())) {
+        return write_out(out, ops::sigmoid(self));
+    }
+    return unary_float_op_kernel_out(self, out, SigmoidFunctor());
+}
+
+#undef TP_KEEP_UNARY_OUT
+#undef TP_FLOAT_UNARY_OUT
+
 // --- Comparison ---
 
 TENSORPLAY_LIBRARY_IMPL(CUDA, PointwiseKernels) {
@@ -270,6 +353,43 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, PointwiseKernels) {
     
     m.impl("sigmoid", sigmoid_kernel_cuda);
     m.impl("angle", angle_kernel_cuda);
+
+    // out= entries: write the same body straight into a matching destination.
+    m.impl("abs.out", abs_out_cuda);
+    m.impl("neg.out", neg_out_cuda);
+    m.impl("square.out", square_out_cuda);
+    m.impl("sign.out", sign_out_cuda);
+    m.impl("trunc.out", trunc_out_cuda);
+    m.impl("frac.out", frac_out_cuda);
+
+    m.impl("acos.out", acos_out_cuda);
+    m.impl("acosh.out", acosh_out_cuda);
+    m.impl("asin.out", asin_out_cuda);
+    m.impl("asinh.out", asinh_out_cuda);
+    m.impl("atan.out", atan_out_cuda);
+    m.impl("atanh.out", atanh_out_cuda);
+    m.impl("ceil.out", ceil_out_cuda);
+    m.impl("cosh.out", cosh_out_cuda);
+    m.impl("floor.out", floor_out_cuda);
+    m.impl("round.out", round_out_cuda);
+    m.impl("sinh.out", sinh_out_cuda);
+    m.impl("tan.out", tan_out_cuda);
+    m.impl("exp.out", exp_out_cuda);
+    m.impl("expm1.out", expm1_out_cuda);
+    m.impl("erf.out", erf_out_cuda);
+    m.impl("erfc.out", erfc_out_cuda);
+    m.impl("log.out", log_out_cuda);
+    m.impl("log10.out", log10_out_cuda);
+    m.impl("log1p.out", log1p_out_cuda);
+    m.impl("log2.out", log2_out_cuda);
+    m.impl("lgamma.out", lgamma_out_cuda);
+    m.impl("sqrt.out", sqrt_out_cuda);
+    m.impl("rsqrt.out", rsqrt_out_cuda);
+    m.impl("sin.out", sin_out_cuda);
+    m.impl("cos.out", cos_out_cuda);
+    m.impl("tanh.out", tanh_out_cuda);
+    m.impl("sigmoid.out", sigmoid_out_cuda);
+    m.impl("angle.out", angle_out_cuda);
 }
 
 } // namespace cuda

@@ -1,4 +1,5 @@
 #include "Tensor.h"
+#include "OutWrite.h"
 #include "Dispatcher.h"
 #include "CUDARuntime.h"
 #include "Exception.h"
@@ -79,11 +80,11 @@ void complex_angle_loop(const Tensor& input, const Tensor& output) {
     });
 }
 
-// Unary dispatcher for same-dtype scalar operations.
+// Runs the dtype-preserving body into a destination that already carries the
+// shape and width the allocating form produces.
 template<typename Functor>
-Tensor unary_op_kernel_v2(const Tensor& self, Functor functor) {
-    Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
-    if (self.numel() == 0) return result;
+void unary_op_kernel_into(const Tensor& self, const Tensor& result, Functor functor) {
+    if (self.numel() == 0) return;
     TensorIterator iter = TensorIteratorConfig()
         .check_all_same_dtype(true)
         .add_output(result)
@@ -101,7 +102,26 @@ Tensor unary_op_kernel_v2(const Tensor& self, Functor functor) {
         default: TP_THROW(TypeError, "CUDA unary op: Unsupported dtype");
     }
     #undef OP_CASE
+}
+
+template<typename Functor>
+Tensor unary_op_kernel_v2(const Tensor& self, Functor functor) {
+    Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
+    unary_op_kernel_into(self, result, functor);
     return result;
+}
+
+// out= entry: writes into the caller's buffer when it is already the tensor
+// the allocating form would produce, and hands the value over otherwise.
+template<typename Functor>
+Tensor& unary_op_kernel_out(const Tensor& self, Tensor& out, Functor functor) {
+    const auto shape = static_cast<std::vector<int64_t>>(self.shape());
+    if (destination_takes(out, self.device(), self.dtype(), shape) &&
+        read_while_write_is_safe(self, out)) {
+        unary_op_kernel_into(self, out, functor);
+        return out;
+    }
+    return write_out(out, unary_op_kernel_v2(self, functor));
 }
 
 template <typename complex_t, typename math_t, typename Functor>
@@ -199,11 +219,9 @@ struct CxPowScalar {
 
 // Float ops need simpler dispatch since we cast to float/double
 template<typename Functor>
-Tensor unary_float_op_kernel_v2(const Tensor& self, Functor functor) {
-    DType out_dtype = self.dtype();
-    if (isIntegralType(out_dtype)) out_dtype = DType::Float32;
-    Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), out_dtype, self.device());
-    if (self.numel() == 0) return result;
+void unary_float_op_kernel_into(const Tensor& self, const Tensor& result, Functor functor) {
+    if (self.numel() == 0) return;
+    const DType out_dtype = result.dtype();
     TensorIterator iter = TensorIteratorConfig()
         .check_all_same_dtype(self.dtype() == out_dtype)
         .add_output(result)
@@ -234,7 +252,30 @@ Tensor unary_float_op_kernel_v2(const Tensor& self, Functor functor) {
         default:
             TP_THROW(TypeError, "CUDA unary float op: Unsupported output dtype");
     }
+}
+
+template<typename Functor>
+Tensor unary_float_op_kernel_v2(const Tensor& self, Functor functor) {
+    DType out_dtype = self.dtype();
+    if (isIntegralType(out_dtype)) out_dtype = DType::Float32;
+    Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), out_dtype, self.device());
+    unary_float_op_kernel_into(self, result, functor);
     return result;
+}
+
+// out= entry for the float-compute family; the destination has to carry the
+// promoted width the allocating form produces.
+template<typename Functor>
+Tensor& unary_float_op_kernel_out(const Tensor& self, Tensor& out, Functor functor) {
+    DType out_dtype = self.dtype();
+    if (isIntegralType(out_dtype)) out_dtype = DType::Float32;
+    const auto shape = static_cast<std::vector<int64_t>>(self.shape());
+    if (destination_takes(out, self.device(), out_dtype, shape) &&
+        read_while_write_is_safe(self, out)) {
+        unary_float_op_kernel_into(self, out, functor);
+        return out;
+    }
+    return write_out(out, unary_float_op_kernel_v2(self, functor));
 }
 
 // float32 tensors never fall into slow double-precision device math.
