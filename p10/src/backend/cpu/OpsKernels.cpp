@@ -76,8 +76,13 @@ Tensor binary_same_kernel(const Tensor& a_in, const Tensor& b_in, Op op, const c
 }
 
 // Binary op whose inputs promote to a FLOATING dtype first (ints -> Float32).
+//
+// `destination` hands the loop a tensor the caller already holds; it only
+// arrives in the width the loop computes at and packed, which is what
+// binary_float_takes checks.
 template <typename F>  // F: (double,double) -> double
-Tensor binary_float_kernel(const Tensor& a_in, const Tensor& b_in, F f, const char* name) {
+Tensor binary_float_kernel(const Tensor& a_in, const Tensor& b_in, F f, const char* name,
+                           const Tensor* destination = nullptr) {
     std::vector<int64_t> out_shape = broadcast_shapes(
         static_cast<std::vector<int64_t>>(a_in.shape()),
         static_cast<std::vector<int64_t>>(b_in.shape()));
@@ -88,7 +93,9 @@ Tensor binary_float_kernel(const Tensor& a_in, const Tensor& b_in, F f, const ch
     DType compute_dt = (dt == DType::Float64) ? DType::Float64 : DType::Float32;
     Tensor ac = a_in.to(compute_dt).expand(out_shape).contiguous();
     Tensor bc = b_in.to(compute_dt).expand(out_shape).contiguous();
-    Tensor out = Tensor::empty(out_shape, compute_dt, a_in.device());
+    Tensor out = destination != nullptr
+                     ? *destination
+                     : Tensor::empty(out_shape, compute_dt, a_in.device());
     int64_t n = out.numel();
     if (compute_dt == DType::Float64) {
         const double* ap = ac.data_ptr<double>();
@@ -106,6 +113,47 @@ Tensor binary_float_kernel(const Tensor& a_in, const Tensor& b_in, F f, const ch
         });
     }
     return (dt == compute_dt) ? out : out.to(dt);
+}
+
+// Whether the flat pairwise map can fill the caller's tensor itself instead of
+// making a result that is copied over afterwards.  The loop pairs element i of
+// one packed operand with element i of the other and stores at the same index,
+// so the destination has to be packed and hold the answer in the width the loop
+// computes at -- a Half or BFloat16 answer still needs a narrowing pass of its
+// own -- and neither operand may be a second window over those bytes.
+static bool binary_float_takes(const Tensor& a_in, const Tensor& b_in,
+                               const Tensor& out) {
+    const DType lhs = a_in.dtype(), rhs = b_in.dtype();
+    if (isComplexType(lhs) || isComplexType(rhs) ||
+        isQuantizedType(lhs) || isQuantizedType(rhs)) {
+        return false;
+    }
+    DType dt = promoteTypes(lhs, rhs);
+    if (isComplexType(dt) || isQuantizedType(dt)) {
+        return false;
+    }
+    if (!isFloatingType(dt)) dt = DType::Float32;
+    const DType compute_dt = (dt == DType::Float64) ? DType::Float64 : DType::Float32;
+    if (dt != compute_dt) {
+        return false;
+    }
+    const std::vector<int64_t> shape = broadcast_shapes(
+        static_cast<std::vector<int64_t>>(a_in.shape()),
+        static_cast<std::vector<int64_t>>(b_in.shape()));
+    return destination_takes_flat(out, a_in.device(), compute_dt, shape, a_in, b_in);
+}
+
+// One map, one pass, into the caller's tensor wherever that holds; everywhere
+// else the value comes from the same kernel that answers without a destination.
+template <typename F>
+Tensor& binary_float_out_kernel(const Tensor& a_in, const Tensor& b_in, Tensor& out,
+                                Tensor (*allocating)(const Tensor&, const Tensor&),
+                                F f, const char* name) {
+    if (binary_float_takes(a_in, b_in, out)) {
+        binary_float_kernel(a_in, b_in, f, name, &out);
+        return out;
+    }
+    return write_out(out, allocating(a_in, b_in));
 }
 
 template <typename Pred>
@@ -972,31 +1020,62 @@ Tensor nan_to_num_cpu(const Tensor& self, const Scalar& nan,
     return out;
 }
 
-Tensor xlogy_cpu(const Tensor& a, const Tensor& b) {
-    return binary_float_kernel(a, b, [](double x, double y) {
+// One arithmetic per map, held by both the form that allocates its answer and
+// the form that is handed one, so the two can never answer differently.
+struct XlogyPair {
+    double operator()(double x, double y) const {
         return tensorplay::special_math::calc_xlogy(x, y);
-    }, "xlogy");
-}
-Tensor logaddexp_cpu(const Tensor& a, const Tensor& b) {
-    return binary_float_kernel(a, b, [](double x, double y) {
+    }
+};
+struct LogAddExpPair {
+    double operator()(double x, double y) const {
         double m = std::max(x, y);
         if (m == -std::numeric_limits<double>::infinity()) return m;
         if (m != m) return m;  // NaN propagates
         return m + std::log1p(std::exp(-std::fabs(x - y)));
-    }, "logaddexp");
-}
-Tensor logaddexp2_cpu(const Tensor& a, const Tensor& b) {
-    return binary_float_kernel(a, b, [](double x, double y) {
+    }
+};
+struct LogAddExp2Pair {
+    double operator()(double x, double y) const {
         double m = std::max(x, y);
         if (m == -std::numeric_limits<double>::infinity()) return m;
         if (m != m) return m;
         return m + std::log1p(std::exp2(-std::fabs(x - y))) / M_LN2;
-    }, "logaddexp2");
+    }
+};
+struct CopysignPair {
+    double operator()(double x, double y) const { return std::copysign(x, y); }
+};
+struct HypotPair {
+    double operator()(double x, double y) const { return std::hypot(x, y); }
+};
+struct Atan2Pair {
+    double operator()(double x, double y) const { return std::atan2(x, y); }
+};
+
+Tensor xlogy_cpu(const Tensor& a, const Tensor& b) {
+    return binary_float_kernel(a, b, XlogyPair{}, "xlogy");
+}
+Tensor& xlogy_out_cpu(const Tensor& a, const Tensor& b, Tensor& out) {
+    return binary_float_out_kernel(a, b, out, xlogy_cpu, XlogyPair{}, "xlogy");
+}
+Tensor logaddexp_cpu(const Tensor& a, const Tensor& b) {
+    return binary_float_kernel(a, b, LogAddExpPair{}, "logaddexp");
+}
+Tensor& logaddexp_out_cpu(const Tensor& a, const Tensor& b, Tensor& out) {
+    return binary_float_out_kernel(a, b, out, logaddexp_cpu, LogAddExpPair{}, "logaddexp");
+}
+Tensor logaddexp2_cpu(const Tensor& a, const Tensor& b) {
+    return binary_float_kernel(a, b, LogAddExp2Pair{}, "logaddexp2");
+}
+Tensor& logaddexp2_out_cpu(const Tensor& a, const Tensor& b, Tensor& out) {
+    return binary_float_out_kernel(a, b, out, logaddexp2_cpu, LogAddExp2Pair{}, "logaddexp2");
 }
 Tensor copysign_cpu(const Tensor& a, const Tensor& b) {
-    return binary_float_kernel(a, b, [](double x, double y) {
-        return std::copysign(x, y);
-    }, "copysign");
+    return binary_float_kernel(a, b, CopysignPair{}, "copysign");
+}
+Tensor& copysign_out_cpu(const Tensor& a, const Tensor& b, Tensor& out) {
+    return binary_float_out_kernel(a, b, out, copysign_cpu, CopysignPair{}, "copysign");
 }
 Tensor copysign_scalar_cpu(const Tensor& self, const Scalar& other) {
     // The sign comes from the scalar alone, so the divisor width never
@@ -1004,15 +1083,17 @@ Tensor copysign_scalar_cpu(const Tensor& self, const Scalar& other) {
     return copysign_cpu(self, Tensor::full({}, other, DType::Float32, self.device()));
 }
 Tensor hypot_cpu(const Tensor& a, const Tensor& b) {
-    return binary_float_kernel(a, b, [](double x, double y) {
-        return std::hypot(x, y);
-    }, "hypot");
+    return binary_float_kernel(a, b, HypotPair{}, "hypot");
+}
+Tensor& hypot_out_cpu(const Tensor& a, const Tensor& b, Tensor& out) {
+    return binary_float_out_kernel(a, b, out, hypot_cpu, HypotPair{}, "hypot");
 }
 
 Tensor atan2_cpu(const Tensor& a, const Tensor& b) {
-    return binary_float_kernel(a, b, [](double x, double y) {
-        return std::atan2(x, y);
-    }, "atan2");
+    return binary_float_kernel(a, b, Atan2Pair{}, "atan2");
+}
+Tensor& atan2_out_cpu(const Tensor& a, const Tensor& b, Tensor& out) {
+    return binary_float_out_kernel(a, b, out, atan2_cpu, Atan2Pair{}, "atan2");
 }
 Tensor nextafter_cpu(const Tensor& a, const Tensor& b) {
     // The step must happen in the element dtype: a double-precision step from
@@ -1574,6 +1655,14 @@ TENSORPLAY_LIBRARY_IMPL(CPU, OpsKernels) {
     m.impl("gcd", gcd_cpu);
     m.impl("lcm", lcm_cpu);
     m.impl("heaviside", heaviside_cpu);
+    m.impl("xlogy.OutTensor", xlogy_out_cpu);
+    m.impl("logaddexp.out", logaddexp_out_cpu);
+    m.impl("logaddexp2.out", logaddexp2_out_cpu);
+    m.impl("copysign.out", copysign_out_cpu);
+    m.impl("hypot.out", hypot_out_cpu);
+    // The two spellings of the same angle map take the destination the same way.
+    m.impl("atan2.out", atan2_out_cpu);
+    m.impl("arctan2.out", atan2_out_cpu);
     // Clamp family
     m.impl("clamp_", clamp__cpu);
     m.impl("clamp_min.Scalar", clamp_min_scalar_cpu);
