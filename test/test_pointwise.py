@@ -237,5 +237,50 @@ class TestPointwiseOps(unittest.TestCase):
         for a, b in zip(y.tolist(), expected):
             self.assertAlmostEqual(a, b, places=5)
 
+    def test_clamp_reduced_precision(self):
+        # Every value and bound below is exact in both reduced widths, so a
+        # wrong result cannot hide inside a rounding allowance: the width only
+        # selects.  The length (30) fills several 8-wide vectors and leaves a
+        # tail, so the tail has to agree with the vectors it follows.
+        inf = float('inf')
+        nan = float('nan')
+        vals = [-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0, -inf, inf, nan]
+
+        def same(got, want):
+            return all(g == w or (g != g and w != w) for g, w in zip(got, want))
+
+        for dt in (tp.float16, tp.bfloat16):
+            x = tp.tensor(vals * 3, dtype=dt)
+            self.assertTrue(same(tp.clamp(x, -1.0, 1.0).tolist(),
+                                 [-1.0, -1.0, -0.5, 0.0, 0.5, 1.0, 1.0,
+                                  -1.0, 1.0, nan] * 3))
+            self.assertTrue(same(tp.clamp(x, min=-1.0).tolist(),
+                                 [-1.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0,
+                                  -1.0, inf, nan] * 3))
+            self.assertTrue(same(tp.clamp(x, max=1.0).tolist(),
+                                 [-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 1.0,
+                                  -inf, 1.0, nan] * 3))
+            self.assertTrue(same(tp.clamp(x, -0.5, -0.5).tolist(),
+                                 ([-0.5] * 9 + [nan]) * 3))
+            # A reversed pair stays with the per-element loop, which raises the
+            # floor before lowering the ceiling: everything lands on the
+            # ceiling, and a value that is not a number stays one.
+            self.assertTrue(same(tp.clamp(x, 1.0, -1.0).tolist(),
+                                 [-1.0] * 9 + [nan] + [-1.0] * 9 + [nan] +
+                                 [-1.0] * 9 + [nan]))
+
+    def test_clamp_reduced_precision_strided(self):
+        # A transposed source is not contiguous, so it takes the path that
+        # walks the storage instead of the flat one.  Clamping has to commute
+        # with the transpose either way.
+        seq = [-2.0, -0.5, 0.5, 2.0]
+        vals = [[seq[(r + c) % 4] for c in range(6)] for r in range(5)]
+        for dt in (tp.float16, tp.bfloat16):
+            grid = tp.tensor(vals, dtype=dt)
+            self.assertEqual(tp.clamp(grid.t(), -1.0, 1.0).tolist(),
+                             tp.clamp(grid, -1.0, 1.0).t().tolist())
+            self.assertEqual(tp.clamp(grid.t(), -1.0, 1.0)[0].tolist(),
+                             [-1.0, -0.5, 0.5, 1.0, -1.0])
+
 if __name__ == '__main__':
     unittest.main()
