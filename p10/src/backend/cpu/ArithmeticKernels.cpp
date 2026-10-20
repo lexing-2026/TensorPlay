@@ -1751,17 +1751,39 @@ bool has_output_alias(const Tensor& out, const Tensor& input) {
            out_impl->storage().is_same(input_impl->storage());
 }
 
-bool try_add_float32_out(const Tensor& self, const Tensor& other,
-                         Scalar alpha, Tensor& out) {
-    if (self.dtype() != DType::Float32 || other.dtype() != DType::Float32 ||
-        out.dtype() != DType::Float32 || self.shape() != other.shape() ||
-        self.shape() != out.shape() || !self.is_contiguous() ||
-        !other.is_contiguous() || !out.is_contiguous() ||
+// The writer for a dense float pair that already has its destination.  Both
+// widths come here: the general iterator pays its setup for a loop the flat
+// kernels run without it.
+bool try_add_float_out(const Tensor& self, const Tensor& other,
+                       Scalar alpha, Tensor& out) {
+    const DType dt = self.dtype();
+    if ((dt != DType::Float32 && dt != DType::Float64) ||
+        other.dtype() != dt || out.dtype() != dt ||
+        self.shape() != other.shape() || self.shape() != out.shape() ||
+        !self.is_contiguous() || !other.is_contiguous() ||
+        !out.is_contiguous() ||
         has_output_alias(out, self) || has_output_alias(out, other)) {
         return false;
     }
 
     const int64_t n = self.numel();
+    if (dt == DType::Float64) {
+        const double alpha_val = alpha.toDouble();
+        const double* self_ptr = self.data_ptr<double>();
+        const double* other_ptr = other.data_ptr<double>();
+        double* out_ptr = out.data_ptr<double>();
+#if defined(__x86_64__)
+        binary_f64_contiguous(BIN_ADD, self_ptr, other_ptr, out_ptr, n,
+                              alpha_val);
+#else
+        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+            for (int64_t i = begin; i < end; ++i) {
+                out_ptr[i] = self_ptr[i] + alpha_val * other_ptr[i];
+            }
+        });
+#endif
+        return true;
+    }
     const float alpha_val = alpha.to<float>();
     const float* self_ptr = self.data_ptr<float>();
     const float* other_ptr = other.data_ptr<float>();
@@ -1786,6 +1808,15 @@ bool try_add_float32_out(const Tensor& self, const Tensor& other,
                                   end - begin, alpha_val);
             });
         }
+        return true;
+    }
+
+    // The contiguous pair is the best case the writer can claim, so it has to
+    // reach the same vector loop as the allocating kernel: one element per
+    // iteration leaves most of each cache line's bandwidth unused.
+    if (cpu_has_avx2f()) {
+        binary_f32_contiguous(BIN_ADD, self_ptr, other_ptr, out_ptr, n,
+                              alpha_val);
         return true;
     }
 #endif
@@ -1861,6 +1892,43 @@ bool try_add_tensor_iterator_out(const Tensor& self, const Tensor& other,
                     *reinterpret_cast<const float*>(data[1] + i * strides[1]) +
                     alpha_val *
                         *reinterpret_cast<const float*>(data[2] + i * strides[2]);
+            }
+        });
+        return true;
+    }
+
+    // The wider storage needs the same shape of fast lane: leaving it out of
+    // the branch list runs a double-by-double loop where the allocating kernel
+    // moves four doubles per instruction.
+    if (result_dtype == DType::Float64 && cpu_has_avx2f()) {
+        const double alpha_val = alpha.toDouble();
+        iter.for_each([&](char** data, const int64_t* strides, int64_t n) {
+            if (strides[0] == 8 && strides[1] == 8 && strides[2] == 8) {
+                binary_f64_vec(
+                    BIN_ADD, reinterpret_cast<const double*>(data[1]),
+                    reinterpret_cast<const double*>(data[2]),
+                    reinterpret_cast<double*>(data[0]), n, alpha_val);
+                return;
+            }
+            if (strides[0] == 8 && strides[1] == 8 && strides[2] == 0) {
+                binary_f64_vec_scalar_b(
+                    BIN_ADD, reinterpret_cast<const double*>(data[1]),
+                    *reinterpret_cast<const double*>(data[2]),
+                    reinterpret_cast<double*>(data[0]), n, alpha_val);
+                return;
+            }
+            if (strides[0] == 8 && strides[1] == 0 && strides[2] == 8) {
+                binary_f64_vec_scalar_a(
+                    BIN_ADD, *reinterpret_cast<const double*>(data[1]),
+                    reinterpret_cast<const double*>(data[2]),
+                    reinterpret_cast<double*>(data[0]), n, alpha_val);
+                return;
+            }
+            for (int64_t i = 0; i < n; ++i) {
+                *reinterpret_cast<double*>(data[0] + i * strides[0]) =
+                    *reinterpret_cast<const double*>(data[1] + i * strides[1]) +
+                    alpha_val *
+                        *reinterpret_cast<const double*>(data[2] + i * strides[2]);
             }
         });
         return true;
@@ -2499,7 +2567,7 @@ Tensor& add_out_kernel(const Tensor& self, const Tensor& other, const Scalar& al
         static_cast<std::vector<int64_t>>(self.shape()),
         static_cast<std::vector<int64_t>>(other.shape()));
     if (static_cast<std::vector<int64_t>>(out.shape()) == out_shape) {
-        if (try_add_float32_out(self, other, alpha, out) ||
+        if (try_add_float_out(self, other, alpha, out) ||
             try_add_narrow_out(self, other, alpha, out) ||
             try_add_tensor_iterator_out(self, other, alpha, result_dtype, out)) {
             return out;
