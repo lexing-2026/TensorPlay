@@ -1,5 +1,6 @@
 #include "TensorIterator.h"
 #include "TensorIteratorInternal.h"
+#include "SizesAndStrides.h"
 #include "Tensor.h"
 #include "ErrorReporting.h"
 #include "TypePromotion.h"
@@ -87,6 +88,67 @@ bool tensors_share_storage(const Tensor& a, const Tensor& b) {
   return impl_a->storage().defined() && impl_b->storage().defined()
       && impl_a->storage().data() == impl_b->storage().data()
       && impl_a->storage().nbytes() == impl_b->storage().nbytes();
+}
+
+// A layout that tiles one unbroken block of memory answers "which bytes do you
+// reach?" by its extent alone: the block starts at the base and holds one element
+// per step.  Any other layout -- a repeated step, a step that skips back -- has no
+// such block, so the bytes it spans say nothing about the elements it touches.
+bool dense_block(const Tensor& t, int64_t& bytes) {
+  bytes = 0;
+  if (!t.defined() || t.numel() == 0) {
+    return false;
+  }
+  // Steps laid out for the allocation they sit in tile the block by definition,
+  // and that is the shape the great majority of these tensors carry.
+  if (!t.is_contiguous()) {
+    const auto sizes = t.sizes().vec();
+    const auto strides = t.strides();
+    if (!SizesAndStrides::is_non_overlapping_and_dense(sizes, strides)) {
+      return false;
+    }
+  }
+  bytes = t.numel() * static_cast<int64_t>(t.itemsize());
+  return true;
+}
+
+// Two elements of a tensor address one location when a dimension spanning more
+// than a single step does not move at all.
+bool has_internal_overlap(const Tensor& t) {
+  int64_t bytes = 0;
+  if (dense_block(t, bytes)) {
+    return false;
+  }
+  for (const auto d : irange(t.dim())) {
+    if (t.size(d) > 1 && t.stride(d) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Whether an operand and the destination write the same byte from different
+// elements.  Blocks of one allocation that keep apart answer for themselves: a
+// pass never stores where it still has to read.  Two layouts over one block that
+// step differently do not -- the element a later step reads can be the one an
+// earlier step stored, and which value survives depends on the order of the
+// chunks.  Where a block cannot be named (a layout with no extent, an operand
+// that shares no allocation) there is nothing to answer, and nothing to refuse.
+bool reaches_partial_overlap(const Tensor& output, const Tensor& input) {
+  if (!tensors_share_storage(output, input)) {
+    return false;
+  }
+  int64_t output_bytes = 0, input_bytes = 0;
+  if (!dense_block(output, output_bytes) || !dense_block(input, input_bytes)) {
+    return false;
+  }
+  const char* output_begin = static_cast<const char*>(output.data_ptr());
+  const char* input_begin = static_cast<const char*>(input.data_ptr());
+  if (output_begin == input_begin && output_bytes == input_bytes) {
+    return output.stride() != input.stride();
+  }
+  return output_begin < input_begin + input_bytes &&
+         input_begin < output_begin + output_bytes;
 }
 
 // Simplified canCast: casting is always allowed between the supported CPU
@@ -917,12 +979,15 @@ void TensorIteratorBase::compute_mem_overlaps(const TensorIteratorConfig& config
   for (const auto i : irange(num_outputs_)) {
     const auto& output = tensor(i);
     if (!output.defined()) continue;
+    TP_CHECK(!has_internal_overlap(output),
+             "unsupported operation: more than one element of the written-to tensor "
+             "refers to a single memory location. Please clone() the tensor before performing the operation");
     for (const auto j : irange(num_outputs_, ntensors())) {
       const auto& input = tensor(j);
-      if (output.unsafeGetTensorImpl() != input.unsafeGetTensorImpl()
-          && tensors_share_storage(output, input)) {
-        TP_CHECK(false, "unsupported memory overlap between output and input");
-      }
+      if (output.unsafeGetTensorImpl() == input.unsafeGetTensorImpl()) continue;
+      TP_CHECK(!reaches_partial_overlap(output, input),
+               "unsupported operation: some elements of the input tensor and the "
+               "written-to tensor refer to a single memory location. Please clone() the tensor before performing the operation");
     }
   }
 }

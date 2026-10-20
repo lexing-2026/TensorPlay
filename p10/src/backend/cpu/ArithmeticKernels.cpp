@@ -1786,33 +1786,6 @@ bool in_place_alias_blocked(const Tensor& out, const Tensor& input) {
            input_base < out_base + view_footprint_bytes(out);
 }
 
-// Two views over one allocation, whatever the ranges they address.  This is the
-// test the general iterator runs before it will build, so a caller that hands it
-// a destination cannot claim a fused pass more widely than the iterator itself
-// would allow.
-bool shares_allocation(const Tensor& a, const Tensor& b) {
-    auto impl_a = a.unsafeGetTensorImpl();
-    auto impl_b = b.unsafeGetTensorImpl();
-    if (impl_a == nullptr || impl_b == nullptr) {
-        return false;
-    }
-    const auto& storage_a = impl_a->storage();
-    const auto& storage_b = impl_b->storage();
-    return storage_a.defined() && storage_b.defined() &&
-           storage_a.data() == storage_b.data() &&
-           storage_a.nbytes() == storage_b.nbytes();
-}
-
-// The iterator's guard accepts an operand that shares an allocation with the
-// destination only when the two are one and the same view.  Anything else has to
-// keep the pass that finishes the result before storing it, even when the two
-// address separate ranges.
-bool iterator_overlap_blocks(const Tensor& out, const Tensor& input) {
-    return in_place_alias_blocked(out, input) ||
-           (out.unsafeGetTensorImpl() != input.unsafeGetTensorImpl() &&
-            shares_allocation(out, input));
-}
-
 // The writer for a dense float pair that already has its destination.  Both
 // widths come here: the general iterator pays its setup for a loop the flat
 // kernels run without it.
@@ -1914,8 +1887,8 @@ bool try_add_narrow_out(const Tensor& self, const Tensor& other, Scalar alpha,
 bool try_add_tensor_iterator_out(const Tensor& self, const Tensor& other,
                                  Scalar alpha, DType result_dtype,
                                  Tensor& out) {
-    if (iterator_overlap_blocks(out, self) ||
-        iterator_overlap_blocks(out, other)) {
+    if (in_place_alias_blocked(out, self) ||
+        in_place_alias_blocked(out, other)) {
         return false;
     }
 
