@@ -702,6 +702,7 @@ if(USE_VULKAN)
         src/backend/vulkan/ops/Pooling.cpp
         src/backend/vulkan/ops/Quant.cpp
         src/backend/vulkan/ops/Random.cpp
+        src/backend/vulkan/ops/Repeat.cpp
         src/backend/vulkan/ops/Reduction.cpp
         src/backend/vulkan/ops/Shape.cpp
         src/backend/vulkan/ops/Softmax.cpp
