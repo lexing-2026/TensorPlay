@@ -312,8 +312,13 @@ static bool strided_unary_loop(const Tensor& self, Tensor& result,
 template<typename Func>
 Tensor unary_op_kernel(const Tensor& self, Func func,
                        vecunary::VOp vec_op = vecunary::VOp::None,
-                       vecunary::VParams vec_prm = {}) {
-    Tensor result = empty_like_in_input_order(self, self.dtype());
+                       vecunary::VParams vec_prm = {},
+                       const Tensor* destination = nullptr) {
+    // A caller that has already judged its own destination hands it over, so the
+    // pass writes where the values have to end up instead of being copied there.
+    Tensor result = destination != nullptr
+        ? *destination
+        : empty_like_in_input_order(self, self.dtype());
     int64_t n = self.numel();
 
     // f16 needs F16C for its widen/narrow pair; bf16 shifts, so plain AVX2
@@ -636,6 +641,26 @@ Tensor& unary_float_out_kernel(const Tensor& self, Tensor& out,
     return write_out(out, allocating(self));
 }
 
+// The same judgment for the ops that keep their input's dtype.  `straight` says
+// that the single pass below is what the allocating kernel does for this dtype;
+// where it is not -- an integral input that floor leaves alone, a complex input,
+// a destination the judge rejects -- the value comes from that kernel and is
+// handed over.
+template<typename Func>
+Tensor& unary_out_kernel(const Tensor& self, Tensor& out,
+                         Tensor (*allocating)(const Tensor&), Func func,
+                         vecunary::VOp vec_op,
+                         vecunary::VParams vec_prm = {},
+                         bool straight = true) {
+    const bool one_pass = straight && !isComplexType(self.dtype()) &&
+                          !isQuantizedType(self.dtype());
+    if (one_pass && destination_writable(self, out, self.dtype())) {
+        unary_op_kernel(self, func, vec_op, vec_prm, &out);
+        return out;
+    }
+    return write_out(out, allocating(self));
+}
+
 // corresponding real dtype (hypot(re, im)).
 Tensor complex_abs_kernel(const Tensor& self) {
     DType out_dtype = toRealValueType(self.dtype());
@@ -701,6 +726,17 @@ Tensor complex_abs_kernel(const Tensor& self) {
 
 // Implementations
 
+// Each functor is named once and shared by the allocating form of its op and by
+// the form that writes a caller's destination, so the two cannot drift apart.
+static constexpr auto abs_scalar = [](auto x) {
+    using T = decltype(x);
+    if constexpr (std::is_unsigned_v<T>) {
+        return x;
+    } else {
+        return std::abs(x);
+    }
+};
+
 Tensor abs_kernel(const Tensor& self) {
     if (isComplexType(self.dtype())) {
         if ((self.dtype() == DType::ComplexFloat ||
@@ -716,14 +752,11 @@ Tensor abs_kernel(const Tensor& self) {
         }
         return complex_abs_kernel(self);
     }
-    return unary_op_kernel(self, [](auto x) {
-        using T = decltype(x);
-        if constexpr (std::is_unsigned_v<T>) {
-            return x;
-        } else {
-            return std::abs(x);
-        }
-    }, vecunary::VOp::Abs);
+    return unary_op_kernel(self, abs_scalar, vecunary::VOp::Abs);
+}
+
+Tensor& abs_out_cpu(const Tensor& self, Tensor& out) {
+    return unary_out_kernel(self, out, abs_kernel, abs_scalar, vecunary::VOp::Abs);
 }
 
 // Vectorized complex unary driver — defined below the float kernels; declared
@@ -731,27 +764,51 @@ Tensor abs_kernel(const Tensor& self) {
 template <typename F>
 static Tensor cplx_unary_vec(const Tensor& self, veccomplex::Op op, F fb);
 
+static constexpr auto neg_scalar = [](auto x) {
+    if constexpr (std::is_same_v<decltype(x), bool>) {
+        return x;  // neg of a bool keeps the bool
+    } else {
+        return -x;
+    }
+};
+
 Tensor neg_kernel(const Tensor& self) {
     if (isComplexType(self.dtype())) {
         return cplx_unary_vec(self, veccomplex::Op::Neg,
                               [](auto x) { return -x; });
     }
-    return unary_op_kernel(self, [](auto x) {
-        if constexpr (std::is_same_v<decltype(x), bool>) {
-             return x; // neg(bool) in same dtype is weird, just return x to avoid warning
-        } else {
-             return -x;
-        }
-    }, vecunary::VOp::Neg);
+    return unary_op_kernel(self, neg_scalar, vecunary::VOp::Neg);
 }
+
+Tensor& neg_out_cpu(const Tensor& self, Tensor& out) {
+    return unary_out_kernel(self, out, neg_kernel, neg_scalar, vecunary::VOp::Neg);
+}
+
+static constexpr auto square_scalar = [](auto x) { return x * x; };
 
 Tensor square_kernel(const Tensor& self) {
     if (isComplexType(self.dtype())) {
         return cplx_unary_vec(self, veccomplex::Op::Square,
                               [](auto x) { return x * x; });
     }
-    return unary_op_kernel(self, [](auto x) { return x * x; }, vecunary::VOp::Square);
+    return unary_op_kernel(self, square_scalar, vecunary::VOp::Square);
 }
+
+Tensor& square_out_cpu(const Tensor& self, Tensor& out) {
+    return unary_out_kernel(self, out, square_kernel, square_scalar,
+                            vecunary::VOp::Square);
+}
+
+static constexpr auto sign_scalar = [](auto x) {
+    if constexpr (std::is_same_v<decltype(x), bool>) {
+        return x ? 1 : 0;
+    } else {
+        using ctype = decltype(x);
+        if (x > ctype(0)) return static_cast<ctype>(1);
+        if (x < ctype(0)) return static_cast<ctype>(-1);
+        return static_cast<ctype>(0);
+    }
+};
 
 Tensor sign_kernel(const Tensor& self) {
     if (isComplexType(self.dtype())) {
@@ -763,31 +820,48 @@ Tensor sign_kernel(const Tensor& self) {
             return x / C(m, T(0));
         });
     }
-    return unary_op_kernel(self, [](auto x) {
-        if constexpr (std::is_same_v<decltype(x), bool>) {
-            return x ? 1 : 0;
-        } else {
-            using ctype = decltype(x);
-            if (x > ctype(0)) return static_cast<ctype>(1);
-            if (x < ctype(0)) return static_cast<ctype>(-1);
-            return static_cast<ctype>(0);
-        }
-    }, vecunary::VOp::Sign);
+    return unary_op_kernel(self, sign_scalar, vecunary::VOp::Sign);
 }
+
+Tensor& sign_out_cpu(const Tensor& self, Tensor& out) {
+    return unary_out_kernel(self, out, sign_kernel, sign_scalar, vecunary::VOp::Sign);
+}
+
+static constexpr auto floor_scalar = [](auto x) { return std::floor(x); };
+static constexpr auto ceil_scalar = [](auto x) { return std::ceil(x); };
+static constexpr auto round_scalar = [](auto x) { return std::nearbyint(x); };
 
 Tensor floor_kernel(const Tensor& self) {
     if (isIntegralType(self.dtype())) return self.clone();
-    return unary_op_kernel(self, [](auto x) { return std::floor(x); }, vecunary::VOp::Floor);
+    return unary_op_kernel(self, floor_scalar, vecunary::VOp::Floor);
+}
+
+Tensor& floor_out_cpu(const Tensor& self, Tensor& out) {
+    return unary_out_kernel(self, out, floor_kernel, floor_scalar,
+                            vecunary::VOp::Floor, {},
+                            !isIntegralType(self.dtype()));
 }
 
 Tensor ceil_kernel(const Tensor& self) {
     if (isIntegralType(self.dtype())) return self.clone();
-    return unary_op_kernel(self, [](auto x) { return std::ceil(x); }, vecunary::VOp::Ceil);
+    return unary_op_kernel(self, ceil_scalar, vecunary::VOp::Ceil);
+}
+
+Tensor& ceil_out_cpu(const Tensor& self, Tensor& out) {
+    return unary_out_kernel(self, out, ceil_kernel, ceil_scalar,
+                            vecunary::VOp::Ceil, {},
+                            !isIntegralType(self.dtype()));
 }
 
 Tensor round_kernel(const Tensor& self) {
     if (isIntegralType(self.dtype())) return self.clone();
-    return unary_op_kernel(self, [](auto x) { return std::nearbyint(x); }, vecunary::VOp::Round);
+    return unary_op_kernel(self, round_scalar, vecunary::VOp::Round);
+}
+
+Tensor& round_out_cpu(const Tensor& self, Tensor& out) {
+    return unary_out_kernel(self, out, round_kernel, round_scalar,
+                            vecunary::VOp::Round, {},
+                            !isIntegralType(self.dtype()));
 }
 
 // Float ops
@@ -1062,16 +1136,32 @@ Tensor& sigmoid_out_cpu(const Tensor& self, Tensor& out) {
         vecunary::VOp::Sigmoid);
 }
 
+static constexpr auto frac_scalar = [](auto x) { return x - std::trunc(x); };
+
 Tensor frac_kernel(const Tensor& self) {
     if (isIntegralType(self.dtype())) {
         TP_THROW(NotImplementedError, "frac is not implemented for integral tensors");
     }
-    return unary_op_kernel(self, [](auto x) { return x - std::trunc(x); }, vecunary::VOp::Frac);
+    return unary_op_kernel(self, frac_scalar, vecunary::VOp::Frac);
 }
+
+Tensor& frac_out_cpu(const Tensor& self, Tensor& out) {
+    return unary_out_kernel(self, out, frac_kernel, frac_scalar,
+                            vecunary::VOp::Frac, {},
+                            !isIntegralType(self.dtype()));
+}
+
+static constexpr auto trunc_scalar = [](auto x) { return std::trunc(x); };
 
 Tensor trunc_kernel(const Tensor& self) {
     if (isIntegralType(self.dtype())) return self.clone();
-    return unary_op_kernel(self, [](auto x) { return std::trunc(x); }, vecunary::VOp::Trunc);
+    return unary_op_kernel(self, trunc_scalar, vecunary::VOp::Trunc);
+}
+
+Tensor& trunc_out_cpu(const Tensor& self, Tensor& out) {
+    return unary_out_kernel(self, out, trunc_kernel, trunc_scalar,
+                            vecunary::VOp::Trunc, {},
+                            !isIntegralType(self.dtype()));
 }
 
 Tensor relu_kernel(const Tensor& self) {
@@ -3567,6 +3657,16 @@ TENSORPLAY_LIBRARY_IMPL(CPU, PointwiseKernels) {
     m.impl("sqrt.out", sqrt_out_cpu);
     m.impl("rsqrt.out", rsqrt_out_cpu);
     m.impl("sigmoid.out", sigmoid_out_cpu);
+    m.impl("abs.out", abs_out_cpu);
+    m.impl("absolute.out", abs_out_cpu);
+    m.impl("neg.out", neg_out_cpu);
+    m.impl("sign.out", sign_out_cpu);
+    m.impl("square.out", square_out_cpu);
+    m.impl("floor.out", floor_out_cpu);
+    m.impl("ceil.out", ceil_out_cpu);
+    m.impl("round.out", round_out_cpu);
+    m.impl("trunc.out", trunc_out_cpu);
+    m.impl("frac.out", frac_out_cpu);
     m.impl("sinh", sinh_kernel);
     m.impl("tan", tan_kernel);
     m.impl("tanh", tanh_kernel);
