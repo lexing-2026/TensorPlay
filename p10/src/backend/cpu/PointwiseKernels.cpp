@@ -2017,6 +2017,54 @@ Tensor clamp_kernel(const Tensor& self, const std::optional<Scalar>& min, const 
     }
 #endif
 
+    // A reduced storage chooses between three values that all live in its own
+    // width, so each bound takes its storage value first -- the very compare the
+    // per-element loop below makes -- and the chunk loops only select.  Nothing
+    // is rounded, which leaves body, tail and fallback with no rounding rule to
+    // disagree about.
+    if (vecunary::vec_ready() &&
+        (self.dtype() == DType::BFloat16 ||
+         (self.dtype() == DType::Float16 && vecunary::f16c_available()))) {
+        const bool bf16 = self.dtype() == DType::BFloat16;
+        const double lo = min.has_value()
+            ? (bf16 ? static_cast<double>(min->to<BFloat16>())
+                    : static_cast<double>(min->to<Half>()))
+            : -std::numeric_limits<double>::infinity();
+        const double hi = max.has_value()
+            ? (bf16 ? static_cast<double>(max->to<BFloat16>())
+                    : static_cast<double>(max->to<Half>()))
+            : std::numeric_limits<double>::infinity();
+        // The chunk loops raise the floor and then lower the ceiling, so a pair
+        // of bounds that is the other way round has to stay with the
+        // per-element loop; otherwise a tail element would not match its own
+        // vector.
+        if (lo <= hi) {
+            vecunary::VParams prm;
+            prm.p0 = lo;
+            prm.p1 = hi;
+            if (bf16) {
+                const uint16_t* src = reinterpret_cast<const uint16_t*>(
+                    self_contig.data_ptr<BFloat16>());
+                uint16_t* dst =
+                    reinterpret_cast<uint16_t*>(result.data_ptr<BFloat16>());
+                parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                    vecunary::run_bf16(vecunary::VOp::Hardtanh, prm, src, dst,
+                                       begin, end);
+                });
+            } else {
+                const uint16_t* src = reinterpret_cast<const uint16_t*>(
+                    self_contig.data_ptr<Half>());
+                uint16_t* dst =
+                    reinterpret_cast<uint16_t*>(result.data_ptr<Half>());
+                parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                    vecunary::run_f16(vecunary::VOp::Hardtanh, prm, src, dst,
+                                      begin, end);
+                });
+            }
+            return result;
+        }
+    }
+
     const bool has_min = min.has_value();
     const bool has_max = max.has_value();
 
