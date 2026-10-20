@@ -5,6 +5,7 @@
 #include "Scalar.h"
 #include "Utils.h"
 #include "TensorIteratorOps.h"
+#include "OutWrite.h"
 #include "Exception.h"
 #include "Parallel.h"
 #include "TypePromotion.h"
@@ -277,14 +278,21 @@ Tensor dtype_unary_kernel(const Tensor& self, F f, const char* name) {
 
 // integral inputs yield Float32; Half/BFloat16 compute in float and keep
 // their dtype; Float32/Float64 preserved.
+//
+// `destination` hands the loop a tensor the caller already holds; it only
+// arrives in the width the loop computes at and packed, which is what
+// float_math_out_kernel checks.
 template <typename F>
-Tensor float_math_kernel(const Tensor& self, F f, const char* name) {
+Tensor float_math_kernel(const Tensor& self, F f, const char* name,
+                         const Tensor* destination = nullptr) {
     DType in = self.dtype();
     DType out_dt = isFloatingType(in) ? in : DType::Float32;
     DType compute_dt = (in == DType::Float64) ? DType::Float64 : DType::Float32;
     Tensor w = (self.dtype() == compute_dt) ? self.contiguous()
                                             : self.to(compute_dt).contiguous();
-    Tensor t = Tensor::empty(static_cast<std::vector<int64_t>>(w.shape()), compute_dt, w.device());
+    Tensor t = destination != nullptr
+                   ? *destination
+                   : Tensor::empty(static_cast<std::vector<int64_t>>(w.shape()), compute_dt, w.device());
     int64_t n = w.numel();
     if (compute_dt == DType::Float64) {
         const double* sp = w.data_ptr<double>();
@@ -301,6 +309,83 @@ Tensor float_math_kernel(const Tensor& self, F f, const char* name) {
     }
     return (out_dt == compute_dt) ? t : t.to(out_dt);
 }
+
+// Whether the flat map over `self` can fill `out` itself instead of making a
+// result that is copied over afterwards.  The loop pairs element i of a packed
+// source with element i of the destination, so the destination has to be packed
+// too and has to carry the answer in the width the loop computes at -- a
+// Half or BFloat16 answer is still narrowed by a conversion of its own, and a
+// complex or quantized operand goes by some other route entirely.
+static bool float_math_takes(const Tensor& self, const Tensor& out) {
+    const DType in = self.dtype();
+    if (isComplexType(in) || isQuantizedType(in)) {
+        return false;
+    }
+    const DType out_dt = isFloatingType(in) ? in : DType::Float32;
+    const DType compute_dt = (in == DType::Float64) ? DType::Float64 : DType::Float32;
+    return out_dt == compute_dt &&
+           destination_takes_flat(out, self.device(), out_dt,
+                                  static_cast<std::vector<int64_t>>(self.shape()),
+                                  self);
+}
+
+// One map, one pass, into the caller's tensor wherever that holds; everywhere
+// else the value comes from the same kernel that answers without a destination.
+template <typename F>
+Tensor& float_math_out_kernel(const Tensor& self, Tensor& out,
+                              Tensor (*allocating)(const Tensor&), F f,
+                              const char* name) {
+    if (float_math_takes(self, out)) {
+        float_math_kernel(self, f, name, &out);
+        return out;
+    }
+    return write_out(out, allocating(self));
+}
+
+struct ReciprocalScalar {
+    double operator()(double x) const { return 1.0 / x; }
+};
+struct Exp2Scalar {
+    double operator()(double x) const { return std::exp2(x); }
+};
+struct SincScalar {
+    double operator()(double x) const {
+        double px = M_PI * x;
+        return std::fabs(px) < 1e-30 ? 1.0 : std::sin(px) / px;
+    }
+};
+struct Deg2RadScalar {
+    double operator()(double x) const { return x * (M_PI / 180.0); }
+};
+struct Rad2DegScalar {
+    double operator()(double x) const { return x * (180.0 / M_PI); }
+};
+struct ErfinvScalar {
+    double operator()(double x) const { return special_math::calc_erfinv(x); }
+};
+struct I0Scalar {
+    double operator()(double x) const {
+        return tensorplay::special_math::modified_bessel_i0_forward(x);
+    }
+};
+struct DigammaScalar {
+    double operator()(double v) const {
+        if (v <= 0 && v == std::floor(v)) return std::numeric_limits<double>::quiet_NaN();
+        double r = 0;
+        while (v < 6.0) { r -= 1.0 / v; v += 1.0; }
+        double inv = 1.0 / v, inv2 = inv * inv;
+        r += std::log(v) - 0.5 * inv
+             - inv2 * (1.0/12.0 - inv2 * (1.0/120.0 - inv2 * (1.0/252.0 - inv2 * (1.0/240.0 - inv2 / 132.0))));
+        return r;
+    }
+};
+struct LogitScalar {
+    double e;
+    double operator()(double p) const {
+        if (e >= 0) p = std::min(std::max(p, e), 1.0 - e);
+        return std::log(p / (1.0 - p));
+    }
+};
 
 } // anonymous namespace
 
@@ -624,7 +709,11 @@ Tensor reciprocal_cpu(const Tensor& self) {
             return static_cast<T>(1) / z;
         });
     }
-    return float_math_kernel(self, [](double x) { return 1.0 / x; }, "reciprocal");
+    return float_math_kernel(self, ReciprocalScalar{}, "reciprocal");
+}
+Tensor& reciprocal_out_cpu(const Tensor& self, Tensor& out) {
+    return float_math_out_kernel(self, out, reciprocal_cpu, ReciprocalScalar{},
+                                 "reciprocal");
 }
 Tensor sgn_cpu(const Tensor& self) {
     if (isComplexType(self.dtype())) {
@@ -646,50 +735,65 @@ Tensor sgn_cpu(const Tensor& self) {
     }, "sgn");
 }
 Tensor exp2_cpu(const Tensor& self) {
-    return float_math_kernel(self, [](double x) { return std::exp2(x); }, "exp2");
+    return float_math_kernel(self, Exp2Scalar{}, "exp2");
+}
+Tensor& exp2_out_cpu(const Tensor& self, Tensor& out) {
+    return float_math_out_kernel(self, out, exp2_cpu, Exp2Scalar{}, "exp2");
 }
 Tensor sinc_cpu(const Tensor& self) {
-    return float_math_kernel(self, [](double x) {
-        double px = M_PI * x;
-        return std::fabs(px) < 1e-30 ? 1.0 : std::sin(px) / px;
-    }, "sinc");
+    return float_math_kernel(self, SincScalar{}, "sinc");
+}
+Tensor& sinc_out_cpu(const Tensor& self, Tensor& out) {
+    return float_math_out_kernel(self, out, sinc_cpu, SincScalar{}, "sinc");
 }
 Tensor deg2rad_cpu(const Tensor& self) {
-    return float_math_kernel(self, [](double x) { return x * (M_PI / 180.0); }, "deg2rad");
+    return float_math_kernel(self, Deg2RadScalar{}, "deg2rad");
+}
+Tensor& deg2rad_out_cpu(const Tensor& self, Tensor& out) {
+    return float_math_out_kernel(self, out, deg2rad_cpu, Deg2RadScalar{}, "deg2rad");
 }
 Tensor rad2deg_cpu(const Tensor& self) {
-    return float_math_kernel(self, [](double x) { return x * (180.0 / M_PI); }, "rad2deg");
+    return float_math_kernel(self, Rad2DegScalar{}, "rad2deg");
+}
+Tensor& rad2deg_out_cpu(const Tensor& self, Tensor& out) {
+    return float_math_out_kernel(self, out, rad2deg_cpu, Rad2DegScalar{}, "rad2deg");
 }
 Tensor erfinv_cpu(const Tensor& self) {
-    return float_math_kernel(self, [](double x) {
-        return special_math::calc_erfinv(x);
-    }, "erfinv");
+    return float_math_kernel(self, ErfinvScalar{}, "erfinv");
+}
+Tensor& erfinv_out_cpu(const Tensor& self, Tensor& out) {
+    return float_math_out_kernel(self, out, erfinv_cpu, ErfinvScalar{}, "erfinv");
 }
 Tensor logit_cpu(const Tensor& self, const std::optional<Scalar>& eps) {
     double e = eps.has_value() ? eps->toDouble() : -1.0;
-    return float_math_kernel(self, [e](double p) {
-        if (e >= 0) p = std::min(std::max(p, e), 1.0 - e);
-        return std::log(p / (1.0 - p));
-    }, "logit");
+    return float_math_kernel(self, LogitScalar{e}, "logit");
+}
+// The destination form spells eps as the schema does, a width the caller chose;
+// the value it holds is what the allocating form would have clamped to.
+Tensor& logit_out_cpu(const Tensor& self, std::optional<double> eps, Tensor& out) {
+    if (float_math_takes(self, out)) {
+        float_math_kernel(self, LogitScalar{eps.has_value() ? *eps : -1.0},
+                          "logit", &out);
+        return out;
+    }
+    std::optional<Scalar> width;
+    if (eps.has_value()) width = Scalar(*eps);
+    return write_out(out, logit_cpu(self, width));
 }
 Tensor digamma_cpu(const Tensor& self) {
-    return float_math_kernel(self, [](double v) {
-        if (v <= 0 && v == std::floor(v)) return std::numeric_limits<double>::quiet_NaN();
-        double r = 0;
-        while (v < 6.0) { r -= 1.0 / v; v += 1.0; }
-        double inv = 1.0 / v, inv2 = inv * inv;
-        r += std::log(v) - 0.5 * inv
-             - inv2 * (1.0/12.0 - inv2 * (1.0/120.0 - inv2 * (1.0/252.0 - inv2 * (1.0/240.0 - inv2 / 132.0))));
-        return r;
-    }, "digamma");
+    return float_math_kernel(self, DigammaScalar{}, "digamma");
+}
+Tensor& digamma_out_cpu(const Tensor& self, Tensor& out) {
+    return float_math_out_kernel(self, out, digamma_cpu, DigammaScalar{}, "digamma");
 }
 Tensor i0_cpu(const Tensor& self) {
     // Modified Bessel I0.  The Chebyshev expansion holds across the whole
     // range; the ((|x|/2)^k / k!)^2 series it replaces needs more terms than
     // any fixed cap allows once |x| passes ~50.
-    return float_math_kernel(self, [](double v) {
-        return tensorplay::special_math::modified_bessel_i0_forward(v);
-    }, "i0");
+    return float_math_kernel(self, I0Scalar{}, "i0");
+}
+Tensor& i0_out_cpu(const Tensor& self, Tensor& out) {
+    return float_math_out_kernel(self, out, i0_cpu, I0Scalar{}, "i0");
 }
 Tensor nan_to_num_cpu(const Tensor& self, const Scalar& nan,
                       const std::optional<Scalar>& posinf, const std::optional<Scalar>& neginf) {
@@ -1303,6 +1407,15 @@ TENSORPLAY_LIBRARY_IMPL(CPU, OpsKernels) {
     m.impl("logit", logit_cpu);
     m.impl("digamma", digamma_cpu);
     m.impl("i0", i0_cpu);
+    m.impl("reciprocal.out", reciprocal_out_cpu);
+    m.impl("exp2.out", exp2_out_cpu);
+    m.impl("sinc.out", sinc_out_cpu);
+    m.impl("deg2rad.out", deg2rad_out_cpu);
+    m.impl("rad2deg.out", rad2deg_out_cpu);
+    m.impl("erfinv.out", erfinv_out_cpu);
+    m.impl("logit.out", logit_out_cpu);
+    m.impl("digamma.out", digamma_out_cpu);
+    m.impl("i0.out", i0_out_cpu);
     m.impl("nan_to_num", nan_to_num_cpu);
     m.impl("xlogy", xlogy_cpu);
     m.impl("logaddexp", logaddexp_cpu);
