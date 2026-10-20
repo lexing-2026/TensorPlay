@@ -848,6 +848,106 @@ class TestVulkanIndexCopy(unittest.TestCase):
             want[:, :, idx, :] = src.cpu().numpy().astype(got.dtype)
             np.testing.assert_array_equal(got, want)
 
+    def test_a_short_cache_scatters_the_rows_its_shape_offers(self):
+        # A cache of two or three axes has the same texel geometry as the four-axis
+        # one: the axis above the last is the texture's height, so its rows are
+        # lines of whole texels.  Appending a decode step into a [slots, features]
+        # page is the shape a runtime actually holds.
+        tensorplay.manual_seed(4242)
+        cases = (
+            ((9, 64), 0, [0, 8, 3], tensorplay.float32),
+            ((7, 24), 0, [6, 0, 1], tensorplay.float16),
+            ((6, 7), 0, [5, 1, 2], tensorplay.float32),
+            ((2, 5, 8), 1, [4, 0, 2], tensorplay.float16),
+            ((4, 6, 5), 1, [0, 5, 2], tensorplay.float32),
+            ((1, 1, 4, 8), 2, [0, 3], tensorplay.float32),
+        )
+        for shape, axis, idx, dtype in cases:
+            buf = tensorplay.randn(shape, device="cpu").to(dtype).to("vulkan")
+            before = buf.cpu().numpy()
+            rows = list(shape)
+            rows[axis] = len(idx)
+            src = tensorplay.randn(rows, device="cpu").to(dtype).to("vulkan")
+            moved = src.cpu().numpy().astype(before.dtype)
+            want = before.copy()
+            picked = [slice(None)] * len(shape)
+            picked[axis] = idx
+            write = [slice(None)] * len(shape)
+            write[axis] = range(len(idx))
+            want[tuple(picked)] = moved[tuple(write)]
+            np.testing.assert_array_equal(
+                tensorplay.index_copy_(
+                    buf, axis, tensorplay.tensor(
+                        idx, dtype=tensorplay.int64, device="vulkan"),
+                    src).cpu().numpy(),
+                want,
+                err_msg=f"rows of a {shape} cache along axis {axis}")
+            # The functional form writes the same rows into the payload the
+            # in-place call left behind, so it answers the same table again and
+            # changes nothing the scatter did not name.
+            np.testing.assert_array_equal(
+                tensorplay.index_copy(
+                    buf, axis,
+                    tensorplay.tensor(
+                        idx, dtype=tensorplay.int64, device="vulkan"),
+                    src).cpu().numpy(),
+                want,
+                err_msg=f"out-of-place rows of a {shape} cache")
+
+    def test_a_cache_without_an_image_form_scatters_any_axis(self):
+        # Past the image axis limit a payload is plain row-major memory, so the
+        # row an invocation moves is a run of consecutive elements and any axis can
+        # name it - including the innermost one, whose rows an image packs into the
+        # lanes of a texel and cannot scatter whole.
+        tensorplay.manual_seed(99)
+        cases = (
+            ((20000,), 0, [0, 19999, 7]),
+            ((40000, 8), 0, [0, 39999, 7]),
+            ((40000, 8), 1, [0, 2, 7]),
+            ((6, 40000, 4), 1, [0, 39999, 7, 100]),
+            ((6, 40000, 4), 0, [5, 0, 1]),
+        )
+        for shape, axis, idx in cases:
+            buf = tensorplay.randn(shape, device="cpu").to("vulkan")
+            before = buf.cpu().numpy()
+            rows = list(shape)
+            rows[axis] = len(idx)
+            src = tensorplay.randn(rows, device="cpu").to("vulkan")
+            moved = src.cpu().numpy()
+            want = before.copy()
+            picked = [slice(None)] * len(shape)
+            picked[axis] = idx
+            write = [slice(None)] * len(shape)
+            write[axis] = range(len(idx))
+            want[tuple(picked)] = moved[tuple(write)]
+            np.testing.assert_array_equal(
+                tensorplay.index_copy_(
+                    buf, axis,
+                    tensorplay.tensor(
+                        idx, dtype=tensorplay.int64, device="vulkan"),
+                    src).cpu().numpy(),
+                want,
+                err_msg=f"a {shape} linear cache along axis {axis}")
+    def test_an_image_row_that_straddles_its_packed_axis_stays_refused(self):
+        # A texel holds four lanes of the axis a payload packs, so writing one of
+        # its rows means rewriting lanes the scatter did not name.  Neither the
+        # innermost axis nor a rank-1 payload's only axis is the texture's height.
+        buf = tensorplay.randn((9, 64), device="cpu").to("vulkan")
+        src = tensorplay.randn((9, 2), device="cpu").to("vulkan")
+        codes = tensorplay.tensor([0, 2], dtype=tensorplay.int64,
+                                  device="vulkan")
+        with self.assertRaisesRegex(
+                RuntimeError, "an image payload scatters the axis above"):
+            tensorplay.index_copy_(buf, 1, codes, src)
+        flat = tensorplay.randn((12,), device="cpu").to("vulkan")
+        with self.assertRaisesRegex(
+                RuntimeError, "an image payload scatters the axis above"):
+            tensorplay.index_copy_(
+                flat, 0,
+                tensorplay.tensor([1, 5], dtype=tensorplay.int64,
+                                  device="vulkan"),
+                tensorplay.randn((2,), device="cpu").to("vulkan"))
+
     def test_index_copy_writes_nothing_for_a_row_it_cannot_name(self):
         # Nothing asserts on the device, and folding a list onto the host to
         # check its range would cost a queue sync per call.  Both scatter
