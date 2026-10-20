@@ -6073,6 +6073,15 @@
     CPU: fused_rope_cpu
     CUDA: fused_rope_cuda
 
+# The half-split rotation over a gathered table: the table names every
+# position, so the rotation does not assume contiguous positions.  The
+# backward is the same rotation with the sine turned around, which the
+# orthogonality of the rotation makes exact.
+- func: _fused_rope_neox(Tensor input, Tensor cos, Tensor sin) -> Tensor
+  variants: function
+- func: _fused_rope_neox_backward(Tensor grad_out, Tensor input, Tensor cos, Tensor sin) -> Tensor
+  variants: function
+
 # ------------------------------------------------------------------
 # In-place family completion.  In-place counterparts (name + '_',
 # mutable self/return) of existing functional ops whose kernels both

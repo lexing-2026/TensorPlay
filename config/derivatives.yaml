@@ -704,6 +704,16 @@
   input: std::get<0>(_fused_rms_norm_backward(grad, input, normalized_shape, ret1, weight, grad_input_mask))
   weight: std::get<1>(_fused_rms_norm_backward(grad, input, normalized_shape, ret1, weight, grad_input_mask))
 
+# The half-split rotation is orthogonal, so its transpose is the rotation
+# with the sine turned around: the backward is the same kernel over the same
+# table, and the backward of that is the forward again.  The backward reads
+# the input only to keep the graph connected, so the input takes no gradient
+# of its own.
+- name: _fused_rope_neox(Tensor input, Tensor cos, Tensor sin) -> Tensor
+  input: _fused_rope_neox_backward(grad, input, cos, sin)
+- name: _fused_rope_neox_backward(Tensor grad_out, Tensor input, Tensor cos, Tensor sin) -> Tensor
+  grad_out: _fused_rope_neox(grad, cos, sin)
+
 # The composite spelling is the same computation with the extents folded into
 # the argument list; the native form is what a captured training region lowers
 # to, because its reverse pass reads the row statistics it reports.
@@ -1057,7 +1067,6 @@
 # saved: exp(score - lse) reproduces each probability, and the dropout seed
 # they recorded reproduces the dropped positions.  Only the output is
 # differentiable; the constant, the tables, the sizes and the seeds are not.
-
 - name: _flash_attention_forward(Tensor query, Tensor key, Tensor value, Tensor? cum_seq_q, Tensor? cum_seq_k, SymInt max_q, SymInt max_k, float dropout_p, bool is_causal, bool return_debug_mask, *, float? scale=None, SymInt? window_size_left=None, SymInt? window_size_right=None, Tensor? seqused_k=None, Tensor? alibi_slopes=None, Tensor? block_table=None, int? num_splits=None) -> (Tensor output, Tensor softmax_logsumexp, Tensor rng_state, Tensor unused, Tensor debug_attn_mask)
   output_differentiability: [True, False, False, False, False]
   query: std::get<0>(_flash_attention_backward(grad, query, key, value, output, softmax_logsumexp, cum_seq_q.value_or(Tensor()), cum_seq_k.value_or(Tensor()), max_q, max_k, dropout_p, is_causal, rng_state, unused, scale, window_size_left, window_size_right))

@@ -263,6 +263,65 @@ inline unsigned rope_blocks(int64_t n) {
       (n + kThreads - 1) / kThreads, 65535));
 }
 
+// The half-split layout: the i-th element of the first half of a head
+// rotates against the i-th element of the second half.  A thread owns one
+// such pair, reads the table entry that names its position, and writes both
+// halves.  The table is gathered per position, so it carries the batch and
+// the token axes of its own.
+template <typename T, typename C, typename Acc>
+__global__ void fused_rope_neox_kernel(
+    const T* input, T* output, const C* cos, const C* sin, int64_t pairs,
+    int64_t half_dim, int64_t tokens, int64_t heads,
+    int64_t batch_stride, int64_t head_stride, int64_t token_stride,
+    int64_t out_batch_stride, int64_t out_head_stride, int64_t out_token_stride,
+    int64_t table_batch_stride, int64_t table_token_stride, bool negate_sin) {
+  const int64_t first = static_cast<int64_t>(blockIdx.x) * blockDim.x +
+                        threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (int64_t pair = first; pair < pairs; pair += stride) {
+    const int64_t row = pair / half_dim;
+    const int64_t pair_in_row = pair - row * half_dim;
+    const int64_t token = row % tokens;
+    const int64_t outer = row / tokens;
+    const int64_t head = outer % heads;
+    const int64_t batch = outer / heads;
+    const int64_t input_offset = batch * batch_stride + head * head_stride +
+                                 token * token_stride + pair_in_row;
+    const int64_t output_offset = batch * out_batch_stride +
+                                  head * out_head_stride +
+                                  token * out_token_stride + pair_in_row;
+    const int64_t table_offset = batch * table_batch_stride +
+                                 token * table_token_stride + pair_in_row;
+    const Acc x0 = static_cast<Acc>(input[input_offset]);
+    const Acc x1 = static_cast<Acc>(input[input_offset + half_dim]);
+    const Acc c = static_cast<Acc>(cos[table_offset]);
+    const Acc s = static_cast<Acc>(sin[table_offset]);
+    // The rotation is orthogonal, so its own transpose is the same rotation
+    // with the sine turned around: the backward reads the same table with
+    // the sign of the sine reversed.
+    const Acc sn = negate_sin ? -s : s;
+    output[output_offset] = static_cast<T>(x0 * c - x1 * sn);
+    output[output_offset + half_dim] = static_cast<T>(x1 * c + x0 * sn);
+  }
+}
+
+template <typename T, typename C>
+void rope_neox_launch(const Tensor& input, Tensor& output, const Tensor& cos,
+                      const Tensor& sin, bool negate_sin) {
+  using Acc = std::conditional_t<std::is_same_v<T, double>, double, float>;
+  const int64_t B = input.size(0), H = input.size(1);
+  const int64_t tokens = input.size(2), D = input.size(3);
+  const int64_t half_dim = D / 2;
+  const int64_t pairs = B * H * tokens * half_dim;
+  fused_rope_neox_kernel<T, C, Acc><<<rope_blocks(pairs), 256, 0,
+                                      getCurrentCUDAStream().stream()>>>(
+      input.data_ptr<T>(), output.data_ptr<T>(), cos.data_ptr<C>(),
+      sin.data_ptr<C>(), pairs, half_dim, tokens, H, input.stride(0),
+      input.stride(1), input.stride(2), output.stride(0), output.stride(1),
+      output.stride(2), cos.stride(0), cos.stride(1), negate_sin);
+  TP_CUDA_CHECK(cudaGetLastError());
+}
+
 template <typename T, typename C>
 Tensor rope_single_typed(const Tensor& input, const Tensor& cos,
                          const Tensor& sin, const RopeTable& table,
@@ -634,6 +693,113 @@ int64_t fused_sdp_choice_cuda(const Tensor& query, const Tensor& key,
                                                         enable_gqa);
 }
 
+// The half-split rotation over a gathered table: the query and the key are
+// rotated by one launch each, with the table naming every position.
+namespace {
+
+Tensor rope_neox_impl(const Tensor& input, const Tensor& cos,
+                      const Tensor& sin, bool negate_sin) {
+  if (input.dim() != 4) {
+    TP_THROW(RuntimeError,
+             "fused_rope_neox: input must be 4D [batch, heads, tokens, width]");
+  }
+  if (!rope_float_dtype(input.dtype())) {
+    TP_THROW(NotImplementedError,
+             "fused_rope_neox: only float32/float64/float16/bfloat16 are "
+             "supported");
+  }
+  const int64_t B = input.size(0), H = input.size(1);
+  const int64_t tokens = input.size(2), D = input.size(3);
+  if ((D & 1) != 0) {
+    TP_THROW(RuntimeError, "fused_rope_neox: the head width must be even");
+  }
+  const int64_t half_dim = D / 2;
+  if (cos.dim() != 3 || sin.dim() != 3 || cos.size(0) != B ||
+      sin.size(0) != B || cos.size(1) != tokens || sin.size(1) != tokens ||
+      cos.size(2) != half_dim || sin.size(2) != half_dim) {
+    TP_THROW(RuntimeError,
+             "fused_rope_neox: cos and sin must be [batch, tokens, width/2]");
+  }
+  if (cos.dtype() != sin.dtype() || !rope_float_dtype(cos.dtype())) {
+    TP_THROW(RuntimeError,
+             "fused_rope_neox: cos and sin must have the same floating dtype");
+  }
+  if (input.device() != cos.device() || input.device() != sin.device()) {
+    TP_THROW(DeviceMismatchError,
+             "fused_rope_neox: input and cos/sin must be on the same device");
+  }
+  // The innermost axis names the two elements of a pair, so it has to be
+  // contiguous; the axes above it are read through their own strides.
+  Tensor input_c = input.stride(3) == 1 ? input : input.contiguous();
+  Tensor cos_c = cos.stride(2) == 1 ? cos : cos.contiguous();
+  Tensor sin_c = sin.stride(2) == 1 ? sin : sin.contiguous();
+  Tensor output = Tensor::empty({B, H, tokens, D}, input.dtype(),
+                                input.device());
+  if (output.numel() == 0) {
+    return output;
+  }
+  switch (input.dtype()) {
+    case DType::Float32:
+      if (cos.dtype() == DType::Float32) {
+        rope_neox_launch<float, float>(input_c, output, cos_c, sin_c, negate_sin);
+      } else if (cos.dtype() == DType::Float64) {
+        rope_neox_launch<float, double>(input_c, output, cos_c, sin_c, negate_sin);
+      } else {
+        TP_THROW(RuntimeError, "fused_rope_neox: unsupported table dtype");
+      }
+      break;
+    case DType::Float64:
+      if (cos.dtype() == DType::Float64) {
+        rope_neox_launch<double, double>(input_c, output, cos_c, sin_c, negate_sin);
+      } else {
+        TP_THROW(RuntimeError, "fused_rope_neox: unsupported table dtype");
+      }
+      break;
+    case DType::Float16:
+      if (cos.dtype() == DType::Float16) {
+        rope_neox_launch<tensorplay::Half, tensorplay::Half>(
+            input_c, output, cos_c, sin_c, negate_sin);
+      } else if (cos.dtype() == DType::Float32) {
+        rope_neox_launch<tensorplay::Half, float>(input_c, output, cos_c, sin_c,
+                                                  negate_sin);
+      } else {
+        TP_THROW(RuntimeError, "fused_rope_neox: unsupported table dtype");
+      }
+      break;
+    case DType::BFloat16:
+      if (cos.dtype() == DType::BFloat16) {
+        rope_neox_launch<tensorplay::BFloat16, tensorplay::BFloat16>(
+            input_c, output, cos_c, sin_c, negate_sin);
+      } else if (cos.dtype() == DType::Float32) {
+        rope_neox_launch<tensorplay::BFloat16, float>(input_c, output, cos_c,
+                                                      sin_c, negate_sin);
+      } else {
+        TP_THROW(RuntimeError, "fused_rope_neox: unsupported table dtype");
+      }
+      break;
+    default:
+      TP_THROW(NotImplementedError, "fused_rope_neox: unsupported dtype");
+  }
+  return output;
+}
+
+} // namespace
+
+Tensor fused_rope_neox_cuda(const Tensor& input, const Tensor& cos,
+                            const Tensor& sin) {
+  return rope_neox_impl(input, cos, sin, /*negate_sin=*/false);
+}
+
+// The transpose of the half-split rotation is the rotation with the sine
+// turned around, so the backward is the same kernel over the same table.
+// The input is taken and not read: it keeps the graph connected, so a
+// second derivative has a path to walk.
+Tensor fused_rope_neox_backward_cuda(const Tensor& grad_out, const Tensor& input,
+                                     const Tensor& cos, const Tensor& sin) {
+  (void)input;
+  return rope_neox_impl(grad_out, cos, sin, /*negate_sin=*/true);
+}
+
 TENSORPLAY_LIBRARY_IMPL(CUDA, AttentionRopeKernels) {
   m.impl("_scaled_dot_product_attention_math", sdpa_math_cuda);
   m.impl("_native_multi_head_attention", native_multi_head_attention_cuda);
@@ -641,6 +807,8 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, AttentionRopeKernels) {
   m.impl("grouped_mm", grouped_mm_cuda);
   m.impl("rotary_embedding", rotary_embedding_cuda);
   m.impl("fused_rope", fused_rope_cuda);
+  m.impl("_fused_rope_neox", fused_rope_neox_cuda);
+  m.impl("_fused_rope_neox_backward", fused_rope_neox_backward_cuda);
 }
 
 } // namespace cuda

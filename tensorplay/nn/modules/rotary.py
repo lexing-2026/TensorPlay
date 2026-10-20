@@ -37,6 +37,48 @@ def _rotate_pairs(x: Tensor) -> Tensor:
     return tensorplay.stack((-x2, x1), dim=-1).flatten(start_dim=-2)
 
 
+# The element types the fused rotation computes in, and the table types it
+# accepts beside the input's own.
+_FUSED_ROPE_DTYPES = frozenset(
+    (tensorplay.float32, tensorplay.float64, tensorplay.float16, tensorplay.bfloat16)
+)
+
+
+def _fused_rope_neox_applies(tensor: Tensor, cos: Tensor, sin: Tensor) -> bool:
+    """Whether the fused half-split rotation can serve this operand.
+
+    It wants a four-dimensional operand whose head width is contiguous and
+    even, a table gathered per position with one entry per pair, and the
+    table in the operand's own type or in single precision beside a
+    reduced-precision operand.
+    """
+    if tensor.device.type != "cuda" or tensor.dim() != 4:
+        return False
+    if tensor.dtype not in _FUSED_ROPE_DTYPES:
+        return False
+    if tensor.stride(-1) != 1:
+        return False
+    width = tensor.size(-1)
+    if width == 0 or width % 2 != 0:
+        return False
+    if cos.dim() != 3 or sin.dim() != 3:
+        return False
+    if cos.size(0) != tensor.size(0) or sin.size(0) != tensor.size(0):
+        return False
+    if cos.size(1) != tensor.size(2) or sin.size(1) != tensor.size(2):
+        return False
+    if cos.size(2) != width // 2 or sin.size(2) != width // 2:
+        return False
+    if cos.dtype != sin.dtype or cos.dtype not in _FUSED_ROPE_DTYPES:
+        return False
+    if cos.dtype != tensor.dtype:
+        if tensor.dtype not in (tensorplay.float16, tensorplay.bfloat16):
+            return False
+        if cos.dtype != tensorplay.float32:
+            return False
+    return True
+
+
 def apply_rotary_emb(
     q: Tensor,
     k: Tensor,
@@ -56,6 +98,18 @@ def apply_rotary_emb(
     Returns:
         Rotated ``(q, k)`` with the original dtypes preserved.
     """
+    # The half-split layout over a gathered table has a kernel of its own:
+    # it rotates both operands in one launch each, where the composed form
+    # needs a handful of operations per operand.
+    if (
+        not interleaved
+        and _fused_rope_neox_applies(q, cos, sin)
+        and _fused_rope_neox_applies(k, cos, sin)
+    ):
+        return (
+            tensorplay._C._fused_rope_neox(q, cos, sin),
+            tensorplay._C._fused_rope_neox(k, cos, sin),
+        )
     rotate = _rotate_pairs if interleaved else _rotate_half
     # Broadcast the [batch, seq, d] tables across the head dimension and to the
     # full rotary width: tiled halves for the NeoX layout, interleaved pairs
