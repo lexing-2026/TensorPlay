@@ -8177,5 +8177,264 @@ class TestVulkanConstantPad(unittest.TestCase):
                 self._device(np.array(1.0, np.float32)), [1, 1], 0.0)
 
 
+class TestVulkanSearchsorted(unittest.TestCase):
+    """The position every query takes in a sorted sequence, and the bucket it
+    falls into once the sequence is read as a set of edges.  The walk halves one
+    table per query, so the answer carries a position for each query and the
+    table is judged as it lies: a sequence handed over unordered gets the
+    position the halving stops at, which is why no order is verified here."""
+
+    @staticmethod
+    def _device(values):
+        return tensorplay.from_numpy(np.asarray(values).copy()).to("vulkan")
+
+    @staticmethod
+    def _back(payload):
+        return np.asarray(payload.cpu())
+
+    @staticmethod
+    def _model(sequence, queries, right=False):
+        """One table answers a rank-1 sequence; otherwise every row of the
+        leading block answers the row of queries it faces."""
+        side = "right" if right else "left"
+        table = np.ascontiguousarray(sequence)
+        if np.ndim(queries) == 0:
+            return np.array(
+                np.searchsorted(table.ravel(), queries, side=side),
+                dtype=np.int64)
+        values = np.asarray(queries)
+        if table.ndim == 1:
+            return np.searchsorted(table, values, side=side)
+        rows = table.reshape(-1, table.shape[-1])
+        columns = values.reshape(rows.shape[0], values.shape[-1])
+        answer = np.empty(columns.shape, dtype=np.int64)
+        for row in range(rows.shape[0]):
+            answer[row] = np.searchsorted(rows[row], columns[row], side=side)
+        return answer.reshape(values.shape)
+
+    def test_the_position_of_every_query(self):
+        table = np.array(
+            [-3.0, -1.0, 0.0, 0.5, 1.0, 1.0, 2.0, 7.5], dtype=np.float32)
+        queries = np.array(
+            [-4.0, -3.0, -1.5, 0.0, 0.75, 1.0, 2.0, 7.4, 7.5, 100.0],
+            dtype=np.float32)
+        got = tensorplay.searchsorted(self._device(table), self._device(queries))
+        self.assertEqual(got.dtype, tensorplay.int64)
+        self.assertEqual(tuple(got.shape), queries.shape)
+        np.testing.assert_array_equal(self._back(got), self._model(table, queries))
+
+    def test_either_bound_of_a_tied_table(self):
+        table = np.array([1.0, 2.0, 2.0, 2.0, 5.0], dtype=np.float32)
+        queries = np.array([0.0, 1.0, 2.0, 3.0, 5.0, 6.0], dtype=np.float32)
+        left = self._back(
+            tensorplay.searchsorted(self._device(table), self._device(queries)))
+        right = self._back(
+            tensorplay.searchsorted(
+                self._device(table), self._device(queries), right=True))
+        np.testing.assert_array_equal(left, self._model(table, queries))
+        np.testing.assert_array_equal(
+            right, self._model(table, queries, right=True))
+        # Every tie shifts the bound by the run it covers, and nothing else moves.
+        np.testing.assert_array_equal(right - left, [0, 1, 3, 0, 1, 0])
+        for side in ("left", "right"):
+            np.testing.assert_array_equal(
+                self._back(
+                    tensorplay.searchsorted(
+                        self._device(table), self._device(queries), side=side)),
+                left if side == "left" else right,
+                err_msg=f"side={side}")
+
+    def test_a_row_of_tables_answers_its_own_row(self):
+        state = np.random.RandomState(0)
+        tables = np.sort(state.randn(4, 9).astype(np.float32), axis=-1)
+        queries = np.random.RandomState(1).randn(4, 6).astype(np.float32)
+        for right in (False, True):
+            got = tensorplay.searchsorted(
+                self._device(tables), self._device(queries), right=right)
+            self.assertEqual(tuple(got.shape), queries.shape)
+            np.testing.assert_array_equal(
+                self._back(got), self._model(tables, queries, right))
+
+        deep = np.sort(
+            np.random.RandomState(2).randn(2, 3, 11).astype(np.float32), axis=-1)
+        deep_queries = np.random.RandomState(3).randn(2, 3, 5).astype(np.float32)
+        np.testing.assert_array_equal(
+            self._back(tensorplay.searchsorted(
+                self._device(deep), self._device(deep_queries))),
+            self._model(deep, deep_queries))
+
+    def test_the_answer_narrows_to_a_count_when_asked(self):
+        table = np.sort(np.random.RandomState(4).randn(64).astype(np.float32))
+        queries = np.random.RandomState(5).randn(9).astype(np.float32)
+        got = tensorplay.searchsorted(
+            self._device(table), self._device(queries), out_int32=True)
+        self.assertEqual(got.dtype, tensorplay.int32)
+        np.testing.assert_array_equal(
+            self._back(got), self._model(table, queries).astype(np.int32))
+        wide = tensorplay.searchsorted(self._device(table), self._device(queries))
+        self.assertEqual(wide.dtype, tensorplay.int64)
+        np.testing.assert_array_equal(self._back(wide), self._back(got).astype(np.int64))
+
+    def test_a_mask_a_byte_or_a_half_is_widened_first(self):
+        cases = [
+            (np.array([-2.5, 0.0, 1.5, 100.0], dtype=np.float16),
+             np.array([-3.0, -2.5, 0.0, 1.6, 100.0, 101.0], dtype=np.float16)),
+            (np.array([-5, -1, 0, 3, 100], dtype=np.int8),
+             np.array([-6, -5, 0, 4, 100, 127], dtype=np.int8)),
+            (np.array([3, 7, 8, 200], dtype=np.uint8),
+             np.array([0, 3, 120, 201], dtype=np.uint8)),
+            (np.array([False, False, True, True, True], dtype=bool),
+             np.array([False, True], dtype=bool)),
+            (np.array([-8, -3, 0, 0, 5, 127], dtype=np.int32),
+             np.array([-9, -8, -4, 0, 4, 5, 128], dtype=np.int32)),
+        ]
+        for table, queries in cases:
+            for right in (False, True):
+                got = tensorplay.searchsorted(
+                    self._device(table), self._device(queries), right=right)
+                np.testing.assert_array_equal(
+                    self._back(got), self._model(table, queries, right),
+                    err_msg=f"{table.dtype} bound {'right' if right else 'left'}")
+
+    def test_operands_of_two_widths_compare_in_the_wider(self):
+        table = np.array([-3.0, -1.0, 0.0, 0.5, 1.0, 2.0, 7.5], dtype=np.float32)
+        counts = np.array([-4, -3, 0, 1, 8], dtype=np.int32)
+        np.testing.assert_array_equal(
+            self._back(tensorplay.searchsorted(self._device(table), self._device(counts))),
+            self._model(table, counts))
+        edges = np.array([-8, -3, 0, 0, 5, 127], dtype=np.int32)
+        measured = np.array([-8.5, 0.0, 6.0], dtype=np.float32)
+        np.testing.assert_array_equal(
+            self._back(tensorplay.searchsorted(self._device(edges), self._device(measured))),
+            self._model(edges, measured))
+
+    def test_a_scalar_query_answers_one_position(self):
+        table = np.array([-3.0, -1.0, 0.0, 0.5, 1.0, 1.0, 2.0, 7.5],
+                         dtype=np.float32)
+        got = tensorplay.searchsorted(self._device(table), 0.75)
+        self.assertEqual(tuple(got.shape), ())
+        self.assertEqual(got.dtype, tensorplay.int64)
+        self.assertEqual(int(self._back(got)), 4)
+        self.assertEqual(
+            int(self._back(tensorplay.searchsorted(self._device(table), 1.0))), 4)
+        self.assertEqual(
+            int(self._back(tensorplay.searchsorted(
+                self._device(table), 1.0, right=True))), 6)
+        # A query taken in the width the table carries, not the one the host
+        # number happens to have.
+        narrow = np.array([-2.5, 0.0, 1.5, 100.0], dtype=np.float16)
+        self.assertEqual(
+            int(self._back(tensorplay.searchsorted(self._device(narrow), 1.6))), 3)
+        counts = np.array([-5, -1, 0, 3, 100], dtype=np.int8)
+        self.assertEqual(
+            int(self._back(tensorplay.searchsorted(self._device(counts), 4,
+                                                   out_int32=True))), 4)
+
+    def test_a_not_a_number_walks_past_the_end(self):
+        table = np.array([-3.0, -1.0, 0.0, 0.5, 1.0], dtype=np.float32)
+        queries = np.array([np.nan, -np.inf, np.inf, 0.0], dtype=np.float32)
+        got = self._back(tensorplay.searchsorted(self._device(table), self._device(queries)))
+        np.testing.assert_array_equal(got, [5, 0, 5, 2])
+
+    def test_a_view_is_searched_as_it_shows(self):
+        state = np.random.RandomState(6)
+        block = np.sort(state.randn(3, 8).astype(np.float32), axis=-1)
+        wide = np.stack([block, block + 4.0], axis=1)  # one table per row, two columns
+        tables = self._device(wide)[:, 0, :]
+        queries = self._device(block)[:, 1::2]
+        np.testing.assert_array_equal(
+            self._back(tensorplay.searchsorted(tables, queries)),
+            self._model(wide[:, 0, :], np.ascontiguousarray(block[:, 1::2])))
+        # A sequence whose rows are strided apart still answers its own row.
+        shifted = self._device(wide)[:, 1, :]
+        np.testing.assert_array_equal(
+            self._back(tensorplay.searchsorted(shifted, self._device(block[:, ::3]))),
+            self._model(wide[:, 1, :], np.ascontiguousarray(block[:, ::3])))
+
+    def test_more_queries_than_the_grid_holds(self):
+        table = np.sort(np.random.RandomState(7).randn(4096).astype(np.float32))
+        queries = np.random.RandomState(8).randn(200_003).astype(np.float32)
+        got = tensorplay.searchsorted(self._device(table), self._device(queries))
+        self.assertEqual(tuple(got.shape), queries.shape)
+        np.testing.assert_array_equal(
+            self._back(got), self._model(table, queries).astype(got.cpu().numpy().dtype))
+
+    def test_an_empty_side_answers_without_a_walk(self):
+        table = np.array([-1.0, 0.0, 1.0], dtype=np.float32)
+        empty = tensorplay.searchsorted(
+            self._device(table), self._device(np.zeros((0,), np.float32)))
+        self.assertEqual(tuple(empty.shape), (0,))
+        self.assertEqual(empty.dtype, tensorplay.int64)
+
+        # Every query takes the front of a table with no entries.
+        for out_int32 in (False, True):
+            for shape in ((5,), (2, 3)):
+                queries = np.zeros(shape, np.float32)
+                got = tensorplay.searchsorted(
+                    self._device(np.zeros((0,), np.float32)),
+                    self._device(queries),
+                    out_int32=out_int32)
+                self.assertEqual(
+                    got.dtype, tensorplay.int32 if out_int32 else tensorplay.int64)
+                np.testing.assert_array_equal(
+                    self._back(got), np.zeros(shape, np.int64))
+        rows = tensorplay.searchsorted(
+            self._device(np.zeros((4, 0), np.float32)),
+            self._device(np.zeros((4, 6), np.float32)))
+        np.testing.assert_array_equal(self._back(rows), np.zeros((4, 6), np.int64))
+
+    def test_bucketize_reads_the_table_as_edges(self):
+        edges = np.array([0.0, 1.0, 2.0, 3.0], dtype=np.float32)
+        values = np.array([-4.0, 0.0, 0.5, 1.0, 2.5, 3.0, 100.0], dtype=np.float32)
+        for right in (False, True):
+            got = tensorplay.bucketize(
+                self._device(values), self._device(edges), right=right)
+            self.assertEqual(got.dtype, tensorplay.int64)
+            np.testing.assert_array_equal(
+                self._back(got), self._model(edges, values, right))
+        for out_int32 in (False, True):
+            got = tensorplay.bucketize(
+                self._device(values), self._device(edges), out_int32=out_int32)
+            self.assertEqual(
+                got.dtype, tensorplay.int32 if out_int32 else tensorplay.int64)
+        # A block bucketed by one edge list, and a lone number.
+        block = np.random.RandomState(9).randn(3, 5).astype(np.float32)
+        np.testing.assert_array_equal(
+            self._back(tensorplay.bucketize(self._device(block), self._device(edges))),
+            self._model(edges, block))
+        self.assertEqual(int(self._back(tensorplay.bucketize(2.5, self._device(edges)))), 3)
+
+    def test_the_method_and_the_function_answer_alike(self):
+        table = np.sort(np.random.RandomState(10).randn(32).astype(np.float32))
+        queries = np.random.RandomState(11).randn(7).astype(np.float32)
+        device_table = self._device(table)
+        device_queries = self._device(queries)
+        np.testing.assert_array_equal(
+            self._back(device_queries.searchsorted(device_table)),
+            self._back(tensorplay.searchsorted(device_table, device_queries)))
+
+    def test_outside_the_supported_surface_refuses(self):
+        table = np.array([-3.0, -1.0, 0.0, 0.5, 1.0], dtype=np.float32)
+        device = self._device(table)
+        wide = self._device(np.round(table * 1000).astype(np.int64))
+        sorter = tensorplay.from_numpy(np.arange(len(table), dtype=np.int64))
+        with self.assertRaisesRegex(RuntimeError, "sorter"):
+            tensorplay.searchsorted(device, device, sorter=sorter)
+        with self.assertRaisesRegex(TypeError, "single precision"):
+            tensorplay.searchsorted(wide, wide)
+        with self.assertRaisesRegex(RuntimeError, "positive"):
+            tensorplay.searchsorted(
+                tensorplay.from_numpy(np.array(1.0, np.float32)).to("vulkan"),
+                device)
+        with self.assertRaisesRegex(RuntimeError, "1 dimension"):
+            tensorplay.searchsorted(self._device(table.reshape(1, 5)), device)
+        with self.assertRaisesRegex(RuntimeError, "opposites"):
+            tensorplay.searchsorted(device, device, right=True, side="left")
+        with self.assertRaisesRegex(RuntimeError, "side can only be"):
+            tensorplay.searchsorted(device, device, side="sideways")
+        with self.assertRaisesRegex(RuntimeError, "1 dimension"):
+            tensorplay.bucketize(device, self._device(table.reshape(1, 5)))
+
+
 if __name__ == "__main__":
     unittest.main()
