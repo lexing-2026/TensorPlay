@@ -2,6 +2,7 @@
 #include "Dispatcher.h"
 #include "Exception.h"
 #include "Scalar.h"
+#include "Allocator.h"
 #include "CUDARuntime.h"
 #include "GPUPrimitives.cuh"
 #include "SortingRadixSelect.cuh"
@@ -895,12 +896,16 @@ std::tuple<Tensor, Tensor, Tensor> unique_cuda(const Tensor& self, bool sorted,
 
     // The output shape is only known on the device, so one element crosses the
     // bus; copying the whole run table back to read its last entry would cost
-    // more than every kernel above put together.
+    // more than every kernel above put together.  The staging block is
+    // page-locked so the hand-off does not fall back to the driver's bounce
+    // buffer.
     int64_t num_groups = 0;
-    CUDA_CHECK(cudaMemcpyAsync(&num_groups, num_selected.data_ptr<int64_t>(),
-                              sizeof(num_groups), cudaMemcpyDeviceToHost,
+    auto host_count = getPinnedMemoryAllocator()->allocate(sizeof(int64_t));
+    CUDA_CHECK(cudaMemcpyAsync(host_count.get(), num_selected.data_ptr<int64_t>(),
+                              sizeof(int64_t), cudaMemcpyDeviceToHost,
                               stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
+    num_groups = *static_cast<const int64_t*>(host_count.get());
     values = values_buffer.slice(0, 0, num_groups);
 
     const int threads = 256;
