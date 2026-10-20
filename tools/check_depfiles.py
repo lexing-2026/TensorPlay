@@ -11,16 +11,21 @@ library keeps the old code while the source says otherwise.  That is a silent
 no-op, not a failure.
 
 The state arrives with a build directory populated from a warm cache -- every
-edge answered from the cache, so nothing ever had a dependency list -- and
-persists object by object until one is really compiled.  A build directory that
-was configured more than once also carries objects no longer in the graph; those
-are dead files rather than frozen edges, and they are reported apart.
+edge answered from the cache, so nothing ever had a dependency list -- and it
+comes back on its own: a rebuild served from the cache erases the list an object
+already had.  So a directory that was healthy at configure time grows frozen
+objects again after any pass that rebuilt some of them from cache (a regenerated
+source, a touched header), and this report is worth re-running after such a pass
+rather than only once.  A build directory that was configured more than once also
+carries objects no longer in the graph; those are dead files rather than frozen
+edges, and they are reported apart.
 
 Only a pass that both runs the compiler and refreshes the cache teaches an edge
-its headers.  Turning the cache off is not enough: the answer still comes from
-the launcher, which never hands the dependency file over.  Recaching compiles
-for real, writes the object a second time, and leaves the edge knowing every
-header it read.  The command to do that is printed with the report.
+its headers.  Turning the cache off is not enough, and neither is deleting the
+object and building again: the answer still comes from the launcher, which never
+hands the dependency file over.  Recaching compiles for real, writes the object
+a second time, and leaves the edge knowing every header it read.  The command to
+do that is printed with the report.
 
 Usage:
     python tools/check_depfiles.py --build-dir build --target p10
