@@ -322,14 +322,16 @@ __global__ void softmax_wave_forward(out_t* dst, const scalar_t* src,
 #pragma unroll
   for (int i = 0; i < kBatchesPerWave; ++i) {
     if (i >= local_batches) break;
+    // One normalizer per row: computing it once keeps the store pass at a
+    // single logarithm instead of one per element.
+    const acc_t log_sum = LOG_MODE ? std::log(sum[i]) : acc_t(0);
 #pragma unroll
     for (int it = 0; it < kIterations; ++it) {
       const int element_index = local_idx + it * kWAVE;
       if (element_index < element_count) {
         if (LOG_MODE) {
           // Elements stay raw: subtract the max and the log normalizer.
-          const acc_t v =
-              elems[i][it] - max_value[i] - std::log(sum[i]);
+          const acc_t v = elems[i][it] - max_value[i] - log_sum;
           dst[i * element_count + it * kWAVE] = static_cast<out_t>(v);
         } else {
           // Elements hold exp(x - max) from the accumulation pass.
