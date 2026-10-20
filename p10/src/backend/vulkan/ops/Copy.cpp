@@ -370,6 +370,34 @@ void submit_linear_cast(
       params.buffer());
 }
 
+// The kernel one storage class answers this pair with, or null when it answers
+// it in two hops through the hub instead.
+const char* cast_shader(
+    const bool linear_destination,
+    const DType from,
+    const DType to) {
+  return linear_destination ? linear_cast_shader(from, to)
+                            : texture_cast_shader(from, to);
+}
+
+// Whether a single-precision hub can carry a conversion between two element
+// types without changing the answer.
+//
+// A byte-packed payload - a mask, a signed byte, a quantized code - holds a
+// value that one single-precision word represents exactly, and a half payload
+// reaches the hub without loss, so the hub destination is the answer a direct
+// route would give.  A wider integer survives such a hop for one question
+// only: whether the value is zero, since rounding never moves a nonzero onto
+// zero.  Its other destinations need the low bits the hub drops, and the wide
+// code needs a pair of words rather than a rounding.
+bool exact_through_hub(const DType from, const DType to) {
+  if (from == DType::Bool || from == DType::Int8 || from == DType::UInt8 ||
+      from == DType::Float16) {
+    return true;
+  }
+  return to == DType::Bool;
+}
+
 } // namespace
 
 Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
@@ -403,24 +431,61 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
       Tensor narrowed;
       Tensor gathered;
 
+      // A pair no kernel of either storage answers at once crosses the hub: one
+      // hop puts the payload in single precision in the storage it already sits
+      // in, the other carries it into the answer's type and class.  Both halves
+      // name a pair a kernel does own, so the walk ends there rather than
+      // recursing.
+      if (v_src.dtype() != v_self.dtype() &&
+          texture_cast_shader(v_src.dtype(), v_self.dtype()) == nullptr &&
+          linear_cast_shader(v_src.dtype(), v_self.dtype()) == nullptr) {
+        const DType hub = DType::Float32;
+        TP_CHECK(
+            exact_through_hub(v_src.dtype(), v_self.dtype()) &&
+                cast_shader(
+                    v_src.storage_type() == api::StorageType::BUFFER,
+                    v_src.dtype(),
+                    hub) != nullptr &&
+                cast_shader(linear_destination, hub, v_self.dtype()) != nullptr,
+            "Unsupported Vulkan dtype conversion from ",
+            toString(v_src.dtype()),
+            " to ",
+            toString(v_self.dtype()));
+        api::vTensor v_hub{
+            context,
+            std::vector<int64_t>(v_src.sizes().begin(), v_src.sizes().end()),
+            hub,
+            v_src.storage_type(),
+            v_src.gpu_memory_layout()};
+        Tensor hop = convert(v_hub);
+        copy_kernel(hop, src, non_blocking);
+        copy_kernel(self, hop, non_blocking);
+        return self;
+      }
+
       // A code wider than a word has no texel form, and the gather that carries
       // a linear payload into an image reads one word per element, so such a
-      // payload converts while both sides are still linear.  The result is
-      // named by the destination's element type, which the gather does read.
+      // payload converts while both sides are still linear.  The gather names
+      // only the types that fill a word with four lanes, so a byte-packed
+      // destination crosses as the hub type and the image cast narrows it.
+      const DType carried = v_self.dtype() == DType::Int8 ||
+              v_self.dtype() == DType::UInt8 || v_self.dtype() == DType::Bool
+          ? DType::Float32
+          : v_self.dtype();
       if (!linear_destination &&
           v_src.storage_type() == api::StorageType::BUFFER &&
-          v_src.dtype() != v_self.dtype()) {
+          v_src.dtype() != carried) {
         TP_CHECK(src.shape() == self.shape(),
                  "Vulkan dtype conversion requires equal shapes");
         const char* const shader =
-            linear_cast_shader(v_src.dtype(), v_self.dtype());
+            linear_cast_shader(v_src.dtype(), carried);
         TP_CHECK(
             shader != nullptr,
             "Unsupported Vulkan dtype conversion from a wide payload");
         api::vTensor v_scratch{
             context,
             static_cast<std::vector<int64_t>>(self.shape()),
-            v_self.dtype(),
+            carried,
             api::StorageType::BUFFER,
             api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
         submit_linear_cast(context, v_src, v_scratch, shader);
@@ -542,10 +607,10 @@ void transfer_vulkan_to_cpu_impl(api::vTensor& v_src, Tensor& dst) {
 //
 // to.dtype(): a same-device element type conversion.  An unchanged type
 // aliases the input unless a copy was requested; otherwise the payload is
-// allocated in the target type and converted through the copy path, which
-// owns the supported type pairs.  A kernel running on this backend has to go
-// through the operator table for conversions, since the host-side one is a
-// CPU entry point.
+// allocated in the target type and converted through the copy path, which owns
+// both the pairs a kernel answers at once and the hub hop for the rest.  A
+// kernel running on this backend has to go through the operator table for
+// conversions, since the host-side one is a CPU entry point.
 //
 Tensor to_dtype_kernel(
     const Tensor& self,
