@@ -1361,6 +1361,18 @@ buffer_scatter_src_half:
   parameter_names_with_default_values: {}
   shader_variants:
   - NAME: buffer_scatter_src_half
+scatter_add_dest:
+  parameter_names_with_default_values: {}
+  shader_variants:
+  - NAME: scatter_add_dest
+scatter_add_buffer:
+  parameter_names_with_default_values: {}
+  shader_variants:
+  - NAME: scatter_add_buffer
+scatter_add_buffer_half:
+  parameter_names_with_default_values: {}
+  shader_variants:
+  - NAME: scatter_add_buffer_half
 conv2d:
   parameter_names_with_default_values:
     HAS_BIAS: true

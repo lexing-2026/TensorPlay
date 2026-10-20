@@ -1,0 +1,61 @@
+#version 450 core
+// clang-format off
+#define PRECISION ${PRECISION}
+// clang-format on
+
+layout(std430) buffer;
+
+// Accumulation pass of a scatter over linear storage: one invocation owns one
+// whole word of the destination - four single-precision lanes - and grows each
+// lane by the source value of every entry of the list that names it.  Owning the
+// word is what makes the store safe without a read-modify-write of a narrower
+// field, and reading the list in its own order is what makes the total of a
+// repeated element the same number for every caller.
+//
+// The walk runs from the destination rather than from the list, so no two
+// invocations touch one word and the payload may be bound in both directions at
+// once.  A word nothing names is left unstored, so the padding of a destination
+// whose count is not a multiple of four keeps whatever the allocation put there.
+layout(set = 0, binding = 0) buffer PRECISION restrict InOut {
+  vec4 data[];
+}
+uSelf;
+layout(set = 0, binding = 1) buffer PRECISION restrict readonly Names {
+  int data[];
+}
+uNames;
+layout(set = 0, binding = 2) buffer PRECISION restrict readonly Src {
+  vec4 data[];
+}
+uSrc;
+layout(set = 0, binding = 3) uniform PRECISION restrict Block {
+  int count; // elements of the destination
+  int n;     // entries of the index list
+  int fill;
+  int fill2;
+}
+uBlock;
+
+layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
+
+void main() {
+  const uint word = gl_GlobalInvocationID.x;
+  const uint n = uint(uBlock.count);
+  if (word >= ((n + 3u) >> 2u)) {
+    return;
+  }
+
+  vec4 held = uSelf.data[word];
+  bool touched = false;
+  for (int k = 0; k < uBlock.n; ++k) {
+    const int named = uNames.data[k];
+    if (named < 0 || (uint(named) >> 2u) != word) {
+      continue;
+    }
+    held[named & 3] += uSrc.data[k >> 2][k & 3];
+    touched = true;
+  }
+  if (touched) {
+    uSelf.data[word] = held;
+  }
+}

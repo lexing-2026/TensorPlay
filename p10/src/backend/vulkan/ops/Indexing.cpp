@@ -1113,31 +1113,36 @@ void check_scatter_geometry(
   }
 }
 
-// The mark pass of a scatter: one word per element of the destination, holding
-// the position of the entry that names it plus one.  Both rewrites share it,
-// because a position is what a payload needs to find its value and a constant
-// simply ignores it.
-void mark_scatter_destinations(
+// The pass that pairs the entries of a scatter's list with the destination: one
+// invocation per entry writes, into the slot its shader names, the other half of
+// the pair.  A rewrite keeps one word per element of the destination, holding the
+// position of the entry that names it plus one, since only the last entry to
+// reach an element has any effect; an accumulation keeps one word per entry,
+// holding the element it names, so that every entry reaching a repeated element
+// is counted and in the order the list states.  Both shapes use the same
+// addressing and differ only in which side of the pair each writes.
+void record_scatter_pairs(
     api::Context* const context,
     api::PipelineBarrier& pipeline_barrier,
     const Tensor& self,
     const Tensor& index,
     int64_t wrapped,
-    api::vTensor& v_marks,
-    api::vTensor& v_indices) {
+    api::vTensor& v_pairs,
+    api::vTensor& v_indices,
+    const api::ShaderInfo& pair_shader) {
   const int64_t rank = self.dim();
   const ivec4 index_strides =
       padded_strides(static_cast<std::vector<int64_t>>(index.shape()));
   const ivec4 self_strides =
       padded_strides(static_cast<std::vector<int64_t>>(self.shape()));
-  const struct MarkBlock final {
+  const struct PairBlock final {
     ivec4 index_strides;
     ivec4 self_strides;
     int32_t axis; // the scattered axis of the padded four-axis shape
     int32_t self_rows; // entries available along that axis
     int32_t count; // entries of the index list
     int32_t fill;
-  } mark_block{
+  } pair_block{
       index_strides,
       self_strides,
       static_cast<int32_t>(wrapped + 4 - rank),
@@ -1145,17 +1150,17 @@ void mark_scatter_destinations(
       static_cast<int32_t>(index.numel()),
       0};
 
-  api::UniformParamsBuffer mark_params(context, mark_block);
+  api::UniformParamsBuffer pair_params(context, pair_block);
   context->submit_compute_job(
-      VK_KERNEL(scatter_mark), pipeline_barrier,
+      pair_shader, pipeline_barrier,
       {safe_downcast_to_u32(index.numel()), 1u, 1u}, {256u, 1u, 1u},
       VK_NULL_HANDLE,
-      v_marks.buffer(
+      v_pairs.buffer(
           pipeline_barrier,
           api::PipelineStage::COMPUTE,
           api::MemoryAccessType::WRITE),
       v_indices.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
-      mark_params.buffer());
+      pair_params.buffer());
 }
 
 Tensor& scatter_value_inplace_kernel(
@@ -1188,8 +1193,15 @@ Tensor& scatter_value_inplace_kernel(
       upload_index_payload(index, api::StorageType::BUFFER);
 
   api::PipelineBarrier pipeline_barrier{};
-  mark_scatter_destinations(
-      context, pipeline_barrier, self, index, wrapped, v_marks, v_indices);
+  record_scatter_pairs(
+      context,
+      pipeline_barrier,
+      self,
+      index,
+      wrapped,
+      v_marks,
+      v_indices,
+      VK_KERNEL(scatter_mark));
 
   const float written = static_cast<float>(value.toDouble());
 
@@ -1340,8 +1352,15 @@ Tensor& scatter_src_inplace_kernel(
   api::vTensor v_src = scatter_source_payload(context, self, payload);
 
   api::PipelineBarrier pipeline_barrier{};
-  mark_scatter_destinations(
-      context, pipeline_barrier, self, index, wrapped, v_marks, v_indices);
+  record_scatter_pairs(
+      context,
+      pipeline_barrier,
+      self,
+      index,
+      wrapped,
+      v_marks,
+      v_indices,
+      VK_KERNEL(scatter_mark));
 
   if (v_self.storage_type() == api::StorageType::BUFFER) {
     const struct SrcBufferBlock final {
@@ -1408,6 +1427,193 @@ Tensor scatter_src_kernel(
     const Tensor& src) {
   Tensor out = self.clone();
   scatter_src_inplace_kernel(out, dim, index, src);
+  return out;
+}
+
+//
+// Accumulating scatter: every entry of a list names an element of the
+// destination and adds its own value onto it.  A rewrite could keep one word per
+// element of the destination and let the last entry to reach it win; a total has
+// to keep every entry, so the request splits the other way round:
+//
+//   1. a naming pass over the list, one word per entry, holding the element of
+//      the destination that entry asks to grow and -1 for a code that names no
+//      row;
+//   2. an accumulation pass over the destination, where one invocation owns one
+//      whole word, walks the names in their own order and adds the source value
+//      of every entry that names one of its lanes.
+//
+// The walk starts from the destination rather than from the list, so no two
+// invocations touch one word and the total of a repeated element is the same
+// number on every call: an accumulation that ran from the list would need a
+// device-side add into a group one other invocation is rewriting at the same
+// time, which either needs a lock or gives an answer that depends on who won.
+//
+// The cost is that each group of lanes reads the whole list, so a destination
+// and a list that are both long are refused by a budget instead of stalling the
+// queue.  A code given from the end names no element and adds nothing, the way
+// the rewrites above read the same list.
+//
+Tensor& scatter_add_inplace_kernel(
+    Tensor& self,
+    int64_t dim,
+    const Tensor& index,
+    const Tensor& src) {
+  NoGradGuard no_grad;
+  validate_gather_operand(self, "scatter_add");
+  validate_gather_operand(src, "scatter_add");
+  TP_CHECK(
+      index.dtype() == DType::Int32 || index.dtype() == DType::Int64,
+      "Vulkan scatter_add: index must be Int32 or Int64");
+  const int64_t rank = self.dim();
+  int64_t wrapped = dim < 0 ? dim + rank : dim;
+  TP_CHECK(
+      wrapped >= 0 && wrapped < rank,
+      "Vulkan scatter_add: dimension out of range");
+  check_scatter_geometry(self, wrapped, index);
+
+  // The values are read at the position of the entry that names a destination,
+  // so the payload has to cover the list: fewer axes than the list carries take
+  // the outer ones as they stand, one value repeats over every entry, a payload
+  // narrower along an axis is read again for the entries below it, and a
+  // narrower element type widens to the one the destination carries.
+  const std::vector<int64_t> list_shape(
+      static_cast<std::vector<int64_t>>(index.shape()));
+  const int64_t depth = static_cast<int64_t>(list_shape.size());
+  TP_CHECK(
+      src.dim() <= depth,
+      "Vulkan scatter_add: the source must not have more axes than the list");
+  // The axes the list carries that the payload does not spell out stand at the
+  // front of it, each with one value to reach the entries below.
+  const int64_t lead = depth - src.dim();
+  std::vector<int64_t> held_shape(static_cast<size_t>(lead), 1);
+  for (int64_t axis = 0; axis < src.dim(); ++axis) {
+    TP_CHECK(
+        src.size(axis) == 1 || src.size(axis) == list_shape[lead + axis],
+        "Vulkan scatter_add: the source must reach the list at dimension ",
+        axis);
+    held_shape.push_back(src.size(axis));
+  }
+  Tensor payload =
+      src.dtype() == self.dtype() ? src : src.to(self.dtype());
+  if (held_shape != list_shape) {
+    payload = payload.reshape(held_shape).expand(list_shape).contiguous();
+  }
+
+  if (self.numel() == 0 || index.numel() == 0) {
+    return self;
+  }
+
+  const int64_t entries = index.numel();
+  // Both passes address elements and entries as signed words, so neither the
+  // destination nor the list may pass the range that arithmetic represents.
+  TP_CHECK(
+      self.numel() <= std::numeric_limits<int32_t>::max() &&
+          entries <= std::numeric_limits<int32_t>::max(),
+      "Vulkan scatter_add: a payload holds more than two billion elements");
+
+  // The accumulation owns a whole word of linear storage - four lanes of a float
+  // payload, two of a half one - since a store replaces the group.  Which flat
+  // elements the channels of a texel hold differs between the two ways a payload
+  // is packed into textures, so no texel owns a fixed set of elements: a
+  // destination that came out of an image keeps its own storage, the total runs
+  // on a dense copy of it, and that copy travels back through the copy kernel.
+  const int64_t lanes = self.dtype() == DType::Float16 ? 2 : 4;
+  const int64_t invocations = (self.numel() + lanes - 1) / lanes;
+  TP_CHECK(
+      invocations <= std::numeric_limits<int32_t>::max(),
+      "Vulkan scatter_add: the accumulation needs more than two billion "
+      "invocations");
+  // One group of lanes reads the list once, so a walk of this shape costs that
+  // many passes; naming the ceiling keeps a call whose destination and list are
+  // both long from stalling the queue instead of answering.
+  const int64_t passes = (invocations + 255) / 256;
+  TP_CHECK(
+      entries <= (int64_t(1) << 28) / std::max<int64_t>(passes, 1),
+      "Vulkan scatter_add: this walk would read the list past the budget the "
+      "device gives it");
+
+  api::Context* const context = api::context();
+  api::vTensor v_self = convert(self);
+  api::vTensor v_indices =
+      upload_index_payload(index, api::StorageType::BUFFER);
+  api::vTensor v_src = scatter_source_payload(context, self, payload);
+  // Every entry writes its own word, including the ones that name nothing, so
+  // this payload needs no clearing pass before the naming runs.
+  api::vTensor v_names{
+      context,
+      {entries},
+      DType::Int32,
+      api::StorageType::BUFFER,
+      api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+
+  api::PipelineBarrier pipeline_barrier{};
+  record_scatter_pairs(
+      context,
+      pipeline_barrier,
+      self,
+      index,
+      wrapped,
+      v_names,
+      v_indices,
+      VK_KERNEL(scatter_add_dest));
+
+  const bool image_destination =
+      v_self.storage_type() != api::StorageType::BUFFER;
+  api::vTensor v_target = image_destination
+      ? to_buffer_storage_dispatch(context, v_self)
+      : v_self;
+
+  const struct AddBlock final {
+    int32_t count; // elements of the destination
+    int32_t n;     // entries of the index list
+    int32_t fill;
+    int32_t fill2;
+  } block{
+      static_cast<int32_t>(self.numel()),
+      static_cast<int32_t>(entries),
+      0,
+      0};
+  api::UniformParamsBuffer params(context, block);
+  context->submit_compute_job(
+      VK_KERNEL_FROM_STR(
+          buffer_shader_for_dtype("scatter_add_buffer", self.dtype())),
+      pipeline_barrier,
+      {buffer_dispatch_count(
+           safe_downcast_to_u32(self.numel()), self.dtype(), 4u),
+       1u,
+       1u},
+      {256u, 1u, 1u},
+      VK_NULL_HANDLE,
+      // The accumulation grows what the destination holds, so the payload is
+      // bound in both directions.
+      v_target.buffer(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::READ | api::MemoryAccessType::WRITE),
+      v_names.buffer(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::READ),
+      v_src.buffer(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::READ),
+      params.buffer());
+  if (image_destination) {
+    Tensor carried = convert(v_target);
+    self.copy_(carried);
+  }
+  return self;
+}
+
+Tensor scatter_add_kernel(
+    const Tensor& self,
+    int64_t dim,
+    const Tensor& index,
+    const Tensor& src) {
+  Tensor out = self.clone();
+  scatter_add_inplace_kernel(out, dim, index, src);
   return out;
 }
 
@@ -1813,6 +2019,10 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, IndexingKernels) {
   m.impl(
       "scatter_.src",
       &tensorplay::vulkan::ops::scatter_src_inplace_kernel);
+  m.impl("scatter_add", &tensorplay::vulkan::ops::scatter_add_kernel);
+  m.impl(
+      "scatter_add_",
+      &tensorplay::vulkan::ops::scatter_add_inplace_kernel);
 }
 
 #endif /* USE_VULKAN */
