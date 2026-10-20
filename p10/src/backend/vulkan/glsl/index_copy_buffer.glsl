@@ -5,12 +5,13 @@
 
 layout(std430) buffer;
 
-// Buffer-to-buffer in-place scatter of whole rows along the sequence axis of
-// a row-major [N, C, S, W] payload (the shapes that exceed the 3-D image axis
-// limit).  One invocation copies four feature lanes from a source row into
-// the destination row selected by the Int32 index payload; the same index
-// array applies to every N*C plane.  The destination is only written, never
-// read, so the write remains the sole access to it besides the source fetch.
+// Buffer-to-buffer in-place scatter of whole rows along any axis of a
+// row-major payload.  The destination flattens to planes x rows x width, where
+// planes are the axes above the scattered one and width the axes below it, so
+// one invocation copies four feature lanes from a source row into the
+// destination row an Int32 index payload names; the same index array applies to
+// every plane.  The destination is only written, never read, so the write
+// remains the sole access to it besides the source fetch.
 layout(set = 0, binding = 0) buffer PRECISION restrict Self {
   vec4 data[];
 }
@@ -24,10 +25,10 @@ layout(set = 0, binding = 2) buffer PRECISION restrict readonly Indices {
 }
 uIndices;
 layout(set = 0, binding = 3) uniform PRECISION restrict Block {
-  int planes;  // N * C
-  int n_idx; // rows of the source and entries of the payload
-  int width; // W: features per row
-  int rows;  // S: rows available in the destination
+  int planes;  // elements of the payload above the scattered axis
+  int n_idx;   // rows of the source and entries of the index payload
+  int width;   // features per row: the axes below the scattered one
+  int rows;    // rows the destination offers along the scattered axis
 }
 uBlock;
 

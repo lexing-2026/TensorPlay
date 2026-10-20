@@ -6,12 +6,13 @@
 
 layout(std430) buffer;
 
-// In-place scatter of whole rows along the sequence axis of a channel-packed
-// [N, C, S, W] texture: one invocation copies one source row texel into its
-// destination row, addressed through an Int32 index payload.  Rows are the
-// texture's y extent, so the copy stays texel-aligned whatever the channel
-// lanes hold.  Nothing is read from the destination, which keeps the write
-// third the only memory access besides the source fetch.
+// In-place scatter of whole rows along the axis just above the last one of a
+// texture payload: one invocation copies one source row texel into its
+// destination row, addressed through an Int32 index payload.  That axis is the
+// texture's y extent, so a row is a line of whole texels and the copy stays
+// texel-aligned whatever the lanes and the depth planes hold.  Nothing is read
+// from the destination, which keeps the write third the only memory access
+// besides the source fetch.
 layout(set = 0, binding = 0, FORMAT) uniform PRECISION restrict writeonly image3D uSelf;
 layout(set = 0, binding = 1) uniform PRECISION sampler3D uSource;
 layout(set = 0, binding = 2) uniform PRECISION isampler3D uIndices;

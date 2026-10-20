@@ -4,9 +4,12 @@
 #include "Common.h"
 #include "Convert.h"
 #include "Factory.h"
+#include "SizesAndStrides.h"
 #include "Utils.h"
 
 #include <Utils.h>
+
+#include <limits>
 
 namespace tensorplay {
 namespace vulkan {
@@ -301,27 +304,36 @@ Tensor embedding_kernel(
 
 //
 // In-place index_copy_: role as the vulkan write path for row updates along
-// the sequence axis, e.g. appending decode steps to a preallocated kv cache.
-// The destination rows arrive through an Int32 payload that the shader walks,
-// so a list already on the device stays there: folding it onto the host would
-// cost a queue sync per call, and a decode step makes one per token.  Range is
-// settled in the shader, where a code naming no row writes nothing.
+// any axis, e.g. appending decode steps to a preallocated kv cache or writing
+// a page of a slot table.  The destination rows arrive through an Int32 payload
+// that the shader walks, so a list already on the device stays there: folding it
+// onto the host would cost a queue sync per call, and a decode step makes one
+// per token.  Range is settled in the shader, where a code naming no row writes
+// nothing.
 //
-// Geometry note: a 4-D channel-packed [N, C, S, W] tensor keeps its rows on
-// the texture's y extent, so a dim == 2 scatter is texel aligned from row to
-// row whatever the channel lanes carry.  Other ranks and axes need a
-// channel-aware tile map and stay composite-side.
+// Geometry: a row is the block of elements the scattered axis names, so the
+// payload flattens to planes x rows x width with planes the axes above it and
+// width the axes below it.  A linear payload is that block in row-major order
+// and any axis works.  An image payload keeps the axis just above its last one
+// on the texture's y extent and packs the rest of the row into texels and lanes,
+// so only that axis names whole texels; a row straddling the packed axis would
+// have to be copied lane by lane and stays composite-side.
 Tensor& index_copy_rows_inplace(Tensor& self, int64_t dim, const Tensor& index, const Tensor& source) {
   NoGradGuard no_grad;
   TP_CHECK(
       self.device().is_vulkan() && source.device().is_vulkan(),
       "Vulkan index_copy_: both tensors must be on the device");
+  const int64_t rank = self.dim();
+  const int64_t wrapped = dim < 0 ? dim + rank : dim;
   TP_CHECK(
-      self.dim() == 4 && source.dim() == 4,
-      "Vulkan index_copy_: 4-D tensors only");
+      wrapped >= 0 && wrapped < rank,
+      "Vulkan index_copy_: dimension out of range");
   TP_CHECK(
-      dim == 2 || dim == -2,
-      "Vulkan index_copy_: scatter runs along the sequence axis (dim 2)");
+      index.dim() < 2,
+      "Vulkan index_copy_: index must be a vector or a single code");
+  TP_CHECK(
+      source.dim() == rank,
+      "Vulkan index_copy_: source and destination must have the same rank");
   TP_CHECK(
       self.dtype() == DType::Float32 || self.dtype() == DType::Float16,
       "Vulkan index_copy_: Float32 and Float16 only");
@@ -336,38 +348,75 @@ Tensor& index_copy_rows_inplace(Tensor& self, int64_t dim, const Tensor& index, 
     return self;
   }
 
-  const int64_t rows = self.size(2);
+  const int64_t rows = self.size(wrapped);
   const int64_t n_idx = index.numel();
+  int64_t planes = 1;
+  int64_t width = 1;
+  for (int64_t axis = 0; axis < wrapped; ++axis) {
+    planes *= self.size(axis);
+  }
+  for (int64_t axis = wrapped + 1; axis < rank; ++axis) {
+    width *= self.size(axis);
+  }
   TP_CHECK(
-      source.size(2) == n_idx,
+      source.size(wrapped) == n_idx,
       "Vulkan index_copy_: source rows must match the index length");
+  for (int64_t axis = 0; axis < rank; ++axis) {
+    TP_CHECK(
+        axis == wrapped || source.size(axis) == self.size(axis),
+        "Vulkan index_copy_: source must match off-axis sizes");
+  }
+  // The row walk addresses elements as words of a four-lane group, so the whole
+  // payload has to stay inside the signed range the block arithmetic uses.
   TP_CHECK(
-      self.size(0) == source.size(0) && self.size(1) == source.size(1) &&
-          self.size(3) == source.size(3),
-      "Vulkan index_copy_: source must match off-axis sizes");
+      self.numel() <= std::numeric_limits<int32_t>::max(),
+      "Vulkan index_copy_: destination holds more than two billion elements");
 
   api::Context* const context = api::context();
   api::vTensor v_self = convert(self);
   api::vTensor v_source = convert(source);
   api::vTensor v_indices = upload_index_payload(index, v_self.storage_type());
 
-  // Linear payloads (shapes beyond the 3-D image axis limit) scatter through
-  // a buffer-to-buffer variant: the index payload is copied to a dense
-  // Int32 buffer and each invocation copies four feature lanes from a source
-  // row into the indexed destination row, walking the N*C planes.
-  if (v_self.storage_type() == api::StorageType::BUFFER) {
-    api::vTensor v_indices_buf =
-        to_buffer_storage_dispatch(context, v_indices);
+  const bool image_destination =
+      v_self.storage_type() != api::StorageType::BUFFER;
+  // A source that arrives without an image form is given one below; the payload
+  // that owns those elements has to outlive the dispatch that reads them.
+  Tensor source_image;
+  if (image_destination) {
+    TP_CHECK(
+        rank >= 2 && wrapped == rank - 2,
+        "Vulkan index_copy_: an image payload scatters the axis above its last "
+        "one only");
+    // The texel route binds both payloads as images, so a source that arrived
+    // in words crosses over first; the identity gather releases the same
+    // elements as a texture of the source's own shape.
+    if (v_source.storage_type() == api::StorageType::BUFFER) {
+      const std::vector<int64_t> source_sizes(
+          static_cast<std::vector<int64_t>>(source.shape()));
+      source_image = materialize_view(
+          source,
+          source_sizes,
+          SizesAndStrides::compute_contiguous_strides(source_sizes),
+          0);
+      v_source = convert(source_image);
+    }
+  } else {
+    // Linear payloads scatter through a buffer-to-buffer variant: the index
+    // payload is copied to a dense Int32 buffer and each invocation copies four
+    // feature lanes from a source row into the indexed destination row, walking
+    // every plane above the scattered axis.
+    v_indices = to_buffer_storage_dispatch(context, v_indices);
     // The source payload may still fit texture storage when the scatter is
     // small; bring it to a dense buffer so every linear-path argument has
     // memory attached (an empty buffer binding would silently skip the job).
-    api::vTensor v_source_buf =
-        to_buffer_storage_dispatch(context, v_source);
-    const int64_t planes = self.size(0) * self.size(1);
-    const int64_t width = self.size(3);
+    v_source = to_buffer_storage_dispatch(context, v_source);
     const uint32_t nf4 = static_cast<uint32_t>((width + 3) / 4);
-    const uint32_t n = nf4 * static_cast<uint32_t>(planes) *
-        static_cast<uint32_t>(n_idx);
+    const int64_t invocations = nf4 * planes * n_idx;
+    TP_CHECK(
+        invocations <= std::numeric_limits<int32_t>::max(),
+        "Vulkan index_copy_: the row walk needs more than two billion "
+        "invocations");
+    const uint32_t n = static_cast<uint32_t>(invocations);
     const struct IndexCopyBufferBlock {
       int32_t planes;
       int32_t n_idx;
@@ -388,11 +437,11 @@ Tensor& index_copy_rows_inplace(Tensor& self, int64_t dim, const Tensor& index, 
             pipeline_barrier,
             api::PipelineStage::COMPUTE,
             api::MemoryAccessType::WRITE),
-        v_source_buf.buffer(
+        v_source.buffer(
             pipeline_barrier,
             api::PipelineStage::COMPUTE,
             api::MemoryAccessType::READ),
-        v_indices_buf.buffer(
+        v_indices.buffer(
             pipeline_barrier,
             api::PipelineStage::COMPUTE,
             api::MemoryAccessType::READ),
