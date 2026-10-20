@@ -163,6 +163,42 @@ static bool flat_layout_pair(const Tensor& t, const Tensor& result) {
     return SizesAndStrides::is_non_overlapping_and_dense(sizes, ts);
 }
 
+// Whether a value computed from `self` may be written straight into a destination
+// the caller already holds, instead of into a fresh tensor that is copied over
+// afterwards.
+//
+// Two things have to hold.  The destination must carry what the compute produces
+// -- the caller's device, that dtype, those sizes -- and it must be laid out so
+// that one storage place holds one element, which is the shape the allocating
+// helper would have handed the pass anyway; a destination with holes would be
+// written as though it were packed.  And the pass must not read bytes it is also
+// writing: the loops pair element i of the source with element i of the
+// destination, so two views of one block that step differently would leave
+// whichever value the chunks stored last.  A destination that fails either test
+// is served the old way, by computing and handing the result over.
+static bool destination_writable(const Tensor& self, const Tensor& out,
+                                 DType want) {
+    if (!out.defined() || out.device() != self.device()) return false;
+    if (out.dtype() != want) return false;
+    const auto sizes = static_cast<std::vector<int64_t>>(self.shape());
+    if (static_cast<std::vector<int64_t>>(out.shape()) != sizes) return false;
+    if (!out.is_contiguous()) {
+        const std::vector<int64_t> out_strides = out.strides();
+        if (!SizesAndStrides::is_non_overlapping_and_dense(sizes, out_strides)) {
+            return false;
+        }
+    }
+    auto self_impl = self.unsafeGetTensorImpl();
+    auto out_impl = out.unsafeGetTensorImpl();
+    const bool one_block = self_impl && out_impl &&
+        self_impl->storage().defined() && out_impl->storage().defined() &&
+        self_impl->storage().data() == out_impl->storage().data();
+    if (one_block) {
+        return self.data_ptr() == out.data_ptr() && flat_layout_pair(self, out);
+    }
+    return true;
+}
+
 // Elementwise work over a strided source without a materialization copy.
 // The result carries the input's layout (dense permuted views keep their
 // strides), so the innermost dim -- unit stride on the result side -- is
@@ -344,12 +380,17 @@ Tensor unary_op_kernel(const Tensor& self, Func func,
 template<typename Func>
 Tensor unary_float_op_kernel(const Tensor& self, Func func,
                              vecunary::VOp vec_op = vecunary::VOp::None,
-                             vecunary::VParams vec_prm = {}) {
+                             vecunary::VParams vec_prm = {},
+                             const Tensor* destination = nullptr) {
     DType out_dtype = self.dtype();
     if (isIntegralType(out_dtype)) {
         out_dtype = DType::Float32;
     }
-    Tensor result = empty_like_in_input_order(self, out_dtype);
+    // A caller that has already judged its own destination hands it over, so the
+    // pass writes where the values have to end up instead of being copied there.
+    Tensor result = destination != nullptr
+        ? *destination
+        : empty_like_in_input_order(self, out_dtype);
     int64_t n = self.numel();
 
     // Vector fast paths cover f32/f64 plus the widen-compute-narrow f16/bf16
@@ -571,6 +612,28 @@ Tensor unary_float_op_kernel(const Tensor& self, Func func,
     }
 
     return result;
+}
+
+// Writes the map of `self` into a destination the caller holds.  Where the
+// destination can take the pass directly, no result tensor is made and nothing
+// is copied; everywhere else -- a cast, a different shape, a destination that
+// reaches the source's bytes by another step, a dtype the allocating kernel
+// handles by some other route (complex, quantized) -- the value is computed by
+// that same kernel and handed over.
+template<typename Func>
+Tensor& unary_float_out_kernel(const Tensor& self, Tensor& out,
+                               Tensor (*allocating)(const Tensor&), Func func,
+                               vecunary::VOp vec_op,
+                               vecunary::VParams vec_prm = {}) {
+    const DType want =
+        isIntegralType(self.dtype()) ? DType::Float32 : self.dtype();
+    const bool plain_float =
+        !isComplexType(self.dtype()) && !isQuantizedType(self.dtype());
+    if (plain_float && destination_writable(self, out, want)) {
+        unary_float_op_kernel(self, func, vec_op, vec_prm, &out);
+        return out;
+    }
+    return write_out(out, allocating(self));
 }
 
 // corresponding real dtype (hypot(re, im)).
@@ -807,10 +870,6 @@ Tensor sin_kernel(const Tensor& self) {
                               [](auto x) { return tensorplay::sin(x);  });
     return unary_float_op_kernel(self, [](auto x) { return std::sin(x); }, vecunary::VOp::Sin);
 }
-Tensor& sin_out_cpu(const Tensor& self, Tensor& out) {
-    write_out(out, sin_kernel(self));
-    return out;
-}
 Tensor sinh_kernel(const Tensor& self) {
     if (isComplexType(self.dtype()))
         return cplx_unary_vec(self, veccomplex::Op::Sinh,
@@ -946,6 +1005,61 @@ Tensor sigmoid_kernel(const Tensor& self) {
         return result;
     }
     return unary_float_op_kernel(self, [](auto x) { using T = decltype(x); return static_cast<T>(1) / (static_cast<T>(1) + std::exp(-x)); }, vecunary::VOp::Sigmoid);
+}
+
+// Each of these fills the caller's destination when it can, and otherwise hands
+// over what the allocating kernel of the same op made.  The scalar functor and
+// the vector lane are the pair that allocating kernel already uses, so the two
+// forms of one op agree element for element.
+#define TP_UNARY_FLOAT_OUT(name, vop)                                          \
+    Tensor& name##_out_cpu(const Tensor& self, Tensor& out) {                  \
+        return unary_float_out_kernel(                                         \
+            self, out, name##_kernel,                                          \
+            [](auto x) { return std::name(x); }, vecunary::VOp::vop);           \
+    }
+
+TP_UNARY_FLOAT_OUT(acos, Acos)
+TP_UNARY_FLOAT_OUT(acosh, Acosh)
+TP_UNARY_FLOAT_OUT(asin, Asin)
+TP_UNARY_FLOAT_OUT(asinh, Asinh)
+TP_UNARY_FLOAT_OUT(atan, Atan)
+TP_UNARY_FLOAT_OUT(atanh, Atanh)
+TP_UNARY_FLOAT_OUT(cos, Cos)
+TP_UNARY_FLOAT_OUT(cosh, Cosh)
+TP_UNARY_FLOAT_OUT(sin, Sin)
+TP_UNARY_FLOAT_OUT(sinh, Sinh)
+TP_UNARY_FLOAT_OUT(tan, Tan)
+TP_UNARY_FLOAT_OUT(tanh, Tanh)
+TP_UNARY_FLOAT_OUT(exp, Exp)
+TP_UNARY_FLOAT_OUT(expm1, Expm1)
+TP_UNARY_FLOAT_OUT(erf, Erf)
+TP_UNARY_FLOAT_OUT(erfc, Erfc)
+TP_UNARY_FLOAT_OUT(log, Log)
+TP_UNARY_FLOAT_OUT(log10, Log10)
+TP_UNARY_FLOAT_OUT(log1p, Log1p)
+TP_UNARY_FLOAT_OUT(log2, Log2)
+TP_UNARY_FLOAT_OUT(lgamma, Lgamma)
+TP_UNARY_FLOAT_OUT(sqrt, Sqrt)
+#undef TP_UNARY_FLOAT_OUT
+
+Tensor& rsqrt_out_cpu(const Tensor& self, Tensor& out) {
+    return unary_float_out_kernel(
+        self, out, rsqrt_kernel,
+        [](auto x) {
+            using T = decltype(x);
+            return static_cast<T>(1) / std::sqrt(x);
+        },
+        vecunary::VOp::Rsqrt);
+}
+
+Tensor& sigmoid_out_cpu(const Tensor& self, Tensor& out) {
+    return unary_float_out_kernel(
+        self, out, sigmoid_kernel,
+        [](auto x) {
+            using T = decltype(x);
+            return static_cast<T>(1) / (static_cast<T>(1) + std::exp(-x));
+        },
+        vecunary::VOp::Sigmoid);
 }
 
 Tensor frac_kernel(const Tensor& self) {
@@ -1977,8 +2091,11 @@ void clamp_f64_avx2(const double* src, double* dst, int64_t n,
 } // namespace
 #endif
 
-Tensor clamp_kernel(const Tensor& self, const std::optional<Scalar>& min, const std::optional<Scalar>& max) {
-    Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
+// Every branch below pairs element i of the source with element i of the
+// destination, so the destination arrives already chosen: a fresh tensor for the
+// functional form, the caller's own tensor for an out= or in-place call.
+Tensor clamp_write(const Tensor& self, const std::optional<Scalar>& min,
+                   const std::optional<Scalar>& max, Tensor result) {
     int64_t n = self.numel();
     Tensor self_contig = self.contiguous();
 
@@ -2094,17 +2211,56 @@ Tensor clamp_kernel(const Tensor& self, const std::optional<Scalar>& min, const 
 }
 
 // clamp(self, bound, nullopt); delegate to the same kernel here.
+Tensor clamp_kernel(const Tensor& self, const std::optional<Scalar>& min,
+                    const std::optional<Scalar>& max) {
+    return clamp_write(self, min, max,
+                       Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()),
+                                     self.dtype(), self.device()));
+}
+
 Tensor clamp_min_kernel(const Tensor& self, const Scalar& min) {
     return clamp_kernel(self, min, std::nullopt);
 }
 Tensor clamp_max_kernel(const Tensor& self, const Scalar& max) {
     return clamp_kernel(self, std::nullopt, max);
 }
+
+// The destination-taking forms keep the clamp in one pass over the bytes it
+// writes.  A destination that cannot be reached element for element -- a cast, a
+// different shape, a view of the input's own block at another step -- is served
+// by computing and handing the result over, as before.
+Tensor& clamp_out_kernel(const Tensor& self, const std::optional<Scalar>& min,
+                         const std::optional<Scalar>& max, Tensor& out) {
+    if (destination_writable(self, out, self.dtype())) {
+        clamp_write(self, min, max, out);
+        return out;
+    }
+    return write_out(out, clamp_kernel(self, min, max));
+}
+
+Tensor& clamp_min_out_kernel(const Tensor& self, const Scalar& min,
+                             Tensor& out) {
+    return clamp_out_kernel(self, min, std::nullopt, out);
+}
+
+Tensor& clamp_max_out_kernel(const Tensor& self, const Scalar& max,
+                             Tensor& out) {
+    return clamp_out_kernel(self, std::nullopt, max, out);
+}
+
 Tensor& clamp_min__kernel(Tensor& self, const Scalar& min) {
+    if (destination_writable(self, self, self.dtype())) {
+        clamp_write(self, min, std::nullopt, self);
+        return self;
+    }
     self.copy_(clamp_kernel(self, min, std::nullopt));
     return self;
 }
 Tensor& clamp_max__kernel(Tensor& self, const Scalar& max) {
+    if (destination_writable(self, self, self.dtype())) {
+        clamp_write(self, std::nullopt, max, self);
+        return self;
+    }
     self.copy_(clamp_kernel(self, std::nullopt, max));
     return self;
 }
@@ -3388,6 +3544,29 @@ TENSORPLAY_LIBRARY_IMPL(CPU, PointwiseKernels) {
     m.impl("cosh", cosh_kernel);
     m.impl("sin", sin_kernel);
     m.impl("sin.out", sin_out_cpu);
+    m.impl("acos.out", acos_out_cpu);
+    m.impl("acosh.out", acosh_out_cpu);
+    m.impl("asin.out", asin_out_cpu);
+    m.impl("asinh.out", asinh_out_cpu);
+    m.impl("atan.out", atan_out_cpu);
+    m.impl("atanh.out", atanh_out_cpu);
+    m.impl("cos.out", cos_out_cpu);
+    m.impl("cosh.out", cosh_out_cpu);
+    m.impl("sinh.out", sinh_out_cpu);
+    m.impl("tan.out", tan_out_cpu);
+    m.impl("tanh.out", tanh_out_cpu);
+    m.impl("exp.out", exp_out_cpu);
+    m.impl("expm1.out", expm1_out_cpu);
+    m.impl("erf.out", erf_out_cpu);
+    m.impl("erfc.out", erfc_out_cpu);
+    m.impl("log.out", log_out_cpu);
+    m.impl("log10.out", log10_out_cpu);
+    m.impl("log1p.out", log1p_out_cpu);
+    m.impl("log2.out", log2_out_cpu);
+    m.impl("lgamma.out", lgamma_out_cpu);
+    m.impl("sqrt.out", sqrt_out_cpu);
+    m.impl("rsqrt.out", rsqrt_out_cpu);
+    m.impl("sigmoid.out", sigmoid_out_cpu);
     m.impl("sinh", sinh_kernel);
     m.impl("tan", tan_kernel);
     m.impl("tanh", tanh_kernel);
@@ -3443,6 +3622,9 @@ TENSORPLAY_LIBRARY_IMPL(CPU, PointwiseKernels) {
     m.impl("pow.Tensor_Scalar", pow_scalar_kernel);
     m.impl("angle", angle_kernel);
     m.impl("clamp", clamp_kernel);
+    m.impl("clamp.out", clamp_out_kernel);
+    m.impl("clamp_min.out", clamp_min_out_kernel);
+    m.impl("clamp_max.out", clamp_max_out_kernel);
     m.impl("clamp_min", clamp_min_kernel);
     m.impl("clamp_max", clamp_max_kernel);
     m.impl("clamp_min_", clamp_min__kernel);
