@@ -239,18 +239,23 @@ __global__ void scatter_kernel(int64_t total_idx, int64_t idx_dim_size, int64_t 
 }
 
 // Contiguous counterpart of scatter_kernel: the grid supplies the outer and row
-// coordinates, and a block walks a contiguous tile of kContigWork columns per
-// thread so the index and source reads pipeline side by side.
+// coordinates, so the per-element coordinate never needs a division.  A block
+// takes a contiguous strip of a row and each thread covers `work` columns of it
+// at a stride of kContigThreads, which keeps the scattered writes of one strip
+// together and amortises the block preamble; `work` is chosen at launch because
+// it trades block count against per-thread run length.
+constexpr int kScatterContigMaxWork = 32;
+
 template <typename T, bool Add, typename IndexT>
 __global__ void scatter_contig_kernel(int64_t idx_dim_size, int64_t idx_inner,
                                       int64_t self_dim_size, int64_t self_inner,
-                                      T* d, const IndexT* ip, const T* vp) {
+                                      int64_t work, T* d, const IndexT* ip,
+                                      const T* vp) {
     const int64_t outer_off = blockIdx.z;
     const int64_t row_base = (outer_off * idx_dim_size + blockIdx.y) * idx_inner;
-    int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.x * kContigWork +
-                threadIdx.x;
-#pragma unroll
-    for (int k = 0; k < kContigWork; ++k) {
+    int64_t t = static_cast<int64_t>(blockIdx.x) * kContigThreads * work + threadIdx.x;
+#pragma unroll 8
+    for (int64_t k = 0; k < work; ++k) {
         if (t < idx_inner) {
             const int64_t flat = row_base + t;
             int64_t idx = ip[flat];
@@ -263,7 +268,7 @@ __global__ void scatter_contig_kernel(int64_t idx_dim_size, int64_t idx_inner,
             }
             else d[dst] = vp[flat];
         }
-        t += blockDim.x;
+        t += kContigThreads;
     }
 }
 
@@ -273,13 +278,18 @@ void launch_scatter_typed(bool contig, int64_t total_idx, int64_t outer,
                           int64_t self_dim_size, int64_t self_inner,
                           T* d, const IndexT* ip, const T* vp, cudaStream_t stream) {
     if (contig) {
+        // Prefer one block per row for narrow rows, and cap the per-thread
+        // strip so wide rows still spread over many blocks.
+        int64_t work = (idx_inner + kContigThreads - 1) / kContigThreads;
+        if (work < kContigWork) work = kContigWork;
+        if (work > kScatterContigMaxWork) work = kScatterContigMaxWork;
         const dim3 grid(static_cast<unsigned>(
-                            (idx_inner + kContigThreads * kContigWork - 1) /
-                            (kContigThreads * kContigWork)),
+                            (idx_inner + kContigThreads * work - 1) /
+                            (kContigThreads * work)),
                         static_cast<unsigned>(idx_dim_size),
                         static_cast<unsigned>(outer));
         scatter_contig_kernel<T, Add, IndexT><<<grid, kContigThreads, 0, stream>>>(
-            idx_dim_size, idx_inner, self_dim_size, self_inner, d, ip, vp);
+            idx_dim_size, idx_inner, self_dim_size, self_inner, work, d, ip, vp);
         return;
     }
     scatter_kernel<T, Add, IndexT><<<
