@@ -758,7 +758,9 @@ inline bool launch_addc_vec(
          reinterpret_cast<uintptr_t>(pc) | reinterpret_cast<uintptr_t>(py)) & align_mask)
         return false;
 
-    dim3 block(256);
+    // 128 threads per block: at equal total threads the narrower block keeps
+    // more blocks resident, and the block count carries the grid width.
+    dim3 block(128);
     const int64_t vec_n = n / kVec;
     const int64_t want = (vec_n + block.x - 1) / block.x;
     dim3 grid(static_cast<unsigned>(want < 1 ? 1 : want));
