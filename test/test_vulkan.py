@@ -5557,5 +5557,241 @@ class TestVulkanIntegralSum(unittest.TestCase):
             wide.sum()
 
 
+class TestVulkanAdvancedIndexing(unittest.TestCase):
+    # A list of row codes is the indexing a decode loop does on its own: read
+    # the rows a page table names, or write a step back into the slots that
+    # table hands out.  The payload is read as planes x rows x width, so the
+    # axis the codes name may be any axis of any rank, and a code that names no
+    # row answers zero and writes nothing.  Range is settled inside the walk,
+    # because a host that asked for it would pay a queue sync for every step.
+
+    SHAPES = ((5,), (5, 4), (2, 5, 3), (2, 3, 5, 2))
+
+    @staticmethod
+    def _device(payload):
+        arr = np.asarray(payload)
+        if arr.ndim and not arr.flags["C_CONTIGUOUS"]:
+            arr = np.ascontiguousarray(arr)
+        return tensorplay.from_numpy(arr).to("vulkan")
+
+    @classmethod
+    def _table(cls, shape, dtype=np.float32):
+        return (np.arange(int(np.prod(shape)), dtype=np.float32)
+                .reshape(shape) % 17).astype(dtype)
+
+    @staticmethod
+    def _codes(values, dtype=np.int64):
+        return TestVulkanAdvancedIndexing._device(
+            np.array(values, dtype=dtype))
+
+    @staticmethod
+    def _read(payload, axis, codes):
+        return tensorplay.index(payload, [None] * axis + [codes])
+
+    def _gather_matches(self, np_dtype, tensorplay_dtype, shapes, axes):
+        for shape in shapes:
+            table = self._table(shape, np_dtype)
+            payload = self._device(table)
+            self.assertEqual(payload.dtype, tensorplay_dtype)
+            for axis in axes(shape):
+                size = shape[axis]
+                codes = [0, size - 1, size // 2, 1, size - 1]
+                want = np.take(table, codes, axis=axis)
+                got = self._read(payload, axis, self._codes(codes))
+                self.assertEqual(tuple(got.shape), want.shape)
+                np.testing.assert_array_equal(
+                    got.cpu().numpy(), want,
+                    err_msg=f"gather of {shape} axis {axis}")
+
+    def test_a_code_list_names_a_row_of_every_axis(self):
+        self._gather_matches(np.float32, tensorplay.float32,
+                             self.SHAPES, lambda shape: range(len(shape)))
+
+    def test_a_half_payload_gathers_the_rows_it_is_asked_for(self):
+        self._gather_matches(np.float16, tensorplay.float16,
+                             self.SHAPES, lambda shape: range(len(shape)))
+
+    def test_a_table_past_the_reach_of_a_texture_gathers_through_words(self):
+        # A payload with no image form is walked in dense row-major storage,
+        # where the planes above the gathered axis and the row the codes name
+        # are arithmetic on an element count rather than a texel coordinate.
+        self._gather_matches(np.float32, tensorplay.float32,
+                             ((20000, 3), (2, 20000, 3)),
+                             lambda shape: range(len(shape)))
+        self._gather_matches(np.float16, tensorplay.float16, ((20000, 3),),
+                             lambda shape: range(len(shape)))
+
+    def test_a_rank_one_payload_gathers_from_either_storage(self):
+        for count in (6, 20000):
+            table = np.arange(count, dtype=np.float32)
+            codes = [count - 1, 0, count // 3]
+            np.testing.assert_array_equal(
+                self._read(self._device(table), 0, self._codes(codes))
+                .cpu().numpy(),
+                table[codes], err_msg=f"a flat payload of {count} lanes")
+
+    def test_a_wide_code_list_answers_the_narrow_one(self):
+        table = self._table((9, 5))
+        payload = self._device(table)
+        for axis, codes in ((0, [0, 8, 3, 1]), (1, [0, 4, 2, 1])):
+            wide = np.take(table, codes, axis=axis)
+            narrow = self._codes(codes, np.int32)
+            np.testing.assert_array_equal(
+                self._read(payload, axis, narrow).cpu().numpy(), wide,
+                err_msg=f"int32 codes over axis {axis}")
+
+    def test_a_code_list_keeps_the_shape_it_arrived_in(self):
+        table = self._table((2, 3, 4))
+        payload = self._device(table)
+        grid = [[0, 1], [1, 0], [0, 0]]
+        for axis in (0, 1, 2):
+            codes = self._device(np.array(grid, dtype=np.int64))
+            # A grid of codes names a grid of rows: the axis it walks is
+            # replaced by the grid's own shape.
+            want = np.take(table, grid, axis=axis)
+            got = tensorplay.index(payload, [None] * axis + [codes])
+            np.testing.assert_array_equal(
+                got.cpu().numpy(), want, err_msg=f"2-d codes over axis {axis}")
+        lone = table[1]
+        np.testing.assert_array_equal(
+            self._read(payload, 0, self._codes(1)).cpu().numpy(), lone,
+            err_msg="a single code drops the axis it walked")
+
+    def test_an_empty_code_list_answers_no_rows(self):
+        payload = self._device(self._table((4, 6)))
+        got = self._read(payload, 0, self._codes(np.zeros(0, dtype=np.int64)))
+        self.assertEqual(tuple(got.shape), (0, 6))
+
+    def test_a_code_outside_the_rows_reads_nothing(self):
+        # Both storages settle the range in the walk: a code that names no row
+        # answers zeros instead of asking the host where the rows stop.
+        small = self._device(self._table((5, 4)))
+        np.testing.assert_array_equal(
+            self._read(small, 0, self._codes([0, 7, -2])).cpu().numpy(),
+            np.array([[0, 1, 2, 3], [0, 0, 0, 0], [0, 0, 0, 0]], np.float32),
+            err_msg="an image payload")
+        big = self._device(self._table((20000, 3)))
+        np.testing.assert_array_equal(
+            self._read(big, 0, self._codes([0, 20000, -1])).cpu().numpy(),
+            np.array([[0, 1, 2], [0, 0, 0], [0, 0, 0]], np.float32),
+            err_msg="a linear payload")
+
+    def _write_matches(self, shape, axis, np_dtype=np.float32):
+        table = np.zeros(shape, dtype=np_dtype)
+        payload = self._device(table)
+        size = shape[axis]
+        # Two codes naming one row race for it, so a write is only answered
+        # once its codes name different rows.
+        codes = [0, size - 1] if size < 3 else [0, size - 1, size // 2]
+        src_shape = list(shape)
+        src_shape[axis] = len(codes)
+        rows = (np.arange(int(np.prod(src_shape)), dtype=np_dtype)
+                + np_dtype(1)).reshape(src_shape)
+        want = table.copy()
+        for slot, code in enumerate(codes):
+            dst = [slice(None)] * len(shape)
+            dst[axis] = code
+            src = [slice(None)] * len(shape)
+            src[axis] = slot
+            want[tuple(dst)] = rows[tuple(src)]
+        tensorplay.index_put_(payload, [None] * axis + [self._codes(codes)],
+                              self._device(rows), False)
+        np.testing.assert_array_equal(
+            payload.cpu().numpy(), want,
+            err_msg=f"write over {shape} axis {axis}")
+
+    def test_a_write_lands_on_every_row_the_codes_name(self):
+        # The axis an image payload can scatter is the one its texture puts on
+        # its own height; a table with no image form scatters any axis.
+        self._write_matches((5, 4), 0)
+        self._write_matches((2, 5, 3), 1)
+        self._write_matches((9, 64), 0, np.float16)
+        for axis in (0, 1, 2):
+            self._write_matches((2, 20000, 3), axis)
+
+    def test_a_narrow_source_is_read_once_per_row_it_lands_in(self):
+        table = np.zeros((4, 3), dtype=np.float32)
+        payload = self._device(table)
+        tensorplay.index_put_(payload, [self._codes([1, 3])],
+                              self._device(np.array([[5.0], [7.0]], np.float32)),
+                              False)
+        want = table.copy()
+        want[1] = 5.0
+        want[3] = 7.0
+        np.testing.assert_array_equal(payload.cpu().numpy(), want,
+                                      err_msg="a column broadcast over a row")
+
+    def test_a_write_that_names_nothing_changes_nothing(self):
+        payload = self._device(np.ones((4, 3), dtype=np.float32))
+        tensorplay.index_put_(payload, [self._codes(np.zeros(0, np.int64))],
+                              self._device(np.zeros((0, 3), np.float32)), False)
+        np.testing.assert_array_equal(payload.cpu().numpy(),
+                                      np.ones((4, 3), np.float32),
+                                      err_msg="an empty code list")
+        tensorplay.index_put_(payload, [self._codes([9, -1])],
+                              self._device(np.zeros((2, 3), np.float32)), False)
+        np.testing.assert_array_equal(payload.cpu().numpy(),
+                                      np.ones((4, 3), np.float32),
+                                      err_msg="codes that name no row")
+
+    def test_a_list_left_on_the_host_is_taken_along(self):
+        table = self._table((5, 4))
+        payload = self._device(table)
+        codes = tensorplay.tensor([0, 2, 1], dtype=tensorplay.int64)
+        self.assertEqual(codes.device.type, "cpu")
+        np.testing.assert_array_equal(
+            self._read(payload, 0, codes).cpu().numpy(),
+            np.take(table, [0, 2, 1], axis=0), err_msg="codes on the host")
+        written = tensorplay.tensor([1, 3], dtype=tensorplay.int64)
+        tensorplay.index_put_(payload, [written], self._device(table[[0, 4]]),
+                              False)
+        want = table.copy()
+        want[1] = table[0]
+        want[3] = table[4]
+        np.testing.assert_array_equal(payload.cpu().numpy(), want,
+                                      err_msg="a write with host codes")
+        lone = self._device(np.zeros((3, 2), dtype=np.float32))
+        tensorplay.index_put_(lone, [self._codes([0, 2])],
+                              tensorplay.tensor(np.float32(3.0)), False)
+        np.testing.assert_array_equal(
+            lone.cpu().numpy(),
+            np.array([[3, 3], [0, 0], [3, 3]], np.float32),
+            err_msg="a scalar that stayed on the host")
+
+    def test_a_subscript_answers_the_way_the_walk_does(self):
+        table = self._table((6, 4))
+        payload = self._device(table)
+        np.testing.assert_array_equal(
+            payload[self._codes([5, 0])].cpu().numpy(),
+            np.take(table, [5, 0], axis=0), err_msg="a subscript read")
+        t = self._device(np.zeros((3, 2), dtype=np.float32))
+        t[self._codes([0, 2])] = self._device(np.full((2, 2), -4.0, np.float32))
+        np.testing.assert_array_equal(
+            t.cpu().numpy(), np.array([[-4, -4], [0, 0], [-4, -4]], np.float32),
+            err_msg="a subscript write")
+        t2 = self._device(np.zeros((3, 2), dtype=np.float32))
+        t2[self._codes([0, 2]), ...] = self._device(
+            np.full((2, 2), -3.0, np.float32))
+        np.testing.assert_array_equal(
+            t2.cpu().numpy(), np.array([[-3, -3], [0, 0], [-3, -3]], np.float32),
+            err_msg="a subscript write that spells its whole axis")
+
+    def test_a_shape_the_walk_would_have_to_guess_is_answered_off_it(self):
+        payload = self._device(self._table((5, 4)))
+        # A mask names rows by counting them, which is a compaction the walk
+        # does not do; neither does a tuple of lists that has to be broadcast
+        # against itself, or an add that folds several rows into one.
+        with self.assertRaisesRegex(RuntimeError, "list of row codes"):
+            tensorplay.index(
+                payload, [self._device(np.array([True, False, True, False, False]))])
+        with self.assertRaisesRegex(RuntimeError, "list of row codes"):
+            tensorplay.index(payload, [self._device(np.ones(2, np.float32))])
+        with self.assertRaisesRegex(RuntimeError, "several lists"):
+            tensorplay.index(payload, [self._codes([0, 1]), self._codes([0, 1])])
+        with self.assertRaisesRegex(RuntimeError, "adding into"):
+            tensorplay.index_put_(payload, [self._codes([0, 1])],
+                                  self._device(np.ones((2, 4), np.float32)), True)
+
+
 if __name__ == "__main__":
     unittest.main()
