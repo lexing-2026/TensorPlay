@@ -659,11 +659,19 @@ def repeat_interleave(input, repeats, dim=None, *, output_size=None):
             picked = tensorplay.empty(
                 output_shape, dtype=input.dtype, device=input.device)
             return picked.reshape([-1]) if dim is None else picked
-        view_shape = list(src.shape)
-        view_shape.insert(axis + 1, rep_n)
         out_shape = list(src.shape)
         out_shape[axis] = total
-        picked = src.unsqueeze(axis + 1).expand(view_shape) \
+        # The repeated axis gains a companion axis, so the expanded view sits
+        # one rank above the payload.  Storage that addresses a payload by its
+        # axes (a texel walk, say) tops out at four, and a tall payload would
+        # then need a fifth.  Folding the block above the repeated axis and the
+        # block below it into a pair of counts holds the walk to three axes for
+        # any rank, and the copy still happens once.
+        above = int(math.prod(src.shape[:axis]))
+        below = int(math.prod(src.shape[axis + 1:]))
+        picked = src.reshape([above, n, below]).unsqueeze(2) \
+            .expand([above, n, rep_n, below]) \
+            .reshape([above, total, below]) \
             .reshape(out_shape)
         if dim is None:
             return picked.reshape([-1])
