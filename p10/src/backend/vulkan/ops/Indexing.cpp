@@ -884,6 +884,38 @@ Tensor index_select_kernel(
   return flat_out.reshape(out_sizes);
 }
 
+// A flat lookup: the payload's own shape drops out and every code names one
+// element of it in row-major order, so the answer has the list's shape rather
+// than the payload's.
+Tensor take_kernel(const Tensor& self, const Tensor& index) {
+  TP_CHECK(
+      index.dtype() == DType::Int64 || index.dtype() == DType::Int32,
+      "Vulkan take: index must be Int32 or Int64");
+  TP_CHECK(
+      !(self.numel() == 0 && index.numel() != 0),
+      "Vulkan take: tried to take from an empty tensor");
+  const int64_t entries = self.numel();
+  const std::vector<int64_t> out_sizes =
+      static_cast<std::vector<int64_t>>(index.shape());
+  if (index.numel() == 0) {
+    api::Context* const context = api::context();
+    api::vTensor v_output{context, out_sizes, self.dtype()};
+    return convert(v_output);
+  }
+  // The list arrives with the payload's rank but the walk reads one code per
+  // entry, and a code wider than a word narrows to its low half the way the
+  // other row lookups of this backend do.
+  Tensor codes = index.reshape({index.numel()});
+  if (codes.dtype() == DType::Int64) {
+    codes = codes.to(DType::Int32);
+  }
+  // A code below zero counts back from the end of the flattened payload.
+  codes = tpx::ops::where(tpx::ops::lt(codes, 0), codes + Scalar(entries), codes);
+  Tensor picked =
+      index_select_kernel(self.reshape({entries}), 0, codes);
+  return picked.reshape(out_sizes);
+}
+
 //
 // Per-position row selection: output element e stands for the source element at
 // e's own coordinates with the gathered coordinate replaced by the e-th code.
@@ -1990,6 +2022,7 @@ Tensor& index_put_impl__kernel(
 TENSORPLAY_LIBRARY_IMPL(Vulkan, IndexingKernels) {
   m.impl("embedding", &tensorplay::vulkan::ops::embedding_kernel);
   m.impl("index_select", &tensorplay::vulkan::ops::index_select_kernel);
+  m.impl("take", &tensorplay::vulkan::ops::take_kernel);
   m.impl("index.Tensor", &tensorplay::vulkan::ops::index_tensor_kernel);
   m.impl(
       "_index_put_impl_",

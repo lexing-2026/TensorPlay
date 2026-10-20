@@ -172,6 +172,13 @@ std::tuple<Tensor, Tensor> sort_kernel(
   return sort_impl(self, dim, descending, -1);
 }
 
+// The permutation alone: the same selection, with the ordered values dropped
+// rather than written out a second time.
+Tensor argsort_kernel(
+    const Tensor& self, int64_t dim, bool descending) {
+  return std::get<1>(sort_impl(self, dim, descending, -1));
+}
+
 std::tuple<Tensor, Tensor> topk_kernel(
     const Tensor& self, int64_t k, int64_t dim, bool largest, bool sorted,
     int64_t impl) {
@@ -188,6 +195,7 @@ std::tuple<Tensor, Tensor> topk_kernel(
 TENSORPLAY_LIBRARY_IMPL(Vulkan, SelectionKernels) {
   m.impl("median", &tensorplay::vulkan::ops::median_kernel);
   m.impl("sort", &tensorplay::vulkan::ops::sort_kernel);
+  m.impl("argsort", &tensorplay::vulkan::ops::argsort_kernel);
   m.impl("topk", &tensorplay::vulkan::ops::topk_kernel);
 }
 
