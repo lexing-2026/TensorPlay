@@ -7513,5 +7513,143 @@ class TestVulkanBernoulliOutOfPlace(unittest.TestCase):
                 tensorplay.bernoulli(self._device(np.zeros(4, np.float32)), p)
 
 
+class TestVulkanConstantPad(unittest.TestCase):
+    """A frame around a payload: negative counts crop, positive counts join a
+    slab of the fill value, and the payload itself keeps its place."""
+
+    @staticmethod
+    def _device(values):
+        return tensorplay.from_numpy(np.asarray(values)).to("vulkan")
+
+    @staticmethod
+    def _framed(data, pad, value):
+        """The same rule read off the axis it names: the list counts from the
+        last axis inwards, and each entry is that end's signed count."""
+        ndim = data.ndim
+        pairs = len(pad) // 2
+        cropped = data
+        for axis in range(ndim - pairs, ndim):
+            at = 2 * (ndim - axis - 1)
+            left, right = pad[at], pad[at + 1]
+            window = [slice(None)] * ndim
+            window[axis] = slice(
+                -left if left < 0 else 0,
+                cropped.shape[axis] + (right if right < 0 else 0))
+            cropped = cropped[tuple(window)]
+        width = [(0, 0)] * ndim
+        for axis in range(ndim - pairs, ndim):
+            at = 2 * (ndim - axis - 1)
+            width[axis] = (max(pad[at], 0), max(pad[at + 1], 0))
+        return np.pad(cropped, width, mode="constant", constant_values=value)
+
+    def _drawn(self, data, pad, value, payload=None):
+        """data is what the payload shows; payload defaults to a fresh upload."""
+        model = self._framed(np.asarray(data), pad, value)
+        device = self._device(data) if payload is None else payload
+        got = tensorplay.constant_pad_nd(device, pad, value)
+        np.testing.assert_array_equal(
+            np.asarray(got.cpu()), model, err_msg=f"pad {pad}")
+        return got, model
+
+    def test_a_single_axis_gains_slabs_of_the_fill(self):
+        rng = np.random.default_rng(71)
+        data = (rng.standard_normal(7) * 3).astype(np.float32)
+        for pad in ([0, 0], [2, 0], [0, 3], [1, 2], [4, 5]):
+            got, model = self._drawn(data, pad, -2.5)
+            self.assertEqual(tuple(got.shape), tuple(model.shape))
+            self.assertEqual(got.dtype, tensorplay.float32)
+
+    def test_both_axes_gain_their_own_frame(self):
+        rng = np.random.default_rng(72)
+        data = (rng.standard_normal((3, 5)) * 3).astype(np.float32)
+        got, _ = self._drawn(data, [1, 2, 3, 0], -7.5)
+        self.assertEqual(tuple(got.shape), (6, 8))
+        self._drawn(data, [0, 0, 1, 1], 4.0)
+
+    def test_a_negative_count_crops_that_end(self):
+        rng = np.random.default_rng(73)
+        data = (rng.standard_normal((4, 6)) * 3).astype(np.float32)
+        cropped, _ = self._drawn(data, [-1, -2, 0, 0], 0.0)
+        self.assertEqual(tuple(cropped.shape), (4, 3))
+        # A crop on one end of an axis and a slab on the other.
+        for pad in ([-1, 2, 0, 0], [3, -2], [0, 0, -1, 4]):
+            self._drawn(data, pad, 0.5)
+
+    def test_the_frame_reaches_every_supported_rank(self):
+        rng = np.random.default_rng(74)
+        for shape in ((5,), (3, 4), (2, 3, 4), (2, 2, 3, 4)):
+            data = (rng.standard_normal(shape) * 3).astype(np.float32)
+            got, model = self._drawn(data, [1, 1], 0.0)
+            self.assertEqual(tuple(got.shape), tuple(model.shape))
+
+    def test_a_count_beyond_the_texel_axis_limit_keeps_the_payload(self):
+        rng = np.random.default_rng(75)
+        short = (rng.standard_normal(37) * 3).astype(np.float32)
+        self._drawn(short, [5, 6], 2.0)
+        long = (rng.standard_normal(5000) * 3).astype(np.float32)
+        got, model = self._drawn(long, [1, 2], 0.0)
+        self.assertEqual(tuple(got.shape), (5003,))
+        np.testing.assert_array_equal(np.asarray(got.cpu()), model)
+
+    def test_a_view_is_framed_as_it_shows(self):
+        rng = np.random.default_rng(76)
+        base = self._device((rng.standard_normal((4, 8)) * 3).astype(np.float32))
+        view = base[1:4, 0:8:2]
+        got, model = self._drawn(
+            np.asarray(view.cpu()), [0, 0, 1, 1], 0.0, payload=view)
+        self.assertEqual(tuple(got.shape), (5, 4))
+        np.testing.assert_array_equal(np.asarray(got.cpu()), model)
+
+    def test_the_element_types_a_concat_walk_can_carry(self):
+        cases = [
+            (np.arange(6, dtype=np.float32), 9.0),
+            (np.arange(6, dtype=np.float16), 9.0),
+            (np.arange(6, dtype=np.int32), 9),
+            (np.array([True, False, True]), False),
+        ]
+        for arr, value in cases:
+            self._drawn(arr, [1, 2], value)
+        # A 64-bit count has no image form and the concat walk stops at 32-bit
+        # words, so an int64 payload is not padded here.
+        with self.assertRaisesRegex(RuntimeError, "Float32, Int32 and Float16"):
+            tensorplay.constant_pad_nd(
+                self._device(np.arange(6, dtype=np.int64)), [1, 2], 9)
+
+    def test_the_frontend_entry_agrees(self):
+        import tensorplay.nn.functional as nnf
+        rng = np.random.default_rng(77)
+        data = (rng.standard_normal((3, 4)) * 3).astype(np.float32)
+        device = self._device(data)
+        np.testing.assert_array_equal(
+            np.asarray(nnf.pad(device, [1, 2]).cpu()),
+            self._framed(data, [1, 2], 0.0))
+        np.testing.assert_array_equal(
+            np.asarray(nnf.pad(device, [1, 2], value=-1.0).cpu()),
+            self._framed(data, [1, 2], -1.0))
+        # Two pairs reach the last two axes.
+        np.testing.assert_array_equal(
+            np.asarray(nnf.pad(device, [1, 2, 0, 1]).cpu()),
+            self._framed(data, [1, 2, 0, 1], 0.0))
+
+    def test_an_empty_axis_still_takes_its_frame(self):
+        got, model = self._drawn(np.zeros((0, 3), np.float32), [1, 1], 0.0)
+        self.assertEqual(tuple(got.shape), tuple(model.shape))
+        outer, outer_model = self._drawn(np.zeros((2, 0), np.float32),
+                                        [0, 0, 2, 2], 0.0)
+        self.assertEqual(tuple(outer.shape), tuple(outer_model.shape))
+
+    def test_outside_the_supported_surface_refuses(self):
+        data = self._device(np.zeros(4, np.float32))
+        with self.assertRaisesRegex(RuntimeError, "pairs of counts"):
+            tensorplay.constant_pad_nd(data, [1, 2, 3], 0.0)
+        with self.assertRaisesRegex(RuntimeError, "covers 4 ends"):
+            tensorplay.constant_pad_nd(data, [1, 1, 1, 1], 0.0)
+        with self.assertRaisesRegex(RuntimeError, "cannot take -9 and -2"):
+            tensorplay.constant_pad_nd(data, [-9, -2], 0.0)
+        with self.assertRaisesRegex(RuntimeError, "1d to 4d"):
+            tensorplay.constant_pad_nd(
+                self._device(np.array(1.0, np.float32)), [1, 1], 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()
