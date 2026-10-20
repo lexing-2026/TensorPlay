@@ -116,19 +116,31 @@ class RotaryEmbedding(Module):
         self._sin_cached = tensorplay.sin(freqs)
         self._seq_len_cached = max_position
 
-    def forward(self, x: Tensor, position_ids: Tensor) -> tuple[Tensor, Tensor]:
+    def forward(
+        self,
+        x: Tensor,
+        position_ids: Tensor,
+        max_position: int | None = None,
+    ) -> tuple[Tensor, Tensor]:
         """Tables for the given positions.
 
         Args:
             x: any tensor on the target device; only its dtype and device are
                 consulted.
             position_ids: ``[batch, seq]`` integer positions.
+            max_position: how many positions the tables must cover, when the
+                caller knows it.  Without it the largest position is read
+                back from the device, which waits for the queued work to
+                finish before the caller may go on.
 
         Returns:
             ``(cos, sin)`` of shape ``[batch, seq, dim / 2]`` cast to ``x``'s
             dtype.
         """
-        max_position = int(position_ids.max().item()) + 1
+        if max_position is None:
+            max_position = int(position_ids.max().item()) + 1
+        else:
+            max_position = int(max_position)
         self._update_cache(max_position, x.device, x.dtype)
         cos = self._cos_cached[position_ids]
         sin = self._sin_cached[position_ids]

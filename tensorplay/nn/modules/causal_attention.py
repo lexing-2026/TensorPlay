@@ -126,12 +126,17 @@ class GroupedQueryAttention(Module):
         offset = 0
         if past_key_values is not None:
             offset = past_key_values.get_seq_length(self.layer_idx)
+        # The tables must cover the positions the call reads.  When the call
+        # makes them itself, their extent is known without reading it back
+        # from the device.
+        table_positions = None
         if position_ids is None:
             position_ids = (
                 tensorplay.arange(offset, offset + seq_len, device=hidden_states.device)
                 .unsqueeze(0)
                 .expand(bsz, seq_len)
             )
+            table_positions = offset + seq_len
 
         q = (
             self.q_proj(hidden_states)
@@ -153,7 +158,7 @@ class GroupedQueryAttention(Module):
             q = self.q_norm(q)
             k = self.k_norm(k)
 
-        cos, sin = self.rope(hidden_states, position_ids)
+        cos, sin = self.rope(hidden_states, position_ids, table_positions)
         q, k = apply_rotary_emb(q, k, cos, sin, self.rope.interleaved)
 
         if past_key_values is not None:
