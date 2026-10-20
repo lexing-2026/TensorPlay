@@ -893,46 +893,57 @@ __global__ void binary_row_broadcast_vec_kernel(
 // kernel.  An operand that repeats one element across the row (or the same
 // row across the batch) contributes a splat scalar; the others are read as
 // packed groups.
+// Loads one packed group, or broadcasts the row-constant value when the
+// operand repeats a single element across the row.
+template <typename T, int VecSize, bool Splat>
+__device__ __forceinline__ TPVecPack<T, VecSize> load_vec_group(
+    const T* __restrict__ row_ptr, int64_t col) {
+    TPVecPack<T, VecSize> pack;
+    if constexpr (Splat) {
+        const T value = row_ptr[0];
+#pragma unroll
+        for (int k = 0; k < VecSize; ++k) pack.v[k] = value;
+    } else {
+        pack = *reinterpret_cast<const TPVecPack<T, VecSize>*>(row_ptr + col);
+    }
+    return pack;
+}
+
 template <typename T, int VecSize, typename Op>
+__device__ __forceinline__ void apply_vec_group(
+    TPVecPack<T, VecSize> a, TPVecPack<T, VecSize> b,
+    T* __restrict__ y, int64_t col,
+    typename BinaryOpMath<T>::type alpha, Op op) {
+    using M = typename BinaryOpMath<T>::type;
+    TPVecPack<T, VecSize> out;
+#pragma unroll
+    for (int v = 0; v < VecSize; ++v) {
+        out.v[v] = static_cast<T>(
+            op(static_cast<M>(a.v[v]), static_cast<M>(b.v[v]), static_cast<M>(alpha)));
+    }
+    *reinterpret_cast<TPVecPack<T, VecSize>*>(y + col) = out;
+}
+
+// One packed group per thread keeps the row sweep at full occupancy. The
+// splat flags are template parameters: a runtime flag forces the load and the
+// branch to serialize, which costs about a percent on this streaming shape.
+template <typename T, int VecSize, bool ASplat, bool BSplat, typename Op>
 __global__ void binary_row_flat_vec_kernel(
     int64_t inner, int64_t vec_inner,
-    const T* __restrict__ a, int64_t a_row_stride, bool a_splat,
-    const T* __restrict__ b, int64_t b_row_stride, bool b_splat,
+    const T* __restrict__ a, int64_t a_row_stride,
+    const T* __restrict__ b, int64_t b_row_stride,
     T* __restrict__ y, typename BinaryOpMath<T>::type alpha, Op op) {
-    using M = typename BinaryOpMath<T>::type;
     const int64_t row = blockIdx.y;
-    const int64_t group = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t group =
+        static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (group >= vec_inner) return;
+    const T* __restrict__ a_row = a + row * a_row_stride;
+    const T* __restrict__ b_row = b + row * b_row_stride;
+    T* __restrict__ y_row = y + row * inner;
     const int64_t col = group * VecSize;
-    TPVecPack<T, VecSize> po;
-    if (a_splat) {
-        const M x = static_cast<M>(a[row * a_row_stride]);
-        const TPVecPack<T, VecSize> pb =
-            *reinterpret_cast<const TPVecPack<T, VecSize>*>(b + row * b_row_stride + col);
-#pragma unroll
-        for (int v = 0; v < VecSize; ++v) {
-            po.v[v] = static_cast<T>(op(x, static_cast<M>(pb.v[v]), static_cast<M>(alpha)));
-        }
-    } else if (b_splat) {
-        const M u = static_cast<M>(b[row * b_row_stride]);
-        const TPVecPack<T, VecSize> pa =
-            *reinterpret_cast<const TPVecPack<T, VecSize>*>(a + row * a_row_stride + col);
-#pragma unroll
-        for (int v = 0; v < VecSize; ++v) {
-            po.v[v] = static_cast<T>(op(static_cast<M>(pa.v[v]), u, static_cast<M>(alpha)));
-        }
-    } else {
-        const TPVecPack<T, VecSize> pa =
-            *reinterpret_cast<const TPVecPack<T, VecSize>*>(a + row * a_row_stride + col);
-        const TPVecPack<T, VecSize> pb =
-            *reinterpret_cast<const TPVecPack<T, VecSize>*>(b + row * b_row_stride + col);
-#pragma unroll
-        for (int v = 0; v < VecSize; ++v) {
-            po.v[v] = static_cast<T>(
-                op(static_cast<M>(pa.v[v]), static_cast<M>(pb.v[v]), static_cast<M>(alpha)));
-        }
-    }
-    *reinterpret_cast<TPVecPack<T, VecSize>*>(y + row * inner + col) = po;
+    TPVecPack<T, VecSize> a0 = load_vec_group<T, VecSize, ASplat>(a_row, col);
+    TPVecPack<T, VecSize> b0 = load_vec_group<T, VecSize, BSplat>(b_row, col);
+    apply_vec_group<T, VecSize, Op>(a0, b0, y_row, col, alpha, op);
 }
 
 // Launches the flat specialization when the output is a contiguous 2-D tensor
@@ -982,11 +993,31 @@ inline bool try_row_flat(
     const int64_t blocks_x = (vec_inner + threads - 1) / threads;
     if (blocks_x > 2147483647) return false;
     dim3 grid(static_cast<unsigned>(blocks_x), static_cast<unsigned>(rows));
-    binary_row_flat_vec_kernel<T, kVec, Op><<<grid, threads, 0, stream>>>(
-        inner, vec_inner,
-        a.data_ptr<T>(), a_row_stride, !a_full,
-        b.data_ptr<T>(), b_row_stride, !b_full,
-        y.data_ptr<T>(), alpha, op);
+    // The splat pattern is fixed for the whole launch, so select it at compile
+    // time instead of branching per thread.
+    if (a_full) {
+        if (b_full) {
+            binary_row_flat_vec_kernel<T, kVec, false, false, Op>
+                <<<grid, threads, 0, stream>>>(
+                    inner, vec_inner, a.data_ptr<T>(), a_row_stride,
+                    b.data_ptr<T>(), b_row_stride, y.data_ptr<T>(), alpha, op);
+        } else {
+            binary_row_flat_vec_kernel<T, kVec, false, true, Op>
+                <<<grid, threads, 0, stream>>>(
+                    inner, vec_inner, a.data_ptr<T>(), a_row_stride,
+                    b.data_ptr<T>(), b_row_stride, y.data_ptr<T>(), alpha, op);
+        }
+    } else if (b_full) {
+        binary_row_flat_vec_kernel<T, kVec, true, false, Op>
+            <<<grid, threads, 0, stream>>>(
+                inner, vec_inner, a.data_ptr<T>(), a_row_stride,
+                b.data_ptr<T>(), b_row_stride, y.data_ptr<T>(), alpha, op);
+    } else {
+        binary_row_flat_vec_kernel<T, kVec, true, true, Op>
+            <<<grid, threads, 0, stream>>>(
+                inner, vec_inner, a.data_ptr<T>(), a_row_stride,
+                b.data_ptr<T>(), b_row_stride, y.data_ptr<T>(), alpha, op);
+    }
     return true;
 }
 
