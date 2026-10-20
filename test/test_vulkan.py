@@ -6655,5 +6655,249 @@ class TestVulkanScatterAdd(unittest.TestCase):
                                  self._device(np.zeros((3, 4), np.float32)))
 
 
+class TestVulkanMatvec(unittest.TestCase):
+    """A matrix against a vector: one reduction over the shared axis."""
+
+    @staticmethod
+    def _device(values):
+        return tensorplay.from_numpy(np.asarray(values)).to("vulkan")
+
+    @staticmethod
+    def _pair(m, k, seed, dtype):
+        rng = np.random.default_rng(seed)
+        mat = (rng.standard_normal((m, k)) * 0.5).astype(np.float32)
+        vec = (rng.standard_normal((k)) * 0.5).astype(np.float32)
+        if dtype is np.float16:
+            mat = mat.astype(np.float16)
+            vec = vec.astype(np.float16)
+        return mat, vec
+
+    def _answered(self, mat, vec, label, rtol=None, atol=None):
+        """Reduce on the device and compare with the same product in full
+        precision, which is what the walk answers up to its own summation."""
+        dtype = np.asarray(mat).dtype
+        got = tensorplay.mv(self._device(mat), self._device(vec)).cpu().numpy()
+        want = np.matmul(mat.astype(np.float32).astype(np.float64),
+                         vec.astype(np.float32).astype(np.float64))
+        if rtol is None:
+            # A half payload holds about ten bits of mantissa, and the device
+            # keeps its running total at full width, so the gap to the model is
+            # the input rounding plus the split reduction's summation order.
+            rtol, atol = (6e-3, 6e-3) if dtype == np.float16 else (1e-4, 1e-4)
+        np.testing.assert_allclose(
+            got.astype(np.float64), want, rtol=rtol, atol=atol,
+            err_msg=f"matrix against vector at {label}")
+        want_dtype = np.float16 if dtype == np.float16 else np.float32
+        self.assertEqual(got.dtype, want_dtype)
+        return got
+
+    def test_every_row_of_the_matrix_is_answered(self):
+        for m, k, seed in [(5, 4, 1), (16, 16, 2), (1, 7, 3), (40, 40, 4),
+                           (3, 101, 5), (257, 64, 6), (700, 3, 7)]:
+            for dtype in (np.float32, np.float16):
+                mat, vec = self._pair(m, k, seed, dtype)
+                self._answered(mat, vec, f"{m}x{k} {dtype.__name__}")
+
+    def test_a_row_reduced_to_a_number_keeps_the_operand_type(self):
+        mat, vec = self._pair(9, 12, 8, np.float16)
+        got = tensorplay.mv(self._device(mat), self._device(vec))
+        self.assertEqual(got.shape, (9,))
+        self.assertTrue(got.device.is_vulkan())
+        self.assertEqual(got.dtype, tensorplay.float16)
+
+    def test_a_long_reduction_streams_from_a_weight_with_no_texture_form(
+            self):
+        # A square this wide passes the device's image limit, so the reduction
+        # reads the layer straight out of its linear payload.
+        for k, seed in [(1024, 9), (2048, 10), (4096, 11)]:
+            for dtype in (np.float32, np.float16):
+                mat, vec = self._pair(k, k, seed, dtype)
+                self._answered(mat, vec, f"{k}x{k} {dtype.__name__}")
+
+    def test_a_single_row_projection_answers_what_the_layer_answers(self):
+        import tensorplay.functional as F
+
+        for k, seed in [(64, 12), (512, 13), (4096, 14)]:
+            for dtype in (np.float32, np.float16):
+                mat, vec = self._pair(k, k, seed, dtype)
+                by_vector = tensorplay.mv(
+                    self._device(mat), self._device(vec)).cpu().numpy()
+                by_layer = F.linear(
+                    self._device(vec), self._device(mat)).cpu().numpy()
+                # Both walk the same layer with the same single row, so the
+                # split reduction lands on the same answer both times.
+                np.testing.assert_array_equal(by_vector, by_layer)
+                self._answered(mat, vec, f"layer at {k} {dtype.__name__}")
+
+    def test_a_matrix_held_as_its_own_transpose_is_read_without_a_copy(self):
+        # The dense twin is (k, rows): the matrix the caller names is the view,
+        # and the packing gather folds the swap on the way into the reduction.
+        rng = np.random.default_rng(15)
+        dense = (rng.standard_normal((6, 9)) * 0.5).astype(np.float32)
+        vec = (rng.standard_normal((6)) * 0.5).astype(np.float32)
+        held = self._device(dense)
+        got = held.transpose(0, 1).mv(self._device(vec)).cpu().numpy()
+        np.testing.assert_allclose(
+            got.astype(np.float64),
+            np.matmul(dense.T.astype(np.float64), vec.astype(np.float64)),
+            rtol=1e-4, atol=1e-4, err_msg="transposed view as the matrix")
+
+        big = (rng.standard_normal((4096, 2048)) * 0.4).astype(np.float32)
+        long_vec = (rng.standard_normal((4096)) * 0.4).astype(np.float32)
+        got = self._device(big).transpose(0, 1).mv(
+            self._device(long_vec)).cpu().numpy()
+        want = np.matmul(big.T.astype(np.float64), long_vec.astype(np.float64))
+        np.testing.assert_allclose(got.astype(np.float64), want, rtol=1e-4,
+                                   atol=1e-3,
+                                   err_msg="transposed view past the image limit")
+
+    def test_a_stride_pattern_the_gather_cannot_read_answers_the_same(self):
+        rng = np.random.default_rng(16)
+        wide = (rng.standard_normal((8, 20)) * 0.5).astype(np.float32)
+        stepped = np.ascontiguousarray(wide[:, ::2])
+        vec = (rng.standard_normal((10)) * 0.5).astype(np.float32)
+        got = self._device(wide)[:, ::2].mv(self._device(vec)).cpu().numpy()
+        np.testing.assert_allclose(
+            got.astype(np.float64),
+            np.matmul(stepped.astype(np.float64), vec.astype(np.float64)),
+            rtol=1e-4, atol=1e-4, err_msg="matrix held a column at a time")
+
+        dense = (rng.standard_normal((4, 6)) * 0.5).astype(np.float32)
+        tail = dense[1:3]
+        row_vec = (rng.standard_normal((6)) * 0.5).astype(np.float32)
+        got = self._device(dense)[1:3].mv(self._device(row_vec)).cpu().numpy()
+        np.testing.assert_allclose(
+            got.astype(np.float64),
+            np.matmul(tail.astype(np.float64), row_vec.astype(np.float64)),
+            rtol=1e-4, atol=1e-4, err_msg="matrix past a storage offset")
+
+    def test_a_reduction_over_no_entries_answers_zero(self):
+        for dtype in (np.float32, np.float16):
+            got = tensorplay.mv(self._device(np.zeros((4, 0), dtype)),
+                                self._device(np.zeros((0), dtype))).cpu().numpy()
+            self.assertEqual(got.shape, (4,))
+            np.testing.assert_array_equal(got, np.zeros((4), dtype))
+        # A matrix with no rows has nothing to answer for.
+        got = tensorplay.mv(self._device(np.zeros((0, 3), np.float32)),
+                            self._device(np.zeros((3), np.float32))).cpu().numpy()
+        self.assertEqual(got.shape, (0,))
+
+    def test_a_product_that_names_a_vector_operand_keeps_the_far_axis(self):
+        rng = np.random.default_rng(17)
+        mat = (rng.standard_normal((9, 5)) * 0.5).astype(np.float32)
+        other = (rng.standard_normal((5, 7)) * 0.5).astype(np.float32)
+        vec = (rng.standard_normal((5)) * 0.5).astype(np.float32)
+
+        by_product = tensorplay.matmul(self._device(mat),
+                                       self._device(vec)).cpu().numpy()
+        np.testing.assert_array_equal(
+            by_product,
+            tensorplay.mv(self._device(mat), self._device(vec)).cpu().numpy())
+
+        row = tensorplay.matmul(self._device(vec), self._device(other)).cpu().numpy()
+        self.assertEqual(row.shape, (7,))
+        np.testing.assert_allclose(
+            row.astype(np.float64),
+            np.matmul(vec.astype(np.float64), other.astype(np.float64)),
+            rtol=1e-4, atol=1e-4, err_msg="vector against a matrix")
+
+        half_row = tensorplay.matmul(
+            self._device(vec.astype(np.float16)),
+            self._device(other.astype(np.float16))).cpu().numpy()
+        np.testing.assert_allclose(
+            half_row.astype(np.float64),
+            np.matmul(vec.astype(np.float64), other.astype(np.float64)),
+            rtol=6e-3, atol=6e-3, err_msg="half vector against a matrix")
+        self.assertEqual(half_row.dtype, np.float16)
+
+        # With no entries to reduce, a shared row answers zero across the far
+        # axis.
+        empty = tensorplay.matmul(self._device(np.zeros((0), np.float32)),
+                                  self._device(np.zeros((0, 4), np.float32))
+                                  ).cpu().numpy()
+        np.testing.assert_array_equal(empty, np.zeros((4), np.float32))
+
+    def test_a_batch_of_matrices_against_a_shared_vector_folds_the_batch(
+            self):
+        rng = np.random.default_rng(18)
+        stacked = (rng.standard_normal((2, 3, 4)) * 0.5).astype(np.float32)
+        vec = (rng.standard_normal((4)) * 0.5).astype(np.float32)
+        got = tensorplay.matmul(self._device(stacked),
+                                self._device(vec)).cpu().numpy()
+        self.assertEqual(got.shape, (2, 3))
+        np.testing.assert_allclose(
+            got.astype(np.float64),
+            np.matmul(stacked.astype(np.float64), vec.astype(np.float64)),
+            rtol=1e-4, atol=1e-4, err_msg="batch against a vector")
+
+        deeper = (rng.standard_normal((4, 2, 3, 5)) * 0.5).astype(np.float32)
+        long_vec = (rng.standard_normal((5)) * 0.5).astype(np.float32)
+        got = tensorplay.matmul(self._device(deeper),
+                                self._device(long_vec)).cpu().numpy()
+        self.assertEqual(got.shape, (4, 2, 3))
+        np.testing.assert_allclose(
+            got.astype(np.float64),
+            np.matmul(deeper.astype(np.float64), long_vec.astype(np.float64)),
+            rtol=1e-4, atol=1e-4, err_msg="deeper batch against a vector")
+
+    def test_a_shared_vector_against_a_batch_of_matrices_drops_the_row_axis(
+            self):
+        rng = np.random.default_rng(19)
+        vec = (rng.standard_normal((5)) * 0.5).astype(np.float32)
+        planes = (rng.standard_normal((4, 5, 3)) * 0.5).astype(np.float32)
+        got = tensorplay.matmul(self._device(vec),
+                                self._device(planes)).cpu().numpy()
+        self.assertEqual(got.shape, (4, 3))
+        np.testing.assert_allclose(
+            got.astype(np.float64),
+            np.matmul(vec.astype(np.float64), planes.astype(np.float64)),
+            rtol=1e-4, atol=1e-4, err_msg="a vector across a batch")
+
+        # A lone plane of the batch answers the same as the matrix itself.
+        tail = tensorplay.matmul(self._device(vec),
+                                 self._device(planes[1:3])).cpu().numpy()
+        self.assertEqual(tail.shape, (2, 3))
+        np.testing.assert_allclose(
+            tail.astype(np.float64),
+            np.matmul(vec.astype(np.float64), planes[1:3].astype(np.float64)),
+            rtol=1e-4, atol=1e-4, err_msg="a vector across a slice of planes")
+
+    def test_a_weight_reduced_twice_answers_the_same(self):
+        mat, vec = self._pair(640, 256, 20, np.float32)
+        other = (np.random.default_rng(21).standard_normal((256))
+                 * 0.5).astype(np.float32)
+        held_mat = self._device(mat)
+        first = tensorplay.mv(held_mat, self._device(vec)).cpu().numpy()
+        # The packed operand for the weight stays cached across calls; a second
+        # weight interleaved must not disturb it.
+        tensorplay.mv(held_mat, self._device(other))
+        again = tensorplay.mv(held_mat, self._device(vec)).cpu().numpy()
+        np.testing.assert_array_equal(first, again)
+        np.testing.assert_allclose(
+            again.astype(np.float64),
+            np.matmul(mat.astype(np.float64), vec.astype(np.float64)),
+            rtol=1e-4, atol=1e-4, err_msg="cached weight reduced again")
+
+    def test_operands_that_do_not_line_up_are_answered_off_it(self):
+        mat, vec = self._pair(4, 5, 22, np.float32)
+        with self.assertRaisesRegex(RuntimeError, "expected a matrix"):
+            tensorplay.mv(self._device(mat[0]), self._device(vec))
+        with self.assertRaisesRegex(RuntimeError, "expected a matrix"):
+            tensorplay.mv(self._device(mat), self._device(vec.reshape(5, 1)))
+        with self.assertRaisesRegex(RuntimeError, "size mismatch"):
+            tensorplay.mv(self._device(mat), self._device(vec[:3]))
+        with self.assertRaisesRegex(RuntimeError, "same element type"):
+            tensorplay.mv(self._device(mat), self._device(
+                vec.astype(np.float16)))
+        with self.assertRaisesRegex(RuntimeError, "Float32 and Float16"):
+            tensorplay.mv(self._device(np.zeros((4, 5), np.int32)),
+                          self._device(np.zeros((5), np.int32)))
+        with self.assertRaisesRegex(RuntimeError, "matrix dimensions do not match"):
+            tensorplay.matmul(self._device(vec), self._device(mat))
+        with self.assertRaisesRegex(RuntimeError, "same element type"):
+            tensorplay.matmul(self._device(vec),
+                              self._device(mat.astype(np.float16).reshape(5, 4)))
+
+
 if __name__ == "__main__":
     unittest.main()
