@@ -75,6 +75,34 @@ Tensor binary_same_kernel(const Tensor& a_in, const Tensor& b_in, Op op, const c
     return out;
 }
 
+// The same map with the destination the caller already holds.  The iterator
+// walks the broadcast the allocating form would walk, at the promoted width,
+// and stores into that buffer instead of a fresh one; overlap with an operand
+// is the iterator's own judgement, so an in-place call stays a single pass.
+// A destination that needs a cast or a resize -- or a pair whose answer the
+// iterator cannot address at all -- takes the value from the allocating kernel.
+template <typename Op>
+Tensor& binary_same_out_kernel(const Tensor& a_in, const Tensor& b_in, Tensor& out,
+                               Tensor (*allocating)(const Tensor&, const Tensor&),
+                               Op op) {
+    TP_CHECK(a_in.device() == b_in.device(),
+             "Expected all tensors to be on the same device, but found ",
+             a_in.device().toString(), " and ", b_in.device().toString(),
+             "!");
+    DType dt = promoteTypes(a_in.dtype(), b_in.dtype());
+    const std::vector<int64_t> out_shape = broadcast_shapes(
+        static_cast<std::vector<int64_t>>(a_in.shape()),
+        static_cast<std::vector<int64_t>>(b_in.shape()));
+    if (!isComplexType(dt) && !isQuantizedType(dt) &&
+        destination_takes(out, a_in.device(), dt, out_shape)) {
+        Tensor ac = (a_in.dtype() == dt ? a_in : a_in.to(dt));
+        Tensor bc = (b_in.dtype() == dt ? b_in : b_in.to(dt));
+        ti_apply_binary(out, ac, bc, op);
+        return out;
+    }
+    return write_out(out, allocating(a_in, b_in));
+}
+
 // Binary op whose inputs promote to a FLOATING dtype first (ints -> Float32).
 //
 // `destination` hands the loop a tensor the caller already holds; it only
@@ -736,13 +764,13 @@ inline T int_floor_div(T x, T y) {
     return q;
 }
 
-Tensor div_rounded_core(const Tensor& a, const Tensor& b, DivRounding rounding) {
-    if (rounding == DivRounding::kTrue) return true_divide_core(a, b);
-    // Rounded division stays in the input dtype: an integral pair must come
-    // back integral, which the float promotion of true division loses.
-    const bool floor_mode = (rounding == DivRounding::kFloor);
-    return binary_same_kernel(a, b, [floor_mode](auto x, auto y) -> decltype(x) {
-        using T = decltype(x);
+// The quotient rounded once per element, held by both the form that allocates
+// its answer and the form that is handed one.
+struct DivRoundedPair {
+    bool floor_mode;
+
+    template <typename T>
+    inline T operator()(T x, T y) const {
         if constexpr (std::is_integral_v<T>) {
             if (y == T(0)) TP_THROW(RuntimeError, "ZeroDivisionError");
             return floor_mode ? int_floor_div<T>(x, y) : static_cast<T>(x / y);
@@ -753,7 +781,15 @@ Tensor div_rounded_core(const Tensor& a, const Tensor& b, DivRounding rounding) 
             const C q = static_cast<C>(x) / static_cast<C>(y);
             return static_cast<T>(floor_mode ? std::floor(q) : std::trunc(q));
         }
-    }, "div");
+    }
+};
+
+Tensor div_rounded_core(const Tensor& a, const Tensor& b, DivRounding rounding) {
+    if (rounding == DivRounding::kTrue) return true_divide_core(a, b);
+    // Rounded division stays in the input dtype: an integral pair must come
+    // back integral, which the float promotion of true division loses.
+    return binary_same_kernel(a, b,
+                              DivRoundedPair{rounding == DivRounding::kFloor}, "div");
 }
 
 Tensor div_rounded_scalar(const Tensor& self, Scalar other, DivRounding rounding) {
@@ -775,6 +811,10 @@ Tensor div_mode_scalar_cpu(const Tensor& self, const Scalar& other,
 }
 Tensor floor_divide_cpu(const Tensor& self, const Tensor& other) {
     return div_rounded_core(self, other, DivRounding::kFloor);
+}
+Tensor& floor_divide_out_cpu(const Tensor& self, const Tensor& other, Tensor& out) {
+    return binary_same_out_kernel(self, other, out, floor_divide_cpu,
+                                  DivRoundedPair{/*floor_mode=*/true});
 }
 Tensor floor_divide_scalar_cpu(const Tensor& self, const Scalar& other) {
     return div_rounded_scalar(self, other, DivRounding::kFloor);
@@ -1124,38 +1164,67 @@ Tensor nextafter_cpu(const Tensor& a, const Tensor& b) {
     }
     return out;
 }
-Tensor gcd_cpu(const Tensor& a, const Tensor& b) {
-    DType dt = promoteTypes(a.dtype(), b.dtype());
-    if (isFloatingType(dt)) TP_THROW(TypeError, "gcd only supports integral tensors");
-    return binary_same_kernel(a, b, [](auto x, auto y) -> decltype(x) {
-        using T = decltype(x);
+// The three integer-pair maps are held once, by both the form that allocates
+// its answer and the form that is handed one.
+struct GcdPair {
+    template <typename T>
+    inline T operator()(T x, T y) const {
         long long ux = static_cast<long long>(x < T(0) ? -x : x);
         long long uy = static_cast<long long>(y < T(0) ? -y : y);
         while (uy) { long long t = ux % uy; ux = uy; uy = t; }
         return static_cast<T>(ux);
-    }, "gcd");
-}
-Tensor lcm_cpu(const Tensor& a, const Tensor& b) {
-    DType dt = promoteTypes(a.dtype(), b.dtype());
-    if (isFloatingType(dt)) TP_THROW(TypeError, "lcm only supports integral tensors");
-    return binary_same_kernel(a, b, [](auto x, auto y) -> decltype(x) {
-        using T = decltype(x);
+    }
+};
+struct LcmPair {
+    template <typename T>
+    inline T operator()(T x, T y) const {
         long long ux = static_cast<long long>(static_cast<float>(x) < 0.0f ? -x : x);
         long long uy = static_cast<long long>(static_cast<float>(y) < 0.0f ? -y : y);
         long long g = ux, t2 = uy;
         while (t2) { long long t3 = g % t2; g = t2; t2 = t3; }
         if (g == 0) return static_cast<T>(0);
         return static_cast<T>(ux / g * uy);
-    }, "lcm");
-}
-Tensor heaviside_cpu(const Tensor& a, const Tensor& values) {
-    return binary_same_kernel(a, values, [](auto x, auto v) -> decltype(x) {
-        using T = decltype(x);
+    }
+};
+struct HeavisidePair {
+    template <typename T>
+    inline T operator()(T x, T v) const {
         double xd = static_cast<double>(x);
         if (xd < 0.0) return static_cast<T>(0);
         if (xd == 0.0) return static_cast<T>(v);
         return static_cast<T>(1);
-    }, "heaviside");
+    }
+};
+
+// gcd and lcm are defined on whole numbers only; the check is shared so both
+// spellings of the answer reject the same operand pairs.
+static void require_integral_pair(const Tensor& a, const Tensor& b, const char* name) {
+    if (isFloatingType(promoteTypes(a.dtype(), b.dtype()))) {
+        TP_THROW(TypeError, name, " only supports integral tensors");
+    }
+}
+
+Tensor gcd_cpu(const Tensor& a, const Tensor& b) {
+    require_integral_pair(a, b, "gcd");
+    return binary_same_kernel(a, b, GcdPair{}, "gcd");
+}
+Tensor& gcd_out_cpu(const Tensor& a, const Tensor& b, Tensor& out) {
+    require_integral_pair(a, b, "gcd");
+    return binary_same_out_kernel(a, b, out, gcd_cpu, GcdPair{});
+}
+Tensor lcm_cpu(const Tensor& a, const Tensor& b) {
+    require_integral_pair(a, b, "lcm");
+    return binary_same_kernel(a, b, LcmPair{}, "lcm");
+}
+Tensor& lcm_out_cpu(const Tensor& a, const Tensor& b, Tensor& out) {
+    require_integral_pair(a, b, "lcm");
+    return binary_same_out_kernel(a, b, out, lcm_cpu, LcmPair{});
+}
+Tensor heaviside_cpu(const Tensor& a, const Tensor& values) {
+    return binary_same_kernel(a, values, HeavisidePair{}, "heaviside");
+}
+Tensor& heaviside_out_cpu(const Tensor& a, const Tensor& values, Tensor& out) {
+    return binary_same_out_kernel(a, values, out, heaviside_cpu, HeavisidePair{});
 }
 
 // ===========================================================================
@@ -1663,6 +1732,10 @@ TENSORPLAY_LIBRARY_IMPL(CPU, OpsKernels) {
     // The two spellings of the same angle map take the destination the same way.
     m.impl("atan2.out", atan2_out_cpu);
     m.impl("arctan2.out", atan2_out_cpu);
+    m.impl("gcd.out", gcd_out_cpu);
+    m.impl("lcm.out", lcm_out_cpu);
+    m.impl("heaviside.out", heaviside_out_cpu);
+    m.impl("floor_divide.out", floor_divide_out_cpu);
     // Clamp family
     m.impl("clamp_", clamp__cpu);
     m.impl("clamp_min.Scalar", clamp_min_scalar_cpu);
