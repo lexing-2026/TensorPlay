@@ -314,6 +314,45 @@ Tensor& bernoulli_tensor_kernel(
   return self;
 }
 
+// Out-of-place draws.  The answer is a fresh payload of the source's shape and
+// element type, so the source keeps its values; the draw itself is the in-place
+// kernel reading a probability plane (the tensor form) or one probability (the
+// scalar form).  A probability plane is fetched texel for texel, so a strided
+// or offset source is laid out densely before it is read.
+Tensor bernoulli_kernel(
+    const Tensor& self,
+    std::optional<Generator> generator) {
+  validate_random_target(self, "bernoulli");
+  const Tensor probs =
+      self.is_contiguous() &&
+              self.unsafeGetTensorImpl()->storage_offset() == 0
+          ? self
+          : self.clone();
+  // The plane is fetched at the output's own texel position, so the answer is
+  // laid out exactly like the plane rather than re-derived from the shape.
+  Tensor out = empty_like_kernel(probs, DType::Undefined, std::nullopt);
+  if (out.numel() > 0) {
+    bernoulli_tensor_kernel(out, probs, std::move(generator));
+  }
+  return out;
+}
+
+Tensor bernoulli_p_kernel(
+    const Tensor& self,
+    double p,
+    std::optional<Generator> generator) {
+  validate_random_target(self, "bernoulli");
+  // Only the shape, element type and device of the source matter here, so no
+  // view of it has to be materialized.
+  Tensor out = empty_kernel(
+      static_cast<std::vector<int64_t>>(self.shape()), self.dtype(),
+      self.device(), false);
+  if (out.numel() > 0) {
+    bernoulli_scalar_kernel(out, p, std::move(generator));
+  }
+  return out;
+}
+
 /*
  * *_like factories: clone the source (same sizes, dtype and device), then
  * refill the clone in place from the random stream.  dtype/device overrides
@@ -609,6 +648,8 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, RandomKernels) {
   m.impl("normal_", &tensorplay::vulkan::ops::normal_kernel);
   m.impl("bernoulli_.float", &tensorplay::vulkan::ops::bernoulli_scalar_kernel);
   m.impl("bernoulli_.Tensor", &tensorplay::vulkan::ops::bernoulli_tensor_kernel);
+  m.impl("bernoulli", &tensorplay::vulkan::ops::bernoulli_kernel);
+  m.impl("bernoulli.p", &tensorplay::vulkan::ops::bernoulli_p_kernel);
   m.impl("randn", &tensorplay::vulkan::ops::randn_kernel);
   m.impl("rand", &tensorplay::vulkan::ops::rand_kernel);
   m.impl("rand_like", &tensorplay::vulkan::ops::rand_like_kernel);
