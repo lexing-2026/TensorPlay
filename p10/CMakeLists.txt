@@ -680,6 +680,7 @@ if(USE_VULKAN)
         src/backend/vulkan/ops/Allocator.cpp
         src/backend/vulkan/ops/AutogradOps.cpp
         src/backend/vulkan/ops/BinaryOp.cpp
+        src/backend/vulkan/ops/Bucketization.cpp
         src/backend/vulkan/ops/Clamp.cpp
         src/backend/vulkan/ops/Clone.cpp
         src/backend/vulkan/ops/Conv.cpp

@@ -1005,6 +1005,14 @@ repeat_interleave_fill:
   parameter_names_with_default_values: {}
   shader_variants:
   - NAME: repeat_interleave_fill
+searchsorted_float:
+  parameter_names_with_default_values: {}
+  shader_variants:
+  - NAME: searchsorted_float
+searchsorted_int:
+  parameter_names_with_default_values: {}
+  shader_variants:
+  - NAME: searchsorted_int
 masked_fill:
   parameter_names_with_default_values:
     VALUE_FROM_TENSOR: false
