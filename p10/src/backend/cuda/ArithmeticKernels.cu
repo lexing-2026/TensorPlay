@@ -656,7 +656,9 @@ template <typename T, typename Op>
 inline bool launch_binary_vec(
     int64_t n, const Tensor& a, const Tensor& b, Tensor& y,
     typename BinaryOpMath<T>::type alpha, Op op, cudaStream_t stream) {
-    constexpr int kVec = 8;
+    // One 16-byte pack per thread: the widest single load/store transaction, so
+    // the address stream is one pack per operand regardless of element type.
+    constexpr int kVec = 16 / sizeof(T);
     const T* pa = a.data_ptr<T>();
     const T* pb = b.data_ptr<T>();
     T* py = y.data_ptr<T>();
@@ -664,9 +666,9 @@ inline bool launch_binary_vec(
     if ((reinterpret_cast<uintptr_t>(pa) | reinterpret_cast<uintptr_t>(pb) |
          reinterpret_cast<uintptr_t>(py)) & align_mask) return false;
 
-    // One block per block-work-size chunk (no occupancy cap): the kernel is
-    // memory-bound and fully provisioned blocks schedule in a single wave.
-    dim3 block(256);
+    // 128 threads per block: at equal total threads the narrower block keeps
+    // more blocks resident, and the block count carries the grid width.
+    dim3 block(128);
     const int64_t vec_n = n / kVec;
     const int64_t want = (vec_n + block.x - 1) / block.x;
     dim3 grid(static_cast<unsigned>(want < 1 ? 1 : want));
