@@ -2337,13 +2337,22 @@ def _rms_norm_impl(
 ) -> Tensor:
     """Native fused kernel (CPU vectorized rows / CUDA block-per-row).
 
-    Falls back to the composite above under autograd: the native forward has
-    flows through its inner ops), so training graphs must keep composing."""
+    A training call reads the same kernel through the fused entry, which
+    reports the row statistic its backward reads; the composite above answers
+    the backends that carry no fused backward."""
     needs_grad = tensorplay.is_grad_enabled() and (
         input.requires_grad
         or (weight is not None and getattr(weight, "requires_grad", False))
     )
     if needs_grad:
+        if input.device.type in _FUSED_RMS_NORM_DEVICES:
+            output, _ = tensorplay._C._fused_rms_norm(
+                input,
+                list(normalized_shape) if isinstance(normalized_shape, (list, tuple)) else [int(normalized_shape)],
+                weight,
+                float(eps) if eps is not None else None,
+            )
+            return output
         return _rms_norm_composite(input, normalized_shape, weight, eps)
     return tensorplay._C.rms_norm(
         input,
@@ -3435,6 +3444,9 @@ _FUSED_MAX_HEAD_DIM = 128
 # Element types the fused cpu attention kernel computes in.
 _CPU_FUSED_DTYPES = frozenset(
     (tensorplay.float16, tensorplay.bfloat16, tensorplay.float32, tensorplay.float64))
+
+# The devices that carry a fused normalization together with its backward.
+_FUSED_RMS_NORM_DEVICES = frozenset(("cuda",))
 
 
 _AUTOCAST_ELIGIBLE = frozenset((tensorplay.float32, tensorplay.float16, tensorplay.bfloat16))

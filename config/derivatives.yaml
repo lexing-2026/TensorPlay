@@ -696,6 +696,14 @@
   weight: std::get<1>(native_layer_norm_backward(grad, input, normalized_shape, ret1, ret2, weight, bias, grad_input_mask))
   bias: std::get<2>(native_layer_norm_backward(grad, input, normalized_shape, ret1, ret2, weight, bias, grad_input_mask))
 
+# The fused normalization reports the row statistic its backward reads, so a
+# training call answers from the fused forward and the fused backward instead
+# of composing the normalization out of separate operations.
+- name: _fused_rms_norm(Tensor input, int[] normalized_shape, Tensor? weight, float? eps) -> (Tensor, Tensor)
+  output_differentiability: [True, False]
+  input: std::get<0>(_fused_rms_norm_backward(grad, input, normalized_shape, ret1, weight, grad_input_mask))
+  weight: std::get<1>(_fused_rms_norm_backward(grad, input, normalized_shape, ret1, weight, grad_input_mask))
+
 # The composite spelling is the same computation with the extents folded into
 # the argument list; the native form is what a captured training region lowers
 # to, because its reverse pass reads the row statistics it reports.
