@@ -7386,5 +7386,132 @@ class TestVulkanArgsort(unittest.TestCase):
             self._device(np.zeros((3, 4), np.float16)).argsort(dim=1)
 
 
+class TestVulkanBernoulliOutOfPlace(unittest.TestCase):
+    """A draw that leaves the probability payload alone: the answer is a fresh
+    tensor of the same shape and element type, not a refill of the source."""
+
+    @staticmethod
+    def _device(values):
+        return tensorplay.from_numpy(np.asarray(values)).to("vulkan")
+
+    @staticmethod
+    def _numpy(payload):
+        """A payload read back as numpy, drawn or not."""
+        if isinstance(payload, tensorplay.Tensor):
+            return np.asarray(payload.cpu())
+        return np.asarray(payload)
+
+    def _flags(self, values):
+        """A draw is only ever 0 or 1, in the source's own element type."""
+        self.assertTrue(np.isin(values, (0.0, 1.0)).all(), values.tolist())
+        return values
+
+    def test_the_answer_is_a_fresh_tensor_of_the_same_kind(self):
+        rng = np.random.default_rng(61)
+        plane = (rng.random((4, 6)) * 0.9 + 0.05).astype(np.float32)
+        source = self._device(plane)
+        got = tensorplay.bernoulli(source)
+        self.assertEqual(tuple(got.shape), (4, 6))
+        self.assertEqual(got.dtype, tensorplay.float32)
+        self.assertTrue(got.device.is_vulkan())
+        self._flags(self._numpy(got))
+        # The source still holds its own probabilities.
+        np.testing.assert_array_equal(self._numpy(source), plane)
+
+    def test_every_element_follows_its_own_probability(self):
+        plane = np.concatenate([np.zeros(8, np.float32), np.ones(8, np.float32)])
+        got = self._numpy(tensorplay.bernoulli(self._device(plane)))
+        np.testing.assert_array_equal(got[:8], np.zeros(8))
+        np.testing.assert_array_equal(got[8:], np.ones(8))
+
+    def test_a_strided_plane_is_laid_out_before_it_is_read(self):
+        # Columns 0, 2, 4 and 6 carry probabilities 0, 0, 1 and 1, so the draw
+        # over that view must be exactly those flags.
+        rows = np.tile(np.array([0.0, 0.5, 0.0, 0.5, 1.0, 0.5, 1.0, 0.5],
+                                np.float32), (2, 1))
+        view = self._device(rows)[:, 0:8:2]
+        got = self._numpy(tensorplay.bernoulli(view))
+        self.assertEqual(tuple(got.shape), (2, 4))
+        np.testing.assert_array_equal(got, np.array([[0.0, 0.0, 1.0, 1.0]] * 2))
+
+    def test_one_probability_governs_the_whole_payload(self):
+        source = self._device(np.zeros((2, 7), np.float32))
+        got = self._numpy(tensorplay.bernoulli(source, 0.5))
+        self.assertEqual(got.shape, (2, 7))
+        self._flags(got)
+        np.testing.assert_array_equal(
+            self._numpy(tensorplay.bernoulli(source, 0.0)), np.zeros((2, 7)))
+        np.testing.assert_array_equal(
+            self._numpy(tensorplay.bernoulli(source, 1.0)), np.ones((2, 7)))
+
+    def test_a_share_of_one_is_reached_by_a_count_of_one(self):
+        draws = np.asarray(
+            tensorplay.bernoulli(self._device(np.zeros(40000, np.float32)), 0.3)
+            .cpu())
+        self.assertAlmostEqual(float(draws.mean()), 0.3, delta=0.01)
+        plane = np.asarray(
+            tensorplay.bernoulli(self._device(np.full(40000, 0.5, np.float32)))
+            .cpu())
+        self.assertAlmostEqual(float(plane.mean()), 0.5, delta=0.01)
+
+    def test_a_wide_or_a_tall_payload_keeps_its_geometry(self):
+        tall = tensorplay.bernoulli(
+            self._device(np.full((2, 3, 4, 5), 0.5, np.float32)))
+        self.assertEqual(tuple(tall.shape), (2, 3, 4, 5))
+        # A count beyond the image axis limit stays a count of that length.
+        long = np.asarray(
+            tensorplay.bernoulli(self._device(np.zeros(5000, np.float32)), 0.25)
+            .cpu())
+        self.assertEqual(long.shape, (5000,))
+        self.assertAlmostEqual(float(long.mean()), 0.25, delta=0.02)
+        empty = tensorplay.bernoulli(self._device(np.zeros((0, 3), np.float32)))
+        self.assertEqual(tuple(empty.shape), (0, 3))
+
+    def test_a_seeded_draw_repeats_and_the_next_draw_moves(self):
+        tensorplay.manual_seed(1234)
+        first = self._numpy(tensorplay.bernoulli(self._device(
+            np.zeros(256, np.float32)), 0.5))
+        tensorplay.manual_seed(1234)
+        again = self._numpy(tensorplay.bernoulli(self._device(
+            np.zeros(256, np.float32)), 0.5))
+        np.testing.assert_array_equal(first, again)
+        moved = self._numpy(tensorplay.bernoulli(self._device(
+            np.zeros(256, np.float32)), 0.5))
+        self.assertFalse(np.array_equal(first, moved))
+
+    def test_the_same_stream_answers_for_both_forms(self):
+        # Both forms fill a payload the device allocated, so a seeded stream
+        # maps every word to the same element either way.
+        tensorplay.manual_seed(99)
+        out = np.asarray(
+            tensorplay.bernoulli(tensorplay.zeros(512, device="vulkan"), 0.5).cpu())
+        tensorplay.manual_seed(99)
+        inplace = tensorplay.zeros(512, device="vulkan")
+        inplace.bernoulli_(0.5)
+        np.testing.assert_array_equal(out, np.asarray(inplace.cpu()))
+
+    def test_a_payload_on_another_device_is_served_there(self):
+        host = tensorplay.tensor(np.full(8, 0.5, np.float32), device="cpu")
+        got = tensorplay.bernoulli(host)
+        self.assertEqual(got.device.type, "cpu")
+        self.assertTrue(set(np.asarray(got.cpu()).tolist()) <= {0.0, 1.0})
+        ones = tensorplay.bernoulli(host, 1.0)
+        np.testing.assert_array_equal(np.asarray(ones.cpu()), np.ones(8))
+
+    def test_outside_the_supported_surface_refuses(self):
+        with self.assertRaisesRegex(RuntimeError, "Float32"):
+            tensorplay.bernoulli(self._device(np.arange(6, dtype=np.int64)))
+        with self.assertRaisesRegex(RuntimeError, "Float32"):
+            tensorplay.bernoulli(self._device(np.zeros(6, np.float16)))
+        with self.assertRaisesRegex(RuntimeError, "1d to 4d"):
+            tensorplay.bernoulli(self._device(np.array(0.5, np.float32)))
+        with self.assertRaisesRegex(RuntimeError, "ndim <= 4"):
+            tensorplay.bernoulli(
+                self._device(np.zeros((1, 1, 1, 1, 2), np.float32)))
+        for p in (-0.5, 1.5):
+            with self.assertRaisesRegex(RuntimeError, r"\[0, 1\]"):
+                tensorplay.bernoulli(self._device(np.zeros(4, np.float32)), p)
+
+
 if __name__ == "__main__":
     unittest.main()
