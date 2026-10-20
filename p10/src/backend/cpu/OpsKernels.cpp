@@ -82,9 +82,9 @@ Tensor binary_same_kernel(const Tensor& a_in, const Tensor& b_in, Op op, const c
 // is the iterator's own judgement, so an in-place call stays a single pass.
 // A destination that needs a cast or a resize -- or a pair whose answer the
 // iterator cannot address at all -- takes the value from the allocating kernel.
-template <typename Op>
+template <typename Op, typename Alloc>
 Tensor& binary_same_out_kernel(const Tensor& a_in, const Tensor& b_in, Tensor& out,
-                               Tensor (*allocating)(const Tensor&, const Tensor&),
+                               Alloc allocating,
                                Op op) {
     TP_CHECK(a_in.device() == b_in.device(),
              "Expected all tensors to be on the same device, but found ",
@@ -330,10 +330,12 @@ Tensor& logical_binary_out_kernel(const Tensor& self, const Tensor& other, Tenso
 }
 
 // A map that keeps the operand's width: the destination has to be packed, that
-// width, and not a second window over the bytes the loop reads.
-template <typename F>
+// width, and not a second window over the bytes the loop reads.  `allocating` is
+// whatever spells the same map in the form that fills a fresh tensor, so a map
+// carrying a parameter can hand its own bound value to both spellings.
+template <typename F, typename Alloc>
 Tensor& dtype_unary_out_kernel(const Tensor& self, Tensor& out,
-                               Tensor (*allocating)(const Tensor&), F f,
+                               Alloc allocating, F f,
                                const char* name) {
     const DType in = self.dtype();
     if (!isComplexType(in) && !isQuantizedType(in) &&
@@ -1444,67 +1446,117 @@ Tensor& clamp__cpu(Tensor& self, const std::optional<Scalar>& min, const std::op
 // Activations
 // ===========================================================================
 
-Tensor hardshrink_cpu(const Tensor& self, const Scalar& lambd) {
-    double l = lambd.toDouble();
-    // lambd.to<scalar_t>(), so float32 boundary values compare exactly.
-    return dtype_unary_kernel(self, [l](auto x) -> decltype(x) {
-        using T = decltype(x);
+// Inside the inclusive [-lambd, lambd] band the answer is zero, outside it the
+// operand passes through.  The limit is read back through the element's own
+// width, so a boundary value that only rounds there still compares exactly.
+struct HardshrinkBand {
+    double l;
+
+    template <typename T>
+    inline T operator()(T x) const {
         const double lt = static_cast<double>(static_cast<T>(l));
         double v = static_cast<double>(x);
         return (v >= -lt && v <= lt) ? static_cast<T>(0) : x;
-    }, "hardshrink");
-}
-Tensor softshrink_cpu(const Tensor& self, const Scalar& lambd) {
-    double l = lambd.toDouble();
-    return dtype_unary_kernel(self, [l](auto x) -> decltype(x) {
-        using T = decltype(x);
+    }
+};
+
+// One limit's distance outside the band, and zero inside it -- where zero keeps
+// the sign the operand carried.
+struct SoftshrinkBand {
+    double l;
+
+    template <typename T>
+    inline T operator()(T x) const {
         const double lt = static_cast<double>(static_cast<T>(l));
         double v = static_cast<double>(x);
         if (v > lt) return static_cast<T>(v - lt);
         if (v < -lt) return static_cast<T>(v + lt);
         return static_cast<T>(v * 0.0);
-    }, "softshrink");
-}
-// passes through where self is outside the inclusive [-lambd, lambd] band.
-Tensor hardshrink_backward_cpu(const Tensor& grad_out, const Tensor& self, const Scalar& lambd) {
-    double l = lambd.toDouble();
-    return binary_same_kernel(grad_out, self, [l](auto g, auto s) -> decltype(g) {
-        using T = decltype(g);
+    }
+};
+
+// Either shrink passes the incoming gradient through wherever the operand lies
+// outside its band, and drops it inside.
+struct ShrinkBandGrad {
+    double l;
+
+    template <typename T>
+    inline T operator()(T g, T s) const {
         const double lt = static_cast<double>(static_cast<T>(l));
         double v = static_cast<double>(s);
         return (v >= -lt && v <= lt) ? static_cast<T>(0) : g;
-    }, "hardshrink_backward");
+    }
+};
+
+Tensor hardshrink_cpu(const Tensor& self, const Scalar& lambd) {
+    return dtype_unary_kernel(self, HardshrinkBand{lambd.toDouble()}, "hardshrink");
+}
+Tensor& hardshrink_out_cpu(const Tensor& self, const Scalar& lambd, Tensor& out) {
+    double l = lambd.toDouble();
+    return dtype_unary_out_kernel(
+        self, out, [l](const Tensor& v) { return hardshrink_cpu(v, Scalar(l)); },
+        HardshrinkBand{l}, "hardshrink");
+}
+Tensor softshrink_cpu(const Tensor& self, const Scalar& lambd) {
+    return dtype_unary_kernel(self, SoftshrinkBand{lambd.toDouble()}, "softshrink");
+}
+Tensor& softshrink_out_cpu(const Tensor& self, const Scalar& lambd, Tensor& out) {
+    double l = lambd.toDouble();
+    return dtype_unary_out_kernel(
+        self, out, [l](const Tensor& v) { return softshrink_cpu(v, Scalar(l)); },
+        SoftshrinkBand{l}, "softshrink");
+}
+Tensor hardshrink_backward_cpu(const Tensor& grad_out, const Tensor& self, const Scalar& lambd) {
+    return binary_same_kernel(grad_out, self,
+                              ShrinkBandGrad{lambd.toDouble()}, "hardshrink_backward");
+}
+Tensor& hardshrink_backward_out_cpu(const Tensor& grad_out, const Tensor& self,
+                                   const Scalar& lambd, Tensor& grad_input) {
+    double l = lambd.toDouble();
+    return binary_same_out_kernel(
+        grad_out, self, grad_input,
+        [l](const Tensor& g, const Tensor& s) {
+            return hardshrink_backward_cpu(g, s, Scalar(l));
+        },
+        ShrinkBandGrad{l});
 }
 Tensor softshrink_backward_cpu(const Tensor& grad_output, const Tensor& self, const Scalar& lambd) {
+    return binary_same_kernel(grad_output, self,
+                              ShrinkBandGrad{lambd.toDouble()}, "softshrink_backward");
+}
+Tensor& softshrink_backward_out_cpu(const Tensor& grad_output, const Tensor& self,
+                                    const Scalar& lambd, Tensor& grad_input) {
     double l = lambd.toDouble();
-    return binary_same_kernel(grad_output, self, [l](auto g, auto s) -> decltype(g) {
-        using T = decltype(g);
-        const double lt = static_cast<double>(static_cast<T>(l));
-        double v = static_cast<double>(s);
-        return (v >= -lt && v <= lt) ? static_cast<T>(0) : g;
-    }, "softshrink_backward");
+    return binary_same_out_kernel(
+        grad_output, self, grad_input,
+        [l](const Tensor& g, const Tensor& s) {
+            return softshrink_backward_cpu(g, s, Scalar(l));
+        },
+        ShrinkBandGrad{l});
 }
-// where `output` is the saved forward result of sigmoid.
-Tensor sigmoid_backward_cpu(const Tensor& grad_output, const Tensor& output) {
-    return binary_same_kernel(grad_output, output, [](auto g, auto o) -> decltype(g) {
-        using T = decltype(o);
+// The saved forward answer of sigmoid is itself the derivative's input:
+// grad * output * (1 - output).
+struct SigmoidGradPair {
+    template <typename T>
+    inline T operator()(T g, T o) const {
         return g * o * (static_cast<T>(1) - o);
-    }, "sigmoid_backward");
-}
-// where `output` is the saved forward result of tanh.
-Tensor tanh_backward_cpu(const Tensor& grad_output, const Tensor& output) {
-    return binary_same_kernel(grad_output, output, [](auto g, auto o) -> decltype(g) {
-        using T = decltype(o);
+    }
+};
+// The saved forward answer of tanh: grad * (1 - output^2).
+struct TanhGradPair {
+    template <typename T>
+    inline T operator()(T g, T o) const {
         return g * (static_cast<T>(1) - o * o);
-    }, "tanh_backward");
-}
-// gradient is dy/(x(1-x)) inside [0,1], NaN outside, and dy*inf at exact
-// 0/1; with eps>=0 values outside [eps, 1-eps] (compared in scalar_t) are
-// masked to zero.
-Tensor logit_backward_cpu(const Tensor& grad_output, const Tensor& self, const std::optional<Scalar>& eps) {
-    double e = eps.has_value() ? eps->toDouble() : -1.0;
-    return binary_same_kernel(grad_output, self, [e](auto g, auto s) -> decltype(g) {
-        using T = decltype(s);
+    }
+};
+// grad / (x (1-x)) inside [0,1], NaN outside, and grad*inf at exact 0/1; with
+// eps >= 0 the values outside [eps, 1-eps] -- compared at the element's own
+// width, because the bound is read back through it -- are masked to zero.
+struct LogitGradPair {
+    double e;
+
+    template <typename T>
+    inline T operator()(T g, T s) const {
         const T zero = static_cast<T>(0);
         const T one = static_cast<T>(1);
         if (e < 0) {
@@ -1512,22 +1564,72 @@ Tensor logit_backward_cpu(const Tensor& grad_output, const Tensor& self, const s
             if (s == zero || s == one) return g * std::numeric_limits<T>::infinity();
             return g / (s * (one - s));
         }
-        // (float32 1 - 0.2f == 0.8f), so the band check must too.
         const T lo = static_cast<T>(e);
         const T hi = one - lo;
         if (s < lo || s > hi) return zero;
         if (s == zero || s == one) return g * std::numeric_limits<T>::infinity();
         return g / (s * (one - s));
-    }, "logit_backward");
+    }
+};
+
+Tensor sigmoid_backward_cpu(const Tensor& grad_output, const Tensor& output) {
+    return binary_same_kernel(grad_output, output, SigmoidGradPair{}, "sigmoid_backward");
 }
+Tensor& sigmoid_backward_out_cpu(const Tensor& grad_output, const Tensor& output,
+                                Tensor& grad_input) {
+    return binary_same_out_kernel(grad_output, output, grad_input, sigmoid_backward_cpu,
+                                  SigmoidGradPair{});
+}
+Tensor tanh_backward_cpu(const Tensor& grad_output, const Tensor& output) {
+    return binary_same_kernel(grad_output, output, TanhGradPair{}, "tanh_backward");
+}
+Tensor& tanh_backward_out_cpu(const Tensor& grad_output, const Tensor& output,
+                              Tensor& grad_input) {
+    return binary_same_out_kernel(grad_output, output, grad_input, tanh_backward_cpu,
+                                  TanhGradPair{});
+}
+Tensor logit_backward_cpu(const Tensor& grad_output, const Tensor& self, const std::optional<Scalar>& eps) {
+    double e = eps.has_value() ? eps->toDouble() : -1.0;
+    return binary_same_kernel(grad_output, self, LogitGradPair{e}, "logit_backward");
+}
+Tensor& logit_backward_out_cpu(const Tensor& grad_output, const Tensor& self,
+                               std::optional<double> eps, Tensor& grad_input) {
+    const double e = eps.has_value() ? *eps : -1.0;
+    const std::optional<Scalar> as_scalar =
+        eps.has_value() ? std::optional<Scalar>(Scalar(*eps)) : std::nullopt;
+    return binary_same_out_kernel(
+        grad_output, self, grad_input,
+        [as_scalar](const Tensor& g, const Tensor& s) {
+            return logit_backward_cpu(g, s, as_scalar);
+        },
+        LogitGradPair{e});
+}
+// Every element at or below the limit takes the replacement value; above it the
+// operand passes through unchanged.
+struct ThresholdAt {
+    double t;
+    double val;
+
+    template <typename T>
+    inline T operator()(T x) const {
+        return static_cast<double>(x) <= t ? static_cast<T>(val) : static_cast<T>(x);
+    }
+};
+
 Tensor threshold_cpu(const Tensor& self, const Scalar& threshold, const Scalar& value) {
     if (isQuantizedType(self.dtype())) return quantized::activation(self, 6, threshold.toDouble(), value.toDouble());
 
+    return dtype_unary_kernel(self, ThresholdAt{threshold.toDouble(), value.toDouble()},
+                              "threshold");
+}
+Tensor& threshold_out_cpu(const Tensor& self, const Scalar& threshold, const Scalar& value,
+                          Tensor& out) {
+    if (isQuantizedType(self.dtype())) return write_out(out, threshold_cpu(self, threshold, value));
+
     double t = threshold.toDouble(), val = value.toDouble();
-    return dtype_unary_kernel(self, [t, val](auto x) -> decltype(x) {
-        using T = decltype(x);
-        return static_cast<double>(x) <= t ? static_cast<T>(val) : static_cast<T>(x);
-    }, "threshold");
+    return dtype_unary_out_kernel(
+        self, out, [t, val](const Tensor& v) { return threshold_cpu(v, Scalar(t), Scalar(val)); },
+        ThresholdAt{t, val}, "threshold");
 }
 Tensor prelu_cpu(const Tensor& self, const Tensor& weight) {
     // PReLU: weight shared when numel==1, otherwise per-channel
@@ -1682,13 +1784,21 @@ TENSORPLAY_LIBRARY_IMPL(CPU, OpsKernels) {
     m.impl("clamp_max.Tensor", clamp_max_tensor_cpu);
     // Activations
     m.impl("hardshrink", hardshrink_cpu);
+    m.impl("hardshrink.out", hardshrink_out_cpu);
     m.impl("hardshrink_backward", hardshrink_backward_cpu);
+    m.impl("hardshrink_backward.grad_input", hardshrink_backward_out_cpu);
     m.impl("softshrink", softshrink_cpu);
+    m.impl("softshrink.out", softshrink_out_cpu);
     m.impl("softshrink_backward", softshrink_backward_cpu);
+    m.impl("softshrink_backward.grad_input", softshrink_backward_out_cpu);
     m.impl("sigmoid_backward", sigmoid_backward_cpu);
+    m.impl("sigmoid_backward.grad_input", sigmoid_backward_out_cpu);
     m.impl("tanh_backward", tanh_backward_cpu);
+    m.impl("tanh_backward.grad_input", tanh_backward_out_cpu);
     m.impl("logit_backward", logit_backward_cpu);
+    m.impl("logit_backward.grad_input", logit_backward_out_cpu);
     m.impl("threshold", threshold_cpu);
+    m.impl("threshold.out", threshold_out_cpu);
     m.impl("prelu", prelu_cpu);
 }
 
