@@ -7436,6 +7436,225 @@ class TestVulkanRepeatExpansion(unittest.TestCase):
             self._device(data).repeat_interleave(2, dim=4)
 
 
+class TestVulkanRepeatIndices(unittest.TestCase):
+    """The source position of every slot in an expansion whose counts are
+    themselves a payload.  The length of the answer is a property of the whole
+    count tensor, so it is known only once the counts have been totalled; the
+    fill then writes one slot per answer position and none of them twice."""
+
+    @staticmethod
+    def _device(values):
+        return tensorplay.from_numpy(np.asarray(values).copy()).to("vulkan")
+
+    @staticmethod
+    def _back(payload):
+        return np.asarray(payload.cpu())
+
+    def test_the_slots_of_a_count_payload(self):
+        import tensorplay.functional as F
+
+        counts = np.array([2, 3, 1, 4], dtype=np.int32)
+        got = F.repeat_interleave(self._device(counts))
+        self.assertEqual(got.dtype, tensorplay.int32)
+        np.testing.assert_array_equal(
+            self._back(got), np.repeat(np.arange(4, dtype=np.int32), counts))
+        self.assertEqual(tuple(got.shape), (counts.sum(),))
+
+        for host in (np.array([1], dtype=np.int32),
+                    np.array([5, 1, 0, 2, 7, 1], dtype=np.int32),
+                    np.array([3, 3, 3], dtype=np.int32)):
+            got = F.repeat_interleave(self._device(host))
+            np.testing.assert_array_equal(
+                self._back(got),
+                np.repeat(np.arange(host.size, dtype=np.int32), host),
+                err_msg=f"counts {host.tolist()}")
+
+    def test_a_wide_count_answers_in_the_wide_code(self):
+        import tensorplay.functional as F
+
+        wide = np.array([1, 0, 3, 2], dtype=np.int64)
+        got = F.repeat_interleave(self._device(wide))
+        self.assertEqual(got.dtype, tensorplay.int64)
+        np.testing.assert_array_equal(
+            self._back(got), np.repeat(np.arange(4, dtype=np.int64), wide))
+
+        # A total that no single 32-bit slot count could carry on its own still
+        # answers position by position.
+        long = np.full(70000, 3, dtype=np.int64)
+        got = F.repeat_interleave(self._device(long))
+        self.assertEqual(got.dtype, tensorplay.int64)
+        self.assertEqual(tuple(got.shape), (210000,))
+        answer = self._back(got)
+        np.testing.assert_array_equal(answer[:3], [0, 0, 0])
+        np.testing.assert_array_equal(answer[-3:], [69999, 69999, 69999])
+        self.assertEqual(int(answer.min()), 0)
+        self.assertEqual(int(np.diff(answer).astype(np.int64).max()), 1)
+
+    def test_a_zero_count_holds_no_slot(self):
+        import tensorplay.functional as F
+
+        for host in (np.array([0, 2, 0, 1, 0], dtype=np.int32),
+                     np.zeros(4, dtype=np.int32),
+                     np.zeros(0, dtype=np.int32),
+                     np.zeros(0, dtype=np.int64)):
+            got = F.repeat_interleave(self._device(host))
+            want = np.repeat(np.arange(host.size, dtype=host.dtype), host)
+            np.testing.assert_array_equal(self._back(got), want)
+            self.assertEqual(got.dtype, self._device(host).dtype)
+
+    def test_a_long_run_of_counts(self):
+        import tensorplay.functional as F
+
+        counts = (np.arange(2000, dtype=np.int32) % 5) + 1
+        got = F.repeat_interleave(self._device(counts))
+        np.testing.assert_array_equal(
+            self._back(got), np.repeat(np.arange(2000, dtype=np.int32), counts))
+
+        # The fill walks segments, so a run of counts with one segment each would
+        # leave most of the answer unwritten; a few wide segments must cover it.
+        few = np.array([50000, 1, 40000], dtype=np.int32)
+        answer = self._back(F.repeat_interleave(self._device(few)))
+        np.testing.assert_array_equal(
+            answer, np.repeat(np.arange(3, dtype=np.int32), few))
+
+        # A run of more segments than the bounded grid covers has to walk the
+        # rest with the whole grid as its stride, so no span may be skipped or
+        # written by two segments at once.
+        many = np.full(20000, 20, dtype=np.int32)
+        answer = self._back(F.repeat_interleave(self._device(many)))
+        self.assertEqual(tuple(answer.shape), (400000,))
+        np.testing.assert_array_equal(
+            answer, np.repeat(np.arange(20000, dtype=np.int32), many))
+
+    def test_the_expansion_of_a_payload_follows_device_counts(self):
+        import tensorplay.functional as F
+
+        grid = np.arange(2 * 3 * 4, dtype=np.float32).reshape(2, 3, 4)
+        for axis, counts in ((0, [2, 1]), (1, [1, 3, 2]), (2, [2, 2, 1, 1])):
+            got = F.repeat_interleave(
+                self._device(grid), self._device(np.array(counts, np.int32)),
+                axis)
+            np.testing.assert_array_equal(
+                self._back(got), np.repeat(grid, counts, axis=axis),
+                err_msg=f"axis {axis}")
+            self.assertEqual(got.dtype, tensorplay.float32)
+        got = F.repeat_interleave(
+            self._device(grid), self._device(np.array([1, 2, 3, 4], np.int32)),
+            -1)
+        np.testing.assert_array_equal(
+            self._back(got), np.repeat(grid, [1, 2, 3, 4], axis=-1))
+
+        half = grid.astype(np.float16)
+        counts = np.array([0, 2, 1], dtype=np.int32)
+        got = F.repeat_interleave(self._device(half), self._device(counts), 1)
+        self.assertEqual(got.dtype, tensorplay.float16)
+        np.testing.assert_array_equal(
+            self._back(got), np.repeat(half, counts, axis=1))
+
+    def test_one_count_spread_over_a_block(self):
+        import tensorplay.functional as F
+
+        rows = np.arange(8, dtype=np.float32).reshape(4, 2)
+        for count in (3, 1, 0):
+            counts = np.array([count], dtype=np.int32)
+            got = F.repeat_interleave(
+                self._device(rows), self._device(counts), 0)
+            np.testing.assert_array_equal(
+                self._back(got), np.repeat(rows, count, axis=0),
+                err_msg=f"count {count}")
+
+        empty = np.zeros((0, 3), dtype=np.float32)
+        got = F.repeat_interleave(
+            self._device(empty), self._device(np.zeros(0, np.int32)), 0)
+        self.assertEqual(tuple(got.shape), (0, 3))
+
+    def test_a_stated_length_matched_and_refused(self):
+        import tensorplay.functional as F
+
+        counts = np.array([2, 3, 1, 4], dtype=np.int32)
+        got = F.repeat_interleave(self._device(counts), output_size=10)
+        np.testing.assert_array_equal(
+            self._back(got), np.repeat(np.arange(4, dtype=np.int32), counts))
+        self.assertEqual(tuple(F.repeat_interleave(
+            self._device(np.zeros(4, np.int32)), output_size=0).shape), (0,))
+        with self.assertRaisesRegex(RuntimeError, "answer length"):
+            F.repeat_interleave(self._device(counts), output_size=9)
+        with self.assertRaisesRegex(RuntimeError, "answer length"):
+            F.repeat_interleave(self._device(counts), output_size=-1)
+
+    def test_a_count_payload_that_is_a_view(self):
+        import tensorplay.functional as F
+
+        source = (np.arange(36, dtype=np.int32) % 4)
+        strided = source[2:20:3]
+        got = F.repeat_interleave(self._device(strided))
+        np.testing.assert_array_equal(
+            self._back(got),
+            np.repeat(np.arange(strided.size, dtype=np.int32), strided))
+
+        wide_rows = np.array([[1, 2, 3, 4]], dtype=np.int64)
+        counts = wide_rows[0, 1:4]
+        got = F.repeat_interleave(self._device(counts))
+        self.assertEqual(got.dtype, tensorplay.int64)
+        np.testing.assert_array_equal(
+            self._back(got),
+            np.repeat(np.arange(counts.size, dtype=np.int64), counts))
+
+        block = self._device(np.arange(12, dtype=np.int32).reshape(3, 4))
+        sliced = block[:, 3:4]
+        counts = sliced.reshape(-1)
+        got = F.repeat_interleave(counts)
+        np.testing.assert_array_equal(
+            self._back(got),
+            np.repeat(np.arange(3, dtype=np.int32), [3, 7, 11]))
+
+    def test_the_positions_drive_a_row_gather(self):
+        import tensorplay.functional as F
+
+        rng = np.random.default_rng(23)
+        table = rng.standard_normal((64, 32)).astype(np.float32)
+        counts = (rng.integers(0, 4, size=64)).astype(np.int32)
+        indices = F.repeat_interleave(self._device(counts))
+        got = F.index_select(self._device(table), 0, indices)
+        np.testing.assert_array_equal(
+            self._back(got), np.repeat(table, counts, axis=0))
+        self.assertEqual(tuple(got.shape), (int(counts.sum()), 32))
+
+    def test_counts_built_on_the_device(self):
+        import tensorplay.functional as F
+
+        counts = tensorplay.ones(6, dtype=tensorplay.int32, device="vulkan") * 2
+        got = F.repeat_interleave(counts)
+        np.testing.assert_array_equal(
+            self._back(got), np.repeat(np.arange(6, dtype=np.int32), 2))
+        self.assertEqual(got.device.type, "vulkan")
+
+        # A count payload may be the answer of another walk rather than a host
+        # upload, so the totals read back have to come from device memory.
+        wide = (tensorplay.ones(4, dtype=tensorplay.int32, device="vulkan") * 3
+                ).to(tensorplay.int64)
+        got = F.repeat_interleave(wide)
+        self.assertEqual(got.dtype, tensorplay.int64)
+        np.testing.assert_array_equal(
+            self._back(got), np.repeat(np.arange(4, dtype=np.int64), 3))
+
+    def test_a_count_vocabulary_outside_the_surface_refuses(self):
+        import tensorplay.functional as F
+
+        with self.assertRaisesRegex(RuntimeError, "Int32 or Int64"):
+            F.repeat_interleave(self._device(np.ones(3, dtype=bool)))
+        with self.assertRaisesRegex(RuntimeError, "Int32 or Int64"):
+            F.repeat_interleave(self._device(np.ones(3, dtype=np.uint8)))
+        with self.assertRaisesRegex(RuntimeError, "Int32 or Int64"):
+            F.repeat_interleave(self._device(np.array([1.0, 2.0], np.float32)))
+        with self.assertRaisesRegex(RuntimeError, "1d count payload"):
+            F.repeat_interleave(self._device(np.ones((2, 2), dtype=np.int32)))
+        with self.assertRaisesRegex(RuntimeError, "negative"):
+            F.repeat_interleave(self._device(np.array([2, -1, 3], np.int32)))
+        with self.assertRaisesRegex(RuntimeError, "negative"):
+            F.repeat_interleave(self._device(np.array([2, 0, -5, 9], np.int64)))
+
+
 class TestVulkanTake(unittest.TestCase):
     """A flat lookup: every code names one entry of the payload's row-major
     order, and the answer has the list's shape."""
