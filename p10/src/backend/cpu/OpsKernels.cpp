@@ -738,6 +738,15 @@ Tensor negative_cpu(const Tensor& self) {
     }
     return dtype_unary_kernel(self, [](auto x) { return static_cast<decltype(x)>(-x); }, "negative");
 }
+// Negation keeps the operand's width, so the loop can write straight into a
+// destination held in that width.  Where it cannot -- a complex or quantized
+// operand, a cast, a stride the loop would have to follow -- the value comes
+// from the allocating kernel and is handed over.
+Tensor& negative_out_cpu(const Tensor& self, Tensor& out) {
+    return dtype_unary_out_kernel(
+        self, out, negative_cpu,
+        [](auto x) { return static_cast<decltype(x)>(-x); }, "negative");
+}
 Tensor positive_cpu(const Tensor& self) { return self.clone(); }
 
 // ===========================================================================
@@ -1507,6 +1516,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, OpsKernels) {
     m.impl("floor_divide", floor_divide_cpu);
     m.impl("floor_divide.Scalar", floor_divide_scalar_cpu);
     m.impl("negative", negative_cpu);
+    m.impl("negative.out", negative_out_cpu);
     m.impl("positive", positive_cpu);
     // Comparisons / logic
     m.impl("greater", greater_cpu);

@@ -2338,6 +2338,11 @@ Tensor& clamp_max_out_kernel(const Tensor& self, const Scalar& max,
     return clamp_out_kernel(self, std::nullopt, max, out);
 }
 
+Tensor& clip_out_cpu(const Tensor& self, const std::optional<Scalar>& min,
+                     const std::optional<Scalar>& max, Tensor& out) {
+    return clamp_out_kernel(self, min, max, out);
+}
+
 Tensor& clamp_min__kernel(Tensor& self, const Scalar& min) {
     if (destination_writable(self, self, self.dtype())) {
         clamp_write(self, min, std::nullopt, self);
@@ -3723,6 +3728,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, PointwiseKernels) {
     m.impl("angle", angle_kernel);
     m.impl("clamp", clamp_kernel);
     m.impl("clamp.out", clamp_out_kernel);
+    m.impl("clip.out", clip_out_cpu);
     m.impl("clamp_min.out", clamp_min_out_kernel);
     m.impl("clamp_max.out", clamp_max_out_kernel);
     m.impl("clamp_min", clamp_min_kernel);

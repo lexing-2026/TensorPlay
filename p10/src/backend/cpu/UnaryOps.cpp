@@ -33,6 +33,17 @@ Tensor& arctanh__native_cpu(Tensor& self) { return ops::atanh_(self); }
 Tensor resolve_conj_native_cpu(const Tensor& self) { return self; }
 Tensor resolve_neg_native_cpu(const Tensor& self) { return self; }
 
+// The out variants of these aliases hand the destination to the same pass the
+// short name runs, so a destination is judged -- and taken -- exactly as it
+// would be under the short spelling.
+Tensor& arccos_out_cpu(const Tensor& self, Tensor& out) { return ops::acos(self, out); }
+Tensor& arccosh_out_cpu(const Tensor& self, Tensor& out) { return ops::acosh(self, out); }
+Tensor& arcsin_out_cpu(const Tensor& self, Tensor& out) { return ops::asin(self, out); }
+Tensor& arcsinh_out_cpu(const Tensor& self, Tensor& out) { return ops::asinh(self, out); }
+Tensor& arctan_out_cpu(const Tensor& self, Tensor& out) { return ops::atan(self, out); }
+Tensor& arctanh_out_cpu(const Tensor& self, Tensor& out) { return ops::atanh(self, out); }
+Tensor& fix_out_cpu(const Tensor& self, Tensor& out) { return ops::trunc(self, out); }
+
 TENSORPLAY_LIBRARY_IMPL(CPU, NativeUnaryOps) {
     m.impl("resolve_conj", resolve_conj_native_cpu);
     m.impl("resolve_neg", resolve_neg_native_cpu);
@@ -50,6 +61,13 @@ TENSORPLAY_LIBRARY_IMPL(CPU, NativeUnaryOps) {
     m.impl("arctan_", arctan__native_cpu);
     m.impl("arctanh", arctanh_native_cpu);
     m.impl("arctanh_", arctanh__native_cpu);
+    m.impl("arccos.out", arccos_out_cpu);
+    m.impl("arccosh.out", arccosh_out_cpu);
+    m.impl("arcsin.out", arcsin_out_cpu);
+    m.impl("arcsinh.out", arcsinh_out_cpu);
+    m.impl("arctan.out", arctan_out_cpu);
+    m.impl("arctanh.out", arctanh_out_cpu);
+    m.impl("fix.out", fix_out_cpu);
 }
 
 } // namespace tensorplay::cpu
