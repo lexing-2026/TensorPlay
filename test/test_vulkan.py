@@ -6899,5 +6899,245 @@ class TestVulkanMatvec(unittest.TestCase):
                               self._device(mat.astype(np.float16).reshape(5, 4)))
 
 
+class TestVulkanVectorProducts(unittest.TestCase):
+    """The products whose operands are vectors: reduce, rank one, contract."""
+
+    @staticmethod
+    def _device(values):
+        return tensorplay.from_numpy(np.asarray(values)).to("vulkan")
+
+    @staticmethod
+    def _tolerance(dtype):
+        return (6e-3, 6e-3) if dtype == np.float16 else (1e-4, 1e-4)
+
+    def test_a_pair_of_vectors_reduces_to_one_number(self):
+        rng = np.random.default_rng(31)
+        for length, seed in [(4, 32), (64, 33), (1000, 34), (4096, 35)]:
+            for dtype in (np.float32, np.float16):
+                r = np.random.default_rng(seed)
+                a = (r.standard_normal(length) * 0.5).astype(dtype)
+                b = (r.standard_normal(length) * 0.5).astype(dtype)
+                got = tensorplay.dot(self._device(a), self._device(b))
+                self.assertEqual(got.shape, ())
+                self.assertEqual(got.dtype, tensorplay.float16
+                                 if dtype == np.float16 else tensorplay.float32)
+                rtol, atol = self._tolerance(dtype)
+                np.testing.assert_allclose(
+                    np.asarray(got.cpu().numpy(), np.float64),
+                    np.matmul(a.astype(np.float64), b.astype(np.float64)),
+                    rtol=rtol, atol=atol,
+                    err_msg=f"pair reduced at {length} {dtype.__name__}")
+
+    def test_a_pair_with_no_entries_answers_zero(self):
+        for dtype in (np.float32, np.float16):
+            empty = self._device(np.zeros(0, dtype))
+            got = tensorplay.dot(empty, empty).cpu().numpy()
+            self.assertEqual(got.shape, ())
+            self.assertEqual(float(got), 0.0)
+
+    def test_a_column_against_a_row_answers_every_pair(self):
+        rng = np.random.default_rng(36)
+        for m, n in [(5, 7), (1, 4), (4, 1), (3, 13)]:
+            for dtype in (np.float32, np.float16):
+                col = (rng.standard_normal(m) * 0.5).astype(dtype)
+                row = (rng.standard_normal(n) * 0.5).astype(dtype)
+                got = tensorplay.outer(self._device(col),
+                                       self._device(row)).cpu().numpy()
+                self.assertEqual(got.shape, (m, n))
+                rtol, atol = self._tolerance(dtype)
+                np.testing.assert_allclose(
+                    got.astype(np.float64),
+                    np.outer(col.astype(np.float64), row.astype(np.float64)),
+                    rtol=rtol, atol=atol,
+                    err_msg=f"rank one at {m}x{n} {dtype.__name__}")
+        # An axis with no entries leaves no pair to answer.
+        for m, n in [(0, 7), (7, 0)]:
+            got = tensorplay.outer(self._device(np.zeros(m, np.float32)),
+                                   self._device(np.zeros(n, np.float32))
+                                   ).cpu().numpy()
+            self.assertEqual(got.shape, (m, n))
+
+    def test_a_contracted_axis_folds_the_axes_ahead_of_it(self):
+        rng = np.random.default_rng(37)
+        planes = (rng.standard_normal((2, 3, 4)) * 0.5).astype(np.float32)
+        rows = (rng.standard_normal((5, 4)) * 0.5).astype(np.float32)
+        vector = (rng.standard_normal((4)) * 0.5).astype(np.float32)
+
+        got = tensorplay.inner(self._device(planes),
+                               self._device(rows)).cpu().numpy()
+        self.assertEqual(got.shape, (2, 3, 5))
+        np.testing.assert_allclose(
+            got.astype(np.float64),
+            np.tensordot(planes.astype(np.float64), rows.astype(np.float64),
+                         axes=([2], [1])),
+            rtol=1e-4, atol=1e-4, err_msg="three axes against two")
+
+        got = tensorplay.inner(self._device(rows[0]),
+                               self._device(rows)).cpu().numpy()
+        self.assertEqual(got.shape, (5,))
+        np.testing.assert_allclose(
+            got.astype(np.float64),
+            np.tensordot(rows[0].astype(np.float64), rows.astype(np.float64),
+                         axes=([0], [1])),
+            rtol=1e-4, atol=1e-4, err_msg="a lone row across a batch")
+
+        got = tensorplay.inner(self._device(rows),
+                               self._device(rows)).cpu().numpy()
+        np.testing.assert_allclose(
+            got.astype(np.float64),
+            np.tensordot(rows.astype(np.float64), rows.astype(np.float64),
+                         axes=([1], [1])),
+            rtol=1e-4, atol=1e-4, err_msg="a batch contracted with itself")
+
+        # A pair of vectors answers the number the reduction already answers,
+        # and a pair of numbers simply multiplies.
+        got = tensorplay.inner(self._device(vector),
+                               self._device(rows[0])).cpu().numpy()
+        np.testing.assert_allclose(
+            got.astype(np.float64),
+            np.dot(vector.astype(np.float64), rows[0].astype(np.float64)),
+            rtol=1e-4, atol=1e-4, err_msg="pair of vectors")
+        got = tensorplay.inner(self._device(np.float32(1.5)),
+                               self._device(np.float32(2.5))).cpu().numpy()
+        self.assertEqual(got.shape, ())
+        self.assertAlmostEqual(float(got), 3.75, places=5)
+
+        half_planes = np.asarray(planes, np.float16)
+        half_rows = np.asarray(rows, np.float16)
+        got = tensorplay.inner(self._device(half_planes),
+                               self._device(half_rows)).cpu().numpy()
+        np.testing.assert_allclose(
+            got.astype(np.float32).astype(np.float64),
+            np.tensordot(half_planes.astype(np.float32),
+                         half_rows.astype(np.float32), axes=([2], [1])),
+            rtol=6e-3, atol=6e-3, err_msg="half axes contracted")
+
+    def test_a_seeded_reduction_carries_the_addend_and_the_weights(self):
+        rng = np.random.default_rng(38)
+        mat = (rng.standard_normal((6, 4)) * 0.5).astype(np.float32)
+        vec = (rng.standard_normal((4)) * 0.5).astype(np.float32)
+        seed = (rng.standard_normal((6)) * 0.5).astype(np.float32)
+        reduced = np.matmul(mat.astype(np.float64), vec.astype(np.float64))
+
+        cases = [
+            ("both weights at one", {}, seed + reduced),
+            ("a doubled seed", {"beta": 2.0}, 2.0 * seed + reduced),
+            ("a tripled reduction", {"alpha": 3.0}, seed + 3.0 * reduced),
+            ("both weights", {"beta": 2.0, "alpha": 3.0},
+             2.0 * seed + 3.0 * reduced),
+            ("no reduction", {"alpha": 0.0}, seed),
+            ("no seed", {"beta": 0.0}, reduced),
+        ]
+        for label, weights, want in cases:
+            got = tensorplay.addmv(self._device(seed), self._device(mat),
+                                   self._device(vec), **weights).cpu().numpy()
+            np.testing.assert_allclose(
+                got.astype(np.float64), want, rtol=1e-4, atol=1e-4,
+                err_msg=f"seeded reduction with {label}")
+
+        # One number seeds every row.
+        got = tensorplay.addmv(self._device(np.float32(1.25)),
+                               self._device(mat), self._device(vec),
+                               beta=1.0, alpha=0.0).cpu().numpy()
+        np.testing.assert_allclose(got, np.full(6, 1.25), rtol=0, atol=1e-6,
+                                   err_msg="one number seeds every row")
+
+        # A reduction over no entries leaves the seed standing alone.
+        got = tensorplay.addmv(self._device(seed[:4]),
+                               self._device(np.zeros((4, 0), np.float32)),
+                               self._device(np.zeros(0, np.float32))
+                               ).cpu().numpy()
+        np.testing.assert_allclose(got.astype(np.float64), seed[:4],
+                                   rtol=0, atol=1e-6,
+                                   err_msg="reduction over no entries")
+
+        half_mat, half_vec = np.asarray(mat, np.float16), np.asarray(vec, np.float16)
+        half_seed = np.asarray(seed, np.float16)
+        got = tensorplay.addmv(self._device(half_seed), self._device(half_mat),
+                               self._device(half_vec)).cpu().numpy()
+        np.testing.assert_allclose(
+            got.astype(np.float32).astype(np.float64),
+            half_seed.astype(np.float32) + np.matmul(
+                half_mat.astype(np.float32), half_vec.astype(np.float32)),
+            rtol=6e-3, atol=6e-3, err_msg="half seeded reduction")
+
+    def test_an_indeterminate_addend_does_not_cross_a_zero_weight(self):
+        rng = np.random.default_rng(39)
+        mat = (rng.standard_normal((5, 4)) * 0.5).astype(np.float32)
+        vec = (rng.standard_normal((4)) * 0.5).astype(np.float32)
+        poisoned = (rng.standard_normal((5)) * 0.5).astype(np.float32)
+        poisoned[2] = np.nan
+        got = tensorplay.addmv(self._device(poisoned), self._device(mat),
+                               self._device(vec), beta=0.0).cpu().numpy()
+        np.testing.assert_allclose(
+            got.astype(np.float64),
+            np.matmul(mat.astype(np.float64), vec.astype(np.float64)),
+            rtol=1e-4, atol=1e-4,
+            err_msg="a weightless addend still carried across")
+
+    def test_the_in_place_seed_keeps_its_own_rows(self):
+        rng = np.random.default_rng(40)
+        mat = (rng.standard_normal((7, 5)) * 0.5).astype(np.float32)
+        vec = (rng.standard_normal((5)) * 0.5).astype(np.float32)
+        seed = (rng.standard_normal((7)) * 0.5).astype(np.float32)
+        held = self._device(seed)
+        held.addmv_(self._device(mat), self._device(vec), beta=2.0, alpha=1.5)
+        self.assertTrue(held.device.is_vulkan())
+        np.testing.assert_allclose(
+            held.cpu().numpy().astype(np.float64),
+            2.0 * seed.astype(np.float64) + 1.5 * np.matmul(
+                mat.astype(np.float64), vec.astype(np.float64)),
+            rtol=1e-4, atol=1e-4, err_msg="in place seeded reduction")
+
+    def test_operands_that_do_not_line_up_are_answered_off_it(self):
+        f32 = np.float32
+        with self.assertRaisesRegex(RuntimeError, "expected two vectors"):
+            tensorplay.dot(self._device(np.zeros((2, 3), f32)),
+                           self._device(np.zeros(3, f32)))
+        with self.assertRaisesRegex(RuntimeError, "entries"):
+            tensorplay.dot(self._device(np.zeros(3, f32)),
+                           self._device(np.zeros(4, f32)))
+        with self.assertRaisesRegex(RuntimeError, "same element type"):
+            tensorplay.dot(self._device(np.zeros(3, f32)),
+                           self._device(np.zeros(3, np.float16)))
+        with self.assertRaisesRegex(RuntimeError, "expected two vectors"):
+            tensorplay.outer(self._device(np.zeros((3, 1), f32)),
+                             self._device(np.zeros(3, f32)))
+        with self.assertRaisesRegex(RuntimeError, "same element type"):
+            tensorplay.outer(self._device(np.zeros(3, f32)),
+                             self._device(np.zeros(4, np.int32)))
+        with self.assertRaisesRegex(RuntimeError, "last axis"):
+            tensorplay.inner(self._device(np.zeros((3, 4), f32)),
+                             self._device(np.zeros((3, 5), f32)))
+        with self.assertRaisesRegex(RuntimeError, "two axes"):
+            tensorplay.addmv(self._device(np.zeros(3, f32)),
+                             self._device(np.zeros((3, 3, 1), f32)),
+                             self._device(np.zeros(3, f32)))
+        with self.assertRaisesRegex(RuntimeError, "one axis"):
+            tensorplay.addmv(self._device(np.zeros(3, f32)),
+                             self._device(np.zeros((3, 3), f32)),
+                             self._device(np.zeros((3, 1), f32)))
+        with self.assertRaisesRegex(RuntimeError, "vector or a number"):
+            tensorplay.addmv(self._device(np.zeros((3, 1), f32)),
+                             self._device(np.zeros((3, 3), f32)),
+                             self._device(np.zeros(3, f32)))
+        with self.assertRaisesRegex(RuntimeError, "cannot reach"):
+            tensorplay.addmv(self._device(np.zeros(2, f32)),
+                             self._device(np.zeros((3, 3), f32)),
+                             self._device(np.zeros(3, f32)))
+        with self.assertRaisesRegex(RuntimeError, "reduction axis"):
+            tensorplay.addmv(self._device(np.zeros(3, f32)),
+                             self._device(np.zeros((3, 4), f32)),
+                             self._device(np.zeros(3, f32)))
+        with self.assertRaisesRegex(RuntimeError, "same element type"):
+            tensorplay.addmv(self._device(np.zeros(3, f32)),
+                             self._device(np.zeros((3, 4), f32)),
+                             self._device(np.zeros(4, np.float16)))
+        with self.assertRaisesRegex(RuntimeError, "Float32 and Float16"):
+            tensorplay.addmv(self._device(np.zeros(3, np.int32)),
+                             self._device(np.zeros((3, 4), np.int32)),
+                             self._device(np.zeros(4, np.int32)))
+
+
 if __name__ == "__main__":
     unittest.main()
