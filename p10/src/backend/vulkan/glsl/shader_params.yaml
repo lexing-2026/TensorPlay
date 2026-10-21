@@ -1106,18 +1106,6 @@ searchsorted_int:
   parameter_names_with_default_values: {}
   shader_variants:
   - NAME: searchsorted_int
-masked_fill:
-  parameter_names_with_default_values:
-    VALUE_FROM_TENSOR: false
-  shader_variants:
-  - NAME: masked_fill_scalar
-    VALUE_FROM_TENSOR: false
-  - NAME: masked_fill_tensor
-    VALUE_FROM_TENSOR: true
-masked_fill_buffer:
-  parameter_names_with_default_values: {}
-  shader_variants:
-  - NAME: masked_fill_buffer
 glu:
   parameter_names_with_default_values: {}
   generate_variant_forall:
