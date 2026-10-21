@@ -9256,6 +9256,144 @@ class TestVulkanCountingCat(unittest.TestCase):
                 ).to("vulkan")], 0)
 
 
+class TestVulkanHalfTexelFormat(unittest.TestCase):
+    """A half payload lives in texels of eight bytes, so every walk that writes
+    its planes has to name that width.  These are the joins, reorders, picks and
+    row reads a decode loop runs on a narrow table."""
+
+    @staticmethod
+    def _grid(shape, dtype=np.float16, modulus=13, scale=1):
+        steps = int(np.prod(shape))
+        values = ((np.arange(steps) % modulus) - modulus // 2) * scale
+        return values.astype(dtype).reshape(shape)
+
+    @staticmethod
+    def _device(values):
+        return tensorplay.from_numpy(np.asarray(values)).to("vulkan")
+
+    def _same(self, got, model, label):
+        """Both sides read as the bits they store, so a texel written in the
+        wrong width cannot hide behind an approximate comparison."""
+        model = np.asarray(model)
+        self.assertEqual(got.dtype, tensorplay.from_numpy(model).dtype, label)
+        self.assertEqual(tuple(got.shape), tuple(model.shape), label)
+        np.testing.assert_array_equal(
+            np.asarray(got.cpu()).view(np.uint16),
+            model.view(np.uint16), err_msg=label)
+
+    def test_a_narrow_join_lands_in_texels_of_its_own_width(self):
+        plane = self._grid((4, 6))
+        other = self._grid((2, 6), modulus=11)
+        short = self._grid((4, 3), modulus=7)
+        self._same(
+            tensorplay.cat([self._device(plane), self._device(other)], 0),
+            np.concatenate([plane, other], axis=0), "half cat of rows")
+        self._same(
+            tensorplay.cat([self._device(plane), self._device(short)], 1),
+            np.concatenate([plane, short], axis=1), "half cat of columns")
+        stack = self._grid((2, 3, 4))
+        for axis in range(3):
+            grown = list(stack.shape)
+            grown[axis] += 1
+            second = self._grid(tuple(grown), modulus=9)
+            self._same(
+                tensorplay.cat([self._device(stack), self._device(second)],
+                               axis),
+                np.concatenate([stack, second], axis=axis),
+                f"half rank-3 cat along axis {axis}")
+
+    def test_a_narrow_reorder_and_pick_read_their_own_width(self):
+        model = self._grid((4, 6))
+        device = self._device(model)
+        self._same(tensorplay.permute(device, (1, 0)), model.T, "half permute")
+        self._same(device.select(0, 1), model[1], "half pick of a row")
+        self._same(device.select(1, 4), model[:, 4], "half pick of a column")
+        self._same(device[1:4:2], model[1:4:2], "half strided slice")
+        self._same(device[:, 0:6:2], model[:, 0:6:2], "half column slice")
+        for row, want in zip(tensorplay.unbind(device, 0), model):
+            self._same(row, want, "half row off the unbind walk")
+        cube = self._grid((2, 3, 4))
+        self._same(
+            tensorplay.permute(self._device(cube), (2, 0, 1)),
+            np.transpose(cube, (2, 0, 1)), "half rank-3 permute")
+
+    def test_a_narrow_row_read_follows_the_codes(self):
+        table = self._grid((9, 5))
+        codes = np.array([4, 0, 8, 1], dtype=np.int64)
+        device = self._device(table)
+        self._same(
+            tensorplay.index_select(device, 0, self._device(codes)),
+            table[codes], "half row lookup")
+        self._same(
+            tensorplay.index_select(device, 1, self._device(codes[:2])),
+            table[:, codes[:2]], "half column lookup")
+        picked = np.tile((np.arange(9) % 5)[:, None], (1, 2))
+        self._same(
+            tensorplay.gather(device, 1, self._device(picked)),
+            np.take_along_axis(table, picked, 1), "half gather")
+        self._same(
+            tensorplay.embedding(device, self._device(codes)),
+            table[codes], "half embedding")
+        replacement = self._grid((2, 5), modulus=5)
+        written = table.copy()
+        written[:2] = replacement
+        self._same(
+            tensorplay.index_copy(
+                device, 0, self._device(np.array([0, 1], np.int64)),
+                self._device(replacement)),
+            written, "half row overwrite")
+
+    def test_a_narrow_choice_keeps_both_planes_aligned(self):
+        plane = self._grid((4, 6))
+        second = self._grid((4, 6), modulus=11)
+        condition = np.array([[1, 0, 1, 1, 0, 0]] * 4, np.bool_)
+        self._same(
+            tensorplay.where(self._device(condition), self._device(plane),
+                             self._device(second)),
+            np.where(condition, plane, second), "half choice")
+
+    def test_a_narrow_payload_past_the_image_limit_is_still_picked(self):
+        tall = self._grid((20000, 4))
+        device = self._device(tall)
+        self._same(device.select(0, 12345), tall[12345],
+                   "half pick out of a long line")
+        self._same(device[100:20000:500], tall[100:20000:500],
+                   "half slice of a long line")
+
+    def test_the_walks_other_widths_use_are_undisturbed(self):
+        for dtype in (np.float32, np.int32):
+            plane = self._grid((4, 6), dtype)
+            device = self._device(plane)
+            label = np.dtype(dtype).name
+            np.testing.assert_array_equal(
+                np.asarray(
+                    tensorplay.cat([device, device], 1).cpu()),
+                np.concatenate([plane, plane], axis=1), err_msg=label)
+            np.testing.assert_array_equal(
+                np.asarray(tensorplay.permute(device, (1, 0)).cpu()), plane.T,
+                err_msg=label)
+            np.testing.assert_array_equal(
+                np.asarray(device.select(0, 2).cpu()), plane[2], err_msg=label)
+            np.testing.assert_array_equal(
+                np.asarray(device[1:4:2].cpu()), plane[1:4:2], err_msg=label)
+            np.testing.assert_array_equal(
+                np.asarray(device.select(0, 1).cpu()), plane[1],
+                err_msg=f"{label} row off the unbind walk")
+            np.testing.assert_array_equal(
+                np.asarray(tensorplay.index_select(
+                    device, 0, self._device(np.array([3, 0], np.int64))).cpu()),
+                plane[[3, 0]], err_msg=label)
+            np.testing.assert_array_equal(
+                np.asarray(tensorplay.where(
+                    self._device(np.zeros((4, 6), np.bool_)), device,
+                    device).cpu()), plane, err_msg=label)
+        # A code wider than a word has no image form, so its pick stays a
+        # strided line of pairs.
+        wide = (np.arange(24, dtype=np.int64) * 10 ** 12).reshape((4, 6))
+        np.testing.assert_array_equal(
+            np.asarray(self._device(wide).select(1, 3).cpu()), wide[:, 3])
+
+
 class TestVulkanBernoulliOutOfPlace(unittest.TestCase):
     """A draw that leaves the probability payload alone: the answer is a fresh
     tensor of the same shape and element type, not a refill of the source."""
