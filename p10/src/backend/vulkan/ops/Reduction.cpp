@@ -362,9 +362,10 @@ const char* extremum_shader_name(ExtremumKind kind) {
   return "reduce_max";
 }
 
-// One extremum pass over a linear payload: `rows` sort rows of `tile`
-// elements each, where consecutive elements of a row stride by `inner`.
-void extremum_buffer_pass(
+// One pass over a linear payload: `rows` sort rows of `tile` elements each,
+// where consecutive elements of a row stride by `inner`.  Extrema and the
+// wide totals share the walk and so the metadata block.
+void linear_reduce_pass(
     api::Context* const context,
     api::vTensor& output,
     api::vTensor& input,
@@ -474,14 +475,14 @@ Tensor extremum_one_axis(
           input.dtype(),
           api::StorageType::BUFFER,
           api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
-      extremum_buffer_pass(
+      linear_reduce_pass(
           context, v_tiles, v_input, kTileElements, 1, tiles, buffer_shader);
-      extremum_buffer_pass(
+      linear_reduce_pass(
           context, v_output, v_tiles, tiles, 1, 1, buffer_shader);
       return release_reduced_output(context, v_output);
     }
 
-    extremum_buffer_pass(
+    linear_reduce_pass(
         context, v_output, v_input, axis_size, inner, rows, buffer_shader);
     return release_reduced_output(context, v_output);
   }
@@ -654,6 +655,108 @@ Tensor integer_prod_impl(
   Tensor current = self;
   for (const int64_t axis : dims) {
     current = integer_prod_one_axis(current, axis);
+  }
+  if (keepdim) {
+    return current;
+  }
+
+  std::vector<int64_t> final_sizes;
+  final_sizes.reserve(static_cast<size_t>(self.dim()));
+  for (int64_t axis = 0; axis < self.dim(); ++axis) {
+    if (std::find(dims.begin(), dims.end(), axis) == dims.end()) {
+      final_sizes.push_back(current.size(axis));
+    }
+  }
+  return repack_with_sizes(current, std::move(final_sizes));
+}
+
+enum class TotalKind { kSum, kProd };
+
+//
+// A payload whose elements are wider than a word has no texel to read and no
+// single-precision register to fold into, so its total walks the pairs of words
+// it is carried in.  One row per invocation, the same stride along the axis and
+// the same tile split an extremum of such a payload uses; the fold starts at the
+// identity it names, so a short tile contributes fewer terms and an empty fold
+// answers with that identity.  Wrapping happens at the width of the pair, which
+// is where a count wrapped at its own width lands.
+//
+Tensor wide_total_one_axis(
+    const Tensor& input,
+    int64_t axis_from_left,
+    TotalKind kind) {
+  api::Context* const context = api::context();
+  api::vTensor v_input = convert(input);
+
+  std::vector<int64_t> out_sizes = shape_vector(input);
+  out_sizes[static_cast<size_t>(axis_from_left)] = 1;
+  api::vTensor v_output{
+      context,
+      out_sizes,
+      input.dtype(),
+      api::StorageType::BUFFER,
+      api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+
+  const int64_t axis_size = input.size(axis_from_left);
+  int64_t inner = 1;
+  for (int64_t d = axis_from_left + 1; d < input.dim(); ++d) {
+    inner *= input.size(d);
+  }
+  const int64_t rows = input.numel() / axis_size;
+  const char* shader =
+      kind == TotalKind::kSum ? "reduce_sum_buffer_i64"
+                              : "reduce_prod_buffer_i64";
+
+  // A row per invocation is already parallel while many rows are left behind.
+  // One that folds the whole payload into a single row would hand every
+  // element to one thread, so split the axis into fixed tiles, fold each tile,
+  // and fold the tile results afterwards.
+  constexpr int64_t kTileElements = 256;
+  if (rows == 1 && axis_size > kTileElements) {
+    const int64_t tiles = (axis_size + kTileElements - 1) / kTileElements;
+    api::vTensor v_tiles{
+        context,
+        std::vector<int64_t>{tiles},
+        input.dtype(),
+        api::StorageType::BUFFER,
+        api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+    linear_reduce_pass(
+        context, v_tiles, v_input, kTileElements, 1, tiles, shader);
+    linear_reduce_pass(context, v_output, v_tiles, tiles, 1, 1, shader);
+    return release_reduced_output(context, v_output);
+  }
+
+  linear_reduce_pass(
+      context, v_output, v_input, axis_size, inner, rows, shader);
+  return release_reduced_output(context, v_output);
+}
+
+Tensor wide_total_impl(
+    const Tensor& self,
+    const std::vector<int64_t>& dims_in,
+    bool keepdim,
+    TotalKind kind) {
+  TP_CHECK(
+      self.dtype() == DType::Int64,
+      "Vulkan wide totals fold a payload of counts only");
+  TP_CHECK(
+      self.dim() >= 1 && self.dim() <= 4,
+      "Vulkan reductions support 1d to 4d tensors");
+  TP_CHECK(self.numel() > 0, "Vulkan reductions do not support empty tensors");
+
+  std::vector<int64_t> dims = dims_in;
+  if (dims.empty()) {
+    dims.reserve(static_cast<size_t>(self.dim()));
+    for (int64_t d = 0; d < self.dim(); ++d) {
+      dims.push_back(d);
+    }
+  }
+  dims = normalized_dims(self, dims);
+  TP_CHECK(!dims.empty(), "Vulkan reductions require at least one dim");
+
+  Tensor current = self;
+  for (const int64_t axis : dims) {
+    current = wide_total_one_axis(current, axis, kind);
   }
   if (keepdim) {
     return current;
@@ -963,6 +1066,13 @@ bool totals_in_singles(DType dtype) {
       dtype == DType::UInt8 || dtype == DType::Int32;
 }
 
+// The codes a total folds in its own width: the narrow ones reach that width
+// through single precision or a signed word, and a count wider than a word
+// folds in the pairs it is carried in.
+bool totals_as_a_count(DType dtype) {
+  return totals_in_singles(dtype) || dtype == DType::Int64;
+}
+
 //
 // The walk that adds lanes into a wide word reads a texture, so a plane whose
 // shape has one is reduced in a single pass.  A signed word is read as itself,
@@ -996,6 +1106,15 @@ Tensor integral_total(
           wanted == DType::Int32,
       "Vulkan sums of a counted payload answer in Int64, Float32, Float16 "
       "or Int32");
+
+  // A payload with no texel to read and no single-precision reach folds in the
+  // pairs it is carried in, and the answer then moves to the width asked for.
+  if (self.dtype() == DType::Int64) {
+    Tensor total = wide_total_impl(self, dims, keepdim, TotalKind::kSum);
+    return wanted == DType::Undefined || wanted == DType::Int64
+        ? total
+        : total.to(wanted);
+  }
 
   const Tensor singles = self.to(DType::Float32);
 
@@ -1043,7 +1162,7 @@ Tensor sum_dim_kernel(
     const std::vector<int64_t>& dims,
     bool keepdim,
     DType dtype) {
-  if (totals_in_singles(self.dtype())) {
+  if (totals_as_a_count(self.dtype())) {
     return integral_total(self, dims, keepdim, dtype);
   }
   return reduce_impl(self, dims, keepdim, false, false, 0);
@@ -1063,7 +1182,7 @@ Tensor mean_dim_kernel(
 // axis in one call, exactly like the dim-listed entry points do.
 //
 Tensor sum_kernel(const Tensor& self, DType dtype) {
-  if (totals_in_singles(self.dtype())) {
+  if (totals_as_a_count(self.dtype())) {
     if (self.numel() == 0) {
       // Nothing adds to nothing: the width the total was asked to carry still
       // names the answer.
@@ -1140,6 +1259,20 @@ Tensor amin_kernel(
 }
 
 Tensor prod_kernel(const Tensor& self, DType dtype) {
+  if (self.dtype() == DType::Int64) {
+    // A count wider than a word multiplies in the pairs it is carried in; the
+    // answer then moves to the width the caller asked the product to carry.
+    if (dtype == DType::Undefined || dtype == DType::Int64) {
+      return wide_total_impl(self, {}, false, TotalKind::kProd);
+    }
+    if (dtype == DType::Int32) {
+      return wide_total_impl(self, {}, false, TotalKind::kProd).to(
+          DType::Int32);
+    }
+    TP_CHECK(dtype == DType::Float32, "Unsupported Vulkan product dtype");
+    return extremum_impl(
+        self.to(DType::Float32), {}, false, ExtremumKind::kProd);
+  }
   if (self.dtype() == DType::Int32) {
     if (dtype == DType::Undefined || dtype == DType::Int64) {
       return reduce_int64(self, {}, false, "prod_int64");
@@ -1158,6 +1291,18 @@ Tensor prod_dim_kernel(
     const std::vector<int64_t>& dims,
     bool keepdim,
     DType dtype) {
+  if (self.dtype() == DType::Int64) {
+    if (dtype == DType::Undefined || dtype == DType::Int64) {
+      return wide_total_impl(self, dims, keepdim, TotalKind::kProd);
+    }
+    if (dtype == DType::Int32) {
+      return wide_total_impl(self, dims, keepdim, TotalKind::kProd).to(
+          DType::Int32);
+    }
+    TP_CHECK(dtype == DType::Float32, "Unsupported Vulkan product dtype");
+    return extremum_impl(
+        self.to(DType::Float32), dims, keepdim, ExtremumKind::kProd);
+  }
   if (self.dtype() == DType::Int32) {
     if (dtype == DType::Undefined || dtype == DType::Int64) {
       return reduce_int64(self, dims, keepdim, "prod_int64");

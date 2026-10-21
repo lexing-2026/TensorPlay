@@ -1930,6 +1930,18 @@ reduce_extremum_i64_buffer:
     GREATER: 1
   - NAME: reduce_min_buffer_i64
     GREATER: 0
+# The same row walk folded into a total instead of an extremum: the fold starts
+# at the identity it names and carries a pair of words, so a count wrapped at
+# its own width lands where the counts it added would land.
+reduce_total_i64_buffer:
+  parameter_names_with_default_values:
+    OPERATOR: wide_add
+    IDENTITY: uvec2(0u, 0u)
+  shader_variants:
+  - NAME: reduce_sum_buffer_i64
+  - NAME: reduce_prod_buffer_i64
+    OPERATOR: wide_mul
+    IDENTITY: uvec2(1u, 0u)
 reduce_argextremum:
   parameter_names_with_default_values:
     GREATER: 1
