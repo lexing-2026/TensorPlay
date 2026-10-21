@@ -623,16 +623,22 @@ class TestVulkanScaledDotProductAttention(unittest.TestCase):
             rows=(4096, 4100), causal=True, gqa=True)
 
 
-def _sdpa_backward_reference(q, k, v, go, mask=None, causal=False, scale=None):
+def _sdpa_backward_reference(
+    q, k, v, go, mask=None, causal=False, scale=None, group=1):
     """The gradient of the attention that `_sdpa_reference` spells out.
 
     The scores are taken again, so a fully masked query row is a row of zeros;
     the probabilities then split the incoming gradient over the keys a row read.
+    A group above one hands each key and value to the query heads it serves, so
+    the gradients of those heads are added back onto the one key head they share.
     """
     q = q.astype(np.float64)
     k = k.astype(np.float64)
     v = v.astype(np.float64)
     go = go.astype(np.float64)
+    kv_heads = k.shape[1]
+    k = np.repeat(k, group, axis=1)
+    v = np.repeat(v, group, axis=1)
     s = 1.0 / np.sqrt(q.shape[-1]) if scale is None else scale
     scores = (q * s) @ k.transpose(0, 1, 3, 2)
     if causal:
@@ -656,6 +662,13 @@ def _sdpa_backward_reference(q, k, v, go, mask=None, causal=False, scale=None):
         d_probs - (d_probs * probs).sum(-1, keepdims=True))
     d_query = (d_scores @ k) * s
     d_key = d_scores.transpose(0, 1, 3, 2) @ (q * s)
+    if group > 1:
+        d_key = d_key.reshape(
+            d_key.shape[0], kv_heads, group, d_key.shape[-2],
+            d_key.shape[-1]).sum(2)
+        d_value = d_value.reshape(
+            d_value.shape[0], kv_heads, group, d_value.shape[-2],
+            d_value.shape[-1]).sum(2)
     return d_query, d_key, d_value
 
 
@@ -671,6 +684,7 @@ def _sdpa_backward_check(
     causal=False,
     mask=None,
     scale=None,
+    gqa=False,
 ):
     """Every gradient of one attention call, against the same arithmetic.
 
@@ -684,9 +698,11 @@ def _sdpa_backward_check(
     v_np = (rng.standard_normal((B, Hkv, Skv, D)) * 1.5).astype(np_dtype)
     go_np = (rng.standard_normal((B, Hq, Sq, D)) * 1.5).astype(np_dtype)
     mask_np = None if mask is None else mask.numpy()
+    group = Hq // Hkv if (gqa or Hkv == 1) else 1
 
     want = _sdpa_backward_reference(
-        q_np, k_np, v_np, go_np, mask=mask_np, causal=causal, scale=scale)
+        q_np, k_np, v_np, go_np,
+        mask=mask_np, causal=causal, scale=scale, group=group)
 
     q = tensorplay.tensor(q_np, dtype=dtype).to("vulkan")
     k = tensorplay.tensor(k_np, dtype=dtype).to("vulkan")
@@ -701,7 +717,8 @@ def _sdpa_backward_check(
         v,
         attn_mask=(mask.to("vulkan") if mask is not None else None),
         is_causal=causal,
-        scale=scale)
+        scale=scale,
+        enable_gqa=gqa)
     out.backward(go)
     got = [q.grad, k.grad, v.grad]
     atol = 2.0e-2 if dtype == tensorplay.float16 else 4.0e-3
@@ -778,6 +795,41 @@ class TestVulkanSdpaBackward(unittest.TestCase):
         _sdpa_backward_check(self, B=2, Hq=2, Hkv=2, Sq=6, Skv=6, D=16,
                              dtype=tensorplay.float16, causal=True)
 
+    def test_grouped_query_heads(self):
+        # Every key and value is read by a whole block of query heads, so its
+        # gradient is the sum of theirs -- the same mapping the forward takes.
+        _sdpa_backward_check(self, B=1, Hq=8, Hkv=2, Sq=6, Skv=6, D=16,
+                             gqa=True)
+        _sdpa_backward_check(self, B=2, Hq=8, Hkv=4, Sq=7, Skv=7, D=32,
+                             gqa=True, causal=True)
+        _sdpa_backward_check(self, B=1, Hq=4, Hkv=4, Sq=5, Skv=5, D=8,
+                             gqa=True)
+
+    def test_a_grouped_context_longer_than_the_queries(self):
+        Sq, Skv = 5, 9
+        rng = np.random.default_rng(23)
+        _sdpa_backward_check(
+            self, B=1, Hq=6, Hkv=3, Sq=Sq, Skv=Skv, D=8, gqa=True,
+            mask=tensorplay.tensor(rng.random((Sq, Skv)) > 0.3))
+        _sdpa_backward_check(
+            self, B=1, Hq=4, Hkv=2, Sq=4, Skv=4, D=8, gqa=True, scale=0.25)
+        _sdpa_backward_check(
+            self, B=1, Hq=8, Hkv=2, Sq=6, Skv=6, D=32,
+            dtype=tensorplay.float16, gqa=True)
+
+    def test_one_key_head_serving_every_query_head(self):
+        # A single key and value broadcasts across the query heads whether or
+        # not the flag was raised, and its gradient gathers all of them back.
+        _sdpa_backward_check(self, B=1, Hq=4, Hkv=1, Sq=5, Skv=5, D=8)
+        _sdpa_backward_check(self, B=2, Hq=8, Hkv=1, Sq=4, Skv=11, D=16,
+                             causal=True, gqa=True)
+
+    def test_a_decode_row_grads_a_grouped_context(self):
+        # The shape a generated token arrives in, read through the group: the
+        # causal alignment keeps the newest key the only one the row can see.
+        _sdpa_backward_check(self, B=1, Hq=8, Hkv=2, Sq=1, Skv=32, D=32,
+                             causal=True, gqa=True)
+
     def test_a_request_the_device_cannot_answer_refuses(self):
         import tensorplay.nn.functional as Fn
         rng = np.random.default_rng(17)
@@ -793,11 +845,26 @@ class TestVulkanSdpaBackward(unittest.TestCase):
         q.requires_grad_(True)
         k.requires_grad_(True)
         v.requires_grad_(True)
-        # Grouped heads would be expanded through an axis no image can carry.
-        out = Fn.scaled_dot_product_attention(q, k, v, enable_gqa=True)
-        with self.assertRaisesRegex(
-                RuntimeError, "no fifth axis"):
+        # A count that does not divide leaves no whole group to broadcast to.
+        qn = tensorplay.tensor(
+            (rng.standard_normal((1, 6, 4, 8))).astype(np.float32),
+            ).to("vulkan")
+        kn = tensorplay.tensor(
+            (rng.standard_normal((1, 4, 4, 8))).astype(np.float32),
+            ).to("vulkan")
+        vn = tensorplay.tensor(
+            (rng.standard_normal((1, 4, 4, 8))).astype(np.float32),
+            ).to("vulkan")
+        qn.requires_grad_(True)
+        kn.requires_grad_(True)
+        vn.requires_grad_(True)
+        with self.assertRaisesRegex(RuntimeError, "multiple of"):
+            out = Fn.scaled_dot_product_attention(
+                qn, kn, vn, enable_gqa=True)
             out.backward(tensorplay.ones_like(out))
+        # Above one key head the flag is the only route that groups.
+        with self.assertRaisesRegex(RuntimeError, "broadcastable through"):
+            Fn.scaled_dot_product_attention(q, k, v)
         # A proportion to drop needs the mask the drop was decided by.
         qs = q.detach().requires_grad_(True)
         ks = k.detach().requires_grad_(True)
