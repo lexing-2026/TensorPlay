@@ -910,40 +910,110 @@ Tensor embedding_dense_backward_cpu(const Tensor& grad_output, const Tensor& ind
                     TP_THROW(IndexError, "embedding_dense_backward: index out of range");
                 }
 
-                std::sort(sorted.begin(), sorted.end(),
-                          [](const std::pair<int64_t, int64_t>& a,
-                             const std::pair<int64_t, int64_t>& b) {
-                              return a.first < b.first;
-                          });
-
-                // Record the [begin, end) span of every run of equal indices.
+                // Group the lookups by weight.  A count of the weights gives
+                // the place every group starts, and the lookups are placed in
+                // their group in the order they came, so a group holds its
+                // lookups in ascending order and the accumulation adds them
+                // in that order.  A weight range too wide for the counts
+                // keeps the comparison sort.
+                const int threads = get_num_threads();
                 std::vector<int64_t> seg_row, seg_begin, seg_end;
-                for (int64_t i = 0; i < num_indices;) {
-                    if (sorted[i].first < 0) { ++i; continue; }
-                    const int64_t w = sorted[i].first;
-                    int64_t j = i + 1;
-                    while (j < num_indices && sorted[j].first == w) ++j;
-                    seg_row.push_back(w);
-                    seg_begin.push_back(i);
-                    seg_end.push_back(j);
-                    i = j;
+                std::vector<int64_t> positions;
+                if (num_weights <= (1 << 20)) {
+                    std::vector<int32_t> tally(
+                        static_cast<size_t>(threads) *
+                        static_cast<size_t>(num_weights), 0);
+                    parallel_for(0, num_indices, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                        int32_t* t = tally.data() +
+                                    static_cast<size_t>(get_thread_num()) *
+                                    static_cast<size_t>(num_weights);
+                        for (int64_t i = begin; i < end; ++i) {
+                            const int64_t w = sorted[i].first;
+                            if (w >= 0) t[w] += 1;
+                        }
+                    });
+                    std::vector<int64_t> start(
+                        static_cast<size_t>(num_weights) + 1, 0);
+                    int64_t running = 0;
+                    for (int64_t w = 0; w < num_weights; ++w) {
+                        int64_t total = 0;
+                        for (int t = 0; t < threads; ++t) {
+                            total += tally[static_cast<size_t>(t) *
+                                              static_cast<size_t>(num_weights) +
+                                          static_cast<size_t>(w)];
+                        }
+                        start[static_cast<size_t>(w)] = running;
+                        running += total;
+                    }
+                    start[static_cast<size_t>(num_weights)] = running;
+                    positions.assign(static_cast<size_t>(num_indices), 0);
+                    std::vector<int64_t> cursor(start.begin(), start.end() - 1);
+                    for (int64_t i = 0; i < num_indices; ++i) {
+                        const int64_t w = sorted[i].first;
+                        if (w < 0) continue;
+                        positions[static_cast<size_t>(
+                            cursor[static_cast<size_t>(w)]++)] = sorted[i].second;
+                    }
+                    for (int64_t w = 0; w < num_weights; ++w) {
+                        const int64_t first = start[static_cast<size_t>(w)];
+                        const int64_t last = start[static_cast<size_t>(w) + 1];
+                        if (last <= first) continue;
+                        seg_row.push_back(w);
+                        seg_begin.push_back(first);
+                        seg_end.push_back(last);
+                    }
+                } else {
+                    std::sort(sorted.begin(), sorted.end(),
+                              [](const std::pair<int64_t, int64_t>& a,
+                                 const std::pair<int64_t, int64_t>& b) {
+                                  return a.first < b.first;
+                              });
+                    // Record the [begin, end) span of every run of equal indices.
+                    for (int64_t i = 0; i < num_indices;) {
+                        if (sorted[i].first < 0) { ++i; continue; }
+                        const int64_t w = sorted[i].first;
+                        int64_t j = i + 1;
+                        while (j < num_indices && sorted[j].first == w) ++j;
+                        seg_row.push_back(w);
+                        seg_begin.push_back(i);
+                        seg_end.push_back(j);
+                        i = j;
+                    }
+                    positions.resize(static_cast<size_t>(num_indices));
+                    for (int64_t i = 0; i < num_indices; ++i)
+                        positions[static_cast<size_t>(i)] = sorted[i].second;
                 }
 
                 if (!seg_row.empty()) {
                     const int64_t n_segments = static_cast<int64_t>(seg_row.size());
-                    const int64_t grain = embedding_grain_indices(row_size);
+                    // The grain counts the segments a chunk covers, so a batch
+                    // with few segments still spreads over the pool.
+                    const int64_t grain = std::min<int64_t>(
+                        embedding_grain_indices(row_size),
+                        std::max<int64_t>(1, n_segments / (get_num_threads() * 4)));
                     parallel_for(0, n_segments, grain, [&](int64_t begin, int64_t end) {
                         for (int64_t k = begin; k < end; ++k) {
                             const int64_t w = seg_row[k];
                             const int64_t first = seg_begin[k];
                             const int64_t last = seg_end[k];
                             T* dst = weight_grad_data + w * row_size;
-                            const T* src = grad_data + sorted[first].second * row_size;
-                            for (int64_t j = 0; j < row_size; ++j) dst[j] = src[j];
-                            for (int64_t p = first + 1; p < last; ++p) {
-                                const T* s = grad_data + sorted[p].second * row_size;
-                                for (int64_t j = 0; j < row_size; ++j) dst[j] += s[j];
+                            // The row is summed in a local buffer: the
+                            // destination is written once instead of once per
+                            // lookup, and the sum keeps the order of the
+                            // lookups.
+                            static thread_local std::vector<T> acc;
+                            if (static_cast<int64_t>(acc.size()) != row_size) {
+                                acc.resize(static_cast<size_t>(row_size));
                             }
+                            const T* src = grad_data +
+                                positions[static_cast<size_t>(first)] * row_size;
+                            for (int64_t j = 0; j < row_size; ++j) acc[j] = src[j];
+                            for (int64_t p = first + 1; p < last; ++p) {
+                                const T* s = grad_data +
+                                    positions[static_cast<size_t>(p)] * row_size;
+                                for (int64_t j = 0; j < row_size; ++j) acc[j] += s[j];
+                            }
+                            for (int64_t j = 0; j < row_size; ++j) dst[j] = acc[j];
                             // The narrow floats hold a float count too, so the
                             // reciprocal is taken in single precision and
                             // rounded once when it reaches the row.
