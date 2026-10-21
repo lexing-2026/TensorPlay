@@ -8057,6 +8057,55 @@ class TestVulkanVectorProducts(unittest.TestCase):
             self.assertEqual(got.shape, ())
             self.assertEqual(float(got), 0.0)
 
+    def test_a_column_and_a_row_of_different_types_answer_one_product(self):
+        # Every entry is one pair of readings, so the operands need no shared
+        # element type: the answer carries the type their product promotes to.
+        rng = np.random.default_rng(36)
+        col = (rng.standard_normal(6) * 0.5).astype(np.float32)
+        row = (rng.standard_normal(5) * 0.5).astype(np.float32)
+        for dtype_a, dtype_b in [
+                (np.float32, np.float16),
+                (np.float16, np.float32),
+                (np.float16, np.float16),
+                (np.float32, np.float32),
+                (np.float32, np.int32),
+                (np.int32, np.float32),
+                (np.int32, np.float16),
+                (np.int32, np.int32),
+                (np.bool_, np.float16),
+                (np.bool_, np.int32)]:
+            a, b = col.astype(dtype_a), row.astype(dtype_b)
+            on_device = (self._device(a), self._device(b))
+            got = tensorplay.outer(*on_device)
+            self.assertEqual(
+                got.dtype, tensorplay.result_type(*on_device),
+                f"rank one typed by {dtype_a.__name__} against "
+                f"{dtype_b.__name__}")
+            want = np.outer(a.astype(np.float64), b.astype(np.float64))
+            rtol, atol = self._tolerance(
+                np.float16 if got.dtype == tensorplay.float16 else np.float32)
+            on_host = tensorplay.outer(
+                tensorplay.from_numpy(a), tensorplay.from_numpy(b))
+            np.testing.assert_allclose(
+                got.cpu().numpy().astype(np.float64), want,
+                rtol=rtol, atol=atol,
+                err_msg=f"rank one {dtype_a.__name__}x{dtype_b.__name__}")
+            self.assertEqual(on_host.dtype, got.dtype)
+            np.testing.assert_allclose(
+                on_host.cpu().numpy().astype(np.float64), want,
+                rtol=rtol, atol=atol, err_msg="the host read a wider type")
+
+        # A gradient of this product is a matrix-vector walk, which reads both
+        # operands as one type, so a mixed pair answers the value alone.
+        for device in ("cpu", "vulkan"):
+            on_device = tensorplay.from_numpy(col).to(device)
+            other = tensorplay.from_numpy(row.astype(np.float16)).to(device)
+            on_device.requires_grad_(True)
+            with self.assertRaisesRegex(
+                    RuntimeError, "dtype",
+                    msg=f"{device} gradient of a mixed rank one"):
+                tensorplay.outer(on_device, other).sum().backward()
+
     def test_a_column_against_a_row_answers_every_pair(self):
         rng = np.random.default_rng(36)
         for m, n in [(5, 7), (1, 4), (4, 1), (3, 13)]:
@@ -8225,9 +8274,11 @@ class TestVulkanVectorProducts(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "expected two vectors"):
             tensorplay.outer(self._device(np.zeros((3, 1), f32)),
                              self._device(np.zeros(3, f32)))
-        with self.assertRaisesRegex(RuntimeError, "same element type"):
-            tensorplay.outer(self._device(np.zeros(3, f32)),
-                             self._device(np.zeros(4, np.int32)))
+        # A pair read as a wider count has no product kernel, so the refusal
+        # comes from the product the rank-one walk is written as.
+        with self.assertRaisesRegex(RuntimeError, "operand widths"):
+            tensorplay.outer(self._device(np.zeros(3, np.int64)),
+                             self._device(np.zeros(3, np.int64)))
         with self.assertRaisesRegex(RuntimeError, "last axis"):
             tensorplay.inner(self._device(np.zeros((3, 4), f32)),
                              self._device(np.zeros((3, 5), f32)))
