@@ -5293,6 +5293,173 @@ class TestVulkanWhereBroadcast(unittest.TestCase):
             F.where(condition, a.to("vulkan"), b)
 
 
+class TestVulkanMaskedFillWidths(unittest.TestCase):
+    # A masked lane takes the fill and every other lane keeps the payload, which
+    # is the same choice a selection makes between two branches.  One walk
+    # answers for both, so the fill covers the widths the selection covers and a
+    # mask narrower than the payload broadcasts inside the kernel instead of
+    # being read as though it already carried the payload's shape.
+
+    LENGTHS = (100000, 100001, 100003)
+
+    @staticmethod
+    def _payload(dtype, shape, seed):
+        rng = np.random.default_rng(seed)
+        if dtype is tensorplay.float32:
+            return (rng.standard_normal(shape) * 8).astype(np.float32)
+        if dtype is tensorplay.float16:
+            return (rng.standard_normal(shape) * 8).astype(np.float16)
+        if dtype is tensorplay.int32:
+            return rng.integers(-1000, 1000, shape).astype(np.int32)
+        return rng.integers(-10**12, 10**12, shape).astype(np.int64)
+
+    def _check(self, host, mask, fill, label):
+        import tensorplay.functional as F
+        want = F.masked_fill(
+            tensorplay.tensor(host), tensorplay.tensor(mask), fill)
+        got = F.masked_fill(
+            tensorplay.tensor(host).to("vulkan"),
+            tensorplay.tensor(mask).to("vulkan"), fill)
+        self.assertEqual(got.dtype, want.dtype, msg=label)
+        np.testing.assert_array_equal(
+            got.cpu().numpy(), want.cpu().numpy(), err_msg=label)
+
+    def test_a_fill_reaches_every_payload_width(self):
+        rng = np.random.default_rng(7)
+        widths = (
+            (tensorplay.float32, -1.75),
+            (tensorplay.float16, -2.5),
+            (tensorplay.int32, -7),
+            # A count past the range of a word still lands where the mask says.
+            (tensorplay.int64, -99999999999),
+        )
+        for i, (dtype, fill) in enumerate(widths):
+            host = self._payload(dtype, (4, 6), 41 + i)
+            mask = rng.random((4, 6)) > 0.45
+            self._check(host, mask, fill, f"{dtype} filled")
+
+    def test_a_narrower_mask_broadcasts_over_the_payload(self):
+        # Each of these once read only as many mask entries as the payload held
+        # lanes of its own texel, filling a few elements and leaving the rest.
+        cases = (
+            ((2, 4), (2, 1)),  # a column decides whole rows
+            ((2, 4), (4,)),  # a row pattern repeats down the rows
+            ((2, 3, 4, 5), (1, 1, 4, 1)),  # a per-position gate across heads
+            ((2, 3, 4, 5), (2, 3, 1, 5)),
+            ((3, 5, 6), (1, 1, 1)),
+        )
+        rng = np.random.default_rng(13)
+        for out, cond in cases:
+            host = (rng.standard_normal(out) * 8).astype(np.float32)
+            mask = rng.random(cond) > 0.4
+            self._check(host, mask, -9.0, f"{out} under a {cond} mask")
+        # A padding mask over a half payload, the shape an attention score
+        # plane arrives in.
+        B, H, Sq, Skv = 2, 4, 5, 9
+        keep = rng.random((B, 1, 1, Skv)) > 0.35
+        scores = (rng.standard_normal((B, H, Sq, Skv)) * 4).astype(np.float16)
+        self._check(scores, keep, np.float16(-1e4), "half padding mask")
+        # The payload may be the plane that has to repeat instead.
+        self._check(
+            (rng.standard_normal((1, 4)) * 8).astype(np.float32),
+            rng.random((3, 4)) > 0.4, -9.0, "a payload that grows to the mask")
+
+    def test_a_replaced_lane_leaks_nothing_of_its_own(self):
+        import tensorplay.functional as F
+        host = np.array([np.inf, 1.0, np.nan, -np.inf, 2.0, 3.0], np.float32)
+        mask = np.array([True, False, True, True, False, True])
+        want = F.masked_fill(
+            tensorplay.tensor(host), tensorplay.tensor(mask), -2.0)
+        got = F.masked_fill(
+            tensorplay.tensor(host).to("vulkan"),
+            tensorplay.tensor(mask).to("vulkan"), -2.0)
+        np.testing.assert_array_equal(
+            got.cpu().numpy(), want.cpu().numpy(), err_msg="lanes replaced")
+        # A lane the mask leaves alone keeps its own infinity.
+        keep = np.array([np.inf, np.nan, 5.0], np.float32)
+        untouched = np.array([False, True, False])
+        self._check(keep, untouched, 0.0, "an untouched infinity")
+
+    def test_a_linear_payload_fills_in_its_own_storage(self):
+        rng = np.random.default_rng(17)
+        widths = (
+            (tensorplay.float32, -1.5),
+            (tensorplay.float16, -2.5),
+            (tensorplay.int32, -7),
+            (tensorplay.int64, -99999999999),
+        )
+        for count in self.LENGTHS:
+            for i, (dtype, fill) in enumerate(widths):
+                host = self._payload(dtype, (count,), 61 + i)
+                mask = rng.random(count) > 0.5
+                self._check(host, mask, fill, f"{dtype} row at {count}")
+                # One condition element decides the whole row.
+                self._check(
+                    host, np.array([True]), fill, f"{dtype} single mask")
+
+    def test_a_tail_that_fills_no_whole_word_still_selects(self):
+        for count in (1, 2, 3, 5, 17, 65, 257):
+            halves = (np.arange(count) % 7).astype(np.float16)
+            mask = np.arange(count) % 3 == 1
+            self._check(halves, mask, np.float16(-3.0), f"half at {count}")
+            counts = (np.arange(count) * 1000000007).astype(np.int64)
+            self._check(counts, mask, -5, f"count at {count}")
+
+    def test_an_in_place_fill_keeps_the_width_it_was_given(self):
+        rng = np.random.default_rng(19)
+        fills = {
+            tensorplay.float32: -2.5,
+            tensorplay.float16: -2.5,
+            tensorplay.int32: -7,
+            tensorplay.int64: -10**11,
+        }
+        for i, dtype in enumerate((
+                tensorplay.float32, tensorplay.float16, tensorplay.int32,
+                tensorplay.int64)):
+            host = self._payload(dtype, (3, 5), 71 + i)
+            mask = rng.random((3, 5)) > 0.4
+            fill = fills[dtype]
+            want = tensorplay.tensor(host.copy())
+            want.masked_fill_(tensorplay.tensor(mask), fill)
+            got = tensorplay.tensor(host.copy()).to("vulkan")
+            got.masked_fill_(tensorplay.tensor(mask).to("vulkan"), fill)
+            self.assertEqual(got.dtype, want.dtype, msg=f"in place {dtype}")
+            np.testing.assert_array_equal(
+                got.cpu().numpy(), want.cpu().numpy(),
+                err_msg=f"in place {dtype}")
+
+    def test_a_value_of_another_width_is_read_into_the_payload(self):
+        import tensorplay.functional as F
+        halves = (np.arange(10) % 5).astype(np.float16)
+        mask = np.arange(10) % 4 == 1
+        value = tensorplay.tensor(np.float32(1.75))
+        want = F.masked_fill(
+            tensorplay.tensor(halves), tensorplay.tensor(mask), value)
+        got = F.masked_fill(
+            tensorplay.tensor(halves).to("vulkan"),
+            tensorplay.tensor(mask).to("vulkan"), value.to("vulkan"))
+        self.assertEqual(got.dtype, tensorplay.float16)
+        np.testing.assert_array_equal(
+            got.cpu().numpy(), want.cpu().numpy(), err_msg="0-dim value")
+
+    def test_a_payload_that_is_only_truth_is_refused(self):
+        import tensorplay.functional as F
+        flags = tensorplay.tensor([True, False, True]).to("vulkan")
+        condition = tensorplay.tensor([True, False, True]).to("vulkan")
+        with self.assertRaisesRegex(
+                RuntimeError,
+                "supports Float32, Float16, Int32 and Int64 tensors only"):
+            F.masked_fill(flags, condition, False)
+        # A payload built straight on the device can outgrow the ranks the walks
+        # cover; the fill names its own refusal rather than filling lanes it
+        # cannot address.
+        deep = tensorplay.tensor(
+            np.zeros((2, 2, 2, 2, 2), np.float32), device="vulkan")
+        with self.assertRaisesRegex(RuntimeError, "supports up to 4d tensors"):
+            F.masked_fill(
+                deep, tensorplay.tensor([True], device="vulkan"), -1.0)
+
+
 class TestVulkanScalarVocabulary(unittest.TestCase):
     # Element-wise arithmetic names the width it computes in after the operands
     # it was given: a count beside a whole number stays a count, a count beside
