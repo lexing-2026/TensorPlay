@@ -1623,13 +1623,12 @@ namespace {
 constexpr int64_t kSearchSortedGrainSize = 200;
 
 // The contiguous hot loop.  `boundaries` must be contiguous with the same
-// dtype as `input`; `sorter` is either undefined or a contiguous permutation
-// with the same shape as `boundaries`.
+// dtype as `input`; `sorter` is a contiguous permutation with the same shape
+// as `boundaries`, and the boundary element access goes through it.
 template <typename input_t, typename output_t>
-void searchsorted_cpu_contiguous(Tensor& result, const Tensor& input,
-                                 const Tensor& boundaries, bool right,
-                                 bool is_1d_boundaries,
-                                 const Tensor& sorter) {
+void searchsorted_cpu_sortered(Tensor& result, const Tensor& input,
+                               const Tensor& boundaries, bool right,
+                               bool is_1d_boundaries, const Tensor& sorter) {
     const int64_t numel_in = input.numel();
     const bool is_scalar_input = input.dim() == 0 && numel_in == 1;
     // Innermost dimension size of the input and of the lookup tables.
@@ -1638,8 +1637,7 @@ void searchsorted_cpu_contiguous(Tensor& result, const Tensor& input,
 
     const input_t* data_in = input.data_ptr<input_t>();
     const input_t* data_bd = boundaries.data_ptr<input_t>();
-    const int64_t* data_sorter =
-        sorter.defined() ? sorter.data_ptr<int64_t>() : nullptr;
+    const int64_t* data_sorter = sorter.data_ptr<int64_t>();
     output_t* data_out = result.data_ptr<output_t>();
 
     parallel_for(0, numel_in, kSearchSortedGrainSize, [&](int64_t b, int64_t e) {
@@ -1655,19 +1653,54 @@ void searchsorted_cpu_contiguous(Tensor& result, const Tensor& input,
                 // lower bound: first position with bd >= val
                 while (start_bd < end_bd) {
                     const int64_t mid = start_bd + ((end_bd - start_bd) >> 1);
-                    const input_t mid_value = data_sorter
-                        ? data_bd[data_sorter[mid] + row_offset]
-                        : data_bd[mid];
+                    const input_t mid_value =
+                        data_bd[data_sorter[mid] + row_offset];
                     if (!(mid_value >= val)) start_bd = mid + 1; else end_bd = mid;
                 }
             } else {
                 // upper bound: first position with bd > val
                 while (start_bd < end_bd) {
                     const int64_t mid = start_bd + ((end_bd - start_bd) >> 1);
-                    const input_t mid_value = data_sorter
-                        ? data_bd[data_sorter[mid] + row_offset]
-                        : data_bd[mid];
+                    const input_t mid_value =
+                        data_bd[data_sorter[mid] + row_offset];
                     if (!(mid_value > val)) start_bd = mid + 1; else end_bd = mid;
+                }
+            }
+            data_out[i] = static_cast<output_t>(start_bd - row_offset);
+        }
+    });
+}
+
+// The same walk without a sorter: the boundary is read directly, so the
+// search does not carry a choice per step.  A sorter is rare, so it keeps
+// its own copy of the walk.
+template <typename input_t, typename output_t>
+void searchsorted_cpu_plain(Tensor& result, const Tensor& input,
+                            const Tensor& boundaries, bool right,
+                            bool is_1d_boundaries) {
+    const int64_t numel_in = input.numel();
+    const bool is_scalar_input = input.dim() == 0 && numel_in == 1;
+    const int64_t idim_in = is_scalar_input ? 1 : input.size(-1);
+    const int64_t idim_bd = boundaries.size(-1);
+    const input_t* data_in = input.data_ptr<input_t>();
+    const input_t* data_bd = boundaries.data_ptr<input_t>();
+    output_t* data_out = result.data_ptr<output_t>();
+    parallel_for(0, numel_in, kSearchSortedGrainSize, [&](int64_t b, int64_t e) {
+        for (int64_t i = b; i < e; ++i) {
+            const int64_t row_offset =
+                is_1d_boundaries ? 0 : i / idim_in * idim_bd;
+            int64_t start_bd = row_offset;
+            int64_t end_bd = start_bd + idim_bd;
+            const input_t val = data_in[i];
+            if (!right) {
+                while (start_bd < end_bd) {
+                    const int64_t mid = start_bd + ((end_bd - start_bd) >> 1);
+                    if (!(data_bd[mid] >= val)) start_bd = mid + 1; else end_bd = mid;
+                }
+            } else {
+                while (start_bd < end_bd) {
+                    const int64_t mid = start_bd + ((end_bd - start_bd) >> 1);
+                    if (!(data_bd[mid] > val)) start_bd = mid + 1; else end_bd = mid;
                 }
             }
             data_out[i] = static_cast<output_t>(start_bd - row_offset);
@@ -1679,8 +1712,16 @@ void searchsorted_dispatch(Tensor& result, const Tensor& input,
                            const Tensor& boundaries, bool right,
                            const Tensor& sorter) {
 #define TP_SS_RUN(input_t, output_t)                                       \
-    searchsorted_cpu_contiguous<input_t, output_t>(                        \
-        result, input, boundaries, right, boundaries.dim() == 1, sorter)
+    do {                                                                   \
+        if (sorter.defined()) {                                            \
+            searchsorted_cpu_sortered<input_t, output_t>(                    \
+                result, input, boundaries, right, boundaries.dim() == 1,    \
+                sorter);                                                   \
+        } else {                                                           \
+            searchsorted_cpu_plain<input_t, output_t>(                        \
+                result, input, boundaries, right, boundaries.dim() == 1);   \
+        }                                                                  \
+    } while (0)
 
     if (result.dtype() == DType::Int64) {
         switch (input.dtype()) {
