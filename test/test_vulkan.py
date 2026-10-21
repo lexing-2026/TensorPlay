@@ -8774,8 +8774,137 @@ class TestVulkanArgsort(unittest.TestCase):
         data = self._device(np.zeros((3, 4), np.float32))
         with self.assertRaises(RuntimeError):
             data.argsort(dim=4)
-        with self.assertRaisesRegex(RuntimeError, "Float32"):
-            self._device(np.zeros((3, 4), np.float16)).argsort(dim=1)
+        with self.assertRaisesRegex(RuntimeError, "Float32 and Float16"):
+            self._device(np.zeros((3, 4), np.int32)).argsort(dim=1)
+
+
+class TestVulkanHalfSelection(unittest.TestCase):
+    # A narrow row of logits sorts on the device too.  The reading of a lane
+    # depends on the form that carries it: a texel a sampler widens on the way
+    # in, or one half of a word.  Past the reading every walk orders those
+    # widenings and keeps its own places, so a value narrows again only where
+    # the answer is written.
+
+    @staticmethod
+    def _uploaded(array):
+        # A payload that arrives from the host keeps the image form.
+        return tensorplay.from_numpy(np.asarray(array, np.float16)).to("vulkan")
+
+    @staticmethod
+    def _built(array):
+        # A payload the device lays out itself keeps its elements in words.
+        return tensorplay.tensor(np.asarray(array, np.float16), device="vulkan")
+
+    @staticmethod
+    def _uses_dense_storage(payload):
+        # Only single precision has both a texture and a linear form of lerp, so
+        # a lerp that reports the missing image marks a payload that keeps its
+        # elements in words.
+        import tensorplay.functional as F
+        try:
+            F.lerp(payload, payload, 0.5)
+            return False
+        except RuntimeError:
+            return True
+
+    @staticmethod
+    def _lanes(rows, cols):
+        # Repeated lanes, so a tie has to be settled by the place it came from.
+        rng = np.random.default_rng(41)
+        return rng.choice(
+            np.arange(-4.0, 4.5, 0.5, dtype=np.float16), (rows, cols))
+
+    def _ordered(self, make, data, axis, descending):
+        payload = make(data)
+        values, indices = tensorplay.sort(payload, dim=axis, descending=descending)
+        want_order = np.argsort(
+            -data.astype(np.float32) if descending else data.astype(np.float32),
+            axis=axis, kind="stable")
+        want_values = np.take_along_axis(data, want_order, axis=axis)
+        self.assertEqual(values.dtype, tensorplay.float16)
+        self.assertEqual(indices.dtype, tensorplay.int32)
+        np.testing.assert_array_equal(
+            values.cpu().numpy(), want_values,
+            err_msg=f"half values axis {axis} descending {descending}")
+        np.testing.assert_array_equal(
+            indices.cpu().numpy(), want_order,
+            err_msg=f"half places axis {axis} descending {descending}")
+
+    def test_a_half_row_orders_its_lanes_both_ways(self):
+        data = self._lanes(5, 9)
+        for make in (self._uploaded, self._built):
+            for axis in (0, 1, -1):
+                for descending in (False, True):
+                    self._ordered(make, data, axis, descending)
+
+    def test_a_half_permutation_agrees_with_the_order(self):
+        data = self._lanes(6, 11)
+        for make in (self._uploaded, self._built):
+            payload = make(data)
+            order = payload.argsort(dim=1, descending=True)
+            _, indices = tensorplay.sort(payload, dim=1, descending=True)
+            np.testing.assert_array_equal(
+                order.cpu().numpy(), indices.cpu().numpy())
+            np.testing.assert_array_equal(
+                tensorplay.gather(payload, 1, order).cpu().numpy(),
+                tensorplay.sort(payload, dim=1, descending=True)[0].cpu().numpy())
+
+    def test_a_half_topk_answers_the_widest_lanes(self):
+        data = self._lanes(4, 13)
+        for make in (self._uploaded, self._built):
+            for largest in (True, False):
+                for k in (1, 3, 13):
+                    values, indices = tensorplay.topk(
+                        make(data), k, dim=-1, largest=largest)
+                    order = np.argsort(
+                        -data.astype(np.float32) if largest
+                        else data.astype(np.float32), axis=-1, kind="stable")
+                    np.testing.assert_array_equal(
+                        values.cpu().numpy(),
+                        np.take_along_axis(data, order, -1)[..., :k],
+                        err_msg=f"half topk {k} largest {largest}")
+                    np.testing.assert_array_equal(
+                        indices.cpu().numpy(), order[..., :k],
+                        err_msg=f"half topk places {k} largest {largest}")
+
+    def test_a_half_row_longer_than_one_tile(self):
+        rng = np.random.default_rng(42)
+        long = (rng.standard_normal((3, 5000)) * 100).astype(np.float16)
+        for make in (self._uploaded, self._built):
+            self._ordered(make, long, 1, False)
+            self._ordered(make, long, 1, True)
+
+    def test_a_half_payload_beyond_an_image_is_ordered_in_words(self):
+        # A plane the device cannot hold as an image is read and written a word
+        # at a time, so both ends of the walk take their narrow variants.  The
+        # texel of either width carries four lanes, so a single-precision twin
+        # of the same shape answers whether this device has room for it.
+        shape = (20000, 8)
+        if not self._uses_dense_storage(
+                tensorplay.from_numpy(np.zeros(shape, np.float32)).to("vulkan")):
+            self.skipTest("this device holds a payload of that shape in an image")
+        data = self._lanes(*shape)
+        payload = self._uploaded(data)
+        values, indices = tensorplay.sort(payload, dim=1)
+        self.assertTrue(self._uses_dense_storage(values))
+        order = np.argsort(data.astype(np.float32), axis=1, kind="stable")
+        np.testing.assert_array_equal(
+            values.cpu().numpy(), np.take_along_axis(data, order, 1))
+        np.testing.assert_array_equal(indices.cpu().numpy(), order)
+
+    def test_a_half_median_is_one_of_its_lanes(self):
+        for size in (7, 8, 5000):
+            data = self._lanes(1, size).reshape(size)
+            for make in (self._uploaded, self._built):
+                got = make(data).median().cpu().numpy()
+                # The middle of an even row is the lower of its two centres.
+                want = np.sort(data.astype(np.float32))[(size - 1) // 2]
+                self.assertEqual(
+                    float(got), float(want), msg=f"half median of {size}")
+
+    def test_a_count_refuses_to_order(self):
+        with self.assertRaisesRegex(RuntimeError, "Float32 and Float16"):
+            tensorplay.from_numpy(np.zeros((3, 4), np.int64)).to("vulkan").sort()
 
 
 class TestVulkanBernoulliOutOfPlace(unittest.TestCase):
