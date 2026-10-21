@@ -25,6 +25,12 @@ Tensor materialize_view(
     const std::vector<int64_t>& out_strides,
     int64_t storage_offset);
 
+// Defined in BinaryOp.cpp; copies a texture payload into a fresh linear one so
+// a kernel that binds every operand as words can read it.
+api::vTensor to_buffer_storage_dispatch(
+    api::Context* context,
+    const api::vTensor& src);
+
 namespace {
 
 // Cache tags distinguishing the packed forms of one operand tensor.  These
@@ -47,6 +53,58 @@ uint32_t batched_tag(uint32_t base, int64_t batches) {
 
 std::vector<int64_t> shape_of(const Tensor& t) {
   return static_cast<std::vector<int64_t>>(t.shape());
+}
+
+/*
+ * A dense payload in whichever of the two storages a kernel needs to read it.
+ * Products meet this whenever an operand was laid out by a route that had no
+ * choice about its form -- a weight whose axes pass the image limit, an
+ * activation the device allocated itself, an addend shaped by the layer it
+ * feeds -- while the kernel that has to consume it streams texels instead.  One
+ * pass of the strided gather carries the operand across, and it is always the
+ * smallest of the three, so the crossing costs far less than the walk it feeds.
+ */
+Tensor image_payload_of(const Tensor& src) {
+  api::vTensor v_src = convert(src);
+  if (v_src.storage_type() == api::StorageType::TEXTURE_3D) {
+    return src;
+  }
+  const std::vector<int64_t> sizes = shape_of(src);
+  TP_CHECK(
+      image_storage_supported(api::context(), sizes),
+      "Vulkan products cannot bring this operand into image storage: its shape "
+      "has no image form");
+  Tensor gathered = materialize_view(
+      src, sizes, SizesAndStrides::compute_contiguous_strides(sizes), 0);
+  api::vTensor v_gathered = convert(gathered);
+  TP_CHECK(
+      v_gathered.storage_type() == api::StorageType::TEXTURE_3D,
+      "Vulkan products cannot bring this operand into image storage");
+  return gathered;
+}
+
+Tensor linear_payload_of(const Tensor& src) {
+  api::vTensor v_src = convert(src);
+  if (v_src.storage_type() == api::StorageType::BUFFER) {
+    return src;
+  }
+  return convert(to_buffer_storage_dispatch(api::context(), v_src));
+}
+
+/*
+ * The addend in the form the epilogue binds it as.  A linear result fetches it
+ * as words of the result's element type, an image result fetches it as a texel
+ * whatever format that texel has; the caller names the one it wrote, and a
+ * mismatched addend crosses rather than ending the product.
+ */
+Tensor addend_for_result(
+    const Tensor& src,
+    api::StorageType result_storage) {
+  if (convert(src).storage_type() == result_storage) {
+    return src;
+  }
+  return result_storage == api::StorageType::BUFFER ? linear_payload_of(src)
+                                                    : image_payload_of(src);
 }
 
 //
@@ -442,12 +500,18 @@ Tensor gemv_decode(
 
   // The addend broadcasts over singleton rows/columns; a bias-free product
   // carries no addend term, expressed here as a zero beta alongside a
-  // stand-in binding the epilogue never fetches.
-  api::vTensor v_bias = bias.has_value() ? convert(*bias) : v_partials;
+  // stand-in binding the epilogue never fetches.  An addend that reached here
+  // in words is laid into a texel first, since this epilogue reads images.
+  std::optional<Tensor> addend;
+  if (bias.has_value()) {
+    addend = addend_for_result(*bias, api::StorageType::TEXTURE_3D);
+  }
+  api::vTensor v_bias =
+      addend.has_value() ? convert(*addend) : v_partials;
   const float alpha_f = alpha.to<float>();
   const float beta_f = bias.has_value() ? beta.to<float>() : 0.0f;
-  const std::vector<int64_t> bias_sizes = bias.has_value()
-      ? shape_of(*bias)
+  const std::vector<int64_t> bias_sizes = addend.has_value()
+      ? shape_of(*addend)
       : std::vector<int64_t>({1, 1});
 
   const struct GemvCombineBlock final {
@@ -665,14 +729,14 @@ Tensor gemv_decode_linear(
   const float beta_f = bias.has_value() ? beta.to<float>() : 0.0f;
 
   std::optional<api::vTensor> v_bias;
+  std::optional<Tensor> addend;
   if (bias.has_value()) {
-    v_bias = convert(*bias);
     // The addend binding follows the result's storage, because a linear output
-    // reads it as a flat array while an image output fetches it as a texel.
-    TP_CHECK(
-        v_bias->storage_type() == v_output.storage_type(),
-        "Vulkan products over buffer-stored weights require an addend in the "
-        "same storage as the result");
+    // reads it as a flat array while an image output fetches it as a texel; an
+    // addend that came in the other form is crossed to match rather than
+    // refused.
+    addend = addend_for_result(*bias, v_output.storage_type());
+    v_bias = convert(*addend);
     // A linear addend is read as words of the result's element type, while an
     // image one hands back floats whatever its format, so only the former
     // needs to match.
@@ -682,8 +746,8 @@ Tensor gemv_decode_linear(
         "Vulkan products over buffer-stored weights need a linear addend of "
         "the result dtype");
   }
-  const std::vector<int64_t> bias_sizes = bias.has_value()
-      ? shape_of(*bias)
+  const std::vector<int64_t> bias_sizes = addend.has_value()
+      ? shape_of(*addend)
       : std::vector<int64_t>({1, 1});
 
   const struct GemvLinearCombineBlock final {
@@ -843,22 +907,22 @@ Tensor mm_buffer_tiled(
       "for a half linear output");
 
   std::optional<api::vTensor> v_bias;
+  std::optional<Tensor> addend;
   if (bias.has_value()) {
-    v_bias = convert(*bias);
     // The addend binding follows the result's storage, because a linear output
-    // reads it as a flat array while an image output fetches it as a texel.
-    TP_CHECK(
-        v_bias->storage_type() == v_output.storage_type(),
-        "Vulkan products over buffer-stored operands require an addend in the "
-        "same storage as the result");
+    // reads it as a flat array while an image output fetches it as a texel; an
+    // addend that came in the other form is crossed to match rather than
+    // refused.
+    addend = addend_for_result(*bias, v_output.storage_type());
+    v_bias = convert(*addend);
     TP_CHECK(
         v_output.storage_type() != api::StorageType::BUFFER ||
             v_bias->dtype() == dtype,
         "Vulkan products over buffer-stored operands need a linear addend of "
         "the result dtype");
   }
-  const std::vector<int64_t> bias_sizes = bias.has_value()
-      ? shape_of(*bias)
+  const std::vector<int64_t> bias_sizes = addend.has_value()
+      ? shape_of(*addend)
       : std::vector<int64_t>({1, 1});
 
   const struct MmBufferTiledBlock final {
@@ -1134,7 +1198,11 @@ Tensor product_dispatch(
     TP_CHECK(
         bias->device().is_vulkan(),
         "Vulkan addmm: the addend must live on the Vulkan device");
-    api::vTensor v_bias = convert(*bias);
+    // This epilogue reads texels, so an addend still carrying its elements in
+    // words crosses into an image before the kernel sees it.
+    const Tensor addend =
+        addend_for_result(*bias, api::StorageType::TEXTURE_3D);
+    api::vTensor v_bias = convert(addend);
 
     const struct AddMMBlock final {
       ivec4 out_sizes;  // (W=N, H=M, C=1, N=1) logical sizes
@@ -1246,6 +1314,16 @@ Tensor mm_impl(
         lhs, v_other, M, N, K, 1, N, bias, beta, alpha, self.dtype());
   }
 
+  // The product that follows reads both operands as images, so an activation
+  // that carries its elements in words crosses into an image first: it is the
+  // operand the walk reads least, and the relayout below then finds the lanes
+  // it expects.
+  Tensor lhs_source = self;
+  if (v_self.storage_type() == api::StorageType::BUFFER) {
+    lhs_source = image_payload_of(self);
+    v_self = convert(lhs_source);
+  }
+
   TP_CHECK(
       v_self.storage_type() == api::StorageType::TEXTURE_3D &&
           v_other.storage_type() == api::StorageType::TEXTURE_3D,
@@ -1260,9 +1338,9 @@ Tensor mm_impl(
       (v_self.gpu_memory_layout() == api::GPUMemoryLayout::TENSOR_WIDTH_PACKED)
       ? v_self
       : packed_cached(
-            self, shape_of(self),
+            lhs_source, shape_of(lhs_source),
             api::GPUMemoryLayout::TENSOR_WIDTH_PACKED, kTagMmWidthPacked,
-            [&] { return pack_lhs_width(self); });
+            [&] { return pack_lhs_width(lhs_source); });
 
   api::vTensor rhs =
       (v_other.gpu_memory_layout() ==
@@ -2087,8 +2165,15 @@ Tensor linear_kernel(
       : std::nullopt;
 
   const int64_t M = in2.size(0);
-  api::vTensor v_lhs = gemv_operand_lhs(in2);
   api::vTensor v_weight = convert(weight);
+
+  // A weight that kept its image means the product runs on texels, so an
+  // activation carrying its elements in words crosses into an image here; the
+  // packing the operand route applies then finds lanes to read.
+  if (v_weight.storage_type() == api::StorageType::TEXTURE_3D) {
+    in2 = image_payload_of(in2);
+  }
+  api::vTensor v_lhs = gemv_operand_lhs(in2);
 
   Tensor out2;
   if (v_weight.storage_type() == api::StorageType::BUFFER) {
