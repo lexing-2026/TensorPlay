@@ -461,8 +461,10 @@ def test_index_add_in_place_sums_into_the_caller_s_buffer(device):
 def test_index_copy_and_fill_in_place_write_into_the_caller_s_buffer(device):
     tp.manual_seed(0)
     base = tp.randn(64, 8, device=device)
-    idx = tp.tensor([3, 3, 1, 7, 0, 3], device=device)
-    src = tp.randn(6, 8, device=device)
+    # Distinct slots: a repeated slot leaves the winner of the writes to the
+    # device, and the two forms need not pick the same one.
+    idx = tp.tensor([3, 1, 7, 0, 5], device=device)
+    src = tp.randn(5, 8, device=device)
 
     copied = base.clone()
     copied.index_copy_(0, idx, src)

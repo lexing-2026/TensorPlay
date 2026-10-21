@@ -11,6 +11,7 @@
 #include "Parallel.h"
 #include "Bucketization.h"
 #include "cpu/ComplexUnary.h"
+#include "cpu/vec/vec.h"
 
 #include <tuple>
 #include <vector>
@@ -73,19 +74,29 @@ Tensor normalize_index_cpu(const Tensor& index, int64_t upper_bound,
     Tensor index_c = (index.dtype() == DType::Int64)
         ? index.contiguous()
         : index.to(DType::Int64).contiguous();
-    if (wrap_negative) {
-        index_c = index_c.clone();
-    }
-    int64_t* values = index_c.data_ptr<int64_t>();
     const int64_t lower_bound = wrap_negative ? -upper_bound : 0;
+    // A negative index is counted from the end, so the values are rewritten
+    // in place; without one they are read where they are, and a copy of the
+    // whole index is spared.
+    std::atomic<bool> has_negative{false};
     parallel_for(0, index_c.numel(), GRAIN_SIZE,
                  [&](int64_t begin, int64_t end) {
+        const int64_t* values = index_c.data_ptr<int64_t>();
         for (int64_t i = begin; i < end; ++i) {
             const int64_t value = values[i];
             if (value < lower_bound || value >= upper_bound) {
                 TP_THROW(IndexError, op, ": index out of range");
             }
-            if (value < 0) values[i] = value + upper_bound;
+            if (value < 0) has_negative.store(true, std::memory_order_relaxed);
+        }
+    });
+    if (!has_negative.load(std::memory_order_relaxed)) return index_c;
+    index_c = index_c.clone();
+    int64_t* values = index_c.data_ptr<int64_t>();
+    parallel_for(0, index_c.numel(), GRAIN_SIZE,
+                 [&](int64_t begin, int64_t end) {
+        for (int64_t i = begin; i < end; ++i) {
+            if (values[i] < 0) values[i] += upper_bound;
         }
     });
     return index_c;
@@ -862,6 +873,21 @@ Tensor& scatter_add_inplace_cpu(Tensor& self, int64_t dim, const Tensor& index, 
 // index_select_cpu_: memcpy per selected slice along dim.
 // ---------------------------------------------------------------------------
 
+// The flat selection: the copies of one index slot do not depend on the
+// others, so the index carries the parallelism when the outer slots are too
+// few to fill the pool.
+template <typename T>
+static void index_select_flat(T* d, const T* s, const int64_t* ip, int64_t n_idx,
+                              int64_t outer, int64_t row) {
+    parallel_for(0, n_idx, GRAIN_SIZE, [&](int64_t kb, int64_t ke) {
+        for (int64_t k = kb; k < ke; ++k) {
+            for (int64_t o = 0; o < outer; ++o) {
+                d[o * n_idx + k] = s[o * row + ip[k]];
+            }
+        }
+    });
+}
+
 Tensor index_select_cpu(const Tensor& self, int64_t dim, const Tensor& index) {
     if (isQuantizedType(self.dtype())) { quantized::q_scale(self); return quantized::with_quantizer(index_select_cpu(quantized::storage_view(self), dim, index), self); }
 
@@ -904,13 +930,7 @@ Tensor index_select_cpu(const Tensor& self, int64_t dim, const Tensor& index) {
                 } \
             }); \
         } else if (inner == 1) { \
-            parallel_for(0, n_idx, GRAIN_SIZE, [&](int64_t kb, int64_t ke) { \
-                for (int64_t k = kb; k < ke; ++k) { \
-                    for (int64_t o = 0; o < outer; ++o) { \
-                        d[o * n_idx + k] = s[o * row + ip[k]]; \
-                    } \
-                } \
-            }); \
+            index_select_flat<ctype>(d, s, ip, n_idx, outer, row); \
         } else { \
             const int64_t slice_grain = std::max<int64_t>(1, GRAIN_SIZE / std::max<int64_t>(inner, 1)); \
             parallel_for(0, outer * n_idx, slice_grain, [&](int64_t b, int64_t e) { \
