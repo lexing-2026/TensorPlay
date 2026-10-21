@@ -21,8 +21,8 @@ std::tuple<Tensor, Tensor> sort_impl(
     bool descending,
     int64_t count,
     int64_t start = 0) {
-  TP_CHECK(self.dtype() == DType::Float32,
-           "Vulkan sort supports Float32 tensors only");
+  TP_CHECK(self.dtype() == DType::Float32 || self.dtype() == DType::Float16,
+           "Vulkan sort supports Float32 and Float16 tensors only");
   TP_CHECK(self.dim() >= 1 && self.dim() <= 4,
            "Vulkan sort supports 1d to 4d tensors");
   dim = dim < 0 ? dim + self.dim() : dim;
@@ -35,12 +35,13 @@ std::tuple<Tensor, Tensor> sort_impl(
            "Vulkan sort exceeds the index range");
   int64_t inner = 1;
   for (int64_t d = dim + 1; d < self.dim(); ++d) inner *= self.size(d);
+  const bool is_half = self.dtype() == DType::Float16;
   const auto sizes = static_cast<std::vector<int64_t>>(self.shape());
   auto out_sizes = sizes;
   out_sizes[dim] = count;
   api::Context* context = api::context();
   api::vTensor input = convert(self);
-  api::vTensor values{context, out_sizes, DType::Float32};
+  api::vTensor values{context, out_sizes, self.dtype()};
   api::vTensor indices{context, out_sizes, DType::Int32};
   if (values.numel() == 0) return {convert(values), convert(indices)};
 
@@ -83,11 +84,15 @@ std::tuple<Tensor, Tensor> sort_impl(
   // allocation time; their tiles read the contiguous input buffer and their
   // final gather writes contiguous output buffers through dedicated
   // variants.  The merge passes already work on raw storage buffers.
+  // A narrow payload needs its own reading of the input: an image carries a
+  // half in its texel, which a plain sampler widens on the way in, while a
+  // linear payload packs two of them into the word a tile sort must unpack.
   const bool buffer_input =
       input.storage_type() == api::StorageType::BUFFER;
   if (buffer_input) {
     context->submit_compute_job(
-        VK_KERNEL(sort_buffer), barrier,
+        is_half ? VK_KERNEL(sort_buffer_half) : VK_KERNEL(sort_buffer),
+        barrier,
         {static_cast<uint32_t>(tiles) * kSortLanes,
          static_cast<uint32_t>(rows), 1u},
         {kSortLanes, 1u, 1u}, VK_NULL_HANDLE,
@@ -132,9 +137,16 @@ std::tuple<Tensor, Tensor> sort_impl(
   }
   api::PipelineBarrier output_barrier{};
   if (values.storage_type() == api::StorageType::BUFFER) {
+    // A narrow result is written a word at a time, so the gather walks half as
+    // many destinations as there are elements.
+    const uint32_t destinations = is_half
+        ? static_cast<uint32_t>((values.numel() + 1) / 2)
+        : static_cast<uint32_t>(values.numel());
     context->submit_compute_job(
-        VK_KERNEL(sort_output_buffer), output_barrier,
-        {static_cast<uint32_t>(values.numel()), 1u, 1u},
+        is_half ? VK_KERNEL(sort_output_buffer_half)
+                : VK_KERNEL(sort_output_buffer),
+        output_barrier,
+        {destinations, 1u, 1u},
         {kSortLanes, 1u, 1u}, VK_NULL_HANDLE,
         values.buffer(output_barrier, api::PipelineStage::COMPUTE,
                       api::MemoryAccessType::WRITE),
@@ -146,7 +158,7 @@ std::tuple<Tensor, Tensor> sort_impl(
     return {convert(values), convert(indices)};
   }
   context->submit_compute_job(
-      VK_KERNEL(sort_output), output_barrier, values.extents(),
+      kernel_for("sort_output", self.dtype()), output_barrier, values.extents(),
       adaptive_work_group_size(values.extents()), VK_NULL_HANDLE,
       values.image(output_barrier, api::PipelineStage::COMPUTE,
                    api::MemoryAccessType::WRITE),
