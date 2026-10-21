@@ -8226,6 +8226,13 @@
   device_check: NoCheck
   variants: function
   tags: pointwise
+- func: relu.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
+  variants: function
+  tags: pointwise
+- func: celu.out(Tensor self, Scalar alpha=1.0, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
+  variants: function
 - func: select.int(Tensor(a) self, int dim, SymInt index) -> Tensor(a)
   device_check: NoCheck
   variants: function, method
@@ -10272,6 +10279,8 @@
   variants: function
 - func: hardswish.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   device_check: NoCheck
+  variants: function
+- func: hardswish_backward.out(Tensor grad_output, Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
 - func: leaky_relu.out(Tensor self, Scalar negative_slope=0.01, *, Tensor(a!) out) -> Tensor(a!)
   device_check: NoCheck

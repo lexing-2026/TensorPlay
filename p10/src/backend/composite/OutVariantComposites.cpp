@@ -445,6 +445,21 @@ Tensor& out_wrap_mish_out(const Tensor& self, Tensor& out) {
     return out;
 }
 
+Tensor& out_wrap_relu_out(const Tensor& self, Tensor& out) {
+    write_out(out, ops::relu(self));
+    return out;
+}
+
+Tensor& out_wrap_celu_out(const Tensor& self, const Scalar& alpha, Tensor& out) {
+    write_out(out, ops::celu(self, alpha));
+    return out;
+}
+
+Tensor& out_wrap_hardswish_backward_out(const Tensor& grad_output, const Tensor& self, Tensor& out) {
+    write_out(out, ops::hardswish_backward(grad_output, self));
+    return out;
+}
+
 Tensor& out_wrap_sigmoid_out(const Tensor& self, Tensor& out) {
     write_out(out, ops::sigmoid(self));
     return out;
@@ -1071,6 +1086,9 @@ TENSORPLAY_LIBRARY_IMPL(Composite, OutVariantOps) {
     m.impl("rsqrt.out", composite::out_wrap_rsqrt_out);
     m.impl("silu.out", composite::out_wrap_silu_out);
     m.impl("mish.out", composite::out_wrap_mish_out);
+    m.impl("relu.out", composite::out_wrap_relu_out);
+    m.impl("celu.out", composite::out_wrap_celu_out);
+    m.impl("hardswish_backward.out", composite::out_wrap_hardswish_backward_out);
     m.impl("sigmoid.out", composite::out_wrap_sigmoid_out);
     m.impl("logit.out", composite::out_wrap_logit_out);
     m.impl("sin.out", composite::out_wrap_sin_out);
