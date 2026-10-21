@@ -9452,9 +9452,8 @@ class TestVulkanLikelihoodLoss(unittest.TestCase):
     # gradient lands on the single class the row named.
 
     @staticmethod
-    def _device(array):
-        return tensorplay.from_numpy(
-            np.asarray(array, np.float32)).to("vulkan")
+    def _device(array, dtype=np.float32):
+        return tensorplay.from_numpy(np.asarray(array, dtype)).to("vulkan")
 
     @staticmethod
     def _codes(array, dtype=np.int64):
@@ -9465,10 +9464,17 @@ class TestVulkanLikelihoodLoss(unittest.TestCase):
         return tensor.cpu().numpy()
 
     @staticmethod
-    def _rows(logits, codes, weight, ignore):
+    def _tolerance(dtype):
+        return (6e-3, 6e-3) if dtype == np.float16 else (1e-4, 1e-5)
+
+    @staticmethod
+    def _rows(logits, codes, weight, ignore, dtype=np.float32):
         # The per-row answers and the weight total they add up to.  A code that
-        # names no class, and the code asked to skip, carry nothing.
-        table = np.atleast_2d(np.asarray(logits, np.float32))
+        # names no class, and the code asked to skip, carry nothing.  The plane
+        # is read as the type it is held in, so a narrow table answers from the
+        # values that type can keep.
+        table = np.atleast_2d(
+            np.asarray(logits, dtype).astype(np.float64))
         wanted = np.atleast_1d(np.asarray(codes))
         live = (wanted != ignore) & (wanted >= 0) & (wanted < table.shape[1])
         scale = np.where(live, 1.0, 0.0)
@@ -9482,20 +9488,22 @@ class TestVulkanLikelihoodLoss(unittest.TestCase):
                 losses[i] = -table[i, code] * scale[i]
         return losses, scale, live
 
-    def _checked(self, logits, codes, weight, reduction, ignore, grad):
-        losses, scale, live = self._rows(logits, codes, weight, ignore)
+    def _checked(self, logits, codes, weight, reduction, ignore, grad,
+                 dtype=np.float32):
+        losses, scale, live = self._rows(logits, codes, weight, ignore, dtype)
         total = float(scale.sum())
         if reduction == "none" and np.asarray(codes).ndim > 0:
             # A batch of unreduced rows reports no normalizer.
             total = 0.0
-        rows = np.atleast_2d(np.asarray(logits, np.float32))
+        rows = np.atleast_2d(np.asarray(logits, dtype).astype(np.float64))
+        rtol, atol = self._tolerance(dtype)
         want_loss = losses
         if reduction == "mean":
             want_loss = losses.sum() / total if total > 0 else float("nan")
         elif reduction == "sum":
             want_loss = losses.sum()
-        grad_in = np.asarray(grad, np.float32)
-        want_grad = np.zeros_like(rows, np.float64)
+        grad_in = np.asarray(grad, dtype).astype(np.float64)
+        want_grad = np.zeros_like(rows)
         for i, code in enumerate(np.atleast_1d(np.asarray(codes))):
             if not live[i]:
                 continue
@@ -9504,21 +9512,26 @@ class TestVulkanLikelihoodLoss(unittest.TestCase):
                 carried = carried / total
             want_grad[i, code] = -scale[i] * carried
 
-        x = self._device(logits)
+        x = self._device(logits, dtype)
         t = self._codes(codes)
-        w = None if weight is None else self._device(weight)
+        w = None if weight is None else self._device(weight, dtype)
         out, reported = tensorplay._C.nll_loss(
             x, t, w, {"none": 0, "mean": 1, "sum": 2}[reduction], ignore)
+        answered = (tensorplay.float16 if dtype == np.float16
+                    else tensorplay.float32)
+        self.assertEqual(out.dtype, answered)
+        self.assertEqual(reported.dtype, answered)
         np.testing.assert_allclose(
-            self._back(out), want_loss, rtol=1e-4, atol=1e-5, equal_nan=True)
+            self._back(out), want_loss, rtol=rtol, atol=atol, equal_nan=True)
         self.assertAlmostEqual(
-            float(self._back(reported)), total, delta=max(1e-4, abs(total) * 1e-4))
+            float(self._back(reported)), total,
+            delta=max(atol, abs(total) * rtol))
         back = tensorplay._C.nll_loss_backward(
-            self._device(grad), x, t, w,
-            {"none": 0, "mean": 1, "sum": 2}[reduction], ignore,
-            self._device(np.array(reported.cpu().numpy(), np.float32)))
+            self._device(grad, dtype), x, t, w,
+            {"none": 0, "mean": 1, "sum": 2}[reduction], ignore, reported)
+        self.assertEqual(back.dtype, answered)
         np.testing.assert_allclose(
-            self._back(back), want_grad, rtol=1e-4, atol=1e-5)
+            self._back(back), want_grad, rtol=rtol, atol=atol)
         return out, reported, back
 
     def test_a_row_answers_with_the_class_it_names(self):
@@ -9652,15 +9665,92 @@ class TestVulkanLikelihoodLoss(unittest.TestCase):
             others = np.delete(grad[row], code)
             np.testing.assert_array_equal(others, np.zeros(4))
 
+    def test_a_narrow_plane_answers_the_rows_it_names(self):
+        # A training run keeps its likelihood plane in the narrow float, so the
+        # row it reads and the gradient it hands back are both that type.
+        logits = np.log(np.linspace(0.05, 0.95, 20).reshape(4, 5))
+        weight = np.array([1.5, 0.5, 2.0, 0.25, 1.0], np.float32)
+        for reduction in ("none", "mean", "sum"):
+            grad = (np.arange(4, dtype=np.float32) + 1.0
+                    if reduction == "none" else np.float32(1.0))
+            self._checked(
+                logits, [0, 3, 1, 4], None, reduction, -100, grad, np.float16)
+            self._checked(
+                logits, [0, 3, 1, -100], weight, reduction, -100, grad,
+                np.float16)
+        self._checked(
+            logits, [0, 9, -3, 4], None, "sum", -100, np.float32(1.0),
+            np.float16)
+        self._checked(
+            logits, [-100] * 4, None, "mean", -100, np.float32(1.0),
+            np.float16)
+        self._checked(
+            logits, [0, 3, 1, 4], None, "mean", 3, np.float32(1.0),
+            np.float16)
+
+    def test_a_narrow_row_and_a_narrow_target_type(self):
+        logits = np.log(np.linspace(0.05, 0.95, 5))
+        x = self._device(logits, np.float16)
+        losses, _, _ = self._rows(logits, [2], None, -100, np.float16)
+        for codes in (self._codes(2), self._codes(2, np.int32)):
+            out, reported = tensorplay._C.nll_loss(x, codes, None, 2, -100)
+            self.assertEqual(tuple(out.shape), ())
+            self.assertEqual(out.dtype, tensorplay.float16)
+            self.assertEqual(reported.dtype, tensorplay.float16)
+            self.assertAlmostEqual(
+                float(self._back(out)), float(losses.sum()), delta=6e-3)
+        # Unreduced, the same row keeps its loss and reports its own weight.
+        out, reported = tensorplay._C.nll_loss(x, self._codes(2), None, 0, -100)
+        self.assertEqual(out.dtype, tensorplay.float16)
+        self.assertAlmostEqual(float(self._back(out)), float(-logits[2]),
+                               delta=6e-3)
+        self.assertAlmostEqual(float(self._back(reported)), 1.0, delta=6e-3)
+
+    def test_a_narrow_plane_with_no_image_form_shares_its_words(self):
+        # A dense plane keeps two classes per word, so a walk over it answers a
+        # pair at a time.  An odd count leaves the last word one lane short, and
+        # that word may hold the one class carrying a gradient.
+        for rows, classes, seed in ((8, 40000, 9), (5, 40001, 11)):
+            table = np.log(
+                np.random.RandomState(seed).rand(rows, classes).astype(
+                    np.float32) + 0.1)
+            wanted = np.arange(rows, dtype=np.int64) * (classes // rows)
+            wanted[-1] = classes - 1
+            for dtype in (np.float32, np.float16):
+                self._checked(
+                    table, wanted, None, "sum", -100, np.float32(1.0), dtype)
+                self._checked(
+                    table, wanted, np.full(classes, 0.5, np.float32), "sum",
+                    -100, np.float32(1.0), dtype)
+
+    def test_the_narrow_gradient_of_a_training_loss(self):
+        logits = np.log(np.linspace(0.05, 0.95, 20).reshape(4, 5))
+        x = self._device(logits, np.float16)
+        x.requires_grad_(True)
+        loss = tensorplay.nn.functional.nll_loss(
+            x, self._codes([0, 3, 1, 4]), reduction="mean")
+        self.assertEqual(loss.dtype, tensorplay.float16)
+        loss.backward()
+        self.assertEqual(x.grad.dtype, tensorplay.float16)
+        grad = self._back(x.grad).astype(np.float64)
+        np.testing.assert_allclose(grad.sum(), -1.0, rtol=6e-3, atol=6e-3)
+        for row, code in enumerate([0, 3, 1, 4]):
+            self.assertAlmostEqual(float(grad[row, code]), -0.25, delta=6e-3)
+            np.testing.assert_array_equal(
+                np.delete(grad[row], code), np.zeros(4))
+
     def test_outside_the_supported_surface_refuses(self):
         logits = np.log(np.linspace(0.05, 0.95, 20).reshape(4, 5))
         x = self._device(logits)
         t = self._codes([0, 3, 1, 4])
-        with self.assertRaisesRegex(RuntimeError, "Float32"):
+        with self.assertRaisesRegex(RuntimeError, "Float32 and Float16"):
             tensorplay._C.nll_loss(
                 tensorplay.zeros((4, 5), device="vulkan",
-                                 dtype=tensorplay.float16),
+                                 dtype=tensorplay.int32),
                 t, None, 1, -100)
+        with self.assertRaisesRegex(RuntimeError, "Float32 or Float16 gradient"):
+            tensorplay._C.nll_loss_backward(
+                self._codes([1, 1, 1, 1]), x, t, None, 0, -100, None)
         with self.assertRaisesRegex(RuntimeError, "1d row"):
             tensorplay._C.nll_loss(
                 self._device(np.ones((2, 3, 4), np.float32)),
