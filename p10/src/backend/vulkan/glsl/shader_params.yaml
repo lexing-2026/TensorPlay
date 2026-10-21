@@ -1330,6 +1330,10 @@ mask_compact:
   parameter_names_with_default_values: {}
   shader_variants:
   - NAME: mask_compact
+masked_scatter_buffer:
+  parameter_names_with_default_values: {}
+  shader_variants:
+  - NAME: masked_scatter_buffer
 gather:
   parameter_names_with_default_values: {}
   shader_variants:

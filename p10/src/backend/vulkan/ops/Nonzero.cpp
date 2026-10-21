@@ -235,6 +235,145 @@ api::vTensor compact_positions(
   return v_out;
 }
 
+// Runs the mask a second time and writes the answer in place of the walk: each
+// selection takes the next element of the source, each unselected element is
+// carried through from the payload it sits in.  The rank the count walk hands a
+// lane is the position in the source its selection takes, so the elements that
+// spread over the destination are the leading ones - the same sequence a serial
+// read of the mask would consume.
+//
+// The answer arrives in linear storage: the walk addresses the payload in the
+// row-major order its source offsets follow, which a texture's padded texels do
+// not lay out.
+api::vTensor scatter_selections(
+    api::Context* const context,
+    const MaskWalk& walk,
+    api::vTensor input,
+    api::vTensor source,
+    const std::vector<int64_t>& sizes) {
+  api::vTensor v_bases{
+      context,
+      {static_cast<int64_t>(walk.blocks)},
+      DType::Int32,
+      api::StorageType::BUFFER,
+      api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+  utils::upload_host_bytes(
+      v_bases,
+      walk.bases.data(),
+      walk.bases.size() * sizeof(int32_t));
+
+  api::vTensor v_out{
+      context,
+      sizes,
+      DType::Float32,
+      api::StorageType::BUFFER,
+      api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+  const struct MaskScatterBlock {
+    int32_t elems;
+    int32_t words;
+    int32_t lane_words;
+    int32_t fill;
+  } block{walk.elems, walk.words, walk.lane_words, 0};
+  api::UniformParamsBuffer params(context, block);
+  api::PipelineBarrier pipeline_barrier{};
+  api::vTensor v_mask = walk.mask;
+  context->submit_compute_job(
+      VK_KERNEL_FROM_STR("masked_scatter_buffer"),
+      pipeline_barrier,
+      walk_extent(walk.blocks),
+      {static_cast<uint32_t>(kLaneCount), 1u, 1u},
+      VK_NULL_HANDLE,
+      v_out.buffer(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::WRITE),
+      input.buffer(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::READ),
+      v_mask.buffer(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::READ),
+      v_bases.buffer(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::READ),
+      source.buffer(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::READ),
+      params.buffer());
+  return v_out;
+}
+
+// Both public forms funnel here: the answer is the destination with the leading
+// source elements spread over the positions the mask selects.
+Tensor masked_scatter_impl(
+    const Tensor& self,
+    const Tensor& mask,
+    const Tensor& source,
+    const char* name) {
+  TP_CHECK(
+      self.dtype() == DType::Float32,
+      std::string("Vulkan ") + name + " spreads Float32 payloads");
+  TP_CHECK(
+      self.dim() >= 1 && self.dim() <= 4,
+      std::string("Vulkan ") + name + " supports 1d to 4d tensors");
+  TP_CHECK(
+      source.dtype() == self.dtype(),
+      std::string(name) + ": self and source must have the same dtype");
+  TP_CHECK(
+      source.device().is_vulkan(),
+      std::string("Vulkan ") + name + " takes the source on the device");
+  validate_flag_source(mask, name);
+
+  const std::vector<int64_t> sizes =
+      static_cast<std::vector<int64_t>>(self.shape());
+  // The destination keeps the answer's shape, so the mask only has to line up
+  // with it element by element; broadcasting settles how often each of its
+  // bytes is read.
+  const std::vector<int64_t> broadcast = tensorplay::broadcast_shapes(
+      sizes, static_cast<std::vector<int64_t>>(mask.shape()));
+  TP_CHECK(
+      broadcast == sizes,
+      std::string("Vulkan ") + name +
+          " takes a mask that broadcasts to the destination");
+
+  const int64_t numel = self.numel();
+  // A payload with no element to write an answer into, or a mask that selects
+  // nothing, is answered by the destination as it stands.
+  if (numel == 0) {
+    return self.clone();
+  }
+
+  const Tensor mask_on_device =
+      mask.device().is_vulkan() ? mask : mask.to(self.device());
+  Tensor flags = flag_payload(mask_on_device);
+  if (flags.sizes() != self.sizes()) {
+    flags = tpx::ops::expand(flags, sizes, false).contiguous();
+  }
+  flags = flags.reshape({numel});
+
+  const MaskWalk walk = mark_mask(api::context(), flags, numel);
+  TP_CHECK(
+      source.numel() >= walk.count,
+      std::string(name) + ": source has fewer elements than the mask selects");
+  if (walk.count == 0) {
+    return self.clone();
+  }
+
+  // The walk reads these payloads after the call that asks for them, so each is
+  // held by name rather than passed on as a temporary.
+  const Tensor input = self.contiguous();
+  const Tensor src = source.contiguous();
+  api::Context* const context = api::context();
+  api::vTensor v_input = to_buffer_storage_dispatch(context, convert(input));
+  api::vTensor v_source = to_buffer_storage_dispatch(context, convert(src));
+  return convert(
+      scatter_selections(context, walk, v_input, v_source, sizes));
+}
+
 } // namespace
 
 Tensor nonzero_kernel(const Tensor& self) {
@@ -322,6 +461,21 @@ Tensor masked_select_kernel(const Tensor& self, const Tensor& mask) {
       picked.reshape({numel}), 0, codes);
 }
 
+Tensor masked_scatter_kernel(
+    const Tensor& self,
+    const Tensor& mask,
+    const Tensor& source) {
+  return masked_scatter_impl(self, mask, source, "masked_scatter");
+}
+
+Tensor& masked_scatter_inplace_kernel(
+    Tensor& self,
+    const Tensor& mask,
+    const Tensor& source) {
+  self.copy_(masked_scatter_impl(self, mask, source, "masked_scatter_"));
+  return self;
+}
+
 } // namespace ops
 } // namespace vulkan
 } // namespace tensorplay
@@ -329,6 +483,10 @@ Tensor masked_select_kernel(const Tensor& self, const Tensor& mask) {
 TENSORPLAY_LIBRARY_IMPL(Vulkan, MaskCompactionKernels) {
   m.impl("nonzero", &tensorplay::vulkan::ops::nonzero_kernel);
   m.impl("masked_select", &tensorplay::vulkan::ops::masked_select_kernel);
+  m.impl("masked_scatter", &tensorplay::vulkan::ops::masked_scatter_kernel);
+  m.impl(
+      "masked_scatter_",
+      &tensorplay::vulkan::ops::masked_scatter_inplace_kernel);
 }
 
 #endif /* USE_VULKAN */
