@@ -5519,7 +5519,7 @@ class TestVulkanUnaryWidth(unittest.TestCase):
         for name in ("sin_", "cos_", "exp_", "sqrt_", "tanh_", "sigmoid_",
                      "reciprocal_"):
             with self.assertRaisesRegex(
-                    RuntimeError, "has no Int32 kernel"):
+                    RuntimeError, "no kernel for a signed word"):
                 getattr(self._device(counts), name)()
         # Written into a float the same formulas need no such step.
         reals = np.array([-3.0, -1.0, 0.5, 1.0, 2.0, 5.0], dtype=np.float32)
@@ -11193,8 +11193,9 @@ class TestVulkanNarrowTraining(unittest.TestCase):
 class TestVulkanWideArithmetic(unittest.TestCase):
     """A count wider than a word has no texel to sit in, so the arithmetic walks
     over one read and write a pair of words.  These are the sums, differences and
-    products a decode loop asks of its token, position and length counters, with
-    the carries and borrows that cross the seam where the two words meet."""
+    products a decode loop asks of its token, position and length counters, the
+    whole-number formulas that turn, compare or measure such a pair, and the
+    carries and borrows that cross the seam where the two words meet."""
 
     MASK = (1 << 64) - 1
 
@@ -11346,6 +11347,179 @@ class TestVulkanWideArithmetic(unittest.TestCase):
             [[a * b for b in right] for a in left],
             "a rank-one product of counting lines")
 
+    def test_the_magnitude_turns_the_word_that_carries_the_sign(self):
+        counts = [0, 1, -1, 1 << 32, -(1 << 32), (1 << 32) + 7,
+                  (1 << 63) - 1, -(1 << 63), 1234567890123, -1234567890123]
+        self._checked(
+            self._device(counts).abs(), [abs(a) for a in counts],
+            "magnitude of a counting payload")
+        # Only the word above the seam tells a count from its negation, so a
+        # payload whose low words are all none still has a magnitude.
+        self._checked(
+            self._device([1 << 32, -(1 << 32), 2 << 32, -(2 << 32)]).abs(),
+            [1 << 32, 1 << 32, 2 << 32, 2 << 32],
+            "magnitude of a pair whose low word is none")
+        # A magnitude past every count a pair holds lands where the count it
+        # turned away lands.
+        self._checked(self._device([-(1 << 63)]).abs(), [-(1 << 63)],
+                      "magnitude of the least count a pair holds")
+        target = self._device(counts)
+        target.abs_()
+        self._checked(target, [abs(a) for a in counts],
+                      "magnitude written back into a count")
+
+    def test_a_negated_pair_walks_back_across_the_seam(self):
+        counts = [0, 1, -1, 1 << 32, -(1 << 32), (1 << 63) - 1, -(1 << 63),
+                  1234567890123]
+        self._checked(self._device(counts).neg(), [-a for a in counts],
+                      "negation of a counting payload")
+        self._checked(-self._device(counts), [-a for a in counts],
+                      "a count read through a minus sign")
+        self._checked(
+            self._device([1 << 32, (1 << 32) + 1, -(2 << 32)]).neg(),
+            [-(1 << 32), -((1 << 32) + 1), 2 << 32],
+            "negation across the seam of a pair")
+        target = self._device(counts)
+        target.neg_()
+        self._checked(target, [-a for a in counts],
+                      "negation written back into a count")
+
+    def test_the_sign_counts_the_whole_pair(self):
+        counts = [0, 1, -1, 5, -5, 1 << 32, -(1 << 32), (1 << 63) - 1,
+                  -(1 << 63)]
+        self._checked(
+            self._device(counts).sign(),
+            [(a > 0) - (a < 0) for a in counts],
+            "sign of a counting payload")
+        # A pair is none only when both of its words are, so a low word of none
+        # under a high word that is not answers one way or the other.
+        self._checked(self._device([1 << 32, -(1 << 32)]).sign(), [1, -1],
+                      "sign of a pair whose low word is none")
+
+    def test_a_squared_pair_keeps_the_low_half_of_the_walk(self):
+        counts = [0, -1, 3, 12345, 1 << 32, (1 << 32) + 1, 1 << 31,
+                  -(1 << 63), (1 << 63) - 1]
+        self._checked(self._device(counts).square(), [a * a for a in counts],
+                      "square of a counting payload")
+        # A factor whose low word is none squares to nothing a pair can hold, so
+        # this asks the walk for the terms that live above the seam.
+        self._checked(self._device([1 << 32, 12345]).square(),
+                      [0, 12345 * 12345], "square of a pair at the seam")
+        target = self._device(counts)
+        target.square_()
+        self._checked(target, [a * a for a in counts],
+                      "square written back into a count")
+
+    def test_a_clamp_at_none_leaves_the_positive_half_alone(self):
+        counts = [0, 1, -1, 5, -5, 1 << 32, -(1 << 32), (1 << 63) - 1,
+                  -(1 << 63)]
+        self._checked(self._device(counts).relu(), [max(a, 0) for a in counts],
+                      "a counting payload clamped at none")
+        target = self._device(counts)
+        target.relu_()
+        self._checked(target, [max(a, 0) for a in counts],
+                      "clamp at none written back into a count")
+
+    def test_the_roundings_answer_a_count_with_itself(self):
+        counts = [-(1 << 63), -(1 << 32), -7, 0, 1, 1 << 32, (1 << 63) - 1]
+        for name in ("floor", "ceil", "round", "trunc"):
+            self._checked(
+                getattr(self._device(counts), name)(), counts,
+                f"{name} of a counting payload")
+            target = self._device(counts)
+            getattr(target, name + "_")()
+            self._checked(target, counts,
+                          f"{name} written back into a count")
+
+    def test_the_greater_and_lesser_of_two_pairs_compare_the_high_word(self):
+        first = [1 << 32, -1, (1 << 63) - 1, 5, 0, -(1 << 32), (1 << 32) + 7,
+                 -(1 << 63)]
+        second = [1, 1 << 32, -1, 5, -(1 << 63), 1, (1 << 32) + 3, 3]
+        self._checked(
+            tensorplay.maximum(self._device(first), self._device(second)),
+            [max(a, b) for a, b in zip(first, second)],
+            "greater of two counting payloads")
+        self._checked(
+            tensorplay.minimum(self._device(first), self._device(second)),
+            [min(a, b) for a, b in zip(first, second)],
+            "lesser of two counting payloads")
+        # A pair with the larger low word is no greater than its partner unless
+        # the word above it agrees, and a negative count sets every bit of its
+        # high word, so comparing those words without a sign would turn both
+        # answers over.
+        self._checked(
+            tensorplay.maximum(self._device([-(1 << 32), 1 << 32]),
+                               self._device([1, 1])),
+            [1, 1 << 32], "extremum of pairs that share no word")
+
+    def test_a_narrow_count_meets_a_wide_one_at_an_extremum(self):
+        narrow = [1, 2, -3, 5, 0, -(1 << 30)]
+        wide = [1 << 40, -1, (1 << 63) - 1, -(1 << 63), 0, 1 << 30]
+        self._checked(
+            tensorplay.maximum(self._device(narrow, tensorplay.int32),
+                               self._device(wide)),
+            [max(a, b) for a, b in zip(narrow, wide)],
+            "greater of a narrow count and a wide one")
+        self._checked(
+            tensorplay.minimum(self._device(narrow, tensorplay.int32),
+                               self._device(wide)),
+            [min(a, b) for a, b in zip(narrow, wide)],
+            "lesser of a narrow count and a wide one")
+
+    def test_a_broadcast_extremum_repeats_a_pair_it_never_materializes(self):
+        rows = [1 << 32, -1, (1 << 63) - 1]
+        columns = [10, 20, -(1 << 33), (1 << 32) + 3]
+        self._checked(
+            tensorplay.maximum(self._device([[r] for r in rows]),
+                               self._device([columns])),
+            [[max(r, c) for c in columns] for r in rows],
+            "a counting column against a counting row")
+        self._checked(
+            tensorplay.minimum(self._device([[r] for r in rows]),
+                               self._device([columns])),
+            [[min(r, c) for c in columns] for r in rows],
+            "least of a counting column and a counting row")
+
+    def test_a_count_subtracted_from_a_number_walks_the_pair_backwards(self):
+        counts = [0, 1, -7, 1 << 32, (1 << 63) - 1, -(1 << 63)]
+        self._checked(5 - self._device(counts), [5 - a for a in counts],
+                      "a count taken from a number")
+        self._checked(
+            (1 << 40) - self._device(counts),
+            [(1 << 40) - a for a in counts],
+            "a count taken from a wide number")
+        self._checked(
+            -(1 << 40) - self._device(counts),
+            [-(1 << 40) - a for a in counts],
+            "a count taken from a wide negative number")
+
+    def test_a_magnitude_over_a_tail_reads_every_pair(self):
+        rng = np.random.default_rng(77)
+        for length in (1, 2, 3, 5, 17, 64, 65):
+            left = rng.integers(-(2**62), 2**62, size=length)
+            right = rng.integers(-(2**62), 2**62, size=length)
+            self._checked(
+                self._device(left).abs(), [abs(int(a)) for a in left],
+                f"magnitude of {length} counts")
+            self._checked(
+                tensorplay.maximum(self._device(left), self._device(right)),
+                [max(int(a), int(b)) for a, b in zip(left, right)],
+                f"greater of {length} counts")
+
+    def test_a_formula_with_fractions_still_refuses_a_pair(self):
+        counts = [0, 1, 2, 5, 30]
+        for name in ("exp", "sqrt", "sin", "tanh", "log"):
+            widened = getattr(self._device(counts), name)()
+            self.assertEqual(widened.dtype, tensorplay.float32, name)
+            np.testing.assert_allclose(
+                np.asarray(widened.cpu()),
+                getattr(np, name)(np.asarray(counts, np.float32)),
+                rtol=1e-5, atol=1e-6, err_msg=name)
+        for name in ("exp_", "sqrt_", "sin_", "reciprocal_", "log_"):
+            with self.assertRaisesRegex(
+                    RuntimeError, "no kernel for a count wider than a word"):
+                getattr(self._device(counts), name)()
+
     def test_lengths_that_fill_no_whole_number_of_slots(self):
         rng = np.random.default_rng(76)
         for length in (1, 2, 3, 5, 7, 13, 17, 64, 65):
@@ -11368,15 +11542,12 @@ class TestVulkanWideArithmetic(unittest.TestCase):
     def test_a_walk_with_no_pair_of_words_to_read_says_so(self):
         counts = self._device([10, 1 << 32, -7])
         other = self._device([3, 3, 3])
-        # Division, a remainder and a reversed subtraction have no walk over a
-        # pair of words: the refusal names the width, rather than reading the
-        # element one word at a time.
+        # Division and a remainder have no walk over a pair of words: the refusal
+        # names the width, rather than reading the element one word at a time.
         with self.assertRaisesRegex(RuntimeError, "count wider than a word"):
             counts / other
         with self.assertRaisesRegex(RuntimeError, "count wider than a word"):
             tensorplay.remainder(counts, other)
-        with self.assertRaisesRegex(RuntimeError, "count wider than a word"):
-            5 - counts
         # A fraction has no slot in a counting payload written in place.
         with self.assertRaisesRegex(RuntimeError, "fractional operand"):
             counts.add_(0.5)
