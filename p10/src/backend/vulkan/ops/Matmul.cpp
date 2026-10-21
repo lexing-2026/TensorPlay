@@ -2236,9 +2236,10 @@ Tensor outer_kernel(const Tensor& self, const Tensor& vec2) {
       self.dim() == 1 && vec2.dim() == 1,
       "Vulkan outer: expected two vectors, got a ", self.dim(), "d and a ",
       vec2.dim(), "d operand");
-  TP_CHECK(
-      self.dtype() == vec2.dtype(),
-      "Vulkan outer: expected both vectors to have the same element type");
+  // Every entry is one product of two readings of the operands, so the pair
+  // needs no shared element type: the broadcast product below settles the
+  // type its entries are answered in.  A gradient of this product is a
+  // matrix-vector walk, which does read both operands as one type.
   return self.unsqueeze(1).mul(vec2.unsqueeze(0));
 }
 

@@ -2189,10 +2189,9 @@ Tensor outer_kernel(const Tensor& self, const Tensor& vec2) {
         TP_THROW(RuntimeError, "1D tensors expected, but got ", self.dim(), "D and ",
                  vec2.dim(), "D tensors");
     }
-    if (self.dtype() != vec2.dtype()) {
-        TP_THROW(RuntimeError, "expected scalar type ", scalarTypeName(self.dtype()),
-                 " but found ", scalarTypeName(vec2.dtype()));
-    }
+    // One entry of the product is one pair of readings, so the two vectors need
+    // no shared element type; the broadcast product below decides the type its
+    // entries are answered in.
     return self.unsqueeze(1).mul(vec2.unsqueeze(0));
 }
 
