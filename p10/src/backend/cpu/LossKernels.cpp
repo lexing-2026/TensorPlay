@@ -81,13 +81,27 @@ std::tuple<Tensor, Tensor> nll_loss_impl(const Tensor& input_arg, const Tensor& 
 std::tuple<Tensor, Tensor> nll_loss_kernel(const Tensor& input, const Tensor& target, const std::optional<Tensor>& weight, int64_t reduction, int64_t ignore_index) {
     if (input.dtype() == DType::Float32) return nll_loss_impl<float>(input, target, weight, reduction, ignore_index);
     if (input.dtype() == DType::Float64) return nll_loss_impl<double>(input, target, weight, reduction, ignore_index);
-    TP_THROW(NotImplementedError, "nll_loss only supports Float32/Float64");
+    if (input.dtype() == DType::BFloat16) return nll_loss_impl<BFloat16>(input, target, weight, reduction, ignore_index);
+    if (input.dtype() == DType::Half) return nll_loss_impl<Half>(input, target, weight, reduction, ignore_index);
+    TP_THROW(NotImplementedError, "nll_loss only supports Float32, Float64, BFloat16 and Half");
 }
 
 template <typename scalar_t>
-Tensor nll_loss_backward_impl(const Tensor& grad_output, const Tensor& input, const Tensor& target,
-                              const std::optional<Tensor>& weight, int64_t reduction,
+Tensor nll_loss_backward_impl(const Tensor& grad_output_arg, const Tensor& input,
+                              const Tensor& target_arg,
+                              const std::optional<Tensor>& weight_arg, int64_t reduction,
                               int64_t ignore_index, const Tensor& total_weight) {
+    // The walk names one entry per row, so every operand is read by position:
+    // the seed a sum leaves behind is a single value spread across the whole row
+    // axis, and an index or weight arriving from another layout is stored in its
+    // own strides.
+    const Tensor grad_output = grad_output_arg.contiguous();
+    const Tensor target = target_arg.contiguous();
+    Tensor weight;
+    if (weight_arg.has_value() && weight_arg->defined()) {
+        weight = weight_arg->contiguous();
+    }
+
     int64_t n_batch = input.size(0);
     int64_t n_classes = input.size(1);
 
@@ -95,7 +109,7 @@ Tensor nll_loss_backward_impl(const Tensor& grad_output, const Tensor& input, co
     scalar_t* grad_input_data = grad_input.data_ptr<scalar_t>();
 
     const int64_t* target_data = target.data_ptr<int64_t>();
-    const scalar_t* weight_data = weight.has_value() && weight->defined() ? weight->data_ptr<scalar_t>() : nullptr;
+    const scalar_t* weight_data = weight.defined() ? weight.data_ptr<scalar_t>() : nullptr;
 
     double tw = 0;
     if (total_weight.defined()) {
@@ -137,7 +151,9 @@ Tensor nll_loss_backward_impl(const Tensor& grad_output, const Tensor& input, co
 Tensor nll_loss_backward_kernel(const Tensor& grad_output, const Tensor& input, const Tensor& target, const std::optional<Tensor>& weight, int64_t reduction, int64_t ignore_index, const Tensor& total_weight) {
     if (input.dtype() == DType::Float32) return nll_loss_backward_impl<float>(grad_output, input, target, weight, reduction, ignore_index, total_weight);
     if (input.dtype() == DType::Float64) return nll_loss_backward_impl<double>(grad_output, input, target, weight, reduction, ignore_index, total_weight);
-    TP_THROW(NotImplementedError, "nll_loss backward only supports Float32/Float64");
+    if (input.dtype() == DType::BFloat16) return nll_loss_backward_impl<BFloat16>(grad_output, input, target, weight, reduction, ignore_index, total_weight);
+    if (input.dtype() == DType::Half) return nll_loss_backward_impl<Half>(grad_output, input, target, weight, reduction, ignore_index, total_weight);
+    TP_THROW(NotImplementedError, "nll_loss backward only supports Float32, Float64, BFloat16 and Half");
 }
 
 // (N, C, H, W), target (N, H, W); every spatial position is an independent
@@ -195,7 +211,9 @@ std::tuple<Tensor, Tensor> nll_loss2d_impl(const Tensor& input, const Tensor& ta
 std::tuple<Tensor, Tensor> nll_loss2d_kernel(const Tensor& input, const Tensor& target, const std::optional<Tensor>& weight, int64_t reduction, int64_t ignore_index) {
     if (input.dtype() == DType::Float32) return nll_loss2d_impl<float>(input, target, weight, reduction, ignore_index);
     if (input.dtype() == DType::Float64) return nll_loss2d_impl<double>(input, target, weight, reduction, ignore_index);
-    TP_THROW(NotImplementedError, "nll_loss2d only supports Float32/Float64");
+    if (input.dtype() == DType::BFloat16) return nll_loss2d_impl<BFloat16>(input, target, weight, reduction, ignore_index);
+    if (input.dtype() == DType::Half) return nll_loss2d_impl<Half>(input, target, weight, reduction, ignore_index);
+    TP_THROW(NotImplementedError, "nll_loss2d only supports Float32, Float64, BFloat16 and Half");
 }
 
 template <typename scalar_t>
@@ -209,7 +227,11 @@ Tensor nll_loss2d_backward_impl(const Tensor& grad_output, const Tensor& input, 
 
     const Tensor target_c = target.contiguous();
     const int64_t* target_data = target_c.data_ptr<int64_t>();
-    const scalar_t* weight_data = weight.has_value() && weight->defined() ? weight->data_ptr<scalar_t>() : nullptr;
+    Tensor weight_c;
+    if (weight.has_value() && weight->defined()) {
+        weight_c = weight->contiguous();
+    }
+    const scalar_t* weight_data = weight_c.defined() ? weight_c.data_ptr<scalar_t>() : nullptr;
 
     Tensor grad_input = Tensor::zeros({N, C, H, W}, input.dtype(), input.device());
     scalar_t* grad_input_data = grad_input.data_ptr<scalar_t>();
@@ -245,7 +267,9 @@ Tensor nll_loss2d_backward_impl(const Tensor& grad_output, const Tensor& input, 
 Tensor nll_loss2d_backward_kernel(const Tensor& grad_output, const Tensor& input, const Tensor& target, const std::optional<Tensor>& weight, int64_t reduction, int64_t ignore_index, const Tensor& total_weight) {
     if (input.dtype() == DType::Float32) return nll_loss2d_backward_impl<float>(grad_output, input, target, weight, reduction, ignore_index, total_weight);
     if (input.dtype() == DType::Float64) return nll_loss2d_backward_impl<double>(grad_output, input, target, weight, reduction, ignore_index, total_weight);
-    TP_THROW(NotImplementedError, "nll_loss2d backward only supports Float32/Float64");
+    if (input.dtype() == DType::BFloat16) return nll_loss2d_backward_impl<BFloat16>(grad_output, input, target, weight, reduction, ignore_index, total_weight);
+    if (input.dtype() == DType::Half) return nll_loss2d_backward_impl<Half>(grad_output, input, target, weight, reduction, ignore_index, total_weight);
+    TP_THROW(NotImplementedError, "nll_loss2d backward only supports Float32, Float64, BFloat16 and Half");
 }
 
 // MSE Loss
