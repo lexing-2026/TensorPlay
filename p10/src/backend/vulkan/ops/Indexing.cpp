@@ -63,6 +63,45 @@ void validate_gather_operand(const Tensor& t, const char* name) {
       std::string("Vulkan ") + name + " supports 1d to 4d tensors");
 }
 
+// A row lookup copies whole rows without reading what they hold, so a payload
+// of counts travels as well as one that measures.  The lookups that also write
+// into a payload keep the narrower check above, since their write path has to
+// know the width it is storing.
+void validate_row_lookup_operand(const Tensor& t, const char* name) {
+  TP_CHECK(
+      t.dtype() == DType::Float32 || t.dtype() == DType::Float16 ||
+          t.dtype() == DType::Int32 || t.dtype() == DType::Int64,
+      std::string("Vulkan ") + name +
+          " supports Float32, Float16, Int32 and Int64 tensors only");
+  TP_CHECK(
+      t.dim() >= 1 && t.dim() <= 4,
+      std::string("Vulkan ") + name + " supports 1d to 4d tensors");
+}
+
+// The number of payload elements one group of words holds: two halves, four
+// words of a measure or a count, or one code wider than a word.
+uint32_t row_lookup_lanes(DType dtype) {
+  if (dtype == DType::Float16) {
+    return 2u;
+  }
+  return dtype == DType::Int64 ? 1u : 4u;
+}
+
+// The linear row lookup that reads and writes one element type at its own
+// width.  The names do not follow one suffix rule, so they are listed.
+const char* row_lookup_buffer_kernel(DType dtype) {
+  switch (dtype) {
+    case DType::Float16:
+      return "index_select_buffer_half";
+    case DType::Int32:
+      return "index_select_buffer_int32";
+    case DType::Int64:
+      return "index_select_buffer_i64";
+    default:
+      return "index_select_buffer";
+  }
+}
+
 struct EmbeddingBlock final {
   int rows;
   int features;
@@ -836,7 +875,7 @@ Tensor index_add_kernel(
 
 Tensor index_select_kernel(
     const Tensor& self, int64_t dim, const Tensor& index) {
-  validate_gather_operand(self, "index_select");
+  validate_row_lookup_operand(self, "index_select");
   TP_CHECK(
       index.dim() == 1,
       "Vulkan index_select: index should be a vector");
@@ -860,7 +899,8 @@ Tensor index_select_kernel(
   const int64_t rows = self.size(wrapped);
   const int64_t index_count = index.numel();
   const int64_t out_count = planes * index_count * width;
-  // Both routes address elements as signed words of a four-lane group.
+  // The walk addresses elements through signed words, so it cannot run past
+  // the reach of the word it counts with.
   TP_CHECK(
       self.numel() <= std::numeric_limits<int32_t>::max() &&
           out_count <= std::numeric_limits<int32_t>::max(),
@@ -883,9 +923,11 @@ Tensor index_select_kernel(
 
   // The texel route walks the payload as a flat 1-D texture, so the source seen
   // whole and the gathered rows must both have an image form, and the index
-  // list must fit one texel per entry.  Otherwise the gather runs flat: a
-  // texture-stored source is copied into dense linear storage, whose row-major
-  // order is already the flattened one, so no 1-D view is materialized.
+  // list must fit one texel per entry.  A payload whose element is wider than a
+  // word has no image form at all, so it is already linear and takes the flat
+  // route.  Otherwise the gather runs flat: a texture-stored source is copied
+  // into dense linear storage, whose row-major order is already the flattened
+  // one, so no 1-D view is materialized.
   const bool texture_gather =
       v_self.storage_type() != api::StorageType::BUFFER &&
       v_indices.storage_type() != api::StorageType::BUFFER &&
@@ -901,7 +943,7 @@ Tensor index_select_kernel(
     api::vTensor v_out_buf{
         context, {out_count}, self.dtype(), api::StorageType::BUFFER,
         api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
-    const uint32_t lanes = self.dtype() == DType::Float16 ? 2u : 4u;
+    const uint32_t lanes = row_lookup_lanes(self.dtype());
     const uint32_t n = static_cast<uint32_t>(out_count);
     const struct IndexSelectBufferBlock {
       int32_t width;
@@ -917,9 +959,7 @@ Tensor index_select_kernel(
     api::UniformParamsBuffer params(context, block);
     api::PipelineBarrier pipeline_barrier{};
     context->submit_compute_job(
-        VK_KERNEL_FROM_STR(self.dtype() == DType::Float16
-                               ? "index_select_buffer_half"
-                               : "index_select_buffer"),
+        VK_KERNEL_FROM_STR(row_lookup_buffer_kernel(self.dtype())),
         pipeline_barrier,
         {api::utils::div_up(n, lanes), 1u, 1u}, {256u, 1u, 1u}, VK_NULL_HANDLE,
         v_out_buf.buffer(
@@ -969,7 +1009,10 @@ Tensor index_select_kernel(
       static_cast<uint32_t>(planes)};
 
   context->submit_compute_job(
-      VK_KERNEL(index_select), pipeline_barrier, grid,
+      VK_KERNEL_FROM_STR(
+          self.dtype() == DType::Int32 ? "index_select_int32"
+                                       : "index_select"),
+      pipeline_barrier, grid,
       adaptive_work_group_size(grid), VK_NULL_HANDLE,
       v_output.image(
           pipeline_barrier,
