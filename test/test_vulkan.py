@@ -10122,6 +10122,183 @@ class TestVulkanEmbeddingBackward(unittest.TestCase):
                 8, -1, False)
 
 
+class TestVulkanSquaredErrorLoss(unittest.TestCase):
+    # How far an element sits from the value it is matched with is squared in
+    # one walk, so an averaged answer is a reduction away and a gradient is the
+    # same distance counted twice, shared by the count it was averaged over.
+
+    @staticmethod
+    def _uploaded(array, dtype=np.float32):
+        # A payload that arrives from the host keeps the image form.
+        return tensorplay.from_numpy(np.asarray(array, dtype)).to("vulkan")
+
+    @staticmethod
+    def _built(array, dtype=np.float32):
+        # A payload the device lays out itself keeps its elements in words.
+        return tensorplay.tensor(np.asarray(array, dtype), device="vulkan")
+
+    @staticmethod
+    def _uses_dense_storage(payload):
+        # Only single precision has both a texture and a linear form of lerp, so
+        # a lerp that reports the missing image marks a payload that keeps its
+        # elements in words.  Both squared-error walks are asked for below, and
+        # this is what says they were.
+        import tensorplay.functional as F
+        try:
+            F.lerp(payload, payload, 0.5)
+            return False
+        except RuntimeError:
+            return True
+
+    @staticmethod
+    def _half(array):
+        return np.asarray(array, np.float16).astype(np.float32)
+
+    @staticmethod
+    def _back(tensor):
+        return tensor.cpu().numpy().astype(np.float64)
+
+    def test_the_squared_error_walks_both_storages(self):
+        from tensorplay.nn.functional import mse_loss
+
+        rng = np.random.default_rng(4)
+        for shape in ((5, 7), (24,), (3, 5, 2)):
+            values = rng.standard_normal(shape).astype(np.float32)
+            compared = rng.standard_normal(shape).astype(np.float32)
+            squares = (values - compared) ** 2
+            for name, make in (("image", self._uploaded),
+                               ("word", self._built)):
+                first = make(values)
+                second = make(compared)
+                self.assertIs(
+                    self._uses_dense_storage(first), make == self._built,
+                    f"a {name} plane was not the storage its builder answers")
+                for reduction, want in (
+                        ("none", squares),
+                        ("mean", float(squares.mean())),
+                        ("sum", float(squares.sum()))):
+                    got = mse_loss(first, second, reduction)
+                    self.assertTrue(
+                        got.device.is_vulkan(),
+                        f"a {name} {reduction} loss left the device")
+                    if reduction == "none":
+                        self.assertEqual(
+                            list(got.shape), list(shape),
+                            f"a {name} unreduced loss changed the plane it walks")
+                    np.testing.assert_allclose(
+                        self._back(got), np.asarray(want, np.float64),
+                        rtol=1e-4, atol=1e-5,
+                        err_msg=f"a {name} {reduction} loss missed the squares")
+
+    def test_the_squared_error_reads_a_narrow_plane(self):
+        from tensorplay.nn.functional import mse_loss
+
+        rng = np.random.default_rng(9)
+        values = self._half(rng.standard_normal((6, 11)))
+        compared = self._half(rng.standard_normal((6, 11)))
+        squares = (values - compared) ** 2
+        for make in (self._uploaded, self._built):
+            first = make(values, np.float16)
+            second = make(compared, np.float16)
+            self.assertEqual(first.dtype, tensorplay.float16,
+                             "a narrow plane left its own width")
+            for reduction, want in (
+                    ("none", squares),
+                    ("mean", float(squares.mean())),
+                    ("sum", float(squares.sum()))):
+                got = mse_loss(first, second, reduction)
+                self.assertEqual(
+                    got.dtype, tensorplay.float16,
+                    f"a narrow {reduction} loss answered wider than its plane")
+                np.testing.assert_allclose(
+                    self._back(got), np.asarray(want, np.float64),
+                    rtol=6e-3, atol=6e-3,
+                    err_msg=f"a narrow {reduction} loss missed the squares")
+
+    def test_the_squared_error_gradient_counts_the_distance_twice(self):
+        from tensorplay.nn.functional import mse_loss
+
+        rng = np.random.default_rng(13)
+        values = rng.standard_normal((6, 9)).astype(np.float32)
+        compared = rng.standard_normal((6, 9)).astype(np.float32)
+        incoming = rng.standard_normal((6, 9)).astype(np.float32)
+        count = values.size
+        distance = 2.0 * (values - compared)
+        for make in (self._uploaded, self._built):
+            for reduction, want in (
+                    ("mean", distance * (1.0 / count)),
+                    ("sum", distance),
+                    ("none", distance * incoming)):
+                plane = make(values).detach().requires_grad_(True)
+                loss = mse_loss(plane, make(compared), reduction)
+                if reduction == "none":
+                    loss.backward(make(incoming))
+                else:
+                    loss.backward()
+                self.assertIsNotNone(
+                    plane.grad, f"a {reduction} loss handed back no gradient")
+                self.assertTrue(
+                    plane.grad.device.is_vulkan(),
+                    f"a {reduction} gradient left the device")
+                np.testing.assert_allclose(
+                    self._back(plane.grad), want.astype(np.float64),
+                    rtol=1e-4, atol=1e-6,
+                    err_msg=f"a {reduction} gradient miscounted the distance")
+
+    def test_a_narrower_target_is_matched_element_by_element(self):
+        from tensorplay.nn.functional import mse_loss
+
+        rng = np.random.default_rng(17)
+        values = rng.standard_normal((5, 8)).astype(np.float32)
+        column = rng.standard_normal((5, 1)).astype(np.float32)
+        squares = (values - column) ** 2
+        plane = self._uploaded(values)
+        want = float(squares.mean())
+        np.testing.assert_allclose(
+            self._back(mse_loss(plane, self._uploaded(column), "mean")), want,
+            rtol=1e-4, atol=1e-5,
+            err_msg="a single-column target was not matched across the plane")
+        # A target still held by the host is read on the device it compares with.
+        host_target = tensorplay.from_numpy(column.copy())
+        np.testing.assert_allclose(
+            self._back(mse_loss(plane, host_target, "sum")),
+            float(squares.sum()), rtol=1e-4, atol=1e-5,
+            err_msg="a host target was not carried onto the plane")
+
+    def test_a_model_trains_on_the_squared_error(self):
+        from tensorplay.nn import Linear, MSELoss
+        from tensorplay.optim import AdamW
+
+        tensorplay.manual_seed(5)
+        rng = np.random.default_rng(21)
+        model = Linear(24, 8).to(tensorplay.float16).to("vulkan")
+        feed = tensorplay.from_numpy(
+            self._half(rng.standard_normal((32, 24)))
+        ).to("vulkan").to(tensorplay.float16)
+        wanted = tensorplay.from_numpy(
+            self._half(rng.standard_normal((32, 8)))
+        ).to("vulkan").to(tensorplay.float16)
+        opt = AdamW(model.parameters(), lr=3.0e-3)
+        crit = MSELoss()
+
+        losses = []
+        for _ in range(12):
+            opt.zero_grad()
+            loss = crit(model(feed), wanted)
+            losses.append(float(loss))
+            loss.backward()
+            opt.step()
+
+        self.assertTrue(all(np.isfinite(v) for v in losses),
+                        f"losses left the finite range: {losses}")
+        self.assertLess(losses[-1], losses[0],
+                        f"loss did not fall: {losses[0]} then {losses[-1]}")
+        for name, parameter in model.named_parameters():
+            self.assertTrue(
+                np.isfinite(parameter.detach().cpu().numpy()).all(),
+                f"{name} left the finite range")
+
+
 class TestVulkanNarrowTraining(unittest.TestCase):
     # A walk that answers one parameter at a time keeps the running averages of
     # a narrow parameter one plane wider, because the share a small gradient
