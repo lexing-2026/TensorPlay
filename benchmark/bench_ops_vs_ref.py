@@ -1,16 +1,23 @@
-"""Per-kernel CUDA micro-benchmark: this tree's kernels against a second
-runtime's, same shapes and dtypes on the same device.
+"""Per-kernel micro-benchmark: this tree's kernels against a second runtime's,
+same shapes and dtypes on the same device.
 
 Every case reports best-of-N milliseconds for both sides plus the ratio
 (ours / other); ratios above the flag threshold are the candidates for kernel
 work.  Each side runs its own kernels, so the ratio is the number to track when
 tuning one.
 
+The device picks the clock: the cuda device is timed with cuda events, the
+host with the wall clock.  Both sides run on the same device, and the host
+run reports the thread count each side used, since the host numbers scale
+with it.
+
 Usage:
-    python benchmark/bench_cuda_ops_vs_ref.py [--filter softmax] [--reps 20]
-                                              [--threshold 1.2] [--dtype f16,f32]
+    python benchmark/bench_ops_vs_ref.py [--device cuda|cpu] [--filter softmax]
+                                         [--reps 20] [--threshold 1.2]
+                                         [--dtype f16,f32]
 """
 import argparse
+import os
 import time
 
 import torch
@@ -36,18 +43,31 @@ def O(x):
     return torch.from_dlpack(tp.to_dlpack(x))
 
 
-def timeit(fn, reps, warmup=5):
+def timeit(fn, reps, device="cuda", warmup=5):
+    """Best-of-N milliseconds for one call.
+
+    The cuda device is timed with cuda events, so the number is device time
+    alone.  The host is timed with the wall clock, which also carries the
+    dispatch cost of the call itself -- the number a caller on the host pays.
+    """
     for _ in range(warmup):
         fn()
-    torch.cuda.synchronize()
+    if device == "cuda":
+        torch.cuda.synchronize()
+        best = float("inf")
+        for _ in range(reps):
+            s, e = torch.cuda.Event(True), torch.cuda.Event(True)
+            s.record()
+            fn()
+            e.record()
+            torch.cuda.synchronize()
+            best = min(best, s.elapsed_time(e))
+        return best
     best = float("inf")
     for _ in range(reps):
-        s, e = torch.cuda.Event(True), torch.cuda.Event(True)
-        s.record()
+        t0 = time.perf_counter()
         fn()
-        e.record()
-        torch.cuda.synchronize()
-        best = min(best, s.elapsed_time(e))
+        best = min(best, (time.perf_counter() - t0) * 1000.0)
     return best
 
 
@@ -301,8 +321,9 @@ def build_cases(dev, dtype):
               lambda x=x: torch.nn.functional.adaptive_avg_pool2d(x, 7)))
     # ---- 多张量 foreach 家族（Foreach*Kernels.cu）----
     # 优化器规模的张量组：尺寸按 5 种典型参数张量循环铺开，列表越长越
-    # 能体现单次分组启动相对逐张量启动的差距。
-    for count in (120, 400):
+    # 能体现单次分组启动相对逐张量启动的差距。主机上的这组张量一直留在
+    # 内存里，规模比设备上的小一圈。
+    for count in ((120, 400) if dev == "cuda" else (20, 60)):
         fa = [torch.randn(*[(4096, 4096), (2048, 1024), (1024, 1024),
                             (4096,), (512, 4096)][i % 5],
                           generator=g, device=dev, dtype=dtype)
@@ -334,8 +355,13 @@ def main():
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
 
-    torch.cuda.init()
-    print(f"device={torch.cuda.get_device_name(0)} dtype={args.dtype} reps={args.reps}")
+    if args.device == "cuda":
+        torch.cuda.init()
+        dev_name = torch.cuda.get_device_name(0)
+    else:
+        dev_name = (f"cpu ({os.cpu_count()} cpus, ours {tp.get_num_threads()} threads, "
+                    f"ref {torch.get_num_threads()} threads)")
+    print(f"device={dev_name} dtype={args.dtype} reps={args.reps}")
     print(f"{'case':44s} {'ours(ms)':>10s} {'ref(ms)':>10s} {'ratio':>7s}")
     slow = []
     for dt in args.dtype.split(","):
@@ -344,8 +370,8 @@ def main():
             if args.filter and args.filter not in label:
                 continue
             try:
-                t_ours = timeit(ours, args.reps)
-                t_ref = timeit(ref, args.reps)
+                t_ours = timeit(ours, args.reps, args.device)
+                t_ref = timeit(ref, args.reps, args.device)
             except Exception as exc:                      # 未实现的算子直接跳过
                 print(f"{label:44s} SKIP ({type(exc).__name__}: {str(exc)[:40]})")
                 continue
