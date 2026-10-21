@@ -1087,6 +1087,22 @@ compare_buffer:
     OPERATOR: greaterThan(X, Y)
   - NAME: ge_buffer
     OPERATOR: greaterThanEqual(X, Y)
+compare_buffer_wide:
+  parameter_names_with_default_values:
+    OPERATOR: wide_less(X, Y)
+  shader_variants:
+  - NAME: eq_buffer_wide
+    OPERATOR: wide_equal(X, Y)
+  - NAME: ne_buffer_wide
+    OPERATOR: wide_not_equal(X, Y)
+  - NAME: lt_buffer_wide
+    OPERATOR: wide_less(X, Y)
+  - NAME: le_buffer_wide
+    OPERATOR: wide_less_equal(X, Y)
+  - NAME: gt_buffer_wide
+    OPERATOR: wide_greater(X, Y)
+  - NAME: ge_buffer_wide
+    OPERATOR: wide_greater_equal(X, Y)
 compare_scalar:
   parameter_names_with_default_values:
     DTYPE: float
