@@ -33,6 +33,7 @@
 #include "TensorIteratorOps.h"
 #include "OpMathType.h"
 #include "Utils.h"
+#include "cpu/ActivationUnaryKernels.h"
 
 #include <cmath>
 #include <optional>
@@ -44,6 +45,12 @@
 namespace tensorplay {
 
 namespace cpu {
+
+// DispatchStub instances for the tiered softmax backward; defined once here
+// because the tier objects (TP_CPU_KERNEL_SRCS) each compile their own copy
+// and would collide at link time.
+DEFINE_DISPATCH(softmax_backward_lastdim_f32_stub);
+DEFINE_DISPATCH(softmax_backward_lastdim_f64_stub);
 
 // Row-wise softmax kernels live in PointwiseKernels.cpp (same namespace).
 Tensor softmax_kernel(const Tensor& self, int64_t dim, DType dtype);
@@ -86,42 +93,6 @@ void softmax_backward_data_loop(const scalar_t* grad, const scalar_t* out,
             const scalar_t* gcol = grad + base;
             const scalar_t* ocol = out + base;
             scalar_t* rcol = grad_in + base;
-            if (inner == 1) {
-                // A unit stride lets the sum fold several elements at once,
-                // while a runtime stride keeps it to one element per step.
-                if constexpr (LogMode) {
-                    scalar_t s0 = scalar_t(0), s1 = scalar_t(0);
-                    scalar_t s2 = scalar_t(0), s3 = scalar_t(0);
-                    int64_t k = 0;
-                    for (; k + 3 < dim_size; k += 4) {
-                        s0 += gcol[k + 0];
-                        s1 += gcol[k + 1];
-                        s2 += gcol[k + 2];
-                        s3 += gcol[k + 3];
-                    }
-                    scalar_t sum = (s0 + s1) + (s2 + s3);
-                    for (; k < dim_size; ++k) sum += gcol[k];
-                    for (int64_t j = 0; j < dim_size; ++j) {
-                        rcol[j] = gcol[j] - std::exp(ocol[j]) * sum;
-                    }
-                } else {
-                    scalar_t s0 = scalar_t(0), s1 = scalar_t(0);
-                    scalar_t s2 = scalar_t(0), s3 = scalar_t(0);
-                    int64_t k = 0;
-                    for (; k + 3 < dim_size; k += 4) {
-                        s0 += gcol[k + 0] * ocol[k + 0];
-                        s1 += gcol[k + 1] * ocol[k + 1];
-                        s2 += gcol[k + 2] * ocol[k + 2];
-                        s3 += gcol[k + 3] * ocol[k + 3];
-                    }
-                    scalar_t sum = (s0 + s1) + (s2 + s3);
-                    for (; k < dim_size; ++k) sum += gcol[k] * ocol[k];
-                    for (int64_t j = 0; j < dim_size; ++j) {
-                        rcol[j] = ocol[j] * (gcol[j] - sum);
-                    }
-                }
-                continue;
-            }
             if constexpr (LogMode) {
                 // The sum runs over four accumulators: one chain of additions
                 // would keep the walk from folding several elements at once.
@@ -204,6 +175,21 @@ Tensor softmax_backward_data_core(const Tensor& grad_output, const Tensor& outpu
     int64_t outer = 1, inner = 1;
     dim_outer_inner(shape, d, outer, inner);
     const int64_t dim_size = shape[d];
+
+    if (inner == 1) {
+        // The last dim is a unit stride: the vector layer answers it, and
+        // every CPU_CAPABILITY tier brings its own width.
+        if (compute_dt == DType::Float32) {
+            softmax_backward_lastdim_f32_stub(
+                DeviceType::CPU, gc.data_ptr<float>(), oc.data_ptr<float>(),
+                result.data_ptr<float>(), outer, dim_size, log_mode);
+        } else {
+            softmax_backward_lastdim_f64_stub(
+                DeviceType::CPU, gc.data_ptr<double>(), oc.data_ptr<double>(),
+                result.data_ptr<double>(), outer, dim_size, log_mode);
+        }
+        return result;
+    }
 
     if (compute_dt == DType::Float32) {
         if (log_mode) {
