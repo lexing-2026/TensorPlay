@@ -1258,6 +1258,20 @@ Tensor amin_kernel(
   return extremum_impl(self, dims, keepdim, ExtremumKind::kMin);
 }
 
+//
+// The range a payload covers, which is the first thing a quantization observer
+// asks of a weight plane before it names a scale.  Both ends answer in the width
+// the payload is carried in, so the two folds take the walks a single extremum
+// already uses and cover every element type on both storages.  A payload with no
+// lanes has no identity to answer a range with, and the folds say so.
+//
+std::tuple<Tensor, Tensor> aminmax_kernel(
+    const Tensor& self,
+    const std::vector<int64_t>& dims,
+    bool keepdim) {
+  return {amin_kernel(self, dims, keepdim), amax_kernel(self, dims, keepdim)};
+}
+
 Tensor prod_kernel(const Tensor& self, DType dtype) {
   if (self.dtype() == DType::Int64) {
     // A count wider than a word multiplies in the pairs it is carried in; the
@@ -1776,6 +1790,7 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, ReductionKernels) {
   m.impl("min.dim", &tensorplay::vulkan::ops::min_dim_kernel);
   m.impl("amax", &tensorplay::vulkan::ops::amax_kernel);
   m.impl("amin", &tensorplay::vulkan::ops::amin_kernel);
+  m.impl("aminmax", &tensorplay::vulkan::ops::aminmax_kernel);
   m.impl("prod", &tensorplay::vulkan::ops::prod_kernel);
   m.impl("prod.dim_IntList", &tensorplay::vulkan::ops::prod_dim_kernel);
   m.impl("all", &tensorplay::vulkan::ops::all_kernel);
