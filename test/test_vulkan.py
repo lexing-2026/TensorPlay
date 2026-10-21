@@ -9626,5 +9626,160 @@ class TestVulkanLikelihoodLoss(unittest.TestCase):
                 self._device(np.float32(1.0)), x, t, None, 0, -100, None)
 
 
+class TestVulkanSliceScatter(unittest.TestCase):
+    # Writing a block back into a payload is the slice read backwards: the same
+    # bounds decide where the block belongs, and this is the route the gradient
+    # of a slice takes.
+
+    @staticmethod
+    def _window(shape, dim, start, end, step):
+        length = shape[dim]
+        first = 0 if start is None else start
+        last = length if end is None else end
+        if first < 0:
+            first += length
+        if last < 0:
+            last += length
+        first = max(0, min(length, first))
+        last = max(first, min(length, last))
+        return first, last, (last - first + step - 1) // step
+
+    def _scatter(self, self_np, src_np, dim, start, end, step,
+                 dtype=tensorplay.float32):
+        payload = tensorplay.tensor(self_np, dtype=dtype).to("vulkan")
+        block = tensorplay.tensor(src_np, dtype=dtype).to("vulkan")
+        out = tensorplay.slice_scatter(payload, block, dim, start, end, step)
+        first, last, _ = self._window(self_np.shape, dim, start, end, step)
+        want = self_np.copy()
+        key = [slice(None)] * self_np.ndim
+        key[dim] = np.arange(first, last, step)
+        want[tuple(key)] = src_np
+        got = out.cpu().numpy()
+        self.assertEqual(got.shape, want.shape)
+        np.testing.assert_allclose(
+            got, want, rtol=0,
+            atol=2.0e-3 if dtype == tensorplay.float16 else 0.0)
+        return got
+
+    def test_a_window_on_either_axis(self):
+        rng = np.random.default_rng(3)
+        base = (rng.standard_normal((6, 3)) * 3).astype(np.float32)
+        self._scatter(base, base[1:3], 0, 1, 3, 1)
+        self._scatter(base, base[:, 2:5], 1, 2, 5, 1)
+        four = (rng.standard_normal((2, 3, 5, 4))).astype(np.float32)
+        self._scatter(four, four[:, :, 2:4], 2, 2, 4, 1)
+        # A payload with no axis above its last one keeps its own row order.
+        line = (rng.standard_normal((11,))).astype(np.float32)
+        self._scatter(line, line[4:8], 0, 4, 8, 1)
+
+    def test_bounds_that_lean_on_the_clamp(self):
+        rng = np.random.default_rng(5)
+        base = (rng.standard_normal((6, 3))).astype(np.float32)
+        self._scatter(base, base[:3], 0, None, 3, 1)
+        self._scatter(base, base[3:], 0, 3, None, 1)
+        self._scatter(base, base[3:5], 0, -3, -1, 1)
+        self._scatter(base, base[3:], 0, 3, 99, 1)
+        self._scatter(base, base[:0], 0, -99, 0, 1)
+        # A window that closes before it opens writes nothing at all.
+        self._scatter(base, np.zeros((0, 3), np.float32), 0, 4, 2, 1)
+        self._scatter(base, base, 0, 0, 6, 1)
+        self._scatter(
+            np.zeros((0, 3), np.float32), np.zeros((0, 3), np.float32),
+            0, 0, 0, 1)
+
+    def test_a_step_wider_than_one(self):
+        # Every nth row the window keeps is written and the rows between them
+        # keep the value they were read with.
+        rng = np.random.default_rng(7)
+        rows = (rng.standard_normal((9, 3))).astype(np.float32)
+        self._scatter(rows, rows[1:8:2], 0, 1, 8, 2)
+        cols = (rng.standard_normal((4, 9))).astype(np.float32)
+        self._scatter(cols, cols[:, 0:9:3], 1, 0, 9, 3)
+        line = (rng.standard_normal((10,))).astype(np.float32)
+        self._scatter(line, line[2:9:3], 0, 2, 9, 3)
+        four = (rng.standard_normal((2, 3, 8, 4))).astype(np.float32)
+        self._scatter(four, four[:, :, 1:7:2], 2, 1, 7, 2)
+        self._scatter(rows, rows[0:9:9], 0, 0, 9, 9)
+
+    def test_the_narrow_float_and_a_source_of_another_type(self):
+        rng = np.random.default_rng(11)
+        base = (rng.standard_normal((6, 4))).astype(np.float32)
+        self._scatter(base, base[2:4], 0, 2, 4, 1, dtype=tensorplay.float16)
+        # The result carries the dtype the payload was read with, so a source
+        # of another is converted before it is written.
+        block = (rng.standard_normal((2, 4))).astype(np.float16)
+        out = tensorplay.slice_scatter(
+            tensorplay.tensor(base).to("vulkan"),
+            tensorplay.tensor(block, dtype=tensorplay.float16).to("vulkan"),
+            0, 1, 3, 1)
+        got = out.cpu().numpy()
+        self.assertEqual(got.dtype, np.float32)
+        want = base.copy()
+        want[1:3] = block.astype(np.float32)
+        np.testing.assert_allclose(got, want, rtol=0, atol=2.0e-3)
+
+    def test_a_payload_with_no_image_form(self):
+        rng = np.random.default_rng(13)
+        big = (rng.standard_normal((40, 4096, 101)) * 0.1).astype(np.float32)
+        self._scatter(big, big[5:9], 0, 5, 9, 1)
+        self._scatter(big, big[:, 0:40000:4], 1, 0, 40000, 4)
+
+    def test_the_gradient_of_a_slice(self):
+        # The gradient of a slice is the slice's own write: the rows the slice
+        # took receive it, and the payload keeps zeros everywhere else.
+        rng = np.random.default_rng(17)
+        for shape, dim, start, end, step in [
+                ((7, 5), 0, 2, 5, 1),
+                ((5, 8), 1, 1, 6, 1),
+                ((6, 4), 0, 3, None, 1),
+                ((6, 4), 0, -3, -1, 1),
+                ((9, 4), 0, 1, 8, 2),
+                ((4, 9, 2), 1, 0, 9, 3),
+                ((3, 5, 4), 1, 1, 4, 1),
+                ((5, 3), 0, None, None, 1)]:
+            base = (rng.standard_normal(shape)).astype(np.float32)
+            first, last, kept = self._window(shape, dim, start, end, step)
+            block_shape = list(shape)
+            block_shape[dim] = kept
+            block = (rng.standard_normal(block_shape)).astype(np.float32)
+            answers = {}
+            for device in ("cpu", "vulkan"):
+                a = tensorplay.tensor(base, device=device).detach().requires_grad_(True)
+                b = tensorplay.tensor(block, device=device).detach().requires_grad_(True)
+                out = tensorplay.slice_scatter(a, b, dim, start, end, step)
+                out.backward(tensorplay.ones_like(out))
+                answers[device] = (
+                    out.detach().cpu().numpy(),
+                    a.grad.cpu().numpy(),
+                    b.grad.cpu().numpy())
+            for name, on_device, on_host in zip(
+                    ("result", "grad_self", "grad_src"),
+                    answers["cpu"], answers["vulkan"]):
+                np.testing.assert_allclose(
+                    on_device, on_host, rtol=1.0e-6, atol=1.0e-5,
+                    err_msg=f"{shape} dim={dim} step={step} {name}")
+
+    def test_outside_the_supported_surface_refuses(self):
+        payload = tensorplay.zeros((4, 3), device="vulkan")
+        block = tensorplay.zeros((2, 3), device="vulkan")
+        with self.assertRaisesRegex(RuntimeError, "step must be positive"):
+            tensorplay.slice_scatter(payload, block, 0, 0, 4, 0)
+        with self.assertRaisesRegex(RuntimeError, "step must be positive"):
+            tensorplay.slice_scatter(payload, block, 0, 0, 4, -2)
+        with self.assertRaisesRegex(RuntimeError, "size equal to the slice"):
+            tensorplay.slice_scatter(
+                payload, tensorplay.zeros((3, 3), device="vulkan"),
+                0, 0, 2, 1)
+        with self.assertRaisesRegex(RuntimeError, "Float32 and Float16"):
+            tensorplay.slice_scatter(
+                tensorplay.zeros(
+                    (4, 3), dtype=tensorplay.int32, device="vulkan"),
+                tensorplay.zeros(
+                    (2, 3), dtype=tensorplay.int32, device="vulkan"),
+                0, 0, 2, 1)
+        with self.assertRaisesRegex(RuntimeError, "dim out of range"):
+            tensorplay.slice_scatter(payload, block, 2, 0, 2, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
