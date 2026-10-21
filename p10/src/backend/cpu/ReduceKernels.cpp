@@ -182,12 +182,6 @@ Tensor reduce_dims_impl(const Tensor& self, std::vector<int64_t> dims_in,
 
 }  // namespace
 
-struct LseState {
-    double m;
-    double s;
-    bool nan_flag;
-};
-
 static void zero_numel_check_dims(const Tensor& self,
                                   const std::vector<int64_t>& dims,
                                   const char* fn_name) {
@@ -278,37 +272,40 @@ Tensor logsumexp_cpu(const Tensor& self, const std::vector<int64_t>& dim, bool k
     if (dims.empty()) {
         for (int64_t i = 0; i < nd; ++i) dims.push_back(i);
     }
-    LseState init{-std::numeric_limits<double>::infinity(), 0.0, false};
-    return reduce_dims_impl<LseState>(
-        self, dims, keepdim, out_dtype, init,
-        [](LseState acc, double value) {
-            if (value != value) {
-                acc.nan_flag = true;
-                return acc;
-            }
-            if (acc.m == -std::numeric_limits<double>::infinity()) {
-                acc.m = value;
-                acc.s = 1.0;
-                return acc;
-            }
-            // A value equal to the running maximum adds exactly one; written
-            // as exp(value - m) it would be exp(inf - inf) for a repeated
-            // infinity.
-            if (value > acc.m) {
-                acc.s = acc.s * std::exp(acc.m - value) + 1.0;
-                acc.m = value;
-            } else if (value == acc.m) {
-                acc.s += 1.0;
-            } else {
-                acc.s += std::exp(value - acc.m);
-            }
-            return acc;
-        },
-        [](LseState acc) {
-            if (acc.nan_flag) return std::numeric_limits<double>::quiet_NaN();
-            if (acc.m == -std::numeric_limits<double>::infinity()) return acc.m;
-            return acc.m + std::log(acc.s);
-        });
+    // The answer is built the way the reference runtime builds it: the
+    // maximum over the reduced axes, the exponentials of the difference to
+    // it, their sum, and the logarithm of that sum.  Every step is one of
+    // the vectorized kernels, where a single walk over the values with a
+    // running state would have to touch them one at a time.
+    Tensor x = self;
+    if (isReducedFloatingType(x.dtype())) {
+        // A narrow input is walked at single precision.
+        x = x.to(DType::Float32);
+    } else if (integral) {
+        x = x.to(out_dtype);
+    }
+    Tensor maxes = amax_cpu(x, dims, /*keepdim=*/true);
+    // An infinite maximum would make every exponential overflow, so it is
+    // set to zero; the sum then carries the infinity on its own.
+    const double infinity = std::numeric_limits<double>::infinity();
+    Tensor safe = maxes.masked_fill(maxes.abs().eq(Scalar(infinity)),
+                                    Scalar(0.0));
+    Tensor shifted = x.sub(safe);
+    shifted.exp_();
+    Tensor sums = sum_dim_stub(DeviceType::CPU, shifted, dims, keepdim, out_dtype);
+    Tensor result = sums.log_();
+    if (keepdim) {
+        result = result.add(safe);
+    } else {
+        // The maximum is squeezed axis by axis, from the last one back, so
+        // that the axis numbers of the ones before it stay valid.
+        std::vector<int64_t> descending(dims);
+        std::sort(descending.rbegin(), descending.rend());
+        Tensor flat = safe;
+        for (int64_t d : descending) flat = flat.squeeze(d);
+        result = result.add(flat);
+    }
+    return result.to(out_dtype);
 }
 
 Tensor nansum_cpu(const Tensor& self, const std::vector<int64_t>& dim_in,
