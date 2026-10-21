@@ -960,6 +960,107 @@ Tensor index_select_cpu(const Tensor& self, int64_t dim, const Tensor& index) {
 // same destination.
 // ---------------------------------------------------------------------------
 
+// Whether the index names a destination more than once.  A bitmap per thread
+// marks the slots it saw, and a slot marked by two of them is named twice.
+// A wide range of slots would make the marks large, so it is not looked at.
+static bool index_names_a_slot_twice(const int64_t* ip, int64_t n_idx,
+                                     int64_t slots) {
+    const int64_t kMaxSlots = 1 << 18;
+    if (slots > kMaxSlots) return true;
+    const int threads = get_num_threads();
+    const int64_t words = (slots + 63) / 64;
+    std::vector<std::vector<uint64_t>> marks(static_cast<size_t>(threads));
+    std::vector<char> repeated(static_cast<size_t>(threads), 0);
+    parallel_for(0, n_idx, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        const size_t t = static_cast<size_t>(get_thread_num());
+        std::vector<uint64_t>& mine = marks[t];
+        if (mine.empty()) mine.assign(static_cast<size_t>(words), 0);
+        for (int64_t i = begin; i < end; ++i) {
+            const uint64_t slot = static_cast<uint64_t>(ip[i]);
+            uint64_t& word = mine[static_cast<size_t>(slot >> 6)];
+            const uint64_t bit = uint64_t(1) << (slot & 63);
+            // A slot this thread saw before is named twice.
+            if (word & bit) repeated[t] = 1;
+            word |= bit;
+        }
+    });
+    for (int t = 0; t < threads; ++t) {
+        if (repeated[static_cast<size_t>(t)]) return true;
+    }
+    for (int64_t w = 0; w < words; ++w) {
+        uint64_t seen = 0;
+        for (int t = 0; t < threads; ++t) {
+            if (marks[static_cast<size_t>(t)].empty()) continue;
+            const uint64_t bits =
+                marks[static_cast<size_t>(t)][static_cast<size_t>(w)];
+            if (seen & bits) return true;
+            seen |= bits;
+        }
+    }
+    return false;
+}
+
+// The entries of an index, grouped by the task that owns the destination each
+// entry names.  The destinations are split into as many ranges as there are
+// tasks, and every entry goes to the task that owns its destination: the adds
+// of one destination then stay in the order of the index, and the source of an
+// entry is read once.
+struct OwnedEntries {
+    std::vector<int64_t> entries;
+    std::vector<int64_t> offsets;
+};
+
+static OwnedEntries index_entries_by_owner(const int64_t* ip, int64_t n_idx,
+                                           int64_t row, int64_t tasks) {
+    OwnedEntries owned;
+    std::vector<int64_t> edges(static_cast<size_t>(tasks) + 1, 0);
+    for (int64_t t = 0; t <= tasks; ++t) {
+        edges[static_cast<size_t>(t)] = row * t / tasks;
+    }
+    // The task that owns a destination: the ranges are even, so the task
+    // follows from the destination, and the edges settle the few slots that
+    // land on a border.
+    const double per_range = static_cast<double>(tasks) / static_cast<double>(row);
+    auto owner_of = [&](int64_t slot) {
+        int64_t t = static_cast<int64_t>(static_cast<double>(slot) * per_range);
+        if (t > 0 && slot < edges[static_cast<size_t>(t)]) --t;
+        if (t + 1 < tasks && slot >= edges[static_cast<size_t>(t) + 1]) ++t;
+        return t;
+    };
+    // How many entries each task takes, counted per thread.
+    const int threads = get_num_threads();
+    std::vector<std::vector<int64_t>> per_thread(static_cast<size_t>(threads));
+    parallel_for(0, n_idx, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        const size_t t = static_cast<size_t>(get_thread_num());
+        std::vector<int64_t>& mine = per_thread[t];
+        if (mine.empty()) mine.assign(static_cast<size_t>(tasks), 0);
+        for (int64_t i = begin; i < end; ++i) {
+            mine[static_cast<size_t>(owner_of(ip[i]))] += 1;
+        }
+    });
+    owned.offsets.assign(static_cast<size_t>(tasks) + 1, 0);
+    for (int64_t t = 0; t < tasks; ++t) {
+        int64_t total = 0;
+        for (int th = 0; th < threads; ++th) {
+            // A thread that took no entries counted nothing.
+            if (per_thread[static_cast<size_t>(th)].empty()) continue;
+            total += per_thread[static_cast<size_t>(th)][static_cast<size_t>(t)];
+        }
+        owned.offsets[static_cast<size_t>(t) + 1] =
+            owned.offsets[static_cast<size_t>(t)] + total;
+    }
+    // The hand-over walks the index once, so the entries of a task keep the
+    // order they came in.
+    owned.entries.assign(static_cast<size_t>(n_idx), 0);
+    std::vector<int64_t> cursor(owned.offsets.begin(), owned.offsets.end() - 1);
+    for (int64_t i = 0; i < n_idx; ++i) {
+        const int64_t t = owner_of(ip[i]);
+        owned.entries[static_cast<size_t>(
+            cursor[static_cast<size_t>(t)]++)] = i;
+    }
+    return owned;
+}
+
 static void index_add_into(Tensor& dest, const Tensor& self, int64_t dim,
                             const Tensor& index, const Tensor& source) {
     int64_t nd = self.dim();
@@ -979,37 +1080,57 @@ static void index_add_into(Tensor& dest, const Tensor& self, int64_t dim,
     if (!source_is_scalar && source_c.size(dim) != n_idx) {
         TP_THROW(RuntimeError, "index_add: source size along dim must equal index length");
     }
-    // A task owns one outer slot and a run of inner positions and walks the
-    // index in order, so a repeated index adds its rows one after another
-    // instead of racing another task for the same destination.  The run is
-    // as wide as the pool allows: a task per thread, each walking a slice
-    // long enough to vectorise.
-    const int64_t chunks_needed = std::max<int64_t>(
-        1, (get_num_threads() + outer - 1) / outer);
-    const int64_t chunk_c = std::max<int64_t>(
-        1, (inner + chunks_needed - 1) / chunks_needed);
-    const int64_t nchunk_c = (inner + chunk_c - 1) / chunk_c;
-    const int64_t task_grain = std::max<int64_t>(1, GRAIN_SIZE / (n_idx * chunk_c));
+    // An index that names every destination once lets the adds spread over
+    // the pool: the adds of one entry do not touch the destination of
+    // another, so each source row is read once and the answer is the same
+    // as the ordered walk.
+    const bool repeats = index_names_a_slot_twice(ip, n_idx, outer * row);
+    // With a repeated index the adds of one destination have to stay in the
+    // order of the index, so the entries are handed to the task that owns the
+    // destination they name.
+    const int64_t tasks = get_num_threads();
+    const OwnedEntries owned =
+        repeats ? index_entries_by_owner(ip, n_idx, row, tasks) : OwnedEntries();
+    // One entry adds a whole slice, so the grain counts the entries a chunk
+    // covers rather than the elements it touches.
+    const int64_t entry_grain = std::max<int64_t>(1, GRAIN_SIZE / std::max<int64_t>(inner, 1));
 #define TP_IADD_CASE(ctype, name) \
     case DType::name: { \
         ctype* d = dest.data_ptr<ctype>(); \
         const ctype* sp = source_c.data_ptr<ctype>(); \
-        parallel_for(0, outer * nchunk_c, task_grain, [&](int64_t b, int64_t e) { \
-            for (int64_t task = b; task < e; ++task) { \
-                const int64_t o = task / nchunk_c; \
-                const int64_t c0 = (task - o * nchunk_c) * chunk_c; \
-                const int64_t c1 = std::min(c0 + chunk_c, inner); \
-                for (int64_t k = 0; k < n_idx; ++k) { \
-                    ctype* dv = d + (o * row + ip[k]) * inner; \
-                    if (source_is_scalar) { \
-                        for (int64_t c = c0; c < c1; ++c) dv[c] += sp[0]; \
-                    } else { \
-                        const ctype* sv = sp + (o * n_idx + k) * inner; \
-                        for (int64_t c = c0; c < c1; ++c) dv[c] += sv[c]; \
+        if (!repeats) { \
+            parallel_for(0, n_idx, entry_grain, [&](int64_t b, int64_t e) { \
+                for (int64_t k = b; k < e; ++k) { \
+                    for (int64_t o = 0; o < outer; ++o) { \
+                        ctype* dv = d + (o * row + ip[k]) * inner; \
+                        if (source_is_scalar) { \
+                            for (int64_t c = 0; c < inner; ++c) dv[c] += sp[0]; \
+                        } else { \
+                            const ctype* sv = sp + (o * n_idx + k) * inner; \
+                            for (int64_t c = 0; c < inner; ++c) dv[c] += sv[c]; \
+                        } \
                     } \
                 } \
-            } \
-        }); \
+            }); \
+        } else { \
+            parallel_for(0, tasks, 1, [&](int64_t tb, int64_t te) { \
+                for (int64_t t = tb; t < te; ++t) { \
+                    for (int64_t i = owned.offsets[static_cast<size_t>(t)]; \
+                         i < owned.offsets[static_cast<size_t>(t) + 1]; ++i) { \
+                        const int64_t k = owned.entries[static_cast<size_t>(i)]; \
+                        for (int64_t o = 0; o < outer; ++o) { \
+                            ctype* dv = d + (o * row + ip[k]) * inner; \
+                            if (source_is_scalar) { \
+                                for (int64_t c = 0; c < inner; ++c) dv[c] += sp[0]; \
+                            } else { \
+                                const ctype* sv = sp + (o * n_idx + k) * inner; \
+                                for (int64_t c = 0; c < inner; ++c) dv[c] += sv[c]; \
+                            } \
+                        } \
+                    } \
+                } \
+            }); \
+        } \
         break; \
     }
     switch (self.dtype()) {
