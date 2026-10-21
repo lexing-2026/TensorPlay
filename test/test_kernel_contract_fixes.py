@@ -407,6 +407,56 @@ def test_index_add_with_a_scalar_source_adds_it_everywhere_indexed():
 
 
 @pytest.mark.parametrize("device", DEVICES)
+def test_index_add_in_place_sums_into_the_caller_s_buffer(device):
+    # The in-place form writes into the caller's tensor, so a repeated index
+    # adds its rows one after another, just like the out-of-place form.
+    tp.manual_seed(0)
+    base = tp.randn(64, 8, device=device)
+    idx = tp.tensor([3, 3, 1, 7, 0, 3], device=device)
+    src = tp.randn(6, 8, device=device)
+
+    in_place = base.clone()
+    in_place.index_add_(0, idx, src)
+    out_of_place = base.index_add(0, idx, src)
+    assert tp.equal(in_place, out_of_place)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_index_copy_and_fill_in_place_write_into_the_caller_s_buffer(device):
+    tp.manual_seed(0)
+    base = tp.randn(64, 8, device=device)
+    idx = tp.tensor([3, 3, 1, 7, 0, 3], device=device)
+    src = tp.randn(6, 8, device=device)
+
+    copied = base.clone()
+    copied.index_copy_(0, idx, src)
+    assert tp.equal(copied, base.index_copy(0, idx, src))
+
+    filled = base.clone()
+    filled.index_fill_(0, idx, 0.0)
+    assert tp.equal(filled, base.index_fill(0, idx, 0.0))
+    assert tp.equal(filled[3], tp.zeros(8, device=device))
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_index_in_place_on_a_strided_view_writes_only_the_view(device):
+    # A strided destination is addressed through a packed copy, so the write
+    # still lands in the view and not beside it.
+    tp.manual_seed(0)
+    base = tp.zeros(8, 64, device=device)
+    idx = tp.tensor([0, 2, 2], device=device)
+    src = tp.randn(3, 8, device=device)
+
+    expected = base.t().index_add(0, idx, src)
+    base.t().index_add_(0, idx, src)
+    assert tp.equal(base.t(), expected)
+    # Only the indexed rows of the view carry the source.
+    assert tp.equal(base[:, 0], src[0])
+    assert tp.equal(base[:, 2], src[1] + src[2])
+    assert tp.equal(base[:, 1], tp.zeros(8, device=device))
+
+
+@pytest.mark.parametrize("device", DEVICES)
 def test_bitwise_with_a_number_answers_in_the_pair_type(device):
     # An integer number widens a boolean tensor to int64; against an integer
     # tensor it, like a zero-dim tensor, keeps the tensor's own width.

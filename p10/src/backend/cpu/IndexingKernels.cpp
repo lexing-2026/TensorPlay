@@ -5,6 +5,7 @@
 #include "Scalar.h"
 #include "Utils.h"
 #include "Exception.h"
+#include "GradMode.h"
 #include "Half.h"
 #include "BFloat16.h"
 #include "Parallel.h"
@@ -28,6 +29,13 @@ namespace cpu {
 using namespace tensorplay::parallel;
 
 namespace {
+
+// RAII over thread-local GradMode for mutation-free sections.
+struct NoGradGuard {
+    bool prev;
+    NoGradGuard() : prev(GradMode::is_enabled()) { GradMode::set_enabled(false); }
+    ~NoGradGuard() { GradMode::set_enabled(prev); }
+};
 
 inline int64_t wrap_dim(int64_t dim, int64_t ndim) {
     if (dim < 0) dim += ndim;
@@ -914,16 +922,19 @@ Tensor index_select_cpu(const Tensor& self, int64_t dim, const Tensor& index) {
 // ---------------------------------------------------------------------------
 // index_add
 //
-// Adds each source slice into self along the selected dimension.
+// Adds each source slice into the destination along the selected dimension.
+// The destination may be the tensor the values come from, so a repeated index
+// adds its rows one after another instead of racing another task for the
+// same destination.
 // ---------------------------------------------------------------------------
 
-Tensor index_add_cpu(const Tensor& self, int64_t dim, const Tensor& index, const Tensor& source) {
+static void index_add_into(Tensor& dest, const Tensor& self, int64_t dim,
+                            const Tensor& index, const Tensor& source) {
     int64_t nd = self.dim();
     dim = wrap_dim(dim, nd);
     Tensor idx = normalize_index_cpu(index, self.size(dim), "index_add");
-    Tensor result = detail::contiguous_clone(self);
     int64_t n_idx = idx.numel();
-    if (n_idx == 0) return result;
+    if (n_idx == 0) return;
     const int64_t* ip = idx.data_ptr<int64_t>();
     int64_t row = self.size(dim);
     int64_t outer = 1, inner = 1;
@@ -945,7 +956,7 @@ Tensor index_add_cpu(const Tensor& self, int64_t dim, const Tensor& index, const
     const int64_t task_grain = std::max<int64_t>(1, GRAIN_SIZE / (n_idx * chunk_c));
 #define TP_IADD_CASE(ctype, name) \
     case DType::name: { \
-        ctype* d = result.data_ptr<ctype>(); \
+        ctype* d = dest.data_ptr<ctype>(); \
         const ctype* sp = source_c.data_ptr<ctype>(); \
         parallel_for(0, outer * nchunk_c, task_grain, [&](int64_t b, int64_t e) { \
             for (int64_t task = b; task < e; ++task) { \
@@ -970,22 +981,40 @@ Tensor index_add_cpu(const Tensor& self, int64_t dim, const Tensor& index, const
         default: TP_THROW(TypeError, "index_add: unsupported dtype");
     }
 #undef TP_IADD_CASE
+}
+
+Tensor index_add_cpu(const Tensor& self, int64_t dim, const Tensor& index, const Tensor& source) {
+    Tensor result = detail::contiguous_clone(self);
+    index_add_into(result, self, dim, index, source);
     return result;
+}
+
+// The in-place form adds into the caller's buffer; a strided destination is
+// addressed through a packed copy, so it keeps the out-of-place path.
+Tensor& index_add__cpu(Tensor& self, int64_t dim, const Tensor& index, const Tensor& source) {
+    NoGradGuard __tp_nograd;
+    if (self.is_contiguous()) {
+        index_add_into(self, self, dim, index, source);
+        return self;
+    }
+    self.copy_(self.index_add(dim, index, source));
+    return self;
 }
 
 // ---------------------------------------------------------------------------
 // index_copy / index_fill
 //
-// Each selected slice is written into the output.
+// Each selected slice is written into the destination.  The destination may be
+// the tensor the values come from, so the write lands in the caller's buffer.
 // ---------------------------------------------------------------------------
 
-Tensor index_copy_cpu(const Tensor& self, int64_t dim, const Tensor& index, const Tensor& source) {
+static void index_copy_into(Tensor& dest, const Tensor& self, int64_t dim,
+                             const Tensor& index, const Tensor& source) {
     int64_t nd = self.dim();
     dim = wrap_dim(dim, nd);
     Tensor idx = normalize_index_cpu(index, self.size(dim), "index_copy");
-    Tensor result = detail::contiguous_clone(self);
     int64_t n_idx = idx.numel();
-    if (n_idx == 0) return result;
+    if (n_idx == 0) return;
     const int64_t* ip = idx.data_ptr<int64_t>();
     int64_t row = self.size(dim);
     int64_t outer = 1, inner = 1;
@@ -993,7 +1022,7 @@ Tensor index_copy_cpu(const Tensor& self, int64_t dim, const Tensor& index, cons
     Tensor source_c = source.contiguous();
 #define TP_ICOPY_CASE(ctype, name) \
     case DType::name: { \
-        ctype* d = result.data_ptr<ctype>(); \
+        ctype* d = dest.data_ptr<ctype>(); \
         const ctype* sp = source_c.data_ptr<ctype>(); \
         for (int64_t o = 0; o < outer; ++o) { \
             for (int64_t k = 0; k < n_idx; ++k) { \
@@ -1008,7 +1037,24 @@ Tensor index_copy_cpu(const Tensor& self, int64_t dim, const Tensor& index, cons
         default: TP_THROW(TypeError, "index_copy: unsupported dtype");
     }
 #undef TP_ICOPY_CASE
+}
+
+Tensor index_copy_cpu(const Tensor& self, int64_t dim, const Tensor& index, const Tensor& source) {
+    Tensor result = detail::contiguous_clone(self);
+    index_copy_into(result, self, dim, index, source);
     return result;
+}
+
+// The in-place form writes into the caller's buffer; a strided destination is
+// addressed through a packed copy, so it keeps the out-of-place path.
+Tensor& index_copy__cpu(Tensor& self, int64_t dim, const Tensor& index, const Tensor& source) {
+    NoGradGuard __tp_nograd;
+    if (self.is_contiguous()) {
+        index_copy_into(self, self, dim, index, source);
+        return self;
+    }
+    self.copy_(self.index_copy(dim, index, source));
+    return self;
 }
 
 Tensor index_fill_scalar_cpu(const Tensor& self, int64_t dim, const Tensor& index, const Scalar& value);
@@ -1023,21 +1069,24 @@ Tensor index_fill_tensor_cpu(const Tensor& self, int64_t dim, const Tensor& inde
     return index_fill_scalar_cpu(self, dim, index, v);
 }
 
-Tensor index_fill_scalar_cpu(const Tensor& self, int64_t dim, const Tensor& index, const Scalar& value) {
+// Writes the value into every selected slice of the destination.  The
+// destination may be the tensor the values come from, so the write lands in
+// the caller's buffer.
+static void index_fill_into(Tensor& dest, const Tensor& self, int64_t dim,
+                             const Tensor& index, const Scalar& value) {
     int64_t nd = self.dim();
     dim = wrap_dim(dim, nd);
     Tensor idx = normalize_index_cpu(index, self.size(dim), "index_fill",
                                      /*wrap_negative=*/true);
-    Tensor result = detail::contiguous_clone(self);
     int64_t n_idx = idx.numel();
-    if (n_idx == 0) return result;
+    if (n_idx == 0) return;
     const int64_t* ip = idx.data_ptr<int64_t>();
     int64_t row = self.size(dim);
     int64_t outer = 1, inner = 1;
     outer_inner(static_cast<std::vector<int64_t>>(self.shape()), dim, outer, inner);
 #define TP_IFILL_CASE(ctype, name) \
     case DType::name: { \
-        ctype* d = result.data_ptr<ctype>(); \
+        ctype* d = dest.data_ptr<ctype>(); \
         ctype v = value.to<ctype>(); \
         for (int64_t o = 0; o < outer; ++o) { \
             for (int64_t k = 0; k < n_idx; ++k) { \
@@ -1053,12 +1102,22 @@ Tensor index_fill_scalar_cpu(const Tensor& self, int64_t dim, const Tensor& inde
         default: TP_THROW(TypeError, "index_fill: unsupported dtype");
     }
 #undef TP_IFILL_CASE
+}
+
+Tensor index_fill_scalar_cpu(const Tensor& self, int64_t dim, const Tensor& index, const Scalar& value) {
+    Tensor result = detail::contiguous_clone(self);
+    index_fill_into(result, self, dim, index, value);
     return result;
 }
 
+// The in-place forms write into the caller's buffer; a strided destination is
+// addressed through a packed copy, so it keeps the out-of-place path.
 Tensor& index_fill_scalar__cpu(Tensor& self, int64_t dim, const Tensor& index, const Scalar& value) {
-    // slice loop; tp composes it as fill-then-copy_ like the other
-    // in-place index ops.
+    NoGradGuard __tp_nograd;
+    if (self.is_contiguous()) {
+        index_fill_into(self, self, dim, index, value);
+        return self;
+    }
     self.copy_(index_fill_scalar_cpu(self, dim, index, value));
     return self;
 }
@@ -2415,7 +2474,9 @@ TENSORPLAY_LIBRARY_IMPL(CPU, IndexingKernels) {
     m.impl("scatter_add_", scatter_add_inplace_cpu);
     m.impl("index_select", index_select_cpu);
     m.impl("index_add", index_add_cpu);
+    m.impl("index_add_", index_add__cpu);
     m.impl("index_copy", index_copy_cpu);
+    m.impl("index_copy_", index_copy__cpu);
     m.impl("index_fill.Tensor", index_fill_tensor_cpu);
     m.impl("index_fill.Scalar", index_fill_scalar_cpu);
     m.impl("index_fill_.Tensor", index_fill_tensor__cpu);
