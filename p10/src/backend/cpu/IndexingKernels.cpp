@@ -102,6 +102,14 @@ Tensor normalize_index_cpu(const Tensor& index, int64_t upper_bound,
     return index_c;
 }
 
+// The index of a walk, ready to be read: whole numbers in one piece.  The
+// values are checked where the walk reads them, so an index of many values
+// is not walked a second time.
+static Tensor prepare_index_cpu(const Tensor& index) {
+    return index.dtype() == DType::Int64 ? index.contiguous()
+                                          : index.to(DType::Int64).contiguous();
+}
+
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -632,7 +640,7 @@ Tensor gather_cpu(const Tensor& self, int64_t dim, const Tensor& index) {
                      " (input: ", self.size(i), ", index: ", index.size(i), ")");
         }
     }
-    Tensor idx_c = normalize_index_cpu(index, self.size(dim), "gather");
+    Tensor idx_c = prepare_index_cpu(index);
     Tensor self_c = self.contiguous();
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(idx_c.shape()), self.dtype(), self.device());
     // Decomposition runs over the RESULT (=index) shape; the source read
@@ -647,32 +655,43 @@ Tensor gather_cpu(const Tensor& self, int64_t dim, const Tensor& index) {
     int64_t n = result.numel();
     int64_t self_dim_size = self.size(dim);
 
-// One row of the index shape per task step: the row base and the source
-// row base are hoisted, so the inner walk is a pure lookup without any
-// per-element coordinate division.
+// The gather walks the elements of the index shape one at a time: the
+// position inside the shape is kept in step instead of being divided for
+// every element, and the answer is written where the walk is.  The index
+// values are checked where they are read.
 #define TP_GATHER_CASE(ctype, name) \
     case DType::name: { \
         const ctype* s = self_c.data_ptr<ctype>(); \
         const int64_t* ip = idx_c.data_ptr<int64_t>(); \
         ctype* d = result.data_ptr<ctype>(); \
         const int64_t row_elems = idx_dim_size * idx_inner; \
-        const int64_t chunk_c = \
-            std::max<int64_t>(1, GRAIN_SIZE / std::max<int64_t>(idx_inner, 1)); \
-        const int64_t nchunk_c = (idx_dim_size + chunk_c - 1) / chunk_c; \
-        parallel_for(0, idx_outer * nchunk_c, 1, [&](int64_t begin, int64_t end) { \
-            for (int64_t task = begin; task < end; ++task) { \
-                const int64_t g = task / nchunk_c; \
-                const int64_t ci = task - g * nchunk_c; \
-                const int64_t c0 = ci * chunk_c; \
-                const int64_t c1 = std::min(c0 + chunk_c, idx_dim_size); \
-                const int64_t* idx_row = ip + g * row_elems + c0 * idx_inner; \
-                ctype* d_row = d + g * row_elems + c0 * idx_inner; \
-                const ctype* s_row = s + g * self_dim_size * self_inner; \
-                for (int64_t c = c0; c < c1; ++c) { \
-                    for (int64_t t = 0; t < idx_inner; ++t) \
-                        d_row[t] = s_row[idx_row[t] * self_inner + t]; \
-                    idx_row += idx_inner; \
-                    d_row += idx_inner; \
+        parallel_for(0, idx_outer * row_elems, GRAIN_SIZE, [&](int64_t begin, int64_t end) { \
+            int64_t g = begin / row_elems; \
+            int64_t within = begin - g * row_elems; \
+            int64_t c = within / idx_inner; \
+            int64_t t = within - c * idx_inner; \
+            const ctype* s_g = s + g * self_dim_size * self_inner; \
+            const int64_t* ip_g = ip + g * row_elems; \
+            const int64_t* ip_row = ip_g + c * idx_inner; \
+            ctype* d_p = d + begin; \
+            for (int64_t u = begin; u < end; ++u) { \
+                const int64_t pick = ip_row[t]; \
+                if (pick < 0 || pick >= self_dim_size) { \
+                    TP_THROW(IndexError, "gather", ": index out of range"); \
+                } \
+                d_p[0] = s_g[pick * self_inner + t]; \
+                ++d_p; \
+                if (++t == idx_inner) { \
+                    t = 0; \
+                    if (++c == idx_dim_size) { \
+                        c = 0; \
+                        ++g; \
+                        s_g += self_dim_size * self_inner; \
+                        ip_g += row_elems; \
+                        ip_row = ip_g; \
+                    } else { \
+                        ip_row += idx_inner; \
+                    } \
                 } \
             } \
         }); \
@@ -698,13 +717,17 @@ Tensor gather_cpu(const Tensor& self, int64_t dim, const Tensor& index) {
 enum class ScatterMode { Assign, Add };
 
 // Index layout [outer][dim][inner]; destination layout [outer][self_dim]
-// [self_inner].  A task owns one outer slot and a run of inner positions,
-// whose destinations no other task touches.
-template <typename T>
-static void scatter_lines(T* d, const int64_t* ip, const T* vp, ScatterMode mode,
+// [self_inner].  The elements of the index shape are walked one at a time.
+template <typename T, ScatterMode Mode>
+static void scatter_lines(T* d, const int64_t* ip, const T* vp,
                           int64_t idx_outer, int64_t idx_dim_size, int64_t idx_inner,
-                          int64_t self_dim_size, int64_t self_inner) {
+                          int64_t self_dim_size, int64_t self_inner,
+                          const char* op) {
     if (idx_outer == 0 || idx_dim_size == 0 || idx_inner == 0) return;
+    // A task owns one outer slot and a run of inner positions and walks the
+    // scattered axis in order, so a repeated index accumulates, or lets the
+    // last one win, exactly as a serial walk would.  The index values are
+    // checked where they are read.
     const int64_t chunk_t = std::min<int64_t>(
         idx_inner, std::max<int64_t>(1, GRAIN_SIZE / idx_dim_size));
     const int64_t nchunk_t = (idx_inner + chunk_t - 1) / chunk_t;
@@ -719,12 +742,17 @@ static void scatter_lines(T* d, const int64_t* ip, const T* vp, ScatterMode mode
             const T* v_row = vp + g * idx_dim_size * idx_inner;
             T* d_slot = d + g * self_dim_size * self_inner;
             for (int64_t j = 0; j < idx_dim_size; ++j) {
-                if (mode == ScatterMode::Assign) {
-                    for (int64_t t = t0; t < t1; ++t)
-                        d_slot[idx_row[t] * self_inner + t] = v_row[t];
-                } else {
-                    for (int64_t t = t0; t < t1; ++t)
-                        d_slot[idx_row[t] * self_inner + t] += v_row[t];
+                for (int64_t t = t0; t < t1; ++t) {
+                    const int64_t pick = idx_row[t];
+                    if (pick < 0 || pick >= self_dim_size) {
+                        TP_THROW(IndexError, op, ": index out of range");
+                    }
+                    T* dst = d_slot + pick * self_inner + t;
+                    if constexpr (Mode == ScatterMode::Assign) {
+                        *dst = v_row[t];
+                    } else {
+                        *dst += v_row[t];
+                    }
                 }
                 idx_row += idx_inner;
                 v_row += idx_inner;
@@ -740,7 +768,7 @@ Tensor scatter_base_cpu(const Tensor& self, int64_t dim, const Tensor& index,
     if (index.dim() != nd) {
         TP_THROW(IndexError, "Index must have same number of dimensions as output tensor");
     }
-    Tensor idx_c = normalize_index_cpu(index, self.size(dim), "scatter");
+    Tensor idx_c = prepare_index_cpu(index);
     std::vector<int64_t> idx_shape(static_cast<std::vector<int64_t>>(idx_c.shape()));
     Tensor src_b;
     if (src.numel() == 1) {
@@ -772,9 +800,17 @@ Tensor scatter_base_cpu(const Tensor& self, int64_t dim, const Tensor& index,
     // out[oo][idx_value][t] <- src[oo][j][t].
 #define TP_SCATTER_CASE(ctype, name) \
     case DType::name: \
-        scatter_lines<ctype>(result.data_ptr<ctype>(), idx_c.data_ptr<int64_t>(), \
-                             src_b.data_ptr<ctype>(), mode, idx_outer, idx_dim_size, \
-                             idx_inner, self_dim_size, self_inner); \
+        if (mode == ScatterMode::Assign) { \
+            scatter_lines<ctype, ScatterMode::Assign>( \
+                result.data_ptr<ctype>(), idx_c.data_ptr<int64_t>(), \
+                src_b.data_ptr<ctype>(), idx_outer, idx_dim_size, \
+                idx_inner, self_dim_size, self_inner, "scatter"); \
+        } else { \
+            scatter_lines<ctype, ScatterMode::Add>( \
+                result.data_ptr<ctype>(), idx_c.data_ptr<int64_t>(), \
+                src_b.data_ptr<ctype>(), idx_outer, idx_dim_size, \
+                idx_inner, self_dim_size, self_inner, "scatter"); \
+        } \
         break;
     switch (self.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_SCATTER_CASE)
@@ -842,9 +878,17 @@ static Tensor& scatter_base_inplace_cpu(Tensor& self, int64_t dim, const Tensor&
 
 #define TP_SCATTER_INPLACE_CASE(ctype, name) \
     case DType::name: \
-        scatter_lines<ctype>(result.data_ptr<ctype>(), idx_c.data_ptr<int64_t>(), \
-                             src_b.data_ptr<ctype>(), mode, idx_outer, idx_dim_size, \
-                             idx_inner, self_dim_size, inner); \
+        if (mode == ScatterMode::Assign) { \
+            scatter_lines<ctype, ScatterMode::Assign>( \
+                result.data_ptr<ctype>(), idx_c.data_ptr<int64_t>(), \
+                src_b.data_ptr<ctype>(), idx_outer, idx_dim_size, \
+                idx_inner, self_dim_size, inner, "scatter_"); \
+        } else { \
+            scatter_lines<ctype, ScatterMode::Add>( \
+                result.data_ptr<ctype>(), idx_c.data_ptr<int64_t>(), \
+                src_b.data_ptr<ctype>(), idx_outer, idx_dim_size, \
+                idx_inner, self_dim_size, inner, "scatter_"); \
+        } \
         break;
     switch (self.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_SCATTER_INPLACE_CASE)
@@ -920,8 +964,7 @@ static Tensor index_select_rows(const Tensor& self, int64_t dim,
     // as it gathers them, so the index is not walked a second time.
     const bool flat = inner == 1 && outer < get_num_threads();
     Tensor idx = flat
-        ? (index_t.dtype() == DType::Int64 ? index_t.contiguous()
-                                           : index_t.to(DType::Int64).contiguous())
+        ? prepare_index_cpu(index_t)
         : normalize_index_cpu(index_t, row, op, wrap_negative);
     int64_t n_idx = idx.numel();
     const int64_t* ip = idx.data_ptr<int64_t>();
