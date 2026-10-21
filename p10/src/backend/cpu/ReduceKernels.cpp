@@ -411,7 +411,9 @@ std::tuple<Tensor, Tensor> cummax_cpu(const Tensor& self, int64_t dim) {
             }); \
             break; \
         } \
-        parallel_for(0, outer * inner, GRAIN_SIZE, [&](int64_t b, int64_t e) { \
+        const int64_t slice_grain = \
+            std::max<int64_t>(1, GRAIN_SIZE / std::max<int64_t>(d_size, 1)); \
+        parallel_for(0, outer * inner, slice_grain, [&](int64_t b, int64_t e) { \
             for (int64_t si = b; si < e; ++si) { \
                 const int64_t o = si / inner, in2 = si % inner; \
                 const ctype* src = sp + o * d_size * inner + in2; \
@@ -524,7 +526,9 @@ std::tuple<Tensor, Tensor> cummin_cpu(const Tensor& self, int64_t dim) {
             }); \
             break; \
         } \
-        parallel_for(0, outer * inner, GRAIN_SIZE, [&](int64_t b, int64_t e) { \
+        const int64_t slice_grain = \
+            std::max<int64_t>(1, GRAIN_SIZE / std::max<int64_t>(d_size, 1)); \
+        parallel_for(0, outer * inner, slice_grain, [&](int64_t b, int64_t e) { \
             for (int64_t si = b; si < e; ++si) { \
                 const int64_t o = si / inner, in2 = si % inner; \
                 const ctype* src = sp + o * d_size * inner + in2; \
@@ -623,7 +627,9 @@ std::tuple<Tensor, Tensor> nanmedian_dim_cpu(const Tensor& self, int64_t dim,
         const ctype* sp = sc.data_ptr<ctype>(); \
         ctype* vp = values.data_ptr<ctype>(); \
         int64_t* ip = indices.data_ptr<int64_t>(); \
-        parallel_for(0, outer * inner, GRAIN_SIZE, [&](int64_t b, int64_t e) { \
+        const int64_t slice_grain = \
+            std::max<int64_t>(1, GRAIN_SIZE / std::max<int64_t>(d_size, 1)); \
+        parallel_for(0, outer * inner, slice_grain, [&](int64_t b, int64_t e) { \
             std::vector<std::pair<ctype, int64_t>> buf( \
                 static_cast<size_t>(std::max<int64_t>(d_size, 1))); \
             for (int64_t si = b; si < e; ++si) { \
@@ -805,7 +811,9 @@ std::tuple<Tensor, Tensor> kthvalue_cpu(const Tensor& self, int64_t k,
         const ctype* sp = sc.data_ptr<ctype>(); \
         ctype* vp = values.data_ptr<ctype>(); \
         int64_t* ip = indices.data_ptr<int64_t>(); \
-        parallel_for(0, outer * inner, GRAIN_SIZE, [&](int64_t b, int64_t e) { \
+        const int64_t slice_grain = \
+            std::max<int64_t>(1, GRAIN_SIZE / std::max<int64_t>(d_size, 1)); \
+        parallel_for(0, outer * inner, slice_grain, [&](int64_t b, int64_t e) { \
             std::vector<std::pair<ctype, int64_t>> buf(d_size); \
             for (int64_t si = b; si < e; ++si) { \
                 const int64_t o = si / inner, in2 = si % inner; \

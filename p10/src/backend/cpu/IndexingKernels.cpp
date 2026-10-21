@@ -594,7 +594,9 @@ Tensor logcumsumexp_cpu(const Tensor& self, int64_t dim, std::optional<DType> dt
         ctype* d = result.data_ptr<ctype>(); \
         const ctype* s = src.data_ptr<ctype>(); \
         constexpr acc_t neg_inf = -std::numeric_limits<acc_t>::infinity(); \
-        parallel_for(0, outer * inner, GRAIN_SIZE, [&](int64_t b, int64_t e) { \
+        const int64_t slice_grain = \
+            std::max<int64_t>(1, GRAIN_SIZE / std::max<int64_t>(d_size, 1)); \
+        parallel_for(0, outer * inner, slice_grain, [&](int64_t b, int64_t e) { \
             for (int64_t si = b; si < e; ++si) { \
                 int64_t o = si / inner, in2 = si % inner; \
                 acc_t acc = neg_inf; \
@@ -2097,7 +2099,9 @@ Tensor cumsum_backward_cpu(const Tensor& grad, int64_t dim) {
     case DType::name: { \
         const ctype* s = g.data_ptr<ctype>(); \
         ctype* d = result.data_ptr<ctype>(); \
-        parallel_for(0, outer * inner, GRAIN_SIZE, [&](int64_t b, int64_t e) { \
+        const int64_t slice_grain = \
+            std::max<int64_t>(1, GRAIN_SIZE / std::max<int64_t>(d_size, 1)); \
+        parallel_for(0, outer * inner, slice_grain, [&](int64_t b, int64_t e) { \
             for (int64_t si = b; si < e; ++si) { \
                 int64_t o = si / inner, in2 = si % inner; \
                 acc_t acc = static_cast<acc_t>(0); \
