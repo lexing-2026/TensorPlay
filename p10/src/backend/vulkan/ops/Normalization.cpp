@@ -4,6 +4,7 @@
 #include "Common.h"
 #include "Convert.h"
 #include "Dispatcher.h"
+#include "../../composite/AttentionComposite.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
 #include "Scalar.h"
 
@@ -1880,6 +1881,84 @@ Tensor scaled_dot_product_attention_kernel(
   return convert(v_output);
 }
 
+/*
+ * The gradient of the attention above.
+ *
+ * Nothing is fused here: the scores are taken again from the query, key and
+ * value, and the arithmetic that produced the output is the arithmetic that is
+ * differentiated.  Every inner operation dispatches on the payload's own
+ * backend, so a masked, scaled or longer-context call is differentiable for the
+ * same reason a plain one is, and a fully masked query row keeps its row of
+ * zeros rather than a number over nothing.
+ *
+ * A grouped call is the exception.  The key and value are handed back with one
+ * head per query head by adding a group axis behind the head axis and reading
+ * the two as one axis afterwards, and the expansion leaves a fifth axis that no
+ * image can carry.  Until the grouping has a route that stays in rank four, an
+ * unequal head count is refused.
+ */
+std::tuple<Tensor, Tensor, Tensor> scaled_dot_product_attention_backward_kernel(
+    const Tensor& grad_output,
+    const Tensor& query,
+    const Tensor& key,
+    const Tensor& value,
+    const std::optional<Tensor>& attn_mask_opt,
+    double dropout_p,
+    bool is_causal,
+    std::optional<double> scale_opt,
+    bool enable_gqa) {
+  TP_CHECK(
+      (query.dtype() == DType::Float32 || query.dtype() == DType::Float16) &&
+          (key.dtype() == DType::Float32 || key.dtype() == DType::Float16) &&
+          (value.dtype() == DType::Float32 || value.dtype() == DType::Float16) &&
+          (grad_output.dtype() == DType::Float32 ||
+           grad_output.dtype() == DType::Float16),
+      "Vulkan sdpa backward supports Float32 and Float16 tensors only");
+  TP_CHECK(
+      query.dim() == 4 && key.dim() == 4 && value.dim() == 4 &&
+          grad_output.dim() == 4,
+      "Vulkan sdpa backward expects 4-D [B, H, S, D] tensors");
+  TP_CHECK(
+      query.size(3) == key.size(3) && key.size(3) == value.size(3),
+      "Vulkan sdpa backward: Q/K/V must share the head size");
+  TP_CHECK(
+      key.size(1) == value.size(1) && key.size(2) == value.size(2),
+      "Vulkan sdpa backward: key and value shapes must match");
+  TP_CHECK(
+      static_cast<std::vector<int64_t>>(grad_output.shape()) ==
+          static_cast<std::vector<int64_t>>(query.shape()),
+      "Vulkan sdpa backward: the gradient must carry the shape the attention "
+      "answered with");
+  TP_CHECK(
+      dropout_p == 0.0, "Vulkan sdpa backward does not support dropout yet");
+  TP_CHECK(
+      !enable_gqa || query.size(1) == key.size(1),
+      "Vulkan sdpa backward: a grouped key/value count needs an expansion that "
+      "leaves no fifth axis behind, which no image can carry");
+  if (attn_mask_opt.has_value()) {
+    TP_CHECK(
+        attn_mask_opt->dim() >= 2 &&
+            attn_mask_opt->size(attn_mask_opt->dim() - 1) == key.size(2) &&
+            attn_mask_opt->size(attn_mask_opt->dim() - 2) == query.size(2),
+        "Vulkan sdpa backward: the attention mask must carry the (Sq, Skv) "
+        "axes");
+  }
+
+  // The scale is the one the scores were built with, so an absent scale means
+  // the head width's own; the gradient folds the same factor back onto the
+  // query side.
+  return composite::sdpa_math_backward_composite(
+      grad_output,
+      query,
+      key,
+      value,
+      attn_mask_opt,
+      dropout_p,
+      is_causal,
+      scale_opt,
+      enable_gqa);
+}
+
 } // namespace ops
 } // namespace vulkan
 } // namespace tensorplay
@@ -1898,6 +1977,10 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, LlmKernels) {
   m.impl(
       "scaled_dot_product_attention",
       &tensorplay::vulkan::ops::scaled_dot_product_attention_kernel);
+  m.impl(
+      "scaled_dot_product_attention_backward",
+      &tensorplay::vulkan::ops::
+          scaled_dot_product_attention_backward_kernel);
 }
 
 #endif /* USE_VULKAN */
