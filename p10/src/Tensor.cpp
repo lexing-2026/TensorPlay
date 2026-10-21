@@ -14,6 +14,7 @@ namespace ops = tensorplay::tpx::ops;
 #include "BatchingKernels.h"
 #include "Utils.h"
 #include "ErrorReporting.h"
+#include "cpu/ParallelCopy.h"
 #include <iostream>
 #include <cstring>
 #include <sstream>
@@ -1412,19 +1413,24 @@ Tensor clone_impl(const Tensor& self, std::optional<MemoryFormat> memory_format)
         out_impl->set_quantizer(self.unsafeGetTensorImpl()->quantizer());
     }
     Tensor t(std::move(out_impl));
-    // every same-dtype contiguous clone through the dispatcher.  Optimizer
-    // momentum initialization creates one clone per parameter, so this
-    // dispatch overhead is visible even though the operation is just a byte
-    // copy.  Everything else (preserved non-contiguous strides, channels-last
-    // destinations, cross-device) retains copy_'s layout and transfer
-    // semantics.  Note is_contiguous() alone is not enough here: it does not
-    // distinguish row-major from channels-last layouts, so compare strides.
+    // A same-dtype contiguous clone does not go through the dispatcher.
+    // Optimizer momentum initialization creates one clone per parameter, so
+    // this dispatch overhead is visible even though the operation is just a
+    // byte copy.  Everything else (preserved non-contiguous strides,
+    // channels-last destinations, cross-device) retains copy_'s layout and
+    // transfer semantics.  Note is_contiguous() alone is not enough here: it
+    // does not distinguish row-major from channels-last layouts, so compare
+    // strides.
     const auto rm_strides = SizesAndStrides::compute_contiguous_strides(sizes_v);
     const bool row_major = strides == rm_strides &&
         static_cast<std::vector<int64_t>>(self.strides()) == rm_strides;
     if (self.device().is_cpu() && row_major) {
-        std::memcpy(t.data_ptr(), self.data_ptr(),
-                    static_cast<size_t>(subByteStorageSize(sizes_v, self.dtype())));
+        // The move is spread over the pool: a clone of a large tensor is a
+        // plain byte copy, and one thread would leave the rest of the
+        // machine idle.  A short run stays on the calling thread.
+        cpu::parallel_copy_bytes(
+            t.data_ptr(), self.data_ptr(),
+            static_cast<size_t>(subByteStorageSize(sizes_v, self.dtype())));
     } else {
         t.copy_(self);
     }
