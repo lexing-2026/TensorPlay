@@ -4363,15 +4363,16 @@ class TestVulkanWidePayload(unittest.TestCase):
                 classes, [True] * 3,
                 f"a {name} table released its rows outside an image")
 
-    def test_wide_payloads_stop_at_the_ops_that_fold_a_code_into_a_word(self):
+    def test_wide_payloads_stop_at_the_walk_that_folds_a_lane_into_a_word(self):
         values = np.array([0, 5, 2, 7, 1], dtype=np.int64)
         payload = tensorplay.from_numpy(values.copy()).to("vulkan")
-        # A total of wide lanes needs an accumulator wider than one word, and the
-        # walk that adds lane by lane reads a single word per element: it has to
-        # say so rather than add up the low words of every code.
-        with self.assertRaisesRegex(
-                RuntimeError, "reductions support Float32 and Float16"):
-            payload.sum()
+        # A total of wide lanes has no single word to accumulate in, so it walks
+        # the pair of words each lane is carried in and answers whole; a fold
+        # that read one word per element would have added up the low halves.
+        total = payload.sum()
+        self.assertEqual(str(total.dtype), "tensorplay.int64")
+        self.assertEqual(int(total.cpu().numpy()), int(values.sum()),
+                         "a total of wide lanes arrived truncated")
         # A half payload packs two lanes into one word, so a wide code would need
         # three of them and the two storages share no word boundary.  The hop
         # through single precision cannot answer either: it drops the bits above
@@ -6500,13 +6501,23 @@ class TestVulkanIntegralSum(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Int64, Float32"):
             self._device(truth).sum(dtype=tensorplay.int16)
 
-    def test_a_plane_of_wide_lanes_stays_outside_the_walk(self):
-        # A lane that is already the wide word has no walk here that adds it
-        # without rounding, so the plane is refused rather than answered with
-        # the low half of every number.
-        wide = self._device(np.arange(5, dtype=np.int64))
-        with self.assertRaisesRegex(RuntimeError, "Float32 and Float16"):
-            wide.sum()
+    def test_a_plane_of_wide_lanes_totals_in_the_pairs_it_holds(self):
+        # A lane that is already the wide word has no texel to read and no
+        # single-precision register to fold into, so its total walks the pair of
+        # words the payload is carried in and answers whole.
+        held = np.array([2 ** 40, 2 ** 40, -(2 ** 40), 2 ** 32], dtype=np.int64)
+        got = self._device(held).sum()
+        self.assertEqual(str(got.dtype), "tensorplay.int64")
+        self.assertEqual(int(got.cpu().numpy()), int(held.sum(dtype=np.int64)),
+                         "a total of wide lanes lost a word on the way in")
+        total = int(held.sum(dtype=np.int64))
+        narrowed = self._device(held).sum(dtype=tensorplay.int32)
+        self.assertEqual(str(narrowed.dtype), "tensorplay.int32")
+        low = total & 0xFFFFFFFF
+        self.assertEqual(
+            int(narrowed.cpu().numpy()),
+            low - (1 << 32) if low >= (1 << 31) else low,
+            "a wide total narrowed to the wrong word")
 
 
 class TestVulkanIntegerExtrema(unittest.TestCase):
@@ -6687,10 +6698,28 @@ class TestVulkanIntegerExtrema(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "index reductions"):
             held.max(0)
 
-    def test_a_product_of_a_wide_plane_stays_outside_the_fold(self):
-        held = self._device(np.arange(2, 6, dtype=np.int64))
-        with self.assertRaisesRegex(RuntimeError, "products fold a measured"):
-            held.prod()
+    def test_a_product_of_a_wide_plane_folds_the_pairs_it_holds(self):
+        # A product of wide lanes has no single word to accumulate in either, so
+        # it walks the pairs the payload is carried in.  The fold starts at the
+        # identity it names, and a count past both words keeps the low bits a
+        # count wrapped at its own width lands on.
+        held = np.array([2, 3, 4, 5], dtype=np.int64)
+        got = self._device(held).prod()
+        self.assertEqual(str(got.dtype), "tensorplay.int64")
+        self.assertEqual(int(got.cpu().numpy()), int(np.prod(held)),
+                         "a small product of wide lanes")
+        carried = np.array([(1 << 32) - 1, (1 << 32) - 1], dtype=np.int64)
+        with np.errstate(over="ignore"):
+            want = int(np.prod(carried, dtype=np.int64))
+        got = self._device(carried).prod()
+        self.assertEqual(int(got.cpu().numpy()), want,
+                         "a product past both words lost its low bits")
+        grid = np.arange(2, 8, dtype=np.int64).reshape(2, 3)
+        folded = self._device(grid).prod(0)
+        self.assertEqual(tuple(folded.shape), (3,))
+        np.testing.assert_array_equal(
+            np.asarray(folded.cpu()), np.prod(grid, axis=0, dtype=np.int64),
+            err_msg="an axis product of wide lanes")
 
 
 class TestVulkanAdvancedIndexing(unittest.TestCase):
@@ -11963,6 +11992,236 @@ class TestVulkanWideArithmetic(unittest.TestCase):
         narrow = self._device([1, 2, 3], tensorplay.int32)
         with self.assertRaisesRegex(RuntimeError, "wider than its destination"):
             narrow += self._device([1, 2, 3])
+
+
+class TestVulkanWideTotals(unittest.TestCase):
+    # A payload of counts wider than a word has no texel to read and no
+    # single-precision register to fold into, so its total and its product walk
+    # the pairs of words it is carried in, one row per invocation.  The fold
+    # starts at the identity it names, so a short tile contributes fewer terms
+    # and a row folded whole still answers.  A decode loop asks for these over
+    # its token, position and length counters.
+
+    MASK = (1 << 64) - 1
+    ROW_LENGTHS = (1, 2, 3, 5, 17, 65, 255, 256, 257, 258, 513, 1024, 40001)
+
+    @classmethod
+    def _as_int64(cls, value):
+        # A total past every word lands where the counts it added land, which is
+        # what a pair of words holds too.
+        bits = int(value) & cls.MASK
+        return bits - (1 << 64) if bits >= (1 << 63) else bits
+
+    @classmethod
+    def _wrapped(cls, values):
+        host = np.array(values, dtype=object)
+        flat = [cls._as_int64(v) for v in host.ravel().tolist()]
+        return np.array(flat, dtype=np.int64).reshape(host.shape)
+
+    def _payload(self, shape, order, reach=2 ** 62):
+        rng = np.random.default_rng(order)
+        return self._wrapped(
+            rng.integers(-reach, reach, size=shape).tolist())
+
+    def _device(self, held):
+        return tensorplay.from_numpy(held).to("vulkan")
+
+    def _checked(self, got, want, label):
+        self.assertEqual(
+            str(got.dtype), f"tensorplay.{np.dtype(want.dtype).name}",
+            f"{label} answered in the wrong width")
+        np.testing.assert_array_equal(
+            np.asarray(got.cpu()), want, err_msg=label)
+
+    def test_a_whole_payload_of_counts_adds_up(self):
+        for order, shape in enumerate([(2, 3), (4, 5, 6), (2, 3, 4, 5), (700,)]):
+            held = self._payload(shape, 71 + order)
+            with np.errstate(over="ignore"):
+                want = np.sum(held, dtype=np.int64)
+            got = self._device(held).sum()
+            self.assertTrue(got.device.is_vulkan(),
+                            "a wide total left the accelerator")
+            self._checked(got, np.asarray(want, dtype=np.int64),
+                          f"total of a {shape} payload")
+
+    def test_a_whole_payload_of_counts_multiplies(self):
+        for order, shape in enumerate([(2, 3), (4, 5, 6), (2, 3, 4, 5)]):
+            held = self._payload(shape, 83 + order, reach=1 << 33)
+            with np.errstate(over="ignore"):
+                want = np.prod(held, dtype=np.int64)
+            self._checked(
+                self._device(held).prod(),
+                np.asarray(want, dtype=np.int64),
+                f"product of a {shape} payload")
+
+    def test_one_axis_folded_keeps_the_axes_it_was_not_asked_about(self):
+        held = self._payload((2, 3, 4, 5), 91)
+        for axis in range(4):
+            for kept in (False, True):
+                for name, host_fold, device_fold in (
+                        ("sum", np.sum, "sum"),
+                        ("product", np.prod, "prod")):
+                    with np.errstate(over="ignore"):
+                        want = host_fold(
+                            held, axis=axis, dtype=np.int64, keepdims=kept)
+                    got = getattr(self._device(held), device_fold)(
+                        axis, keepdim=kept)
+                    expected_shape = (
+                        tuple(held.shape[:axis]) + (1,) + tuple(held.shape[axis + 1:])
+                        if kept else held.shape[:axis] + held.shape[axis + 1:])
+                    self.assertEqual(tuple(got.shape), expected_shape,
+                                     f"{name} over axis {axis} kept shape")
+                    self._checked(
+                        got, np.asarray(want, dtype=np.int64),
+                        f"{name} over axis {axis}, keepdim={kept}")
+
+    def test_a_list_of_axes_folds_them_all(self):
+        held = self._payload((3, 4, 5), 97)
+        for axes in ((0, 2), (0, 1), (1, 2)):
+            for kept in (False, True):
+                with np.errstate(over="ignore"):
+                    want = np.sum(
+                        held, axis=axes, dtype=np.int64, keepdims=kept)
+                got = self._device(held).sum(list(axes), keepdim=kept)
+                self._checked(
+                    got, np.asarray(want, dtype=np.int64),
+                    f"total over axes {axes}, keepdim={kept}")
+
+    def test_a_negative_axis_folds_the_same_row(self):
+        held = self._payload((3, 5, 7), 101)
+        for axis in (-1, -2, -3):
+            with np.errstate(over="ignore"):
+                want = np.sum(held, axis=axis, dtype=np.int64)
+            self._checked(
+                self._device(held).sum(axis),
+                np.asarray(want, dtype=np.int64), f"total over axis {axis}")
+
+    def test_a_row_folded_whole_splits_into_tiles(self):
+        # A single row would hand every element to one thread, so the axis is
+        # split into fixed tiles, each folded, and the tile results folded after.
+        for length in self.ROW_LENGTHS:
+            held = ((np.arange(length, dtype=np.int64) - length // 2)
+                    * 1000000007).astype(np.int64)
+            with np.errstate(over="ignore"):
+                total = np.sum(held, dtype=np.int64)
+                product = np.prod(
+                    ((np.arange(length, dtype=np.int64) % 5) - 2).astype(
+                        np.int64), dtype=np.int64)
+            self._checked(
+                self._device(held.reshape(1, length)).sum(1),
+                np.asarray([total], dtype=np.int64),
+                f"a tiled row of {length} counts")
+            self._checked(
+                self._device(
+                    ((np.arange(length, dtype=np.int64) % 5) - 2)
+                    .astype(np.int64)).prod(),
+                np.asarray(product, dtype=np.int64),
+                f"a tiled product of {length} counts")
+
+    def test_a_column_folded_with_a_stride(self):
+        # Consecutive elements of a row need not sit beside each other: the walk
+        # strides by the size of the axes that follow the folded one.
+        held = self._payload((3, 400), 103)
+        for axis in (0, 1):
+            with np.errstate(over="ignore"):
+                want = np.sum(held, axis=axis, dtype=np.int64)
+            self._checked(
+                self._device(held).sum(axis),
+                np.asarray(want, dtype=np.int64), f"strided total on axis {axis}")
+        middle = self._payload((2, 7, 1, 5), 107)
+        with np.errstate(over="ignore"):
+            want = np.prod(middle, axis=1, dtype=np.int64)
+        self._checked(
+            self._device(middle).prod(1), np.asarray(want, dtype=np.int64),
+            "a product folded across a stride of five")
+
+    def test_an_answer_carried_in_another_width(self):
+        held = np.array([[1, 2, 3], [4, 5, 7]], dtype=np.int64)
+        host = self._device(held)
+        for wanted, name, inexact in ((tensorplay.int32, "int32", np.int32),
+                                      (tensorplay.float32, "float32", np.float32)):
+            total = host.sum(dtype=wanted)
+            self.assertEqual(str(total.dtype), f"tensorplay.{name}",
+                             f"a total asked for as {name}")
+            self.assertEqual(int(total.cpu().numpy()), int(held.sum()),
+                             "a widened total moved the wrong number")
+            product = host.prod(dtype=wanted)
+            self.assertEqual(str(product.dtype), f"tensorplay.{name}",
+                             f"a product asked for as {name}")
+            self.assertEqual(int(product.cpu().numpy()), int(held.prod()),
+                             "a widened product moved the wrong number")
+            folded = host.sum(1, keepdim=True, dtype=wanted)
+            self.assertEqual(str(folded.dtype), f"tensorplay.{name}",
+                             f"an axis total asked for as {name}")
+            np.testing.assert_array_equal(
+                np.asarray(folded.cpu()),
+                held.sum(axis=1, keepdims=True).astype(inexact),
+                err_msg=f"an axis total as {name}")
+
+    def test_a_total_that_crosses_the_seam_of_its_pair(self):
+        # A walk that carried only the low word of a pair keeps every count below
+        # 2^32 right, so the cases asked for are exactly the ones that carry.
+        cases = (
+            ([1 << 32, 1 << 32], 1 << 33),
+            ([(1 << 63) - 1, 1], -(1 << 63)),
+            ([-(1 << 63), -1], (1 << 63) - 1),
+            ([2 ** 62, 2 ** 62], -(1 << 63)),
+            ([-(1 << 62), -(1 << 62), -(1 << 62)], -(1 << 63) - (1 << 62)),
+        )
+        for values, want in cases:
+            held = self._wrapped(values)
+            got = self._device(held).sum()
+            self._checked(
+                got, np.array(self._as_int64(want), dtype=np.int64),
+                f"a sum of {values}")
+
+    def test_a_product_keeps_the_bits_past_both_words(self):
+        cases = (
+            ([-(1 << 40), -(1 << 40)], (1 << 80)),
+            ([1 << 32, 1 << 32], 1 << 64),
+            ([(1 << 32) - 1, (1 << 32) - 1], ((1 << 32) - 1) ** 2),
+            ([0, 1 << 40, -3], 0),
+            ([-7, -11, 1 << 45], 77 * (1 << 45)),
+        )
+        for values, want in cases:
+            held = self._wrapped(values)
+            got = self._device(held).prod()
+            self._checked(
+                got, np.array(self._as_int64(want), dtype=np.int64),
+                f"a product of {values}")
+
+    def test_a_fold_of_one_count_answers_with_the_count(self):
+        held = self._payload((1, 1), 109)
+        self._checked(
+            self._device(held).sum(),
+            np.asarray(np.sum(held, dtype=np.int64), dtype=np.int64),
+            "a lone count added up")
+        self._checked(
+            self._device(held).prod(),
+            np.asarray(np.prod(held, dtype=np.int64), dtype=np.int64),
+            "a lone count multiplied")
+
+    def test_an_empty_payload_adds_to_nothing(self):
+        held = np.zeros((0,), dtype=np.int64)
+        got = self._device(held).sum()
+        self.assertEqual(str(got.dtype), "tensorplay.int64")
+        self.assertEqual(int(got.cpu().numpy()), 0,
+                         "nothing added to nothing")
+
+    def test_a_fold_over_a_shape_the_walk_cannot_name_says_so(self):
+        # A payload carried in pairs has no image form at all, yet the fold still
+        # needs a plane it can index: a rank beyond four is refused by name.
+        held = tensorplay.tensor(
+            np.arange(2 * 3 * 4 * 5 * 6, dtype=np.int64)
+            .reshape(2, 3, 4, 5, 6),
+            dtype=tensorplay.int64, device="vulkan")
+        self.assertEqual(tuple(held.shape), (2, 3, 4, 5, 6))
+        with self.assertRaisesRegex(
+                RuntimeError, "reductions support 1d to 4d tensors"):
+            held.sum()
+        with self.assertRaisesRegex(
+                RuntimeError, "reductions support 1d to 4d tensors"):
+            held.prod()
 
 
 if __name__ == "__main__":
