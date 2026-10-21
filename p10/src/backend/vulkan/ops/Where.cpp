@@ -8,6 +8,7 @@
 #include <TypeProperties.h>
 #include <Utils.h>
 
+#include <limits>
 #include <utility>
 #include <vector>
 
@@ -19,17 +20,26 @@ namespace {
 
 /*
  * Branch payload vocabulary: float planes sample through the float shader,
- * Int32 planes ride the `where_i32` twin with iimage loads.  Both operands
- * share one vocabulary, so a mixed pair is converted to the type that holds it.
+ * Int32 planes ride the `where_i32` twin with iimage loads, and a code wider
+ * than a word walks the pair of words it is carried in.  Both operands share
+ * one vocabulary, so a mixed pair is converted to the type that holds it.
  */
 void validate_operand(const Tensor& t, const char* name) {
   TP_CHECK(
       t.dtype() == DType::Float32 || t.dtype() == DType::Float16 ||
-          t.dtype() == DType::Int32,
+          t.dtype() == DType::Int32 || t.dtype() == DType::Int64,
       std::string("Vulkan ") + name +
-          " supports Float32, Float16 and Int32 tensors only");
+          " supports Float32, Float16, Int32 and Int64 tensors only");
   TP_CHECK(
       t.dim() <= 4, std::string("Vulkan ") + name + " supports up to 4d tensors");
+}
+
+// A count handed out as a plane of one keeps the width the pair of numbers
+// needs: one past a signed word has no word to be read into.
+bool fits_a_signed_word(const Scalar& value) {
+  const int64_t wide = value.to<int64_t>();
+  return wide >= static_cast<int64_t>(std::numeric_limits<int32_t>::min()) &&
+      wide <= static_cast<int64_t>(std::numeric_limits<int32_t>::max());
 }
 
 // Texel metadata: the output extents plus each plane's own sizes, since a plane
@@ -118,8 +128,8 @@ Tensor where_kernel(
   const DType vocabulary = tensorplay::native::result_type(self, other);
   TP_CHECK(
       vocabulary == DType::Float32 || vocabulary == DType::Float16 ||
-          vocabulary == DType::Int32,
-      "Vulkan where selects between Float32, Float16 and Int32 branches");
+          vocabulary == DType::Int32 || vocabulary == DType::Int64,
+      "Vulkan where selects between Float32, Float16, Int32 and Int64 branches");
   const Tensor self_branch =
       self.dtype() == vocabulary ? self : self.to(vocabulary);
   const Tensor other_branch =
@@ -194,10 +204,17 @@ Tensor where_kernel(
       // words as the four-lane vocabularies do.
       buffer_shader = "where_half_buffer";
       lanes_per_word = 2u;
+    } else if (vocabulary == DType::Int64) {
+      // An element of a counting payload owns the pair of words that a slot
+      // would otherwise hand to four lanes, so one invocation answers for one
+      // element of the selection.
+      buffer_shader = "where_wide_buffer";
+      lanes_per_word = 1u;
     } else {
       TP_THROW(
           NotImplementedError,
-          "Vulkan where over buffer supports Float32, Float16 and Int32 only");
+          "Vulkan where over buffer supports Float32, Float16, Int32 and "
+          "Int64 only");
     }
     const uint32_t n =
         static_cast<uint32_t>(multiply_integers(out_sizes));
@@ -241,6 +258,12 @@ Tensor where_kernel(
         params.buffer());
     return convert(v_output);
   }
+
+  // An image names one payload per texel, so a code wider than a word has no
+  // image form to select through.
+  TP_CHECK(
+      vocabulary != DType::Int64,
+      "Vulkan where has no image form for a count wider than a word");
 
   api::vTensor v_output{context, out_sizes, vocabulary};
 
@@ -300,9 +323,13 @@ Tensor where_scalar_scalar_kernel(
   TP_CHECK(
       !self.isComplex() && !other.isComplex(),
       "Vulkan where does not select between complex numbers");
+  // A count the word cannot hold is folded as a pair of words instead of being
+  // read into one.
   const DType vocabulary =
-      self.isFloatingPoint() || other.isFloatingPoint() ? DType::Float32
-                                                        : DType::Int32;
+      self.isFloatingPoint() || other.isFloatingPoint()
+      ? DType::Float32
+      : (fits_a_signed_word(self) && fits_a_signed_word(other) ? DType::Int32
+                                                              : DType::Int64);
   Tensor held =
       full_kernel({1}, self, vocabulary, condition.device(), false);
   Tensor taken =

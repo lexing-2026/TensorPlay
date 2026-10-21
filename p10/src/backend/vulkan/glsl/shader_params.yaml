@@ -1379,6 +1379,13 @@ where_half_buffer:
   parameter_names_with_default_values: {}
   shader_variants:
   - NAME: where_half_buffer
+# The same selection between branches whose elements are a pair of words: one
+# element per invocation, since a code wider than a word fills the slot that
+# four lanes of a word would share.
+where_wide_buffer:
+  parameter_names_with_default_values: {}
+  shader_variants:
+  - NAME: where_wide_buffer
 embedding:
   parameter_names_with_default_values: {}
   shader_variants:
