@@ -697,6 +697,7 @@ if(USE_VULKAN)
         src/backend/vulkan/ops/ParamCache.cpp
         src/backend/vulkan/ops/Comparison.cpp
         src/backend/vulkan/ops/Indexing.cpp
+        src/backend/vulkan/ops/Loss.cpp
         src/backend/vulkan/ops/Upsample.cpp
         src/backend/vulkan/ops/Selection.cpp
         src/backend/vulkan/ops/Where.cpp

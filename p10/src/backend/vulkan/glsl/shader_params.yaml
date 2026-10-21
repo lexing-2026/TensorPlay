@@ -1826,6 +1826,41 @@ reduce_bool:
     OPERATOR: max(X, Y)
     COLLAPSE: max(max(V.x, V.y), max(V.z, V.w))
     NEUTRAL: 0
+nll_loss_rows:
+  parameter_names_with_default_values:
+    SELF_PACKED: 1
+    HAS_WEIGHT: 0
+  shader_variants:
+  - NAME: nll_loss_rows
+    SELF_PACKED: 1
+    HAS_WEIGHT: 0
+  - NAME: nll_loss_rows_weight
+    SELF_PACKED: 1
+    HAS_WEIGHT: 1
+  - NAME: nll_loss_rows_buffer
+    SELF_PACKED: 0
+    HAS_WEIGHT: 0
+  - NAME: nll_loss_rows_buffer_weight
+    SELF_PACKED: 0
+    HAS_WEIGHT: 1
+nll_loss_grad:
+  parameter_names_with_default_values:
+    SELF_PACKED: 1
+    HAS_WEIGHT: 0
+    FORMAT: rgba32f
+  shader_variants:
+  - NAME: nll_loss_grad
+    SELF_PACKED: 1
+    HAS_WEIGHT: 0
+  - NAME: nll_loss_grad_weight
+    SELF_PACKED: 1
+    HAS_WEIGHT: 1
+  - NAME: nll_loss_grad_buffer
+    SELF_PACKED: 0
+    HAS_WEIGHT: 0
+  - NAME: nll_loss_grad_buffer_weight
+    SELF_PACKED: 0
+    HAS_WEIGHT: 1
 quantized_binary_op:
   parameter_names_with_default_values:
     OPERATOR: X + Y
