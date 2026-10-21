@@ -1012,7 +1012,10 @@ def _emit_op(out: list[str], f, variant: str, fn: str,
         splat_slot = next(i for i, (n, _, _) in enumerate(slots) if n == splat_name)
     for i, (name, tpl, dflt) in enumerate(slots):
         src = "slots[%d]" % i
-        if i == self_idx:
+        if is_method and i == self_idx:
+            # The receiver is always present; the schema's `self` slot of a
+            # function surface is an ordinary argument and still needs the
+            # missing-argument guard below.
             out.append(f"        PyObject* r_{i} = {src};")
             out.append(f"        (void)r_{i};")
         elif dflt is not None:

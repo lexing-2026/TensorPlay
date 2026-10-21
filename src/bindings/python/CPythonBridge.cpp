@@ -1319,6 +1319,11 @@ NumpyScalarKind numpy_scalar_kind(PyObject* obj) {
 }
 
 Scalar as_scalar(PyObject* obj, const char* op, int idx) {
+    // A missing argument reaches the unpackers as a null slot; the type
+    // probes below would dereference it.
+    if (obj == nullptr) {
+        throw std::invalid_argument("missing required argument");
+    }
     // Fast paths for the overwhelmingly common number cases; complex and
     // exotic inputs fall through to the pybind caster.
     if (PyBool_Check(obj)) return Scalar(obj == Py_True);
@@ -1372,6 +1377,11 @@ Scalar as_scalar(PyObject* obj, const char* op, int idx) {
 }
 
 DType as_dtype(PyObject* obj, const char* op, int idx) {
+    // A missing argument reaches the unpackers as a null slot; the type
+    // probes below would dereference it.
+    if (obj == nullptr) {
+        throw std::invalid_argument("missing required argument");
+    }
     // Enum members are plain pybind instances holding the DType behind the
     // first holder slot.  A type match reads it directly instead of sending
     // every factory call that spells dtype=... explicitly through the
@@ -1393,6 +1403,11 @@ DType as_dtype(PyObject* obj, const char* op, int idx) {
 }
 
 int64_t as_int(PyObject* obj, const char* op, int idx) {
+    // A missing argument reaches the unpackers as a null slot; the type
+    // probes below would dereference it.
+    if (obj == nullptr) {
+        throw std::invalid_argument("missing required argument");
+    }
     // Integral-valued floats are accepted for integer slots; non-integral
     // floats still raise.
     if (PyFloat_Check(obj)) {
@@ -1416,6 +1431,11 @@ int64_t as_int(PyObject* obj, const char* op, int idx) {
 }
 
 double as_double(PyObject* obj, const char* op, int idx) {
+    // A missing argument reaches the unpackers as a null slot; the type
+    // probes below would dereference it.
+    if (obj == nullptr) {
+        throw std::invalid_argument("missing required argument");
+    }
     double v = PyFloat_AsDouble(obj);
     if (v == -1.0 && PyErr_Occurred()) {
         PyErr_Clear();
@@ -1496,6 +1516,11 @@ std::optional<Tensor> tpx_py_opt_tensor(PyObject* obj) {
 int64_t tpx_py_int64(PyObject* obj) { return as_int(obj, "op", 0); }
 double tpx_py_double(PyObject* obj) { return as_double(obj, "op", 0); }
 bool tpx_py_bool(PyObject* obj) {
+    // A missing argument reaches the unpackers as a null slot; the type
+    // probe below would dereference it.
+    if (obj == nullptr) {
+        throw std::invalid_argument("missing required argument");
+    }
     // Only real bools are accepted by this conversion.  Truthiness of
     // arbitrary objects would silently change the call contract.
     if (PyBool_Check(obj)) return obj == Py_True;
@@ -1536,6 +1561,11 @@ Storage tpx_py_storage(PyObject* obj) {
     }
 }
 Device tpx_py_device(PyObject* obj) {
+    // A missing argument reaches the unpackers as a null slot; the type
+    // probe below would dereference it.
+    if (obj == nullptr) {
+        throw std::invalid_argument("missing required argument");
+    }
     if (PyUnicode_Check(obj)) {
         const char* text = PyUnicode_AsUTF8(obj);
         if (text == nullptr) {
@@ -1555,6 +1585,11 @@ std::optional<Device> tpx_py_opt_device(PyObject* obj) {
     return tpx_py_device(obj);
 }
 std::vector<int64_t> tpx_py_intlist(PyObject* obj) {
+    // A missing argument reaches the unpackers as a null slot; the type
+    // probes below would dereference it.
+    if (obj == nullptr) {
+        throw std::invalid_argument("missing required argument");
+    }
     std::vector<int64_t> r;
     if (PyLong_Check(obj)) { r.push_back(as_int(obj, "op", 0)); return r; }
     PyObject* seq = PySequence_Fast(obj, "expected a sequence of integers");
@@ -1568,6 +1603,11 @@ std::vector<int64_t> tpx_py_intlist(PyObject* obj) {
     return r;
 }
 std::vector<double> tpx_py_doublelist(PyObject* obj) {
+    // A missing argument reaches the unpackers as a null slot; the type
+    // probes below would dereference it.
+    if (obj == nullptr) {
+        throw std::invalid_argument("missing required argument");
+    }
     std::vector<double> r;
     if (PyFloat_Check(obj)) { r.push_back(as_double(obj, "op", 0)); return r; }
     if (PyLong_Check(obj)) { r.push_back(as_double(obj, "op", 0)); return r; }
@@ -1582,6 +1622,11 @@ std::vector<double> tpx_py_doublelist(PyObject* obj) {
     return r;
 }
 std::vector<bool> tpx_py_boollist(PyObject* obj) {
+    // A missing argument reaches the unpackers as a null slot; the type
+    // probes below would dereference it.
+    if (obj == nullptr) {
+        throw std::invalid_argument("missing required argument");
+    }
     std::vector<bool> r;
     if (PyBool_Check(obj)) { r.push_back(obj == Py_True); return r; }
     PyObject* seq = PySequence_Fast(obj, "expected a sequence of bools");
@@ -1602,6 +1647,11 @@ std::vector<bool> tpx_py_boollist(PyObject* obj) {
     return r;
 }
 std::string tpx_py_string(PyObject* obj) {
+    // A missing argument reaches the unpackers as a null slot; the type
+    // probe below would dereference it.
+    if (obj == nullptr) {
+        throw std::invalid_argument("missing required argument");
+    }
     const char* s = PyUnicode_AsUTF8(obj);
     if (!s) { PyErr_Clear(); throw std::invalid_argument("expected a string"); }
     return std::string(s);
@@ -1796,6 +1846,11 @@ void tpx_py_check_types(PyObject* const* slots, Py_ssize_t n,
 // Element errors stay std::invalid_argument so multi-overload dispatch can
 // fall through to the next candidate signature.
 std::vector<Tensor> tpx_py_tensorlist(PyObject* obj) {
+    // A missing argument reaches the unpackers as a null slot; the type
+    // probes below would dereference it.
+    if (obj == nullptr) {
+        throw std::invalid_argument("missing required argument");
+    }
     std::vector<Tensor> r;
     if (!PyTuple_Check(obj) && !PyList_Check(obj)) {
         throw std::invalid_argument("expected a sequence of tensors");
