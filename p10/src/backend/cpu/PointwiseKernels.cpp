@@ -1779,6 +1779,14 @@ Tensor& hardtanh_out_cpu(const Tensor& self, const Scalar& min_val,
                          const Scalar& max_val, Tensor& out) {
     const double lo = min_val.toDouble();
     const double hi = max_val.toDouble();
+    // A packet is clamped within its own grid: the bounds only narrow the codes
+    // the packet already carries, so the answer is a packet drawn at the input's
+    // scale and offset rather than a fill of whatever grid the destination was
+    // made with.  Bringing that answer over replaces the destination.
+    if (isQuantizedType(self.dtype())) {
+        out = quantized::activation(self, 7, lo, hi);
+        return out;
+    }
     vecunary::VParams prm;
     prm.p0 = lo;
     prm.p1 = hi;
@@ -1957,6 +1965,12 @@ Tensor leaky_relu_kernel_impl(const Tensor& self, const Scalar& negative_slope) 
 Tensor& leaky_relu_out_cpu(const Tensor& self, const Scalar& negative_slope,
                            Tensor& out) {
     const double slope = negative_slope.toDouble();
+    // The slope carries a packet's negative half onto a grid of its own, so the
+    // destination decides where the answer lands: it is requantized at the
+    // destination's scale and offset and stored into the bytes it stands on.
+    if (isQuantizedType(self.dtype())) {
+        return quantized::activation_out(self, out, 0, slope);
+    }
     vecunary::VParams prm;
     prm.p0 = slope;
     return unary_float_out_kernel(
@@ -3211,24 +3225,53 @@ static Tensor softmax_fused_kernel_impl(const Tensor& self, int64_t dim, DType o
         for (int64_t i = 0; i < d; ++i) before *= input.size(i);
         for (int64_t i = d + 1; i < input.dim(); ++i) after *= input.size(i);
 
+        // A block of b values is walked together: the elements of the reduced
+        // dimension live a stride apart, so one b at a time reads the same
+        // cache lines again for every b.  A block of them keeps those lines
+        // in the cache for the whole block.
+        constexpr int64_t kStridedBlock = 64;
+        const int64_t nblocks = (after + kStridedBlock - 1) / kStridedBlock;
+
         #define TP_SOFTMAX_STRIDED_ROW(ctype)                              \
             const ctype* src = in + a * size * stride + b;                 \
             ctype* dst = out + a * size * stride + b;                      \
-            ctype m = src[0];                                              \
-            for (int64_t k = 1; k < size; ++k) m = std::max(m, src[k * stride]); \
-            ctype sum = ctype(0);                                          \
+            ctype m[kStridedBlock];                                        \
+            for (int64_t j = 0; j < nb; ++j) m[j] = src[j];                \
+            for (int64_t k = 1; k < size; ++k) {                           \
+                const ctype* row = src + k * stride;                        \
+                for (int64_t j = 0; j < nb; ++j) {                         \
+                    const ctype v = row[j];                                \
+                    m[j] = v > m[j] ? v : m[j];                            \
+                }                                                          \
+            }                                                              \
+            ctype sum[kStridedBlock];                                      \
+            for (int64_t j = 0; j < nb; ++j) sum[j] = ctype(0);            \
             for (int64_t k = 0; k < size; ++k) {                           \
-                ctype e = std::exp(src[k * stride] - m);                   \
-                dst[k * stride] = e;                                       \
-                sum += e;                                                  \
+                const ctype* row = src + k * stride;                        \
+                ctype* drow = dst + k * stride;                            \
+                for (int64_t j = 0; j < nb; ++j) {                         \
+                    const ctype e = std::exp(row[j] - m[j]);               \
+                    drow[j] = e;                                           \
+                    sum[j] += e;                                           \
+                }                                                          \
+            }                                                              \
+            ctype acc[kStridedBlock];                                      \
+            for (int64_t j = 0; j < nb; ++j) {                             \
+                acc[j] = LogMode ? std::log(sum[j])                        \
+                                 : (ctype(1) / sum[j]);                    \
             }                                                              \
             if constexpr (LogMode) {                                       \
-                ctype lse = std::log(sum);                                 \
-                for (int64_t k = 0; k < size; ++k)                         \
-                    dst[k * stride] = (src[k * stride] - m) - lse;         \
+                for (int64_t k = 0; k < size; ++k) {                       \
+                    const ctype* row = src + k * stride;                    \
+                    ctype* drow = dst + k * stride;                        \
+                    for (int64_t j = 0; j < nb; ++j)                       \
+                        drow[j] = (row[j] - m[j]) - acc[j];                \
+                }                                                          \
             } else {                                                       \
-                ctype inv = ctype(1) / sum;                                \
-                for (int64_t k = 0; k < size; ++k) dst[k * stride] *= inv; \
+                for (int64_t k = 0; k < size; ++k) {                       \
+                    ctype* drow = dst + k * stride;                        \
+                    for (int64_t j = 0; j < nb; ++j) drow[j] *= acc[j];    \
+                }                                                          \
             }
 
 #if defined(__x86_64__)
@@ -3259,10 +3302,11 @@ static Tensor softmax_fused_kernel_impl(const Tensor& self, int64_t dim, DType o
             const float* in = input.data_ptr<float>();
             float* out = result.data_ptr<float>();
 #endif
-            parallel_for(0, before * after, 1, [&](int64_t rb, int64_t re) {
+            parallel_for(0, before * nblocks, 1, [&](int64_t rb, int64_t re) {
                 for (int64_t r = rb; r < re; ++r) {
-                    const int64_t a = r / after;
-                    const int64_t b = r % after;
+                    const int64_t a = r / nblocks;
+                    const int64_t b = (r - a * nblocks) * kStridedBlock;
+                    const int64_t nb = std::min<int64_t>(kStridedBlock, after - b);
                     TP_SOFTMAX_STRIDED_ROW(float)
                 }
             });
@@ -3279,10 +3323,11 @@ static Tensor softmax_fused_kernel_impl(const Tensor& self, int64_t dim, DType o
             const double* in = input.data_ptr<double>();
             double* out = result.data_ptr<double>();
 #endif
-            parallel_for(0, before * after, 1, [&](int64_t rb, int64_t re) {
+            parallel_for(0, before * nblocks, 1, [&](int64_t rb, int64_t re) {
                 for (int64_t r = rb; r < re; ++r) {
-                    const int64_t a = r / after;
-                    const int64_t b = r % after;
+                    const int64_t a = r / nblocks;
+                    const int64_t b = (r - a * nblocks) * kStridedBlock;
+                    const int64_t nb = std::min<int64_t>(kStridedBlock, after - b);
                     TP_SOFTMAX_STRIDED_ROW(double)
                 }
             });
