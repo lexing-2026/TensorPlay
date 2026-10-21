@@ -581,6 +581,12 @@ buffer_wide_binary_op_tensor:
     OPERATOR: wide_sub(X, wide_mul(A, Y))
   - NAME: buffer_mul_wide
     OPERATOR: wide_mul(X, Y)
+  # The greater or lesser of two counts compares the word that holds the sign
+  # first, so the pair is walked rather than read a word at a time.
+  - NAME: buffer_maximum_wide
+    OPERATOR: wide_max(X, Y)
+  - NAME: buffer_minimum_wide
+    OPERATOR: wide_min(X, Y)
 buffer_wide_binary_op_scalar:
   parameter_names_with_default_values:
     OPERATOR: wide_add(X, Y)
@@ -596,6 +602,41 @@ buffer_wide_binary_op_scalar:
     OPERATOR: wide_add(X, Y)
   - NAME: buffer_mul_scalar_wide
     OPERATOR: wide_mul(X, Y)
+  # A count subtracted from a number walks the pair the other way round.
+  - NAME: buffer_rsub_scalar_wide
+    OPERATOR: wide_sub(Y, X)
+# The whole-number walks over a code wider than a word: a magnitude, a negation,
+# the count of a sign, a square and a clamp at none, plus the roundings, which a
+# count already answers with itself.
+buffer_wide_unary_op:
+  parameter_names_with_default_values:
+    OPERATOR: X
+    INPLACE: false
+  generate_variant_forall:
+    INPLACE:
+    - VALUE: false
+      SUFFIX: ''
+    - VALUE: true
+      SUFFIX: inplace
+  shader_variants:
+  - NAME: buffer_abs_wide
+    OPERATOR: wide_abs(X)
+  - NAME: buffer_neg_wide
+    OPERATOR: wide_neg(X)
+  - NAME: buffer_sign_wide
+    OPERATOR: wide_sign(X)
+  - NAME: buffer_square_wide
+    OPERATOR: wide_mul(X, X)
+  - NAME: buffer_relu_wide
+    OPERATOR: wide_max(X, uvec2(0u, 0u))
+  - NAME: buffer_floor_wide
+    OPERATOR: X
+  - NAME: buffer_ceil_wide
+    OPERATOR: X
+  - NAME: buffer_round_wide
+    OPERATOR: X
+  - NAME: buffer_trunc_wide
+    OPERATOR: X
 mm:
   parameter_names_with_default_values: {}
   generate_variant_forall:

@@ -423,9 +423,9 @@ std::string binary_variant(
     TP_CHECK(
         api::shader_registry().has_shader(b),
         std::string("Vulkan ") + name + " has no kernel" +
-            (vocab == BinaryVocab::kWide ? " for a count wider than a word"
-                                         : " for a signed word") +
-            "; the op is float-only");
+            (vocab == BinaryVocab::kWide
+                 ? " for a count wider than a word"
+                 : " for a signed word; the op is float-only"));
   }
   return b;
 }

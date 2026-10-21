@@ -19,9 +19,11 @@ namespace {
 
 /*
  * Element-width classes the unary dispatch covers.  kFloat covers Float32 /
- * Float16 (sampler planes), kInt covers Int32 (signed-word iimage planes).
+ * Float16 (sampler planes), kInt covers Int32 (signed-word iimage planes), and
+ * kWide covers a code wider than a word, which has no texel to sit in and so is
+ * only ever walked over linear storage.
  */
-enum class UnaryVocab { kFloat, kInt };
+enum class UnaryVocab { kFloat, kInt, kWide };
 
 UnaryVocab unary_vocab(const Tensor& t, const char* name) {
   if (t.dtype() == DType::Float32 || t.dtype() == DType::Float16) {
@@ -30,34 +32,67 @@ UnaryVocab unary_vocab(const Tensor& t, const char* name) {
   if (t.dtype() == DType::Int32) {
     return UnaryVocab::kInt;
   }
+  if (t.dtype() == DType::Int64) {
+    return UnaryVocab::kWide;
+  }
   TP_THROW(
       NotImplementedError,
       std::string("Vulkan ") + name +
-          " supports Float32, Float16 and Int32 tensors only");
+          " supports Float32, Float16, Int32 and Int64 tensors only");
   return UnaryVocab::kFloat;
 }
 
-// Variant name for the payload vocabulary: the Int32 marker is inserted
+// Variant name for the payload vocabulary: the marker of the width is inserted
 // before the generated "inplace" suffix (variants compile as
-// `<base>_i32inplace`), and the registry check turns a float-only op into
-// an explicit error instead of a missing-kernel crash.
-std::string unary_variant(const char* base, UnaryVocab vocab, const char* name) {
+// `<base>_i32inplace`), and the registry check turns an op with no kernel in
+// that width into an explicit error instead of a missing-kernel crash.  A code
+// wider than a word has no image form, so the image side of such a payload keeps
+// its own name and is refused at the image path.
+std::string unary_variant(
+    const char* base,
+    UnaryVocab vocab,
+    const char* name,
+    bool linear) {
   std::string b(base);
+  std::string marker;
   if (vocab == UnaryVocab::kInt) {
-    static const std::string kInplace = "inplace";
-    const size_t pos = b.rfind(kInplace);
-    if (pos != std::string::npos && pos + kInplace.size() == b.size() &&
-        (pos < 4 || b.compare(pos - 4, 4, "_i32") != 0)) {
-      b.insert(pos, "_i32");
-    } else if (b.size() < 4 || b.compare(b.size() - 4, 4, "_i32") != 0) {
-      b += "_i32";
+    marker = "_i32";
+  } else if (vocab == UnaryVocab::kWide) {
+    if (!linear) {
+      return b;
     }
-    TP_CHECK(
-        api::shader_registry().has_shader(b),
-        std::string("Vulkan ") + name +
-            " has no Int32 kernel; the op is float-only");
+    marker = "_wide";
+  } else {
+    return b;
   }
+  static const std::string kInplace = "inplace";
+  const size_t pos = b.rfind(kInplace);
+  if (pos != std::string::npos && pos + kInplace.size() == b.size() &&
+      (pos < marker.size() ||
+       b.compare(pos - marker.size(), marker.size(), marker) != 0)) {
+    b.insert(pos, marker);
+  } else if (b.size() < marker.size() ||
+             b.compare(b.size() - marker.size(), marker.size(), marker) != 0) {
+    b += marker;
+  }
+  TP_CHECK(
+      api::shader_registry().has_shader(b),
+      std::string("Vulkan ") + name + " has no kernel" +
+          (vocab == UnaryVocab::kWide
+               ? " for a count wider than a word"
+               : " for a signed word; the op is float-only"));
   return b;
+}
+
+// An image names one payload per texel, so a code wider than a word has no image
+// form to be read through.  Such a payload never gets image storage either; the
+// refusal is named rather than left to a kernel that would read the word above
+// an element as a second lane.
+void require_image_vocab(const Tensor& self_arg, const char* name) {
+  TP_CHECK(
+      self_arg.dtype() != DType::Int64,
+      std::string("Vulkan ") + name +
+          " has no image form for a count wider than a word");
 }
 
 Tensor unary_op(
@@ -106,6 +141,7 @@ Tensor unary_op(
         params.buffer());
     return convert(v_output);
   }
+  require_image_vocab(self_arg, buffer_shader_name);
 
   const struct Block final {
     uvec3 extents;
@@ -173,6 +209,7 @@ Tensor& unary_op_(
         params.buffer());
     return self_arg;
   }
+  require_image_vocab(self_arg, buffer_shader_name);
 
   const struct Block final {
     uvec3 extents;
@@ -220,15 +257,16 @@ Tensor unary_op_typed(
     const char* buffer_shader_name,
     bool int_capable,
     const char* name) {
+  const bool counts = self_arg.dtype() == DType::Int32 ||
+      self_arg.dtype() == DType::Int64;
   const Tensor operand =
-      (int_capable || self_arg.dtype() != DType::Int32)
-      ? self_arg
-      : self_arg.to(DType::Float32);
+      (int_capable || !counts) ? self_arg : self_arg.to(DType::Float32);
   const UnaryVocab vocab = unary_vocab(operand, name);
   return unary_op(
       operand,
-      kernel_for(unary_variant(shader_name, vocab, name).c_str(), operand),
-      unary_variant(buffer_shader_name, vocab, name).c_str());
+      kernel_for(
+          unary_variant(shader_name, vocab, name, false).c_str(), operand),
+      unary_variant(buffer_shader_name, vocab, name, true).c_str());
 }
 
 Tensor& unary_op_typed_inplace(
@@ -239,8 +277,9 @@ Tensor& unary_op_typed_inplace(
   const UnaryVocab vocab = unary_vocab(self_arg, name);
   return unary_op_(
       self_arg,
-      kernel_for(unary_variant(shader_name, vocab, name).c_str(), self_arg),
-      unary_variant(buffer_shader_name, vocab, name).c_str());
+      kernel_for(
+          unary_variant(shader_name, vocab, name, false).c_str(), self_arg),
+      unary_variant(buffer_shader_name, vocab, name, true).c_str());
 }
 
 } // namespace

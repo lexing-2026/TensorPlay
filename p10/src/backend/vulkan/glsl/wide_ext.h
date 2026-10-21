@@ -63,3 +63,29 @@ uvec2 wide_neg(const uvec2 x) {
 uvec2 wide_abs(const uvec2 x) {
   return (x.y >> 31u) == 0u ? x : wide_neg(x);
 }
+
+// Greater of two counts.  The word that holds the sign decides, and only when
+// the two agree does the low word get a say -- and there it compares without a
+// sign, because a pair sharing its high word differs below it.
+uvec2 wide_max(const uvec2 x, const uvec2 y) {
+  const bool greater =
+      int(x.y) > int(y.y) || (x.y == y.y && x.x > y.x);
+  return greater ? x : y;
+}
+
+// Lesser of two counts, the same walk turned around.
+uvec2 wide_min(const uvec2 x, const uvec2 y) {
+  const bool lesser = int(x.y) < int(y.y) || (x.y == y.y && x.x < y.x);
+  return lesser ? x : y;
+}
+
+// One, none or a taken-away one as a count: a pair is zero only when both of
+// its words are, and the sign again lives in the high word.
+uvec2 wide_sign(const uvec2 x) {
+  if (x.x == 0u && x.y == 0u) {
+    return uvec2(0u, 0u);
+  }
+  return (x.y >> 31u) == 0u
+      ? uvec2(1u, 0u)
+      : uvec2(0xFFFFFFFFu, 0xFFFFFFFFu);
+}
