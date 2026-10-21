@@ -420,6 +420,27 @@ def test_softmax_backward_answers_the_formula_on_a_wide_row(device):
 
 
 @pytest.mark.parametrize("device", DEVICES)
+def test_count_nonzero_along_a_dimension_counts_every_row(device):
+    tp.manual_seed(0)
+    x = tp.tensor([[0.0, 1.0, 0.0], [2.0, 0.0, 3.0], [0.0, 0.0, 0.0]], device=device)
+    assert tp.equal(tp.count_nonzero(x, [1]), tp.tensor([1, 2, 0], device=device))
+    assert tp.equal(tp.count_nonzero(x, [0]), tp.tensor([1, 1, 1], device=device))
+    assert tp.equal(tp.count_nonzero(x, [0, 1]), tp.tensor(3, device=device))
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_take_from_a_flat_tensor_picks_the_named_elements(device):
+    tp.manual_seed(0)
+    values = tp.randn(4096, device=device)
+    index = tp.tensor([7, 7, 0, 4095, 1024], dtype=tp.int64, device=device)
+    got = tp.take(values, index)
+    assert tp.equal(got, values.take(index))
+    # A negative index counts from the end.
+    assert tp.equal(tp.take(values, tp.tensor([-1], dtype=tp.int64, device=device)),
+                    values[4095:4096])
+
+
+@pytest.mark.parametrize("device", DEVICES)
 def test_index_add_in_place_sums_into_the_caller_s_buffer(device):
     # The in-place form writes into the caller's tensor, so a repeated index
     # adds its rows one after another, just like the out-of-place form.
@@ -431,7 +452,9 @@ def test_index_add_in_place_sums_into_the_caller_s_buffer(device):
     in_place = base.clone()
     in_place.index_add_(0, idx, src)
     out_of_place = base.index_add(0, idx, src)
-    assert tp.equal(in_place, out_of_place)
+    # A repeated index is summed in the order the device happens to reach it,
+    # so the two answers are compared with a tolerance.
+    assert _close(in_place, out_of_place, tol=1e-6)
 
 
 @pytest.mark.parametrize("device", DEVICES)

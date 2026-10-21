@@ -736,6 +736,48 @@ int64_t count_nonzero_flat_cpu_impl(const Tensor& self) {
     return count;
 }
 
+// Counts the elements that are not zero along one reduced dimension.  The
+// buffer splits into (outer, dim_size, inner), so each count reads the
+// elements of one row: a packed sequence when the dimension is the last one
+// and a strided one otherwise.  The count of an outer slot and an inner
+// position lands at the same place in the answer as the pair they name.
+template <typename scalar_t>
+Tensor count_nonzero_one_dim_cpu_impl(const Tensor& self, int64_t dim) {
+    const int64_t nd = self.dim();
+    std::vector<int64_t> out_shape;
+    for (int64_t i = 0; i < nd; ++i) {
+        if (i != dim) out_shape.push_back(self.size(i));
+    }
+    int64_t outer = 1, inner = 1;
+    for (int64_t i = 0; i < dim; ++i) outer *= self.size(i);
+    for (int64_t i = dim + 1; i < nd; ++i) inner *= self.size(i);
+    const int64_t dim_size = self.size(dim);
+
+    Tensor sc = self.contiguous();
+    Tensor out = Tensor::empty(out_shape, DType::Int64, self.device());
+    const int64_t tasks = outer * inner;
+    if (tasks == 0 || dim_size == 0) return out;
+
+    const scalar_t* in = sc.data_ptr<scalar_t>();
+    int64_t* op = out.data_ptr<int64_t>();
+    // One task counts one row, so the grain counts the rows a chunk covers.
+    const int64_t grain = std::max<int64_t>(
+        1, GRAIN_SIZE / std::max<int64_t>(dim_size * inner, 1));
+    parallel_for(0, tasks, grain, [&](int64_t begin, int64_t end) {
+        for (int64_t t = begin; t < end; ++t) {
+            const int64_t o = inner == 1 ? t : t / inner;
+            const int64_t in_off = inner == 1 ? 0 : t % inner;
+            const int64_t base = o * dim_size * inner + in_off;
+            int64_t count = 0;
+            for (int64_t k = 0; k < dim_size; ++k) {
+                count += count_nonzero_value(in[base + k * inner]) ? 1 : 0;
+            }
+            op[t] = count;
+        }
+    });
+    return out;
+}
+
 Tensor count_nonzero_cpu(const Tensor& self, const std::vector<int64_t>& dim) {
     if (dim.empty()) {
         int64_t count = 0;
@@ -747,6 +789,28 @@ Tensor count_nonzero_cpu(const Tensor& self, const std::vector<int64_t>& dim) {
         }
 #undef TP_COUNT_CASE
         return Tensor::zeros({}, DType::Int64, self.device()).fill_(Scalar(count));
+    }
+    // One reduced dimension has a walk of its own; more than one falls back
+    // to the composed reduction.
+    const int64_t nd = self.dim();
+    std::vector<bool> reduced(static_cast<size_t>(nd), false);
+    std::vector<int64_t> dims;
+    for (const int64_t d : dim) {
+        const int64_t w = wrap_dim(d, nd);
+        if (!reduced[static_cast<size_t>(w)]) {
+            reduced[static_cast<size_t>(w)] = true;
+            dims.push_back(w);
+        }
+    }
+    if (dims.size() == 1) {
+#define TP_COUNT_DIM_CASE(ctype, name_) \
+    case DType::name_: \
+        return count_nonzero_one_dim_cpu_impl<ctype>(self, dims[0]);
+        switch (self.dtype()) {
+            TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_COUNT_DIM_CASE)
+            default: TP_THROW(TypeError, "count_nonzero: unsupported dtype");
+        }
+#undef TP_COUNT_DIM_CASE
     }
     return reduce_dims_impl<double>(
         self, dim, false, DType::Int64, 0.0,

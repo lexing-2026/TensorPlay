@@ -884,11 +884,14 @@ Tensor index_select_cpu(const Tensor& self, int64_t dim, const Tensor& index) {
     out_shape[dim] = n_idx;
     Tensor result = Tensor::empty(out_shape, self.dtype(), self.device());
     Tensor self_c = self.contiguous();
+    // When the selection walks the last dimension, the copies either spread
+    // over the outer slots or over the index: too few outer slots to fill the
+    // pool means the index carries the parallelism.
 #define TP_ISEL_CASE(ctype, name) \
     case DType::name: { \
         const ctype* s = self_c.data_ptr<ctype>(); \
         ctype* d = result.data_ptr<ctype>(); \
-        if (inner == 1) { \
+        if (inner == 1 && outer >= get_num_threads()) { \
             const int64_t batch_grain = std::max<int64_t>(1, GRAIN_SIZE / std::max<int64_t>(n_idx, 1)); \
             parallel_for(0, outer, batch_grain, [&](int64_t ob, int64_t oe) { \
                 for (int64_t o = ob; o < oe; ++o) { \
@@ -896,6 +899,14 @@ Tensor index_select_cpu(const Tensor& self, int64_t dim, const Tensor& index) {
                     ctype* dst_row = d + o * n_idx; \
                     for (int64_t k = 0; k < n_idx; ++k) { \
                         dst_row[k] = src_row[ip[k]]; \
+                    } \
+                } \
+            }); \
+        } else if (inner == 1) { \
+            parallel_for(0, n_idx, GRAIN_SIZE, [&](int64_t kb, int64_t ke) { \
+                for (int64_t k = kb; k < ke; ++k) { \
+                    for (int64_t o = 0; o < outer; ++o) { \
+                        d[o * n_idx + k] = s[o * row + ip[k]]; \
                     } \
                 } \
             }); \
