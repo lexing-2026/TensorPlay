@@ -5014,17 +5014,69 @@ class TestVulkanComparisonBroadcast(unittest.TestCase):
             np.array([-(2 ** 63)], dtype=np.int64), dtype=tensorplay.int64)
         self._check(wide, one, "int64 against one element")
 
-    def test_a_wider_count_and_a_word_cannot_share_a_kernel(self):
-        import tensorplay.functional as F
-        # The scalar form has no wide kernel, so a count beyond a word keeps its
-        # own request refused rather than being read as a word.
+    def test_a_wider_count_meets_a_number_in_every_order(self):
+        # The number a count is measured against travels as the pair of words
+        # such a count is carried in, so a fixed side answers the same six orders
+        # the two-payload walk does - and a request that names the extremes of
+        # the width is the tightest one it can make.
+        values = np.array(
+            [0, 1, -1, 2, 5, -7, 2 ** 31, -(2 ** 31) - 1, 2 ** 63 - 1,
+             -(2 ** 63), (2 ** 40) + 7],
+            dtype=np.int64)
+        counts = tensorplay.tensor(values.copy(), dtype=tensorplay.int64)
+        for threshold in (2, -1, 0, 5, 2 ** 31, (2 ** 63) - 1, -(2 ** 63)):
+            for name, want in (
+                    ("eq", values == threshold),
+                    ("ne", values != threshold),
+                    ("lt", values < threshold),
+                    ("le", values <= threshold),
+                    ("gt", values > threshold),
+                    ("ge", values >= threshold)):
+                got = getattr(tensorplay, name)(
+                    counts.to("vulkan"), threshold).cpu().numpy()
+                np.testing.assert_array_equal(
+                    got, want,
+                    err_msg=f"int64 {name} against {threshold}")
+
+    def test_a_wider_count_turned_into_a_mask_keeps_its_own_width(self):
+        # The mask a vocabulary keeps is the same walk with the count side first:
+        # a reversed request compares the number against the pair, not the pair
+        # read as a word.
+        values = np.array(
+            [0, 1, -1, 5, -(1 << 32), (1 << 40) + 7, -(2 ** 63), 2 ** 63 - 1],
+            dtype=np.int64)
+        counts = tensorplay.tensor(values.copy(), dtype=tensorplay.int64)
+        np.testing.assert_array_equal(
+            (counts.to("vulkan") > 5).cpu().numpy(), values > 5,
+            err_msg="int64 kept above a number")
+        np.testing.assert_array_equal(
+            (counts.to("vulkan") >= (1 << 40)).cpu().numpy(),
+            values >= (1 << 40), err_msg="int64 kept past a word")
+        np.testing.assert_array_equal(
+            (5 > counts.to("vulkan")).cpu().numpy(), 5 > values,
+            err_msg="a number kept above an int64")
+        # A whole number written with a fraction in it is still whole.
+        np.testing.assert_array_equal(
+            (counts.to("vulkan") > 2.0).cpu().numpy(), values > 2,
+            err_msg="int64 against a whole number of a different family")
+        # The answer packs one byte per element, four lanes to a word, so a
+        # length that fills no whole number of words still needs every lane.
+        for length in (1, 2, 3, 5, 17, 65, 257):
+            rng = np.random.default_rng(length)
+            host = rng.integers(-(2 ** 62), 2 ** 62, size=length)
+            np.testing.assert_array_equal(
+                tensorplay.gt(
+                    tensorplay.tensor(host.copy(), dtype=tensorplay.int64)
+                    .to("vulkan"), 0).cpu().numpy(),
+                host > 0, err_msg=f"{length} counts kept above none")
+
+    def test_a_wider_count_and_a_fraction_cannot_share_a_kernel(self):
         counts = tensorplay.tensor(
             np.array([1, 2, 3], dtype=np.int64),
             dtype=tensorplay.int64).to("vulkan")
-        with self.assertRaisesRegex(RuntimeError, "unsupported dtype"):
-            F.ge(counts, 2)
-        with self.assertRaisesRegex(RuntimeError, "unsupported dtype"):
-            counts > 2
+        with self.assertRaisesRegex(
+                RuntimeError, "against a whole number"):
+            counts > 2.5
 
     def test_a_causal_mask_keeps_its_strict_triangle(self):
         # The additive mask of attention is one comparison of two ranges: a row
@@ -11538,6 +11590,79 @@ class TestVulkanWideArithmetic(unittest.TestCase):
         host = np.full((20001,), 1 << 31, dtype=np.int64)
         got = self._device(host) + self._device(host)
         self._checked(got, [1 << 32] * 20001, "a long counting payload doubled")
+
+    def test_a_clip_between_two_counts_of_its_own_width(self):
+        # A closed range over a pair of words is settled word against word on each
+        # side: a count outside it lands on the edge, one inside is left alone.
+        counts = [0, 1, -1, 5, -7, 1 << 32, -(1 << 32), (1 << 40) + 7,
+                  -(1 << 63), (1 << 63) - 1]
+        lo, hi = -(1 << 40), 1 << 40
+        self._checked(
+            self._device(counts).clamp(lo, hi),
+            [min(max(a, lo), hi) for a in counts],
+            "counting payload clipped to a range of its own width")
+        # The extremes of the width clip nothing, which is how a caller leaves one
+        # side of the range open.
+        self._checked(
+            self._device(counts).clamp(-(2 ** 63), 2 ** 63 - 1),
+            counts,
+            "clip at the ends of the width")
+        import tensorplay.functional as F
+        self._checked(
+            F.clamp(self._device(counts), min=-5),
+            [max(a, -5) for a in counts],
+            "counting payload given only a floor")
+        self._checked(
+            F.clamp(self._device(counts), max=3),
+            [min(a, 3) for a in counts],
+            "counting payload given only a ceiling")
+
+    def test_a_clip_written_back_keeps_the_pair_it_was_allocated(self):
+        counts = [0, 1, -1, 5, -7, 1 << 32, -(1 << 32), (1 << 63) - 1, -(2 ** 63)]
+        target = self._device(counts)
+        target.clamp_(0, 1 << 32)
+        self._checked(
+            target, [min(max(a, 0), 1 << 32) for a in counts],
+            "clip written into a counting payload")
+        target = self._device(counts)
+        target.clamp_min_(1 << 32)
+        self._checked(
+            target, [max(a, 1 << 32) for a in counts],
+            "floor written into a counting payload")
+        target = self._device(counts)
+        target.clamp_max_(-(1 << 32))
+        self._checked(
+            target, [min(a, -(1 << 32)) for a in counts],
+            "ceiling written into a counting payload")
+
+    def test_a_clip_of_a_narrow_count_keeps_its_word(self):
+        # The wide walk is chosen by the width of the payload, not by the shape of
+        # the request: a count that fits a word answers with the kernels it did
+        # before a wider one was added.
+        narrow = self._device([0, 5, -7, 100, -200], tensorplay.int32)
+        got = narrow.clamp(-10, 10)
+        self.assertEqual(got.dtype, tensorplay.int32,
+                         "clip changed the width of a narrow count")
+        np.testing.assert_array_equal(
+            np.asarray(got.cpu()),
+            np.array([min(max(a, -10), 10) for a in [0, 5, -7, 100, -200]],
+                     dtype=np.int32),
+            err_msg="narrow count clipped to a range")
+
+    def test_a_clip_over_a_grid_and_a_tail_that_fills_no_whole_word(self):
+        grid = [[1 << 32, -1, 5], [-(1 << 40), 0, (1 << 63) - 1]]
+        lo, hi = -(1 << 36), 1 << 36
+        self._checked(
+            self._device(grid).clamp(lo, hi),
+            [[min(max(a, lo), hi) for a in row] for row in grid],
+            "counting grid clipped to a range")
+        for length in (1, 2, 3, 5, 17, 64, 65, 2001):
+            rng = np.random.default_rng(length)
+            host = rng.integers(-(2 ** 62), 2 ** 62, size=length)
+            self._checked(
+                self._device(host).clamp(-(1 << 40), 1 << 40),
+                [min(max(int(a), -(1 << 40)), 1 << 40) for a in host],
+                f"clip over {length} counts")
 
     def test_a_walk_with_no_pair_of_words_to_read_says_so(self):
         counts = self._device([10, 1 << 32, -7])
