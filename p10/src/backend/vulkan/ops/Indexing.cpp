@@ -87,18 +87,19 @@ uint32_t row_lookup_lanes(DType dtype) {
   return dtype == DType::Int64 ? 1u : 4u;
 }
 
-// The linear row lookup that reads and writes one element type at its own
-// width.  The names do not follow one suffix rule, so they are listed.
-const char* row_lookup_buffer_kernel(DType dtype) {
+// The linear row-lookup kernels read and write the payload at its own width, so
+// each element type has its own name.  The tail of that name is listed here; the
+// single-precision kernel carries the bare name.
+const char* row_lookup_suffix(DType dtype) {
   switch (dtype) {
     case DType::Float16:
-      return "index_select_buffer_half";
+      return "_half";
     case DType::Int32:
-      return "index_select_buffer_int32";
+      return "_int32";
     case DType::Int64:
-      return "index_select_buffer_i64";
+      return "_i64";
     default:
-      return "index_select_buffer";
+      return "";
   }
 }
 
@@ -959,7 +960,9 @@ Tensor index_select_kernel(
     api::UniformParamsBuffer params(context, block);
     api::PipelineBarrier pipeline_barrier{};
     context->submit_compute_job(
-        VK_KERNEL_FROM_STR(row_lookup_buffer_kernel(self.dtype())),
+        VK_KERNEL_FROM_STR(
+            std::string("index_select_buffer") +
+            row_lookup_suffix(self.dtype())),
         pipeline_barrier,
         {api::utils::div_up(n, lanes), 1u, 1u}, {256u, 1u, 1u}, VK_NULL_HANDLE,
         v_out_buf.buffer(
@@ -1075,7 +1078,7 @@ Tensor take_kernel(const Tensor& self, const Tensor& index) {
 // A code naming no row of the source contributes a zero, the answer the other row
 // lookups of this backend already give.
 Tensor gather_kernel(const Tensor& self, int64_t dim, const Tensor& index) {
-  validate_gather_operand(self, "gather");
+  validate_row_lookup_operand(self, "gather");
   TP_CHECK(
       index.dtype() == DType::Int32 || index.dtype() == DType::Int64,
       "Vulkan gather: index must be Int32 or Int64");
@@ -1131,7 +1134,7 @@ Tensor gather_kernel(const Tensor& self, int64_t dim, const Tensor& index) {
     api::vTensor v_out_buf{
         context, {out_count}, self.dtype(), api::StorageType::BUFFER,
         api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
-    const uint32_t lanes = self.dtype() == DType::Float16 ? 2u : 4u;
+    const uint32_t lanes = row_lookup_lanes(self.dtype());
     const ivec4 out_strides = padded_strides(out_sizes);
     const ivec4 self_strides = padded_strides(
         static_cast<std::vector<int64_t>>(self.shape()));
@@ -1152,8 +1155,8 @@ Tensor gather_kernel(const Tensor& self, int64_t dim, const Tensor& index) {
     api::UniformParamsBuffer params(context, block);
     api::PipelineBarrier pipeline_barrier{};
     context->submit_compute_job(
-        VK_KERNEL_FROM_STR(self.dtype() == DType::Float16 ? "gather_buffer_half"
-                                                          : "gather_buffer"),
+        VK_KERNEL_FROM_STR(
+            std::string("gather_buffer") + row_lookup_suffix(self.dtype())),
         pipeline_barrier,
         {api::utils::div_up(static_cast<uint32_t>(out_count), lanes), 1u, 1u},
         {256u, 1u, 1u}, VK_NULL_HANDLE,
@@ -1205,7 +1208,9 @@ Tensor gather_kernel(const Tensor& self, int64_t dim, const Tensor& index) {
   const api::utils::uvec3 grid = v_output.extents();
 
   context->submit_compute_job(
-      VK_KERNEL(gather), pipeline_barrier, grid,
+      VK_KERNEL_FROM_STR(
+          self.dtype() == DType::Int32 ? "gather_int32" : "gather"),
+      pipeline_barrier, grid,
       adaptive_work_group_size(grid), VK_NULL_HANDLE,
       v_output.image(
           pipeline_barrier,
