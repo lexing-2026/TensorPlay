@@ -119,10 +119,11 @@ class Adam(Optimizer):
                     if (group["capturable"] or group["fused"])
                     else tp.device("cpu"),
                 )
-                state["exp_avg"] = zeros_like(p)
-                state["exp_avg_sq"] = zeros_like(p)
+                state["exp_avg"] = _new_moments(p, _moments_dtype(p, group))
+                state["exp_avg_sq"] = _new_moments(p, state["exp_avg"].dtype)
                 if group["amsgrad"]:
-                    state["max_exp_avg_sq"] = zeros_like(p)
+                    state["max_exp_avg_sq"] = _new_moments(
+                        p, state["exp_avg"].dtype)
 
             exp_avgs.append(state["exp_avg"])
             exp_avg_sqs.append(state["exp_avg_sq"])
@@ -237,6 +238,41 @@ def _adam_fused_layout_ready(
     )
 
 
+def _moments_dtype(param, group):
+    """Width the running averages of a parameter are kept in.
+
+    A gradient of 4e-3 contributes (1 - beta2) * g * g = 1.5e-8 to the second
+    average, and a half plane names nothing that small: the average reads zero,
+    its root reads zero, and the step divides by that zero.  A narrow parameter
+    whose walk runs one parameter at a time therefore keeps its averages one
+    plane wider, and only the value handed back to the parameter is rounded.
+
+    The batched and native bodies ask every tensor of a walk to share the
+    parameter's width, as does a walk whose scalars live in tensors, so those
+    layouts keep the narrow averages and take the risk with them.
+    """
+    if param.dtype not in (tp.float16, tp.bfloat16):
+        return param.dtype
+    if group.get("fused") or group.get("foreach"):
+        return param.dtype
+    if group.get("capturable") or group.get("differentiable"):
+        return param.dtype
+    if any(isinstance(value, tp.Tensor) for value in
+           (group["lr"], group["weight_decay"], group["eps"],
+            *group["betas"])):
+        return param.dtype
+    if param.device.type in ("cpu", "cuda"):
+        return param.dtype
+    return tp.float32
+
+
+def _new_moments(param, dtype):
+    state = zeros_like(param)
+    if dtype != param.dtype:
+        return state.to(dtype)
+    return state
+
+
 def _single_tensor_adam(
         params, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs, state_steps,
         grad_scale, found_inf, *, amsgrad, has_complex, beta1, beta2, lr,
@@ -341,14 +377,21 @@ def _single_tensor_adam(
             beta2.to(device=exp_avg_sq.device, dtype=exp_avg_sq.dtype)
             if isinstance(beta2, tp.Tensor) else beta2
         )
+        # An average kept wider than the parameter walks in its own width, so
+        # the gradient is read there; nothing is lost on the way in.
+        moment_grad = (
+            grad if grad.dtype == exp_avg.dtype else grad.to(exp_avg.dtype)
+        )
         if isinstance(beta1_param, tp.Tensor):
-            exp_avg.lerp_(grad, 1 - beta1_param)
+            exp_avg.lerp_(moment_grad, 1 - beta1_param)
         else:
-            exp_avg.mul_(beta1_param).add_(grad * (1 - beta1_param))
+            exp_avg.mul_(beta1_param).add_(
+                moment_grad * (1 - beta1_param))
         if isinstance(beta2_param, tp.Tensor):
-            exp_avg_sq.lerp_(grad * grad, 1 - beta2_param)
+            exp_avg_sq.lerp_(moment_grad * moment_grad, 1 - beta2_param)
         else:
-            exp_avg_sq.mul_(beta2_param).add_(grad * grad * (1 - beta2_param))
+            exp_avg_sq.mul_(beta2_param).add_(
+                moment_grad * moment_grad * (1 - beta2_param))
 
         tensor_math = (
             isinstance(lr_param, tp.Tensor)
@@ -386,7 +429,13 @@ def _single_tensor_adam(
                 denom = (max_exp_avg_sq.sqrt() / bias_correction2 ** 0.5).add_(eps)
             else:
                 denom = (exp_avg_sq.sqrt() / bias_correction2 ** 0.5).add_(eps)
-            param.addcdiv_(exp_avg, denom, value=-lr / bias_correction1)
+            if exp_avg.dtype != param.dtype:
+                # The quotient is answered in the width the averages carry and
+                # rounded once, into the plane the parameter lives in.
+                param.add_((exp_avg / denom).to(param.dtype),
+                           alpha=-lr / bias_correction1)
+            else:
+                param.addcdiv_(exp_avg, denom, value=-lr / bias_correction1)
 
 
 def _multi_tensor_adam(
