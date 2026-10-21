@@ -5437,7 +5437,7 @@ class TestVulkanScalarVocabulary(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "negative exponent"):
             counts ** -1
         with self.assertRaisesRegex(
-                RuntimeError, "Float32, Float16 and Int32"):
+                RuntimeError, "tensors only"):
             self._device(np.array([1, 2], dtype=np.int8)) + 2
 
 
@@ -8283,11 +8283,13 @@ class TestVulkanVectorProducts(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "expected two vectors"):
             tensorplay.outer(self._device(np.zeros((3, 1), f32)),
                              self._device(np.zeros(3, f32)))
-        # A pair read as a wider count has no product kernel, so the refusal
-        # comes from the product the rank-one walk is written as.
-        with self.assertRaisesRegex(RuntimeError, "operand widths"):
-            tensorplay.outer(self._device(np.zeros(3, np.int64)),
-                             self._device(np.zeros(3, np.int64)))
+        # A rank-one walk over a pair of counts is a product of the payload, so
+        # it answers; the total of such a pair has no walk over a wide code and
+        # the product path names the widths it reads.
+        with self.assertRaisesRegex(
+                RuntimeError, "Float32 and Float16"):
+            tensorplay.dot(self._device(np.zeros(3, np.int64)),
+                           self._device(np.zeros(3, np.int64)))
         with self.assertRaisesRegex(RuntimeError, "last axis"):
             tensorplay.inner(self._device(np.zeros((3, 4), f32)),
                              self._device(np.zeros((3, 5), f32)))
@@ -11186,6 +11188,202 @@ class TestVulkanNarrowTraining(unittest.TestCase):
                              f"a host {narrow} parameter widened its averages")
             self.assertEqual(state["exp_avg_sq"].dtype, narrow,
                              f"a host {narrow} parameter widened its averages")
+
+
+class TestVulkanWideArithmetic(unittest.TestCase):
+    """A count wider than a word has no texel to sit in, so the arithmetic walks
+    over one read and write a pair of words.  These are the sums, differences and
+    products a decode loop asks of its token, position and length counters, with
+    the carries and borrows that cross the seam where the two words meet."""
+
+    MASK = (1 << 64) - 1
+
+    @classmethod
+    def _as_int64(cls, value):
+        # A total past every word lands where the counts it added land, which is
+        # what a pair of words holds too.
+        bits = int(value) & cls.MASK
+        return bits - (1 << 64) if bits >= (1 << 63) else bits
+
+    @classmethod
+    def _wrapped(cls, values):
+        host = np.array(values, dtype=object)
+        flat = [cls._as_int64(v) for v in host.ravel().tolist()]
+        return np.array(flat, dtype=np.int64).reshape(host.shape)
+
+    def _device(self, values, dtype=tensorplay.int64):
+        return tensorplay.from_numpy(self._wrapped(values)).to("vulkan").to(dtype)
+
+    def _checked(self, got, want, label):
+        self.assertEqual(got.dtype, tensorplay.int64,
+                         f"{label} changed the width of its payload")
+        self.assertTrue(got.device.is_vulkan(),
+                        f"{label} left the accelerator")
+        np.testing.assert_array_equal(
+            np.asarray(got.cpu()), self._wrapped(want), err_msg=label)
+
+    def test_a_sum_hands_one_across_the_seam_of_its_pair(self):
+        first = [1, (1 << 32) - 1, 1 << 32, 1 << 40, -(1 << 63), (1 << 63) - 1,
+                 -1, 0, 1234567890123, -(1 << 32)]
+        second = [1, 1, 1 << 32, 1 << 23, -1, 1, -1, 0, 987654321098, 1]
+        self._checked(
+            self._device(first) + self._device(second),
+            [a + b for a, b in zip(first, second)],
+            "sum of two counting payloads")
+        # A walk that moved only the low word of a pair would keep every value
+        # below 2^32 correct, so the same payload doubled at both ends is asked
+        # for as well.
+        doubled = self._device(first) + self._device(first)
+        self._checked(doubled, [2 * a for a in first], "doubled counting payload")
+
+    def test_a_difference_borrows_from_the_word_that_holds_the_sign(self):
+        first = [(1 << 32), (1 << 40), -(1 << 63), (1 << 63) - 1, 5, 0, -1]
+        second = [1, (1 << 23), 1, 1, 9, 0, (1 << 32)]
+        self._checked(
+            self._device(first) - self._device(second),
+            [a - b for a, b in zip(first, second)],
+            "difference of two counting payloads")
+        self._checked(
+            self._device(first) - self._device(first),
+            [0] * len(first), "a count taken from itself")
+
+    def test_a_product_keeps_the_low_bits_of_the_full_walk(self):
+        first = [1 << 32, 1 << 31, (1 << 63) - 1, -(1 << 63), -1, 0, 3, 1 << 20]
+        second = [1 << 32, 1 << 31, (1 << 63) - 1, -(1 << 63), -1, 7, -4,
+                  1 << 43]
+        self._checked(
+            self._device(first) * self._device(second),
+            [a * b for a, b in zip(first, second)],
+            "product of two counting payloads")
+
+    def test_a_scaled_sum_folds_the_factor_into_the_operand_slot(self):
+        counts = [1, 1 << 32, (1 << 63) - 1, -(1 << 63), -7, 0]
+        addends = [3, 1 << 31, 1, 5, 2, 9]
+        wide = self._device(counts)
+        other = self._device(addends)
+        self._checked(wide + other * 3, [c + 3 * a for c, a in
+                                        zip(counts, addends)],
+                      "count added to a scaled count")
+        self._checked(wide - other * 2, [c - 2 * a for c, a in
+                                        zip(counts, addends)],
+                      "count reduced by a scaled count")
+
+    def test_a_count_meets_a_single_number_in_both_directions(self):
+        counts = [1, 1 << 32, (1 << 63) - 1, -(1 << 63), -7, 0]
+        wide = self._device(counts)
+        self._checked(wide + 5, [c + 5 for c in counts], "count plus a number")
+        self._checked(5 + wide, [5 + c for c in counts], "number plus a count")
+        self._checked(wide - 9, [c - 9 for c in counts], "count less a number")
+        self._checked(wide * 7, [c * 7 for c in counts], "count times a number")
+        # A number with a fraction asks for a plane a count has no image form on,
+        # so the payload steps up to single precision, which holds the sum.
+        widened = wide + 0.5
+        self.assertEqual(widened.dtype, tensorplay.float32)
+        np.testing.assert_allclose(
+            np.asarray(widened.cpu()),
+            np.asarray(self._wrapped(counts), np.float32) + np.float32(0.5),
+            rtol=1e-6, atol=1.0, err_msg="a fraction refused to widen a count")
+
+    def test_a_count_written_in_place_keeps_its_own_width(self):
+        base = [1, 1 << 32, (1 << 63) - 1, -(1 << 63), -7, 0]
+        added = [2, 1 << 31, 1, 3, 5, 7]
+
+        target = self._device(base)
+        target += self._device(added)
+        self._checked(target, [a + b for a, b in zip(base, added)],
+                      "in-place sum of counts")
+
+        target = self._device(base)
+        target -= self._device(added)
+        self._checked(target, [a - b for a, b in zip(base, added)],
+                      "in-place difference of counts")
+
+        target = self._device(base)
+        target *= self._device(added)
+        self._checked(target, [a * b for a, b in zip(base, added)],
+                      "in-place product of counts")
+
+        target = self._device(base)
+        target += 4
+        target *= 2
+        target -= 8
+        self._checked(target, [(a + 4) * 2 - 8 for a in base],
+                      "a counting payload scaled in place")
+
+    def test_a_narrow_count_steps_up_to_the_pair(self):
+        narrow = [1, 2, -3, 5]
+        wide = [1 << 40, 1, 1, (1 << 63) - 1]
+        self._checked(
+            self._device(narrow, tensorplay.int32) + self._device(wide),
+            [a + b for a, b in zip(narrow, wide)],
+            "a narrow count widened to meet its partner")
+        self._checked(
+            self._device(wide) * self._device(narrow, tensorplay.int32),
+            [a * b for a, b in zip(wide, narrow)],
+            "a product across the two widths")
+
+    def test_a_broadcast_count_repeats_without_a_materialized_pair(self):
+        rows = [1, 1 << 32, (1 << 63) - 1]
+        columns = [10, 20, 30, 1 << 33]
+        want = [[r + c for c in columns] for r in rows]
+        self._checked(
+            self._device([[r] for r in rows]) + self._device([columns]),
+            want, "a counting column against a counting row")
+
+        target = self._device([[r + j for j in range(4)] for r in rows])
+        target += self._device([columns])
+        self._checked(
+            target, [[r + j + c for j, c in enumerate(columns)] for r in rows],
+            "a counting row added in place across a broadcast")
+
+    def test_a_rank_one_walk_over_two_counting_lines(self):
+        # Both operands need their index remapped here, so every element of the
+        # answer is read from a pair of words chosen by a stride.
+        left = [1, 1 << 32, -3]
+        right = [5, 1 << 31, -(1 << 63)]
+        self._checked(
+            tensorplay.outer(self._device(left), self._device(right)),
+            [[a * b for b in right] for a in left],
+            "a rank-one product of counting lines")
+
+    def test_lengths_that_fill_no_whole_number_of_slots(self):
+        rng = np.random.default_rng(76)
+        for length in (1, 2, 3, 5, 7, 13, 17, 64, 65):
+            left = rng.integers(-(2**62), 2**62, size=length)
+            right = rng.integers(-(2**62), 2**62, size=length)
+            self._checked(
+                self._device(left) + self._device(right),
+                [int(a) + int(b) for a, b in zip(left, right)],
+                f"sum of {length} counts")
+            self._checked(
+                self._device(left) * self._device(right),
+                [int(a) * int(b) for a, b in zip(left, right)],
+                f"product of {length} counts")
+
+    def test_a_wide_payload_past_the_image_limit_still_counts(self):
+        host = np.full((20001,), 1 << 31, dtype=np.int64)
+        got = self._device(host) + self._device(host)
+        self._checked(got, [1 << 32] * 20001, "a long counting payload doubled")
+
+    def test_a_walk_with_no_pair_of_words_to_read_says_so(self):
+        counts = self._device([10, 1 << 32, -7])
+        other = self._device([3, 3, 3])
+        # Division, a remainder and a reversed subtraction have no walk over a
+        # pair of words: the refusal names the width, rather than reading the
+        # element one word at a time.
+        with self.assertRaisesRegex(RuntimeError, "count wider than a word"):
+            counts / other
+        with self.assertRaisesRegex(RuntimeError, "count wider than a word"):
+            tensorplay.remainder(counts, other)
+        with self.assertRaisesRegex(RuntimeError, "count wider than a word"):
+            5 - counts
+        # A fraction has no slot in a counting payload written in place.
+        with self.assertRaisesRegex(RuntimeError, "fractional operand"):
+            counts.add_(0.5)
+        # A payload allocated as a narrow count cannot hold a wider partner.
+        narrow = self._device([1, 2, 3], tensorplay.int32)
+        with self.assertRaisesRegex(RuntimeError, "wider than its destination"):
+            narrow += self._device([1, 2, 3])
 
 
 if __name__ == "__main__":
