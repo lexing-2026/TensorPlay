@@ -863,7 +863,7 @@ static Tensor& scatter_base_inplace_cpu(Tensor& self, int64_t dim, const Tensor&
     if (index.dim() != nd) {
         TP_THROW(IndexError, "Index must have same number of dimensions as output tensor");
     }
-    Tensor idx_c = normalize_index_cpu(index, self.size(dim), "scatter_");
+    Tensor idx_c = prepare_index_cpu(index);
     std::vector<int64_t> idx_shape(static_cast<std::vector<int64_t>>(idx_c.shape()));
     Tensor src_b;
     if (src.numel() == 1) {
@@ -995,12 +995,9 @@ static Tensor index_select_rows(const Tensor& self, int64_t dim,
     int64_t row = self.size(dim);
     int64_t outer = 1, inner = 1;
     outer_inner(static_cast<std::vector<int64_t>>(self.shape()), dim, outer, inner);
-    // A flat selection reads the index where it lies and checks the values
-    // as it gathers them, so the index is not walked a second time.
-    const bool flat = inner == 1 && outer < get_num_threads();
-    Tensor idx = flat
-        ? prepare_index_cpu(index_t)
-        : normalize_index_cpu(index_t, row, op, wrap_negative);
+    // Every walk below reads the index where it lies and checks the values as
+    // it gathers them, so the index is not walked a second time.
+    Tensor idx = prepare_index_cpu(index_t);
     int64_t n_idx = idx.numel();
     const int64_t* ip = idx.data_ptr<int64_t>();
     std::vector<int64_t> out_shape(static_cast<std::vector<int64_t>>(self.shape()));
@@ -1035,7 +1032,12 @@ static Tensor index_select_rows(const Tensor& self, int64_t dim,
                 int64_t o = b / n_idx; \
                 int64_t k = b - o * n_idx; \
                 for (int64_t t = b; t < e; ++t) { \
-                    std::memcpy(d + static_cast<int64_t>(t) * inner, s + (o * row + ip[k]) * inner, inner * sizeof(ctype)); \
+                    int64_t v = ip[k]; \
+                    if (v < 0 && wrap_negative) v += row; \
+                    if (v < 0 || v >= row) { \
+                        TP_THROW(IndexError, op, ": index out of range"); \
+                    } \
+                    std::memcpy(d + static_cast<int64_t>(t) * inner, s + (o * row + v) * inner, inner * sizeof(ctype)); \
                     if (++k == n_idx) { k = 0; ++o; } \
                 } \
             }); \
