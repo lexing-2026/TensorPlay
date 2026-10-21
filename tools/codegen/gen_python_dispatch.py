@@ -177,6 +177,11 @@ def _emit_kernel(out: list[str], f: NativeFunction, derivative=None) -> str:
     mutable = [a.name for a in args if a.type.is_mutable_ref]
     if kind == "mut_ref" and not mutable:
         raise UnsupportedPythonDispatch("mutable return without a mutable argument")
+    # The return hands back the writable argument its own write alias names,
+    # which is not always the first writable one: a schema may write a
+    # companion alongside its destination.
+    returned = f.mutable_return_arg()
+    returned_name = returned.name if returned is not None else None
 
     signature = ", ".join(stub_arg_type_for(f.base_name, a) for a in args)
     names = ", ".join(_cpp_string(a.python_name) for a in args) or "nullptr"
@@ -221,7 +226,7 @@ def _emit_kernel(out: list[str], f: NativeFunction, derivative=None) -> str:
         # The mode mutates the destination in place; the kernel ABI returns
         # that argument, whatever object the handler returned.
         out.append("    Py_DECREF(call.invoke());")
-        out.append(f"    return {mutable[0]};")
+        out.append(f"    return {returned_name};")
     else:
         out.append(
             f"    return convert_result(call.invoke(), "

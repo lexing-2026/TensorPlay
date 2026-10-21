@@ -217,6 +217,42 @@ class NativeFunction:
                 if a.type.is_mutable_ref or a.type.is_mutable_tensor_list]
 
     @property
+    def return_alias(self) -> str | None:
+        """The write alias the return names, when it names one."""
+        if not self.returns:
+            return None
+        src = self.returns[0].source_return
+        ann = getattr(src, "annotation", None)
+        kind = getattr(ann, "kind", None)
+        return kind if getattr(ann, "write", False) and kind else None
+
+    def mutable_return_arg(self) -> Argument | None:
+        """The writable argument the return hands back.
+
+        A schema that writes more than one tensor names the one it returns
+        through the write alias the return carries; the argument bearing that
+        same alias is the one to hand back.  A schema that writes a single
+        tensor has no such pair to match, and that one is the answer.
+        """
+        writable = [a for a in self.args if a.type.is_mutable_ref]
+        if not writable:
+            return None
+        alias = self.return_alias
+        if alias is not None:
+            for a in writable:
+                ann = getattr(a.source_argument, "annotation", None)
+                if (getattr(ann, "write", False)
+                        and getattr(ann, "kind", None) == alias):
+                    return a
+        return writable[0]
+
+    @property
+    def mutable_return_name(self) -> str:
+        """The name of the writable argument the return hands back."""
+        arg = self.mutable_return_arg()
+        return arg.name if arg is not None else self.args[0].name
+
+    @property
     def returns_tuple(self) -> bool:
         return len(self.returns) > 1
 

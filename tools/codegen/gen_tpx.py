@@ -145,8 +145,7 @@ def _inline_forward_lines(f: NativeFunction, autocast_ops: set[str],
     if kind == 'void':
         return [f'    {core_call};']
     if kind == 'mut_ref':
-        alias = next((a.name for a in f.mutable_args if a.type.is_mutable_ref),
-                     f.args[0].name)
+        alias = f.mutable_return_name
         return [f'    {core_call};', f'    return {alias};']
     return None
 
@@ -884,8 +883,7 @@ def generate_tpx_ops_cpp(funcs: list[NativeFunction], *,
             if (kind == 'mut_ref' and has_ag and _dv_res is not None
                     and 'result' in _dv_res.used_output_names):
                 # An in-place op's result is the updated tensor itself.
-                _alias = next((a.name for a in f.mutable_args if a.type.is_mutable_ref),
-                              f.args[0].name)
+                _alias = f.mutable_return_name
                 lines.append(f'    const Tensor& result = {_alias};')
 
         if _fw[0] is not None and _fw[0] not in _FW_REFUSALS:
@@ -1033,8 +1031,7 @@ def generate_tpx_ops_cpp(funcs: list[NativeFunction], *,
                 lines.append('    }')
             lines.append('    return core_result;')
         elif kind == 'mut_ref':
-            alias = next((a.name for a in f.mutable_args if a.type.is_mutable_ref),
-                         f.args[0].name)
+            alias = f.mutable_return_name
             if has_ag and f.is_view_op and f.base_name.endswith('_'):
                 # An update of the tensor's own geometry (t_, squeeze_)
                 # writes no element of a base it may view: the view takes the
