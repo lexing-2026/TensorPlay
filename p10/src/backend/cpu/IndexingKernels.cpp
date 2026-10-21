@@ -269,6 +269,39 @@ inline void cum_base(ctype* d, const ctype* s, int64_t d_size, int64_t outer,
         });
         return;
     }
+    // A column at a time reads one line per element and revisits those lines
+    // once per column.  A block of columns that fills a line is scanned
+    // together, so each line of the scanned axis is read and written once.
+    // Every lane still sees the elements of the axis in ascending order.
+    constexpr int64_t kLanes =
+        std::max<int64_t>(1, 64 / static_cast<int64_t>(sizeof(ctype)));
+    if (inner >= kLanes) {
+        const int64_t col_blocks = (inner + kLanes - 1) / kLanes;
+        const int64_t block_grain =
+            std::max<int64_t>(1, GRAIN_SIZE / std::max<int64_t>(d_size, 1));
+        parallel_for(0, outer * col_blocks, block_grain, [&](int64_t b, int64_t e) {
+            for (int64_t flat = b; flat < e; ++flat) {
+                const int64_t o = flat / col_blocks;
+                const int64_t c0 = (flat - o * col_blocks) * kLanes;
+                const int64_t cols = std::min(kLanes, inner - c0);
+                const ctype* sp = s + o * d_size * inner + c0;
+                ctype* dp = d + o * d_size * inner + c0;
+                acc_t acc[kLanes];
+                for (int64_t c = 0; c < kLanes; ++c) {
+                    acc[c] = static_cast<acc_t>(init_val);
+                }
+                for (int64_t j = 0; j < d_size; ++j) {
+                    const ctype* row = sp + j * inner;
+                    ctype* drow = dp + j * inner;
+                    for (int64_t c = 0; c < cols; ++c) {
+                        acc[c] = op(acc[c], static_cast<acc_t>(row[c]));
+                        drow[c] = static_cast<ctype>(acc[c]);
+                    }
+                }
+            }
+        });
+        return;
+    }
     parallel_for(0, outer * inner, slice_grain, [&](int64_t b, int64_t e) {
         for (int64_t si = b; si < e; ++si) {
             int64_t o = si / inner, in2 = si % inner;
