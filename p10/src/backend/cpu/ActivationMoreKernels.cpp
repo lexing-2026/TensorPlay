@@ -482,48 +482,108 @@ std::tuple<Tensor, Tensor> log_sigmoid_forward_cpu(const Tensor& input) {
 std::tuple<Tensor, Tensor> log_sigmoid_forward_out_cpu(const Tensor& input,
                                                        Tensor& result,
                                                        Tensor& buffer) {
-    auto computed = log_sigmoid_forward_cpu(input);
-    write_out(result, std::get<0>(computed));
-    write_out(buffer, std::get<1>(computed));
+    const Tensor input_c = input.contiguous();
+    const auto shape = static_cast<std::vector<int64_t>>(input_c.shape());
+    const DType want = input_c.dtype();
+    const int64_t n = input_c.numel();
+    // The run stores element i of the answer beside element i of the saved
+    // exponential, so it is offered to the two destinations together: either one
+    // of them still needing a tensor of the op's own sends both answers through
+    // the hand-over, since a single run cannot fill one and leave the other.
+    Tensor answer, saved;
+    Tensor* answer_to = &result;
+    Tensor* saved_to = &buffer;
+    if (n == 0 ||
+        !destination_takes_flat(result, input_c.device(), want, shape, input_c) ||
+        !destination_takes_flat(buffer, input_c.device(), want, shape, input_c)) {
+        answer = Tensor::empty(shape, want, input_c.device());
+        saved = Tensor::empty(shape, want, input_c.device());
+        answer_to = &answer;
+        saved_to = &saved;
+    }
+    if (n > 0) {
+        switch (want) {
+            case DType::Float32:
+                log_sigmoid_forward_loop<float, float>(
+                    input_c.data_ptr<float>(), answer_to->data_ptr<float>(),
+                    saved_to->data_ptr<float>(), n);
+                break;
+            case DType::Float64:
+                log_sigmoid_forward_loop<double, double>(
+                    input_c.data_ptr<double>(), answer_to->data_ptr<double>(),
+                    saved_to->data_ptr<double>(), n);
+                break;
+            case DType::Float16:
+                log_sigmoid_forward_loop<Half, float>(
+                    input_c.data_ptr<Half>(), answer_to->data_ptr<Half>(),
+                    saved_to->data_ptr<Half>(), n);
+                break;
+            case DType::BFloat16:
+                log_sigmoid_forward_loop<BFloat16, float>(
+                    input_c.data_ptr<BFloat16>(),
+                    answer_to->data_ptr<BFloat16>(),
+                    saved_to->data_ptr<BFloat16>(), n);
+                break;
+            default:
+                TP_THROW(TypeError, "log_sigmoid_forward: unsupported dtype");
+        }
+    }
+    if (answer_to != &result) write_out(result, answer);
+    if (saved_to != &buffer) write_out(buffer, saved);
     return {result, buffer};
 }
 
 Tensor& log_sigmoid_backward_out_cpu(const Tensor& grad_output,
                                      const Tensor& input, const Tensor& buffer,
                                      Tensor& grad_input) {
-    Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(grad_output.shape()),
-                                  grad_output.dtype(), grad_output.device());
+    const DType want = grad_output.dtype();
+    const auto shape = static_cast<std::vector<int64_t>>(grad_output.shape());
     const int64_t n = grad_output.numel();
-    if (n > 0) {
-        const Tensor gc = grad_output.contiguous();
-        const Tensor ic = input.to(grad_output.dtype()).contiguous();
-        const Tensor bc = buffer.to(grad_output.dtype()).contiguous();
-        switch (grad_output.dtype()) {
-            case DType::Float32:
-                log_sigmoid_backward_loop<float, float>(
-                    gc.data_ptr<float>(), ic.data_ptr<float>(),
-                    bc.data_ptr<float>(), result.data_ptr<float>(), n);
-                break;
-            case DType::Float64:
-                log_sigmoid_backward_loop<double, double>(
-                    gc.data_ptr<double>(), ic.data_ptr<double>(),
-                    bc.data_ptr<double>(), result.data_ptr<double>(), n);
-                break;
-            case DType::Float16:
-                log_sigmoid_backward_loop<Half, float>(
-                    gc.data_ptr<Half>(), ic.data_ptr<Half>(),
-                    bc.data_ptr<Half>(), result.data_ptr<Half>(), n);
-                break;
-            case DType::BFloat16:
-                log_sigmoid_backward_loop<BFloat16, float>(
-                    gc.data_ptr<BFloat16>(), ic.data_ptr<BFloat16>(),
-                    bc.data_ptr<BFloat16>(), result.data_ptr<BFloat16>(), n);
-                break;
-            default:
-                TP_THROW(TypeError, "log_sigmoid_backward: unsupported dtype");
-        }
+    if (n == 0) {
+        write_out(grad_input, Tensor::empty(shape, want, grad_output.device()));
+        return grad_input;
     }
-    write_out(grad_input, result);
+    const Tensor gc = grad_output.contiguous();
+    const Tensor ic = input.to(want).contiguous();
+    const Tensor bc = buffer.to(want).contiguous();
+    // The run reads the three materialised operands at the gradient's width and
+    // stores element i in order, so a packed destination of that same width,
+    // shape and device -- and none of those three reached by another step from
+    // it -- takes the pass.  Anything else is answered into a tensor of the op's
+    // own and handed over.
+    Tensor result;
+    Tensor* dest = &grad_input;
+    if (!destination_takes_flat(grad_input, grad_output.device(), want, shape,
+                                gc, ic) ||
+        !read_while_write_is_safe(bc, grad_input)) {
+        result = Tensor::empty(shape, want, grad_output.device());
+        dest = &result;
+    }
+    switch (want) {
+        case DType::Float32:
+            log_sigmoid_backward_loop<float, float>(
+                gc.data_ptr<float>(), ic.data_ptr<float>(),
+                bc.data_ptr<float>(), dest->data_ptr<float>(), n);
+            break;
+        case DType::Float64:
+            log_sigmoid_backward_loop<double, double>(
+                gc.data_ptr<double>(), ic.data_ptr<double>(),
+                bc.data_ptr<double>(), dest->data_ptr<double>(), n);
+            break;
+        case DType::Float16:
+            log_sigmoid_backward_loop<Half, float>(
+                gc.data_ptr<Half>(), ic.data_ptr<Half>(),
+                bc.data_ptr<Half>(), dest->data_ptr<Half>(), n);
+            break;
+        case DType::BFloat16:
+            log_sigmoid_backward_loop<BFloat16, float>(
+                gc.data_ptr<BFloat16>(), ic.data_ptr<BFloat16>(),
+                bc.data_ptr<BFloat16>(), dest->data_ptr<BFloat16>(), n);
+            break;
+        default:
+            TP_THROW(TypeError, "log_sigmoid_backward: unsupported dtype");
+    }
+    if (dest != &grad_input) write_out(grad_input, result);
     return grad_input;
 }
 

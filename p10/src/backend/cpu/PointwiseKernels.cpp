@@ -2242,12 +2242,20 @@ Tensor& softplus_backward_grad_input_cpu(const Tensor& grad_output, const Tensor
 // log_sigmoid: out = min(x, 0) - log1p(exp(-|x|)).  The branch split keeps
 // exp() bounded for both large-positive and large-negative inputs.
 // ---------------------------------------------------------------------------
+static constexpr auto log_sigmoid_map = [](auto x) {
+    using T = decltype(x);
+    T z = std::min(x, static_cast<T>(0));
+    return static_cast<T>(z - std::log1p(std::exp(-std::abs(x))));
+};
+
 Tensor log_sigmoid_kernel_impl(const Tensor& self) {
-    return unary_float_op_kernel(self, [](auto x) {
-        using T = decltype(x);
-        T z = std::min(x, static_cast<T>(0));
-        return static_cast<T>(z - std::log1p(std::exp(-std::abs(x))));
-    });
+    return unary_float_op_kernel(self, log_sigmoid_map);
+}
+
+Tensor& log_sigmoid_out_cpu(const Tensor& self, Tensor& out) {
+    return unary_float_strict_out_kernel(self, out, "log_sigmoid",
+                                         log_sigmoid_kernel_impl, log_sigmoid_map,
+                                         vecunary::VOp::None);
 }
 
 Tensor log_sigmoid_backward_kernel_impl(const Tensor& grad_output, const Tensor& self) {
@@ -4225,6 +4233,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, PointwiseKernels) {
     m.impl("softplus_backward", softplus_backward_kernel_impl);
     m.impl("softplus_backward.grad_input", softplus_backward_grad_input_cpu);
     m.impl("log_sigmoid", log_sigmoid_kernel_impl);
+    m.impl("log_sigmoid.out", log_sigmoid_out_cpu);
     m.impl("log_sigmoid_backward", log_sigmoid_backward_kernel_impl);
     m.impl("rrelu_with_noise_backward", rrelu_with_noise_backward_kernel_impl);
     m.impl("pow.Tensor_Scalar", pow_scalar_kernel);
