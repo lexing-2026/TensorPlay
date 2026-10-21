@@ -944,10 +944,15 @@ Tensor embedding_dense_backward_cpu(const Tensor& grad_output, const Tensor& ind
                                 const T* s = grad_data + sorted[p].second * row_size;
                                 for (int64_t j = 0; j < row_size; ++j) dst[j] += s[j];
                             }
-                            if constexpr (std::is_floating_point_v<T>) {
+                            // The narrow floats hold a float count too, so the
+                            // reciprocal is taken in single precision and
+                            // rounded once when it reaches the row.
+                            if constexpr (std::is_floating_point_v<T> ||
+                                          std::is_same_v<T, Half> ||
+                                          std::is_same_v<T, BFloat16>) {
                                 if (scale_grad_by_freq) {
-                                    const T inv = static_cast<T>(1) /
-                                                  static_cast<T>(last - first);
+                                    const T inv = static_cast<T>(
+                                        1.0f / static_cast<float>(last - first));
                                     for (int64_t j = 0; j < row_size; ++j) dst[j] *= inv;
                                 }
                             }
