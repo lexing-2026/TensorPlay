@@ -50,6 +50,10 @@ Tensor softmax_kernel(const Tensor& self, int64_t dim, DType dtype);
 Tensor log_softmax_kernel(const Tensor& self, int64_t dim, DType dtype);
 // Leaky ReLU elementwise kernel lives in PointwiseKernels.cpp.
 Tensor leaky_relu_kernel_impl(const Tensor& self, const Scalar& negative_slope);
+// Its destination-taking form, which writes the caller's tensor in one pass
+// wherever that map can walk it.
+Tensor& leaky_relu_out_cpu(const Tensor& self, const Scalar& negative_slope,
+                           Tensor& out);
 
 using tensorplay::parallel::GRAIN_SIZE;
 using tensorplay::parallel::parallel_for;
@@ -266,14 +270,23 @@ void rrelu_with_noise_train_draw(const Tensor& input, Tensor& noise,
     }
 }
 
+// The factors are stored at the input's own width, so a noise of another one
+// would be written through a buffer of the wrong element size.
 Tensor rrelu_with_noise_train_cpu(const Tensor& input, Tensor& noise,
                                   Scalar lower, Scalar upper,
-                                  std::optional<Generator>& generator) {
+                                  std::optional<Generator>& generator,
+                                  const Tensor* destination = nullptr) {
     TP_CHECK(noise.is_contiguous(),
              "rrelu_with_noise: noise tensor must be contiguous");
+    TP_CHECK(noise.dtype() == input.dtype(),
+             "rrelu_with_noise: noise tensor must have the same dtype as the "
+             "input, got noise.dtype = ", toString(noise.dtype()),
+             " input.dtype = ", toString(input.dtype()));
     const Tensor input_c = input.contiguous();
-    Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(input_c.shape()),
-                                  input_c.dtype(), input_c.device());
+    Tensor result = destination != nullptr
+        ? *destination
+        : Tensor::empty(static_cast<std::vector<int64_t>>(input_c.shape()),
+                        input_c.dtype(), input_c.device());
     if (input_c.numel() > 0) {
         Generator& gen =
             generator.has_value() ? *generator : default_generator();
@@ -302,6 +315,40 @@ Tensor rrelu_with_noise_train_cpu(const Tensor& input, Tensor& noise,
         }
     }
     return result;
+}
+
+// Whether two tensors are filled from separate blocks of storage.
+inline bool stored_apart(const Tensor& first, const Tensor& second) {
+    const auto first_impl = first.unsafeGetTensorImpl();
+    const auto second_impl = second.unsafeGetTensorImpl();
+    if (!first_impl || !second_impl) return false;
+    const auto& first_storage = first_impl->storage();
+    const auto& second_storage = second_impl->storage();
+    return first_storage.defined() && second_storage.defined() &&
+           first_storage.data() != second_storage.data();
+}
+
+// Whether the draw can answer into the pair the caller holds.  It walks the
+// input in element order and lays two stores beside each element it reads: the
+// answer at element i of its own tensor, the factor at element i of the noise.
+// Both therefore have to be packed at the input's shape and width.  The answer
+// may be the input itself, whose element i is read before the store lands on it,
+// but the noise may not share the input's block: for a positive element the
+// factor is laid down first, and the answer reads that element afterwards.  Nor
+// may answer and noise be one block -- the two stores then land in whichever
+// order the branch took, while the run that hands them over fills the noise
+// first and the answer last.
+inline bool rrelu_with_noise_destinations_take(const Tensor& input,
+                                               Tensor& noise,
+                                               const Tensor& output) {
+    const auto shape = static_cast<std::vector<int64_t>>(input.shape());
+    const DType want = input.dtype();
+    if (!destination_takes_flat(output, input.device(), want, shape, input) ||
+        !destination_takes(noise, input.device(), want, shape) ||
+        !noise.is_contiguous()) {
+        return false;
+    }
+    return stored_apart(input, noise) && stored_apart(noise, output);
 }
 
 Tensor rrelu_with_noise_core(const Tensor& self, Tensor& noise, Scalar lower,
@@ -654,6 +701,18 @@ Tensor& rrelu_with_noise_out_cpu(const Tensor& self, Tensor& noise,
     TP_CHECK(self.shape() == noise.shape(),
              "noise tensor shape must match self tensor shape. Got self.shape = ",
              self.shape(), " noise.shape = ", noise.shape());
+    if (!training) {
+        // Eval mode has no randomness: the expected slope is the midpoint, and
+        // the map that applies it writes the caller's tensor where it can.
+        const double negative = (lower.toDouble() + upper.toDouble()) / 2.0;
+        return leaky_relu_out_cpu(self, Scalar(negative), output);
+    }
+    const Tensor input_c = self.contiguous();
+    if (rrelu_with_noise_destinations_take(input_c, noise, output)) {
+        rrelu_with_noise_train_cpu(input_c, noise, lower, upper, generator,
+                                   &output);
+        return output;
+    }
     Tensor result =
         rrelu_with_noise_core(self, noise, lower, upper, training, generator);
     const auto target = static_cast<std::vector<int64_t>>(result.shape());
@@ -679,13 +738,10 @@ Tensor rrelu_with_noise_cpu(const Tensor& self, Tensor& noise, const Scalar& low
 Tensor& rrelu_with_noise__cpu(Tensor& self, Tensor& noise, const Scalar& lower,
                               const Scalar& upper, bool training,
                               std::optional<Generator> generator) {
-    TP_CHECK(self.shape() == noise.shape(),
-             "noise tensor shape must match self tensor shape. Got self.shape = ",
-             self.shape(), " noise.shape = ", noise.shape());
-    Tensor result =
-        rrelu_with_noise_core(self, noise, lower, upper, training, generator);
-    self.copy_(result);
-    return self;
+    // The in-place form is the same run with the input as its own destination,
+    // which is one of the pair the draw is allowed to walk.
+    return rrelu_with_noise_out_cpu(self, noise, lower, upper, training,
+                                    generator, self);
 }
 
 TENSORPLAY_LIBRARY_IMPL(CPU, ActivationMoreOps) {
