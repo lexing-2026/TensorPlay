@@ -9934,6 +9934,27 @@ class TestVulkanEmbeddingBackward(unittest.TestCase):
                 answers["cpu"][1], answers["vulkan"][1], rtol=1.0e-6,
                 atol=1.0e-5, err_msg=f"padding={padding} scaled={scaled}")
 
+    def test_a_narrow_float_scales_the_same_way_on_both_devices(self):
+        # The frequency proportion belongs to the narrow float too: a row read
+        # three times divides by three whichever device summed it.
+        rng = np.random.default_rng(59)
+        table = (rng.standard_normal((16, 6)) * 0.5).astype(np.float16)
+        codes = np.array([1, 9, 1, 4, 1, 9, 15], np.int64)
+        grad = (rng.standard_normal((7, 6)) * 2).astype(np.float16)
+        answers = {}
+        for device in ("cpu", "vulkan"):
+            weight = tensorplay.tensor(table, device=device)\
+                .detach().requires_grad_(True)
+            tensorplay.nn.functional.embedding(
+                tensorplay.tensor(codes, device=device), weight,
+                scale_grad_by_freq=True).backward(
+                    tensorplay.tensor(grad, device=device))
+            answers[device] = weight.grad.cpu().numpy().astype(np.float32)
+        np.testing.assert_allclose(answers["cpu"], answers["vulkan"],
+                                   rtol=0, atol=2.0e-3)
+        want = self._named(codes, grad, 16, scaled=True)
+        np.testing.assert_allclose(answers["cpu"], want, rtol=0, atol=2.0e-3)
+
     def test_outside_the_supported_surface_refuses(self):
         device = tensorplay.device("vulkan")
         grad = tensorplay.zeros((4, 6), device=device)
