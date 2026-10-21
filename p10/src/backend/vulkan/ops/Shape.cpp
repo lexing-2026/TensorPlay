@@ -541,15 +541,19 @@ Tensor cat_kernel(const std::vector<Tensor>& tensors, int64_t dim) {
     TP_CHECK(
         tensors[0].dtype() == DType::Float32 ||
             tensors[0].dtype() == DType::Int32 ||
+            tensors[0].dtype() == DType::Int64 ||
             tensors[0].dtype() == DType::Float16,
-        "Vulkan cat over buffer storage supports Float32, Int32 and Float16 "
-        "only");
+        "Vulkan cat over buffer storage supports Float32, Int32, Int64 and "
+        "Float16 only");
     TP_CHECK(
         ndim >= 1 && ndim <= 4,
         "Vulkan cat supports 1d to 4d tensors");
     const bool is_int32 = tensors[0].dtype() == DType::Int32;
+    const bool is_int64 = tensors[0].dtype() == DType::Int64;
     const bool is_half = tensors[0].dtype() == DType::Float16;
-    const api::ShaderInfo shader = is_int32
+    const api::ShaderInfo shader = is_int64
+        ? VK_KERNEL(cat_int64_buffer_to_buffer)
+        : is_int32
         ? VK_KERNEL(cat_int32_buffer_to_buffer)
         : is_half
         ? VK_KERNEL_FROM_STR("cat_buffer_to_buffer_half")
