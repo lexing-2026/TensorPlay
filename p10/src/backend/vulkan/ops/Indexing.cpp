@@ -25,6 +25,22 @@ api::vTensor to_buffer_storage_dispatch(
     api::Context* context,
     const api::vTensor& src);
 
+// Defined in Copy.cpp; the element type conversion entry point.
+Tensor to_dtype_kernel(
+    const Tensor& self,
+    DType dtype,
+    bool non_blocking,
+    bool copy,
+    std::optional<int64_t> memory_format);
+
+// Defined below in this file; adds the rows a code list names into the
+// destination along any axis.
+Tensor& index_add_rows_inplace(
+    Tensor& self,
+    int64_t dim,
+    const Tensor& index,
+    const Tensor& source);
+
 // Defined in View.cpp; materializes a strided view of a payload.  An identity
 // mapping over a word-stored source releases an image copy of the same
 // elements, which is how a lookup that had to stream its table still hands its
@@ -309,6 +325,93 @@ Tensor embedding_kernel(
 }
 
 //
+//
+// The gradient of a table lookup.  Every read of a row answers with that row,
+// so the gradient a row receives is the sum of the gradients of every lookup
+// that named it, and a row the list never read keeps a zero.  The gradient
+// arrives shaped like the lookup answered -- the list's own axes followed by
+// the row -- so folding those axes into one count leaves the list and the rows
+// facing each other on the first axis of the table.
+//
+// The accumulation runs on the row walk that adds whole rows a list names,
+// which reads the list from the destination: a code the table does not carry
+// names no row and contributes nothing, exactly as it answers no row in the
+// lookup.  That walk costs one pass of the list per row of the table, so a
+// vocabulary too wide to afford it is stopped by the walk's own budget rather
+// than left to stall the queue.
+//
+// A proportion scaled by frequency divides each row by how many times the list
+// named it.  The tally travels in single precision, where a count of a lookup
+// list stays exact, and reaches the division in the element type the gradient
+// was called for; a row the list never named divides by one, so its zeros stay
+// zeros.  A padding row leaves the list before the walk, so it adds to neither
+// the gradient nor the tally.
+Tensor embedding_dense_backward_kernel(
+    const Tensor& grad_output,
+    const Tensor& indices,
+    int64_t num_weights,
+    int64_t padding_idx,
+    bool scale_grad_by_freq) {
+  NoGradGuard no_grad;
+  TP_CHECK(
+      grad_output.device().is_vulkan() && indices.device().is_vulkan(),
+      "Vulkan embedding_dense_backward: both tensors must be on the device");
+  TP_CHECK(
+      grad_output.dtype() == DType::Float32 ||
+          grad_output.dtype() == DType::Float16,
+      "Vulkan embedding_dense_backward: Float32 and Float16 only");
+  TP_CHECK(
+      indices.dtype() == DType::Int64 || indices.dtype() == DType::Int32,
+      "Vulkan embedding_dense_backward: indices must be Int64 or Int32");
+  TP_CHECK(
+      num_weights >= 0,
+      "Vulkan embedding_dense_backward: a table holds no negative count of rows");
+  TP_CHECK(
+      grad_output.dim() >= 1,
+      "Vulkan embedding_dense_backward: the gradient carries no row to add");
+
+  const int64_t features = grad_output.size(-1);
+  const int64_t n = indices.numel();
+  TP_CHECK(
+      grad_output.numel() == n * features,
+      "Vulkan embedding_dense_backward: the gradient must carry one row per "
+      "entry of the list");
+
+  const Device device = grad_output.device();
+  Tensor grad_weight =
+      zeros_kernel({num_weights, features}, grad_output.dtype(), device, false);
+  if (n == 0 || num_weights == 0) {
+    return grad_weight;
+  }
+
+  // One code per lookup, in the width the row walk and the selection read.
+  Tensor codes = to_dtype_kernel(
+      reshape_kernel(indices, {n}), DType::Int32, false, false, std::nullopt);
+  if (padding_idx >= 0 && padding_idx < num_weights) {
+    codes = tpx::ops::where(
+        tpx::ops::eq(codes, padding_idx),
+        full_kernel({1}, -1, DType::Int32, device, false),
+        codes);
+  }
+  index_add_rows_inplace(
+      grad_weight, 0, codes, reshape_kernel(grad_output, {n, features}));
+
+  if (scale_grad_by_freq) {
+    Tensor counts =
+        zeros_kernel({num_weights, 1}, DType::Float32, device, false);
+    index_add_rows_inplace(
+        counts, 0, codes, ones_kernel({n, 1}, DType::Float32, device, false));
+    Tensor divisor = tpx::ops::maximum(
+        counts, full_kernel({1}, 1.0, DType::Float32, device, false));
+    if (divisor.dtype() != grad_output.dtype()) {
+      divisor = to_dtype_kernel(
+          divisor, grad_output.dtype(), false, false, std::nullopt);
+    }
+    grad_weight = tpx::ops::div(grad_weight, divisor);
+  }
+  return grad_weight;
+}
+
 // In-place index_copy_: role as the vulkan write path for row updates along
 // any axis, e.g. appending decode steps to a preallocated kv cache or writing
 // a page of a slot table.  The destination rows arrive through an Int32 payload
@@ -2021,6 +2124,9 @@ Tensor& index_put_impl__kernel(
 
 TENSORPLAY_LIBRARY_IMPL(Vulkan, IndexingKernels) {
   m.impl("embedding", &tensorplay::vulkan::ops::embedding_kernel);
+  m.impl(
+      "embedding_dense_backward",
+      &tensorplay::vulkan::ops::embedding_dense_backward_kernel);
   m.impl("index_select", &tensorplay::vulkan::ops::index_select_kernel);
   m.impl("take", &tensorplay::vulkan::ops::take_kernel);
   m.impl("index.Tensor", &tensorplay::vulkan::ops::index_tensor_kernel);
