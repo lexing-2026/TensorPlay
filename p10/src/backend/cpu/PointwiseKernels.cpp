@@ -3251,7 +3251,10 @@ static Tensor softmax_fused_kernel_impl(const Tensor& self, int64_t dim, DType o
                 ctype* drow = dst + k * stride;                            \
                 for (int64_t j = 0; j < nb; ++j) {                         \
                     const ctype e = std::exp(row[j] - m[j]);               \
-                    drow[j] = e;                                           \
+                    /* The logarithmic form writes its answer from the row  \
+                       itself, so the exponentials are not stored on the \
+                       way; the plain form scales what it stored. */       \
+                    if (!LogMode) drow[j] = e;                             \
                     sum[j] += e;                                           \
                 }                                                          \
             }                                                              \
