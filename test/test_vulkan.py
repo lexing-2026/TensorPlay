@@ -3175,20 +3175,20 @@ class TestVulkanHalfGather(unittest.TestCase):
 
     def test_a_counting_table_this_long_is_read_in_words(self):
         # A payload this flat has no image form, so the codes travel through
-        # linear storage; a per-position gather still asks for a measure and so
-        # refuses what a count is.
+        # linear storage - both for a list of rows and for a per-position pick.
         import tensorplay.functional as F
         table = np.arange(200003, dtype=np.int32)
         device = tensorplay.from_numpy(table.copy()).to("vulkan")
         sel = np.arange(0, 200003, 25000, dtype=np.int32)
-        got = F.index_select(
-            device, 0, tensorplay.from_numpy(sel.copy()).to("vulkan"))
+        codes = tensorplay.from_numpy(sel.copy()).to("vulkan")
+        got = F.index_select(device, 0, codes)
         np.testing.assert_array_equal(
             got.cpu().numpy(), table[sel], err_msg="long int32 table")
         self.assertEqual(got.dtype, tensorplay.int32)
-        with self.assertRaisesRegex(RuntimeError, "Float32 and Float16"):
-            tensorplay.gather(
-                device, 0, tensorplay.from_numpy(sel.copy()).to("vulkan"))
+        picked = tensorplay.gather(device, 0, codes)
+        np.testing.assert_array_equal(
+            picked.cpu().numpy(), table[sel], err_msg="long int32 gather")
+        self.assertEqual(picked.dtype, tensorplay.int32)
 
 
 class TestVulkanHalfCat(unittest.TestCase):
@@ -9048,6 +9048,123 @@ class TestVulkanCountingRowLookup(unittest.TestCase):
         with self.assertRaisesRegex(
                 RuntimeError, "Float32, Float16, Int32 and Int64"):
             tensorplay.take(payload, self._codes(np.array([0], np.int64)))
+
+
+class TestVulkanCountingGather(unittest.TestCase):
+    """A per-position pick out of a table of counts: the code at each answer
+    element names a row of the source, and the answer is a count again.  A
+    gathered axis that is one of the two texel axes moves the fetch along that
+    axis; an outer axis would have to carry a value between lanes of different
+    texels and so runs over words, where a code wider than a word lives a pair
+    of words at a time."""
+
+    @staticmethod
+    def _uploaded(values):
+        return tensorplay.from_numpy(np.asarray(values)).to("vulkan")
+
+    @staticmethod
+    def _built(values):
+        return tensorplay.tensor(np.asarray(values), device="vulkan")
+
+    @staticmethod
+    def _table(rows, cols):
+        r = np.arange(rows, dtype=np.int64)[:, None]
+        c = np.arange(cols, dtype=np.int64)[None, :]
+        return (r * 977 + c * 131) % 4000000019 - 50000
+
+    def _gathered(self, make, table, codes, axis, dtype, label):
+        out = tensorplay.gather(make(table), axis, self._uploaded(codes))
+        self.assertEqual(out.dtype, dtype, msg=label)
+        self.assertEqual(tuple(out.shape), tuple(codes.shape), msg=label)
+        np.testing.assert_array_equal(
+            out.cpu().numpy(), np.take_along_axis(table, codes, axis=axis),
+            err_msg=label)
+
+    def test_a_counting_table_is_picked_row_by_row(self):
+        rng = np.random.default_rng(61)
+        for dtype in (np.int32, np.int64):
+            element = (tensorplay.int32 if dtype is np.int32
+                       else tensorplay.int64)
+            table = self._table(60, 7).astype(dtype)
+            rows = rng.integers(0, 60, (4, 7)).astype(np.int64)
+            cols = rng.integers(0, 7, (60, 3)).astype(np.int64)
+            for make in (self._uploaded, self._built):
+                self._gathered(make, table, rows, 0, element,
+                               f"{make.__name__} {np.dtype(dtype).name} rows")
+                self._gathered(make, table, cols, 1, element,
+                               f"{make.__name__} {np.dtype(dtype).name} cols")
+
+    def test_a_gather_of_an_outer_axis_crosses_lanes(self):
+        # The batch and channel axes of a four-axis payload live in the depth
+        # planes and the lanes, so their codes are moved over linear storage
+        # even when the shape has an image form.
+        rng = np.random.default_rng(62)
+        table_shape = (5, 7, 4)
+        for dtype in (np.int32, np.int64):
+            element = (tensorplay.int32 if dtype is np.int32
+                       else tensorplay.int64)
+            table = np.arange(
+                5 * 7 * 4, dtype=np.int64).reshape(table_shape).astype(dtype)
+            outer = rng.integers(0, 5, (3, 7, 4)).astype(np.int64)
+            middle = rng.integers(0, 7, (5, 2, 4)).astype(np.int64)
+            inner = rng.integers(0, 4, (5, 7, 6)).astype(np.int64)
+            for axis, codes in ((0, outer), (1, middle), (2, inner)):
+                for make in (self._uploaded, self._built):
+                    self._gathered(
+                        make, table, codes, axis, element,
+                        f"{np.dtype(dtype).name} rank three axis {axis}")
+
+    def test_a_long_index_list_has_no_texel_route(self):
+        rng = np.random.default_rng(63)
+        for dtype in (np.int32, np.int64):
+            element = (tensorplay.int32 if dtype is np.int32
+                       else tensorplay.int64)
+            table = np.arange(9000 * 3, dtype=np.int64).reshape(
+                9000, 3).astype(dtype)
+            codes = rng.integers(0, 3, (9000, 5)).astype(np.int64)
+            for make in (self._uploaded, self._built):
+                self._gathered(
+                    make, table, codes, 1, element,
+                    f"{np.dtype(dtype).name} long per-position pick")
+
+    def test_a_wide_code_survives_a_gather(self):
+        # A count past the reach of one word lives in its high half, and the
+        # answer must show it.
+        r = np.arange(500, dtype=np.int64)[:, None]
+        table = (r * 9000000000 + np.arange(4, dtype=np.int64)[None, :]).astype(
+            np.int64)
+        self.assertTrue(int(table.max()) > 2**32)
+        codes = np.repeat(
+            np.array([[0], [499], [250], [7], [0]], np.int64), 4, axis=1)
+        codes[3] = [250, 250, 7, 3]
+        out = tensorplay.gather(self._built(table), 0, self._uploaded(codes))
+        np.testing.assert_array_equal(
+            out.cpu().numpy(), np.take_along_axis(table, codes, axis=0),
+            err_msg="wide rows through a gather")
+
+    def test_a_code_naming_no_row_contributes_a_zero(self):
+        for dtype in (np.int32, np.int64):
+            element = (tensorplay.int32 if dtype is np.int32
+                       else tensorplay.int64)
+            table = self._table(12, 4).astype(dtype)
+            codes = np.array([[12, -1, 2, 0], [5, 99, 1, 11]], np.int64)
+            out = tensorplay.gather(
+                self._uploaded(table), 0, self._uploaded(codes))
+            want = np.take_along_axis(
+                table, np.where((codes < 0) | (codes >= 12), 0, codes), axis=0)
+            want[(codes < 0) | (codes >= 12)] = 0
+            self.assertEqual(out.dtype, element, msg="dead code dtype")
+            np.testing.assert_array_equal(
+                out.cpu().numpy(), want,
+                err_msg=f"{np.dtype(dtype).name} dead code")
+
+    def test_a_payload_narrower_than_a_word_still_refuses(self):
+        payload = tensorplay.from_numpy(np.zeros((4, 3), np.bool_)).to("vulkan")
+        with self.assertRaisesRegex(
+                RuntimeError, "Float32, Float16, Int32 and Int64"):
+            tensorplay.gather(
+                payload, 0, tensorplay.from_numpy(
+                    np.zeros((4, 3), np.int64)).to("vulkan"))
 
 
 class TestVulkanBernoulliOutOfPlace(unittest.TestCase):
