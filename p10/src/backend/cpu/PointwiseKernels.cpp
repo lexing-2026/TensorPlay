@@ -11,6 +11,7 @@
 #include "OutWrite.h"
 #include "Parallel.h"
 #include "cpu/VecUnary.h"
+#include "cpu/VecHalfMath.h"
 #include "cpu/ComplexUnary.h"
 #include "cpu/SoftmaxStridedKernels.h"
 #include "cpu/VecComplex.h"
@@ -3742,6 +3743,48 @@ void lerp_tensor_f32_avx2(const float* self, const float* end,
     }
 }
 
+// The reduced width crosses between the two widths once at the end of the
+// interpolation.  The hardware crossing does that in one instruction, where
+// the software one takes several.
+//
+// The interpolation is computed in single precision and narrowed once, the
+// same way the scalar walk computes it: the weight picks the nearer end
+// when it is below a half, and the answer is narrowed where it is stored.
+#if defined(TP_VECHALF_X86)
+__attribute__((target("avx2,f16c"), noinline))
+void lerp_tensor_half_walk(const tensorplay::Half* self,
+                           const tensorplay::Half* end,
+                           const tensorplay::Half* weight,
+                           tensorplay::Half* result, int64_t n) {
+    const auto* self_bits = reinterpret_cast<const uint16_t*>(self);
+    const auto* end_bits = reinterpret_cast<const uint16_t*>(end);
+    const auto* weight_bits = reinterpret_cast<const uint16_t*>(weight);
+    auto* out_bits = reinterpret_cast<uint16_t*>(result);
+    const __m256 half = _mm256_set1_ps(0.5f);
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 abs_mask = _mm256_set1_ps(-0.0f);
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 s = tensorplay::cpu::vechalf::widen8(self_bits + i);
+        const __m256 e = tensorplay::cpu::vechalf::widen8(end_bits + i);
+        const __m256 w = tensorplay::cpu::vechalf::widen8(weight_bits + i);
+        const __m256 small =
+            _mm256_cmp_ps(_mm256_andnot_ps(abs_mask, w), half, _CMP_LT_OQ);
+        const __m256 delta = _mm256_sub_ps(e, s);
+        const __m256 near = _mm256_add_ps(s, _mm256_mul_ps(w, delta));
+        const __m256 far = _mm256_sub_ps(
+            e, _mm256_mul_ps(delta, _mm256_sub_ps(one, w)));
+        _mm_storeu_si128(
+            reinterpret_cast<__m128i*>(out_bits + i),
+            tensorplay::cpu::vechalf::narrow8(
+                _mm256_blendv_ps(far, near, small)));
+    }
+    for (; i < n; ++i) {
+        result[i] = lerp_scalar_value(self[i], end[i], weight[i]);
+    }
+}
+#endif  // TP_VECHALF_X86
+
 __attribute__((target("avx2,fma")))
 void lerp_tensor_f64_avx2(const double* self, const double* end,
                           const double* weight, double* result, int64_t n) {
@@ -3851,6 +3894,17 @@ void lerp_tensor_contiguous(const T* self, const T* end, const T* weight,
             });
             return;
         }
+    } else if constexpr (std::is_same_v<T, tensorplay::Half>) {
+#if defined(TP_VECHALF_X86)
+        if (tensorplay::cpu::vechalf::f16c_available()) {
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t finish) {
+                lerp_tensor_half_walk(self + begin, end + begin,
+                                      weight + begin, result + begin,
+                                      finish - begin);
+            });
+            return;
+        }
+#endif
     }
 #endif
     parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t finish) {

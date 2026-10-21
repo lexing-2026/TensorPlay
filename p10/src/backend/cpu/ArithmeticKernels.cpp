@@ -16,6 +16,7 @@
 #include "GradMode.h"
 #include "OutWrite.h"
 #include "cpu/VecComplex.h"
+#include "cpu/VecHalfMath.h"
 #include <iostream>
 #include <vector>
 #include <cmath>
@@ -4308,6 +4309,77 @@ Tensor& div_scalar_inplace_kernel(Tensor& self, const Scalar& other) {
 // traversal for every broadcasted/promotion path.  The latter is important:
 // composing mul() and add() here would reintroduce the Python/composite
 // implementation that this operator is meant to replace.
+#if defined(TP_VECHALF_X86)
+// The reduced width crosses between the two widths once per step of the
+// formula.  The hardware crossing does that in one instruction, where the
+// software one takes several and stands in the way of the walk vectorizing.
+//
+// The steps are the ones the software walk takes, in the same order: the
+// scaled product is narrowed before it is applied, so the answer of one
+// step is the one the next step reads.  Every step therefore lands on the
+// pattern the software walk lands on.
+//
+// The elements that do not fill a step are answered by the software walk,
+// one element at a time.
+__attribute__((target("avx2,f16c"), noinline))
+void addcmul_half_walk(const tensorplay::Half* self,
+                       const tensorplay::Half* tensor1,
+                       const tensorplay::Half* tensor2, float alpha,
+                       tensorplay::Half* result, int64_t begin, int64_t end) {
+    const auto* self_bits = reinterpret_cast<const uint16_t*>(self);
+    const auto* t1_bits = reinterpret_cast<const uint16_t*>(tensor1);
+    const auto* t2_bits = reinterpret_cast<const uint16_t*>(tensor2);
+    auto* out_bits = reinterpret_cast<uint16_t*>(result);
+    const __m256 scale = _mm256_set1_ps(alpha);
+    int64_t i = begin;
+    for (; i + 8 <= end; i += 8) {
+        const __m256 s = tensorplay::cpu::vechalf::widen8(self_bits + i);
+        const __m256 x = tensorplay::cpu::vechalf::widen8(t1_bits + i);
+        const __m256 y = tensorplay::cpu::vechalf::widen8(t2_bits + i);
+        const __m256 product = tensorplay::cpu::vechalf::carried(
+            _mm256_mul_ps(scale, x));
+        const __m256 scaled = tensorplay::cpu::vechalf::carried(
+            _mm256_mul_ps(product, y));
+        _mm_storeu_si128(
+            reinterpret_cast<__m128i*>(out_bits + i),
+            tensorplay::cpu::vechalf::narrow8(_mm256_add_ps(s, scaled)));
+    }
+    for (; i < end; ++i) {
+        const tensorplay::Half product = tensorplay::Half(alpha) * tensor1[i];
+        result[i] = self[i] + product * tensor2[i];
+    }
+}
+
+__attribute__((target("avx2,f16c"), noinline))
+void addcdiv_half_walk(const tensorplay::Half* self,
+                       const tensorplay::Half* tensor1,
+                       const tensorplay::Half* tensor2, float alpha,
+                       tensorplay::Half* result, int64_t begin, int64_t end) {
+    const auto* self_bits = reinterpret_cast<const uint16_t*>(self);
+    const auto* t1_bits = reinterpret_cast<const uint16_t*>(tensor1);
+    const auto* t2_bits = reinterpret_cast<const uint16_t*>(tensor2);
+    auto* out_bits = reinterpret_cast<uint16_t*>(result);
+    const __m256 scale = _mm256_set1_ps(alpha);
+    int64_t i = begin;
+    for (; i + 8 <= end; i += 8) {
+        const __m256 s = tensorplay::cpu::vechalf::widen8(self_bits + i);
+        const __m256 x = tensorplay::cpu::vechalf::widen8(t1_bits + i);
+        const __m256 y = tensorplay::cpu::vechalf::widen8(t2_bits + i);
+        const __m256 product = tensorplay::cpu::vechalf::carried(
+            _mm256_mul_ps(scale, x));
+        const __m256 scaled = tensorplay::cpu::vechalf::carried(
+            _mm256_div_ps(product, y));
+        _mm_storeu_si128(
+            reinterpret_cast<__m128i*>(out_bits + i),
+            tensorplay::cpu::vechalf::narrow8(_mm256_add_ps(s, scaled)));
+    }
+    for (; i < end; ++i) {
+        const tensorplay::Half product = tensorplay::Half(alpha) * tensor1[i];
+        result[i] = self[i] + product / tensor2[i];
+    }
+}
+#endif  // TP_VECHALF_X86
+
 // The dense walk: element i of each operand lands on element i of the answer,
 // which the caller either hands over as the destination it wants filled or
 // leaves undefined for a block of its own.  The product is scaled before it is
@@ -4322,6 +4394,18 @@ void addcmul_dense_walk(const Tensor& self, const Tensor& tensor1,
     T* result_ptr = result.data_ptr<T>();
     const T alpha = value.to<T>();
     const int64_t n = self.numel();
+#if defined(TP_VECHALF_X86)
+    if constexpr (std::is_same_v<T, tensorplay::Half>) {
+        if (tensorplay::cpu::vechalf::f16c_available()) {
+            const float scale = static_cast<float>(alpha);
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                addcmul_half_walk(self_ptr, tensor1_ptr, tensor2_ptr, scale,
+                                  result_ptr, begin, end);
+            });
+            return;
+        }
+    }
+#endif
     parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
         for (int64_t i = begin; i < end; ++i) {
             result_ptr[i] = self_ptr[i] + alpha * tensor1_ptr[i] * tensor2_ptr[i];
@@ -4565,6 +4649,18 @@ void addcdiv_dense_walk(const Tensor& self, const Tensor& tensor1,
     T* result_ptr = result.data_ptr<T>();
     const T alpha = value.to<T>();
     const int64_t n = self.numel();
+#if defined(TP_VECHALF_X86)
+    if constexpr (std::is_same_v<T, tensorplay::Half>) {
+        if (tensorplay::cpu::vechalf::f16c_available()) {
+            const float scale = static_cast<float>(alpha);
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                addcdiv_half_walk(self_ptr, tensor1_ptr, tensor2_ptr, scale,
+                                  result_ptr, begin, end);
+            });
+            return;
+        }
+    }
+#endif
     parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
         for (int64_t i = begin; i < end; ++i) {
             result_ptr[i] = self_ptr[i] + alpha * tensor1_ptr[i] / tensor2_ptr[i];

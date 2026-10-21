@@ -967,29 +967,38 @@ Tensor& xlogy_out_cpu(const Tensor& a, const Tensor& b, Tensor& out) {
 }
 // The pairwise maps whose answer is a library call per element answer
 // several elements at a time on the vector path.  The flat loop answers
-// them one element at a time, so a Float32 pair would pay for that call
-// once per element; the vector path walks eight at a time instead.
+// them one element at a time, and a reduced-width pair would cross between
+// the two widths on a pass of its own before the answer is computed.
 //
 // The path is taken when both operands carry the same floating width, have
 // the same shape, are packed, and the destination is a packed tensor of that
 // width and shape that no operand reads through.  Everything else -- a
-// broadcast pair, a mixed pair, a reduced width -- is left to the flat loop.
+// broadcast pair, a mixed pair -- is left to the flat loop.
 static bool pair_math_takes(const Tensor& a, const Tensor& b, const Tensor& out) {
     if (!vecbinary::avx2_available() || a.dtype() != b.dtype() ||
-        out.dtype() != a.dtype() ||
-        (a.dtype() != DType::Float32 && a.dtype() != DType::Float64)) {
+        out.dtype() != a.dtype()) {
         return false;
     }
-    return a.shape() == b.shape() && a.shape() == out.shape() &&
-           a.is_contiguous() && b.is_contiguous() && out.is_contiguous() &&
-           cpu::binary_float_takes(a, b, out);
+    const DType dt = a.dtype();
+    if (dt != DType::Float32 && dt != DType::Float64 && dt != DType::Float16) {
+        return false;
+    }
+    if (a.shape() != b.shape() || a.shape() != out.shape() ||
+        !a.is_contiguous() || !b.is_contiguous() || !out.is_contiguous()) {
+        return false;
+    }
+    // Neither operand may be a second window over the bytes the destination
+    // covers: the walk reads an element after it has written another.
+    return destination_takes_flat(
+        out, out.device(), dt, static_cast<std::vector<int64_t>>(a.shape()), a, b);
 }
 
 template <typename F>
 static Tensor pair_math_kernel(const Tensor& a, const Tensor& b, F f,
                                const char* name, vecbinary::BOp op) {
     if (vecbinary::avx2_available() && a.dtype() == b.dtype() &&
-        (a.dtype() == DType::Float32 || a.dtype() == DType::Float64) &&
+        (a.dtype() == DType::Float32 || a.dtype() == DType::Float64 ||
+         a.dtype() == DType::Float16) &&
         a.shape() == b.shape() && a.is_contiguous() && b.is_contiguous()) {
         Tensor result = Tensor::empty(
             static_cast<std::vector<int64_t>>(a.shape()), a.dtype(),
@@ -1000,10 +1009,19 @@ static Tensor pair_math_kernel(const Tensor& a, const Tensor& b, F f,
                 vecbinary::f32_chunk_avx2(op, a.data_ptr<float>(),
                                           b.data_ptr<float>(),
                                           result.data_ptr<float>(), 0, n);
-            } else {
+            } else if (a.dtype() == DType::Float64) {
                 vecbinary::f64_chunk_avx2(op, a.data_ptr<double>(),
                                           b.data_ptr<double>(),
                                           result.data_ptr<double>(), 0, n);
+            } else {
+                vecbinary::f16_chunk_avx2(
+                    op,
+                    reinterpret_cast<const uint16_t*>(
+                        a.data_ptr<tensorplay::Half>()),
+                    reinterpret_cast<const uint16_t*>(
+                        b.data_ptr<tensorplay::Half>()),
+                    reinterpret_cast<uint16_t*>(
+                        result.data_ptr<tensorplay::Half>()), 0, n);
             }
         }
         return result;
@@ -1024,10 +1042,19 @@ static Tensor& pair_math_out_kernel(const Tensor& a, const Tensor& b,
                 vecbinary::f32_chunk_avx2(op, a.data_ptr<float>(),
                                           b.data_ptr<float>(),
                                           out.data_ptr<float>(), 0, n);
-            } else {
+            } else if (out.dtype() == DType::Float64) {
                 vecbinary::f64_chunk_avx2(op, a.data_ptr<double>(),
                                           b.data_ptr<double>(),
                                           out.data_ptr<double>(), 0, n);
+            } else {
+                vecbinary::f16_chunk_avx2(
+                    op,
+                    reinterpret_cast<const uint16_t*>(
+                        a.data_ptr<tensorplay::Half>()),
+                    reinterpret_cast<const uint16_t*>(
+                        b.data_ptr<tensorplay::Half>()),
+                    reinterpret_cast<uint16_t*>(
+                        out.data_ptr<tensorplay::Half>()), 0, n);
             }
         }
         return out;

@@ -30,6 +30,7 @@
 //   when it is minus infinity.
 
 #include "cpu/vec/intrinsics.h"
+#include "cpu/VecHalfMath.h"
 #include <cstdint>
 #include <cmath>
 #include <limits>
@@ -97,6 +98,33 @@ inline double scalar_f64(BOp op, double x, double y) {
     return 0.0;
 }
 
+// The answer at the reduced width: the operands are widened, the map is
+// answered in single precision, and the answer is narrowed once.  This is
+// what the flat loop answers for a reduced-width pair, which evaluates in
+// single precision and narrows once at the end.
+inline uint16_t scalar_f16(BOp op, uint16_t a, uint16_t b) {
+    const float x = tensorplay::cpu::vechalf::widen_one(a);
+    const float y = tensorplay::cpu::vechalf::widen_one(b);
+    switch (op) {
+        case BOp::Hypot:
+            return tensorplay::cpu::vechalf::narrow_one(std::hypot(x, y));
+        case BOp::Atan2:
+            return tensorplay::cpu::vechalf::narrow_one(std::atan2(x, y));
+        case BOp::LogAddExp: {
+            const float m = std::max(x, y);
+            if (m == -std::numeric_limits<float>::infinity()) {
+                return tensorplay::cpu::vechalf::narrow_one(m);
+            }
+            if (m != m) {
+                return tensorplay::cpu::vechalf::narrow_one(m);
+            }
+            return tensorplay::cpu::vechalf::narrow_one(
+                m + std::log1p(std::exp(-std::fabs(x - y))));
+        }
+    }
+    return 0;
+}
+
 __attribute__((target("avx2,fma"), always_inline))
 inline __m256 log_add_exp_f32(__m256 x, __m256 y) {
     const __m256 signbit = _mm256_set1_ps(-0.0f);
@@ -150,6 +178,42 @@ static void f32_chunk_avx2(BOp op, const float* a, const float* b, float* d,
     }
     for (; i < end; ++i) {
         d[i] = scalar_f32(op, a[i], b[i]);
+    }
+}
+
+// The reduced width answers the map in single precision: the operands are
+// widened, the map is answered there, and the answer is narrowed once.  The
+// widening and the narrowing are the hardware crossing, so a reduced-width
+// pair no longer pays for a pass that converts the operands before the map
+// is answered.
+__attribute__((target("avx2,fma,f16c"), noinline))
+static void f16_chunk_avx2(BOp op, const uint16_t* a, const uint16_t* b,
+                           uint16_t* d, int64_t begin, int64_t end) {
+    int64_t i = begin;
+    for (; i + 8 <= end; i += 8) {
+        const __m256 x = tensorplay::cpu::vechalf::widen8(a + i);
+        const __m256 y = tensorplay::cpu::vechalf::widen8(b + i);
+        __m256 r;
+        switch (op) {
+            case BOp::Hypot:
+                r = tensorplay::tpsleef::hypot(x, y);
+                break;
+            case BOp::Atan2:
+                r = tensorplay::tpsleef::atan2(x, y);
+                break;
+            case BOp::LogAddExp:
+                r = log_add_exp_f32(x, y);
+                break;
+            default:
+                r = _mm256_setzero_ps();
+                break;
+        }
+        _mm_storeu_si128(
+            reinterpret_cast<__m128i*>(d + i),
+            tensorplay::cpu::vechalf::narrow8(r));
+    }
+    for (; i < end; ++i) {
+        d[i] = scalar_f16(op, a[i], b[i]);
     }
 }
 
