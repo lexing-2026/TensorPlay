@@ -4339,6 +4339,72 @@ Tensor argmax_kernel_impl(const Tensor& self, std::optional<int64_t> dim, bool k
     #define OP_CASE(ctype, name) \
     case DType::name: { \
         const ctype* data = sc.data_ptr<ctype>(); \
+        /* Columns that fill a line are scanned together, so each line of the  \
+           reduced axis is read once instead of once per column. */ \
+        constexpr int64_t kLanes = std::max<int64_t>(1, 64 / static_cast<int64_t>(sizeof(ctype))); \
+        if (inner >= kLanes) { \
+            const int64_t col_blocks = (inner + kLanes - 1) / kLanes; \
+            const int64_t block_grain = std::max<int64_t>(1, GRAIN_SIZE / d_size); \
+            parallel_for(0, outer * col_blocks, block_grain, [&](int64_t b, int64_t e) { \
+                for (int64_t flat = b; flat < e; ++flat) { \
+                    const int64_t o = flat / col_blocks; \
+                    const int64_t c0 = (flat - o * col_blocks) * kLanes; \
+                    const int64_t cols = std::min(kLanes, inner - c0); \
+                    const ctype* base = data + o * d_size * inner + c0; \
+                    int64_t* orow = out_data + o * inner + c0; \
+                    if (cols == kLanes) { \
+                        ctype best[kLanes]; \
+                        int64_t bidx[kLanes]; \
+                        bool bnan[kLanes]; \
+                        for (int64_t c = 0; c < kLanes; ++c) { \
+                            best[c] = base[c]; \
+                            bidx[c] = 0; \
+                            bnan[c] = false; \
+                            if constexpr (std::is_floating_point_v<ctype>) { \
+                                bnan[c] = std::isnan(base[c]); \
+                            } \
+                        } \
+                        for (int64_t i = 1; i < d_size; ++i) { \
+                            const ctype* row = base + i * inner; \
+                            for (int64_t c = 0; c < kLanes; ++c) { \
+                                const ctype x = row[c]; \
+                                if constexpr (std::is_floating_point_v<ctype>) { \
+                                    if (!bnan[c] && std::isnan(x)) { \
+                                        bnan[c] = true; \
+                                        bidx[c] = i; \
+                                    } else if (!bnan[c] && x > best[c]) { \
+                                        best[c] = x; \
+                                        bidx[c] = i; \
+                                    } \
+                                } else { \
+                                    if (x > best[c]) { \
+                                        best[c] = x; \
+                                        bidx[c] = i; \
+                                    } \
+                                } \
+                            } \
+                        } \
+                        for (int64_t c = 0; c < kLanes; ++c) orow[c] = bidx[c]; \
+                    } else { \
+                        for (int64_t c = 0; c < cols; ++c) { \
+                            const ctype* line = base + c; \
+                            ctype max_val = line[0]; \
+                            int64_t max_idx = 0; \
+                            bool has_nan = false; \
+                            for (int64_t j = 0; j < d_size; ++j) { \
+                                ctype val = line[j * inner]; \
+                                if constexpr (std::is_floating_point_v<ctype>) { \
+                                    if (!has_nan && std::isnan(val)) { has_nan = true; max_idx = j; break; } \
+                                } \
+                                if (!has_nan && val > max_val) { max_val = val; max_idx = j; } \
+                            } \
+                            orow[c] = max_idx; \
+                        } \
+                    } \
+                } \
+            }); \
+            break; \
+        } \
         const int64_t line_grain = std::max<int64_t>(1, GRAIN_SIZE / d_size); \
         parallel_for(0, outer * inner, line_grain, [&](int64_t b, int64_t e) { \
             for (int64_t flat = b; flat < e; ++flat) { \
@@ -4421,6 +4487,56 @@ Tensor argmin_kernel_impl(const Tensor& self, std::optional<int64_t> dim, bool k
 #define TP_ARGMIN_DIM_CASE(ctype, name) \
     case DType::name: { \
         const ctype* data = sc.data_ptr<ctype>(); \
+        /* Columns that fill a line are scanned together, so each line of the  \
+           reduced axis is read once instead of once per column. */ \
+        constexpr int64_t kLanes = std::max<int64_t>(1, 64 / static_cast<int64_t>(sizeof(ctype))); \
+        if (inner >= kLanes) { \
+            const int64_t col_blocks = (inner + kLanes - 1) / kLanes; \
+            const int64_t block_grain = std::max<int64_t>(1, GRAIN_SIZE / d_size); \
+            parallel_for(0, outer * col_blocks, block_grain, [&](int64_t begin, int64_t end) { \
+                for (int64_t flat = begin; flat < end; ++flat) { \
+                    const int64_t outer_index = flat / col_blocks; \
+                    const int64_t c0 = (flat - outer_index * col_blocks) * kLanes; \
+                    const int64_t cols = std::min(kLanes, inner - c0); \
+                    const ctype* base = data + outer_index * d_size * inner + c0; \
+                    int64_t* orow = out_data + outer_index * inner + c0; \
+                    if (cols == kLanes) { \
+                        ctype value[kLanes]; \
+                        int64_t index[kLanes]; \
+                        for (int64_t c = 0; c < kLanes; ++c) { \
+                            value[c] = get_highest<ctype>(); \
+                            index[c] = 0; \
+                        } \
+                        for (int64_t i = 0; i < d_size; ++i) { \
+                            const ctype* row = base + i * inner; \
+                            for (int64_t c = 0; c < kLanes; ++c) { \
+                                const ctype candidate = row[c]; \
+                                if (candidate < value[c]) { \
+                                    value[c] = candidate; \
+                                    index[c] = i; \
+                                } \
+                            } \
+                        } \
+                        for (int64_t c = 0; c < kLanes; ++c) orow[c] = index[c]; \
+                    } else { \
+                        for (int64_t c = 0; c < cols; ++c) { \
+                            const ctype* line = base + c; \
+                            ctype value = get_highest<ctype>(); \
+                            int64_t index = 0; \
+                            for (int64_t i = 0; i < d_size; ++i) { \
+                                const ctype candidate = line[i * inner]; \
+                                if (candidate < value) { \
+                                    value = candidate; \
+                                    index = i; \
+                                } \
+                            } \
+                            orow[c] = index; \
+                        } \
+                    } \
+                } \
+            }); \
+            break; \
+        } \
         const int64_t line_grain = std::max<int64_t>(1, GRAIN_SIZE / d_size); \
         parallel_for(0, outer * inner, line_grain, [&](int64_t begin, int64_t end) { \
             for (int64_t flat = begin; flat < end; ++flat) { \
