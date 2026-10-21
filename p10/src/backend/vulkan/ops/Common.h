@@ -67,8 +67,11 @@ inline uint32_t buffer_dispatch_count(
     uint32_t elements,
     DType dtype,
     uint32_t float_elements_per_invocation) {
-  const uint32_t per =
-      dtype == DType::Float16 ? 2u : float_elements_per_invocation;
+  // A code wider than a word owns a whole pair of them, so one invocation
+  // carries exactly one element of it.
+  const uint32_t per = dtype == DType::Int64
+      ? 1u
+      : (dtype == DType::Float16 ? 2u : float_elements_per_invocation);
   return (elements + per - 1u) / per;
 }
 
@@ -174,22 +177,23 @@ inline api::vTensor allocate_output_like(
       context, operand.storage_type(), sizes, dtype);
 }
 
-// Elementwise linear-buffer kernels address whole 4-byte words per lane: a
-// Float32 element fills one word, a Float16 pair shares one.  Byte-packed and
-// Bool payloads have no such shader yet; rejecting them here keeps a missing
-// buffer variant visible instead of silently reinterpreting 1-byte (or 2-byte)
-// elements as Float32 words.
+// Elementwise linear-buffer kernels address payload in the slots of a 16-byte
+// word: a Float32 element fills one, a Float16 pair shares one, and a code
+// wider than a word owns a pair of them.  Byte-packed and Bool payloads have no
+// such shader yet; rejecting them here keeps a missing buffer variant visible
+// instead of silently reinterpreting 1-byte (or 2-byte) elements as Float32
+// words.
 inline void validate_buffer_elementwise_dtype(
     const api::vTensor& v,
     const char* name) {
   if (v.storage_type() == api::StorageType::BUFFER &&
       v.dtype() != DType::Float32 && v.dtype() != DType::Float16 &&
-      v.dtype() != DType::Int32) {
+      v.dtype() != DType::Int32 && v.dtype() != DType::Int64) {
     TP_THROW(
         NotImplementedError,
         std::string("Vulkan ") + name +
-            " over buffer storage supports Float32, Float16 and Int32 tensors "
-            "only");
+            " over buffer storage supports Float32, Float16, Int32 and Int64 "
+            "tensors only");
   }
 }
 

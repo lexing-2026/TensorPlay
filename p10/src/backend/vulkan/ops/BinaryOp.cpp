@@ -44,6 +44,47 @@ struct BlockBi final {
   ivec4 other_strides;
 };
 
+// The two blocks of a walk over a payload of codes wider than a word.  A count
+// of that width has no uniform slot to hold it and no register promised to it,
+// so it arrives as its low word and its high word, which the shader joins.
+struct BlockBw final {
+  uint32_t buf_length;
+  uint32_t fill0;
+  uint32_t other_low;
+  uint32_t other_high;
+};
+
+struct BlockBwt final {
+  uint32_t buf_length;
+  uint32_t fill0;
+  uint32_t alpha_low;
+  uint32_t alpha_high;
+  int32_t broadcast;
+  int32_t fill1;
+  int32_t fill2;
+  int32_t fill3;
+  ivec4 out_strides;
+  ivec4 input_sizes;
+  ivec4 input_strides;
+  ivec4 other_sizes;
+  ivec4 other_strides;
+};
+
+// A count split into the pair of words a shader is promised to hold.
+std::pair<uint32_t, uint32_t> wide_words(int64_t value) {
+  const uint64_t bits = static_cast<uint64_t>(value);
+  return {static_cast<uint32_t>(bits),
+          static_cast<uint32_t>(bits >> 32u)};
+}
+
+// A count scaled by a count, with the product taken between unsigned words: a
+// pair that overflows lands where the counts it multiplied would land, rather
+// than trapping on the way.
+std::pair<uint32_t, uint32_t> wide_product(int64_t a, int64_t b) {
+  return wide_words(
+      static_cast<int64_t>(static_cast<uint64_t>(a) * static_cast<uint64_t>(b)));
+}
+
 // Contiguous row-major strides of a shape, outer dims first, zero-padded
 // to four entries.  The linear broadcast remap in the buffer shaders walks
 // the output index through these strides.
@@ -269,7 +310,7 @@ api::vTensor to_buffer_storage(
 }
 
 // Element-width classes used by binary dispatch.
-enum class BinaryVocab { kFloat, kInt };
+enum class BinaryVocab { kFloat, kInt, kWide };
 
 BinaryVocab binary_vocab(const Tensor& t, const char* name) {
   if (t.dtype() == DType::Float32 || t.dtype() == DType::Float16) {
@@ -278,10 +319,13 @@ BinaryVocab binary_vocab(const Tensor& t, const char* name) {
   if (t.dtype() == DType::Int32) {
     return BinaryVocab::kInt;
   }
+  if (t.dtype() == DType::Int64) {
+    return BinaryVocab::kWide;
+  }
   TP_THROW(
       NotImplementedError,
       std::string("Vulkan ") + name +
-          " supports Float32, Float16 and Int32 tensors only");
+          " supports Float32, Float16, Int32 and Int64 tensors only");
   return BinaryVocab::kFloat;
 }
 
@@ -298,7 +342,7 @@ DType pair_vocabulary(
   const DType vocabulary = tensorplay::native::result_type(self, other);
   TP_CHECK(
       vocabulary == DType::Float32 || vocabulary == DType::Float16 ||
-          vocabulary == DType::Int32,
+          vocabulary == DType::Int32 || vocabulary == DType::Int64,
       std::string("Vulkan ") + name +
           " has no kernel for the operand widths it was given");
   return vocabulary;
@@ -343,29 +387,58 @@ Tensor scalar_op_operand(const Tensor& self, const Scalar& other) {
 }
 
 // Resolves the variant name against the registry: an Int32 payload needs the
-// `_i32` twin to exist, otherwise the op has no integer kernel and the call
-// fails with an explicit message.  The marker is inserted before the
+// `_i32` twin to exist, and a code wider than a word needs the `_wide` walk
+// over a pair of words, otherwise the op has no kernel in that width and the
+// call fails with an explicit message.  The marker is inserted before the
 // generated "inplace" suffix, matching the variant naming of the generator
 // (`add_i32inplace`, not `addinplace_i32`).
+//
+// A wide code has no texel format to name, so the pair-of-words walk exists
+// only over linear storage: the image side keeps its own name, and each image
+// path refuses such a payload at its head.
 std::string binary_variant(
     const char* base,
     BinaryVocab vocab,
-    const char* name) {
+    const char* name,
+    bool linear) {
   std::string b(base);
+  const char* marker = nullptr;
   if (vocab == BinaryVocab::kInt) {
-    static const std::string kInplace = "inplace";
-    const size_t pos = b.rfind(kInplace);
-    if (pos != std::string::npos && pos + kInplace.size() == b.size()) {
-      b.insert(pos, "_i32");
+    marker = "_i32";
+  } else if (vocab == BinaryVocab::kWide && linear) {
+    marker = "_wide";
+  } else if (vocab == BinaryVocab::kWide) {
+    return b;
+  }
+  if (marker != nullptr) {
+    const std::string suffix = marker;
+    constexpr std::string_view in_place_suffix = "inplace";
+    const size_t pos = b.rfind(in_place_suffix);
+    if (pos != std::string::npos &&
+        pos + in_place_suffix.size() == b.size()) {
+      b.insert(pos, suffix);
     } else {
-      b += "_i32";
+      b += suffix;
     }
     TP_CHECK(
         api::shader_registry().has_shader(b),
-        std::string("Vulkan ") + name +
-            " has no Int32 kernel; the op is float-only");
+        std::string("Vulkan ") + name + " has no kernel" +
+            (vocab == BinaryVocab::kWide ? " for a count wider than a word"
+                                         : " for a signed word") +
+            "; the op is float-only");
   }
   return b;
+}
+
+// An image walk names one payload per texel, so a code wider than a word has no
+// image form to be read through.  Such a payload never gets image storage in the
+// first place; the refusal is named here rather than left to a kernel that would
+// read the word above its element as a second lane.
+void require_image_vocab(BinaryVocab vocab, const char* name) {
+  TP_CHECK(
+      vocab != BinaryVocab::kWide,
+      std::string("Vulkan ") + name +
+          " has no image form for a count wider than a word");
 }
 
 /*
@@ -384,9 +457,10 @@ Tensor binary_op_tensor(
   const Tensor other = to_vocabulary(other_arg, vocabulary);
 
   const BinaryVocab vocab = binary_vocab(self, name);
-  const std::string variant = binary_variant(shader_name, vocab, name);
+  const std::string variant =
+      binary_variant(shader_name, vocab, name, false);
   const std::string buffer_variant =
-      binary_variant(buffer_shader_name, vocab, name);
+      binary_variant(buffer_shader_name, vocab, name, true);
 
   api::Context* const context = api::context();
 
@@ -438,17 +512,39 @@ Tensor binary_op_tensor(
     const ivec4 out_strides = buffer_out_strides(out_sizes);
     const auto input_meta = buffer_broadcast_meta(out_sizes, self_sizes);
     const auto other_meta = buffer_broadcast_meta(out_sizes, other_sizes);
-    api::UniformParamsBuffer params = (vocab == BinaryVocab::kInt)
+    // A count reaches the shader as the pair of words it owns, so only a walk
+    // over a payload that wide asks its scale factor for whole words.
+    const auto alpha_words = wide_words(vocab == BinaryVocab::kWide
+            ? alpha.to<int64_t>()
+            : 0);
+    api::UniformParamsBuffer params = vocab == BinaryVocab::kWide
         ? api::UniformParamsBuffer(
               context,
-              BlockBi{n, 0u, static_cast<int32_t>(alpha.to<int64_t>()),
-                      broadcast, out_strides, input_meta.first,
-                      input_meta.second, other_meta.first, other_meta.second})
-        : api::UniformParamsBuffer(
-              context,
-              BlockB{n, 0u, alpha.to<float>(), broadcast, out_strides,
-                     input_meta.first, input_meta.second, other_meta.first,
-                     other_meta.second});
+              BlockBwt{n,
+                      0u,
+                      alpha_words.first,
+                      alpha_words.second,
+                      broadcast,
+                      0,
+                      0,
+                      0,
+                      out_strides,
+                      input_meta.first,
+                      input_meta.second,
+                      other_meta.first,
+                      other_meta.second})
+        : (vocab == BinaryVocab::kInt
+              ? api::UniformParamsBuffer(
+                    context,
+                    BlockBi{n, 0u, static_cast<int32_t>(alpha.to<int64_t>()),
+                            broadcast, out_strides, input_meta.first,
+                            input_meta.second, other_meta.first,
+                            other_meta.second})
+              : api::UniformParamsBuffer(
+                    context,
+                    BlockB{n, 0u, alpha.to<float>(), broadcast, out_strides,
+                           input_meta.first, input_meta.second,
+                           other_meta.first, other_meta.second}));
     api::PipelineBarrier pipeline_barrier{};
     context->submit_compute_job(
         VK_KERNEL_FROM_STR(linear_shader.c_str()), pipeline_barrier,
@@ -461,6 +557,7 @@ Tensor binary_op_tensor(
         params.buffer());
     return convert(v_output);
   }
+  require_image_vocab(vocab, name);
 
   const struct Block final {
     ivec4 output_sizes;
@@ -524,7 +621,7 @@ Tensor& binary_op_tensor_inplace(
     const Scalar& alpha,
     const char* name) {
   const BinaryVocab vocab = binary_vocab(self_arg, name);
-  if (vocab == BinaryVocab::kInt) {
+  if (vocab != BinaryVocab::kFloat) {
     // As in the scalar writer: a count is scaled by a whole factor or not at
     // all, since the packing of the factor into the operand slot truncates.
     TP_CHECK(
@@ -546,9 +643,10 @@ Tensor& binary_op_tensor_inplace(
   }
   const Tensor other = to_vocabulary(other_arg, destination);
 
-  const std::string variant = binary_variant(shader_name, vocab, name);
+  const std::string variant =
+      binary_variant(shader_name, vocab, name, false);
   const std::string buffer_variant =
-      binary_variant(buffer_shader_name, vocab, name);
+      binary_variant(buffer_shader_name, vocab, name, true);
 
   api::Context* const context = api::context();
 
@@ -573,16 +671,36 @@ Tensor& binary_op_tensor_inplace(
     const ivec4 out_strides = buffer_out_strides(self_sizes);
     const ivec4 zero{0, 0, 0, 0};
     const auto other_meta = buffer_broadcast_meta(self_sizes, other_sizes);
-    api::UniformParamsBuffer params = (vocab == BinaryVocab::kInt)
+    const auto alpha_words = wide_words(vocab == BinaryVocab::kWide
+            ? alpha.to<int64_t>()
+            : 0);
+    api::UniformParamsBuffer params = vocab == BinaryVocab::kWide
         ? api::UniformParamsBuffer(
               context,
-              BlockBi{n, 0u, static_cast<int32_t>(alpha.to<int64_t>()),
-                      broadcast, out_strides, zero, zero, other_meta.first,
-                      other_meta.second})
-        : api::UniformParamsBuffer(
-              context,
-              BlockB{n, 0u, alpha.to<float>(), broadcast, out_strides,
-                     zero, zero, other_meta.first, other_meta.second});
+              BlockBwt{n,
+                       0u,
+                       alpha_words.first,
+                       alpha_words.second,
+                       broadcast,
+                       0,
+                       0,
+                       0,
+                       out_strides,
+                       zero,
+                       zero,
+                       other_meta.first,
+                       other_meta.second})
+        : (vocab == BinaryVocab::kInt
+              ? api::UniformParamsBuffer(
+                    context,
+                    BlockBi{n, 0u, static_cast<int32_t>(alpha.to<int64_t>()),
+                            broadcast, out_strides, zero, zero,
+                            other_meta.first, other_meta.second})
+              : api::UniformParamsBuffer(
+                    context,
+                    BlockB{n, 0u, alpha.to<float>(), broadcast, out_strides,
+                           zero, zero, other_meta.first,
+                           other_meta.second}));
     api::PipelineBarrier pipeline_barrier{};
     context->submit_compute_job(
         VK_KERNEL_FROM_STR(linear_shader.c_str()), pipeline_barrier,
@@ -597,6 +715,7 @@ Tensor& binary_op_tensor_inplace(
         params.buffer());
     return self_arg;
   }
+  require_image_vocab(vocab, name);
 
   const struct Block final {
     ivec4 output_sizes;
@@ -659,9 +778,10 @@ Tensor binary_op_scalar(
     const char* name) {
   const Tensor operand = scalar_op_operand(self_arg, other);
   const BinaryVocab vocab = binary_vocab(operand, name);
-  const std::string variant = binary_variant(shader_name, vocab, name);
+  const std::string variant =
+      binary_variant(shader_name, vocab, name, false);
   const std::string buffer_variant =
-      binary_variant(buffer_shader_name, vocab, name);
+      binary_variant(buffer_shader_name, vocab, name, true);
 
   api::Context* const context = api::context();
 
@@ -718,13 +838,23 @@ Tensor binary_op_scalar(
         safe_downcast_to_u32(static_cast<int64_t>(v_output.numel()));
     const std::string linear_shader =
         buffer_shader_for_dtype(buffer_variant, v_output.dtype());
-    api::UniformParamsBuffer paramsb = (vocab == BinaryVocab::kInt)
+    // The scalar and the op's scale factor are folded into one count on this
+    // side, then handed to the walk as the pair of words it owns.
+    const auto other_words = vocab == BinaryVocab::kWide
+        ? wide_product(other.to<int64_t>(), alpha.to<int64_t>())
+        : std::pair<uint32_t, uint32_t>{0u, 0u};
+    api::UniformParamsBuffer paramsb = vocab == BinaryVocab::kWide
         ? api::UniformParamsBuffer(
               context,
-              BlockBi{n, 0u, static_cast<int32_t>(
-                  other.to<int64_t>() * alpha.to<int64_t>())})
-        : api::UniformParamsBuffer(
-              context, BlockB{n, 0u, other.to<float>() * alpha.to<float>()});
+              BlockBw{n, 0u, other_words.first, other_words.second})
+        : (vocab == BinaryVocab::kInt
+              ? api::UniformParamsBuffer(
+                    context,
+                    BlockBi{n, 0u, static_cast<int32_t>(
+                        other.to<int64_t>() * alpha.to<int64_t>())})
+              : api::UniformParamsBuffer(
+                    context,
+                    BlockB{n, 0u, other.to<float>() * alpha.to<float>()}));
     api::PipelineBarrier pipeline_barrier{};
     context->submit_compute_job(
         VK_KERNEL_FROM_STR(linear_shader.c_str()), pipeline_barrier,
@@ -736,6 +866,7 @@ Tensor binary_op_scalar(
         paramsb.buffer());
     return convert(v_output);
   }
+  require_image_vocab(vocab, name);
 
   api::UniformParamsBuffer params =
       (vocab == BinaryVocab::kInt)
@@ -774,7 +905,7 @@ Tensor& binary_op_scalar_inplace(
     const Scalar& alpha,
     const char* name) {
   const BinaryVocab vocab = binary_vocab(self_arg, name);
-  if (vocab == BinaryVocab::kInt) {
+  if (vocab != BinaryVocab::kFloat) {
     // The operand slot of a count holds a whole number, and the destination
     // keeps its own width, so a fraction arriving here would be rounded on the
     // way in rather than written.  Each factor is tested where it is packed,
@@ -785,9 +916,10 @@ Tensor& binary_op_scalar_inplace(
         std::string("Vulkan ") + name +
             " in place over a count refuses a fractional operand");
   }
-  const std::string variant = binary_variant(shader_name, vocab, name);
+  const std::string variant =
+      binary_variant(shader_name, vocab, name, false);
   const std::string buffer_variant =
-      binary_variant(buffer_shader_name, vocab, name);
+      binary_variant(buffer_shader_name, vocab, name, true);
 
   api::Context* const context = api::context();
 
@@ -799,13 +931,21 @@ Tensor& binary_op_scalar_inplace(
         safe_downcast_to_u32(static_cast<int64_t>(v_self.numel()));
     const std::string linear_shader =
         buffer_shader_for_dtype(buffer_variant, v_self.dtype());
-    api::UniformParamsBuffer params = (vocab == BinaryVocab::kInt)
+    const auto other_words = vocab == BinaryVocab::kWide
+        ? wide_product(other.to<int64_t>(), alpha.to<int64_t>())
+        : std::pair<uint32_t, uint32_t>{0u, 0u};
+    api::UniformParamsBuffer params = vocab == BinaryVocab::kWide
         ? api::UniformParamsBuffer(
               context,
-              BlockBi{n, 0u, static_cast<int32_t>(
-                  other.to<int64_t>() * alpha.to<int64_t>())})
-        : api::UniformParamsBuffer(
-              context, BlockB{n, 0u, other.to<float>() * alpha.to<float>()});
+              BlockBw{n, 0u, other_words.first, other_words.second})
+        : (vocab == BinaryVocab::kInt
+              ? api::UniformParamsBuffer(
+                    context,
+                    BlockBi{n, 0u, static_cast<int32_t>(
+                        other.to<int64_t>() * alpha.to<int64_t>())})
+              : api::UniformParamsBuffer(
+                    context,
+                    BlockB{n, 0u, other.to<float>() * alpha.to<float>()}));
     api::PipelineBarrier pipeline_barrier{};
     context->submit_compute_job(
         VK_KERNEL_FROM_STR(linear_shader.c_str()), pipeline_barrier,
@@ -819,6 +959,7 @@ Tensor& binary_op_scalar_inplace(
         params.buffer());
     return self_arg;
   }
+  require_image_vocab(vocab, name);
 
   const uvec3 self_extents = v_self.extents();
   const struct Block final {

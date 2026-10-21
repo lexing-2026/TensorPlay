@@ -562,6 +562,40 @@ buffer_binary_op_scalar:
   - NAME: buffer_mod_scalar_tensor_i32
     DTYPE: int
     OPERATOR: Y - X * int(floor(float(Y) / float(X)))
+# A code wider than a word has no image form, so these walks only ever run over
+# linear storage, where one element owns a pair of words.
+buffer_wide_binary_op_tensor:
+  parameter_names_with_default_values:
+    OPERATOR: wide_add(X, wide_mul(A, Y))
+    INPLACE: false
+  generate_variant_forall:
+    INPLACE:
+    - VALUE: false
+      SUFFIX: ''
+    - VALUE: true
+      SUFFIX: inplace
+  shader_variants:
+  - NAME: buffer_add_wide
+    OPERATOR: wide_add(X, wide_mul(A, Y))
+  - NAME: buffer_sub_wide
+    OPERATOR: wide_sub(X, wide_mul(A, Y))
+  - NAME: buffer_mul_wide
+    OPERATOR: wide_mul(X, Y)
+buffer_wide_binary_op_scalar:
+  parameter_names_with_default_values:
+    OPERATOR: wide_add(X, Y)
+    INPLACE: false
+  generate_variant_forall:
+    INPLACE:
+    - VALUE: false
+      SUFFIX: ''
+    - VALUE: true
+      SUFFIX: inplace
+  shader_variants:
+  - NAME: buffer_add_scalar_wide
+    OPERATOR: wide_add(X, Y)
+  - NAME: buffer_mul_scalar_wide
+    OPERATOR: wide_mul(X, Y)
 mm:
   parameter_names_with_default_values: {}
   generate_variant_forall:
