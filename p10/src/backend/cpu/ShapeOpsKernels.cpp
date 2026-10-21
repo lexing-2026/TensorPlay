@@ -10,6 +10,7 @@
 #include "tensorplay/ops/TPXOpsGenerated.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <complex>
 #include <cstdint>
@@ -299,6 +300,52 @@ Tensor flip_cpu(const Tensor& self, const std::vector<int64_t>& dims) {
         Tensor out = empty_transform_output(self);
         const char* src = static_cast<const char*>(self.data_ptr());
         char* dst = static_cast<char*>(out.data_ptr());
+        if (inner == 1) {
+            // Flipping the last dim reverses each row.  One reversed copy of
+            // the row replaces one move per element, and the elements are
+            // carried as plain bit patterns so a row of any dtype is the
+            // same move.
+            const int64_t rows = outer;
+            const int64_t cols = dim_size;
+            auto reverse_rows = [&]<typename cell_t>() {
+                const cell_t* s = reinterpret_cast<const cell_t*>(src);
+                cell_t* d = reinterpret_cast<cell_t*>(dst);
+                const int64_t row_grain = std::max<int64_t>(
+                    1, GRAIN_SIZE / std::max<int64_t>(cols, 1));
+                parallel_for(0, rows, row_grain, [&](int64_t b, int64_t e) {
+                    for (int64_t r = b; r < e; ++r) {
+                        const cell_t* srow = s + r * cols;
+                        cell_t* drow = d + r * cols;
+                        for (int64_t j = 0; j < cols; ++j) {
+                            drow[j] = srow[cols - 1 - j];
+                        }
+                    }
+                });
+            };
+            switch (self.itemsize()) {
+                case 1: reverse_rows.template operator()<uint8_t>(); break;
+                case 2: reverse_rows.template operator()<uint16_t>(); break;
+                case 4: reverse_rows.template operator()<uint32_t>(); break;
+                case 8: reverse_rows.template operator()<uint64_t>(); break;
+                case 16: reverse_rows.template operator()<std::array<uint64_t, 2>>(); break;
+                default: {
+                    const size_t cell_bytes = self.itemsize();
+                    parallel_for(0, rows, GRAIN_SIZE, [&](int64_t b, int64_t e) {
+                        for (int64_t r = b; r < e; ++r) {
+                            const char* srow = src + r * cols * cell_bytes;
+                            char* drow = dst + r * cols * cell_bytes;
+                            for (int64_t j = 0; j < cols; ++j) {
+                                std::memcpy(drow + j * cell_bytes,
+                                            srow + (cols - 1 - j) * cell_bytes,
+                                            cell_bytes);
+                            }
+                        }
+                    });
+                    break;
+                }
+            }
+            return out;
+        }
         const size_t block_bytes =
             static_cast<size_t>(inner) * self.itemsize();
         parallel_for(0, outer * dim_size, GRAIN_SIZE,
