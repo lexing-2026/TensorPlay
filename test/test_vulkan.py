@@ -8978,5 +8978,237 @@ class TestVulkanMultinomial(unittest.TestCase):
             tensorplay.exponential_(tensorplay.zeros((4, 4), device="vulkan"), 0.0)
 
 
+class TestVulkanLikelihoodLoss(unittest.TestCase):
+    # A likelihood loss reads one class per row: the class its target names, and
+    # the weight that class carries.  Nothing accumulates inside a row, so the
+    # totals a reduction asks for are a sum of the row answers away, and every
+    # gradient lands on the single class the row named.
+
+    @staticmethod
+    def _device(array):
+        return tensorplay.from_numpy(
+            np.asarray(array, np.float32)).to("vulkan")
+
+    @staticmethod
+    def _codes(array, dtype=np.int64):
+        return tensorplay.from_numpy(np.asarray(array, dtype)).to("vulkan")
+
+    @staticmethod
+    def _back(tensor):
+        return tensor.cpu().numpy()
+
+    @staticmethod
+    def _rows(logits, codes, weight, ignore):
+        # The per-row answers and the weight total they add up to.  A code that
+        # names no class, and the code asked to skip, carry nothing.
+        table = np.atleast_2d(np.asarray(logits, np.float32))
+        wanted = np.atleast_1d(np.asarray(codes))
+        live = (wanted != ignore) & (wanted >= 0) & (wanted < table.shape[1])
+        scale = np.where(live, 1.0, 0.0)
+        if weight is not None:
+            for i, code in enumerate(wanted):
+                if live[i]:
+                    scale[i] = weight[code]
+        losses = np.zeros(wanted.size, np.float64)
+        for i, code in enumerate(wanted):
+            if live[i]:
+                losses[i] = -table[i, code] * scale[i]
+        return losses, scale, live
+
+    def _checked(self, logits, codes, weight, reduction, ignore, grad):
+        losses, scale, live = self._rows(logits, codes, weight, ignore)
+        total = float(scale.sum())
+        if reduction == "none" and np.asarray(codes).ndim > 0:
+            # A batch of unreduced rows reports no normalizer.
+            total = 0.0
+        rows = np.atleast_2d(np.asarray(logits, np.float32))
+        want_loss = losses
+        if reduction == "mean":
+            want_loss = losses.sum() / total if total > 0 else float("nan")
+        elif reduction == "sum":
+            want_loss = losses.sum()
+        grad_in = np.asarray(grad, np.float32)
+        want_grad = np.zeros_like(rows, np.float64)
+        for i, code in enumerate(np.atleast_1d(np.asarray(codes))):
+            if not live[i]:
+                continue
+            carried = grad_in[i] if reduction == "none" else float(grad_in)
+            if reduction == "mean" and total > 0:
+                carried = carried / total
+            want_grad[i, code] = -scale[i] * carried
+
+        x = self._device(logits)
+        t = self._codes(codes)
+        w = None if weight is None else self._device(weight)
+        out, reported = tensorplay._C.nll_loss(
+            x, t, w, {"none": 0, "mean": 1, "sum": 2}[reduction], ignore)
+        np.testing.assert_allclose(
+            self._back(out), want_loss, rtol=1e-4, atol=1e-5, equal_nan=True)
+        self.assertAlmostEqual(
+            float(self._back(reported)), total, delta=max(1e-4, abs(total) * 1e-4))
+        back = tensorplay._C.nll_loss_backward(
+            self._device(grad), x, t, w,
+            {"none": 0, "mean": 1, "sum": 2}[reduction], ignore,
+            self._device(np.array(reported.cpu().numpy(), np.float32)))
+        np.testing.assert_allclose(
+            self._back(back), want_grad, rtol=1e-4, atol=1e-5)
+        return out, reported, back
+
+    def test_a_row_answers_with_the_class_it_names(self):
+        logits = np.log(np.linspace(0.05, 0.95, 20).reshape(4, 5))
+        self._checked(logits, [0, 3, 1, 4], None, "mean", -100, np.float32(1.0))
+        self._checked(logits, [0, 3, 1, 4], None, "sum", -100, np.float32(1.0))
+
+    def test_unreduced_rows_keep_their_own_loss(self):
+        logits = np.log(np.linspace(0.05, 0.95, 20).reshape(4, 5))
+        out, reported, _ = self._checked(
+            logits, [0, 3, 1, 4], None, "none", -100,
+            np.array([0.2, 0.4, 0.6, 0.8], np.float32))
+        self.assertEqual(tuple(out.shape), (4,))
+        self.assertEqual(float(self._back(reported)), 0.0)
+
+    def test_a_skipped_row_carries_nothing(self):
+        logits = np.log(np.linspace(0.05, 0.95, 20).reshape(4, 5))
+        losses, _, _ = self._rows(logits, [0, -100, 1, -100], None, -100)
+        self.assertEqual(float(losses[1]), 0.0)
+        self.assertEqual(float(losses[3]), 0.0)
+        self._checked(logits, [0, -100, 1, -100], None, "mean", -100, np.float32(1.0))
+        # A skip may be named by any code, not just the usual one.
+        self._checked(logits, [0, 3, 1, 4], None, "mean", 3, np.float32(1.0))
+
+    def test_class_weights_scale_both_loss_and_total(self):
+        logits = np.log(np.linspace(0.05, 0.95, 20).reshape(4, 5))
+        weight = np.array([1.5, 0.5, 2.0, 0.25, 1.0], np.float32)
+        for reduction in ("none", "mean", "sum"):
+            grad = (np.arange(4, dtype=np.float32) + 1.0
+                    if reduction == "none" else np.float32(1.0))
+            self._checked(logits, [0, 3, 1, -100], weight, reduction, -100, grad)
+
+    def test_a_code_naming_no_class_marks_nothing(self):
+        # The row lookups of this backend answer a request outside their rows
+        # with nothing, so no bounds check has to travel back to the host.
+        logits = np.log(np.linspace(0.05, 0.95, 20).reshape(4, 5))
+        out, reported, back = self._checked(
+            logits, [0, 9, -3, 4], None, "sum", -100, np.float32(1.0))
+        self.assertAlmostEqual(
+            float(self._back(out)),
+            float(-logits[0, 0] - logits[3, 4]), places=4)
+        self.assertAlmostEqual(float(self._back(reported)), 2.0, places=4)
+        np.testing.assert_array_equal(self._back(back)[1], np.zeros(5))
+        np.testing.assert_array_equal(self._back(back)[2], np.zeros(5))
+
+    def test_a_wide_negative_code_is_not_the_skipped_one(self):
+        # A count wider than a word is matched word against word: only the pair
+        # the skipped code is stored in skips.
+        logits = np.log(np.linspace(0.05, 0.95, 20).reshape(4, 5))
+        _, reported, _ = self._checked(
+            logits, [0, -100 - 2 ** 32, 1, 4], None, "sum", -100, np.float32(1.0))
+        self.assertAlmostEqual(float(self._back(reported)), 3.0, places=4)
+
+    def test_a_narrow_target_is_read_as_a_count(self):
+        logits = np.log(np.linspace(0.05, 0.95, 20).reshape(4, 5))
+        x = self._device(logits)
+        losses, _, _ = self._rows(logits, [0, 3, 1, 4], None, -100)
+        out, _ = tensorplay._C.nll_loss(
+            x, self._codes([0, 3, 1, 4], np.int32), None, 2, -100)
+        self.assertAlmostEqual(
+            float(self._back(out)), float(losses.sum()), places=4)
+
+    def test_a_single_row_reports_the_weight_it_carries(self):
+        logits = np.log(np.linspace(0.05, 0.95, 5))
+        weight = np.array([1.5, 0.5, 2.0, 0.25, 1.0], np.float32)
+        x = self._device(logits)
+        t = self._codes(2)
+        out, reported = tensorplay._C.nll_loss(x, t, self._device(weight), 1, -100)
+        self.assertEqual(tuple(out.shape), ())
+        self.assertAlmostEqual(
+            float(self._back(out)), float(-logits[2] * weight[2]) / weight[2],
+            places=4)
+        self.assertAlmostEqual(float(self._back(reported)), float(weight[2]), places=4)
+        # Unreduced, the same row keeps its loss and still reports its weight.
+        out, reported = tensorplay._C.nll_loss(x, t, None, 0, -100)
+        self.assertEqual(tuple(out.shape), ())
+        self.assertAlmostEqual(float(self._back(out)), float(-logits[2]), places=4)
+        self.assertAlmostEqual(float(self._back(reported)), 1.0, places=4)
+
+    def test_the_averaged_gradient_needs_no_total_from_the_host(self):
+        logits = np.log(np.linspace(0.05, 0.95, 20).reshape(4, 5))
+        x = self._device(logits)
+        t = self._codes([0, 3, 1, -100])
+        grad = self._device(np.float32(1.0))
+        with_total = tensorplay._C.nll_loss_backward(
+            grad, x, t, None, 1, -100, self._device(np.array(3.0, np.float32)))
+        measured = tensorplay._C.nll_loss_backward(grad, x, t, None, 1, -100, None)
+        np.testing.assert_allclose(
+            self._back(with_total), self._back(measured), rtol=1e-4, atol=1e-5)
+
+    def test_nothing_to_average_answers_with_nothing(self):
+        empty = np.zeros((0, 5), np.float32)
+        out, reported = tensorplay._C.nll_loss(
+            self._device(empty), self._codes([]), None, 1, -100)
+        self.assertTrue(bool(np.isnan(float(self._back(out)))))
+        self.assertEqual(float(self._back(reported)), 0.0)
+        out, reported = tensorplay._C.nll_loss(
+            self._device(empty), self._codes([]), None, 2, -100)
+        self.assertEqual(float(self._back(out)), 0.0)
+        self.assertEqual(float(self._back(reported)), 0.0)
+        # Rows that all skip divide nothing by nothing too.
+        logits = np.log(np.linspace(0.05, 0.95, 20).reshape(4, 5))
+        self._checked(logits, [-100] * 4, None, "mean", -100, np.float32(1.0))
+
+    def test_a_long_walk_reaches_every_row(self):
+        table = np.log(
+            np.random.RandomState(5).rand(300, 517).astype(np.float32) + 0.1)
+        codes = np.random.RandomState(7).randint(0, 517, size=300).astype(np.int64)
+        codes[10] = -100
+        codes[299] = -100
+        self._checked(table, codes, None, "mean", -100, np.float32(1.7))
+        wide = np.log(
+            np.random.RandomState(9).rand(9, 4096).astype(np.float32) + 0.1)
+        self._checked(
+            wide, np.arange(9, dtype=np.int64) * 37, None, "sum", -100,
+            np.float32(1.0))
+
+    def test_the_gradient_lands_only_on_the_named_class(self):
+        logits = np.log(np.linspace(0.05, 0.95, 20).reshape(4, 5))
+        x = self._device(logits)
+        x.requires_grad_(True)
+        loss = tensorplay.nn.functional.nll_loss(
+            x, self._codes([0, 3, 1, 4]), reduction="mean")
+        loss.backward()
+        grad = self._back(x.grad)
+        # Four rows share one unit of gradient, and the average divides it by
+        # the four weights the rows carry.
+        self.assertAlmostEqual(float(grad.sum()), -1.0, places=4)
+        for row, code in enumerate([0, 3, 1, 4]):
+            self.assertAlmostEqual(float(grad[row, code]), -0.25, places=4)
+            others = np.delete(grad[row], code)
+            np.testing.assert_array_equal(others, np.zeros(4))
+
+    def test_outside_the_supported_surface_refuses(self):
+        logits = np.log(np.linspace(0.05, 0.95, 20).reshape(4, 5))
+        x = self._device(logits)
+        t = self._codes([0, 3, 1, 4])
+        with self.assertRaisesRegex(RuntimeError, "Float32"):
+            tensorplay._C.nll_loss(
+                tensorplay.zeros((4, 5), device="vulkan",
+                                 dtype=tensorplay.float16),
+                t, None, 1, -100)
+        with self.assertRaisesRegex(RuntimeError, "1d row"):
+            tensorplay._C.nll_loss(
+                self._device(np.ones((2, 3, 4), np.float32)),
+                self._codes([0, 3]), None, 1, -100)
+        with self.assertRaisesRegex(RuntimeError, "expected a target of"):
+            tensorplay._C.nll_loss(x, self._codes([0, 3]), None, 1, -100)
+        with self.assertRaisesRegex(RuntimeError, "cover every class"):
+            tensorplay._C.nll_loss(
+                x, t, self._device(np.ones(3, np.float32)), 1, -100)
+        with self.assertRaisesRegex(RuntimeError, "invalid reduction"):
+            tensorplay._C.nll_loss(x, t, None, 5, -100)
+        with self.assertRaisesRegex(RuntimeError, "one value to every row"):
+            tensorplay._C.nll_loss_backward(
+                self._device(np.float32(1.0)), x, t, None, 0, -100, None)
+
+
 if __name__ == "__main__":
     unittest.main()
