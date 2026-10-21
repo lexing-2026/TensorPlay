@@ -257,7 +257,7 @@ Tensor where_kernel(
   api::PipelineBarrier pipeline_barrier{};
 
   context->submit_compute_job(
-      int_branches ? VK_KERNEL(where_i32) : VK_KERNEL(where),
+      int_branches ? VK_KERNEL(where_i32) : kernel_for("where", vocabulary),
       pipeline_barrier, v_output.extents(),
       adaptive_work_group_size(v_output.extents()), VK_NULL_HANDLE,
       v_output.image(

@@ -200,7 +200,8 @@ Tensor permute_with_dims(const Tensor& self, const ivec4& perm) {
   api::PipelineBarrier pipeline_barrier{};
 
   context->submit_compute_job(
-      VK_KERNEL(permute), pipeline_barrier, v_output.extents(),
+      kernel_for("permute", self.dtype()),
+      pipeline_barrier, v_output.extents(),
       adaptive_work_group_size(v_output.extents()), VK_NULL_HANDLE,
       v_output.image(
           pipeline_barrier,
@@ -475,8 +476,13 @@ Tensor select_kernel(const Tensor& self, int64_t dim, int64_t index) {
   api::UniformParamsBuffer params(context, block);
   api::PipelineBarrier pipeline_barrier{};
 
+  // A selection is a slice with one axis removed, so it reads the texel planes
+  // in the width the payload itself was written in.
+  const api::ShaderInfo shader = self.dtype() == DType::Int32
+      ? VK_KERNEL(slice_int32)
+      : kernel_for("slice", self.dtype());
   context->submit_compute_job(
-      VK_KERNEL(slice), pipeline_barrier, v_output.extents(),
+      shader, pipeline_barrier, v_output.extents(),
       adaptive_work_group_size(v_output.extents()), VK_NULL_HANDLE,
       v_output.image(
           pipeline_barrier,
@@ -679,7 +685,8 @@ Tensor cat_kernel(const std::vector<Tensor>& tensors, int64_t dim) {
     api::UniformParamsBuffer params(context, block);
 
     context->submit_compute_job(
-        VK_KERNEL(cat), pipeline_barrier, v_output.extents(),
+        kernel_for("cat", tensors[0].dtype()),
+        pipeline_barrier, v_output.extents(),
         adaptive_work_group_size(v_output.extents()), VK_NULL_HANDLE,
         v_output.image(
             pipeline_barrier,

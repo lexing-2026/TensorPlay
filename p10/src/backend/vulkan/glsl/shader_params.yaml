@@ -1256,6 +1256,8 @@ where:
     DTYPE: float
   shader_variants:
   - NAME: where
+  - NAME: where_f16
+    FORMAT: rgba16f
   - NAME: where_i32
     DTYPE: int
 where_buffer:
@@ -1274,6 +1276,8 @@ embedding:
   parameter_names_with_default_values: {}
   shader_variants:
   - NAME: embedding
+  - NAME: embedding_f16
+    FORMAT: rgba16f
 embedding_buffer:
   parameter_names_with_default_values: {}
   shader_variants:
@@ -1334,6 +1338,8 @@ index_select:
   parameter_names_with_default_values: {}
   shader_variants:
   - NAME: index_select
+  - NAME: index_select_f16
+    FORMAT: rgba16f
 index_select_buffer:
   parameter_names_with_default_values: {}
   shader_variants:
@@ -1358,6 +1364,8 @@ gather:
   parameter_names_with_default_values: {}
   shader_variants:
   - NAME: gather
+  - NAME: gather_f16
+    FORMAT: rgba16f
 gather_buffer:
   parameter_names_with_default_values: {}
   shader_variants:
@@ -1538,6 +1546,8 @@ cat:
   parameter_names_with_default_values: {}
   shader_variants:
   - NAME: cat
+  - NAME: cat_f16
+    FORMAT: rgba16f
   - NAME: cat_buffer_to_buffer
   - NAME: cat_int32_buffer_to_buffer
 cat_buffer_to_buffer_half:
@@ -1556,6 +1566,8 @@ permute:
   parameter_names_with_default_values: {}
   shader_variants:
   - NAME: permute
+  - NAME: permute_f16
+    FORMAT: rgba16f
 slice:
   parameter_names_with_default_values: {}
   generate_variant_forall:

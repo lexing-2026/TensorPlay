@@ -345,7 +345,8 @@ Tensor embedding_kernel(
   api::PipelineBarrier pipeline_barrier{};
 
   context->submit_compute_job(
-      VK_KERNEL(embedding), pipeline_barrier, v_output.extents(),
+      kernel_for("embedding", weight.dtype()),
+      pipeline_barrier, v_output.extents(),
       adaptive_work_group_size(v_output.extents()), VK_NULL_HANDLE,
       v_output.image(
           pipeline_barrier,
@@ -1012,9 +1013,8 @@ Tensor index_select_kernel(
       static_cast<uint32_t>(planes)};
 
   context->submit_compute_job(
-      VK_KERNEL_FROM_STR(
-          self.dtype() == DType::Int32 ? "index_select_int32"
-                                       : "index_select"),
+      self.dtype() == DType::Int32 ? VK_KERNEL(index_select_int32)
+                                   : kernel_for("index_select", self.dtype()),
       pipeline_barrier, grid,
       adaptive_work_group_size(grid), VK_NULL_HANDLE,
       v_output.image(
@@ -1208,8 +1208,8 @@ Tensor gather_kernel(const Tensor& self, int64_t dim, const Tensor& index) {
   const api::utils::uvec3 grid = v_output.extents();
 
   context->submit_compute_job(
-      VK_KERNEL_FROM_STR(
-          self.dtype() == DType::Int32 ? "gather_int32" : "gather"),
+      self.dtype() == DType::Int32 ? VK_KERNEL(gather_int32)
+                                   : kernel_for("gather", self.dtype()),
       pipeline_barrier, grid,
       adaptive_work_group_size(grid), VK_NULL_HANDLE,
       v_output.image(
