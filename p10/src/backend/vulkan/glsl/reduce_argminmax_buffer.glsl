@@ -15,7 +15,8 @@ layout(std430) buffer;
  * strided slices of the row, then a shared-memory reduction picks the
  * extremum value together with the smallest winning axis position.  Strict
  * comparisons implement the first-occurrence tie-break, which is what makes
- * greedy decoding pick the lowest index of a tied set.
+ * greedy decoding pick the lowest index of a tied set.  A lane that is not a
+ * number owns the row, and the earliest such lane is the position named.
  */
 layout(set = 0, binding = 0) buffer PRECISION restrict writeonly Output {
   int data[];
@@ -37,6 +38,23 @@ shared float s_value[256];
 shared int s_index[256];
 
 layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
+
+// Whether a candidate (value, position) takes the row from the pair held.  A
+// held lane that is not a number keeps its position against a numeric
+// candidate and yields only to an earlier lane that is not a number either.
+bool takes_row(const in float value, const in int index, const in float best,
+               const in int best_index, const in int greater) {
+  const bool is_nan = isnan(value);
+  if (isnan(best)) {
+    return is_nan && index < best_index;
+  }
+  if (is_nan) {
+    return true;
+  }
+  const bool lower_index = index < best_index;
+  return greater != 0 ? (value > best || (value == best && lower_index))
+                      : (value < best || (value == best && lower_index));
+}
 
 void main() {
   // The workgroup, not the invocation, names the row: the x axis carries the
@@ -62,7 +80,7 @@ void main() {
   }
   for (int i = tid + 256; i < uBlock.axis_size; i += 256) {
     const float value = uInput.data[base + i * uBlock.inner + inner_pos];
-    const bool take = uBlock.greater != 0 ? value > best : value < best;
+    const bool take = takes_row(value, i, best, best_index, uBlock.greater);
     if (take) {
       best = value;
       best_index = i;
@@ -79,9 +97,7 @@ void main() {
       const int ia = s_index[tid];
       const int ib = s_index[tid + stride];
       // Equal values fall back to the smaller axis position.
-      const bool b_wins = uBlock.greater != 0
-          ? (b > a || (b == a && ib < ia))
-          : (b < a || (b == a && ib < ia));
+      const bool b_wins = takes_row(b, ib, a, ia, uBlock.greater);
       if (b_wins) {
         s_value[tid] = b;
         s_index[tid] = ib;

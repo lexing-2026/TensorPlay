@@ -25,6 +25,39 @@ uBlock;
 layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
 
 /*
+ * A lane that is not a number wins both ends it is asked about: the fold
+ * carries it out of the axis instead of trading it for the numeric lane
+ * sitting next to it.  The word handed back is a quiet NaN in the width the
+ * fold runs in, so a signalling lane is answered with a value that only the
+ * "is not a number" test can be read out of.
+ *
+ * The hand-over is a boolean select, never an interpolation: a not-a-number
+ * word carried through a weighted sum would poison the numeric lane the
+ * select was meant to keep, and a fold poisoned that way loses the whole walk.
+ */
+vec4 nan_max4(const in vec4 a, const in vec4 b) {
+  const bvec4 unnumbered = bvec4(max(vec4(isnan(a)), vec4(isnan(b))));
+  return mix(max(a, b), vec4(uintBitsToFloat(0x7fc00000u)), unnumbered);
+}
+
+vec4 nan_min4(const in vec4 a, const in vec4 b) {
+  const bvec4 unnumbered = bvec4(max(vec4(isnan(a)), vec4(isnan(b))));
+  return mix(min(a, b), vec4(uintBitsToFloat(0x7fc00000u)), unnumbered);
+}
+
+// The four lanes of one texel collapse into a single answer, so the same rule
+// holds for the last step: a lane that is not a number survives the collapse.
+float nan_max1(const in float a, const in float b) {
+  return mix(max(a, b), uintBitsToFloat(0x7fc00000u),
+             isnan(a) || isnan(b));
+}
+
+float nan_min1(const in float a, const in float b) {
+  return mix(min(a, b), uintBitsToFloat(0x7fc00000u),
+             isnan(a) || isnan(b));
+}
+
+/*
  * Single-axis reduction with a caller-selected lane operator.  Width,
  * height, and batch reductions fold lane-wise; the texel z coordinate
  * carries over directly.  A channel reduction walks the texel depth of

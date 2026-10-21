@@ -14,7 +14,8 @@ layout(std430) buffer;
  * element and one invocation owns one row outright; only the input is read as
  * pairs of half lanes.  Strict comparisons implement the first-occurrence
  * tie-break, which is what makes greedy decoding pick the lowest index of a
- * tied set.
+ * tied set.  A lane that is not a number owns the row, and the earliest such
+ * lane is the position named.
  */
 layout(set = 0, binding = 0) buffer PRECISION restrict writeonly Output {
   int data[];
@@ -39,6 +40,24 @@ float element_at(const in int index) {
   return (index & 1) == 0 ? pair.x : pair.y;
 }
 
+// Whether a candidate (value, position) takes the row from the pair held: a
+// lane that is not a number wins, a held lane that is not a number keeps its
+// position, and a numeric pair falls back to the strict comparison.
+bool takes_row(const in float value, const in int index, const in float best,
+               const in int best_index) {
+  const bool is_nan = isnan(value);
+  if (isnan(best)) {
+    return is_nan && index < best_index;
+  }
+  if (is_nan) {
+    return true;
+  }
+  const bool lower_index = index < best_index;
+  return uBlock.greater != 0
+      ? (value > best || (value == best && lower_index))
+      : (value < best || (value == best && lower_index));
+}
+
 void main() {
   const int row = int(gl_GlobalInvocationID.x);
   if (row >= uBlock.rows) {
@@ -52,8 +71,7 @@ void main() {
   int best_index = 0;
   for (int index = 1; index < uBlock.axis_size; ++index) {
     const float value = element_at(base + index * uBlock.inner + inner_pos);
-    const bool take = uBlock.greater != 0 ? value > best : value < best;
-    if (take) {
+    if (takes_row(value, index, best, best_index)) {
       best = value;
       best_index = index;
     }

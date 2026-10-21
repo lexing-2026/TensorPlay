@@ -15,7 +15,8 @@ layout(std430) buffer;
  * value.  `total` is the element count of the payload; the walk stops at it so
  * a tile grid that does not divide the payload evenly never reads past the
  * last element.  Comparisons are strict, keeping the first occurrence when
- * several elements tie.
+ * several elements tie.  A lane that is not a number wins the row and nothing
+ * displaces it afterwards, so both ends of a range name it.
  */
 layout(set = 0, binding = 0) buffer PRECISION restrict writeonly Output {
   float data[];
@@ -52,11 +53,11 @@ void main() {
     const float value = uInput.data[base + index * uBlock.inner + inner_pos];
     // clang-format off
     $if GREATER == 1:
-      if (value > best) {
+      if (!isnan(best) && (isnan(value) || value > best)) {
         best = value;
       }
     $else:
-      if (value < best) {
+      if (!isnan(best) && (isnan(value) || value < best)) {
         best = value;
       }
     // clang-format on

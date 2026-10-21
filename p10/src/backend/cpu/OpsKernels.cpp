@@ -2,6 +2,7 @@
 // Elementwise arithmetic, comparison, math, clamp, and activation CPU kernels.
 #include "Tensor.h"
 #include "Dispatcher.h"
+#include "tensorplay/ops/TPXOpsGenerated.h"
 #include "Scalar.h"
 #include "Utils.h"
 #include "TensorIteratorOps.h"
@@ -1558,8 +1559,10 @@ Tensor clip_cpu(const Tensor& self, const std::optional<Scalar>& min, const std:
     return self.clone();
 }
 Tensor& clamp__cpu(Tensor& self, const std::optional<Scalar>& min, const std::optional<Scalar>& max) {
-    Tensor r = clip_cpu(self, std::move(min), std::move(max));
-    self.copy_(r);
+    // The destination variant writes into the tensor itself, so the values
+    // are computed where they belong instead of in a copy that is moved
+    // over afterwards.
+    tensorplay::detail::redispatch_clip_out_function(self, min, max, self);
     return self;
 }
 

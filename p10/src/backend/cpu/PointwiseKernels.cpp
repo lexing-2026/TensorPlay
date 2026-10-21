@@ -4390,22 +4390,25 @@ Tensor& lerp_tensor_inplace_kernel(Tensor& self, const Tensor& end, const Tensor
 }
 
 Tensor& abs_inplace_kernel(Tensor& self) {
-    self.copy_(abs_kernel(self));
+    // The destination variant writes into the tensor itself, so the values
+    // are computed where they belong instead of in a copy that is moved
+    // over afterwards.
+    tensorplay::detail::redispatch_abs_out_function(self, self);
     return self;
 }
 
 Tensor& neg_inplace_kernel(Tensor& self) {
-    self.copy_(neg_kernel(self));
+    tensorplay::detail::redispatch_neg_out_function(self, self);
     return self;
 }
 
 Tensor& sqrt_inplace_kernel(Tensor& self) {
-    self.copy_(sqrt_kernel(self));
+    tensorplay::detail::redispatch_sqrt_out_function(self, self);
     return self;
 }
 
 Tensor& rsqrt_inplace_kernel(Tensor& self) {
-    self.copy_(rsqrt_kernel(self));
+    tensorplay::detail::redispatch_rsqrt_out_function(self, self);
     return self;
 }
 

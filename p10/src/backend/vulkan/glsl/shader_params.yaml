@@ -1888,13 +1888,15 @@ reduce_extremum:
     - VALUE: rgba16f
       SUFFIX: _f16
   shader_variants:
+  # A measured fold hands a lane that is not a number to both ends, so the
+  # operators name it instead of trading it for the numeric lane beside it.
   - NAME: reduce_max
-    OPERATOR: max(X, Y)
-    COLLAPSE: max(max(V.x, V.y), max(V.z, V.w))
+    OPERATOR: nan_max4(X, Y)
+    COLLAPSE: nan_max1(nan_max1(nan_max1(V.x, V.y), V.z), V.w)
     NEUTRAL: -3.402823466e38
   - NAME: reduce_min
-    OPERATOR: min(X, Y)
-    COLLAPSE: min(min(V.x, V.y), min(V.z, V.w))
+    OPERATOR: nan_min4(X, Y)
+    COLLAPSE: nan_min1(nan_min1(nan_min1(V.x, V.y), V.z), V.w)
     NEUTRAL: 3.402823466e38
   - NAME: reduce_prod
     OPERATOR: X * Y

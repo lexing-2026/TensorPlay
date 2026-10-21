@@ -16,8 +16,9 @@ layout(std430) buffer;
  * lane.
  *
  * Comparisons are strict, keeping the first occurrence when several elements
- * tie.  The winner is folded in single precision and narrowed once at the
- * store.
+ * tie.  A lane that is not a number wins the row and nothing displaces it
+ * afterwards, so both ends of a range name it.  The winner is folded in single
+ * precision and narrowed once at the store.
  */
 layout(set = 0, binding = 0) buffer PRECISION restrict writeonly Output {
   uint data[];
@@ -56,11 +57,11 @@ float row_extremum(const in int row) {
     const float value = (e & 1) == 0 ? pair.x : pair.y;
     // clang-format off
     $if GREATER == 1:
-      if (value > best) {
+      if (!isnan(best) && (isnan(value) || value > best)) {
         best = value;
       }
     $else:
-      if (value < best) {
+      if (!isnan(best) && (isnan(value) || value < best)) {
         best = value;
       }
     // clang-format on
