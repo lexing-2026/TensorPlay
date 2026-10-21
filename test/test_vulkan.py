@@ -5864,6 +5864,190 @@ class TestVulkanIntegralSum(unittest.TestCase):
             wide.sum()
 
 
+class TestVulkanIntegerExtrema(unittest.TestCase):
+    # The largest row code a window holds, the end of a position walk, the
+    # widest count a page table names: an extremum of a counted plane answers
+    # in the width the plane itself names.  Read through single precision a lane
+    # past 2**24 arrives as a different number than it left, and a wide lane has
+    # no single word that carries it, so these folds walk the signed word and
+    # the pair of words the payload actually lives in.
+
+    INT32_LOW = -2147483647 - 1
+    INT32_HIGH = 2147483647
+    INT64_LOW = -9223372036854775807 - 1
+    INT64_HIGH = 9223372036854775807
+
+    @staticmethod
+    def _device(payload):
+        return tensorplay.from_numpy(np.ascontiguousarray(payload)).to("vulkan")
+
+    @staticmethod
+    def _host(answer):
+        return answer.cpu().numpy()
+
+    def test_the_ends_of_a_signed_word_survive_the_fold(self):
+        # Both ends of the range in one row: a fold that borrowed a wider
+        # measurement would have to name a number the word cannot hold.
+        held = np.array([7, -3, self.INT32_LOW, 0, self.INT32_HIGH, 2],
+                        np.int32)
+        folded = self._device(held)
+        self.assertEqual(str(folded.max().dtype), "tensorplay.int32")
+        self.assertEqual(int(self._host(folded.max())), self.INT32_HIGH)
+        self.assertEqual(int(self._host(folded.min())), self.INT32_LOW)
+
+    def test_a_signed_word_past_the_reach_of_a_fraction_keeps_its_number(self):
+        held = np.array(
+            [2**24 + 1, 2**24 + 3, -(2**24 + 5), 2**24, 2**24 + 2], np.int32)
+        folded = self._device(held)
+        self.assertEqual(int(self._host(folded.max())), 2**24 + 3,
+                         "the largest lane, not the largest fraction")
+        self.assertEqual(int(self._host(folded.min())), -(2**24 + 5))
+
+    def test_the_ends_of_a_wide_lane_survive_the_fold(self):
+        held = np.array(
+            [self.INT64_LOW, 0, 12345, self.INT64_HIGH, -(2**62)], np.int64)
+        folded = self._device(held)
+        self.assertEqual(str(folded.max().dtype), "tensorplay.int64")
+        self.assertEqual(int(self._host(folded.max())), self.INT64_HIGH)
+        self.assertEqual(int(self._host(folded.min())), self.INT64_LOW)
+
+    def test_a_wide_lane_that_differs_only_in_its_low_word_is_the_larger(self):
+        # Two lanes sharing a high word are ordered by their low words, so a
+        # fold that stopped at the top word would call these the same number.
+        held = np.array(
+            [2**32, 2**32 + 1, 2**32 - 1, -(2**32), -(2**32) + 1], np.int64)
+        folded = self._device(held)
+        self.assertEqual(int(self._host(folded.max())), 2**32 + 1)
+        self.assertEqual(int(self._host(folded.min())), -(2**32))
+
+    def test_a_fold_of_lanes_around_zero_orders_the_sign_right(self):
+        # A biased high word puts a lane that borrows from the sign above every
+        # lane that does not, and the walk starts at the row's own first element
+        # rather than at a number a count could fall outside of.
+        for held in (np.array([-1, -(2**32), 0, 1], np.int64),
+                     np.array([-(2**32), -1, 1, 0], np.int64)):
+            folded = self._device(held)
+            np.testing.assert_array_equal(
+                self._host(folded.max()), np.max(held),
+                err_msg="the largest of a handful of counts")
+            np.testing.assert_array_equal(
+                self._host(folded.min()), np.min(held),
+                err_msg="the smallest of a handful of counts")
+
+    def test_a_counted_row_extremes_the_axis_it_names(self):
+        rng = np.random.default_rng(91)
+        held = rng.integers(-10_000, 10_000, (3, 5)).astype(np.int32)
+        rows = self._device(held)
+        np.testing.assert_array_equal(
+            self._host(rows.amax(dim=[1])), np.max(held, axis=1),
+            err_msg="the widest lane of each row")
+        np.testing.assert_array_equal(
+            self._host(rows.amin(dim=[0], keepdim=True)),
+            np.min(held, axis=0, keepdims=True),
+            err_msg="a kept axis of a counted plane")
+
+    def test_a_fold_across_two_axes_of_a_counted_plane(self):
+        rng = np.random.default_rng(92)
+        held = rng.integers(-5_000_000, 5_000_000, (2, 3, 4)).astype(np.int32)
+        folded = self._device(held)
+        np.testing.assert_array_equal(
+            self._host(folded.amax(dim=[0, 2])),
+            np.max(held, axis=(0, 2)),
+            err_msg="a span of two axes")
+
+    def test_a_fold_over_a_channel_axis_drops_the_lanes_that_pad_the_texture(self):
+        # Five channels fill two texels, so three of the eight lanes a walk
+        # touches name no element.  A padded lane has to fold the identity of
+        # the direction, or the answer comes from a lane that is not there.
+        rng = np.random.default_rng(93)
+        held = rng.integers(-2**30, 2**30, (2, 5, 3, 4)).astype(np.int32)
+        folded = self._device(held)
+        self.assertEqual(tuple(folded.amax(dim=[1], keepdim=True).shape),
+                         (2, 1, 3, 4))
+        np.testing.assert_array_equal(
+            self._host(folded.amax(dim=[1])),
+            np.max(held, axis=1),
+            err_msg="the widest channel of a counted plane")
+        np.testing.assert_array_equal(
+            self._host(folded.amin(dim=[1])),
+            np.min(held, axis=1),
+            err_msg="the narrowest channel of a counted plane")
+
+    def test_a_wide_fold_beyond_an_image_walks_the_words_it_lives_in(self):
+        rng = np.random.default_rng(94)
+        held = rng.integers(-2**60, 2**60, (2, 100_003)).astype(np.int64)
+        folded = self._device(held)
+        np.testing.assert_array_equal(
+            self._host(folded.amax(dim=[1])), np.max(held, axis=1),
+            err_msg="a row of wide lanes in linear storage")
+        self.assertEqual(int(self._host(folded.max())), int(np.max(held)),
+                         "the widest lane of a whole plane")
+
+    def test_a_fold_of_one_long_row_walks_every_tile(self):
+        # A whole-plane fold of a single row has no row to spread over, so it
+        # folds fixed tiles and then the tile results.  The extremes sit on the
+        # far side of a tile boundary and on the last lane, where the walk stops
+        # short of the payload's end.
+        length = 5000
+        for place, value in ((257, np.int64(2**60)),
+                             (4099, np.int64(-(2**60) - 1)),
+                             (length - 1, np.int64(2**60 - 1)),
+                             (256, np.int64(-(2**60) - 2))):
+            held = np.zeros(length, np.int64)
+            held[place] = value
+            folded = self._device(held)
+            self.assertEqual(
+                int(self._host(folded.max())), int(np.max(held)),
+                f"the widest lane with an extreme at {place}")
+            self.assertEqual(
+                int(self._host(folded.min())), int(np.min(held)),
+                f"the narrowest lane with an extreme at {place}")
+
+    def test_a_position_walk_answers_with_the_end_of_its_window(self):
+        # The number a rotary walk reads to size its table: the last position of
+        # a window of counted lanes, which is a whole number, not a fraction of
+        # one that rounds at 2**24.  A walk may name its positions in either
+        # width, so both folds are checked.
+        for payload in (
+                np.arange(0, 4096, dtype=np.int32),
+                np.arange(0, 4096, dtype=np.int64)):
+            folded = self._device(payload)
+            self.assertEqual(
+                int(self._host(folded.max())), 4095,
+                f"the last position of a {payload.dtype} window")
+            self.assertEqual(int(self._host(folded.min())), 0)
+
+    def test_a_counted_plane_folds_the_way_a_host_fold_does(self):
+        rng = np.random.default_rng(95)
+        held = rng.integers(-10_000, 10_000, (8, 37)).astype(np.int32)
+        folded = self._device(held)
+        np.testing.assert_array_equal(
+            self._host(folded.max()), np.max(held))
+        np.testing.assert_array_equal(
+            self._host(folded.min()), np.min(held))
+        np.testing.assert_array_equal(
+            self._host(folded.amin(dim=[])), np.min(held),
+            err_msg="a whole plane folded through an empty axis list")
+
+    def test_a_plane_without_lanes_has_no_fold(self):
+        for payload in (np.zeros((0, 4), np.int32), np.zeros((0,), np.int64)):
+            with self.assertRaisesRegex(RuntimeError, "empty"):
+                self._device(payload).max()
+
+    def test_a_fold_that_names_a_position_is_refused_loudly(self):
+        # The value of a counted plane is in hand here; the position that holds
+        # it has no counted walk yet, so the pair is refused rather than
+        # answered with a position read from the wrong width.
+        held = self._device(np.arange(6, dtype=np.int64).reshape(2, 3))
+        with self.assertRaisesRegex(RuntimeError, "index reductions"):
+            held.max(0)
+
+    def test_a_product_of_a_wide_plane_stays_outside_the_fold(self):
+        held = self._device(np.arange(2, 6, dtype=np.int64))
+        with self.assertRaisesRegex(RuntimeError, "products fold a measured"):
+            held.prod()
+
+
 class TestVulkanAdvancedIndexing(unittest.TestCase):
     # A list of row codes is the indexing a decode loop does on its own: read
     # the rows a page table names, or write a step back into the slots that
