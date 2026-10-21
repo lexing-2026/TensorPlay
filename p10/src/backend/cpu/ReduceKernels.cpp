@@ -352,6 +352,68 @@ std::tuple<Tensor, Tensor> cummax_cpu(const Tensor& self, int64_t dim) {
         const ctype* sp = sc.data_ptr<ctype>(); \
         ctype* vp = vals.data_ptr<ctype>(); \
         int64_t* ip = idxs.data_ptr<int64_t>(); \
+        /* A column at a time reads and writes one line per element and    \
+           revisits those lines once per column.  A block of columns that   \
+           fills a line advances every lane of it together, so each line of \
+           the scanned axis is read and written once. */ \
+        constexpr int64_t kLanes = std::max<int64_t>(1, 64 / static_cast<int64_t>(sizeof(ctype))); \
+        if (inner >= kLanes) { \
+            const int64_t col_blocks = (inner + kLanes - 1) / kLanes; \
+            const int64_t block_grain = std::max<int64_t>(1, GRAIN_SIZE / d_size); \
+            parallel_for(0, outer * col_blocks, block_grain, [&](int64_t b, int64_t e) { \
+                for (int64_t flat = b; flat < e; ++flat) { \
+                    const int64_t o = flat / col_blocks; \
+                    const int64_t c0 = (flat - o * col_blocks) * kLanes; \
+                    const int64_t cols = std::min(kLanes, inner - c0); \
+                    const ctype* base = sp + o * d_size * inner + c0; \
+                    ctype* vbase = vp + o * d_size * inner + c0; \
+                    int64_t* ibase = ip + o * d_size * inner + c0; \
+                    if (cols == kLanes) { \
+                        ctype best[kLanes]; \
+                        int64_t best_i[kLanes]; \
+                        for (int64_t c = 0; c < kLanes; ++c) { \
+                            best[c] = base[c]; \
+                            best_i[c] = 0; \
+                            vbase[c] = best[c]; \
+                            ibase[c] = 0; \
+                        } \
+                        for (int64_t j = 1; j < d_size; ++j) { \
+                            const ctype* row = base + j * inner; \
+                            ctype* vrow = vbase + j * inner; \
+                            int64_t* irow = ibase + j * inner; \
+                            for (int64_t c = 0; c < kLanes; ++c) { \
+                                const ctype current = row[c]; \
+                                if (current != current || \
+                                    (best[c] == best[c] && current >= best[c])) { \
+                                    best[c] = current; \
+                                    best_i[c] = j; \
+                                } \
+                                vrow[c] = best[c]; \
+                                irow[c] = best_i[c]; \
+                            } \
+                        } \
+                    } else { \
+                        for (int64_t c = 0; c < cols; ++c) { \
+                            const ctype* src = base + c; \
+                            ctype* dst = vbase + c; \
+                            int64_t* out_i = ibase + c; \
+                            ctype best = src[0]; \
+                            int64_t best_i = 0; \
+                            dst[0] = best; out_i[0] = 0; \
+                            for (int64_t j = 1; j < d_size; ++j) { \
+                                const ctype current = src[j * inner]; \
+                                if (current != current || \
+                                    (best == best && current >= best)) { \
+                                    best = current; best_i = j; \
+                                } \
+                                dst[j * inner] = best; out_i[j * inner] = best_i; \
+                            } \
+                        } \
+                    } \
+                } \
+            }); \
+            break; \
+        } \
         parallel_for(0, outer * inner, GRAIN_SIZE, [&](int64_t b, int64_t e) { \
             for (int64_t si = b; si < e; ++si) { \
                 const int64_t o = si / inner, in2 = si % inner; \
@@ -403,6 +465,68 @@ std::tuple<Tensor, Tensor> cummin_cpu(const Tensor& self, int64_t dim) {
         const ctype* sp = sc.data_ptr<ctype>(); \
         ctype* vp = vals.data_ptr<ctype>(); \
         int64_t* ip = idxs.data_ptr<int64_t>(); \
+        /* A column at a time reads and writes one line per element and    \
+           revisits those lines once per column.  A block of columns that   \
+           fills a line advances every lane of it together, so each line of \
+           the scanned axis is read and written once. */ \
+        constexpr int64_t kLanes = std::max<int64_t>(1, 64 / static_cast<int64_t>(sizeof(ctype))); \
+        if (inner >= kLanes) { \
+            const int64_t col_blocks = (inner + kLanes - 1) / kLanes; \
+            const int64_t block_grain = std::max<int64_t>(1, GRAIN_SIZE / d_size); \
+            parallel_for(0, outer * col_blocks, block_grain, [&](int64_t b, int64_t e) { \
+                for (int64_t flat = b; flat < e; ++flat) { \
+                    const int64_t o = flat / col_blocks; \
+                    const int64_t c0 = (flat - o * col_blocks) * kLanes; \
+                    const int64_t cols = std::min(kLanes, inner - c0); \
+                    const ctype* base = sp + o * d_size * inner + c0; \
+                    ctype* vbase = vp + o * d_size * inner + c0; \
+                    int64_t* ibase = ip + o * d_size * inner + c0; \
+                    if (cols == kLanes) { \
+                        ctype best[kLanes]; \
+                        int64_t best_i[kLanes]; \
+                        for (int64_t c = 0; c < kLanes; ++c) { \
+                            best[c] = base[c]; \
+                            best_i[c] = 0; \
+                            vbase[c] = best[c]; \
+                            ibase[c] = 0; \
+                        } \
+                        for (int64_t j = 1; j < d_size; ++j) { \
+                            const ctype* row = base + j * inner; \
+                            ctype* vrow = vbase + j * inner; \
+                            int64_t* irow = ibase + j * inner; \
+                            for (int64_t c = 0; c < kLanes; ++c) { \
+                                const ctype current = row[c]; \
+                                if (current != current || \
+                                    (best[c] == best[c] && current <= best[c])) { \
+                                    best[c] = current; \
+                                    best_i[c] = j; \
+                                } \
+                                vrow[c] = best[c]; \
+                                irow[c] = best_i[c]; \
+                            } \
+                        } \
+                    } else { \
+                        for (int64_t c = 0; c < cols; ++c) { \
+                            const ctype* src = base + c; \
+                            ctype* dst = vbase + c; \
+                            int64_t* out_i = ibase + c; \
+                            ctype best = src[0]; \
+                            int64_t best_i = 0; \
+                            dst[0] = best; out_i[0] = 0; \
+                            for (int64_t j = 1; j < d_size; ++j) { \
+                                const ctype current = src[j * inner]; \
+                                if (current != current || \
+                                    (best == best && current <= best)) { \
+                                    best = current; best_i = j; \
+                                } \
+                                dst[j * inner] = best; out_i[j * inner] = best_i; \
+                            } \
+                        } \
+                    } \
+                } \
+            }); \
+            break; \
+        } \
         parallel_for(0, outer * inner, GRAIN_SIZE, [&](int64_t b, int64_t e) { \
             for (int64_t si = b; si < e; ++si) { \
                 const int64_t o = si / inner, in2 = si % inner; \
