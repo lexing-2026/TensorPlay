@@ -64,19 +64,42 @@ uvec2 wide_abs(const uvec2 x) {
   return (x.y >> 31u) == 0u ? x : wide_neg(x);
 }
 
-// Greater of two counts.  The word that holds the sign decides, and only when
-// the two agree does the low word get a say -- and there it compares without a
-// sign, because a pair sharing its high word differs below it.
+// Order between two counts, decided word against word: the high word carries
+// the sign and settles it on its own, and the low word only breaks a tie
+// between them - where it counts without a sign, because the sign has already
+// been settled above it.
+bool wide_less(const uvec2 x, const uvec2 y) {
+  return int(x.y) < int(y.y) || (x.y == y.y && x.x < y.x);
+}
+
+bool wide_less_equal(const uvec2 x, const uvec2 y) {
+  return !wide_less(y, x);
+}
+
+bool wide_greater(const uvec2 x, const uvec2 y) {
+  return wide_less(y, x);
+}
+
+bool wide_greater_equal(const uvec2 x, const uvec2 y) {
+  return !wide_less(x, y);
+}
+
+bool wide_equal(const uvec2 x, const uvec2 y) {
+  return x.x == y.x && x.y == y.y;
+}
+
+bool wide_not_equal(const uvec2 x, const uvec2 y) {
+  return !wide_equal(x, y);
+}
+
+// Greater of two counts.
 uvec2 wide_max(const uvec2 x, const uvec2 y) {
-  const bool greater =
-      int(x.y) > int(y.y) || (x.y == y.y && x.x > y.x);
-  return greater ? x : y;
+  return wide_less(x, y) ? y : x;
 }
 
 // Lesser of two counts, the same walk turned around.
 uvec2 wide_min(const uvec2 x, const uvec2 y) {
-  const bool lesser = int(x.y) < int(y.y) || (x.y == y.y && x.x < y.x);
-  return lesser ? x : y;
+  return wide_greater(x, y) ? y : x;
 }
 
 // One, none or a taken-away one as a count: a pair is zero only when both of

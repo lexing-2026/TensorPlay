@@ -8,16 +8,15 @@
 layout(std430) buffer;
 
 #include "broadcast_index.h"
+#include "wide_ext.h"
 
 /*
  * Elementwise comparison of two payloads whose elements are wider than a word.
  *
  * A count that needs more than 32 bits has no texel form, so it always lives in
  * linear storage as a pair of words per element, the low word first.  One such
- * element is therefore read as a pair, and the decision is made word against
- * word: the high word carries the sign and settles the order on its own, and
- * the low word only breaks a tie between them - where it counts as unsigned,
- * because the sign has already been settled above it.
+ * element is therefore read as a pair, and the order is the one the pair
+ * helpers settle.
  *
  * The Bool result packs one byte per element, four lanes to a word.  An
  * invocation owns one destination word and answers for its four elements, so no
@@ -56,26 +55,6 @@ layout(set = 0, binding = 3) uniform PRECISION restrict Block {
 uBlock;
 
 layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
-
-// Signed order decided word against word, as described above.
-bool wide_less(const uvec2 a, const uvec2 b) {
-  return int(a.y) < int(b.y) || (a.y == b.y && a.x < b.x);
-}
-bool wide_less_equal(const uvec2 a, const uvec2 b) {
-  return !wide_less(b, a);
-}
-bool wide_greater(const uvec2 a, const uvec2 b) {
-  return wide_less(b, a);
-}
-bool wide_greater_equal(const uvec2 a, const uvec2 b) {
-  return !wide_less(a, b);
-}
-bool wide_equal(const uvec2 a, const uvec2 b) {
-  return a.x == b.x && a.y == b.y;
-}
-bool wide_not_equal(const uvec2 a, const uvec2 b) {
-  return !wide_equal(a, b);
-}
 
 void main() {
   const uint idx = gl_GlobalInvocationID.x;

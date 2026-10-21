@@ -6,6 +6,7 @@
 
 #include <Utils.h>
 
+#include <cmath>
 #include <utility>
 #include <vector>
 
@@ -21,21 +22,11 @@ api::vTensor to_buffer_storage_dispatch(
 
 namespace {
 
+// The widths a comparison reads.  A count wider than a word has no texel to sit
+// in, so it is walked as a pair of words over linear storage by both the
+// two-payload form and the form that compares against a number; each of those
+// refuses such a payload at its image path.
 void validate_operand(const Tensor& t, const char* name) {
-  TP_CHECK(
-      t.dtype() == DType::Float32 || t.dtype() == DType::Float16 ||
-          t.dtype() == DType::Int32 || t.dtype() == DType::Int8 ||
-          t.dtype() == DType::UInt8 || t.dtype() == DType::Bool,
-      std::string("Vulkan ") + name + " has an unsupported dtype");
-  TP_CHECK(
-      t.dim() <= 4,
-      std::string("Vulkan ") + name + " supports up to 4d tensors");
-}
-
-// A comparison of two payloads also takes a count wider than a word, which has a
-// linear kernel of its own; the scalar form has none, so it keeps the narrower
-// vocabulary above.
-void validate_pair_operand(const Tensor& t, const char* name) {
   TP_CHECK(
       t.dtype() == DType::Float32 || t.dtype() == DType::Float16 ||
           t.dtype() == DType::Int32 || t.dtype() == DType::Int64 ||
@@ -80,6 +71,15 @@ struct CompareScalarBufferBlock final {
   float value_float;
   int32_t value_int;
   uint32_t fill0;
+};
+
+// The same walk over a code wider than a word, where the threshold travels as the
+// pair of words such a count is carried in rather than as a number a lane holds.
+struct CompareScalarWideBufferBlock final {
+  uint32_t buf_length;
+  uint32_t fill0;
+  uint32_t value_low;
+  uint32_t value_high;
 };
 
 // A payload wider than the device's image axis lives in a storage buffer;
@@ -165,8 +165,8 @@ Tensor compare_impl(
     const Tensor& other,
     const char* kernel_name,
     const char* name) {
-  validate_pair_operand(self, name);
-  validate_pair_operand(other, name);
+  validate_operand(self, name);
+  validate_operand(other, name);
   TP_CHECK(self.dtype() == other.dtype(),
            "Vulkan comparison requires matching operand dtypes");
 
@@ -277,11 +277,21 @@ Tensor compare_scalar(const Tensor& self, Scalar other, const char* name) {
   // widens each half lane exactly, so a half payload reuses the float variant.
   const bool is_float =
       self.dtype() == DType::Float32 || self.dtype() == DType::Float16;
+  const bool is_wide = self.dtype() == DType::Int64;
+  // A count wider than a word is carried as a pair of words, so a threshold with
+  // a fraction in it has no pair of its own to travel in: the walk would have to
+  // answer for a number the width of the payload does not name.
+  TP_CHECK(
+      !is_wide || other.isIntegral() ||
+          std::floor(other.to<double>()) == other.to<double>(),
+      std::string("Vulkan ") + name +
+          " compares a count wider than a word against a whole number");
   const char* suffix =
       is_float ? "" : (self.dtype() == DType::UInt8 ? "_u8" : "_i32");
   const std::string shader = std::string(name) + "_scalar" + suffix;
   const float threshold = is_float ? scalar_threshold(self, other) : 0.0f;
-  const int32_t integer = is_float ? 0 : other.to<int32_t>();
+  const int32_t integer = (is_float || is_wide) ? 0 : other.to<int32_t>();
+  const int64_t wide_threshold = is_wide ? other.to<int64_t>() : 0;
   api::Context* context = api::context();
   api::vTensor input = convert(self);
 
@@ -294,10 +304,18 @@ Tensor compare_scalar(const Tensor& self, Scalar other, const char* name) {
         api::StorageType::BUFFER,
         api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
     const uint32_t n = safe_downcast_to_u32(static_cast<int64_t>(input.numel()));
-    const CompareScalarBufferBlock block{n, threshold, integer, 0u};
+    // The threshold of a wide walk arrives as the two words such a count is
+    // carried in, low one first.
+    const uint64_t wide_bits = static_cast<uint64_t>(wide_threshold);
+    api::UniformParamsBuffer params = is_wide
+        ? api::UniformParamsBuffer(
+              context,
+              CompareScalarWideBufferBlock{n, 0u, static_cast<uint32_t>(wide_bits),
+                                          static_cast<uint32_t>(wide_bits >> 32u)})
+        : api::UniformParamsBuffer(
+              context, CompareScalarBufferBlock{n, threshold, integer, 0u});
     const std::string linear_shader =
         std::string(name) + "_scalar_buffer" + linear_dtype_suffix(self.dtype());
-    api::UniformParamsBuffer params(context, block);
     api::PipelineBarrier barrier{};
     context->submit_compute_job(
         VK_KERNEL_FROM_STR(linear_shader.c_str()),
@@ -313,6 +331,13 @@ Tensor compare_scalar(const Tensor& self, Scalar other, const char* name) {
         params.buffer());
     return convert(output);
   }
+
+  // An image names one payload per texel, so a code wider than a word has no
+  // image form to be read through.
+  TP_CHECK(
+      !is_wide,
+      std::string("Vulkan ") + name +
+          " has no image form for a count wider than a word");
 
   api::vTensor output{context, input.sizes(), DType::Bool};
   const struct Block final {

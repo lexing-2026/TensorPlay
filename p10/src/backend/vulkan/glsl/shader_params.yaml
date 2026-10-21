@@ -432,6 +432,20 @@ buffer_clamp:
   - NAME: buffer_clamp
   - NAME: buffer_clamp_i32
     DTYPE: int
+# The same closed range over a code wider than a word: each side of the range
+# travels as the pair of words such a count is carried in, so an absent side is
+# the extreme of the width and clips nothing.
+buffer_wide_clamp:
+  parameter_names_with_default_values:
+    INPLACE: false
+  generate_variant_forall:
+    INPLACE:
+    - VALUE: false
+      SUFFIX: ''
+    - VALUE: true
+      SUFFIX: inplace
+  shader_variants:
+  - NAME: buffer_clamp_wide
 buffer_binary_op_tensor:
   parameter_names_with_default_values:
     OPERATOR: X + A * Y
@@ -1232,6 +1246,24 @@ compare_scalar_buffer:
     OPERATOR: greaterThan(X, Y)
   - NAME: ge_scalar_buffer
     OPERATOR: greaterThanEqual(X, Y)
+# The same six orders with the fixed side carried as a pair of words, for a
+# payload whose elements are wider than a word.
+compare_scalar_buffer_wide:
+  parameter_names_with_default_values:
+    OPERATOR: wide_less(X, Y)
+  shader_variants:
+  - NAME: eq_scalar_buffer_wide
+    OPERATOR: wide_equal(X, Y)
+  - NAME: ne_scalar_buffer_wide
+    OPERATOR: wide_not_equal(X, Y)
+  - NAME: lt_scalar_buffer_wide
+    OPERATOR: wide_less(X, Y)
+  - NAME: le_scalar_buffer_wide
+    OPERATOR: wide_less_equal(X, Y)
+  - NAME: gt_scalar_buffer_wide
+    OPERATOR: wide_greater(X, Y)
+  - NAME: ge_scalar_buffer_wide
+    OPERATOR: wide_greater_equal(X, Y)
 logic_op:
   parameter_names_with_default_values:
     OPERATOR: X * Y

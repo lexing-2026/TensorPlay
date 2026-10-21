@@ -5,6 +5,9 @@
 #include "../impl/Common.h"
 #include "../api/ShaderRegistry.h"
 
+#include <limits>
+#include <utility>
+
 namespace tensorplay {
 namespace vulkan {
 namespace ops {
@@ -13,6 +16,17 @@ using namespace api::utils;
 
 namespace {
 
+// One side of the closed range a count wider than a word is clipped to, carried
+// as the pair of words such a count is held in, low one first.  A side the caller
+// left unset is the extreme of the width, which clips nothing.
+std::pair<uint32_t, uint32_t> wide_bound(
+    const std::optional<Scalar>& value,
+    const int64_t extreme) {
+  const uint64_t bits = static_cast<uint64_t>(
+      value ? value->to<int64_t>() : extreme);
+  return {static_cast<uint32_t>(bits), static_cast<uint32_t>(bits >> 32u)};
+}
+
 Tensor clamp(
     const Tensor& self_arg,
     const std::optional<Scalar>& min_arg,
@@ -20,8 +34,9 @@ Tensor clamp(
   const bool is_int = self_arg.dtype() == DType::Int32;
   TP_CHECK(
       is_int || self_arg.dtype() == DType::Float32 ||
-          self_arg.dtype() == DType::Float16,
-      "Vulkan clamp supports Float32, Float16 and Int32 tensors only");
+          self_arg.dtype() == DType::Float16 ||
+          self_arg.dtype() == DType::Int64,
+      "Vulkan clamp supports Float32, Float16, Int32 and Int64 tensors only");
   api::Context* const context = api::context();
 
   api::vTensor v_self = convert(self_arg);
@@ -42,6 +57,41 @@ Tensor clamp(
 
     const uint32_t elements =
         safe_downcast_to_u32(static_cast<int64_t>(v_linear_output.numel()));
+
+    // A count wider than a word clips between two bounds of its own width, each
+    // of which travels as a pair of words.
+    if (self_arg.dtype() == DType::Int64) {
+      const auto lo = wide_bound(min_arg, std::numeric_limits<int64_t>::min());
+      const auto hi = wide_bound(max_arg, std::numeric_limits<int64_t>::max());
+      const struct BlockW final {
+        uint32_t buf_length;
+        uint32_t lo_low;
+        uint32_t lo_high;
+        uint32_t hi_low;
+        uint32_t hi_high;
+      } blockw{
+          elements,
+          lo.first,
+          lo.second,
+          hi.first,
+          hi.second,
+      };
+      api::UniformParamsBuffer wide_params(context, blockw);
+      api::PipelineBarrier wide_barrier{};
+      context->submit_compute_job(
+          VK_KERNEL(buffer_clamp_wide),
+          wide_barrier,
+          {buffer_dispatch_count(elements, self_arg.dtype(), 4u), 1u, 1u},
+          api::utils::uvec3{256u, 1u, 1u},
+          VK_NULL_HANDLE,
+          v_linear_output.buffer(
+              wide_barrier,
+              api::PipelineStage::COMPUTE,
+              api::MemoryAccessType::WRITE),
+          v_self.buffer(wide_barrier, api::PipelineStage::COMPUTE),
+          wide_params.buffer());
+      return convert(v_linear_output);
+    }
 
     const struct BlockF final {
       uint32_t buf_length;
@@ -108,6 +158,12 @@ Tensor clamp(
 
     return convert(v_linear_output);
   }
+
+  // An image names one payload per texel, so a code wider than a word has no
+  // image form to be clipped through.
+  TP_CHECK(
+      self_arg.dtype() != DType::Int64,
+      "Vulkan clamp has no image form for a count wider than a word");
 
   api::vTensor v_output{
       context,
@@ -180,8 +236,9 @@ Tensor& clamp_(
   const bool is_int = self_arg.dtype() == DType::Int32;
   TP_CHECK(
       is_int || self_arg.dtype() == DType::Float32 ||
-          self_arg.dtype() == DType::Float16,
-      "Vulkan clamp_ supports Float32, Float16 and Int32 tensors only");
+          self_arg.dtype() == DType::Float16 ||
+          self_arg.dtype() == DType::Int64,
+      "Vulkan clamp_ supports Float32, Float16, Int32 and Int64 tensors only");
   api::Context* const context = api::context();
 
   api::vTensor v_self = convert(self_arg);
@@ -192,6 +249,40 @@ Tensor& clamp_(
     validate_buffer_elementwise_dtype(v_self, "clamp");
     const uint32_t elements =
         safe_downcast_to_u32(static_cast<int64_t>(v_self.numel()));
+
+    // The destination of a written-back clip keeps the width it was allocated
+    // in, so the bounds of a counting payload are pairs of words too.
+    if (self_arg.dtype() == DType::Int64) {
+      const auto lo = wide_bound(min_arg, std::numeric_limits<int64_t>::min());
+      const auto hi = wide_bound(max_arg, std::numeric_limits<int64_t>::max());
+      const struct BlockW final {
+        uint32_t buf_length;
+        uint32_t lo_low;
+        uint32_t lo_high;
+        uint32_t hi_low;
+        uint32_t hi_high;
+      } blockw{
+          elements,
+          lo.first,
+          lo.second,
+          hi.first,
+          hi.second,
+      };
+      api::UniformParamsBuffer wide_params(context, blockw);
+      api::PipelineBarrier wide_barrier{};
+      context->submit_compute_job(
+          VK_KERNEL(buffer_clamp_wideinplace),
+          wide_barrier,
+          {buffer_dispatch_count(elements, self_arg.dtype(), 4u), 1u, 1u},
+          api::utils::uvec3{256u, 1u, 1u},
+          VK_NULL_HANDLE,
+          v_self.buffer(
+              wide_barrier,
+              api::PipelineStage::COMPUTE,
+              api::MemoryAccessType::READ | api::MemoryAccessType::WRITE),
+          wide_params.buffer());
+      return self_arg;
+    }
 
     const struct BlockF final {
       uint32_t buf_length;
@@ -257,6 +348,10 @@ Tensor& clamp_(
 
     return self_arg;
   }
+
+  TP_CHECK(
+      self_arg.dtype() != DType::Int64,
+      "Vulkan clamp_ has no image form for a count wider than a word");
 
   const struct Block final {
     ivec4 extents;
