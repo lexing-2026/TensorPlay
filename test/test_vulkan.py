@@ -9167,6 +9167,95 @@ class TestVulkanCountingGather(unittest.TestCase):
                     np.zeros((4, 3), np.int64)).to("vulkan"))
 
 
+class TestVulkanCountingCat(unittest.TestCase):
+    """Joining sequences of counts: a decode loop grows its token ids, its
+    positions and its mask by appending to the end, so the walk that stitches
+    payloads together has to carry a 64-bit element as well as a 32-bit one."""
+
+    @staticmethod
+    def _device(values):
+        return tensorplay.from_numpy(np.asarray(values, np.int64)).to("vulkan")
+
+    def _joined(self, parts, dim):
+        device = [self._device(part) for part in parts]
+        got = tensorplay.cat(device, dim)
+        self.assertEqual(got.dtype, tensorplay.int64)
+        self.assertTrue(got.device.is_vulkan())
+        model = np.concatenate([np.asarray(part, np.int64) for part in parts],
+                               axis=dim)
+        np.testing.assert_array_equal(
+            np.asarray(got.cpu()), model, err_msg=f"cat along axis {dim}")
+        return got
+
+    def test_two_vectors_join_at_either_end(self):
+        first = np.arange(7, dtype=np.int64) * 1000
+        second = np.arange(5, dtype=np.int64) - 4
+        joined = self._joined([first, second], 0)
+        self.assertEqual(tuple(joined.shape), (12,))
+        self._joined([second, first], 0)
+        self._joined([first, second, first], 0)
+
+    def test_a_row_of_a_table_joins_along_the_feature_axis(self):
+        rng = np.random.default_rng(90)
+        ids = rng.integers(0, 50257, size=(2, 6), dtype=np.int64)
+        extra = rng.integers(0, 50257, size=(2, 1), dtype=np.int64)
+        self.assertEqual(tuple(self._joined([ids, extra], 1).shape), (2, 7))
+        self.assertEqual(tuple(self._joined([ids, ids], 0).shape), (4, 6))
+
+    def test_every_axis_of_a_rank_three_or_four_payload(self):
+        rng = np.random.default_rng(91)
+        for shape in ((2, 3, 4), (2, 3, 4, 5)):
+            base = rng.integers(-1000, 1000, size=shape, dtype=np.int64)
+            for axis in range(len(shape)):
+                grown = list(shape)
+                grown[axis] += 2
+                other = rng.integers(
+                    -1000, 1000, size=tuple(grown), dtype=np.int64)
+                self._joined([base, other], axis)
+
+    def test_a_count_wider_than_a_word_travels_whole(self):
+        # Values that set the high word of the element, positive and negative,
+        # so a pass that moved only one word of a pair would be caught.
+        wide = np.array(
+            [1 << 40, -(1 << 40), (1 << 32) + 7, -((1 << 32) + 7),
+             1 << 62, -(1 << 62), 0, 2 ** 63 - 1, -(2 ** 63)],
+            dtype=np.int64)
+        tail = np.array([1234567890123, -987654321098], dtype=np.int64)
+        self._joined([wide, tail], 0)
+        self._joined([tail, wide], 0)
+
+    def test_a_payload_without_an_image_form(self):
+        # Past the image axis limit the element count is only ever linear, so
+        # the join runs entirely over words.
+        first = np.arange(20000, dtype=np.int64)
+        second = np.arange(30000, dtype=np.int64)
+        got = self._joined([first, second], 0)
+        self.assertEqual(tuple(got.shape), (50000,))
+
+    def test_a_growing_sequence_walks_one_step_at_a_time(self):
+        ids = np.array([[41, 59, 26]], dtype=np.int64)
+        built = self._device(ids)
+        model = ids.copy()
+        for step in range(5):
+            nxt = np.array([[step + 1]], dtype=np.int64)
+            built = tensorplay.cat([built, self._device(nxt)], dim=1)
+            model = np.concatenate([model, nxt], axis=1)
+            np.testing.assert_array_equal(np.asarray(built.cpu()), model)
+        self.assertEqual(tuple(built.shape), (1, 8))
+
+    def test_the_shapes_outside_the_join_axis_stay_agreed(self):
+        base = np.arange(12, dtype=np.int64).reshape((3, 4))
+        odd = np.arange(8, dtype=np.int64).reshape((2, 4))
+        with self.assertRaisesRegex(RuntimeError, "sizes must match"):
+            tensorplay.cat([self._device(base), self._device(odd)], 1)
+        # An element type other than the first one's is refused too.
+        with self.assertRaisesRegex(RuntimeError, "same dtype"):
+            tensorplay.cat(
+                [self._device(base), tensorplay.from_numpy(
+                    np.arange(12, dtype=np.float32).reshape((3, 4))
+                ).to("vulkan")], 0)
+
+
 class TestVulkanBernoulliOutOfPlace(unittest.TestCase):
     """A draw that leaves the probability payload alone: the answer is a fresh
     tensor of the same shape and element type, not a refill of the source."""
@@ -9390,11 +9479,10 @@ class TestVulkanConstantPad(unittest.TestCase):
         ]
         for arr, value in cases:
             self._drawn(arr, [1, 2], value)
-        # A 64-bit count has no image form and the concat walk stops at 32-bit
-        # words, so an int64 payload is not padded here.
-        with self.assertRaisesRegex(RuntimeError, "Float32, Int32 and Float16"):
-            tensorplay.constant_pad_nd(
-                self._device(np.arange(6, dtype=np.int64)), [1, 2], 9)
+        # A 64-bit count has no image form, so its slabs join it to the payload
+        # through the linear walk, which moves a whole pair of words per element.
+        padded, _ = self._drawn(np.arange(6, dtype=np.int64), [1, 2], 9)
+        self.assertEqual(padded.dtype, tensorplay.int64)
 
     def test_the_frontend_entry_agrees(self):
         import tensorplay.nn.functional as nnf
