@@ -784,6 +784,7 @@ set(TP_CPU_KERNEL_SRCS
     src/backend/cpu/GridSamplerKernelsImpl.cpp
     src/backend/cpu/SparseBlasKernelsImpl.cpp
     src/backend/cpu/SpmmReduceKernelsImpl.cpp
+    src/backend/cpu/SoftmaxStridedKernelsImpl.cpp
 )
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
     # (TP_CXX_AVX512_FOUND): only build the tier when the compiler accepts

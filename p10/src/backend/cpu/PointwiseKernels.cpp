@@ -12,6 +12,7 @@
 #include "Parallel.h"
 #include "cpu/VecUnary.h"
 #include "cpu/ComplexUnary.h"
+#include "cpu/SoftmaxStridedKernels.h"
 #include "cpu/VecComplex.h"
 #include "cpu/ActivationUnaryKernels.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
@@ -33,6 +34,8 @@ DEFINE_DISPATCH(sigmoid_f32_stub);
 DEFINE_DISPATCH(silu_f32_stub);
 DEFINE_DISPATCH(sigmoid_f64_stub);
 DEFINE_DISPATCH(silu_f64_stub);
+DEFINE_DISPATCH(softmax_strided_f32_stub);
+DEFINE_DISPATCH(softmax_strided_f64_stub);
 }} // namespace tensorplay::cpu
 
 #ifdef USE_ONEDNN
@@ -3099,207 +3102,6 @@ TP_SOFTMAX_ROW_F64(f64_256, __m256d, 4, tensorplay::tpsleef::exp,
 
 }  // namespace softmax_row
 
-#if defined(__x86_64__)
-// Vectorized strided-softmax unit: softmax along the strided dim, lanes across
-// the contiguous inner dimension.  One unit = one (outer, lane-block) pair;
-// the running max/sum vectors live in registers while sweeping k, so loads and
-// stores along the inner dim are coalesced.
-template <bool LogMode>
-struct SoftmaxStridedCtx {
-    const float* in_f32;
-    float* out_f32;
-    const double* in_f64;
-    double* out_f64;
-    int64_t size, stride, nblk;
-};
-
-template <bool LogMode>
-__attribute__((target("avx512f")))
-static void softmax_strided_f32_512_unit(const SoftmaxStridedCtx<LogMode>& c, int64_t u) {
-    const int64_t a = u / c.nblk;
-    const int64_t iv0 = (u % c.nblk) * 16;
-    const float* base = c.in_f32 + a * c.size * c.stride + iv0;
-    float* obase = c.out_f32 + a * c.size * c.stride + iv0;
-    const __m512 vinf = _mm512_set1_ps(-std::numeric_limits<float>::infinity());
-    __m512 vm = vinf;
-    for (int64_t k = 0; k < c.size; ++k)
-        vm = _mm512_max_ps(vm, _mm512_loadu_ps(base + k * c.stride));
-    __m512 vs = _mm512_setzero_ps();
-    for (int64_t k = 0; k < c.size; ++k) {
-        __m512 e = tensorplay::tpsleef::exp(
-            _mm512_sub_ps(_mm512_loadu_ps(base + k * c.stride), vm));
-        vs = _mm512_add_ps(vs, e);
-        _mm512_storeu_ps(obase + k * c.stride, e);
-    }
-    if constexpr (LogMode) {
-        alignas(64) float sb[16];
-        _mm512_storeu_ps(sb, vs);
-        for (int64_t l = 0; l < 16; ++l) sb[l] = std::log(sb[l]);
-        const __m512 vlse = _mm512_loadu_ps(sb);
-        for (int64_t k = 0; k < c.size; ++k) {
-            __m512 v = _mm512_sub_ps(_mm512_loadu_ps(base + k * c.stride), vm);
-            _mm512_storeu_ps(obase + k * c.stride, _mm512_sub_ps(v, vlse));
-        }
-    } else {
-        const __m512 vinv = _mm512_div_ps(_mm512_set1_ps(1.0f), vs);
-        for (int64_t k = 0; k < c.size; ++k) {
-            _mm512_storeu_ps(obase + k * c.stride,
-                             _mm512_mul_ps(_mm512_loadu_ps(obase + k * c.stride), vinv));
-        }
-    }
-}
-
-// The same unit for the machines without AVX-512: the values of one unit sit
-// in two 256-bit registers, so a unit still covers a whole cache line.
-template <bool LogMode>
-__attribute__((target("avx2")))
-static void softmax_strided_f32_avx2_unit(const SoftmaxStridedCtx<LogMode>& c, int64_t u) {
-    const int64_t a = u / c.nblk;
-    const int64_t iv0 = (u % c.nblk) * 16;
-    const float* base = c.in_f32 + a * c.size * c.stride + iv0;
-    float* obase = c.out_f32 + a * c.size * c.stride + iv0;
-    __m256 m0 = _mm256_loadu_ps(base);
-    __m256 m1 = _mm256_loadu_ps(base + 8);
-    for (int64_t k = 1; k < c.size; ++k) {
-        const float* row = base + k * c.stride;
-        m0 = _mm256_max_ps(m0, _mm256_loadu_ps(row));
-        m1 = _mm256_max_ps(m1, _mm256_loadu_ps(row + 8));
-    }
-    __m256 s0 = _mm256_setzero_ps();
-    __m256 s1 = _mm256_setzero_ps();
-    for (int64_t k = 0; k < c.size; ++k) {
-        const float* row = base + k * c.stride;
-        const __m256 e0 = tensorplay::tpsleef::exp(
-            _mm256_sub_ps(_mm256_loadu_ps(row), m0));
-        const __m256 e1 = tensorplay::tpsleef::exp(
-            _mm256_sub_ps(_mm256_loadu_ps(row + 8), m1));
-        s0 = _mm256_add_ps(s0, e0);
-        s1 = _mm256_add_ps(s1, e1);
-        if (!LogMode) {
-            _mm256_storeu_ps(obase + k * c.stride, e0);
-            _mm256_storeu_ps(obase + k * c.stride + 8, e1);
-        }
-    }
-    if constexpr (LogMode) {
-        alignas(32) float b0[8], b1[8];
-        _mm256_storeu_ps(b0, s0);
-        _mm256_storeu_ps(b1, s1);
-        for (int64_t l = 0; l < 8; ++l) {
-            b0[l] = std::log(b0[l]);
-            b1[l] = std::log(b1[l]);
-        }
-        const __m256 l0 = _mm256_loadu_ps(b0);
-        const __m256 l1 = _mm256_loadu_ps(b1);
-        for (int64_t k = 0; k < c.size; ++k) {
-            const float* row = base + k * c.stride;
-            _mm256_storeu_ps(obase + k * c.stride,
-                _mm256_sub_ps(_mm256_sub_ps(_mm256_loadu_ps(row), m0), l0));
-            _mm256_storeu_ps(obase + k * c.stride + 8,
-                _mm256_sub_ps(_mm256_sub_ps(_mm256_loadu_ps(row + 8), m1), l1));
-        }
-    } else {
-        const __m256 i0 = _mm256_div_ps(_mm256_set1_ps(1.0f), s0);
-        const __m256 i1 = _mm256_div_ps(_mm256_set1_ps(1.0f), s1);
-        for (int64_t k = 0; k < c.size; ++k) {
-            float* drow = obase + k * c.stride;
-            _mm256_storeu_ps(drow, _mm256_mul_ps(_mm256_loadu_ps(drow), i0));
-            _mm256_storeu_ps(drow + 8, _mm256_mul_ps(_mm256_loadu_ps(drow + 8), i1));
-        }
-    }
-}
-
-template <bool LogMode>
-__attribute__((target("avx512f")))
-static void softmax_strided_f64_512_unit(const SoftmaxStridedCtx<LogMode>& c, int64_t u) {
-    const int64_t a = u / c.nblk;
-    const int64_t iv0 = (u % c.nblk) * 8;
-    const double* base = c.in_f64 + a * c.size * c.stride + iv0;
-    double* obase = c.out_f64 + a * c.size * c.stride + iv0;
-    __m512d vm = _mm512_set1_pd(-std::numeric_limits<double>::infinity());
-    for (int64_t k = 0; k < c.size; ++k)
-        vm = _mm512_max_pd(vm, _mm512_loadu_pd(base + k * c.stride));
-    __m512d vs = _mm512_setzero_pd();
-    for (int64_t k = 0; k < c.size; ++k) {
-        __m512d e = tensorplay::tpsleef::exp(
-            _mm512_sub_pd(_mm512_loadu_pd(base + k * c.stride), vm));
-        vs = _mm512_add_pd(vs, e);
-        _mm512_storeu_pd(obase + k * c.stride, e);
-    }
-    if constexpr (LogMode) {
-        alignas(64) double sb[8];
-        _mm512_storeu_pd(sb, vs);
-        for (int64_t l = 0; l < 8; ++l) sb[l] = std::log(sb[l]);
-        const __m512d vlse = _mm512_loadu_pd(sb);
-        for (int64_t k = 0; k < c.size; ++k) {
-            __m512d v = _mm512_sub_pd(_mm512_loadu_pd(base + k * c.stride), vm);
-            _mm512_storeu_pd(obase + k * c.stride, _mm512_sub_pd(v, vlse));
-        }
-    } else {
-        const __m512d vinv = _mm512_div_pd(_mm512_set1_pd(1.0), vs);
-        for (int64_t k = 0; k < c.size; ++k) {
-            _mm512_storeu_pd(obase + k * c.stride,
-                             _mm512_mul_pd(_mm512_loadu_pd(obase + k * c.stride), vinv));
-        }
-    }
-}
-
-template <bool LogMode>
-__attribute__((target("avx2")))
-static void softmax_strided_f64_avx2_unit(const SoftmaxStridedCtx<LogMode>& c, int64_t u) {
-    const int64_t a = u / c.nblk;
-    const int64_t iv0 = (u % c.nblk) * 8;
-    const double* base = c.in_f64 + a * c.size * c.stride + iv0;
-    double* obase = c.out_f64 + a * c.size * c.stride + iv0;
-    __m256d m0 = _mm256_loadu_pd(base);
-    __m256d m1 = _mm256_loadu_pd(base + 4);
-    for (int64_t k = 1; k < c.size; ++k) {
-        const double* row = base + k * c.stride;
-        m0 = _mm256_max_pd(m0, _mm256_loadu_pd(row));
-        m1 = _mm256_max_pd(m1, _mm256_loadu_pd(row + 4));
-    }
-    __m256d s0 = _mm256_setzero_pd();
-    __m256d s1 = _mm256_setzero_pd();
-    for (int64_t k = 0; k < c.size; ++k) {
-        const double* row = base + k * c.stride;
-        const __m256d e0 = tensorplay::tpsleef::exp(
-            _mm256_sub_pd(_mm256_loadu_pd(row), m0));
-        const __m256d e1 = tensorplay::tpsleef::exp(
-            _mm256_sub_pd(_mm256_loadu_pd(row + 4), m1));
-        s0 = _mm256_add_pd(s0, e0);
-        s1 = _mm256_add_pd(s1, e1);
-        if (!LogMode) {
-            _mm256_storeu_pd(obase + k * c.stride, e0);
-            _mm256_storeu_pd(obase + k * c.stride + 4, e1);
-        }
-    }
-    if constexpr (LogMode) {
-        alignas(32) double b0[4], b1[4];
-        _mm256_storeu_pd(b0, s0);
-        _mm256_storeu_pd(b1, s1);
-        for (int64_t l = 0; l < 4; ++l) {
-            b0[l] = std::log(b0[l]);
-            b1[l] = std::log(b1[l]);
-        }
-        const __m256d l0 = _mm256_loadu_pd(b0);
-        const __m256d l1 = _mm256_loadu_pd(b1);
-        for (int64_t k = 0; k < c.size; ++k) {
-            const double* row = base + k * c.stride;
-            _mm256_storeu_pd(obase + k * c.stride,
-                _mm256_sub_pd(_mm256_sub_pd(_mm256_loadu_pd(row), m0), l0));
-            _mm256_storeu_pd(obase + k * c.stride + 4,
-                _mm256_sub_pd(_mm256_sub_pd(_mm256_loadu_pd(row + 4), m1), l1));
-        }
-    } else {
-        const __m256d i0 = _mm256_div_pd(_mm256_set1_pd(1.0), s0);
-        const __m256d i1 = _mm256_div_pd(_mm256_set1_pd(1.0), s1);
-        for (int64_t k = 0; k < c.size; ++k) {
-            double* drow = obase + k * c.stride;
-            _mm256_storeu_pd(drow, _mm256_mul_pd(_mm256_loadu_pd(drow), i0));
-            _mm256_storeu_pd(drow + 4, _mm256_mul_pd(_mm256_loadu_pd(drow + 4), i1));
-        }
-    }
-}
-#endif  // __x86_64__
 
 template <bool LogMode>
 static Tensor softmax_fused_kernel_impl(const Tensor& self, int64_t dim, DType out_dtype,
@@ -3341,133 +3143,18 @@ static Tensor softmax_fused_kernel_impl(const Tensor& self, int64_t dim, DType o
         for (int64_t i = 0; i < d; ++i) before *= input.size(i);
         for (int64_t i = d + 1; i < input.dim(); ++i) after *= input.size(i);
 
-        // A block of b values is walked together: the elements of the reduced
-        // dimension live a stride apart, so one b at a time reads the same
-        // cache lines again for every b.  A block of them keeps those lines
-        // in the cache for the whole block.
-        constexpr int64_t kStridedBlock = 64;
-        const int64_t nblocks = (after + kStridedBlock - 1) / kStridedBlock;
-
-        #define TP_SOFTMAX_STRIDED_ROW(ctype)                              \
-            const ctype* src = in + a * size * stride + b;                 \
-            ctype* dst = out + a * size * stride + b;                      \
-            ctype m[kStridedBlock];                                        \
-            for (int64_t j = 0; j < nb; ++j) m[j] = src[j];                \
-            for (int64_t k = 1; k < size; ++k) {                           \
-                const ctype* row = src + k * stride;                        \
-                for (int64_t j = 0; j < nb; ++j) {                         \
-                    const ctype v = row[j];                                \
-                    m[j] = v > m[j] ? v : m[j];                            \
-                }                                                          \
-            }                                                              \
-            ctype sum[kStridedBlock];                                      \
-            for (int64_t j = 0; j < nb; ++j) sum[j] = ctype(0);            \
-            for (int64_t k = 0; k < size; ++k) {                           \
-                const ctype* row = src + k * stride;                        \
-                ctype* drow = dst + k * stride;                            \
-                for (int64_t j = 0; j < nb; ++j) {                         \
-                    const ctype e = std::exp(row[j] - m[j]);               \
-                    /* The logarithmic form writes its answer from the row  \
-                       itself, so the exponentials are not stored on the \
-                       way; the plain form scales what it stored. */       \
-                    if (!LogMode) drow[j] = e;                             \
-                    sum[j] += e;                                           \
-                }                                                          \
-            }                                                              \
-            ctype acc[kStridedBlock];                                      \
-            for (int64_t j = 0; j < nb; ++j) {                             \
-                acc[j] = LogMode ? std::log(sum[j])                        \
-                                 : (ctype(1) / sum[j]);                    \
-            }                                                              \
-            if constexpr (LogMode) {                                       \
-                for (int64_t k = 0; k < size; ++k) {                       \
-                    const ctype* row = src + k * stride;                    \
-                    ctype* drow = dst + k * stride;                        \
-                    for (int64_t j = 0; j < nb; ++j)                       \
-                        drow[j] = (row[j] - m[j]) - acc[j];                \
-                }                                                          \
-            } else {                                                       \
-                for (int64_t k = 0; k < size; ++k) {                       \
-                    ctype* drow = dst + k * stride;                        \
-                    for (int64_t j = 0; j < nb; ++j) drow[j] *= acc[j];    \
-                }                                                          \
-            }
-
-#if defined(__x86_64__)
-        SoftmaxStridedCtx<LogMode> sctx{
-            out_dtype == DType::Float32 ? input.data_ptr<float>() : nullptr,
-            out_dtype == DType::Float32 ? result.data_ptr<float>() : nullptr,
-            out_dtype == DType::Float64 ? input.data_ptr<double>() : nullptr,
-            out_dtype == DType::Float64 ? result.data_ptr<double>() : nullptr,
-            size, stride, 0};
-        auto run_f32_512 = [&](int64_t ub, int64_t ue) {
-            for (int64_t u = ub; u < ue; ++u) softmax_strided_f32_512_unit<LogMode>(sctx, u);
-        };
-        auto run_f32_avx2 = [&](int64_t ub, int64_t ue) {
-            for (int64_t u = ub; u < ue; ++u) softmax_strided_f32_avx2_unit<LogMode>(sctx, u);
-        };
-        auto run_f64_512 = [&](int64_t ub, int64_t ue) {
-            for (int64_t u = ub; u < ue; ++u) softmax_strided_f64_512_unit<LogMode>(sctx, u);
-        };
-        auto run_f64_avx2 = [&](int64_t ub, int64_t ue) {
-            for (int64_t u = ub; u < ue; ++u) softmax_strided_f64_avx2_unit<LogMode>(sctx, u);
-        };
-#endif
-
+        // The walk is compiled per CPU_CAPABILITY and the best tier is
+        // picked at runtime: it reduces across the strided dimension while
+        // the values of the inner dimension are handled several at a time.
         if (out_dtype == DType::Float32) {
-#if defined(__x86_64__)
-            if (vecunary::avx512_available() && after >= 16 && after % 16 == 0) {
-                sctx.nblk = after / 16;
-                parallel_for(0, before * sctx.nblk, 1, run_f32_512);
-                return result;
-            }
-            if (vecunary::avx2_available() && after >= 16 && after % 16 == 0) {
-                sctx.nblk = after / 16;
-                parallel_for(0, before * sctx.nblk, 1, run_f32_avx2);
-                return result;
-            }
-            const float* in = sctx.in_f32;
-            float* out = sctx.out_f32;
-#else
-            const float* in = input.data_ptr<float>();
-            float* out = result.data_ptr<float>();
-#endif
-            parallel_for(0, before * nblocks, 1, [&](int64_t rb, int64_t re) {
-                for (int64_t r = rb; r < re; ++r) {
-                    const int64_t a = r / nblocks;
-                    const int64_t b = (r - a * nblocks) * kStridedBlock;
-                    const int64_t nb = std::min<int64_t>(kStridedBlock, after - b);
-                    TP_SOFTMAX_STRIDED_ROW(float)
-                }
-            });
+            softmax_strided_f32_stub(DeviceType::CPU, input.data_ptr<float>(),
+                                     result.data_ptr<float>(), size, stride,
+                                     before, after, LogMode);
         } else {
-#if defined(__x86_64__)
-            if (vecunary::avx512_available() && after >= 8 && after % 8 == 0) {
-                sctx.nblk = after / 8;
-                parallel_for(0, before * sctx.nblk, 1, run_f64_512);
-                return result;
-            }
-            if (vecunary::avx2_available() && after >= 8 && after % 8 == 0) {
-                sctx.nblk = after / 8;
-                parallel_for(0, before * sctx.nblk, 1, run_f64_avx2);
-                return result;
-            }
-            const double* in = sctx.in_f64;
-            double* out = sctx.out_f64;
-#else
-            const double* in = input.data_ptr<double>();
-            double* out = result.data_ptr<double>();
-#endif
-            parallel_for(0, before * nblocks, 1, [&](int64_t rb, int64_t re) {
-                for (int64_t r = rb; r < re; ++r) {
-                    const int64_t a = r / nblocks;
-                    const int64_t b = (r - a * nblocks) * kStridedBlock;
-                    const int64_t nb = std::min<int64_t>(kStridedBlock, after - b);
-                    TP_SOFTMAX_STRIDED_ROW(double)
-                }
-            });
+            softmax_strided_f64_stub(DeviceType::CPU, input.data_ptr<double>(),
+                                     result.data_ptr<double>(), size, stride,
+                                     before, after, LogMode);
         }
-        #undef TP_SOFTMAX_STRIDED_ROW
         return result;
     }
     if (!innermost) {

@@ -875,21 +875,33 @@ Tensor& scatter_add_inplace_cpu(Tensor& self, int64_t dim, const Tensor& index, 
 
 // The flat selection: the copies of one index slot do not depend on the
 // others, so the index carries the parallelism when the outer slots are too
-// few to fill the pool.
+// few to fill the pool.  The values are checked where they are read, so a
+// selection of many rows does not walk the index a second time.
 template <typename T>
 static void index_select_flat(T* d, const T* s, const int64_t* ip, int64_t n_idx,
-                              int64_t outer, int64_t row) {
+                              int64_t outer, int64_t row, bool wrap_negative,
+                              const char* op) {
     parallel_for(0, n_idx, GRAIN_SIZE, [&](int64_t kb, int64_t ke) {
         for (int64_t k = kb; k < ke; ++k) {
+            int64_t v = ip[k];
+            if (v < 0 && wrap_negative) v += row;
+            if (v < 0 || v >= row) {
+                TP_THROW(IndexError, op, ": index out of range");
+            }
             for (int64_t o = 0; o < outer; ++o) {
-                d[o * n_idx + k] = s[o * row + ip[k]];
+                d[o * n_idx + k] = s[o * row + v];
             }
         }
     });
 }
 
-Tensor index_select_cpu(const Tensor& self, int64_t dim, const Tensor& index) {
-    if (isQuantizedType(self.dtype())) { quantized::q_scale(self); return quantized::with_quantizer(index_select_cpu(quantized::storage_view(self), dim, index), self); }
+// The selection of rows along a dimension.  A caller that counts negative
+// indices from the end (take) says so, and the index is then read where it
+// lies: the walk below needs the values, not a copy of them.
+static Tensor index_select_rows(const Tensor& self, int64_t dim,
+                                const Tensor& index, bool wrap_negative,
+                                const char* op) {
+    if (isQuantizedType(self.dtype())) { quantized::q_scale(self); return quantized::with_quantizer(index_select_rows(quantized::storage_view(self), dim, index, wrap_negative, op), self); }
 
     int64_t nd = self.dim();
     dim = wrap_dim(dim, nd);
@@ -901,12 +913,18 @@ Tensor index_select_cpu(const Tensor& self, int64_t dim, const Tensor& index) {
     } else if (index_t.dim() != 1) {
         TP_THROW(IndexError, "index_select(): index should be a vector");
     }
-    Tensor idx = normalize_index_cpu(index_t, self.size(dim), "index_select");
-    int64_t n_idx = idx.numel();
     int64_t row = self.size(dim);
-    const int64_t* ip = idx.data_ptr<int64_t>();
     int64_t outer = 1, inner = 1;
     outer_inner(static_cast<std::vector<int64_t>>(self.shape()), dim, outer, inner);
+    // A flat selection reads the index where it lies and checks the values
+    // as it gathers them, so the index is not walked a second time.
+    const bool flat = inner == 1 && outer < get_num_threads();
+    Tensor idx = flat
+        ? (index_t.dtype() == DType::Int64 ? index_t.contiguous()
+                                           : index_t.to(DType::Int64).contiguous())
+        : normalize_index_cpu(index_t, row, op, wrap_negative);
+    int64_t n_idx = idx.numel();
+    const int64_t* ip = idx.data_ptr<int64_t>();
     std::vector<int64_t> out_shape(static_cast<std::vector<int64_t>>(self.shape()));
     out_shape[dim] = n_idx;
     Tensor result = Tensor::empty(out_shape, self.dtype(), self.device());
@@ -930,7 +948,7 @@ Tensor index_select_cpu(const Tensor& self, int64_t dim, const Tensor& index) {
                 } \
             }); \
         } else if (inner == 1) { \
-            index_select_flat<ctype>(d, s, ip, n_idx, outer, row); \
+            index_select_flat<ctype>(d, s, ip, n_idx, outer, row, wrap_negative, op); \
         } else { \
             const int64_t slice_grain = std::max<int64_t>(1, GRAIN_SIZE / std::max<int64_t>(inner, 1)); \
             parallel_for(0, outer * n_idx, slice_grain, [&](int64_t b, int64_t e) { \
@@ -949,6 +967,11 @@ Tensor index_select_cpu(const Tensor& self, int64_t dim, const Tensor& index) {
     }
 #undef TP_ISEL_CASE
     return result;
+}
+
+Tensor index_select_cpu(const Tensor& self, int64_t dim, const Tensor& index) {
+    return index_select_rows(self, dim, index, /*wrap_negative=*/false,
+                             "index_select");
 }
 
 // ---------------------------------------------------------------------------
@@ -1864,10 +1887,10 @@ Tensor bincount_cpu(const Tensor& self, const std::optional<Tensor>& weights_opt
 
 Tensor take_cpu(const Tensor& self, const Tensor& index) {
     Tensor flat = self.reshape({self.numel()});
-    // take counts negative indices from the end of the flattened input.
-    Tensor wrapped = normalize_index_cpu(index.reshape({index.numel()}), self.numel(),
-                                         "take", /*wrap_negative=*/true);
-    return index_select_cpu(flat, 0, wrapped)
+    // take counts negative indices from the end of the flattened input, so
+    // the walk below reads the index where it lies instead of a copy of it.
+    return index_select_rows(flat, 0, index.reshape({index.numel()}),
+                              /*wrap_negative=*/true, "take")
         .reshape(static_cast<std::vector<int64_t>>(index.shape()));
 }
 
