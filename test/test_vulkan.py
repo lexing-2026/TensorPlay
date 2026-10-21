@@ -9781,5 +9781,184 @@ class TestVulkanSliceScatter(unittest.TestCase):
             tensorplay.slice_scatter(payload, block, 2, 0, 2, 1)
 
 
+class TestVulkanEmbeddingBackward(unittest.TestCase):
+    # The gradient of a table lookup: a row answers with the sum of the
+    # gradients of every lookup that named it, and a row the list never read
+    # keeps a zero.
+
+    @staticmethod
+    def _named(codes, grad, rows, padding=-1, scaled=False):
+        # The answer the walk owes: one row per code the table carries, a
+        # padding entry left out, and a frequency-scaled row divided by how
+        # many times the list named it.
+        flat = np.asarray(codes).reshape(-1)
+        features = tuple(np.asarray(grad).shape)[-1]
+        out = np.zeros((rows, features), np.float32)
+        source = np.asarray(grad).reshape(flat.size, features).astype(np.float32)
+        counts = np.zeros(rows, np.int32)
+        for position, code in enumerate(flat):
+            if code == padding or code < 0 or code >= rows:
+                continue
+            out[code] += source[position]
+            counts[code] += 1
+        if scaled:
+            out /= np.maximum(counts, 1)[:, None]
+        return out
+
+    def _against_reference(
+            self, codes_np, grad_np, rows, dtype=tensorplay.float32,
+            padding=-1, scaled=False, atol=0.0):
+        device = tensorplay.device("vulkan")
+        grad = tensorplay.tensor(grad_np, dtype=dtype).to(device)
+        codes = tensorplay.tensor(codes_np).to(device)
+        out = tensorplay.embedding_dense_backward(
+            grad, codes, rows, padding, scaled)
+        got = out.cpu().numpy()
+        want = self._named(codes_np, grad_np, rows, padding, scaled)
+        self.assertEqual(got.shape, want.shape)
+        self.assertEqual(got.dtype, np.float32 if dtype == tensorplay.float32
+                         else np.float16)
+        np.testing.assert_allclose(
+            got.astype(np.float32), want, rtol=0,
+            atol=atol if atol else (2.0e-3
+                                    if dtype == tensorplay.float16 else 1.0e-6))
+        return got
+
+    def test_the_rows_a_list_names_add_in_the_order_they_read(self):
+        rng = np.random.default_rng(23)
+        for codes in ([0, 3, 3, 10, 1, 3], [4, 4, 4, 4], list(range(12)),
+                      [11, 0, 11, 5]):
+            grad = (rng.standard_normal((len(codes), 6)) * 2).astype(np.float32)
+            self._against_reference(
+                np.array(codes, np.int64), grad, 12)
+
+    def test_a_padding_row_neither_adds_nor_is_counted(self):
+        rng = np.random.default_rng(29)
+        codes = np.array([0, 2, 2, 4, 2, 7], np.int64)
+        grad = (rng.standard_normal((6, 5)) * 2).astype(np.float32)
+        for scaled in (False, True):
+            got = self._against_reference(
+                codes, grad, 9, padding=2, scaled=scaled)
+            np.testing.assert_array_equal(got[2], np.zeros(5, np.float32))
+        # A padding entry outside the table changes nothing about the answer.
+        self._against_reference(codes, grad, 9, padding=99, scaled=True)
+
+    def test_a_proportion_scaled_by_frequency_divides_each_row(self):
+        rng = np.random.default_rng(31)
+        codes = np.array([0, 0, 0, 5, 5, 7, 3], np.int64)
+        grad = (rng.standard_normal((7, 8)) * 2).astype(np.float32)
+        self._against_reference(codes, grad, 20, scaled=True)
+        # A row the list never named divides by one, so its zeros stay there.
+        got = self._against_reference(codes, grad, 20, scaled=True)
+        np.testing.assert_array_equal(
+            got[[1, 2, 4, 6, 8]], np.zeros((5, 8), np.float32))
+
+    def test_a_list_of_any_rank_and_element_type(self):
+        rng = np.random.default_rng(37)
+        for shape in ((4, 3), (2, 3, 4)):
+            codes = rng.integers(0, 20, size=shape).astype(np.int64)
+            grad = (rng.standard_normal(shape + (8,)) * 2).astype(np.float32)
+            self._against_reference(codes, grad, 20)
+            self._against_reference(codes, grad, 20, scaled=True)
+        self._against_reference(
+            rng.integers(0, 20, size=(9,)).astype(np.int32),
+            (rng.standard_normal((9, 8)) * 2).astype(np.float32), 20,
+            scaled=True)
+
+    def test_the_narrow_float_of_a_scaled_row(self):
+        rng = np.random.default_rng(41)
+        codes = np.array([1, 1, 1, 6, 6, 2], np.int64)
+        grad = (rng.standard_normal((6, 8)) * 2).astype(np.float16)
+        self._against_reference(
+            codes, grad, 16, dtype=tensorplay.float16, scaled=True)
+        self._against_reference(codes, grad, 16, dtype=tensorplay.float16)
+
+    def test_a_code_the_table_does_not_carry_answers_no_row(self):
+        # The lookup answers no row for a code outside it and the walk adds no
+        # row for the same code: both ends of a lookup agree on what a code
+        # with no row means.
+        rng = np.random.default_rng(43)
+        codes = np.array([-1, 14, 2, 0, -7, 14, 5], np.int64)
+        grad = (rng.standard_normal((7, 4)) * 2).astype(np.float32)
+        device = tensorplay.device("vulkan")
+        got = tensorplay.embedding_dense_backward(
+            tensorplay.tensor(grad).to(device),
+            tensorplay.tensor(codes).to(device), 12, -1, False).cpu().numpy()
+        want = np.zeros((12, 4), np.float32)
+        for position, code in enumerate(codes):
+            if 0 <= code < 12:
+                want[code] += grad[position]
+        np.testing.assert_allclose(got, want, rtol=0, atol=1.0e-6)
+        np.testing.assert_array_equal(got[[1, 3, 4, 6, 7]], np.zeros((5, 4)))
+
+    def test_a_table_with_no_image_form(self):
+        rng = np.random.default_rng(47)
+        codes = np.array([0, 7, 7, 19999, 1234, 7], np.int64)
+        grad = (rng.standard_normal((6, 300)) * 0.2).astype(np.float32)
+        self._against_reference(codes, grad, 20000, atol=1.0e-6)
+        self._against_reference(codes, grad, 20000, scaled=True, atol=1.0e-6)
+
+    def test_an_empty_list_or_an_empty_table(self):
+        empty = tensorplay.zeros((0, 5), device="vulkan")
+        codes = tensorplay.tensor(np.zeros((0,), np.int64)).to("vulkan")
+        out = tensorplay.embedding_dense_backward(empty, codes, 7, -1, False)
+        self.assertEqual(tuple(out.shape), (7, 5))
+        np.testing.assert_array_equal(out.cpu().numpy(), np.zeros((7, 5)))
+        # A table with no row holds nothing for a list to name.
+        out = tensorplay.embedding_dense_backward(
+            tensorplay.zeros((3, 4), device="vulkan"),
+            tensorplay.tensor(np.array([0, 1, 2], np.int64)).to("vulkan"),
+            0, -1, True)
+        self.assertEqual(tuple(out.shape), (0, 4))
+
+    def test_the_gradient_of_a_lookup_layer(self):
+        import tensorplay.nn.functional as Fn
+        rng = np.random.default_rng(53)
+        table = (rng.standard_normal((24, 6)) * 0.5).astype(np.float32)
+        codes = rng.integers(0, 24, size=(3, 5)).astype(np.int64)
+        for padding, scaled in ((None, False), (3, False), (None, True),
+                                (3, True)):
+            answers = {}
+            for device in ("cpu", "vulkan"):
+                weight = tensorplay.tensor(table, device=device)\
+                    .detach().requires_grad_(True)
+                out = Fn.embedding(
+                    tensorplay.tensor(codes, device=device), weight,
+                    padding_idx=padding, scale_grad_by_freq=scaled)
+                out.backward(tensorplay.ones_like(out))
+                answers[device] = (
+                    out.detach().cpu().numpy(), weight.grad.cpu().numpy())
+            np.testing.assert_allclose(
+                answers["cpu"][0], answers["vulkan"][0], rtol=0, atol=0)
+            np.testing.assert_allclose(
+                answers["cpu"][1], answers["vulkan"][1], rtol=1.0e-6,
+                atol=1.0e-5, err_msg=f"padding={padding} scaled={scaled}")
+
+    def test_outside_the_supported_surface_refuses(self):
+        device = tensorplay.device("vulkan")
+        grad = tensorplay.zeros((4, 6), device=device)
+        codes = tensorplay.tensor(np.array([0, 1, 2, 3], np.int64)).to(device)
+        with self.assertRaisesRegex(RuntimeError, "Float32 and Float16"):
+            tensorplay.embedding_dense_backward(
+                tensorplay.zeros(
+                    (4, 6), dtype=tensorplay.int32, device=device),
+                codes, 8, -1, False)
+        with self.assertRaisesRegex(RuntimeError, "Int64 or Int32"):
+            tensorplay.embedding_dense_backward(
+                grad, tensorplay.tensor(
+                    np.array([0, 1, 2, 3], np.float32)).to(device),
+                8, -1, False)
+        # A gradient that does not carry one row per entry of the list.
+        with self.assertRaisesRegex(RuntimeError, "one row per"):
+            tensorplay.embedding_dense_backward(
+                tensorplay.zeros((5, 6), device=device), codes, 8, -1, False)
+        with self.assertRaisesRegex(RuntimeError, "negative count of rows"):
+            tensorplay.embedding_dense_backward(grad, codes, -3, -1, False)
+        with self.assertRaisesRegex(RuntimeError, "on the device"):
+            tensorplay.embedding_dense_backward(
+                grad, tensorplay.tensor(np.array([0, 1, 2, 3], np.int64)),
+                8, -1, False)
+
+
 if __name__ == "__main__":
     unittest.main()
