@@ -3149,6 +3149,65 @@ static void softmax_strided_f32_512_unit(const SoftmaxStridedCtx<LogMode>& c, in
     }
 }
 
+// The same unit for the machines without AVX-512: the values of one unit sit
+// in two 256-bit registers, so a unit still covers a whole cache line.
+template <bool LogMode>
+__attribute__((target("avx2")))
+static void softmax_strided_f32_avx2_unit(const SoftmaxStridedCtx<LogMode>& c, int64_t u) {
+    const int64_t a = u / c.nblk;
+    const int64_t iv0 = (u % c.nblk) * 16;
+    const float* base = c.in_f32 + a * c.size * c.stride + iv0;
+    float* obase = c.out_f32 + a * c.size * c.stride + iv0;
+    __m256 m0 = _mm256_loadu_ps(base);
+    __m256 m1 = _mm256_loadu_ps(base + 8);
+    for (int64_t k = 1; k < c.size; ++k) {
+        const float* row = base + k * c.stride;
+        m0 = _mm256_max_ps(m0, _mm256_loadu_ps(row));
+        m1 = _mm256_max_ps(m1, _mm256_loadu_ps(row + 8));
+    }
+    __m256 s0 = _mm256_setzero_ps();
+    __m256 s1 = _mm256_setzero_ps();
+    for (int64_t k = 0; k < c.size; ++k) {
+        const float* row = base + k * c.stride;
+        const __m256 e0 = tensorplay::tpsleef::exp(
+            _mm256_sub_ps(_mm256_loadu_ps(row), m0));
+        const __m256 e1 = tensorplay::tpsleef::exp(
+            _mm256_sub_ps(_mm256_loadu_ps(row + 8), m1));
+        s0 = _mm256_add_ps(s0, e0);
+        s1 = _mm256_add_ps(s1, e1);
+        if (!LogMode) {
+            _mm256_storeu_ps(obase + k * c.stride, e0);
+            _mm256_storeu_ps(obase + k * c.stride + 8, e1);
+        }
+    }
+    if constexpr (LogMode) {
+        alignas(32) float b0[8], b1[8];
+        _mm256_storeu_ps(b0, s0);
+        _mm256_storeu_ps(b1, s1);
+        for (int64_t l = 0; l < 8; ++l) {
+            b0[l] = std::log(b0[l]);
+            b1[l] = std::log(b1[l]);
+        }
+        const __m256 l0 = _mm256_loadu_ps(b0);
+        const __m256 l1 = _mm256_loadu_ps(b1);
+        for (int64_t k = 0; k < c.size; ++k) {
+            const float* row = base + k * c.stride;
+            _mm256_storeu_ps(obase + k * c.stride,
+                _mm256_sub_ps(_mm256_sub_ps(_mm256_loadu_ps(row), m0), l0));
+            _mm256_storeu_ps(obase + k * c.stride + 8,
+                _mm256_sub_ps(_mm256_sub_ps(_mm256_loadu_ps(row + 8), m1), l1));
+        }
+    } else {
+        const __m256 i0 = _mm256_div_ps(_mm256_set1_ps(1.0f), s0);
+        const __m256 i1 = _mm256_div_ps(_mm256_set1_ps(1.0f), s1);
+        for (int64_t k = 0; k < c.size; ++k) {
+            float* drow = obase + k * c.stride;
+            _mm256_storeu_ps(drow, _mm256_mul_ps(_mm256_loadu_ps(drow), i0));
+            _mm256_storeu_ps(drow + 8, _mm256_mul_ps(_mm256_loadu_ps(drow + 8), i1));
+        }
+    }
+}
+
 template <bool LogMode>
 __attribute__((target("avx512f")))
 static void softmax_strided_f64_512_unit(const SoftmaxStridedCtx<LogMode>& c, int64_t u) {
@@ -3180,6 +3239,63 @@ static void softmax_strided_f64_512_unit(const SoftmaxStridedCtx<LogMode>& c, in
         for (int64_t k = 0; k < c.size; ++k) {
             _mm512_storeu_pd(obase + k * c.stride,
                              _mm512_mul_pd(_mm512_loadu_pd(obase + k * c.stride), vinv));
+        }
+    }
+}
+
+template <bool LogMode>
+__attribute__((target("avx2")))
+static void softmax_strided_f64_avx2_unit(const SoftmaxStridedCtx<LogMode>& c, int64_t u) {
+    const int64_t a = u / c.nblk;
+    const int64_t iv0 = (u % c.nblk) * 8;
+    const double* base = c.in_f64 + a * c.size * c.stride + iv0;
+    double* obase = c.out_f64 + a * c.size * c.stride + iv0;
+    __m256d m0 = _mm256_loadu_pd(base);
+    __m256d m1 = _mm256_loadu_pd(base + 4);
+    for (int64_t k = 1; k < c.size; ++k) {
+        const double* row = base + k * c.stride;
+        m0 = _mm256_max_pd(m0, _mm256_loadu_pd(row));
+        m1 = _mm256_max_pd(m1, _mm256_loadu_pd(row + 4));
+    }
+    __m256d s0 = _mm256_setzero_pd();
+    __m256d s1 = _mm256_setzero_pd();
+    for (int64_t k = 0; k < c.size; ++k) {
+        const double* row = base + k * c.stride;
+        const __m256d e0 = tensorplay::tpsleef::exp(
+            _mm256_sub_pd(_mm256_loadu_pd(row), m0));
+        const __m256d e1 = tensorplay::tpsleef::exp(
+            _mm256_sub_pd(_mm256_loadu_pd(row + 4), m1));
+        s0 = _mm256_add_pd(s0, e0);
+        s1 = _mm256_add_pd(s1, e1);
+        if (!LogMode) {
+            _mm256_storeu_pd(obase + k * c.stride, e0);
+            _mm256_storeu_pd(obase + k * c.stride + 4, e1);
+        }
+    }
+    if constexpr (LogMode) {
+        alignas(32) double b0[4], b1[4];
+        _mm256_storeu_pd(b0, s0);
+        _mm256_storeu_pd(b1, s1);
+        for (int64_t l = 0; l < 4; ++l) {
+            b0[l] = std::log(b0[l]);
+            b1[l] = std::log(b1[l]);
+        }
+        const __m256d l0 = _mm256_loadu_pd(b0);
+        const __m256d l1 = _mm256_loadu_pd(b1);
+        for (int64_t k = 0; k < c.size; ++k) {
+            const double* row = base + k * c.stride;
+            _mm256_storeu_pd(obase + k * c.stride,
+                _mm256_sub_pd(_mm256_sub_pd(_mm256_loadu_pd(row), m0), l0));
+            _mm256_storeu_pd(obase + k * c.stride + 4,
+                _mm256_sub_pd(_mm256_sub_pd(_mm256_loadu_pd(row + 4), m1), l1));
+        }
+    } else {
+        const __m256d i0 = _mm256_div_pd(_mm256_set1_pd(1.0), s0);
+        const __m256d i1 = _mm256_div_pd(_mm256_set1_pd(1.0), s1);
+        for (int64_t k = 0; k < c.size; ++k) {
+            double* drow = obase + k * c.stride;
+            _mm256_storeu_pd(drow, _mm256_mul_pd(_mm256_loadu_pd(drow), i0));
+            _mm256_storeu_pd(drow + 4, _mm256_mul_pd(_mm256_loadu_pd(drow + 4), i1));
         }
     }
 }
@@ -3287,8 +3403,14 @@ static Tensor softmax_fused_kernel_impl(const Tensor& self, int64_t dim, DType o
         auto run_f32_512 = [&](int64_t ub, int64_t ue) {
             for (int64_t u = ub; u < ue; ++u) softmax_strided_f32_512_unit<LogMode>(sctx, u);
         };
+        auto run_f32_avx2 = [&](int64_t ub, int64_t ue) {
+            for (int64_t u = ub; u < ue; ++u) softmax_strided_f32_avx2_unit<LogMode>(sctx, u);
+        };
         auto run_f64_512 = [&](int64_t ub, int64_t ue) {
             for (int64_t u = ub; u < ue; ++u) softmax_strided_f64_512_unit<LogMode>(sctx, u);
+        };
+        auto run_f64_avx2 = [&](int64_t ub, int64_t ue) {
+            for (int64_t u = ub; u < ue; ++u) softmax_strided_f64_avx2_unit<LogMode>(sctx, u);
         };
 #endif
 
@@ -3297,6 +3419,11 @@ static Tensor softmax_fused_kernel_impl(const Tensor& self, int64_t dim, DType o
             if (vecunary::avx512_available() && after >= 16 && after % 16 == 0) {
                 sctx.nblk = after / 16;
                 parallel_for(0, before * sctx.nblk, 1, run_f32_512);
+                return result;
+            }
+            if (vecunary::avx2_available() && after >= 16 && after % 16 == 0) {
+                sctx.nblk = after / 16;
+                parallel_for(0, before * sctx.nblk, 1, run_f32_avx2);
                 return result;
             }
             const float* in = sctx.in_f32;
@@ -3318,6 +3445,11 @@ static Tensor softmax_fused_kernel_impl(const Tensor& self, int64_t dim, DType o
             if (vecunary::avx512_available() && after >= 8 && after % 8 == 0) {
                 sctx.nblk = after / 8;
                 parallel_for(0, before * sctx.nblk, 1, run_f64_512);
+                return result;
+            }
+            if (vecunary::avx2_available() && after >= 8 && after % 8 == 0) {
+                sctx.nblk = after / 8;
+                parallel_for(0, before * sctx.nblk, 1, run_f64_avx2);
                 return result;
             }
             const double* in = sctx.in_f64;
