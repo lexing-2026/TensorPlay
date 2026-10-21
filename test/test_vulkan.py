@@ -10122,6 +10122,187 @@ class TestVulkanEmbeddingBackward(unittest.TestCase):
                 8, -1, False)
 
 
+class TestVulkanProductStorageClasses(unittest.TestCase):
+    # A product meets three operands, each written by whichever route had to
+    # carry it: a weight whose axes pass the device's image limit lies in words,
+    # a batch the device laid out itself has no other place to be, and a small
+    # addend keeps the form its own shape answers.  Kernels walk texels or words
+    # according to what they were written to read, so a mismatch crosses the
+    # operand the walk touches least instead of ending the product.
+
+    @staticmethod
+    def _uploaded(array, dtype=np.float32):
+        # A payload that arrives from the host keeps the image form.
+        return tensorplay.from_numpy(np.asarray(array, dtype)).to("vulkan")
+
+    @staticmethod
+    def _built(array, dtype=np.float32):
+        # A payload the device lays out itself keeps its elements in words.
+        return tensorplay.tensor(np.asarray(array, dtype), device="vulkan")
+
+    @staticmethod
+    def _uses_dense_storage(payload):
+        # Only single precision has both a texture and a linear form of lerp, so
+        # a lerp that reports the missing image marks a payload that keeps its
+        # elements in words.
+        import tensorplay.functional as F
+        try:
+            F.lerp(payload, payload, 0.5)
+            return False
+        except RuntimeError:
+            return True
+
+    @classmethod
+    def _rows_without_an_image_form(cls, width):
+        # The smallest row count whose plane the device cannot hold in an image,
+        # which is where a product over such rows has to write words.
+        rows = 4096
+        while rows <= 262144:
+            probe = tensorplay.from_numpy(
+                np.zeros((rows, width), np.float32)).to("vulkan")
+            if cls._uses_dense_storage(probe):
+                return rows
+            rows *= 2
+        return None
+
+    @staticmethod
+    def _relerr(got, want):
+        got = np.asarray(got, dtype=np.float64)
+        want = np.asarray(want, dtype=np.float64)
+        denom = max(float(np.abs(want).max()), 1.0)
+        return float(np.abs(got - want).max()) / denom
+
+    def _back(self, tensor):
+        return tensor.detach().cpu().numpy().astype(np.float64)
+
+    def test_a_product_meets_operands_of_either_storage(self):
+        from tensorplay.nn.functional import linear
+
+        rng = np.random.default_rng(3)
+        M, N, K = 3, 5, 6
+        host_x = rng.standard_normal((M, K)).astype(np.float32)
+        host_w = rng.standard_normal((N, K)).astype(np.float32)
+        host_wt = np.ascontiguousarray(host_w.T)
+        for dtype, tol in ((np.float32, 1e-4), (np.float16, 6e-3)):
+            x = host_x.astype(dtype)
+            w = host_w.astype(dtype)
+            wt = host_wt.astype(dtype)
+            # The answer is walked in the wide plane from the values the narrow
+            # one actually carries, so the width only costs rounding.
+            want_linear = x.astype(np.float32) @ w.astype(np.float32).T
+            want_mm = x.astype(np.float32) @ wt.astype(np.float32)
+            for act_name, make_act in (("word", self._built),
+                                       ("image", self._uploaded)):
+                probe = make_act(x, np.float32)
+                self.assertIs(
+                    self._uses_dense_storage(probe), make_act == self._built,
+                    f"a {act_name} activation was not the storage its builder "
+                    "answers")
+                for wt_name, make_wt in (("word", self._built),
+                                         ("image", self._uploaded)):
+                    activation = make_act(x, dtype)
+                    answers = (
+                        linear(activation, make_wt(w, dtype)),
+                        tensorplay.mm(activation, make_wt(wt, dtype)))
+                    for answer, want in zip(answers, (want_linear, want_mm)):
+                        self.assertTrue(
+                            answer.device.is_vulkan(),
+                            f"a {act_name} x {wt_name} product left the device")
+                        self.assertLessEqual(
+                            self._relerr(self._back(answer), want), tol,
+                            f"a {act_name} activation against a {wt_name} "
+                            f"weight missed the product ({dtype.__name__})")
+
+    def test_an_addend_of_either_storage_feeds_the_product(self):
+        from tensorplay.nn.functional import linear
+
+        rng = np.random.default_rng(5)
+        M, N, K = 3, 5, 6
+        host_x = rng.standard_normal((M, K)).astype(np.float32)
+        host_w = rng.standard_normal((N, K)).astype(np.float32)
+        host_b = rng.standard_normal((N,)).astype(np.float32)
+        for dtype, tol in ((np.float32, 1e-4), (np.float16, 6e-3)):
+            x = host_x.astype(dtype)
+            w = host_w.astype(dtype)
+            b = host_b.astype(dtype)
+            want = (x.astype(np.float32) @ w.astype(np.float32).T
+                    + b.astype(np.float32))
+            for act_name, make_act in (("word", self._built),
+                                       ("image", self._uploaded)):
+                for wt_name, make_wt in (("word", self._built),
+                                         ("image", self._uploaded)):
+                    for bias_name, make_bias in (("word", self._built),
+                                                 ("image", self._uploaded)):
+                        answer = linear(
+                            make_act(x, dtype), make_wt(w, dtype),
+                            make_bias(b, dtype))
+                        self.assertLessEqual(
+                            self._relerr(self._back(answer), want), tol,
+                            f"a {bias_name} addend against a {act_name} "
+                            f"activation and a {wt_name} weight missed the "
+                            f"product ({dtype.__name__})")
+
+    def test_a_product_wide_enough_for_words_reads_an_image_addend(self):
+        # Rows past the device's image axes leave a product no image to write,
+        # so its result lies in words while the addend broadcast over those rows
+        # still has a texture of its own.
+        from tensorplay.nn.functional import linear
+
+        rows = self._rows_without_an_image_form(8)
+        if rows is None:
+            self.skipTest("no row count here is beyond the image axes")
+        width, features = 8, 6
+        rng = np.random.default_rng(9)
+        host_x = rng.standard_normal((rows, features)).astype(np.float32)
+        host_w = rng.standard_normal((width, features)).astype(np.float32)
+        host_b = rng.standard_normal((width,)).astype(np.float32)
+        want = host_x @ host_w.T + host_b
+
+        answer = linear(
+            self._built(host_x), self._built(host_w), self._uploaded(host_b))
+        self.assertTrue(
+            self._uses_dense_storage(answer),
+            "a product over this many rows was expected to write words")
+        self.assertLessEqual(
+            self._relerr(self._back(answer), want), 1e-4,
+            "a word-shaped product missed the image addend")
+
+    def test_a_model_reads_a_batch_built_on_the_device(self):
+        from tensorplay.nn import Linear
+
+        tensorplay.manual_seed(7)
+        rng = np.random.default_rng(13)
+        M, features, units = 4, 6, 5
+        host_x = rng.standard_normal((M, features)).astype(np.float32)
+        model = Linear(features, units)
+        host_w = model.weight.detach().cpu().numpy().astype(np.float32)
+        host_b = model.bias.detach().cpu().numpy().astype(np.float32)
+        model.to("vulkan")
+        self.assertFalse(
+            self._uses_dense_storage(model.weight.detach()),
+            "an uploaded layer was expected to keep its image")
+
+        feed = self._built(host_x).detach().requires_grad_(True)
+        answer = model(feed)
+        self.assertTrue(
+            answer.device.is_vulkan(),
+            "a layer answer for a device-built batch left the device")
+        self.assertLessEqual(
+            self._relerr(self._back(answer), host_x @ host_w.T + host_b), 1e-4,
+            "a device-built batch through an uploaded layer missed the walk")
+
+        answer.sum().backward()
+        self.assertIsNotNone(feed.grad, "the batch kept no gradient")
+        moved = feed.grad.detach().cpu().numpy().astype(np.float32)
+        self.assertTrue(
+            np.isfinite(moved).all(),
+            "the gradient a device-built batch was handed went non-finite")
+        self.assertLessEqual(
+            self._relerr(moved, np.ones((M, units), np.float32) @ host_w),
+            1e-3,
+            "the gradient of a device-built batch missed the layer")
+
+
 class TestVulkanSquaredErrorLoss(unittest.TestCase):
     # How far an element sits from the value it is matched with is squared in
     # one walk, so an averaged answer is a reduction away and a gradient is the
