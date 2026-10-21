@@ -1610,11 +1610,28 @@ Tensor bincount_cpu_impl(const Tensor& self, const Tensor& weights,
     }
     Tensor inp = self.contiguous();
     const input_t* ip = inp.data_ptr<input_t>();
-    input_t min_v = std::numeric_limits<input_t>::max();
-    input_t max_v = std::numeric_limits<input_t>::lowest();
-    for (int64_t i = 0; i < inp.numel(); ++i) {
-        if (ip[i] < min_v) min_v = ip[i];
-        if (ip[i] > max_v) max_v = ip[i];
+    // The range of the values is gathered per thread, so the scan of the
+    // input does not hold the whole count back.
+    const int threads = get_num_threads();
+    std::vector<input_t> mins(static_cast<size_t>(threads),
+                             std::numeric_limits<input_t>::max());
+    std::vector<input_t> maxs(static_cast<size_t>(threads),
+                             std::numeric_limits<input_t>::lowest());
+    parallel_for(0, inp.numel(), GRAIN_SIZE, [&](int64_t b, int64_t e) {
+        const size_t t = static_cast<size_t>(get_thread_num());
+        input_t lo = mins[t], hi = maxs[t];
+        for (int64_t i = b; i < e; ++i) {
+            const input_t v = ip[i];
+            if (v < lo) lo = v;
+            if (v > hi) hi = v;
+        }
+        mins[t] = lo;
+        maxs[t] = hi;
+    });
+    input_t min_v = mins[0], max_v = maxs[0];
+    for (int t = 1; t < threads; ++t) {
+        if (mins[static_cast<size_t>(t)] < min_v) min_v = mins[static_cast<size_t>(t)];
+        if (maxs[static_cast<size_t>(t)] > max_v) max_v = maxs[static_cast<size_t>(t)];
     }
     if constexpr (std::is_signed_v<input_t>) {
         if (min_v < 0) {
@@ -1653,8 +1670,33 @@ Tensor bincount_cpu_impl(const Tensor& self, const Tensor& weights,
     }
     Tensor result = Tensor::zeros({nbins}, DType::Int64, self.device());
     int64_t* rp = result.data_ptr<int64_t>();
-    for (int64_t i = 0; i < self_size; ++i) {
-        rp[static_cast<int64_t>(ip[i])] += 1;
+    if (nbins <= (1 << 20)) {
+        // A tally per thread, folded together at the end: the threads do not
+        // share a bin, so no two of them write the same counter.
+        std::vector<int32_t> tally(static_cast<size_t>(threads) *
+                                   static_cast<size_t>(nbins), 0);
+        parallel_for(0, self_size, GRAIN_SIZE, [&](int64_t b, int64_t e) {
+            int32_t* t = tally.data() +
+                         static_cast<size_t>(get_thread_num()) *
+                             static_cast<size_t>(nbins);
+            for (int64_t i = b; i < e; ++i) {
+                t[static_cast<int64_t>(ip[i])] += 1;
+            }
+        });
+        for (int t = 0; t < threads; ++t) {
+            const int32_t* row = tally.data() +
+                                 static_cast<size_t>(t) * static_cast<size_t>(nbins);
+            for (int64_t b = 0; b < nbins; ++b) rp[b] += row[b];
+        }
+    } else {
+        // A wide range of bins would make a tally per thread large, so the
+        // threads share the counters instead.
+        parallel_for(0, self_size, GRAIN_SIZE, [&](int64_t b, int64_t e) {
+            for (int64_t i = b; i < e; ++i) {
+                std::atomic_ref<int64_t>(rp[static_cast<int64_t>(ip[i])])
+                    .fetch_add(1, std::memory_order_relaxed);
+            }
+        });
     }
     return result;
 }
