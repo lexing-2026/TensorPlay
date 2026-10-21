@@ -10122,5 +10122,98 @@ class TestVulkanEmbeddingBackward(unittest.TestCase):
                 8, -1, False)
 
 
+class TestVulkanNarrowTraining(unittest.TestCase):
+    # A walk that answers one parameter at a time keeps the running averages of
+    # a narrow parameter one plane wider, because the share a small gradient
+    # adds to the second average has no name in the narrow plane.  The device
+    # carries half planes only, so the narrow case is measured there.
+
+    def test_averages_of_a_half_parameter_are_kept_wide(self):
+        from tensorplay.optim import AdamW
+
+        narrow = tensorplay.float16
+        param = tensorplay.nn.Parameter(
+            tensorplay.zeros((3, 5), dtype=narrow, device="vulkan"))
+        param.grad = tensorplay.full((3, 5), 4.0e-3, dtype=narrow,
+                                     device="vulkan")
+        opt = AdamW([param], lr=3.0e-4)
+        opt.step()
+
+        state = opt.state[param]
+        self.assertEqual(state["exp_avg"].dtype, tensorplay.float32,
+                         "a half first average kept the narrow plane")
+        self.assertEqual(state["exp_avg_sq"].dtype, tensorplay.float32,
+                         "a half second average kept the narrow plane")
+        self.assertEqual(param.dtype, narrow,
+                         "a half parameter left its own plane")
+
+        # The share one step of a 4e-3 gradient adds to the second average is
+        # (1 - 0.999) * g * g.  A half plane cannot name it at all: the average
+        # would read zero, its root zero, and the step divides by that zero.
+        # Wide, the share is answered.
+        step = float(param.grad.to(tensorplay.float32)[0, 0].cpu())
+        share = (1.0 - 0.999) * step * step
+        smallest_half = float(np.nextafter(np.float16(0.0), np.float16(1.0)))
+        self.assertLess(share, smallest_half,
+                        "the share this test measures is not a case")
+        answers = state["exp_avg_sq"].cpu().numpy()
+        np.testing.assert_allclose(
+            answers, np.full((3, 5), share), rtol=1.0e-3, atol=1.0e-12,
+            err_msg="the second average answered the wrong share")
+
+        moved = param.detach().to(tensorplay.float32).cpu().numpy()
+        self.assertTrue(np.isfinite(moved).all(), "a half parameter went non-finite")
+        self.assertGreater(float(np.max(np.abs(moved))), 0.0,
+                           "a half parameter never moved")
+
+    def test_a_narrow_model_trains_on_the_device(self):
+        from tensorplay.nn import CrossEntropyLoss, Linear
+        from tensorplay.optim import AdamW
+
+        tensorplay.manual_seed(3)
+        model = Linear(24, 16).to(tensorplay.float16).to("vulkan")
+        opt = AdamW(model.parameters(), lr=3.0e-3)
+        crit = CrossEntropyLoss()
+        codes = tensorplay.tensor(
+            np.random.default_rng(7).integers(0, 16, size=(64,)).astype(
+                np.int64), device="vulkan")
+        host = np.random.default_rng(11).standard_normal(
+            (64, 24)).astype(np.float32)
+        feed = tensorplay.tensor(host, device="vulkan").to(
+            tensorplay.float16).detach().requires_grad_(False)
+
+        losses = []
+        for _ in range(12):
+            opt.zero_grad()
+            loss = crit(model(feed), codes)
+            losses.append(float(loss))
+            loss.backward()
+            opt.step()
+
+        self.assertTrue(all(np.isfinite(v) for v in losses),
+                        f"losses left the finite range: {losses}")
+        self.assertLess(losses[-1], losses[0],
+                        f"loss did not fall: first {losses[0]}, last {losses[-1]}")
+        for name, p in model.named_parameters():
+            plane = p.detach().to(tensorplay.float32).cpu().numpy()
+            self.assertTrue(np.isfinite(plane).all(),
+                            f"{name} left the finite range")
+
+    def test_the_host_walk_keeps_the_narrow_averages(self):
+        from tensorplay.optim import AdamW
+
+        for narrow in (tensorplay.float16, tensorplay.bfloat16):
+            param = tensorplay.nn.Parameter(
+                tensorplay.zeros((3, 5), dtype=narrow))
+            param.grad = tensorplay.full((3, 5), 4.0e-3, dtype=narrow)
+            opt = AdamW([param], lr=3.0e-4)
+            opt.step()
+            state = opt.state[param]
+            self.assertEqual(state["exp_avg"].dtype, narrow,
+                             f"a host {narrow} parameter widened its averages")
+            self.assertEqual(state["exp_avg_sq"].dtype, narrow,
+                             f"a host {narrow} parameter widened its averages")
+
+
 if __name__ == "__main__":
     unittest.main()
