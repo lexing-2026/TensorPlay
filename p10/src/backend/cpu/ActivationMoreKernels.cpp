@@ -87,20 +87,40 @@ void softmax_backward_data_loop(const scalar_t* grad, const scalar_t* out,
             const scalar_t* ocol = out + base;
             scalar_t* rcol = grad_in + base;
             if constexpr (LogMode) {
-                scalar_t sum = scalar_t(0);
-                for (int64_t k = 0; k < dim_size; ++k) sum += gcol[k * inner];
-                for (int64_t k = 0; k < dim_size; ++k) {
-                    rcol[k * inner] =
-                        gcol[k * inner] - std::exp(ocol[k * inner]) * sum;
+                // The sum runs over four accumulators: one chain of additions
+                // would keep the walk from folding several elements at once.
+                scalar_t s0 = scalar_t(0), s1 = scalar_t(0);
+                scalar_t s2 = scalar_t(0), s3 = scalar_t(0);
+                int64_t k = 0;
+                for (; k + 3 < dim_size; k += 4) {
+                    s0 += gcol[(k + 0) * inner];
+                    s1 += gcol[(k + 1) * inner];
+                    s2 += gcol[(k + 2) * inner];
+                    s3 += gcol[(k + 3) * inner];
+                }
+                scalar_t sum = (s0 + s1) + (s2 + s3);
+                for (; k < dim_size; ++k) sum += gcol[k * inner];
+                for (int64_t j = 0; j < dim_size; ++j) {
+                    rcol[j * inner] =
+                        gcol[j * inner] - std::exp(ocol[j * inner]) * sum;
                 }
             } else {
-                scalar_t sum = scalar_t(0);
-                for (int64_t k = 0; k < dim_size; ++k) {
+                scalar_t s0 = scalar_t(0), s1 = scalar_t(0);
+                scalar_t s2 = scalar_t(0), s3 = scalar_t(0);
+                int64_t k = 0;
+                for (; k + 3 < dim_size; k += 4) {
+                    s0 += gcol[(k + 0) * inner] * ocol[(k + 0) * inner];
+                    s1 += gcol[(k + 1) * inner] * ocol[(k + 1) * inner];
+                    s2 += gcol[(k + 2) * inner] * ocol[(k + 2) * inner];
+                    s3 += gcol[(k + 3) * inner] * ocol[(k + 3) * inner];
+                }
+                scalar_t sum = (s0 + s1) + (s2 + s3);
+                for (; k < dim_size; ++k) {
                     sum += gcol[k * inner] * ocol[k * inner];
                 }
-                for (int64_t k = 0; k < dim_size; ++k) {
-                    rcol[k * inner] =
-                        ocol[k * inner] * (gcol[k * inner] - sum);
+                for (int64_t j = 0; j < dim_size; ++j) {
+                    rcol[j * inner] =
+                        ocol[j * inner] * (gcol[j * inner] - sum);
                 }
             }
         }
