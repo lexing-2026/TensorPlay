@@ -12224,5 +12224,160 @@ class TestVulkanWideTotals(unittest.TestCase):
             held.prod()
 
 
+class TestVulkanRangeOfAPayload(unittest.TestCase):
+    # The range a payload covers is the first thing a quantization observer asks
+    # of a weight plane before it names a scale, and a calibration step that
+    # cannot answer it on the device carries the whole plane back to the host.
+    # Both ends answer in the width the payload is carried in, so the fold covers
+    # the same element types and both storages the single extrema walk.
+
+    SHAPES = ((2, 3), (4, 5, 6), (2, 3, 4, 5), (700,), (100003,))
+    WIDTHS = (
+        (tensorplay.float32, np.float32),
+        (tensorplay.float16, np.float16),
+        (tensorplay.int32, np.int32),
+        (tensorplay.int64, np.int64),
+    )
+
+    @staticmethod
+    def _plane(shape, order, np_dtype):
+        rng = np.random.default_rng(order)
+        if np_dtype is np.float32:
+            return (rng.standard_normal(shape) * 7).astype(np.float32)
+        if np_dtype is np.float16:
+            return (rng.standard_normal(shape) * 4).astype(np.float16)
+        if np_dtype is np.int32:
+            return rng.integers(-(2 ** 30), 2 ** 30, shape).astype(np.int32)
+        return rng.integers(-(2 ** 62), 2 ** 62, shape).astype(np.int64)
+
+    def _checked(self, host, call, label):
+        import tensorplay.functional as F
+        want = call(tensorplay.tensor(host))
+        got = call(tensorplay.tensor(host).to("vulkan"))
+        for name, a, b in (("low", got[0], want[0]), ("high", got[1], want[1])):
+            self.assertEqual(
+                a.dtype, b.dtype, f"{label}: the {name} end changed its width")
+            self.assertTrue(
+                a.device.is_vulkan(), f"{label}: the {name} end left the device")
+            np.testing.assert_array_equal(
+                np.asarray(a.cpu()), np.asarray(b.cpu()),
+                err_msg=f"{label}: the {name} end")
+
+    def test_a_whole_payload_answers_both_ends_of_its_range(self):
+        import tensorplay.functional as F
+        for order, shape in enumerate(self.SHAPES):
+            for w, (dtype, np_dtype) in enumerate(self.WIDTHS):
+                host = self._plane(shape, 300 + order * 5 + w, np_dtype)
+                self._checked(
+                    host, lambda t: F.aminmax(t),
+                    f"a range over a whole {str(dtype).split('.')[-1]} {shape}")
+                # The method form and the function form answer the same pair.
+                self._checked(
+                    host, lambda t: t.aminmax(),
+                    f"a range asked of the payload itself {shape}")
+
+    def test_one_axis_answers_both_ends_of_the_range_it_covers(self):
+        for shape in ((4, 5, 6), (2, 3, 4, 5)):
+            host = self._plane(shape, 11, np.float32)
+            for axis in range(len(shape)):
+                for kept in (False, True):
+                    self._checked(
+                        host,
+                        lambda t, axis=axis, kept=kept: t.aminmax(
+                            axis, keepdim=kept),
+                        f"the range of axis {axis} of {shape}, keepdim={kept}")
+
+    def test_the_two_ends_keep_the_shape_the_fold_names(self):
+        host = self._plane((3, 4, 5), 12, np.float32)
+        device = tensorplay.tensor(host).to("vulkan")
+        low, high = device.aminmax(1)
+        self.assertEqual(tuple(low.shape), (3, 5))
+        self.assertEqual(tuple(high.shape), (3, 5))
+        low, high = device.aminmax(1, keepdim=True)
+        self.assertEqual(tuple(low.shape), (3, 1, 5))
+        self.assertEqual(tuple(high.shape), (3, 1, 5))
+
+    def test_a_list_of_axes_answers_the_range_they_cover_together(self):
+        import tensorplay.functional as F
+        host = self._plane((2, 3, 4, 5), 13, np.int32)
+        for axes in ([0, 3], [0, 1], [1, 2, 3]):
+            for kept in (False, True):
+                self._checked(
+                    host,
+                    lambda t, axes=axes, kept=kept: F.aminmax(
+                        t, axes, keepdim=kept),
+                    f"the range over axes {axes}, keepdim={kept}")
+
+    def test_a_negative_axis_names_the_same_range(self):
+        host = self._plane((3, 5, 7), 14, np.float16)
+        for axis in (-1, -2, -3):
+            self._checked(
+                host, lambda t, axis=axis: t.aminmax(axis),
+                f"the range of axis {axis}")
+
+    def test_a_range_agrees_with_the_two_folds_asked_apart(self):
+        # The pair is the two extrema of the payload, so a fold that answered a
+        # different shape or a different lane would show up here.
+        for order, shape in enumerate(self.SHAPES):
+            for dtype, np_dtype in self.WIDTHS:
+                host = self._plane(shape, 400 + order, np_dtype)
+                device = tensorplay.tensor(host, dtype=dtype).to("vulkan")
+                low, high = device.aminmax()
+                np.testing.assert_array_equal(
+                    np.asarray(low.cpu()), np.asarray(device.min().cpu()),
+                    err_msg=f"a range whose low end differs from amin {shape}")
+                np.testing.assert_array_equal(
+                    np.asarray(high.cpu()), np.asarray(device.max().cpu()),
+                    err_msg=f"a range whose high end differs from amax {shape}")
+
+    def test_the_range_of_a_long_row_is_read_from_linear_storage(self):
+        import tensorplay.functional as F
+        # A row past the image axis limit lives in words, and a calibration step
+        # over it must not ask the host for the payload.
+        for width in (100000, 100001, 100003):
+            host = self._plane((2, width), width, np.float32)
+            self._checked(
+                host, lambda t: t.aminmax(1), f"a range over {width} lanes")
+            self._checked(
+                host, lambda t: F.aminmax(t), f"a whole range over {width}")
+
+    def test_the_range_of_a_plane_read_out_as_a_step_reaches_its_own_ends(self):
+        # The point of asking for both ends in one call: an observer turns the
+        # range into a step and measures every lane from the bottom of it.
+        host = self._plane((3, 400), 21, np.float32)
+        device = tensorplay.tensor(host).to("vulkan")
+        low, high = device.aminmax()
+        scaled = (device - low) / ((high - low) / 255.0)
+        self.assertEqual(float(scaled.min().cpu().numpy()), 0.0,
+                         "the bottom of a plane is not the step's zero")
+        np.testing.assert_allclose(
+            float(scaled.max().cpu().numpy()), 255.0, rtol=1e-6,
+            err_msg="a range whose top lane is not 255 steps above its bottom")
+
+    def test_a_lone_lane_answers_itself_at_both_ends(self):
+        for dtype, np_dtype in self.WIDTHS:
+            value = -(2 ** 62) if np_dtype is np.int64 else -7
+            host = np.array([[value]], dtype=np_dtype)
+            low, high = tensorplay.tensor(
+                host, dtype=dtype).to("vulkan").aminmax()
+            self.assertEqual(tuple(low.shape), (), "a lone lane kept a plane")
+            np.testing.assert_array_equal(
+                np.asarray(low.cpu()), np.asarray(high.cpu()),
+                err_msg="a lone lane split into two ends")
+            np.testing.assert_array_equal(
+                np.asarray(low.cpu()), np.asarray(value, np_dtype),
+                err_msg="a lone lane moved")
+
+    def test_a_range_with_no_lane_or_no_number_refuses_by_name(self):
+        with self.assertRaisesRegex(
+                RuntimeError, "do not support empty tensors"):
+            tensorplay.tensor(np.zeros((0, 4), np.float32)).to("vulkan").aminmax()
+        # A plane of pure truth has no fold that orders its lanes, so the range
+        # names the widths it does cover rather than answering zero and one.
+        with self.assertRaisesRegex(
+                RuntimeError, "extrema support Float32, Float16"):
+            tensorplay.tensor(np.array([True, False])).to("vulkan").aminmax()
+
+
 if __name__ == "__main__":
     unittest.main()
