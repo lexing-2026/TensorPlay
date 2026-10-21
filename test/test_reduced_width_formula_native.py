@@ -6,25 +6,17 @@ the reduced width.  Every step of the formula therefore rounds at the
 reduced width, and the answer of one step is the one the next step reads.
 
 The hardware crossing between the two widths and the software crossing
-answer the same, step for step: the scaled product is narrowed before it is
-applied, the quotient is narrowed before it is added, and the interpolation
-is computed in single precision and narrowed once.  This states the formulas
-that way and compares them, element for element, with what the walks
-answer.
+answer the same, step for step.  The formula is carried through single
+precision and narrowed once at the end, which is what both backends answer
+and what the reference runtime answers as well.
 
-The two backends round in different places, and have done so before the
-hardware crossing arrived.  The CPU walk narrows after each step of the
-scaled product and of the quotient, while the other backend carries the
-whole formula through single precision and narrows once at the end.  The
-answers are therefore one unit in the last place apart where the narrowing
-falls; the CPU answer is stated exactly and the other one within the bound
-the reduced width carries.
+This states the formulas that way and compares them, element for element,
+with what the walks answer.
 
-The pairwise maps are stated differently as well: they answer in single
-precision and narrow once, and the answer is computed by the vector math
-rather than by the library, so the two may sit one unit in the last place
-apart after the narrowing.  They are compared within the bound the reduced
-width carries.
+The pairwise maps are stated the same way, but the answer is computed by
+the vector math rather than by the library, so the two may sit one unit in
+the last place apart after the narrowing.  They are compared within the
+bound the reduced width carries.
 """
 import numpy as np
 import pytest
@@ -43,6 +35,17 @@ def read_bits(t):
     return np.array(t.tolist(), dtype=np.float16).view(np.uint16)
 
 
+def to_bf16(values):
+    """The values as the other reduced width holds them.
+
+    The layout is the upper half of the single-precision pattern, rounded
+    to nearest with ties to even.
+    """
+    bits = np.array(values, dtype=np.float32).view(np.uint32)
+    rounded = (bits + np.uint32(0x7FFF) + ((bits >> np.uint32(16)) & np.uint32(1)))
+    return (rounded >> np.uint32(16)).astype(np.uint16)
+
+
 def to_values(t):
     """The elements as numbers."""
     return np.array(t.tolist(), dtype=np.float32)
@@ -57,21 +60,17 @@ def operands():
     return self_np, first_np, second_np, weight_np
 
 
-def scaled_product(self_np, first_np, second_np, alpha, narrowed_each_step):
-    """self + alpha * t1 * t2, stated at the reduced width."""
-    if narrowed_each_step:
-        return (self_np + (alpha * first_np * second_np)).astype(np.float16)
+def scaled_product(self_np, first_np, second_np, alpha):
+    """self + alpha * t1 * t2, carried through single precision."""
     return (self_np.astype(np.float32) +
             (alpha.astype(np.float32) * first_np.astype(np.float32) *
              second_np.astype(np.float32))).astype(np.float16)
 
 
-def quotient(self_np, first_np, second_np, alpha, narrowed_each_step):
-    """self + alpha * t1 / t2, stated at the reduced width."""
+def quotient(self_np, first_np, second_np, alpha):
+    """self + alpha * t1 / t2, carried through single precision."""
     divisor = np.where(second_np == np.float16(0), np.float16(1),
                        second_np).astype(np.float16)
-    if narrowed_each_step:
-        return (self_np + (alpha * first_np / divisor)).astype(np.float16)
     return (self_np.astype(np.float32) +
             (alpha.astype(np.float32) * first_np.astype(np.float32) /
              divisor.astype(np.float32))).astype(np.float16)
@@ -87,14 +86,8 @@ def test_the_scaled_product_rounds_at_the_reduced_width(device):
                      tp.from_numpy(second_np).to(device),
                      value=0.75)
 
-    if device == "cpu":
-        want = scaled_product(self_np, first_np, second_np, alpha, True)
-        assert np.array_equal(read_bits(got), want.view(np.uint16))
-    else:
-        want = scaled_product(self_np, first_np, second_np, alpha, False)
-        assert np.allclose(to_values(got),
-                           np.array(want, dtype=np.float32),
-                           rtol=BOUND, atol=BOUND, equal_nan=True)
+    want = scaled_product(self_np, first_np, second_np, alpha)
+    assert np.array_equal(read_bits(got), want.view(np.uint16))
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -107,14 +100,8 @@ def test_the_quotient_rounds_at_the_reduced_width(device):
                      tp.from_numpy(second_np).to(device),
                      value=0.75)
 
-    if device == "cpu":
-        want = quotient(self_np, first_np, second_np, alpha, True)
-        assert np.array_equal(read_bits(got), want.view(np.uint16))
-    else:
-        want = quotient(self_np, first_np, second_np, alpha, False)
-        assert np.allclose(to_values(got),
-                           np.array(want, dtype=np.float32),
-                           rtol=BOUND, atol=BOUND, equal_nan=True)
+    want = quotient(self_np, first_np, second_np, alpha)
+    assert np.array_equal(read_bits(got), want.view(np.uint16))
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -137,6 +124,44 @@ def test_the_interpolation_is_computed_in_single_precision(device):
                   tp.from_numpy(weight_np).to(device))
 
     assert np.array_equal(read_bits(got), want.view(np.uint16))
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("name", ["addcmul", "addcdiv"])
+def test_the_other_reduced_width_carries_the_formula_through(device, name):
+    # The other reduced width carries the formula through single precision
+    # and narrows once, the same way the half layout does.
+    rng = np.random.default_rng(3)
+    count = 4096
+    self_np = rng.standard_normal(count).astype(np.float32)
+    first_np = rng.standard_normal(count).astype(np.float32)
+    second_np = rng.standard_normal(count).astype(np.float32)
+    alpha = np.float32(0.75)
+
+    if name == "addcmul":
+        want = to_bf16(self_np + alpha * first_np * second_np)
+        got = getattr(tp, name)(tp.from_numpy(self_np).to(tp.bfloat16).to(device),
+                                tp.from_numpy(first_np).to(tp.bfloat16).to(device),
+                                tp.from_numpy(second_np).to(tp.bfloat16).to(device),
+                                value=0.75)
+    else:
+        divisor = np.where(second_np == np.float32(0), np.float32(1), second_np)
+        want = to_bf16(self_np + alpha * first_np / divisor)
+        got = getattr(tp, name)(tp.from_numpy(self_np).to(tp.bfloat16).to(device),
+                                tp.from_numpy(first_np).to(tp.bfloat16).to(device),
+                                tp.from_numpy(second_np).to(tp.bfloat16).to(device),
+                                value=0.75)
+
+    got_values = np.array(got.tolist(), dtype=np.float32)
+    want_values = np.array(want.astype(np.uint32) << np.uint32(16),
+                           dtype=np.uint32).view(np.float32)
+    # The two backends answer the same; the formula stated in single
+    # precision may sit one unit in the last place of the reduced width
+    # away from it, where the rounding of the two widths differs.
+    # The bound is the one the reduced width carries: a unit in its last
+    # place is a larger share of a number than it is of a wider one.
+    assert np.allclose(got_values, want_values, rtol=2e-2, atol=2e-2,
+                       equal_nan=True)
 
 
 @pytest.mark.parametrize("device", DEVICES)

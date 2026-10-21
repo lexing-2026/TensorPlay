@@ -30,7 +30,7 @@
 //   when it is minus infinity.
 
 #include "cpu/vec/intrinsics.h"
-#include "cpu/VecHalfMath.h"
+#include "cpu/VecReducedMath.h"
 #include <cstdint>
 #include <cmath>
 #include <limits>
@@ -52,6 +52,29 @@ namespace vecbinary {
 
 // Which pairwise map the chunk answers.
 enum class BOp : int { Hypot, Atan2, LogAddExp };
+
+// The answer of the map at the width of the operands, one element at a
+// time.  It stands in for the tail of a chunk.
+template <BOp op>
+inline float scalar_f32_of(float x, float y);
+
+template <>
+inline float scalar_f32_of<BOp::Hypot>(float x, float y) {
+    return std::hypot(x, y);
+}
+
+template <>
+inline float scalar_f32_of<BOp::Atan2>(float x, float y) {
+    return std::atan2(x, y);
+}
+
+template <>
+inline float scalar_f32_of<BOp::LogAddExp>(float x, float y) {
+    const float m = std::max(x, y);
+    if (m == -std::numeric_limits<float>::infinity()) return m;
+    if (m != m) return m;  // NaN propagates
+    return m + std::log1p(std::exp(-std::fabs(x - y)));
+}
 
 inline bool avx2_available() {
 #if defined(TP_VECBINARY_X86)
@@ -103,22 +126,22 @@ inline double scalar_f64(BOp op, double x, double y) {
 // what the flat loop answers for a reduced-width pair, which evaluates in
 // single precision and narrows once at the end.
 inline uint16_t scalar_f16(BOp op, uint16_t a, uint16_t b) {
-    const float x = tensorplay::cpu::vechalf::widen_one(a);
-    const float y = tensorplay::cpu::vechalf::widen_one(b);
+    const float x = tensorplay::cpu::vecreduced::widen_one(a);
+    const float y = tensorplay::cpu::vecreduced::widen_one(b);
     switch (op) {
         case BOp::Hypot:
-            return tensorplay::cpu::vechalf::narrow_one(std::hypot(x, y));
+            return tensorplay::cpu::vecreduced::narrow_one(std::hypot(x, y));
         case BOp::Atan2:
-            return tensorplay::cpu::vechalf::narrow_one(std::atan2(x, y));
+            return tensorplay::cpu::vecreduced::narrow_one(std::atan2(x, y));
         case BOp::LogAddExp: {
             const float m = std::max(x, y);
             if (m == -std::numeric_limits<float>::infinity()) {
-                return tensorplay::cpu::vechalf::narrow_one(m);
+                return tensorplay::cpu::vecreduced::narrow_one(m);
             }
             if (m != m) {
-                return tensorplay::cpu::vechalf::narrow_one(m);
+                return tensorplay::cpu::vecreduced::narrow_one(m);
             }
-            return tensorplay::cpu::vechalf::narrow_one(
+            return tensorplay::cpu::vecreduced::narrow_one(
                 m + std::log1p(std::exp(-std::fabs(x - y))));
         }
     }
@@ -152,32 +175,50 @@ inline __m256d log_add_exp_f64(__m256d x, __m256d y) {
     return _mm256_blendv_pd(sum, m, _mm256_cmp_pd(m, neg_inf, _CMP_EQ_OQ));
 }
 
+// The chunk answers one map, so the map is named once rather than chosen
+// at every step.
+template <BOp op>
 __attribute__((target("avx2,fma"), noinline))
-static void f32_chunk_avx2(BOp op, const float* a, const float* b, float* d,
+static void f32_chunk_avx2(const float* a, const float* b, float* d,
                            int64_t begin, int64_t end) {
+    // Two vectors are answered per step: the two answers do not depend on
+    // each other, so the machine overlaps them instead of waiting for one
+    // to finish before it starts the next.
     int64_t i = begin;
+    for (; i + 16 <= end; i += 16) {
+        const __m256 x0 = _mm256_loadu_ps(a + i);
+        const __m256 y0 = _mm256_loadu_ps(b + i);
+        const __m256 x1 = _mm256_loadu_ps(a + i + 8);
+        const __m256 y1 = _mm256_loadu_ps(b + i + 8);
+        __m256 r0, r1;
+        if constexpr (op == BOp::Hypot) {
+            r0 = tensorplay::tpsleef::hypot(x0, y0);
+            r1 = tensorplay::tpsleef::hypot(x1, y1);
+        } else if constexpr (op == BOp::Atan2) {
+            r0 = tensorplay::tpsleef::atan2(x0, y0);
+            r1 = tensorplay::tpsleef::atan2(x1, y1);
+        } else {
+            r0 = log_add_exp_f32(x0, y0);
+            r1 = log_add_exp_f32(x1, y1);
+        }
+        _mm256_storeu_ps(d + i, r0);
+        _mm256_storeu_ps(d + i + 8, r1);
+    }
     for (; i + 8 <= end; i += 8) {
         const __m256 x = _mm256_loadu_ps(a + i);
         const __m256 y = _mm256_loadu_ps(b + i);
         __m256 r;
-        switch (op) {
-            case BOp::Hypot:
-                r = tensorplay::tpsleef::hypot(x, y);
-                break;
-            case BOp::Atan2:
-                r = tensorplay::tpsleef::atan2(x, y);
-                break;
-            case BOp::LogAddExp:
-                r = log_add_exp_f32(x, y);
-                break;
-            default:
-                r = _mm256_setzero_ps();
-                break;
+        if constexpr (op == BOp::Hypot) {
+            r = tensorplay::tpsleef::hypot(x, y);
+        } else if constexpr (op == BOp::Atan2) {
+            r = tensorplay::tpsleef::atan2(x, y);
+        } else {
+            r = log_add_exp_f32(x, y);
         }
         _mm256_storeu_ps(d + i, r);
     }
     for (; i < end; ++i) {
-        d[i] = scalar_f32(op, a[i], b[i]);
+        d[i] = scalar_f32_of<op>(a[i], b[i]);
     }
 }
 
@@ -186,58 +227,86 @@ static void f32_chunk_avx2(BOp op, const float* a, const float* b, float* d,
 // widening and the narrowing are the hardware crossing, so a reduced-width
 // pair no longer pays for a pass that converts the operands before the map
 // is answered.
+template <BOp op>
 __attribute__((target("avx2,fma,f16c"), noinline))
-static void f16_chunk_avx2(BOp op, const uint16_t* a, const uint16_t* b,
+static void f16_chunk_avx2(const uint16_t* a, const uint16_t* b,
                            uint16_t* d, int64_t begin, int64_t end) {
     int64_t i = begin;
+    for (; i + 16 <= end; i += 16) {
+        const __m256 x0 = tensorplay::cpu::vecreduced::widen8(a + i);
+        const __m256 y0 = tensorplay::cpu::vecreduced::widen8(b + i);
+        const __m256 x1 = tensorplay::cpu::vecreduced::widen8(a + i + 8);
+        const __m256 y1 = tensorplay::cpu::vecreduced::widen8(b + i + 8);
+        __m256 r0, r1;
+        if constexpr (op == BOp::Hypot) {
+            r0 = tensorplay::tpsleef::hypot(x0, y0);
+            r1 = tensorplay::tpsleef::hypot(x1, y1);
+        } else if constexpr (op == BOp::Atan2) {
+            r0 = tensorplay::tpsleef::atan2(x0, y0);
+            r1 = tensorplay::tpsleef::atan2(x1, y1);
+        } else {
+            r0 = log_add_exp_f32(x0, y0);
+            r1 = log_add_exp_f32(x1, y1);
+        }
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(d + i),
+                         tensorplay::cpu::vecreduced::narrow8(r0));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(d + i + 8),
+                         tensorplay::cpu::vecreduced::narrow8(r1));
+    }
     for (; i + 8 <= end; i += 8) {
-        const __m256 x = tensorplay::cpu::vechalf::widen8(a + i);
-        const __m256 y = tensorplay::cpu::vechalf::widen8(b + i);
+        const __m256 x = tensorplay::cpu::vecreduced::widen8(a + i);
+        const __m256 y = tensorplay::cpu::vecreduced::widen8(b + i);
         __m256 r;
-        switch (op) {
-            case BOp::Hypot:
-                r = tensorplay::tpsleef::hypot(x, y);
-                break;
-            case BOp::Atan2:
-                r = tensorplay::tpsleef::atan2(x, y);
-                break;
-            case BOp::LogAddExp:
-                r = log_add_exp_f32(x, y);
-                break;
-            default:
-                r = _mm256_setzero_ps();
-                break;
+        if constexpr (op == BOp::Hypot) {
+            r = tensorplay::tpsleef::hypot(x, y);
+        } else if constexpr (op == BOp::Atan2) {
+            r = tensorplay::tpsleef::atan2(x, y);
+        } else {
+            r = log_add_exp_f32(x, y);
         }
         _mm_storeu_si128(
             reinterpret_cast<__m128i*>(d + i),
-            tensorplay::cpu::vechalf::narrow8(r));
+            tensorplay::cpu::vecreduced::narrow8(r));
     }
     for (; i < end; ++i) {
         d[i] = scalar_f16(op, a[i], b[i]);
     }
 }
 
+template <BOp op>
 __attribute__((target("avx2,fma"), noinline))
-static void f64_chunk_avx2(BOp op, const double* a, const double* b, double* d,
+static void f64_chunk_avx2(const double* a, const double* b, double* d,
                            int64_t begin, int64_t end) {
     int64_t i = begin;
+    for (; i + 8 <= end; i += 8) {
+        const __m256d x0 = _mm256_loadu_pd(a + i);
+        const __m256d y0 = _mm256_loadu_pd(b + i);
+        const __m256d x1 = _mm256_loadu_pd(a + i + 4);
+        const __m256d y1 = _mm256_loadu_pd(b + i + 4);
+        __m256d r0, r1;
+        if constexpr (op == BOp::Hypot) {
+            r0 = tensorplay::tpsleef::hypot(x0, y0);
+            r1 = tensorplay::tpsleef::hypot(x1, y1);
+        } else if constexpr (op == BOp::Atan2) {
+            r0 = tensorplay::tpsleef::atan2(x0, y0);
+            r1 = tensorplay::tpsleef::atan2(x1, y1);
+        } else {
+            r0 = log_add_exp_f64(x0, y0);
+            r1 = log_add_exp_f64(x1, y1);
+        }
+        _mm256_storeu_pd(d + i, r0);
+        _mm256_storeu_pd(d + i + 4, r1);
+    }
     for (; i + 4 <= end; i += 4) {
         const __m256d x = _mm256_loadu_pd(a + i);
         const __m256d y = _mm256_loadu_pd(b + i);
         __m256d r;
-        switch (op) {
-            case BOp::Hypot:
-                r = tensorplay::tpsleef::hypot(x, y);
-                break;
-            case BOp::Atan2:
-                r = tensorplay::tpsleef::atan2(x, y);
-                break;
-            case BOp::LogAddExp:
-                r = log_add_exp_f64(x, y);
-                break;
-            default:
-                r = _mm256_setzero_pd();
-                break;
+        if constexpr (op == BOp::Hypot) {
+            r = tensorplay::tpsleef::hypot(x, y);
+        } else if constexpr (op == BOp::Atan2) {
+            r = tensorplay::tpsleef::atan2(x, y);
+        } else {
+            r = log_add_exp_f64(x, y);
         }
         _mm256_storeu_pd(d + i, r);
     }

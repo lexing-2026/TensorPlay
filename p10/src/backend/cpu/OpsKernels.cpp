@@ -993,9 +993,29 @@ static bool pair_math_takes(const Tensor& a, const Tensor& b, const Tensor& out)
         out, out.device(), dt, static_cast<std::vector<int64_t>>(a.shape()), a, b);
 }
 
-template <typename F>
+// The walk is spread over the pool: a chunk of the answer is handed to a
+// thread, and the thread answers the elements of that chunk.
+template <vecbinary::BOp op, typename T>
+static void pair_math_walk(const T* a, const T* b, T* d, int64_t n) {
+    parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        if constexpr (std::is_same_v<T, float>) {
+            vecbinary::f32_chunk_avx2<op>(a + begin, b + begin, d + begin, 0,
+                                           end - begin);
+        } else if constexpr (std::is_same_v<T, double>) {
+            vecbinary::f64_chunk_avx2<op>(a + begin, b + begin, d + begin, 0,
+                                           end - begin);
+        } else {
+            vecbinary::f16_chunk_avx2<op>(
+                reinterpret_cast<const uint16_t*>(a + begin),
+                reinterpret_cast<const uint16_t*>(b + begin),
+                reinterpret_cast<uint16_t*>(d + begin), 0, end - begin);
+        }
+    });
+}
+
+template <vecbinary::BOp op, typename F>
 static Tensor pair_math_kernel(const Tensor& a, const Tensor& b, F f,
-                               const char* name, vecbinary::BOp op) {
+                               const char* name) {
     if (vecbinary::avx2_available() && a.dtype() == b.dtype() &&
         (a.dtype() == DType::Float32 || a.dtype() == DType::Float64 ||
          a.dtype() == DType::Float16) &&
@@ -1006,22 +1026,15 @@ static Tensor pair_math_kernel(const Tensor& a, const Tensor& b, F f,
         const int64_t n = result.numel();
         if (n > 0) {
             if (a.dtype() == DType::Float32) {
-                vecbinary::f32_chunk_avx2(op, a.data_ptr<float>(),
-                                          b.data_ptr<float>(),
-                                          result.data_ptr<float>(), 0, n);
+                pair_math_walk<op>(a.data_ptr<float>(), b.data_ptr<float>(),
+                                   result.data_ptr<float>(), n);
             } else if (a.dtype() == DType::Float64) {
-                vecbinary::f64_chunk_avx2(op, a.data_ptr<double>(),
-                                          b.data_ptr<double>(),
-                                          result.data_ptr<double>(), 0, n);
+                pair_math_walk<op>(a.data_ptr<double>(), b.data_ptr<double>(),
+                                   result.data_ptr<double>(), n);
             } else {
-                vecbinary::f16_chunk_avx2(
-                    op,
-                    reinterpret_cast<const uint16_t*>(
-                        a.data_ptr<tensorplay::Half>()),
-                    reinterpret_cast<const uint16_t*>(
-                        b.data_ptr<tensorplay::Half>()),
-                    reinterpret_cast<uint16_t*>(
-                        result.data_ptr<tensorplay::Half>()), 0, n);
+                pair_math_walk<op>(
+                    a.data_ptr<tensorplay::Half>(), b.data_ptr<tensorplay::Half>(),
+                    result.data_ptr<tensorplay::Half>(), n);
             }
         }
         return result;
@@ -1031,47 +1044,41 @@ static Tensor pair_math_kernel(const Tensor& a, const Tensor& b, F f,
 
 // The same map with the destination the caller holds: the answer is laid on
 // it directly when it is packed and holds the width the map answers in.
-template <typename F>
+template <vecbinary::BOp op, typename F>
 static Tensor& pair_math_out_kernel(const Tensor& a, const Tensor& b,
-                                    Tensor& out, F f, const char* name,
-                                    vecbinary::BOp op) {
+                                    Tensor& out, F f, const char* name) {
     if (pair_math_takes(a, b, out)) {
         const int64_t n = out.numel();
         if (n > 0) {
             if (out.dtype() == DType::Float32) {
-                vecbinary::f32_chunk_avx2(op, a.data_ptr<float>(),
-                                          b.data_ptr<float>(),
-                                          out.data_ptr<float>(), 0, n);
+                pair_math_walk<op>(a.data_ptr<float>(), b.data_ptr<float>(),
+                                   out.data_ptr<float>(), n);
             } else if (out.dtype() == DType::Float64) {
-                vecbinary::f64_chunk_avx2(op, a.data_ptr<double>(),
-                                          b.data_ptr<double>(),
-                                          out.data_ptr<double>(), 0, n);
+                pair_math_walk<op>(a.data_ptr<double>(), b.data_ptr<double>(),
+                                   out.data_ptr<double>(), n);
             } else {
-                vecbinary::f16_chunk_avx2(
-                    op,
-                    reinterpret_cast<const uint16_t*>(
-                        a.data_ptr<tensorplay::Half>()),
-                    reinterpret_cast<const uint16_t*>(
-                        b.data_ptr<tensorplay::Half>()),
-                    reinterpret_cast<uint16_t*>(
-                        out.data_ptr<tensorplay::Half>()), 0, n);
+                pair_math_walk<op>(
+                    a.data_ptr<tensorplay::Half>(), b.data_ptr<tensorplay::Half>(),
+                    out.data_ptr<tensorplay::Half>(), n);
             }
         }
         return out;
     }
     return binary_float_out_kernel(
         a, b, out,
-        [=](const Tensor&, const Tensor&) { return pair_math_kernel(a, b, f, name, op); },
+        [=](const Tensor&, const Tensor&) {
+            return pair_math_kernel<op>(a, b, f, name);
+        },
         f, name);
 }
 
 Tensor logaddexp_cpu(const Tensor& a, const Tensor& b) {
-    return pair_math_kernel(a, b, LogAddExpPair{}, "logaddexp",
-                             vecbinary::BOp::LogAddExp);
+    return pair_math_kernel<vecbinary::BOp::LogAddExp>(
+        a, b, LogAddExpPair{}, "logaddexp");
 }
 Tensor& logaddexp_out_cpu(const Tensor& a, const Tensor& b, Tensor& out) {
-    return pair_math_out_kernel(a, b, out, LogAddExpPair{}, "logaddexp",
-                                 vecbinary::BOp::LogAddExp);
+    return pair_math_out_kernel<vecbinary::BOp::LogAddExp>(
+        a, b, out, LogAddExpPair{}, "logaddexp");
 }
 Tensor logaddexp2_cpu(const Tensor& a, const Tensor& b) {
     return binary_float_kernel(a, b, LogAddExp2Pair{}, "logaddexp2");
@@ -1091,19 +1098,19 @@ Tensor copysign_scalar_cpu(const Tensor& self, const Scalar& other) {
     return copysign_cpu(self, Tensor::full({}, other, DType::Float32, self.device()));
 }
 Tensor hypot_cpu(const Tensor& a, const Tensor& b) {
-    return pair_math_kernel(a, b, HypotPair{}, "hypot", vecbinary::BOp::Hypot);
+    return pair_math_kernel<vecbinary::BOp::Hypot>(a, b, HypotPair{}, "hypot");
 }
 Tensor& hypot_out_cpu(const Tensor& a, const Tensor& b, Tensor& out) {
-    return pair_math_out_kernel(a, b, out, HypotPair{}, "hypot",
-                                 vecbinary::BOp::Hypot);
+    return pair_math_out_kernel<vecbinary::BOp::Hypot>(a, b, out, HypotPair{},
+                                                        "hypot");
 }
 
 Tensor atan2_cpu(const Tensor& a, const Tensor& b) {
-    return pair_math_kernel(a, b, Atan2Pair{}, "atan2", vecbinary::BOp::Atan2);
+    return pair_math_kernel<vecbinary::BOp::Atan2>(a, b, Atan2Pair{}, "atan2");
 }
 Tensor& atan2_out_cpu(const Tensor& a, const Tensor& b, Tensor& out) {
-    return pair_math_out_kernel(a, b, out, Atan2Pair{}, "atan2",
-                                 vecbinary::BOp::Atan2);
+    return pair_math_out_kernel<vecbinary::BOp::Atan2>(a, b, out, Atan2Pair{},
+                                                        "atan2");
 }
 // One representable step from `from` toward `to`, taken in the 16-bit layout the
 // reduced widths share.  Clearing the sign bit leaves a pattern that grows with

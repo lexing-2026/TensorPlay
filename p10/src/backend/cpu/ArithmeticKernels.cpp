@@ -16,7 +16,8 @@
 #include "GradMode.h"
 #include "OutWrite.h"
 #include "cpu/VecComplex.h"
-#include "cpu/VecHalfMath.h"
+#include "cpu/VecReducedMath.h"
+#include "cpu/VecBinaryMath.h"
 #include <iostream>
 #include <vector>
 #include <cmath>
@@ -4309,7 +4310,7 @@ Tensor& div_scalar_inplace_kernel(Tensor& self, const Scalar& other) {
 // traversal for every broadcasted/promotion path.  The latter is important:
 // composing mul() and add() here would reintroduce the Python/composite
 // implementation that this operator is meant to replace.
-#if defined(TP_VECHALF_X86)
+#if defined(TP_VECREDUCED_X86)
 // The reduced width crosses between the two widths once per step of the
 // formula.  The hardware crossing does that in one instruction, where the
 // software one takes several and stands in the way of the walk vectorizing.
@@ -4332,21 +4333,38 @@ void addcmul_half_walk(const tensorplay::Half* self,
     auto* out_bits = reinterpret_cast<uint16_t*>(result);
     const __m256 scale = _mm256_set1_ps(alpha);
     int64_t i = begin;
-    for (; i + 8 <= end; i += 8) {
-        const __m256 s = tensorplay::cpu::vechalf::widen8(self_bits + i);
-        const __m256 x = tensorplay::cpu::vechalf::widen8(t1_bits + i);
-        const __m256 y = tensorplay::cpu::vechalf::widen8(t2_bits + i);
-        const __m256 product = tensorplay::cpu::vechalf::carried(
-            _mm256_mul_ps(scale, x));
-        const __m256 scaled = tensorplay::cpu::vechalf::carried(
-            _mm256_mul_ps(product, y));
+    for (; i + 16 <= end; i += 16) {
+        const __m256 s0 = tensorplay::cpu::vecreduced::widen8(self_bits + i);
+        const __m256 x0 = tensorplay::cpu::vecreduced::widen8(t1_bits + i);
+        const __m256 y0 = tensorplay::cpu::vecreduced::widen8(t2_bits + i);
+        const __m256 s1 = tensorplay::cpu::vecreduced::widen8(self_bits + i + 8);
+        const __m256 x1 = tensorplay::cpu::vecreduced::widen8(t1_bits + i + 8);
+        const __m256 y1 = tensorplay::cpu::vecreduced::widen8(t2_bits + i + 8);
+        const __m256 p0 = _mm256_mul_ps(scale, x0);
+        const __m256 q0 = _mm256_mul_ps(p0, y0);
+        const __m256 p1 = _mm256_mul_ps(scale, x1);
+        const __m256 q1 = _mm256_mul_ps(p1, y1);
         _mm_storeu_si128(
             reinterpret_cast<__m128i*>(out_bits + i),
-            tensorplay::cpu::vechalf::narrow8(_mm256_add_ps(s, scaled)));
+            tensorplay::cpu::vecreduced::narrow8(_mm256_add_ps(s0, q0)));
+        _mm_storeu_si128(
+            reinterpret_cast<__m128i*>(out_bits + i + 8),
+            tensorplay::cpu::vecreduced::narrow8(_mm256_add_ps(s1, q1)));
+    }
+    for (; i + 8 <= end; i += 8) {
+        const __m256 s = tensorplay::cpu::vecreduced::widen8(self_bits + i);
+        const __m256 x = tensorplay::cpu::vecreduced::widen8(t1_bits + i);
+        const __m256 y = tensorplay::cpu::vecreduced::widen8(t2_bits + i);
+        const __m256 product = _mm256_mul_ps(scale, x);
+        const __m256 scaled = _mm256_mul_ps(product, y);
+        _mm_storeu_si128(
+            reinterpret_cast<__m128i*>(out_bits + i),
+            tensorplay::cpu::vecreduced::narrow8(_mm256_add_ps(s, scaled)));
     }
     for (; i < end; ++i) {
-        const tensorplay::Half product = tensorplay::Half(alpha) * tensor1[i];
-        result[i] = self[i] + product * tensor2[i];
+        const float product = alpha * static_cast<float>(tensor1[i]);
+        result[i] = tensorplay::Half(static_cast<float>(self[i]) +
+                                      product * static_cast<float>(tensor2[i]));
     }
 }
 
@@ -4361,24 +4379,262 @@ void addcdiv_half_walk(const tensorplay::Half* self,
     auto* out_bits = reinterpret_cast<uint16_t*>(result);
     const __m256 scale = _mm256_set1_ps(alpha);
     int64_t i = begin;
-    for (; i + 8 <= end; i += 8) {
-        const __m256 s = tensorplay::cpu::vechalf::widen8(self_bits + i);
-        const __m256 x = tensorplay::cpu::vechalf::widen8(t1_bits + i);
-        const __m256 y = tensorplay::cpu::vechalf::widen8(t2_bits + i);
-        const __m256 product = tensorplay::cpu::vechalf::carried(
-            _mm256_mul_ps(scale, x));
-        const __m256 scaled = tensorplay::cpu::vechalf::carried(
-            _mm256_div_ps(product, y));
+    for (; i + 16 <= end; i += 16) {
+        const __m256 s0 = tensorplay::cpu::vecreduced::widen8(self_bits + i);
+        const __m256 x0 = tensorplay::cpu::vecreduced::widen8(t1_bits + i);
+        const __m256 y0 = tensorplay::cpu::vecreduced::widen8(t2_bits + i);
+        const __m256 s1 = tensorplay::cpu::vecreduced::widen8(self_bits + i + 8);
+        const __m256 x1 = tensorplay::cpu::vecreduced::widen8(t1_bits + i + 8);
+        const __m256 y1 = tensorplay::cpu::vecreduced::widen8(t2_bits + i + 8);
+        const __m256 p0 = _mm256_mul_ps(scale, x0);
+        const __m256 q0 = _mm256_div_ps(p0, y0);
+        const __m256 p1 = _mm256_mul_ps(scale, x1);
+        const __m256 q1 = _mm256_div_ps(p1, y1);
         _mm_storeu_si128(
             reinterpret_cast<__m128i*>(out_bits + i),
-            tensorplay::cpu::vechalf::narrow8(_mm256_add_ps(s, scaled)));
+            tensorplay::cpu::vecreduced::narrow8(_mm256_add_ps(s0, q0)));
+        _mm_storeu_si128(
+            reinterpret_cast<__m128i*>(out_bits + i + 8),
+            tensorplay::cpu::vecreduced::narrow8(_mm256_add_ps(s1, q1)));
+    }
+    for (; i + 8 <= end; i += 8) {
+        const __m256 s = tensorplay::cpu::vecreduced::widen8(self_bits + i);
+        const __m256 x = tensorplay::cpu::vecreduced::widen8(t1_bits + i);
+        const __m256 y = tensorplay::cpu::vecreduced::widen8(t2_bits + i);
+        const __m256 product = _mm256_mul_ps(scale, x);
+        const __m256 scaled = _mm256_div_ps(product, y);
+        _mm_storeu_si128(
+            reinterpret_cast<__m128i*>(out_bits + i),
+            tensorplay::cpu::vecreduced::narrow8(_mm256_add_ps(s, scaled)));
     }
     for (; i < end; ++i) {
-        const tensorplay::Half product = tensorplay::Half(alpha) * tensor1[i];
-        result[i] = self[i] + product / tensor2[i];
+        const float product = alpha * static_cast<float>(tensor1[i]);
+        result[i] = tensorplay::Half(static_cast<float>(self[i]) +
+                                      product / static_cast<float>(tensor2[i]));
     }
 }
-#endif  // TP_VECHALF_X86
+// The other reduced width crosses by a shift of the single-precision
+// pattern, so its walk is the same shape as the half one.
+__attribute__((target("avx2,fma"), noinline))
+void addcmul_bf16_walk(const tensorplay::BFloat16* self,
+                        const tensorplay::BFloat16* tensor1,
+                        const tensorplay::BFloat16* tensor2, float alpha,
+                        tensorplay::BFloat16* result, int64_t begin, int64_t end) {
+    const auto* self_bits = reinterpret_cast<const uint16_t*>(self);
+    const auto* t1_bits = reinterpret_cast<const uint16_t*>(tensor1);
+    const auto* t2_bits = reinterpret_cast<const uint16_t*>(tensor2);
+    auto* out_bits = reinterpret_cast<uint16_t*>(result);
+    const __m256 scale = _mm256_set1_ps(alpha);
+    int64_t i = begin;
+    for (; i + 16 <= end; i += 16) {
+        const __m256 s0 = tensorplay::cpu::vecreduced::widen_bf16_8(self_bits + i);
+        const __m256 x0 = tensorplay::cpu::vecreduced::widen_bf16_8(t1_bits + i);
+        const __m256 y0 = tensorplay::cpu::vecreduced::widen_bf16_8(t2_bits + i);
+        const __m256 s1 = tensorplay::cpu::vecreduced::widen_bf16_8(self_bits + i + 8);
+        const __m256 x1 = tensorplay::cpu::vecreduced::widen_bf16_8(t1_bits + i + 8);
+        const __m256 y1 = tensorplay::cpu::vecreduced::widen_bf16_8(t2_bits + i + 8);
+        const __m256 p0 = _mm256_mul_ps(scale, x0);
+        const __m256 q0 = _mm256_mul_ps(p0, y0);
+        const __m256 p1 = _mm256_mul_ps(scale, x1);
+        const __m256 q1 = _mm256_mul_ps(p1, y1);
+        tensorplay::cpu::vecreduced::store_bf16_8(
+            out_bits + i, _mm256_add_ps(s0, q0));
+        tensorplay::cpu::vecreduced::store_bf16_8(
+            out_bits + i + 8, _mm256_add_ps(s1, q1));
+    }
+    for (; i + 8 <= end; i += 8) {
+        const __m256 s = tensorplay::cpu::vecreduced::widen_bf16_8(self_bits + i);
+        const __m256 x = tensorplay::cpu::vecreduced::widen_bf16_8(t1_bits + i);
+        const __m256 y = tensorplay::cpu::vecreduced::widen_bf16_8(t2_bits + i);
+        const __m256 product = _mm256_mul_ps(scale, x);
+        const __m256 scaled = _mm256_mul_ps(product, y);
+        tensorplay::cpu::vecreduced::store_bf16_8(
+            out_bits + i, _mm256_add_ps(s, scaled));
+    }
+    for (; i < end; ++i) {
+        const float product = alpha * static_cast<float>(tensor1[i]);
+        result[i] = tensorplay::BFloat16(static_cast<float>(self[i]) +
+                                          product * static_cast<float>(tensor2[i]));
+    }
+}
+
+__attribute__((target("avx2,fma"), noinline))
+void addcdiv_bf16_walk(const tensorplay::BFloat16* self,
+                        const tensorplay::BFloat16* tensor1,
+                        const tensorplay::BFloat16* tensor2, float alpha,
+                        tensorplay::BFloat16* result, int64_t begin, int64_t end) {
+    const auto* self_bits = reinterpret_cast<const uint16_t*>(self);
+    const auto* t1_bits = reinterpret_cast<const uint16_t*>(tensor1);
+    const auto* t2_bits = reinterpret_cast<const uint16_t*>(tensor2);
+    auto* out_bits = reinterpret_cast<uint16_t*>(result);
+    const __m256 scale = _mm256_set1_ps(alpha);
+    int64_t i = begin;
+    for (; i + 16 <= end; i += 16) {
+        const __m256 s0 = tensorplay::cpu::vecreduced::widen_bf16_8(self_bits + i);
+        const __m256 x0 = tensorplay::cpu::vecreduced::widen_bf16_8(t1_bits + i);
+        const __m256 y0 = tensorplay::cpu::vecreduced::widen_bf16_8(t2_bits + i);
+        const __m256 s1 = tensorplay::cpu::vecreduced::widen_bf16_8(self_bits + i + 8);
+        const __m256 x1 = tensorplay::cpu::vecreduced::widen_bf16_8(t1_bits + i + 8);
+        const __m256 y1 = tensorplay::cpu::vecreduced::widen_bf16_8(t2_bits + i + 8);
+        const __m256 p0 = _mm256_mul_ps(scale, x0);
+        const __m256 q0 = _mm256_div_ps(p0, y0);
+        const __m256 p1 = _mm256_mul_ps(scale, x1);
+        const __m256 q1 = _mm256_div_ps(p1, y1);
+        tensorplay::cpu::vecreduced::store_bf16_8(
+            out_bits + i, _mm256_add_ps(s0, q0));
+        tensorplay::cpu::vecreduced::store_bf16_8(
+            out_bits + i + 8, _mm256_add_ps(s1, q1));
+    }
+    for (; i + 8 <= end; i += 8) {
+        const __m256 s = tensorplay::cpu::vecreduced::widen_bf16_8(self_bits + i);
+        const __m256 x = tensorplay::cpu::vecreduced::widen_bf16_8(t1_bits + i);
+        const __m256 y = tensorplay::cpu::vecreduced::widen_bf16_8(t2_bits + i);
+        const __m256 product = _mm256_mul_ps(scale, x);
+        const __m256 scaled = _mm256_div_ps(product, y);
+        tensorplay::cpu::vecreduced::store_bf16_8(
+            out_bits + i, _mm256_add_ps(s, scaled));
+    }
+    for (; i < end; ++i) {
+        const float product = alpha * static_cast<float>(tensor1[i]);
+        result[i] = tensorplay::BFloat16(static_cast<float>(self[i]) +
+                                          product / static_cast<float>(tensor2[i]));
+    }
+}
+
+// The single precision and the double precision walks walk eight and four
+// elements at a time.  The scaled product is rounded before it is applied,
+// the same way the scalar walk rounds it.
+__attribute__((target("avx2,fma"), noinline))
+void addcmul_f32_avx2(const float* self, const float* tensor1,
+                      const float* tensor2, float alpha, float* result,
+                      int64_t begin, int64_t end) {
+    const __m256 scale = _mm256_set1_ps(alpha);
+    int64_t i = begin;
+    for (; i + 16 <= end; i += 16) {
+        const __m256 s0 = _mm256_loadu_ps(self + i);
+        const __m256 x0 = _mm256_loadu_ps(tensor1 + i);
+        const __m256 y0 = _mm256_loadu_ps(tensor2 + i);
+        const __m256 s1 = _mm256_loadu_ps(self + i + 8);
+        const __m256 x1 = _mm256_loadu_ps(tensor1 + i + 8);
+        const __m256 y1 = _mm256_loadu_ps(tensor2 + i + 8);
+        _mm256_storeu_ps(
+            result + i,
+            _mm256_fmadd_ps(_mm256_mul_ps(scale, x0), y0, s0));
+        _mm256_storeu_ps(
+            result + i + 8,
+            _mm256_fmadd_ps(_mm256_mul_ps(scale, x1), y1, s1));
+    }
+    for (; i + 8 <= end; i += 8) {
+        const __m256 s = _mm256_loadu_ps(self + i);
+        const __m256 x = _mm256_loadu_ps(tensor1 + i);
+        const __m256 y = _mm256_loadu_ps(tensor2 + i);
+        _mm256_storeu_ps(result + i,
+                         _mm256_fmadd_ps(_mm256_mul_ps(scale, x), y, s));
+    }
+    for (; i < end; ++i) {
+        result[i] = self[i] + alpha * tensor1[i] * tensor2[i];
+    }
+}
+
+__attribute__((target("avx2,fma"), noinline))
+void addcdiv_f32_avx2(const float* self, const float* tensor1,
+                      const float* tensor2, float alpha, float* result,
+                      int64_t begin, int64_t end) {
+    const __m256 scale = _mm256_set1_ps(alpha);
+    int64_t i = begin;
+    for (; i + 16 <= end; i += 16) {
+        const __m256 s0 = _mm256_loadu_ps(self + i);
+        const __m256 x0 = _mm256_loadu_ps(tensor1 + i);
+        const __m256 y0 = _mm256_loadu_ps(tensor2 + i);
+        const __m256 s1 = _mm256_loadu_ps(self + i + 8);
+        const __m256 x1 = _mm256_loadu_ps(tensor1 + i + 8);
+        const __m256 y1 = _mm256_loadu_ps(tensor2 + i + 8);
+        _mm256_storeu_ps(
+            result + i,
+            _mm256_add_ps(s0, _mm256_div_ps(_mm256_mul_ps(scale, x0), y0)));
+        _mm256_storeu_ps(
+            result + i + 8,
+            _mm256_add_ps(s1, _mm256_div_ps(_mm256_mul_ps(scale, x1), y1)));
+    }
+    for (; i + 8 <= end; i += 8) {
+        const __m256 s = _mm256_loadu_ps(self + i);
+        const __m256 x = _mm256_loadu_ps(tensor1 + i);
+        const __m256 y = _mm256_loadu_ps(tensor2 + i);
+        _mm256_storeu_ps(result + i,
+                         _mm256_add_ps(
+                             s, _mm256_div_ps(_mm256_mul_ps(scale, x), y)));
+    }
+    for (; i < end; ++i) {
+        result[i] = self[i] + alpha * tensor1[i] / tensor2[i];
+    }
+}
+
+__attribute__((target("avx2,fma"), noinline))
+void addcmul_f64_avx2(const double* self, const double* tensor1,
+                      const double* tensor2, double alpha, double* result,
+                      int64_t begin, int64_t end) {
+    const __m256d scale = _mm256_set1_pd(alpha);
+    int64_t i = begin;
+    for (; i + 8 <= end; i += 8) {
+        const __m256d s0 = _mm256_loadu_pd(self + i);
+        const __m256d x0 = _mm256_loadu_pd(tensor1 + i);
+        const __m256d y0 = _mm256_loadu_pd(tensor2 + i);
+        const __m256d s1 = _mm256_loadu_pd(self + i + 4);
+        const __m256d x1 = _mm256_loadu_pd(tensor1 + i + 4);
+        const __m256d y1 = _mm256_loadu_pd(tensor2 + i + 4);
+        _mm256_storeu_pd(
+            result + i,
+            _mm256_fmadd_pd(_mm256_mul_pd(scale, x0), y0, s0));
+        _mm256_storeu_pd(
+            result + i + 4,
+            _mm256_fmadd_pd(_mm256_mul_pd(scale, x1), y1, s1));
+    }
+    for (; i + 4 <= end; i += 4) {
+        const __m256d s = _mm256_loadu_pd(self + i);
+        const __m256d x = _mm256_loadu_pd(tensor1 + i);
+        const __m256d y = _mm256_loadu_pd(tensor2 + i);
+        _mm256_storeu_pd(result + i,
+                         _mm256_fmadd_pd(_mm256_mul_pd(scale, x), y, s));
+    }
+    for (; i < end; ++i) {
+        result[i] = self[i] + alpha * tensor1[i] * tensor2[i];
+    }
+}
+
+__attribute__((target("avx2,fma"), noinline))
+void addcdiv_f64_avx2(const double* self, const double* tensor1,
+                      const double* tensor2, double alpha, double* result,
+                      int64_t begin, int64_t end) {
+    const __m256d scale = _mm256_set1_pd(alpha);
+    int64_t i = begin;
+    for (; i + 8 <= end; i += 8) {
+        const __m256d s0 = _mm256_loadu_pd(self + i);
+        const __m256d x0 = _mm256_loadu_pd(tensor1 + i);
+        const __m256d y0 = _mm256_loadu_pd(tensor2 + i);
+        const __m256d s1 = _mm256_loadu_pd(self + i + 4);
+        const __m256d x1 = _mm256_loadu_pd(tensor1 + i + 4);
+        const __m256d y1 = _mm256_loadu_pd(tensor2 + i + 4);
+        _mm256_storeu_pd(
+            result + i,
+            _mm256_add_pd(s0, _mm256_div_pd(_mm256_mul_pd(scale, x0), y0)));
+        _mm256_storeu_pd(
+            result + i + 4,
+            _mm256_add_pd(s1, _mm256_div_pd(_mm256_mul_pd(scale, x1), y1)));
+    }
+    for (; i + 4 <= end; i += 4) {
+        const __m256d s = _mm256_loadu_pd(self + i);
+        const __m256d x = _mm256_loadu_pd(tensor1 + i);
+        const __m256d y = _mm256_loadu_pd(tensor2 + i);
+        _mm256_storeu_pd(result + i,
+                         _mm256_add_pd(
+                             s, _mm256_div_pd(_mm256_mul_pd(scale, x), y)));
+    }
+    for (; i < end; ++i) {
+        result[i] = self[i] + alpha * tensor1[i] / tensor2[i];
+    }
+}
+
+#endif  // TP_VECREDUCED_X86
 
 // The dense walk: element i of each operand lands on element i of the answer,
 // which the caller either hands over as the destination it wants filled or
@@ -4388,18 +4644,50 @@ template <typename T>
 void addcmul_dense_walk(const Tensor& self, const Tensor& tensor1,
                         const Tensor& tensor2, const Scalar& value,
                         Tensor& result) {
+    // A reduced width carries its arithmetic through single precision, so
+    // the answer is computed there and narrowed once.  The scale is taken
+    // at that width too: narrowing it first would move it away from the
+    // value the caller handed in.
+    using compute_t = typename OpMathType<T>::type;
     const T* self_ptr = self.data_ptr<T>();
     const T* tensor1_ptr = tensor1.data_ptr<T>();
     const T* tensor2_ptr = tensor2.data_ptr<T>();
     T* result_ptr = result.data_ptr<T>();
-    const T alpha = value.to<T>();
+    const compute_t alpha = value.to<compute_t>();
     const int64_t n = self.numel();
-#if defined(TP_VECHALF_X86)
+#if defined(TP_VECREDUCED_X86)
     if constexpr (std::is_same_v<T, tensorplay::Half>) {
-        if (tensorplay::cpu::vechalf::f16c_available()) {
+        if (tensorplay::cpu::vecreduced::f16c_available()) {
             const float scale = static_cast<float>(alpha);
             parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
                 addcmul_half_walk(self_ptr, tensor1_ptr, tensor2_ptr, scale,
+                                  result_ptr, begin, end);
+            });
+            return;
+        }
+    } else if constexpr (std::is_same_v<T, float>) {
+        if (tensorplay::cpu::vecbinary::avx2_available()) {
+            const float scale = static_cast<float>(alpha);
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                addcmul_f32_avx2(self_ptr, tensor1_ptr, tensor2_ptr, scale,
+                                 result_ptr, begin, end);
+            });
+            return;
+        }
+    } else if constexpr (std::is_same_v<T, double>) {
+        if (tensorplay::cpu::vecbinary::avx2_available()) {
+            const double scale = static_cast<double>(alpha);
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                addcmul_f64_avx2(self_ptr, tensor1_ptr, tensor2_ptr, scale,
+                                 result_ptr, begin, end);
+            });
+            return;
+        }
+    } else if constexpr (std::is_same_v<T, tensorplay::BFloat16>) {
+        if (tensorplay::cpu::vecbinary::avx2_available()) {
+            const float scale = static_cast<float>(alpha);
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                addcmul_bf16_walk(self_ptr, tensor1_ptr, tensor2_ptr, scale,
                                   result_ptr, begin, end);
             });
             return;
@@ -4408,7 +4696,10 @@ void addcmul_dense_walk(const Tensor& self, const Tensor& tensor1,
 #endif
     parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
         for (int64_t i = begin; i < end; ++i) {
-            result_ptr[i] = self_ptr[i] + alpha * tensor1_ptr[i] * tensor2_ptr[i];
+            result_ptr[i] = static_cast<T>(
+                static_cast<compute_t>(self_ptr[i]) +
+                alpha * static_cast<compute_t>(tensor1_ptr[i]) *
+                static_cast<compute_t>(tensor2_ptr[i]));
         }
     });
 }
@@ -4464,9 +4755,13 @@ static void addcmul_composition(const Tensor& self, const Tensor& tensor1,
 
     #define ADDCMUL_CASE(ctype, name) \
         case DType::name: { \
-            const ctype alpha = value.to<ctype>(); \
+            using addcmul_compute_t = typename OpMathType<ctype>::type; \
+            const addcmul_compute_t alpha = value.to<addcmul_compute_t>(); \
             auto op = [alpha](ctype x, ctype y, ctype z) -> ctype { \
-                return x + alpha * y * z; \
+                return static_cast<ctype>( \
+                    static_cast<addcmul_compute_t>(x) + \
+                    alpha * static_cast<addcmul_compute_t>(y) * \
+                    static_cast<addcmul_compute_t>(z)); \
             }; \
             apply_ternary_op_recursive<ctype, ctype>( \
                 result.data_ptr<ctype>(), result.strides(), a, a_strides, \
@@ -4643,18 +4938,46 @@ template <typename T>
 void addcdiv_dense_walk(const Tensor& self, const Tensor& tensor1,
                         const Tensor& tensor2, const Scalar& value,
                         Tensor& result) {
+    using compute_t = typename OpMathType<T>::type;
     const T* self_ptr = self.data_ptr<T>();
     const T* tensor1_ptr = tensor1.data_ptr<T>();
     const T* tensor2_ptr = tensor2.data_ptr<T>();
     T* result_ptr = result.data_ptr<T>();
-    const T alpha = value.to<T>();
+    const compute_t alpha = value.to<compute_t>();
     const int64_t n = self.numel();
-#if defined(TP_VECHALF_X86)
+#if defined(TP_VECREDUCED_X86)
     if constexpr (std::is_same_v<T, tensorplay::Half>) {
-        if (tensorplay::cpu::vechalf::f16c_available()) {
+        if (tensorplay::cpu::vecreduced::f16c_available()) {
             const float scale = static_cast<float>(alpha);
             parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
                 addcdiv_half_walk(self_ptr, tensor1_ptr, tensor2_ptr, scale,
+                                  result_ptr, begin, end);
+            });
+            return;
+        }
+    } else if constexpr (std::is_same_v<T, float>) {
+        if (tensorplay::cpu::vecbinary::avx2_available()) {
+            const float scale = static_cast<float>(alpha);
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                addcdiv_f32_avx2(self_ptr, tensor1_ptr, tensor2_ptr, scale,
+                                 result_ptr, begin, end);
+            });
+            return;
+        }
+    } else if constexpr (std::is_same_v<T, double>) {
+        if (tensorplay::cpu::vecbinary::avx2_available()) {
+            const double scale = static_cast<double>(alpha);
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                addcdiv_f64_avx2(self_ptr, tensor1_ptr, tensor2_ptr, scale,
+                                 result_ptr, begin, end);
+            });
+            return;
+        }
+    } else if constexpr (std::is_same_v<T, tensorplay::BFloat16>) {
+        if (tensorplay::cpu::vecbinary::avx2_available()) {
+            const float scale = static_cast<float>(alpha);
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                addcdiv_bf16_walk(self_ptr, tensor1_ptr, tensor2_ptr, scale,
                                   result_ptr, begin, end);
             });
             return;
@@ -4663,7 +4986,10 @@ void addcdiv_dense_walk(const Tensor& self, const Tensor& tensor1,
 #endif
     parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
         for (int64_t i = begin; i < end; ++i) {
-            result_ptr[i] = self_ptr[i] + alpha * tensor1_ptr[i] / tensor2_ptr[i];
+            result_ptr[i] = static_cast<T>(
+                static_cast<compute_t>(self_ptr[i]) +
+                alpha * static_cast<compute_t>(tensor1_ptr[i]) /
+                static_cast<compute_t>(tensor2_ptr[i]));
         }
     });
 }
@@ -4715,9 +5041,13 @@ static void addcdiv_composition(const Tensor& self, const Tensor& tensor1,
     auto c_strides = broadcast_strides(c, out_shape);
     #define ADDCDIV_CASE(ctype, name) \
         case DType::name: { \
-            const ctype alpha = value.to<ctype>(); \
+            using addcdiv_compute_t = typename OpMathType<ctype>::type; \
+            const addcdiv_compute_t alpha = value.to<addcdiv_compute_t>(); \
             auto op = [alpha](ctype x, ctype y, ctype z) -> ctype { \
-                return x + alpha * (y / z); \
+                return static_cast<ctype>( \
+                    static_cast<addcdiv_compute_t>(x) + \
+                    alpha * (static_cast<addcdiv_compute_t>(y) / \
+                             static_cast<addcdiv_compute_t>(z))); \
             }; \
             apply_ternary_op_recursive<ctype, ctype>( \
                 result.data_ptr<ctype>(), result.strides(), a, a_strides, \

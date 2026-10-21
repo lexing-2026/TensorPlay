@@ -11,7 +11,7 @@
 #include "OutWrite.h"
 #include "Parallel.h"
 #include "cpu/VecUnary.h"
-#include "cpu/VecHalfMath.h"
+#include "cpu/VecReducedMath.h"
 #include "cpu/ComplexUnary.h"
 #include "cpu/SoftmaxStridedKernels.h"
 #include "cpu/VecComplex.h"
@@ -3727,6 +3727,29 @@ void lerp_tensor_f32_avx2(const float* self, const float* end,
     const __m256 one = _mm256_set1_ps(1.0f);
     const __m256 abs_mask = _mm256_set1_ps(-0.0f);
     int64_t i = 0;
+    // Two vectors are answered per step: the two answers do not depend on
+    // each other, so the machine overlaps them instead of waiting for one
+    // to finish before it starts the next.
+    for (; i + 16 <= n; i += 16) {
+        const __m256 s0 = _mm256_loadu_ps(self + i);
+        const __m256 e0 = _mm256_loadu_ps(end + i);
+        const __m256 w0 = _mm256_loadu_ps(weight + i);
+        const __m256 s1 = _mm256_loadu_ps(self + i + 8);
+        const __m256 e1 = _mm256_loadu_ps(end + i + 8);
+        const __m256 w1 = _mm256_loadu_ps(weight + i + 8);
+        const __m256 small0 = _mm256_cmp_ps(
+            _mm256_andnot_ps(abs_mask, w0), half, _CMP_LT_OQ);
+        const __m256 small1 = _mm256_cmp_ps(
+            _mm256_andnot_ps(abs_mask, w1), half, _CMP_LT_OQ);
+        const __m256 coeff0 = _mm256_blendv_ps(_mm256_sub_ps(w0, one), w0, small0);
+        const __m256 coeff1 = _mm256_blendv_ps(_mm256_sub_ps(w1, one), w1, small1);
+        const __m256 base0 = _mm256_blendv_ps(e0, s0, small0);
+        const __m256 base1 = _mm256_blendv_ps(e1, s1, small1);
+        _mm256_storeu_ps(result + i,
+                         _mm256_fmadd_ps(coeff0, _mm256_sub_ps(e0, s0), base0));
+        _mm256_storeu_ps(result + i + 8,
+                         _mm256_fmadd_ps(coeff1, _mm256_sub_ps(e1, s1), base1));
+    }
     for (; i + 8 <= n; i += 8) {
         const __m256 s = _mm256_loadu_ps(self + i);
         const __m256 e = _mm256_loadu_ps(end + i);
@@ -3750,7 +3773,7 @@ void lerp_tensor_f32_avx2(const float* self, const float* end,
 // The interpolation is computed in single precision and narrowed once, the
 // same way the scalar walk computes it: the weight picks the nearer end
 // when it is below a half, and the answer is narrowed where it is stored.
-#if defined(TP_VECHALF_X86)
+#if defined(TP_VECREDUCED_X86)
 __attribute__((target("avx2,f16c"), noinline))
 void lerp_tensor_half_walk(const tensorplay::Half* self,
                            const tensorplay::Half* end,
@@ -3764,10 +3787,38 @@ void lerp_tensor_half_walk(const tensorplay::Half* self,
     const __m256 one = _mm256_set1_ps(1.0f);
     const __m256 abs_mask = _mm256_set1_ps(-0.0f);
     int64_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        const __m256 s0 = tensorplay::cpu::vecreduced::widen8(self_bits + i);
+        const __m256 e0 = tensorplay::cpu::vecreduced::widen8(end_bits + i);
+        const __m256 w0 = tensorplay::cpu::vecreduced::widen8(weight_bits + i);
+        const __m256 s1 = tensorplay::cpu::vecreduced::widen8(self_bits + i + 8);
+        const __m256 e1 = tensorplay::cpu::vecreduced::widen8(end_bits + i + 8);
+        const __m256 w1 = tensorplay::cpu::vecreduced::widen8(weight_bits + i + 8);
+        const __m256 small0 =
+            _mm256_cmp_ps(_mm256_andnot_ps(abs_mask, w0), half, _CMP_LT_OQ);
+        const __m256 small1 =
+            _mm256_cmp_ps(_mm256_andnot_ps(abs_mask, w1), half, _CMP_LT_OQ);
+        const __m256 delta0 = _mm256_sub_ps(e0, s0);
+        const __m256 delta1 = _mm256_sub_ps(e1, s1);
+        const __m256 near0 = _mm256_add_ps(s0, _mm256_mul_ps(w0, delta0));
+        const __m256 near1 = _mm256_add_ps(s1, _mm256_mul_ps(w1, delta1));
+        const __m256 far0 = _mm256_sub_ps(
+            e0, _mm256_mul_ps(delta0, _mm256_sub_ps(one, w0)));
+        const __m256 far1 = _mm256_sub_ps(
+            e1, _mm256_mul_ps(delta1, _mm256_sub_ps(one, w1)));
+        _mm_storeu_si128(
+            reinterpret_cast<__m128i*>(out_bits + i),
+            tensorplay::cpu::vecreduced::narrow8(
+                _mm256_blendv_ps(far0, near0, small0)));
+        _mm_storeu_si128(
+            reinterpret_cast<__m128i*>(out_bits + i + 8),
+            tensorplay::cpu::vecreduced::narrow8(
+                _mm256_blendv_ps(far1, near1, small1)));
+    }
     for (; i + 8 <= n; i += 8) {
-        const __m256 s = tensorplay::cpu::vechalf::widen8(self_bits + i);
-        const __m256 e = tensorplay::cpu::vechalf::widen8(end_bits + i);
-        const __m256 w = tensorplay::cpu::vechalf::widen8(weight_bits + i);
+        const __m256 s = tensorplay::cpu::vecreduced::widen8(self_bits + i);
+        const __m256 e = tensorplay::cpu::vecreduced::widen8(end_bits + i);
+        const __m256 w = tensorplay::cpu::vecreduced::widen8(weight_bits + i);
         const __m256 small =
             _mm256_cmp_ps(_mm256_andnot_ps(abs_mask, w), half, _CMP_LT_OQ);
         const __m256 delta = _mm256_sub_ps(e, s);
@@ -3776,14 +3827,71 @@ void lerp_tensor_half_walk(const tensorplay::Half* self,
             e, _mm256_mul_ps(delta, _mm256_sub_ps(one, w)));
         _mm_storeu_si128(
             reinterpret_cast<__m128i*>(out_bits + i),
-            tensorplay::cpu::vechalf::narrow8(
+            tensorplay::cpu::vecreduced::narrow8(
                 _mm256_blendv_ps(far, near, small)));
     }
     for (; i < n; ++i) {
         result[i] = lerp_scalar_value(self[i], end[i], weight[i]);
     }
 }
-#endif  // TP_VECHALF_X86
+#endif  // TP_VECREDUCED_X86
+
+// The other reduced width crosses by a shift of the single-precision
+// pattern, so its walk is the same shape as the half one.
+__attribute__((target("avx2,fma"), noinline))
+void lerp_tensor_bf16_walk(const tensorplay::BFloat16* self,
+                           const tensorplay::BFloat16* end,
+                           const tensorplay::BFloat16* weight,
+                           tensorplay::BFloat16* result, int64_t n) {
+    const auto* self_bits = reinterpret_cast<const uint16_t*>(self);
+    const auto* end_bits = reinterpret_cast<const uint16_t*>(end);
+    const auto* weight_bits = reinterpret_cast<const uint16_t*>(weight);
+    auto* out_bits = reinterpret_cast<uint16_t*>(result);
+    const __m256 half = _mm256_set1_ps(0.5f);
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 abs_mask = _mm256_set1_ps(-0.0f);
+    int64_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        const __m256 s0 = tensorplay::cpu::vecreduced::widen_bf16_8(self_bits + i);
+        const __m256 e0 = tensorplay::cpu::vecreduced::widen_bf16_8(end_bits + i);
+        const __m256 w0 = tensorplay::cpu::vecreduced::widen_bf16_8(weight_bits + i);
+        const __m256 s1 = tensorplay::cpu::vecreduced::widen_bf16_8(self_bits + i + 8);
+        const __m256 e1 = tensorplay::cpu::vecreduced::widen_bf16_8(end_bits + i + 8);
+        const __m256 w1 = tensorplay::cpu::vecreduced::widen_bf16_8(weight_bits + i + 8);
+        const __m256 small0 = _mm256_cmp_ps(
+            _mm256_andnot_ps(abs_mask, w0), half, _CMP_LT_OQ);
+        const __m256 small1 = _mm256_cmp_ps(
+            _mm256_andnot_ps(abs_mask, w1), half, _CMP_LT_OQ);
+        const __m256 delta0 = _mm256_sub_ps(e0, s0);
+        const __m256 delta1 = _mm256_sub_ps(e1, s1);
+        const __m256 near0 = _mm256_add_ps(s0, _mm256_mul_ps(w0, delta0));
+        const __m256 near1 = _mm256_add_ps(s1, _mm256_mul_ps(w1, delta1));
+        const __m256 far0 = _mm256_sub_ps(
+            e0, _mm256_mul_ps(delta0, _mm256_sub_ps(one, w0)));
+        const __m256 far1 = _mm256_sub_ps(
+            e1, _mm256_mul_ps(delta1, _mm256_sub_ps(one, w1)));
+        tensorplay::cpu::vecreduced::store_bf16_8(
+            out_bits + i, _mm256_blendv_ps(far0, near0, small0));
+        tensorplay::cpu::vecreduced::store_bf16_8(
+            out_bits + i + 8, _mm256_blendv_ps(far1, near1, small1));
+    }
+    for (; i + 8 <= n; i += 8) {
+        const __m256 s = tensorplay::cpu::vecreduced::widen_bf16_8(self_bits + i);
+        const __m256 e = tensorplay::cpu::vecreduced::widen_bf16_8(end_bits + i);
+        const __m256 w = tensorplay::cpu::vecreduced::widen_bf16_8(weight_bits + i);
+        const __m256 small = _mm256_cmp_ps(
+            _mm256_andnot_ps(abs_mask, w), half, _CMP_LT_OQ);
+        const __m256 delta = _mm256_sub_ps(e, s);
+        const __m256 near = _mm256_add_ps(s, _mm256_mul_ps(w, delta));
+        const __m256 far = _mm256_sub_ps(
+            e, _mm256_mul_ps(delta, _mm256_sub_ps(one, w)));
+        tensorplay::cpu::vecreduced::store_bf16_8(
+            out_bits + i, _mm256_blendv_ps(far, near, small));
+    }
+    for (; i < n; ++i) {
+        result[i] = lerp_scalar_value(self[i], end[i], weight[i]);
+    }
+}
 
 __attribute__((target("avx2,fma")))
 void lerp_tensor_f64_avx2(const double* self, const double* end,
@@ -3792,6 +3900,26 @@ void lerp_tensor_f64_avx2(const double* self, const double* end,
     const __m256d one = _mm256_set1_pd(1.0);
     const __m256d abs_mask = _mm256_set1_pd(-0.0);
     int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256d s0 = _mm256_loadu_pd(self + i);
+        const __m256d e0 = _mm256_loadu_pd(end + i);
+        const __m256d w0 = _mm256_loadu_pd(weight + i);
+        const __m256d s1 = _mm256_loadu_pd(self + i + 4);
+        const __m256d e1 = _mm256_loadu_pd(end + i + 4);
+        const __m256d w1 = _mm256_loadu_pd(weight + i + 4);
+        const __m256d small0 = _mm256_cmp_pd(
+            _mm256_andnot_pd(abs_mask, w0), half, _CMP_LT_OQ);
+        const __m256d small1 = _mm256_cmp_pd(
+            _mm256_andnot_pd(abs_mask, w1), half, _CMP_LT_OQ);
+        const __m256d coeff0 = _mm256_blendv_pd(_mm256_sub_pd(w0, one), w0, small0);
+        const __m256d coeff1 = _mm256_blendv_pd(_mm256_sub_pd(w1, one), w1, small1);
+        const __m256d base0 = _mm256_blendv_pd(e0, s0, small0);
+        const __m256d base1 = _mm256_blendv_pd(e1, s1, small1);
+        _mm256_storeu_pd(result + i,
+                         _mm256_fmadd_pd(coeff0, _mm256_sub_pd(e0, s0), base0));
+        _mm256_storeu_pd(result + i + 4,
+                         _mm256_fmadd_pd(coeff1, _mm256_sub_pd(e1, s1), base1));
+    }
     for (; i + 4 <= n; i += 4) {
         const __m256d s = _mm256_loadu_pd(self + i);
         const __m256d e = _mm256_loadu_pd(end + i);
@@ -3895,10 +4023,21 @@ void lerp_tensor_contiguous(const T* self, const T* end, const T* weight,
             return;
         }
     } else if constexpr (std::is_same_v<T, tensorplay::Half>) {
-#if defined(TP_VECHALF_X86)
-        if (tensorplay::cpu::vechalf::f16c_available()) {
+#if defined(TP_VECREDUCED_X86)
+        if (tensorplay::cpu::vecreduced::f16c_available()) {
             parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t finish) {
                 lerp_tensor_half_walk(self + begin, end + begin,
+                                      weight + begin, result + begin,
+                                      finish - begin);
+            });
+            return;
+        }
+#endif
+    } else if constexpr (std::is_same_v<T, tensorplay::BFloat16>) {
+#if defined(TP_VECREDUCED_X86)
+        if (pointwise_cpu_has_avx2()) {
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t finish) {
+                lerp_tensor_bf16_walk(self + begin, end + begin,
                                       weight + begin, result + begin,
                                       finish - begin);
             });
