@@ -15,6 +15,7 @@
 #include <tuple>
 #include <vector>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <numeric>
 #include <cstring>
@@ -1823,6 +1824,66 @@ std::tuple<Tensor, Tensor, Tensor> unique_flat_cpu_template(
             inverse.resize_(static_cast<std::vector<int64_t>>(self.shape()));
         }
         return {values, inverse, counts};
+    }
+
+    // A bounded range of whole numbers answers from a count of the range
+    // instead of a sort: the counts are gathered in parallel and a scan of
+    // them gives the values in order.  A wider range, or a float, falls back
+    // to the sorted walk below.
+    if constexpr (std::is_integral_v<scalar_t>) {
+        if (!return_inverse && numel >= 1024) {
+            const scalar_t* in = input.data_ptr<scalar_t>();
+            const int threads = get_num_threads();
+            std::vector<scalar_t> lows(static_cast<size_t>(threads), in[0]);
+            std::vector<scalar_t> highs(static_cast<size_t>(threads), in[0]);
+            parallel_for(0, numel, GRAIN_SIZE, [&](int64_t b, int64_t e) {
+                const size_t t = static_cast<size_t>(get_thread_num());
+                scalar_t lo = lows[t], hi = highs[t];
+                for (int64_t i = b; i < e; ++i) {
+                    const scalar_t v = in[i];
+                    if (v < lo) lo = v;
+                    if (v > hi) hi = v;
+                }
+                lows[t] = lo;
+                highs[t] = hi;
+            });
+            scalar_t lo = lows[0], hi = highs[0];
+            for (int t = 1; t < threads; ++t) {
+                if (lows[static_cast<size_t>(t)] < lo) lo = lows[static_cast<size_t>(t)];
+                if (highs[static_cast<size_t>(t)] > hi) hi = highs[static_cast<size_t>(t)];
+            }
+            const uint64_t base = static_cast<uint64_t>(lo);
+            const uint64_t range =
+                static_cast<uint64_t>(hi) - base + 1u;
+            if (range <= (1u << 20)) {
+                std::vector<int32_t> tally(static_cast<size_t>(range), 0);
+                parallel_for(0, numel, GRAIN_SIZE, [&](int64_t b, int64_t e) {
+                    for (int64_t i = b; i < e; ++i) {
+                        const uint64_t v = static_cast<uint64_t>(in[i]) - base;
+                        std::atomic_ref<int32_t>(tally[static_cast<size_t>(v)])
+                            .fetch_add(1, std::memory_order_relaxed);
+                    }
+                });
+                int64_t n_groups = 0;
+                for (uint64_t v = 0; v < range; ++v) {
+                    if (tally[static_cast<size_t>(v)] > 0) ++n_groups;
+                }
+                values.resize_({n_groups});
+                scalar_t* vp = values.data_ptr<scalar_t>();
+                int64_t* cp = return_counts
+                    ? (counts.resize_({n_groups}), counts.data_ptr<int64_t>())
+                    : nullptr;
+                int64_t g = 0;
+                for (uint64_t v = 0; v < range; ++v) {
+                    const int32_t c = tally[static_cast<size_t>(v)];
+                    if (c == 0) continue;
+                    vp[g] = static_cast<scalar_t>(base + v);
+                    if (cp) cp[g] = c;
+                    ++g;
+                }
+                return {values, inverse, counts};
+            }
+        }
     }
 
     Tensor sorted_vals, order;
