@@ -410,13 +410,14 @@ Tensor slice_kernel(
 }
 
 Tensor select_kernel(const Tensor& self, int64_t dim, int64_t index) {
-  // A single-precision payload can be picked out of an image or out of linear
-  // storage; a code wider than a word only ever has the second of those, so its
-  // selection is the strided view below.  The types in between keep an image the
-  // line below reads and have no linear one yet.
+  // A selection is a slice with one axis removed, so it reads the texel planes
+  // in the width the payload was written in: single precision on a float texel,
+  // signed words on a count, and a strided line of pairs for a code wider than
+  // a word, which never has an image form.
   TP_CHECK(
-      self.dtype() == DType::Float32 || self.dtype() == DType::Int64,
-      "Vulkan select supports Float32 and Int64 tensors only");
+      self.dtype() == DType::Float32 || self.dtype() == DType::Float16 ||
+          self.dtype() == DType::Int32 || self.dtype() == DType::Int64,
+      "Vulkan select supports Float32, Float16, Int32 and Int64 tensors only");
   TP_CHECK(
       self.dim() >= 1 && self.dim() <= 4,
       "Vulkan select supports 1d to 4d tensors");
