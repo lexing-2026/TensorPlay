@@ -730,14 +730,23 @@ static void scatter_lines(T* d, const int64_t* ip, const T* vp,
     // checked where they are read.
     const int64_t chunk_t = std::min<int64_t>(
         idx_inner, std::max<int64_t>(1, GRAIN_SIZE / idx_dim_size));
-    const int64_t nchunk_t = (idx_inner + chunk_t - 1) / chunk_t;
+    // A destination line that two tasks both own is fetched and written
+    // twice, so a run of inner positions is widened to whole lines while
+    // enough runs remain to keep the pool busy.  The index and source side
+    // gain too: one line of each is then read by a single task.
+    const int64_t lanes =
+        std::max<int64_t>(1, 64 / static_cast<int64_t>(sizeof(T)));
+    const int64_t run_t = (idx_inner / lanes >= 8 && chunk_t < lanes)
+        ? std::max<int64_t>(1, std::min<int64_t>(idx_inner / 8, lanes))
+        : chunk_t;
+    const int64_t nchunk_t = (idx_inner + run_t - 1) / run_t;
     const int64_t task_grain =
-        std::max<int64_t>(1, GRAIN_SIZE / (idx_dim_size * chunk_t));
+        std::max<int64_t>(1, GRAIN_SIZE / (idx_dim_size * run_t));
     parallel_for(0, idx_outer * nchunk_t, task_grain, [&](int64_t begin, int64_t end) {
         for (int64_t task = begin; task < end; ++task) {
             const int64_t g = task / nchunk_t;
-            const int64_t t0 = (task - g * nchunk_t) * chunk_t;
-            const int64_t t1 = std::min(t0 + chunk_t, idx_inner);
+            const int64_t t0 = (task - g * nchunk_t) * run_t;
+            const int64_t t1 = std::min(t0 + run_t, idx_inner);
             const int64_t* idx_row = ip + g * idx_dim_size * idx_inner;
             const T* v_row = vp + g * idx_dim_size * idx_inner;
             T* d_slot = d + g * self_dim_size * self_inner;
