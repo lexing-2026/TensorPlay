@@ -152,12 +152,131 @@ def test_cross_entropy():
 
     check("CrossEntropyLoss Grad Input", x_tp.grad, x_torch.grad)
 
+def _narrow_loss_rows(host, codes, weight, reduction):
+    # The row the target names, negated and scaled by that class's weight; rows
+    # naming the skipped code answer zero and carry no weight.
+    counted = [i for i in range(host.shape[0]) if codes[i] != -100]
+    picked = [-float(host[i, codes[i]]) * (float(weight[codes[i]])
+                                            if weight is not None else 1.0)
+              for i in counted]
+    weight_sum = sum(float(weight[codes[i]]) if weight is not None else 1.0
+                     for i in counted)
+    if reduction == 0:
+        per_row = np.zeros(host.shape[0], np.float64)
+        for position, i in enumerate(counted):
+            per_row[i] = picked[position]
+        # An unreduced batch reports no normalizer at all.
+        return per_row, 0.0, weight_sum
+    total = sum(picked)
+    if reduction == 1:
+        total /= weight_sum
+    return np.float64(total), weight_sum, weight_sum
+
+
+def test_likelihood_loss_in_narrow_planes():
+    # A narrow likelihood plane is answered in its own type: the walk reads one
+    # class per row and totals in double, so the only rounding is the answer's.
+    rng = np.random.default_rng(11)
+    for tp_dtype, np_dtype, torch_dtype, tol in (
+            (tp.float16, np.float16, torch.float16, 6e-3),
+            (tp.bfloat16, None, torch.bfloat16, 6e-2)):
+        for rows, classes in ((5, 7), (64, 33), (3, 1000)):
+            logits = rng.normal(0.0, 2.5, (rows, classes))
+            probs = np.exp(logits - logits.max(axis=1, keepdims=True))
+            host = np.log(probs / probs.sum(axis=1, keepdims=True))
+            cast = host.astype(np_dtype) if np_dtype else host.astype(np.float32)
+            codes = rng.integers(0, classes, rows)
+            codes[0] = -100
+            for reduction in (0, 1, 2):
+                for weighted in (False, True):
+                    weight = (np.full(classes, 0.5, np.float32)
+                              if weighted else None)
+                    label = ["none", "mean", "sum"][reduction]
+                    x = tp.tensor(cast, dtype=tp_dtype, device=tp.device("cpu"))
+                    t = tp.tensor(codes, device=tp.device("cpu"))
+                    w = (tp.tensor(weight, dtype=tp_dtype,
+                                   device=tp.device("cpu"))
+                         if weighted else None)
+                    got, reported = tp._C.nll_loss(x, t, w, reduction, -100)
+                    wanted, normalizer, weight_sum = _narrow_loss_rows(
+                        host, codes, weight, reduction)
+                    answer = got.detach().to(tp.float32).numpy().astype(np.float64)
+                    assert got.dtype == tp_dtype, (tp_dtype, got.dtype)
+                    assert reported.dtype == tp_dtype, (tp_dtype, reported.dtype)
+                    np.testing.assert_allclose(answer.reshape(-1),
+                                               np.asarray(wanted).reshape(-1),
+                                               atol=tol, rtol=tol)
+                    assert abs(float(reported) - normalizer) < 1e-4
+
+                    reference = torch.nn.functional.nll_loss(
+                        torch.tensor(cast, dtype=torch_dtype),
+                        torch.tensor(codes, dtype=torch.long),
+                        torch.tensor(weight, dtype=torch_dtype) if weighted else None,
+                        reduction=label, ignore_index=-100)
+                    np.testing.assert_allclose(
+                        answer.reshape(-1),
+                        reference.detach().float().numpy().reshape(-1),
+                        atol=tol, rtol=tol)
+
+                    # Every row contributes one entry of its own class, scaled by
+                    # the same normalizer the reduction divided the loss by.  The
+                    # seed a sum leaves behind is one value spread across the row
+                    # axis, so the walk reads it through a layout of its own.
+                    x = x.detach().requires_grad_(True)
+                    seed = 1.0 if reduction == 1 else 1.0 / weight_sum
+                    traced, _ = tp._C.nll_loss(x, t, w, reduction, -100)
+                    scale = traced.sum() * seed if reduction == 0 else traced * seed
+                    (grad,) = tp.autograd.grad(scale, [x])
+                    expected = np.zeros((rows, classes), np.float64)
+                    for i in range(rows):
+                        if codes[i] != -100:
+                            expected[i, codes[i]] = -(
+                                float(weight[codes[i]]) if weighted else 1.0)
+                            expected[i, codes[i]] /= weight_sum
+                    assert grad.dtype == tp_dtype, (tp_dtype, grad.dtype)
+                    np.testing.assert_allclose(
+                        grad.detach().to(tp.float32).numpy().astype(np.float64),
+                        expected, atol=tol, rtol=tol)
+
+    # A seed that reaches the walk as a slice of the rows keeps its own layout:
+    # only the rows the slice names receive an entry.
+    for tp_dtype, np_dtype, tol in ((tp.float32, np.float32, 1e-5),
+                                    (tp.float16, np.float16, 6e-3)):
+        rows, classes = 6, 5
+        host = np.log(np.linspace(0.2, 0.8, rows * classes)
+                      .reshape(rows, classes).astype(np_dtype))
+        codes = np.arange(rows) % classes
+        x = tp.tensor(host, dtype=tp_dtype,
+                      device=tp.device("cpu")).requires_grad_(True)
+        traced, _ = tp._C.nll_loss(x, tp.tensor(codes, device=tp.device("cpu")),
+                                   None, 0, -100)
+        (grad,) = tp.autograd.grad(traced[::2].sum(), [x])
+        wanted = np.zeros((rows, classes), np.float64)
+        for i in range(0, rows, 2):
+            wanted[i, codes[i]] = -1.0
+        np.testing.assert_allclose(
+            grad.detach().to(tp.float32).numpy().astype(np.float64),
+            wanted, atol=tol, rtol=tol)
+
+    integral = tp.tensor(np.zeros((4, 5), np.int32), dtype=tp.int32,
+                         device=tp.device("cpu"))
+    try:
+        tp._C.nll_loss(integral, tp.tensor(np.zeros(4, np.int64),
+                                           device=tp.device("cpu")),
+                       None, 1, -100)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("a likelihood loss read an integral plane")
+
+
 if __name__ == "__main__":
     test_conv2d()
     test_relu()
     test_max_pool2d()
     test_linear()
     test_cross_entropy()
+    test_likelihood_loss_in_narrow_planes()
 
 
 def test_activations_in_double_keep_double_precision():
