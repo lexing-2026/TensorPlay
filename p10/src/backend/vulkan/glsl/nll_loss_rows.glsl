@@ -31,8 +31,16 @@ uWeights;
 // clang-format off
 $if SELF_PACKED == 1:
   // A payload with an image form carries one class per texel along its width,
-  // so a class code moves the fetch along x and the row rides on y.
+  // so a class code moves the fetch along x and the row rides on y.  A narrow
+  // image reads through the same float sampler: the format conversion happens
+  // as the texel is fetched.
   layout(set = 0, binding = 2) uniform PRECISION sampler3D uSelf;
+$elif DTYPE == "half":
+  // A dense narrow payload shares one word between two classes.
+  layout(set = 0, binding = 2) buffer PRECISION restrict readonly Self {
+    uint data[];
+  }
+  uSelf;
 $else:
   layout(set = 0, binding = 2) buffer PRECISION restrict readonly Self {
     float data[];
@@ -83,6 +91,10 @@ void main() {
     $if SELF_PACKED == 1:
       const float picked =
           texelFetch(uSelf, ivec3(class_code, row, 0), 0).x;
+    $elif DTYPE == "half":
+      const int at = row * uBlock.classes + class_code;
+      const vec2 pair = unpackHalf2x16(uSelf.data[at >> 1]);
+      const float picked = (at & 1) == 0 ? pair.x : pair.y;
     $else:
       const float picked = uSelf.data[row * uBlock.classes + class_code];
     // clang-format on

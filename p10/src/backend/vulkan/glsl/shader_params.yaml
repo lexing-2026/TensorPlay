@@ -1846,6 +1846,7 @@ nll_loss_rows:
   parameter_names_with_default_values:
     SELF_PACKED: 1
     HAS_WEIGHT: 0
+    DTYPE: float
   shader_variants:
   - NAME: nll_loss_rows
     SELF_PACKED: 1
@@ -1859,10 +1860,19 @@ nll_loss_rows:
   - NAME: nll_loss_rows_buffer_weight
     SELF_PACKED: 0
     HAS_WEIGHT: 1
+  - NAME: nll_loss_rows_buffer_f16
+    SELF_PACKED: 0
+    HAS_WEIGHT: 0
+    DTYPE: half
+  - NAME: nll_loss_rows_buffer_f16_weight
+    SELF_PACKED: 0
+    HAS_WEIGHT: 1
+    DTYPE: half
 nll_loss_grad:
   parameter_names_with_default_values:
     SELF_PACKED: 1
     HAS_WEIGHT: 0
+    DTYPE: float
     FORMAT: rgba32f
   shader_variants:
   - NAME: nll_loss_grad
@@ -1877,6 +1887,24 @@ nll_loss_grad:
   - NAME: nll_loss_grad_buffer_weight
     SELF_PACKED: 0
     HAS_WEIGHT: 1
+  - NAME: nll_loss_grad_f16
+    SELF_PACKED: 1
+    HAS_WEIGHT: 0
+    DTYPE: half
+    FORMAT: rgba16f
+  - NAME: nll_loss_grad_f16_weight
+    SELF_PACKED: 1
+    HAS_WEIGHT: 1
+    DTYPE: half
+    FORMAT: rgba16f
+  - NAME: nll_loss_grad_buffer_f16
+    SELF_PACKED: 0
+    HAS_WEIGHT: 0
+    DTYPE: half
+  - NAME: nll_loss_grad_buffer_f16_weight
+    SELF_PACKED: 0
+    HAS_WEIGHT: 1
+    DTYPE: half
 quantized_binary_op:
   parameter_names_with_default_values:
     OPERATOR: X + Y

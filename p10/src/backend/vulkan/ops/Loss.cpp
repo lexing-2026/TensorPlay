@@ -69,8 +69,9 @@ struct LossShape final {
 
 LossShape loss_shape(const Tensor& self, const char* name) {
   TP_CHECK(
-      self.dtype() == DType::Float32,
-      std::string("Vulkan ") + name + " supports Float32 tensors only");
+      self.dtype() == DType::Float32 || self.dtype() == DType::Float16,
+      std::string("Vulkan ") + name +
+          " supports Float32 and Float16 tensors only");
   TP_CHECK(
       self.dim() == 1 || self.dim() == 2,
       std::string("Vulkan ") + name +
@@ -141,6 +142,13 @@ LossOperands prepare_operands(
   return operands;
 }
 
+// The rows walk totals in single precision whatever the likelihood plane was
+// read as, so a narrow plane rounds its loss and its normalizer once, at the end
+// of the walk.
+Tensor answered_as(const Tensor& totals, DType dtype) {
+  return totals.dtype() == dtype ? totals : tpx::ops::to(totals, dtype);
+}
+
 // One pass over the rows: each row reads the class its target names and answers
 // with its loss and the class weight it contributes to the normalizer.  Nothing
 // accumulates here, so a row neither reads nor races another row's word, and the
@@ -180,8 +188,14 @@ std::pair<Tensor, Tensor> loss_rows(
         0,
     };
     api::UniformParamsBuffer params(context, block);
+    // A dense narrow plane holds two classes per word, so its own walk reads the
+    // pair a word keeps; a plane with an image form needs no such variant, as
+    // the texel fetch converts the narrow component on its way in.
     std::string shader =
         packed ? "nll_loss_rows" : "nll_loss_rows_buffer";
+    if (!packed && self.dtype() == DType::Float16) {
+      shader += "_f16";
+    }
     if (has_weight) {
       shader += "_weight";
     }
@@ -245,9 +259,16 @@ Tensor grad_incoming(
       ? grad_output
       : grad_output.to(vulkan_device());
   TP_CHECK(
-      device_grad.dtype() == DType::Float32,
-      std::string("Vulkan ") + name + " supports Float32 gradients only");
-  const Tensor incoming = device_grad.contiguous();
+      device_grad.dtype() == DType::Float32 ||
+          device_grad.dtype() == DType::Float16,
+      std::string("Vulkan ") + name +
+          " answers from a Float32 or Float16 gradient");
+  // The walk reads the values it hands out as single-precision words, so a
+  // narrow gradient is widened here - one entry per row, or one shared entry -
+  // rather than in the pass over the plane.
+  const Tensor incoming = device_grad.dtype() == DType::Float32
+      ? device_grad.contiguous()
+      : tpx::ops::to(device_grad, DType::Float32).contiguous();
   TP_CHECK(
       incoming.numel() > 0,
       std::string("Vulkan ") + name + " expects a gradient to hand out");
@@ -298,11 +319,13 @@ std::tuple<Tensor, Tensor> nll_loss_kernel(
         shape.classes,
         loss_sizes);
     if (shape.unbatched) {
-      return {rows.first, tpx::ops::sum(rows.second)};
+      return {
+          answered_as(rows.first, self.dtype()),
+          answered_as(tpx::ops::sum(rows.second), self.dtype())};
     }
     return {
-        rows.first,
-        zeros_kernel({}, DType::Float32, self.device(), false)};
+        answered_as(rows.first, self.dtype()),
+        zeros_kernel({}, self.dtype(), self.device(), false)};
   }
 
   const auto rows =
@@ -312,10 +335,13 @@ std::tuple<Tensor, Tensor> nll_loss_kernel(
   const Tensor total_weight = tpx::ops::sum(rows.second);
   if (reduction == 1) {
     // Rows that all named the skipped code divide nothing by nothing, the
-    // answer an average over no rows takes.
+    // answer an average over no rows takes.  The divide runs in single
+    // precision, so a narrow plane is rounded only once its answer is known.
     loss_total = tpx::ops::div(loss_total, total_weight);
   }
-  return {loss_total, total_weight};
+  return {
+      answered_as(loss_total, self.dtype()),
+      answered_as(total_weight, self.dtype())};
 }
 
 Tensor nll_loss_backward_kernel(
@@ -348,7 +374,7 @@ Tensor nll_loss_backward_kernel(
       context,
       convert(self.contiguous()).storage_type(),
       std::vector<int64_t>(self.sizes().begin(), self.sizes().end()),
-      DType::Float32);
+      self.dtype());
   const bool packed =
       v_grad.storage_type() != api::StorageType::BUFFER;
 
@@ -397,19 +423,27 @@ Tensor nll_loss_backward_kernel(
   api::UniformParamsBuffer params(context, block);
 
   if (shape.rows > 0 && shape.classes > 0) {
+    const bool narrow = self.dtype() == DType::Float16;
+    // A narrow plane is stored as narrow texels or as two classes per word, so
+    // both storages answer with their own variant.
     std::string shader =
         packed ? "nll_loss_grad" : "nll_loss_grad_buffer";
+    if (narrow) {
+      shader += "_f16";
+    }
     if (operands.weight.defined()) {
       shader += "_weight";
     }
     api::PipelineBarrier barrier{};
     // Every element of the plane gets exactly one writer: the classes an image
-    // row holds ride along its width, and a dense plane walks word by word.
+    // row holds ride along its width, a dense plane walks word by word, and a
+    // dense narrow plane walks the pairs its words hold.
+    const int64_t elements = shape.rows * shape.classes;
     const api::utils::uvec3 extent = packed
         ? v_grad.extents()
         : api::utils::uvec3{
               api::utils::safe_downcast_to_u32(
-                  shape.rows * shape.classes),
+                  narrow ? (elements + 1) / 2 : elements),
               1u,
               1u};
     const api::utils::uvec3 local = packed
