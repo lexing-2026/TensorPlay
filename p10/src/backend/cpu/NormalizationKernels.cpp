@@ -1604,12 +1604,184 @@ std::tuple<Tensor, Tensor> fused_rms_norm_cpu(
     TP_THROW(NotImplementedError, "rms_norm_cpu: unsupported dtype");
 }
 
+// Row walk of the fused RMS norm backward.  The statistic the forward saved
+// shrank the row to its root mean square, so with rstd = rsqrt(mean(x^2)+eps)
+// and N the normalized width,
+//
+//   dx_j = rstd * dy_j * w_j - x_j * rstd^2 / N * sum_i (dy_i * w_i * x_i * rstd)
+//   dw_j = sum_rows dy_rj * x_rj * rstd_r
+//
+// one walk collects the sum the second walk subtracts, and the weight
+// gradient falls out of the same products without another pass over the rows.
+template <typename T, typename Acc, bool HasWeight>
+void rms_norm_backward_one_row(
+    const T* grad, const T* input, const T* weight, T* grad_input,
+    Acc inv, Acc f_cols, int64_t cols, Acc* partial_row) {
+    Acc projection = Acc(0);
+    for (int64_t j = 0; j < cols; ++j) {
+        const Acc g = static_cast<Acc>(grad[j]);
+        const Acc x = static_cast<Acc>(input[j]);
+        const Acc gx = HasWeight ? g * static_cast<Acc>(weight[j]) * x : g * x;
+        projection += gx * inv;
+        // The weight gradient reads the same product without the weight.
+        if (partial_row) partial_row[j] += (HasWeight ? g * x : gx) * inv;
+    }
+    if (!grad_input) return;
+    const Acc scale = inv / f_cols;
+    for (int64_t j = 0; j < cols; ++j) {
+        const Acc g = static_cast<Acc>(grad[j]);
+        const Acc x = static_cast<Acc>(input[j]);
+        const Acc gw = HasWeight ? g * static_cast<Acc>(weight[j]) : g;
+        grad_input[j] = static_cast<T>((f_cols * gw - x * inv * projection) * scale);
+    }
+}
+
+template <typename T, typename Acc>
+void rms_norm_backward_rows(
+    const T* grad_output, const T* input, const Acc* rstd, const T* weight,
+    int64_t rows, int64_t cols, T* grad_input, std::vector<Acc>& partial) {
+    const bool want_weight = !partial.empty();
+    const Acc f_cols = static_cast<Acc>(cols);
+    const int64_t grain = std::max<int64_t>(
+        1, tensorplay::parallel::GRAIN_SIZE / std::max<int64_t>(cols, 1));
+    tensorplay::parallel::parallel_for(0, rows, grain, [&](int64_t rb, int64_t re) {
+        Acc* partial_row = want_weight
+            ? partial.data() + static_cast<size_t>(
+                  tensorplay::parallel::get_thread_num()) * static_cast<size_t>(cols)
+            : nullptr;
+        for (int64_t i = rb; i < re; ++i) {
+            const int64_t offset = i * cols;
+            const Acc inv = rstd[i];
+            T* row_out = grad_input ? grad_input + offset : nullptr;
+            if (weight) {
+                rms_norm_backward_one_row<T, Acc, true>(
+                    grad_output + offset, input + offset, weight, row_out,
+                    inv, f_cols, cols, partial_row);
+            } else {
+                rms_norm_backward_one_row<T, Acc, false>(
+                    grad_output + offset, input + offset, nullptr, row_out,
+                    inv, f_cols, cols, partial_row);
+            }
+        }
+    });
+}
+
+template <typename T, typename Acc>
+std::tuple<Tensor, Tensor> rms_norm_backward_cpu_typed(
+    const Tensor& grad_output, const Tensor& input,
+    const std::vector<int64_t>& normalized_shape, const Tensor& rstd,
+    const std::optional<Tensor>& weight_opt,
+    const std::vector<bool>& output_mask) {
+    const int64_t input_ndim = input.dim();
+    const int64_t norm_ndim = static_cast<int64_t>(normalized_shape.size());
+    if (norm_ndim > input_ndim)
+        TP_THROW(RuntimeError,
+                 "rms_norm_backward: normalized_shape dim larger than input dim");
+    int64_t inner_size = 1;
+    for (int64_t i = 0; i < norm_ndim; ++i) {
+        if (input.size(input_ndim - norm_ndim + i) != normalized_shape[i])
+            TP_THROW(RuntimeError,
+                     "rms_norm_backward: Input shape mismatch with normalized_shape");
+        inner_size *= normalized_shape[i];
+    }
+    if (grad_output.numel() != input.numel() ||
+        grad_output.dtype() != input.dtype())
+        TP_THROW(RuntimeError,
+                 "rms_norm_backward: grad_output must match input");
+    const int64_t outer_size = inner_size == 0 ? 0 : input.numel() / inner_size;
+    const bool has_w = weight_opt.has_value() && weight_opt->defined();
+    if (has_w && weight_opt->numel() != inner_size)
+        TP_THROW(RuntimeError, "rms_norm_backward: weight shape mismatch");
+    if (rstd.numel() != outer_size)
+        TP_THROW(RuntimeError,
+                 "rms_norm_backward: saved rstd must have one value per row");
+
+    const bool want_input = output_mask.empty() || output_mask[0];
+    const bool want_weight = output_mask.size() > 1 && output_mask[1] && has_w;
+    Tensor grad_input = want_input ? Tensor::empty_like(input) : Tensor();
+    Tensor grad_weight = want_weight
+        ? Tensor::empty({inner_size}, input.dtype(), input.device())
+        : Tensor();
+    if (outer_size == 0 || inner_size == 0) return {grad_input, grad_weight};
+
+    // The row walk reads packed rows, so a view is read from a packed copy.
+    const Tensor grad_c = grad_output.contiguous();
+    const Tensor input_c = input.contiguous();
+    const Tensor weight_c = has_w ? weight_opt->contiguous() : Tensor();
+    const Tensor rstd_c = rstd.contiguous();
+    const DType acc_dtype =
+        std::is_same<Acc, double>::value ? DType::Float64 : DType::Float32;
+    // The forward may have saved the statistic in another float precision.
+    const Tensor rstd_acc = rstd_c.dtype() == acc_dtype
+        ? rstd_c
+        : rstd_c.to(acc_dtype);
+
+    const int64_t threads = tensorplay::parallel::get_num_threads();
+    std::vector<Acc> partial;
+    if (want_weight) {
+        partial.assign(static_cast<size_t>(threads) * static_cast<size_t>(inner_size),
+                       Acc(0));
+    }
+    rms_norm_backward_rows<T, Acc>(
+        static_cast<const T*>(grad_c.data_ptr()),
+        static_cast<const T*>(input_c.data_ptr()),
+        static_cast<const Acc*>(rstd_acc.data_ptr()),
+        has_w ? static_cast<const T*>(weight_c.data_ptr()) : nullptr,
+        outer_size, inner_size,
+        want_input ? static_cast<T*>(grad_input.data_ptr()) : nullptr,
+        partial);
+
+    if (want_weight) {
+        T* dw = static_cast<T*>(grad_weight.data_ptr());
+        const int64_t grain = std::max<int64_t>(1, inner_size / (threads * 4));
+        tensorplay::parallel::parallel_for(0, inner_size, grain, [&](int64_t b, int64_t e) {
+            for (int64_t j = b; j < e; ++j) {
+                Acc acc = Acc(0);
+                for (int64_t t = 0; t < threads; ++t)
+                    acc += partial[static_cast<size_t>(t) * static_cast<size_t>(inner_size) +
+                                   static_cast<size_t>(j)];
+                dw[j] = static_cast<T>(acc);
+            }
+        });
+    }
+    return {grad_input, grad_weight};
+}
+
+std::tuple<Tensor, Tensor> fused_rms_norm_backward_cpu(
+    const Tensor& grad_output, const Tensor& input,
+    const std::vector<int64_t>& normalized_shape, const Tensor& rstd,
+    const std::optional<Tensor>& weight_opt,
+    const std::vector<bool>& output_mask) {
+    switch (input.dtype()) {
+        case DType::Float32:
+            return rms_norm_backward_cpu_typed<float, float>(
+                grad_output, input, normalized_shape, rstd, weight_opt,
+                output_mask);
+        case DType::Float64:
+            return rms_norm_backward_cpu_typed<double, double>(
+                grad_output, input, normalized_shape, rstd, weight_opt,
+                output_mask);
+        case DType::Float16:
+            return rms_norm_backward_cpu_typed<tensorplay::Half, float>(
+                grad_output, input, normalized_shape, rstd, weight_opt,
+                output_mask);
+        case DType::BFloat16:
+            return rms_norm_backward_cpu_typed<tensorplay::BFloat16, float>(
+                grad_output, input, normalized_shape, rstd, weight_opt,
+                output_mask);
+        default:
+            TP_THROW(NotImplementedError,
+                     "rms_norm_backward: unsupported dtype");
+    }
+}
+
 // Registration
 TENSORPLAY_LIBRARY_IMPL(CPU, NormalizationKernels) {
     m.impl("layer_norm", layer_norm_cpu);
     m.impl("group_norm", group_norm_cpu);
     m.impl("rms_norm", rms_norm_cpu);
     m.impl("_fused_rms_norm", fused_rms_norm_cpu);
+    m.impl("_fused_rms_norm_backward", fused_rms_norm_backward_cpu);
 
     m.impl("layer_norm_backward", layer_norm_backward_cpu);
     m.impl("group_norm_backward", group_norm_backward_cpu);

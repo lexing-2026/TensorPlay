@@ -1195,8 +1195,7 @@ def test_reduction_decompositions_follow_their_contracts():
 
 
 def test_fused_rms_norm_against_formula_and_autograd():
-    # No CPU kernel serves these overloads; the oracle is the formula itself
-    # and its autograd gradient.
+    # The oracle is the formula itself and its autograd gradient.
     get_decompositions([])
     x = _t(3, 4)
     w = _unit(4)

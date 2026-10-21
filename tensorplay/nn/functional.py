@@ -3483,7 +3483,7 @@ _CPU_FUSED_DTYPES = frozenset(
     (tensorplay.float16, tensorplay.bfloat16, tensorplay.float32, tensorplay.float64))
 
 # The devices that carry a fused normalization together with its backward.
-_FUSED_RMS_NORM_DEVICES = frozenset(("cuda",))
+_FUSED_RMS_NORM_DEVICES = frozenset(("cuda", "cpu"))
 
 # Element types the fused cuda attention kernel computes in.  A wider
 # precision has no kernel there and stays on the composed reference.
