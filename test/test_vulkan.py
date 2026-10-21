@@ -4613,6 +4613,167 @@ class TestVulkanMaskLogic(unittest.TestCase):
             F.bitwise_not(ints)
 
 
+class TestVulkanComparisonBroadcast(unittest.TestCase):
+    # Two payloads merge into one broadcast shape, and a plane narrower than the
+    # answer is repeated inside the kernel instead of being materialized first.
+    # A texel operand is addressed through its own geometry, a linear one
+    # through row-major strides, so both storages need the arithmetic: a
+    # vocabulary row lives in buffers, where a singleton costs one element
+    # rather than one texel.
+
+    OPERATORS = (
+        ("gt", lambda a, b: a > b),
+        ("ge", lambda a, b: a >= b),
+        ("lt", lambda a, b: a < b),
+        ("le", lambda a, b: a <= b),
+        ("eq", lambda a, b: a == b),
+        ("ne", lambda a, b: a != b),
+    )
+    SHAPES = (
+        ((3, 4), (1, 4)),          # one row repeats
+        ((3, 4), (3, 1)),          # one channel repeats
+        ((4,), (3, 4)),            # rank left-padded
+        ((2, 3, 4, 5), (2, 1, 1, 5)),  # a mask across heads
+        ((2, 3, 4, 5), (1, 1, 4, 5)),
+        ((2, 3, 4, 5), (2, 3, 1, 5)),
+    )
+
+    def _check(self, host_a, host_b, label):
+        for name, apply_op in self.OPERATORS:
+            got = apply_op(host_a.to("vulkan"), host_b.to("vulkan"))
+            want = apply_op(host_a, host_b)
+            self.assertEqual(got.dtype, tensorplay.bool, msg=f"{name} {label}")
+            np.testing.assert_array_equal(
+                got.cpu().numpy(), want.cpu().numpy(),
+                err_msg=f"{name} {label}")
+
+    def _pair(self, shape_a, shape_b, seed, kind="float", scale=6.0):
+        rng = np.random.default_rng(seed)
+
+        def make(shape):
+            if kind == "half":
+                values = (rng.standard_normal(shape) * scale).astype(np.float16)
+                dtype = tensorplay.float16
+            elif kind == "int32":
+                values = rng.integers(-999, 1000, shape).astype(np.int32)
+                dtype = tensorplay.int32
+            elif kind == "int64":
+                values = rng.integers(
+                    -(2 ** 62), 2 ** 62, shape).astype(np.int64)
+                dtype = tensorplay.int64
+            else:
+                values = (rng.standard_normal(shape) * scale).astype(np.float32)
+                dtype = tensorplay.float32
+            return tensorplay.tensor(values, dtype=dtype)
+
+        return make(shape_a), make(shape_b)
+
+    def test_texel_planes_compare_across_the_broadcast_shape(self):
+        for i, (shape_a, shape_b) in enumerate(self.SHAPES):
+            a, b = self._pair(shape_a, shape_b, 41 + i)
+            self._check(a, b, f"{shape_a} against {shape_b}")
+            # Swapping the pair swaps which plane repeats.
+            self._check(b, a, f"{shape_b} against {shape_a} swapped")
+
+    def test_halves_compare_across_the_broadcast_shape(self):
+        for i, (shape_a, shape_b) in enumerate(self.SHAPES):
+            a, b = self._pair(shape_a, shape_b, 61 + i, kind="half", scale=3.0)
+            self._check(a, b, f"half {shape_a} against {shape_b}")
+
+    def test_linear_planes_compare_across_a_broadcast(self):
+        # A row past the image-axis limit has no texel form, so the answer is
+        # packed one byte per element into buffers; a length that is not a
+        # multiple of four leaves a partial result word.
+        for count in (100000, 100001, 100003):
+            rng = np.random.default_rng(71 + count % 7)
+            row = tensorplay.tensor(
+                (rng.standard_normal((count,)) * 5).astype(np.float32))
+            one = tensorplay.tensor(np.array([0.25], dtype=np.float32))
+            self._check(row, one, f"float row {count} against one element")
+            self._check(one, row, f"one element against float row {count}")
+            ints = tensorplay.tensor(
+                rng.integers(-999, 1000, (count,)).astype(np.int32),
+                dtype=tensorplay.int32)
+            one_int = tensorplay.tensor(
+                np.array([7], dtype=np.int32), dtype=tensorplay.int32)
+            self._check(ints, one_int, f"int row {count} against one element")
+
+    def test_a_mask_row_of_a_vocabulary_compares_broadcast(self):
+        # The shape a logits mask arrives in: one threshold per batch row
+        # against a whole vocabulary.
+        rng = np.random.default_rng(83)
+        B, V = 4, 60000
+        logits = tensorplay.tensor(
+            (rng.standard_normal((B, V)) * 20).astype(np.float32))
+        threshold = tensorplay.tensor(
+            (rng.standard_normal((B, 1)) * 20).astype(np.float32))
+        self._check(logits, threshold, f"({B}, {V}) against ({B}, 1)")
+        ints = tensorplay.tensor(
+            rng.integers(-100000, 100000, (B, V)).astype(np.int32),
+            dtype=tensorplay.int32)
+        codes = tensorplay.tensor(
+            rng.integers(-3, 4, (B, 1)).astype(np.int32),
+            dtype=tensorplay.int32)
+        self._check(ints, codes, "int32 vocabulary against per-row codes")
+
+    def test_counts_wider_than_a_word_compare_elementwise(self):
+        # An Int64 payload carries one element per pair of words, so the
+        # decision has to be taken word against word, with the sign living in
+        # the high word.
+        values = np.array(
+            [0, -1, 1, -(2 ** 63), 2 ** 63 - 1, -(2 ** 62), 2 ** 62, 5, -5,
+             2 ** 31, -(2 ** 31) - 1, 7, -7, 3],
+            dtype=np.int64)
+        other = np.array(
+            [0, 0, 0, 2 ** 63 - 1, -(2 ** 63), 2 ** 62 - 1, -(2 ** 62), -5, 5,
+             2 ** 31 - 1, -(2 ** 31), 8, -6, 3],
+            dtype=np.int64)
+        a = tensorplay.tensor(values.copy(), dtype=tensorplay.int64)
+        b = tensorplay.tensor(other.copy(), dtype=tensorplay.int64)
+        self._check(a, b, "int64 equal shapes")
+        # A tail that does not fill a result word.
+        self._check(a.narrow(0, 0, 9), b.narrow(0, 0, 9), "int64 odd length")
+
+    def test_counts_wider_than_a_word_compare_broadcast(self):
+        rng = np.random.default_rng(89)
+        rows, cols = 14, 3
+        wide = tensorplay.tensor(
+            rng.integers(-(2 ** 60), 2 ** 60, (rows, cols),
+                         dtype=np.int64),
+            dtype=tensorplay.int64)
+        per_row = tensorplay.tensor(
+            rng.integers(-(2 ** 60), 2 ** 60, (rows, 1), dtype=np.int64),
+            dtype=tensorplay.int64)
+        self._check(wide, per_row, "int64 column repeat")
+        self._check(per_row, wide, "int64 column repeat swapped")
+        one = tensorplay.tensor(
+            np.array([-(2 ** 63)], dtype=np.int64), dtype=tensorplay.int64)
+        self._check(wide, one, "int64 against one element")
+
+    def test_a_wider_count_and_a_word_cannot_share_a_kernel(self):
+        import tensorplay.functional as F
+        # The scalar form has no wide kernel, so a count beyond a word keeps its
+        # own request refused rather than being read as a word.
+        counts = tensorplay.tensor(
+            np.array([1, 2, 3], dtype=np.int64),
+            dtype=tensorplay.int64).to("vulkan")
+        with self.assertRaisesRegex(RuntimeError, "unsupported dtype"):
+            F.ge(counts, 2)
+        with self.assertRaisesRegex(RuntimeError, "unsupported dtype"):
+            counts > 2
+
+    def test_a_causal_mask_keeps_its_strict_triangle(self):
+        # The additive mask of attention is one comparison of two ranges: a row
+        # keeps every key up to and including its own position.
+        Sq, Skv = 5, 7
+        rows = np.arange(Sq, dtype=np.int64).reshape(Sq, 1)
+        cols = np.arange(Skv, dtype=np.int64).reshape(1, Skv)
+        a = tensorplay.tensor(rows.copy(), dtype=tensorplay.int64)
+        b = tensorplay.tensor(cols.copy(), dtype=tensorplay.int64)
+        got = (a >= b).cpu().numpy()
+        np.testing.assert_array_equal(got, rows >= cols, err_msg="causal keep")
+
+
 class TestVulkanWhereBranches(unittest.TestCase):
     # A select reads both branches in one element width.  Pairing a single
     # precision plane with a signed-word plane therefore cannot read the word as
