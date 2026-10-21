@@ -74,7 +74,11 @@ void softmax_backward_data_loop(const scalar_t* grad, const scalar_t* out,
                                 scalar_t* grad_in, int64_t outer, int64_t inner,
                                 int64_t dim_size) {
     const int64_t outer_stride = dim_size * inner;
-    parallel_for(0, outer * inner, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+    // One task walks a whole column, so the grain counts the columns a chunk
+    // covers rather than the elements it touches.
+    const int64_t grain = std::max<int64_t>(
+        1, GRAIN_SIZE / std::max<int64_t>(dim_size * inner, 1));
+    parallel_for(0, outer * inner, grain, [&](int64_t begin, int64_t end) {
         for (int64_t i = begin; i < end; ++i) {
             const int64_t o = i / inner;
             const int64_t in = i % inner;

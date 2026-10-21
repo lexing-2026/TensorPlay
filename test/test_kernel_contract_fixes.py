@@ -407,6 +407,19 @@ def test_index_add_with_a_scalar_source_adds_it_everywhere_indexed():
 
 
 @pytest.mark.parametrize("device", DEVICES)
+def test_softmax_backward_answers_the_formula_on_a_wide_row(device):
+    # A row wide enough to be split over the pool still answers the formula:
+    # out * (grad - sum(grad * out)).
+    tp.manual_seed(0)
+    x = tp.randn(1024, 512, device=device)
+    grad = tp.randn(1024, 512, device=device)
+    out = tp.softmax(x, -1)
+    got = tp._C._softmax_backward_data(grad, out, -1, grad.dtype)
+    expected = out * (grad - (grad * out).sum(-1, keepdim=True))
+    assert _close(got, expected, tol=1e-5)
+
+
+@pytest.mark.parametrize("device", DEVICES)
 def test_index_add_in_place_sums_into_the_caller_s_buffer(device):
     # The in-place form writes into the caller's tensor, so a repeated index
     # adds its rows one after another, just like the out-of-place form.
