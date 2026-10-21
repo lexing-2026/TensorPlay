@@ -23,6 +23,23 @@ api::vTensor to_buffer_storage_dispatch(
     api::Context* context,
     const api::vTensor& src);
 
+// Also defined in BinaryOp.cpp: the element walk every binary op shares, with
+// the broadcasting and the two storages already routed.
+Tensor binary_op_tensor_dispatch(
+    const char* shader_name,
+    const char* buffer_shader_name,
+    const Tensor& self_arg,
+    const Tensor& other_arg,
+    const Scalar& alpha,
+    const char* name);
+Tensor binary_op_scalar_dispatch(
+    const char* shader_name,
+    const char* buffer_shader_name,
+    const Tensor& self_arg,
+    const Scalar& other,
+    const Scalar& alpha,
+    const char* name);
+
 namespace {
 
 // Invocations owning one row each, so a walk asks for a group of this width.
@@ -488,6 +505,58 @@ Tensor nll_loss_backward_kernel(
   return convert(v_grad);
 }
 
+// A plane compared with another plane: one walk reads both and lays down the
+// square of how far each element sits from the value it is matched with.  The
+// squares answer as one payload, so a loss that totals them is a reduction away
+// rather than two element walks and a difference kept on the device.
+Tensor mse_loss_kernel(
+    const Tensor& self,
+    const Tensor& target,
+    int64_t reduction) {
+  constexpr const char* kName = "mse_loss";
+  TP_CHECK(
+      reduction >= 0 && reduction <= 2,
+      std::string("Vulkan ") + kName + ": invalid reduction mode");
+  const Tensor compared =
+      target.device().is_vulkan() ? target : target.to(vulkan_device());
+  const Tensor squared = binary_op_tensor_dispatch(
+      "sq_diff", "buffer_sq_diff", self, compared, Scalar(1.0), kName);
+  if (reduction == 0) {
+    return squared;
+  }
+  return reduction == 1 ? tpx::ops::mean(squared) : tpx::ops::sum(squared);
+}
+
+// The gradient one element of the plane hands back is twice its distance from
+// the value it was compared with, shared by the count that was averaged when
+// the loss asks for an average, and carried by whatever the loss is answered
+// with.
+Tensor mse_loss_backward_kernel(
+    const Tensor& grad_output,
+    const Tensor& self,
+    const Tensor& target,
+    int64_t reduction) {
+  constexpr const char* kName = "mse_loss_backward";
+  TP_CHECK(
+      reduction >= 0 && reduction <= 2,
+      std::string("Vulkan ") + kName + ": invalid reduction mode");
+  const double norm = reduction == 1
+      ? 2.0 / static_cast<double>(self.numel())
+      : 2.0;
+  const Tensor compared =
+      target.device().is_vulkan() ? target : target.to(vulkan_device());
+  const Tensor incoming = grad_output.device().is_vulkan()
+      ? grad_output
+      : grad_output.to(vulkan_device());
+  Tensor difference = binary_op_tensor_dispatch(
+      "sub", "buffer_sub", self, compared, Scalar(1.0), kName);
+  difference = binary_op_scalar_dispatch(
+      "mul_scalar", "buffer_mul_scalar", difference, Scalar(norm),
+      Scalar(1.0), kName);
+  return binary_op_tensor_dispatch(
+      "mul", "buffer_mul", difference, incoming, Scalar(1.0), kName);
+}
+
 } // namespace ops
 } // namespace vulkan
 } // namespace tensorplay
@@ -497,6 +566,10 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, LossKernels) {
   m.impl(
       "nll_loss_backward",
       &tensorplay::vulkan::ops::nll_loss_backward_kernel);
+  m.impl("mse_loss", &tensorplay::vulkan::ops::mse_loss_kernel);
+  m.impl(
+      "mse_loss_backward",
+      &tensorplay::vulkan::ops::mse_loss_backward_kernel);
 }
 
 #endif /* USE_VULKAN */

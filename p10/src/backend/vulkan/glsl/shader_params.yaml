@@ -501,6 +501,10 @@ buffer_binary_op_tensor:
     OPERATOR: atan(X, Y)
   - NAME: buffer_logaddexp
     OPERATOR: max(X, Y) + log(1.0f + exp(-abs(X - Y)))
+  # The linear twin of the squared difference: one walk answers what a subtract
+  # and a multiply would take two to lay down.
+  - NAME: buffer_sq_diff
+    OPERATOR: (X - Y) * (X - Y)
 buffer_binary_op_scalar:
   parameter_names_with_default_values:
     OPERATOR: X + A * Y
@@ -2538,6 +2542,9 @@ buffer_half_binary_op_tensor:
   - NAME: buffer_remainder_halfinplace
     OPERATOR: 'X - Y * floor(X / Y)'
     INPLACE: true
+  - NAME: buffer_sq_diff_half
+    OPERATOR: '(X - Y) * (X - Y)'
+    INPLACE: false
   - NAME: buffer_sub_half
     OPERATOR: 'X - A * Y'
     INPLACE: false
