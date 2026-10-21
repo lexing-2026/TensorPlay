@@ -3173,13 +3173,22 @@ class TestVulkanHalfGather(unittest.TestCase):
                 got.view(np.uint16), table_np[sel].view(np.uint16),
                 err_msg=f"flat half gather at {count} indices")
 
-    def test_half_gather_rejects_integer_table(self):
+    def test_a_counting_table_this_long_is_read_in_words(self):
+        # A payload this flat has no image form, so the codes travel through
+        # linear storage; a per-position gather still asks for a measure and so
+        # refuses what a count is.
         import tensorplay.functional as F
-        device = tensorplay.from_numpy(
-            np.arange(200003, dtype=np.int32)).to("vulkan")
-        sel = tensorplay.from_numpy(np.arange(8, dtype=np.int32)).to("vulkan")
+        table = np.arange(200003, dtype=np.int32)
+        device = tensorplay.from_numpy(table.copy()).to("vulkan")
+        sel = np.arange(0, 200003, 25000, dtype=np.int32)
+        got = F.index_select(
+            device, 0, tensorplay.from_numpy(sel.copy()).to("vulkan"))
+        np.testing.assert_array_equal(
+            got.cpu().numpy(), table[sel], err_msg="long int32 table")
+        self.assertEqual(got.dtype, tensorplay.int32)
         with self.assertRaisesRegex(RuntimeError, "Float32 and Float16"):
-            F.index_select(device, 0, sel)
+            tensorplay.gather(
+                device, 0, tensorplay.from_numpy(sel.copy()).to("vulkan"))
 
 
 class TestVulkanHalfCat(unittest.TestCase):
@@ -8905,6 +8914,140 @@ class TestVulkanHalfSelection(unittest.TestCase):
     def test_a_count_refuses_to_order(self):
         with self.assertRaisesRegex(RuntimeError, "Float32 and Float16"):
             tensorplay.from_numpy(np.zeros((3, 4), np.int64)).to("vulkan").sort()
+
+
+class TestVulkanCountingRowLookup(unittest.TestCase):
+    """A table whose rows hold counts is a table like any other: an id column,
+    a list of positions, the row of codes a decode step reads out of a cached
+    beam.  A row lookup never opens what the row carries, so the answer is the
+    same codes in the order the list names - but the width of a count still
+    decides which kernel moves it."""
+
+    @staticmethod
+    def _uploaded(values):
+        # A payload that arrives from the host keeps the image form its shape
+        # allows.
+        return tensorplay.from_numpy(np.asarray(values)).to("vulkan")
+
+    @staticmethod
+    def _built(values):
+        # A payload the device lays out itself keeps its elements in words.
+        return tensorplay.tensor(np.asarray(values), device="vulkan")
+
+    @staticmethod
+    def _codes(values):
+        return tensorplay.from_numpy(np.asarray(values)).to("vulkan")
+
+    @staticmethod
+    def _rows(rows, cols):
+        r = np.arange(rows, dtype=np.int64)[:, None]
+        c = np.arange(cols, dtype=np.int64)[None, :]
+        return (r * 977 + c * 131) % 4000000019 - 50000
+
+    def _selected(self, make, table, axis, sel, dtype, label):
+        import tensorplay.functional as F
+        out = F.index_select(make(table), axis, self._codes(sel))
+        self.assertEqual(out.dtype, dtype, msg=label)
+        np.testing.assert_array_equal(
+            out.cpu().numpy(), np.take(np.asarray(table), sel, axis=axis),
+            err_msg=label)
+
+    def test_a_column_of_counts_selects_its_rows(self):
+        for dtype in (np.int32, np.int64):
+            table = self._rows(60, 7).astype(dtype)
+            element = (tensorplay.int32 if dtype is np.int32
+                       else tensorplay.int64)
+            for axis, sel in ((0, np.array([0, 59, 3, 3, 41, 17], np.int64)),
+                              (1, np.array([0, 6, 2, 5, 1, 0], np.int64))):
+                for make in (self._uploaded, self._built):
+                    self._selected(
+                        make, table, axis, sel, element,
+                        f"{make.__name__} {np.dtype(dtype).name} axis {axis}")
+
+    def test_a_counting_table_beyond_an_image_axis_is_read_in_words(self):
+        # A flat payload this long has no texel route, so every code is moved
+        # through linear storage a word (or a pair of words) at a time.
+        for dtype in (np.int32, np.int64):
+            table = self._rows(20000, 3).astype(dtype)
+            rng = np.random.default_rng(51)
+            sel = rng.integers(0, 20000, 777)
+            for make in (self._uploaded, self._built):
+                self._selected(
+                    make, table, 0, sel,
+                    tensorplay.int32 if dtype is np.int32 else tensorplay.int64,
+                    f"{make.__name__} {np.dtype(dtype).name} long table")
+
+    def test_a_row_width_that_is_not_a_group_of_words_straddles_them(self):
+        # Five counts do not fill a group of four lanes, so the tail of one row
+        # shares its words with the head of the next; a code that lands in that
+        # tail has to be read out of the right lane.
+        for dtype in (np.int32, np.int64):
+            element = (tensorplay.int32 if dtype is np.int32
+                       else tensorplay.int64)
+            table = self._rows(900, 5).astype(dtype)
+            self._selected(
+                self._built, table, 1, np.array([0, 4, 1, 3], np.int64),
+                element, f"{np.dtype(dtype).name} row tail, columns")
+            self._selected(
+                self._built, table, 0, np.arange(0, 900, 7, dtype=np.int64),
+                element, f"{np.dtype(dtype).name} row tail, rows")
+
+    def test_a_wide_count_keeps_every_bit_it_carries(self):
+        # A code past the reach of one word lives in its high half: the answer
+        # must show it, not the low word alone.
+        r = np.arange(500, dtype=np.int64)[:, None]
+        table = (r * 9000000000 + np.arange(4, dtype=np.int64)[None, :]).astype(
+            np.int64)
+        self.assertTrue(int(table.max()) > 2**32)
+        payload = self._built(table)
+        sel = np.array([0, 499, 250, 250, 7], dtype=np.int64)
+        import tensorplay.functional as F
+        got = F.index_select(payload, 0, self._codes(sel)).cpu().numpy()
+        np.testing.assert_array_equal(got, table[sel], err_msg="wide rows")
+        flat = self._built(table.reshape(-1))
+        picked = tensorplay.take(
+            flat, self._codes(np.array([0, -1, 1999, 0], np.int64)))
+        want = table.reshape(-1)[[0, -1, 1999, 0]]
+        np.testing.assert_array_equal(
+            picked.cpu().numpy(), want, err_msg="wide flat lookup")
+
+    def test_a_flat_lookup_of_counts_keeps_the_list_shape(self):
+        table = self._rows(40, 9).astype(np.int32)
+        rng = np.random.default_rng(52)
+        codes = rng.integers(-360, 360, (3, 2, 5))
+        for make in (self._uploaded, self._built):
+            got = tensorplay.take(make(table), self._codes(codes))
+            self.assertEqual(tuple(got.shape), (3, 2, 5))
+            np.testing.assert_array_equal(
+                got.cpu().numpy(), table.reshape(-1)[codes],
+                err_msg=f"{make.__name__} counting take")
+
+    def test_a_code_naming_no_row_contributes_a_zero(self):
+        # The answer the other row lookups of this backend already give.
+        import tensorplay.functional as F
+        for dtype in (np.int32, np.int64):
+            table = self._rows(24, 6).astype(dtype)
+            sel = np.array([24, -1, 5, 1000, 2, -99], dtype=np.int64)
+            want = np.zeros((len(sel), 6), table.dtype)
+            want[2] = table[5]
+            want[4] = table[2]
+            for make in (self._uploaded, self._built):
+                got = F.index_select(
+                    make(table), 0, self._codes(sel)).cpu().numpy()
+                np.testing.assert_array_equal(
+                    got, want,
+                    err_msg=f"{np.dtype(dtype).name} {make.__name__} dead code")
+
+    def test_a_payload_narrower_than_a_word_still_refuses(self):
+        payload = tensorplay.from_numpy(
+            np.zeros((4, 3), np.bool_)).to("vulkan")
+        with self.assertRaisesRegex(
+                RuntimeError, "Float32, Float16, Int32 and Int64"):
+            tensorplay.functional.index_select(
+                payload, 0, self._codes(np.array([0, 1], np.int64)))
+        with self.assertRaisesRegex(
+                RuntimeError, "Float32, Float16, Int32 and Int64"):
+            tensorplay.take(payload, self._codes(np.array([0], np.int64)))
 
 
 class TestVulkanBernoulliOutOfPlace(unittest.TestCase):
