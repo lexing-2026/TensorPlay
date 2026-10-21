@@ -54,6 +54,22 @@ api::vTensor to_buffer_storage_dispatch(
     api::Context* context,
     const api::vTensor& src);
 
+// Defined in Copy.cpp; the element type conversion entry point.
+Tensor to_dtype_kernel(
+    const Tensor& self,
+    DType dtype,
+    bool non_blocking,
+    bool copy,
+    std::optional<int64_t> memory_format);
+
+// Defined in Indexing.cpp; writes each source row into the destination row the
+// matching index entry names.
+Tensor& index_copy__kernel(
+    Tensor& self,
+    int64_t dim,
+    const Tensor& index,
+    const Tensor& source);
+
 namespace {
 
 //
@@ -976,6 +992,99 @@ Tensor narrow_kernel(const Tensor& self, int64_t dim, int64_t start,
   return slice_kernel(self, dim, start, start + length, 1);
 }
 
+// Writing a block back into a payload is the slice read backwards: the same
+// bounds decide where the block belongs, and everything the block does not
+// cover keeps the value it was read with.  A step of one therefore splices the
+// source between the head and the tail of the payload it falls into.  A wider
+// step leaves the rows between the ones it names, so each row the window keeps
+// is named in turn and written by the scatter that reads an index.
+Tensor slice_scatter_kernel(
+    const Tensor& self,
+    const Tensor& src,
+    int64_t dim,
+    std::optional<int64_t> start,
+    std::optional<int64_t> end,
+    int64_t step) {
+  TP_CHECK(
+      self.dtype() == DType::Float32 || self.dtype() == DType::Float16,
+      "Vulkan slice_scatter supports Float32 and Float16 tensors only");
+  TP_CHECK(step > 0, "Vulkan slice_scatter: step must be positive");
+  TP_CHECK(
+      self.dim() >= 1 && self.dim() <= 4,
+      "Vulkan slice_scatter supports 1d to 4d tensors");
+
+  const int64_t ndim = self.dim();
+  dim = dim < 0 ? dim + ndim : dim;
+  TP_CHECK(dim >= 0 && dim < ndim, "Vulkan slice_scatter: dim out of range");
+
+  const int64_t length = self.size(dim);
+  const int64_t raw_start = start.value_or(0);
+  const int64_t raw_end = end.value_or(length);
+  const int64_t begin = std::clamp<int64_t>(
+      raw_start < 0 ? raw_start + length : raw_start, 0, length);
+  const int64_t past = std::clamp<int64_t>(
+      raw_end < 0 ? raw_end + length : raw_end, 0, length);
+  // A window that closes before it opens holds nothing, and neither does one
+  // that starts where the payload ends.
+  const int64_t finish = std::max(begin, past);
+  const int64_t out_len = (finish - begin + step - 1) / step;
+
+  std::vector<int64_t> window = shape_vector(self);
+  window[static_cast<size_t>(dim)] = out_len;
+  TP_CHECK(
+      static_cast<std::vector<int64_t>>(src.shape()) == window,
+      "Vulkan slice_scatter: expected src to have a size equal to the slice "
+      "of self");
+
+  // The result carries the dtype the payload was read with, so a source of
+  // another is converted before it is written.
+  const Tensor drawn = src.dtype() == self.dtype()
+      ? src
+      : to_dtype_kernel(src, self.dtype(), false, false, std::nullopt);
+
+  if (step == 1) {
+    std::vector<Tensor> pieces;
+    if (begin > 0) {
+      pieces.push_back(slice_kernel(self, dim, 0, begin, 1));
+    }
+    if (out_len > 0) {
+      pieces.push_back(drawn);
+    }
+    if (finish < length) {
+      pieces.push_back(slice_kernel(self, dim, finish, length, 1));
+    }
+    // Nothing to write means the payload was empty along this axis already.
+    if (pieces.empty()) {
+      return clone_kernel(self);
+    }
+    return cat_kernel(pieces, dim);
+  }
+
+  Tensor out = clone_kernel(self);
+  if (out_len == 0) {
+    return out;
+  }
+  // A row scatter on an image payload writes the axis above its last one, so
+  // the axes on either side of the one the window runs along are folded into a
+  // pair of counts and every row the step names is written on the middle of
+  // three.  The clone owns its storage, so reshaping it and writing through
+  // that reshape leaves the payload the caller handed in untouched.
+  int64_t before = 1;
+  int64_t after = 1;
+  for (int64_t axis = 0; axis < dim; ++axis) {
+    before *= self.size(axis);
+  }
+  for (int64_t axis = dim + 1; axis < ndim; ++axis) {
+    after *= self.size(axis);
+  }
+  Tensor rows = reshape_kernel(out, {before, length, after});
+  Tensor block = reshape_kernel(drawn, {before, out_len, after});
+  Tensor codes = arange_start_step_kernel(
+      Scalar(begin), Scalar(finish), Scalar(step), DType::Int32, std::nullopt);
+  index_copy__kernel(rows, 1, codes, block);
+  return reshape_kernel(rows, shape_vector(self));
+}
+
 namespace {
 
 // Batch sizes of a triangular op: every axis before the last two repeats the
@@ -1215,6 +1324,7 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, ShapeKernels) {
   m.impl("unsqueeze", &tensorplay::vulkan::ops::unsqueeze_kernel);
   m.impl("slice.Tensor", &tensorplay::vulkan::ops::slice_kernel);
   m.impl("narrow", &tensorplay::vulkan::ops::narrow_kernel);
+  m.impl("slice_scatter", &tensorplay::vulkan::ops::slice_scatter_kernel);
   m.impl("triu", &tensorplay::vulkan::ops::triu_kernel);
   m.impl("tril", &tensorplay::vulkan::ops::tril_kernel);
   m.impl("triu_", &tensorplay::vulkan::ops::triu_inplace_kernel);
