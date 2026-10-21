@@ -1409,14 +1409,17 @@ Tensor rms_norm_cpu(const Tensor& input, const std::vector<int64_t>& normalized_
     const int64_t outer_size = input.numel() / inner_size;
     const bool has_w = weight_opt.has_value() && weight_opt->defined();
 
+    // The row walk below reads the buffer as a packed row-major sequence, so a
+    // view is read from a packed copy while the result keeps the input shape.
+    const Tensor input_c = input.contiguous();
     Tensor out = Tensor::empty_like(input);
     Tensor wc = has_w ? weight_opt->contiguous() : Tensor();
 
     const DType dt = input.dtype();
     if (dt == DType::Float32 || dt == DType::Float64) {
         const bool is_f64 = dt == DType::Float64;
-        const auto* in = is_f64 ? static_cast<const void*>(input.data_ptr<double>())
-                                : static_cast<const void*>(input.data_ptr<float>());
+        const auto* in = is_f64 ? static_cast<const void*>(input_c.data_ptr<double>())
+                                : static_cast<const void*>(input_c.data_ptr<float>());
         auto* op = is_f64 ? static_cast<void*>(out.data_ptr<double>())
                           : static_cast<void*>(out.data_ptr<float>());
         const auto* wp = has_w ? (is_f64 ? static_cast<const void*>(wc.data_ptr<double>())
@@ -1462,7 +1465,7 @@ Tensor rms_norm_cpu(const Tensor& input, const std::vector<int64_t>& normalized_
             if (is_bf16) static_cast<tensorplay::BFloat16*>(p)[i] = tensorplay::BFloat16(v);
             else static_cast<tensorplay::Half*>(p)[i] = tensorplay::Half(v);
         };
-        const void* ip = input.data_ptr();
+        const void* ip = input_c.data_ptr();
         void* optr = out.data_ptr();
         const void* wp = has_w ? wc.data_ptr() : nullptr;
         const bool wb16 = has_w && wc.dtype() == DType::BFloat16;
@@ -1514,6 +1517,9 @@ std::tuple<Tensor, Tensor> fused_rms_norm_cpu(
     // rstd keeps the outer dims and collapses the normalized dims to 1.
     std::vector<int64_t> stat_shape(static_cast<size_t>(input_ndim), 1);
     for (int64_t i = 0; i < input_ndim - norm_ndim; ++i) stat_shape[i] = input.size(i);
+    // The row walk below reads the buffer as a packed row-major sequence, so a
+    // view is read from a packed copy while the result keeps the input shape.
+    const Tensor input_c = input.contiguous();
     Tensor rstd = Tensor::empty(stat_shape, DType::Float32, input.device());
     Tensor out = Tensor::empty_like(input);
     Tensor wc = has_w ? weight_opt->contiguous() : Tensor();
@@ -1521,8 +1527,8 @@ std::tuple<Tensor, Tensor> fused_rms_norm_cpu(
     const DType dt = input.dtype();
     if (dt == DType::Float32 || dt == DType::Float64) {
         const bool is_f64 = dt == DType::Float64;
-        const auto* in = is_f64 ? static_cast<const void*>(input.data_ptr<double>())
-                                : static_cast<const void*>(input.data_ptr<float>());
+        const auto* in = is_f64 ? static_cast<const void*>(input_c.data_ptr<double>())
+                                : static_cast<const void*>(input_c.data_ptr<float>());
         auto* op = is_f64 ? static_cast<void*>(out.data_ptr<double>())
                           : static_cast<void*>(out.data_ptr<float>());
         auto* rp = static_cast<float*>(rstd.data_ptr<float>());
@@ -1570,7 +1576,7 @@ std::tuple<Tensor, Tensor> fused_rms_norm_cpu(
             if (is_bf16) static_cast<tensorplay::BFloat16*>(p)[i] = tensorplay::BFloat16(v);
             else static_cast<tensorplay::Half*>(p)[i] = tensorplay::Half(v);
         };
-        const void* ip = input.data_ptr();
+        const void* ip = input_c.data_ptr();
         void* optr = out.data_ptr();
         float* rp = static_cast<float*>(rstd.data_ptr<float>());
         const void* wp = has_w ? wc.data_ptr() : nullptr;
