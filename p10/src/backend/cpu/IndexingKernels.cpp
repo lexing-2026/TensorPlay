@@ -960,9 +960,13 @@ static void index_add_into(Tensor& dest, const Tensor& self, int64_t dim,
     }
     // A task owns one outer slot and a run of inner positions and walks the
     // index in order, so a repeated index adds its rows one after another
-    // instead of racing another task for the same destination.
-    const int64_t chunk_c = std::min<int64_t>(
-        std::max<int64_t>(inner, 1), std::max<int64_t>(1, GRAIN_SIZE / n_idx));
+    // instead of racing another task for the same destination.  The run is
+    // as wide as the pool allows: a task per thread, each walking a slice
+    // long enough to vectorise.
+    const int64_t chunks_needed = std::max<int64_t>(
+        1, (get_num_threads() + outer - 1) / outer);
+    const int64_t chunk_c = std::max<int64_t>(
+        1, (inner + chunks_needed - 1) / chunks_needed);
     const int64_t nchunk_c = (inner + chunk_c - 1) / chunk_c;
     const int64_t task_grain = std::max<int64_t>(1, GRAIN_SIZE / (n_idx * chunk_c));
 #define TP_IADD_CASE(ctype, name) \
@@ -1031,16 +1035,22 @@ static void index_copy_into(Tensor& dest, const Tensor& self, int64_t dim,
     int64_t outer = 1, inner = 1;
     outer_inner(static_cast<std::vector<int64_t>>(self.shape()), dim, outer, inner);
     Tensor source_c = source.contiguous();
+// The copies of one index slot do not depend on the others, so they spread
+// over the pool; a repeated index then keeps whichever write lands last, as
+// the device paths do.
 #define TP_ICOPY_CASE(ctype, name) \
     case DType::name: { \
         ctype* d = dest.data_ptr<ctype>(); \
         const ctype* sp = source_c.data_ptr<ctype>(); \
-        for (int64_t o = 0; o < outer; ++o) { \
-            for (int64_t k = 0; k < n_idx; ++k) { \
-                int64_t iv = ip[k]; \
-                std::memcpy(d + (o * row + iv) * inner, sp + (o * n_idx + k) * inner, inner * sizeof(ctype)); \
+        const int64_t grain = std::max<int64_t>(1, GRAIN_SIZE / std::max<int64_t>(outer * inner, 1)); \
+        parallel_for(0, n_idx, grain, [&](int64_t b, int64_t e) { \
+            for (int64_t k = b; k < e; ++k) { \
+                const int64_t iv = ip[k]; \
+                for (int64_t o = 0; o < outer; ++o) { \
+                    std::memcpy(d + (o * row + iv) * inner, sp + (o * n_idx + k) * inner, inner * sizeof(ctype)); \
+                } \
             } \
-        } \
+        }); \
         break; \
     }
     switch (self.dtype()) {
@@ -1095,17 +1105,23 @@ static void index_fill_into(Tensor& dest, const Tensor& self, int64_t dim,
     int64_t row = self.size(dim);
     int64_t outer = 1, inner = 1;
     outer_inner(static_cast<std::vector<int64_t>>(self.shape()), dim, outer, inner);
+// The fills of one index slot do not depend on the others, so they spread
+// over the pool.  Every write carries the same value, so a repeated index
+// holds the same answer however the writes land.
 #define TP_IFILL_CASE(ctype, name) \
     case DType::name: { \
         ctype* d = dest.data_ptr<ctype>(); \
         ctype v = value.to<ctype>(); \
-        for (int64_t o = 0; o < outer; ++o) { \
-            for (int64_t k = 0; k < n_idx; ++k) { \
-                int64_t iv = ip[k]; \
-                ctype* dp = d + (o * row + iv) * inner; \
-                for (int64_t c = 0; c < inner; ++c) dp[c] = v; \
+        const int64_t grain = std::max<int64_t>(1, GRAIN_SIZE / std::max<int64_t>(outer * inner, 1)); \
+        parallel_for(0, n_idx, grain, [&](int64_t b, int64_t e) { \
+            for (int64_t k = b; k < e; ++k) { \
+                const int64_t iv = ip[k]; \
+                for (int64_t o = 0; o < outer; ++o) { \
+                    ctype* dp = d + (o * row + iv) * inner; \
+                    for (int64_t c = 0; c < inner; ++c) dp[c] = v; \
+                } \
             } \
-        } \
+        }); \
         break; \
     }
     switch (self.dtype()) {
