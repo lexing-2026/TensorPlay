@@ -90,11 +90,22 @@ Tensor index_cpu(const Tensor& self,
     for (const auto& index : info.indices) config.add_const_input(index);
     config.declare_static_dtype_and_device(info.source.dtype(), info.source.device());
     auto iter = config.build();
-    const auto item_size = elementSize(self.dtype());
-    cpu_index_kernel(iter, info.indexed_sizes, info.indexed_strides,
-        [item_size](char* dst, char* src, int64_t offset) {
-            std::memcpy(dst, src + offset, item_size);
-        });
+    // The copy of one element is typed: a load and a store, and not a call
+    // with a length that is only known at run time.
+#define TP_INDEX_CASE(ctype, name) \
+    case DType::name: \
+        cpu_index_kernel(iter, info.indexed_sizes, info.indexed_strides, \
+            [](char* dst, char* src, int64_t offset) { \
+                *reinterpret_cast<ctype*>(dst) = \
+                    *reinterpret_cast<const ctype*>(src + offset); \
+            }); \
+        break;
+    switch (self.dtype()) {
+        TENSORPLAY_FORALL_SCALAR_TYPES(TP_INDEX_CASE)
+        TENSORPLAY_FORALL_COMPLEX_TYPES(TP_INDEX_CASE)
+        default: TP_THROW(TypeError, "index: unsupported dtype");
+    }
+#undef TP_INDEX_CASE
     return iter.output();
 }
 
