@@ -1551,6 +1551,63 @@ Tensor activation_backward_kernel(const Tensor& grad_output, const Tensor& self,
     return result;
 }
 
+// Hands a computed gradient to the tensor the caller holds.  Most of these maps
+// are served by a backend-neutral form that refuses a destination of a width it
+// does not answer at, so that refusal is kept here; the few served by a plain
+// copy take a safe cast into the destination instead.  Either way a destination
+// of another shape is resized before the values move in.
+static Tensor& write_backward_out(const char* op, Tensor value, Tensor& grad_input,
+                                  bool refuse_a_cast) {
+    if (!grad_input.defined()) {
+        grad_input = std::move(value);
+        return grad_input;
+    }
+    if (!refuse_a_cast) return write_out(grad_input, value);
+    if (grad_input.dtype() != value.dtype()) {
+        TP_THROW(TypeError, op, ": output dtype must match input dtype");
+    }
+    if (grad_input.device() != value.device()) {
+        TP_THROW(DeviceMismatchError, op, ": output device must match input device");
+    }
+    const auto target = static_cast<std::vector<int64_t>>(value.shape());
+    if (static_cast<std::vector<int64_t>>(grad_input.shape()) != target) {
+        grad_input.resize_(target);
+    }
+    grad_input.copy_(value);
+    return grad_input;
+}
+
+// The same map with the gradient the caller already holds.  A backward map reads
+// the incoming gradient and the value the forward saved at the same position, so
+// it is the two operands' own order that defines the answer; when the destination
+// is the width and shape that pair answers at, the iterator walks it in whatever
+// layout it arrives in -- including one of the operands itself, which the
+// iterator judges -- and the gradient is stored once, into the caller's buffer.
+// An operand pair the map is not defined on (two widths, two shapes) and a
+// destination that needs a cast or a resize take the value from the allocating
+// map, so the answer never depends on which of the two routes ran.
+template <typename Alloc, typename Func>
+Tensor& activation_backward_out_kernel(const Tensor& grad_output, const Tensor& self,
+                                       Tensor& grad_input, const char* op,
+                                       Alloc allocating, Func func,
+                                       bool refuse_a_cast) {
+    const DType want = grad_output.dtype();
+    const std::vector<int64_t> shape =
+        static_cast<std::vector<int64_t>>(grad_output.shape());
+    if (!isComplexType(want) && !isQuantizedType(want) && self.dtype() == want &&
+        static_cast<std::vector<int64_t>>(self.shape()) == shape &&
+        destination_takes(grad_input, grad_output.device(), want, shape)) {
+        ti_apply_binary(grad_input, grad_output, self, func);
+        return grad_input;
+    }
+    return write_backward_out(op, allocating(grad_output, self), grad_input,
+                              refuse_a_cast);
+}
+
+// Each backward map is written once, as a functor over the element's own width,
+// and both spellings run it: the allocating one evaluates it in the widening
+// math type the lanes use, and the destination-writing one lets the iterator
+// hand it the elements at the width the answer comes in.
 static inline float gelu_none_scalar(float x) {
     constexpr float kAlpha = 0.70710678118654752440f; // M_SQRT1_2
     return x * 0.5f * (1.0f + std::erf(x * kAlpha));
@@ -1610,6 +1667,26 @@ static inline float gelu_backward_tanh_scalar(float dy, float x) {
     return dy * (left_derivative + right_derivative);
 }
 
+// The gradient of either GELU approximation: the forward's own derivative times
+// the incoming gradient.  Both spellings of gelu_backward run one of these.
+struct GeluBackwardNone {
+    template <typename T>
+    inline T operator()(T dy, T x) const {
+        using M = activation_math_t<T>;
+        return static_cast<T>(gelu_backward_none_scalar(static_cast<M>(dy),
+                                                        static_cast<M>(x)));
+    }
+};
+
+struct GeluBackwardTanh {
+    template <typename T>
+    inline T operator()(T dy, T x) const {
+        using M = activation_math_t<T>;
+        return static_cast<T>(gelu_backward_tanh_scalar(static_cast<M>(dy),
+                                                        static_cast<M>(x)));
+    }
+};
+
 // The tanh approximation of GELU, evaluated in the widening math type the
 // vector lanes use.
 static constexpr auto gelu_tanh_map = [](auto x) {
@@ -1640,13 +1717,35 @@ Tensor& gelu_out_cpu(const Tensor& self, const std::string& approximate,
 
 Tensor gelu_backward_impl(const Tensor& grad_output, const Tensor& self, const std::string& approximate) {
     if (approximate == "none") {
-        return activation_backward_kernel(grad_output, self,
-            [](auto dy, auto x) { return gelu_backward_none_scalar(dy, x); });
+        return activation_backward_kernel(grad_output, self, GeluBackwardNone{});
     } else if (approximate == "tanh") {
-        return activation_backward_kernel(grad_output, self,
-            [](auto dy, auto x) { return gelu_backward_tanh_scalar(dy, x); });
+        return activation_backward_kernel(grad_output, self, GeluBackwardTanh{});
     }
     TP_THROW(ValueError, "approximate argument must be either none or tanh, but got " + approximate);
+}
+
+// The destination-writing pair of gelu_backward: the approximation chooses the
+// derivative, and the gradient lands in the caller's own tensor.
+Tensor& gelu_backward_grad_input_cpu(const Tensor& grad_output, const Tensor& self,
+                                     const std::string& approximate,
+                                     Tensor& grad_input) {
+    const std::string approx = approximate;
+    const auto allocating = [approx](const Tensor& g, const Tensor& s) {
+        return gelu_backward_impl(g, s, approx);
+    };
+    if (approximate == "none") {
+        return activation_backward_out_kernel(grad_output, self, grad_input,
+                                              "gelu_backward", allocating,
+                                              GeluBackwardNone{}, /*refuse_a_cast=*/true);
+    }
+    if (approximate == "tanh") {
+        return activation_backward_out_kernel(grad_output, self, grad_input,
+                                              "gelu_backward", allocating,
+                                              GeluBackwardTanh{}, /*refuse_a_cast=*/true);
+    }
+    // An approximation neither spelling knows is refused by the allocating map.
+    return write_backward_out("gelu_backward", allocating(grad_output, self),
+                              grad_input, /*refuse_a_cast=*/true);
 }
 
 // Every element outside [min, max] is pulled to the nearer bound; inside it the
@@ -1688,11 +1787,39 @@ Tensor& hardtanh_out_cpu(const Tensor& self, const Scalar& min_val,
         HardtanhAt{lo, hi}, vecunary::VOp::Hardtanh, prm);
 }
 
+// Inside the bounds the gradient passes through; at or beyond either bound the
+// forward stopped moving, so nothing of it reaches back.  The bounds are compared
+// at the wider of the two, as the scalar form does.
+struct HardtanhBackwardAt {
+    double lo;
+    double hi;
+
+    template <typename T>
+    inline T operator()(T dy, T x) const {
+        using M = activation_math_t<T>;
+        const M g = static_cast<M>(dy);
+        const M v = static_cast<M>(x);
+        return static_cast<T>(v <= lo || v >= hi ? M(0) : g);
+    }
+};
+
 Tensor hardtanh_backward_kernel_impl(const Tensor& grad_output, const Tensor& self, const Scalar& min_val, const Scalar& max_val) {
     double lo = min_val.toDouble();
     double hi = max_val.toDouble();
-    return activation_backward_kernel(grad_output, self,
-        [lo, hi](auto dy, auto x) { return (x <= lo || x >= hi) ? decltype(dy)(0) : dy; });
+    return activation_backward_kernel(grad_output, self, HardtanhBackwardAt{lo, hi});
+}
+
+Tensor& hardtanh_backward_grad_input_cpu(const Tensor& grad_output, const Tensor& self,
+                                         const Scalar& min_val, const Scalar& max_val,
+                                         Tensor& grad_input) {
+    const double lo = min_val.toDouble();
+    const double hi = max_val.toDouble();
+    return activation_backward_out_kernel(
+        grad_output, self, grad_input, "hardtanh_backward",
+        [lo, hi](const Tensor& g, const Tensor& s) {
+            return hardtanh_backward_kernel_impl(g, s, Scalar(lo), Scalar(hi));
+        },
+        HardtanhBackwardAt{lo, hi}, /*refuse_a_cast=*/false);
 }
 
 Tensor relu6_kernel_impl(const Tensor& self) {
@@ -1730,14 +1857,31 @@ Tensor hardswish_backward_kernel_impl(const Tensor& grad_output, const Tensor& s
         });
 }
 
+// d/dx [x * sigmoid(x)] = sigmoid * (1 + x * (1 - sigmoid)), with the sigmoid
+// rebuilt from the saved input.
+struct SiluBackward {
+    template <typename T>
+    inline T operator()(T dy, T x) const {
+        using M = activation_math_t<T>;
+        const M g = static_cast<M>(dy);
+        const M v = static_cast<M>(x);
+        const M s = M(1) / (M(1) + std::exp(-v));
+        return static_cast<T>(g * s * (M(1) + v * (M(1) - s)));
+    }
+};
+
 Tensor silu_backward_kernel_impl(const Tensor& grad_output, const Tensor& self) {
-    //   sigmoid = 1 / (1 + exp(-x)); dy * sigmoid * (1 + x * (1 - sigmoid))
-    return activation_backward_kernel(grad_output, self,
-        [](auto dy, auto x) {
-            using M = decltype(x);
-            const M s = M(1) / (M(1) + std::exp(-x));
-            return dy * s * (M(1) + x * (M(1) - s));
-        });
+    return activation_backward_kernel(grad_output, self, SiluBackward{});
+}
+
+Tensor& silu_backward_grad_input_cpu(const Tensor& grad_output, const Tensor& self,
+                                     Tensor& grad_input) {
+    return activation_backward_out_kernel(
+        grad_output, self, grad_input, "silu_backward",
+        [](const Tensor& g, const Tensor& s) {
+            return silu_backward_kernel_impl(g, s);
+        },
+        SiluBackward{}, /*refuse_a_cast=*/true);
 }
 
 // relu6(x + 3) / 6
@@ -1761,14 +1905,30 @@ Tensor& hardsigmoid_out_cpu(const Tensor& self, Tensor& out) {
                                          vecunary::VOp::Hardsigmoid);
 }
 
+// d/dx [relu6(x + 3) / 6]: the gradient arrives scaled by 1/6 strictly inside
+// (-3, 3) and is stopped at either edge.
+struct HardsigmoidBackward {
+    template <typename T>
+    inline T operator()(T dy, T x) const {
+        using M = activation_math_t<T>;
+        const M g = static_cast<M>(dy);
+        const M v = static_cast<M>(x);
+        return static_cast<T>(v <= M(-3) || v >= M(3) ? M(0) : g / M(6));
+    }
+};
+
 Tensor hardsigmoid_backward_kernel_impl(const Tensor& grad_output, const Tensor& self) {
-    //   d/dx [relu6(x + 3) / 6]: dy / 6 strictly inside (-3, 3), else 0
-    return activation_backward_kernel(grad_output, self,
-        [](auto dy, auto x) {
-            using M = decltype(x);
-            if (x <= M(-3) || x >= M(3)) return M(0);
-            return dy / M(6);
-        });
+    return activation_backward_kernel(grad_output, self, HardsigmoidBackward{});
+}
+
+Tensor& hardsigmoid_backward_grad_input_cpu(const Tensor& grad_output,
+                                            const Tensor& self, Tensor& grad_input) {
+    return activation_backward_out_kernel(
+        grad_output, self, grad_input, "hardsigmoid_backward",
+        [](const Tensor& g, const Tensor& s) {
+            return hardsigmoid_backward_kernel_impl(g, s);
+        },
+        HardsigmoidBackward{}, /*refuse_a_cast=*/true);
 }
 
 // Below zero the element is scaled by the slope; at or above it the operand
@@ -1804,14 +1964,37 @@ Tensor& leaky_relu_out_cpu(const Tensor& self, const Scalar& negative_slope,
         LeakyAt{slope}, vecunary::VOp::LeakyRelu, prm);
 }
 
+// Below zero the incoming gradient is scaled by the slope; at or above it the
+// gradient passes through.  The value the branch reads is the operand the caller
+// saved, compared at the width the answer comes in.
+struct LeakyBackwardAt {
+    double slope;
+
+    template <typename T>
+    inline T operator()(T dy, T x) const {
+        using M = activation_math_t<T>;
+        const M g = static_cast<M>(dy);
+        const M v = static_cast<M>(x);
+        return static_cast<T>(v > M(0) ? g : g * static_cast<M>(slope));
+    }
+};
+
 Tensor leaky_relu_backward_kernel_impl(const Tensor& grad_output, const Tensor& self, const Scalar& negative_slope, bool self_is_result) {
     (void)self_is_result; // out-of-place call always receives the input itself
     double slope = negative_slope.toDouble();
-    return activation_backward_kernel(grad_output, self,
-        [slope](auto dy, auto x) {
-            using M = decltype(x);
-            return x > M(0) ? dy : dy * static_cast<M>(slope);
-        });
+    return activation_backward_kernel(grad_output, self, LeakyBackwardAt{slope});
+}
+
+Tensor& leaky_relu_backward_grad_input_cpu(const Tensor& grad_output, const Tensor& self,
+                                           const Scalar& negative_slope,
+                                           bool self_is_result, Tensor& grad_input) {
+    const double slope = negative_slope.toDouble();
+    return activation_backward_out_kernel(
+        grad_output, self, grad_input, "leaky_relu_backward",
+        [slope, self_is_result](const Tensor& g, const Tensor& s) {
+            return leaky_relu_backward_kernel_impl(g, s, Scalar(slope), self_is_result);
+        },
+        LeakyBackwardAt{slope}, /*refuse_a_cast=*/true);
 }
 
 //   a < 0 ? expm1(a * input_scale) * negcoef : a * poscoef
@@ -1866,6 +2049,31 @@ Tensor& elu_out_cpu(const Tensor& self, const Scalar& alpha, const Scalar& scale
         EluAt{negcoef, poscoef, negiptcoef}, vecunary::VOp::Elu, prm);
 }
 
+// The gradient of elu, read either from the input the forward was given or from
+// the answer it left behind -- the two differ below zero, where the saved value
+// is the scaled exponential rather than the raw input.
+struct EluBackwardAt {
+    double negcoef;
+    double poscoef;
+    double negiptcoef;
+    bool is_result;
+
+    template <typename T>
+    inline T operator()(T dy, T b) const {
+        using M = activation_math_t<T>;
+        const M g = static_cast<M>(dy);
+        const M v = static_cast<M>(b);
+        return static_cast<T>(
+            v <= M(0)
+                ? (is_result ? g * static_cast<M>(negiptcoef) *
+                                       (v + static_cast<M>(negcoef))
+                             : g * static_cast<M>(negiptcoef) *
+                                   static_cast<M>(negcoef) *
+                                   std::exp(v * static_cast<M>(negiptcoef)))
+                : g * static_cast<M>(poscoef));
+    }
+};
+
 Tensor elu_backward_kernel_impl(const Tensor& grad_output, const Scalar& alpha, const Scalar& scale, const Scalar& input_scale, bool is_result, const Tensor& self_or_result) {
     //   is_result: b <= 0 ? a*negiptcoef*(b + negcoef) : a*poscoef
     //   else:      b <= 0 ? a*negiptcoef*negcoef*exp(b*negiptcoef) : a*poscoef
@@ -1873,14 +2081,24 @@ Tensor elu_backward_kernel_impl(const Tensor& grad_output, const Scalar& alpha, 
     double poscoef = scale.toDouble();
     double negiptcoef = input_scale.toDouble();
     return activation_backward_kernel(grad_output, self_or_result,
-        [negcoef, poscoef, negiptcoef, is_result](auto dy, auto b) {
-            using M = decltype(b);
-            return b <= M(0)
-                ? (is_result
-                      ? dy * static_cast<M>(negiptcoef) * (b + static_cast<M>(negcoef))
-                      : dy * static_cast<M>(negiptcoef) * static_cast<M>(negcoef) * std::exp(b * static_cast<M>(negiptcoef)))
-                : dy * static_cast<M>(poscoef);
-        });
+                                      EluBackwardAt{negcoef, poscoef, negiptcoef,
+                                                    is_result});
+}
+
+Tensor& elu_backward_grad_input_cpu(const Tensor& grad_output, const Scalar& alpha,
+                                    const Scalar& scale, const Scalar& input_scale,
+                                    bool is_result, const Tensor& self_or_result,
+                                    Tensor& grad_input) {
+    const double a = alpha.toDouble();
+    const double sc = scale.toDouble();
+    const double isc = input_scale.toDouble();
+    return activation_backward_out_kernel(
+        grad_output, self_or_result, grad_input, "elu_backward",
+        [a, sc, isc, is_result](const Tensor& g, const Tensor& s) {
+            return elu_backward_kernel_impl(g, Scalar(a), Scalar(sc), Scalar(isc),
+                                            is_result, s);
+        },
+        EluBackwardAt{a * sc, sc, isc, is_result}, /*refuse_a_cast=*/true);
 }
 
 // x * tanh(softplus(x))
@@ -1979,17 +2197,45 @@ Tensor& softplus_out_cpu(const Tensor& self, const Scalar& beta,
         SoftplusAt{beta_in, threshold_in}, vecunary::VOp::Softplus, prm);
 }
 
+// The gradient of softplus: above the threshold the forward passed the input
+// straight through, so the gradient does too; below it the gradient is scaled by
+// the sigmoid the forward's derivative is made of.
+struct SoftplusBackwardAt {
+    double beta;
+    double threshold;
+
+    template <typename T>
+    inline T operator()(T dy, T a) const {
+        using M = activation_math_t<T>;
+        const M g = static_cast<M>(dy);
+        const M v = static_cast<M>(a);
+        return static_cast<T>(
+            v * static_cast<M>(beta) > static_cast<M>(threshold)
+                ? g
+                : g * (M(1) / (M(1) + std::exp(-v * static_cast<M>(beta)))));
+    }
+};
+
 Tensor softplus_backward_kernel_impl(const Tensor& grad_output, const Tensor& self, const Scalar& beta, const Scalar& threshold) {
     //   beta_in * a > threshold ? dy : dy * sigmoid(beta_in * a)
     double beta_in = beta.toDouble();
     double threshold_in = threshold.toDouble();
     return activation_backward_kernel(grad_output, self,
-        [beta_in, threshold_in](auto dy, auto a) {
-            using M = decltype(a);
-            return a * static_cast<M>(beta_in) > static_cast<M>(threshold_in)
-                ? dy
-                : dy * (M(1) / (M(1) + std::exp(-a * static_cast<M>(beta_in))));
-        });
+                                      SoftplusBackwardAt{beta_in, threshold_in});
+}
+
+Tensor& softplus_backward_grad_input_cpu(const Tensor& grad_output, const Tensor& self,
+                                         const Scalar& beta, const Scalar& threshold,
+                                         Tensor& grad_input) {
+    const double beta_in = beta.toDouble();
+    const double threshold_in = threshold.toDouble();
+    return activation_backward_out_kernel(
+        grad_output, self, grad_input, "softplus_backward",
+        [beta_in, threshold_in](const Tensor& g, const Tensor& s) {
+            return softplus_backward_kernel_impl(g, s, Scalar(beta_in),
+                                                 Scalar(threshold_in));
+        },
+        SoftplusBackwardAt{beta_in, threshold_in}, /*refuse_a_cast=*/true);
 }
 
 // ---------------------------------------------------------------------------
@@ -3935,15 +4181,18 @@ TENSORPLAY_LIBRARY_IMPL(CPU, PointwiseKernels) {
     m.impl("gelu", gelu_kernel);
     m.impl("gelu.out", gelu_out_cpu);
     m.impl("gelu_backward", gelu_backward_kernel);
+    m.impl("gelu_backward.grad_input", gelu_backward_grad_input_cpu);
     m.impl("silu", silu_kernel);
     m.impl("silu.out", silu_out_cpu);
     m.impl("silu_backward", silu_backward_kernel_impl);
+    m.impl("silu_backward.grad_input", silu_backward_grad_input_cpu);
     m.impl("silu_mul", silu_mul_cpu);
     m.impl("fused_swiglu", fused_swiglu_cpu);
     m.impl("silu_and_mul", silu_and_mul_cpu);
     m.impl("hardtanh", hardtanh_kernel_impl);
     m.impl("hardtanh.out", hardtanh_out_cpu);
     m.impl("hardtanh_backward", hardtanh_backward_kernel_impl);
+    m.impl("hardtanh_backward.grad_input", hardtanh_backward_grad_input_cpu);
     m.impl("relu6", relu6_kernel_impl);
     m.impl("hardswish", hardswish_kernel_impl);
     m.impl("hardswish.out", hardswish_out_cpu);
@@ -3957,12 +4206,15 @@ TENSORPLAY_LIBRARY_IMPL(CPU, PointwiseKernels) {
     m.impl("hardsigmoid", hardsigmoid_kernel_impl);
     m.impl("hardsigmoid.out", hardsigmoid_out_cpu);
     m.impl("hardsigmoid_backward", hardsigmoid_backward_kernel_impl);
+    m.impl("hardsigmoid_backward.grad_input", hardsigmoid_backward_grad_input_cpu);
     m.impl("leaky_relu", leaky_relu_kernel_impl);
     m.impl("leaky_relu.out", leaky_relu_out_cpu);
     m.impl("leaky_relu_backward", leaky_relu_backward_kernel_impl);
+    m.impl("leaky_relu_backward.grad_input", leaky_relu_backward_grad_input_cpu);
     m.impl("elu", elu_kernel_impl);
     m.impl("elu.out", elu_out_cpu);
     m.impl("elu_backward", elu_backward_kernel_impl);
+    m.impl("elu_backward.grad_input", elu_backward_grad_input_cpu);
     m.impl("selu", selu_kernel_impl);
     m.impl("celu", celu_kernel_impl);
     m.impl("mish", mish_kernel_impl);
@@ -3971,6 +4223,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, PointwiseKernels) {
     m.impl("softplus", softplus_kernel_impl);
     m.impl("softplus.out", softplus_out_cpu);
     m.impl("softplus_backward", softplus_backward_kernel_impl);
+    m.impl("softplus_backward.grad_input", softplus_backward_grad_input_cpu);
     m.impl("log_sigmoid", log_sigmoid_kernel_impl);
     m.impl("log_sigmoid_backward", log_sigmoid_backward_kernel_impl);
     m.impl("rrelu_with_noise_backward", rrelu_with_noise_backward_kernel_impl);
