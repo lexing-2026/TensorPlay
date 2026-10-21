@@ -1766,6 +1766,36 @@ reduce_extremum:
     OPERATOR: X * Y
     COLLAPSE: V.x * V.y * V.z * V.w
     NEUTRAL: 1.0
+reduce_extremum_int:
+  parameter_names_with_default_values:
+    OPERATOR: max(X, Y)
+    NEUTRAL: -2147483647 - 1
+    COLLAPSE: max(max(V.x, V.y), max(V.z, V.w))
+  shader_variants:
+  - NAME: reduce_max_i32
+    OPERATOR: max(X, Y)
+    NEUTRAL: -2147483647 - 1
+    COLLAPSE: max(max(V.x, V.y), max(V.z, V.w))
+  - NAME: reduce_min_i32
+    OPERATOR: min(X, Y)
+    NEUTRAL: 2147483647
+    COLLAPSE: min(min(V.x, V.y), min(V.z, V.w))
+reduce_extremum_i32_buffer:
+  parameter_names_with_default_values:
+    GREATER: 1
+  shader_variants:
+  - NAME: reduce_max_buffer_i32
+    GREATER: 1
+  - NAME: reduce_min_buffer_i32
+    GREATER: 0
+reduce_extremum_i64_buffer:
+  parameter_names_with_default_values:
+    GREATER: 1
+  shader_variants:
+  - NAME: reduce_max_buffer_i64
+    GREATER: 1
+  - NAME: reduce_min_buffer_i64
+    GREATER: 0
 reduce_argextremum:
   parameter_names_with_default_values:
     GREATER: 1

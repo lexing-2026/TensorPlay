@@ -426,12 +426,24 @@ Tensor extremum_one_axis(
   // Buffer payloads reduce through the linear variant; only the extremum
   // kinds have one, so a product over buffer storage still reports the
   // texture requirement below.  The half builds pack two winners per word.
+  // A counted payload folds in the width it names: the signed word for a
+  // narrow count, a pair of words for a wide one.
   const bool is_half = input.dtype() == DType::Float16;
-  const char* buffer_shader = kind == ExtremumKind::kMax
-      ? (is_half ? "reduce_max_buffer_half" : "reduce_max_buffer")
-      : kind == ExtremumKind::kMin
-          ? (is_half ? "reduce_min_buffer_half" : "reduce_min_buffer")
-          : nullptr;
+  const bool is_wide = input.dtype() == DType::Int64;
+  const bool integral =
+      kind != ExtremumKind::kProd &&
+      (input.dtype() == DType::Int32 || is_wide);
+  const bool greater = kind == ExtremumKind::kMax;
+  const char* buffer_shader = nullptr;
+  if (integral) {
+    buffer_shader = greater
+        ? (is_wide ? "reduce_max_buffer_i64" : "reduce_max_buffer_i32")
+        : (is_wide ? "reduce_min_buffer_i64" : "reduce_min_buffer_i32");
+  } else if (greater) {
+    buffer_shader = is_half ? "reduce_max_buffer_half" : "reduce_max_buffer";
+  } else if (kind == ExtremumKind::kMin) {
+    buffer_shader = is_half ? "reduce_min_buffer_half" : "reduce_min_buffer";
+  }
   if (v_input.storage_type() == api::StorageType::BUFFER &&
       buffer_shader != nullptr) {
     api::vTensor v_output{
@@ -498,8 +510,15 @@ Tensor extremum_one_axis(
 
   api::UniformParamsBuffer params(context, block);
   api::PipelineBarrier pipeline_barrier{};
+  // A counted payload answers with the signed-word builds; a measurement keeps
+  // the dtype-selected texture family.  A wide count has no texel format to
+  // name, so it never reaches this walk.
+  const api::ShaderInfo& texture_kernel =
+      input.dtype() == DType::Int32
+      ? VK_KERNEL_FROM_STR(greater ? "reduce_max_i32" : "reduce_min_i32")
+      : kernel_for(extremum_shader_name(kind), input.dtype());
   context->submit_compute_job(
-      kernel_for(extremum_shader_name(kind), input.dtype()), pipeline_barrier,
+      texture_kernel, pipeline_barrier,
       v_output.extents(),
       adaptive_work_group_size(v_output.extents()),
       VK_NULL_HANDLE,
@@ -518,9 +537,14 @@ Tensor extremum_impl(
     const std::vector<int64_t>& dims_in,
     bool keepdim,
     ExtremumKind kind) {
+  // An extremum folds in the width the payload names, so a counted payload has
+  // its own walk; a product is a measurement and keeps the floating family.
   TP_CHECK(
-      self.dtype() == DType::Float32 || self.dtype() == DType::Float16,
-      "Vulkan reductions support Float32 and Float16 tensors only");
+      self.dtype() == DType::Float32 || self.dtype() == DType::Float16 ||
+          (kind != ExtremumKind::kProd &&
+           (self.dtype() == DType::Int32 || self.dtype() == DType::Int64)),
+      "Vulkan extrema support Float32, Float16, Int32 and Int64 tensors; "
+      "products fold a measured payload");
   TP_CHECK(
       self.dim() >= 1 && self.dim() <= 4,
       "Vulkan reductions support 1d to 4d tensors");
