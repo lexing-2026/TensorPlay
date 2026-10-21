@@ -5148,7 +5148,8 @@ class TestVulkanWhereBranches(unittest.TestCase):
         condition = tensorplay.tensor([True, False]).to("vulkan")
         flags = tensorplay.tensor([True, False]).to("vulkan")
         with self.assertRaisesRegex(
-                RuntimeError, "selects between Float32, Float16 and Int32"):
+                RuntimeError,
+                "selects between Float32, Float16, Int32 and Int64"):
             F.where(condition, flags, flags)
 
 
@@ -11663,6 +11664,121 @@ class TestVulkanWideArithmetic(unittest.TestCase):
                 self._device(host).clamp(-(1 << 40), 1 << 40),
                 [min(max(int(a), -(1 << 40)), 1 << 40) for a in host],
                 f"clip over {length} counts")
+
+    def test_a_selection_between_two_counting_payloads(self):
+        # A lane takes the whole pair of words it is told to, so the low word of
+        # a held element never lands beside the high word of the rejected one.
+        held = [0, 1, -1, 1 << 32, -(1 << 32), (1 << 40) + 7, (1 << 63) - 1,
+                -(2 ** 63), 5, -7]
+        taken = [7] * len(held)
+        truth = [1, 0, 1, 0, 1, 1, 0, 1, 0, 1]
+        mask = tensorplay.from_numpy(np.array(truth, dtype=np.bool_)).to("vulkan")
+        self._checked(
+            tensorplay.where(mask, self._device(held), self._device(taken)),
+            [a if t else b for a, b, t in zip(held, taken, truth)],
+            "selection between two counting payloads")
+        self._checked(
+            tensorplay.where(mask, self._device(taken), self._device(held)),
+            [b if t else a for a, b, t in zip(held, taken, truth)],
+            "the same selection turned around")
+
+    def test_a_selection_that_repeats_a_plane_of_one_count(self):
+        # A number folded into a plane of one is a counting payload too: the walk
+        # reads its pair again for every element rather than materializing it.
+        held = [0, 1, -1, 1 << 32, -(1 << 32), (1 << 40) + 7, 5, -7]
+        truth = [1, 0, 1, 1, 0, 0, 1, 0]
+        mask = tensorplay.from_numpy(np.array(truth, dtype=np.bool_)).to("vulkan")
+        self._checked(
+            tensorplay.where(mask, self._device(held), 3),
+            [a if t else 3 for a, t in zip(held, truth)],
+            "a count taken beside a number")
+        self._checked(
+            tensorplay.where(mask, -1, self._device(held)),
+            [-1 if t else a for a, t in zip(held, truth)],
+            "a number taken beside a count")
+
+    def test_a_mixed_pair_selects_at_the_wider_width(self):
+        # The width that holds the pair decides, so a count beside a word moves
+        # the word up rather than the count down: the answer keeps both.
+        narrow = [1, 2, 3, 4, 5, 6, 7, 8]
+        wide = [0, 1, -1, 1 << 32, -(1 << 32), (1 << 40) + 7, 5, -7]
+        truth = [1, 1, 0, 0, 1, 0, 1, 0]
+        mask = tensorplay.from_numpy(np.array(truth, dtype=np.bool_)).to("vulkan")
+        self._checked(
+            tensorplay.where(
+                mask, self._device(narrow, tensorplay.int32), self._device(wide)),
+            [a if t else b for a, b, t in zip(narrow, wide, truth)],
+            "a word beside a counting payload")
+        got = tensorplay.where(
+            mask, self._device(wide), self._device(narrow, tensorplay.int32))
+        self.assertEqual(got.dtype, tensorplay.int64,
+                         "a mixed pair narrowed the counting payload")
+
+    def test_a_selection_that_repeats_a_line_of_truth(self):
+        # The condition, like a branch, is addressed through its own strides: a
+        # column of truth repeats across the row and a row across the column.
+        grid = [[0, 1, -1], [(1 << 40) + 7, -(1 << 32), 5]]
+        filler = [[-99, -99, -99], [-99, -99, -99]]
+        column = [[True], [False]]
+        row = [[True, False, True]]
+        self._checked(
+            tensorplay.where(
+                tensorplay.from_numpy(np.array(column, dtype=np.bool_))
+                .to("vulkan"),
+                self._device(grid), self._device(filler)),
+            [[a if column[r][0] else b for a, b in zip(gr, fl)]
+             for r, (gr, fl) in enumerate(zip(grid, filler))],
+            "a column of truth over a counting grid")
+        self._checked(
+            tensorplay.where(
+                tensorplay.from_numpy(np.array(row, dtype=np.bool_))
+                .to("vulkan"),
+                self._device(grid), self._device(filler)),
+            [[a if t else b for a, b, t in zip(gr, fl, row[0])]
+             for gr, fl in zip(grid, filler)],
+            "a row of truth over a counting grid")
+
+    def test_a_selection_under_a_mask_of_its_own_counts(self):
+        # The mask a counting payload answers for is the same pair of words read
+        # against a number, so the two walks join without a host round trip.
+        counts = [0, 1, -1, 1 << 32, -(1 << 32), (1 << 40) + 7, 5, -7]
+        self._checked(
+            tensorplay.where(
+                self._device(counts) > 0, self._device([7] * len(counts)),
+                self._device(counts)),
+            [7 if a > 0 else a for a in counts],
+            "a counting payload measured and then replaced")
+
+    def test_a_selection_over_a_tail_of_counting_payloads(self):
+        for length in (1, 2, 3, 5, 17, 65, 257, 20001):
+            rng = np.random.default_rng(length)
+            left = rng.integers(-(2 ** 62), 2 ** 62, size=length)
+            right = rng.integers(-(2 ** 62), 2 ** 62, size=length)
+            truth = rng.random(length) > 0.5
+            self._checked(
+                tensorplay.where(
+                    tensorplay.from_numpy(truth).to("vulkan"),
+                    self._device(left), self._device(right)),
+                np.where(truth, left, right),
+                f"selection over {length} counts")
+
+    def test_a_number_past_a_word_folds_as_a_pair(self):
+        # Two numbers with no payload beside them keep the integer plane a count
+        # fits in - and step up to a pair of words when one of them does not.
+        condition = tensorplay.tensor([True, False]).to("vulkan")
+        in_word = tensorplay.where(condition, 7, 3)
+        self.assertEqual(in_word.dtype, tensorplay.int32,
+                         "a count inside a word widened its plane")
+        np.testing.assert_array_equal(
+            np.asarray(in_word.cpu()), np.array([7, 3], dtype=np.int32),
+            err_msg="a pair inside a word")
+        past_word = tensorplay.where(condition, (1 << 40) + 7, 3)
+        self.assertEqual(past_word.dtype, tensorplay.int64,
+                         "a count past a word kept a plane that truncates it")
+        np.testing.assert_array_equal(
+            np.asarray(past_word.cpu()),
+            np.array([(1 << 40) + 7, 3], dtype=np.int64),
+            err_msg="a pair where one count needs two words")
 
     def test_a_walk_with_no_pair_of_words_to_read_says_so(self):
         counts = self._device([10, 1 << 32, -7])
