@@ -419,6 +419,14 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
         group = [g for g in funcs if g.cpp_name == name]
         out_variant = next(
             (g for g in group if g.overload_name == 'out' or g.out_args), None)
+        # A schema may name its destination something other than "out": a
+        # backward map spells it "grad_input", a forward map spells it
+        # "output".  The public wrapper still calls that slot "out", but the
+        # binding takes the destination under the name the schema gives it,
+        # so the forward has to carry that name.
+        out_dest = 'out'
+        if out_variant is not None and len(out_variant.out_args) == 1:
+            out_dest = out_variant.out_args[0]
         multi_overload = sum(
             1 for g in group
             if g.overload_name != 'out' and not g.out_args) > 1
@@ -1098,7 +1106,7 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
                             indent='            ')
                         lines.append(
                             f'            return _C.{name}('
-                            f'{", ".join(kw_call + ["out=out"])})')
+                            f'{", ".join(kw_call + [f"{out_dest}=out"])})')
                     cap_kw = ', '.join(
                         f"'{_param_name(a)}': {_param_name(a)}"
                         for a in f.args if a.kwonly)
@@ -1139,7 +1147,7 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
                         f'{a.python_name}={_param_name(a)}'
                         for a in out_schema_args if a.kwonly
                     ]
-                    out_forward = out_pos + out_kw + ['out=out']
+                    out_forward = out_pos + out_kw + [f'{out_dest}=out']
                     out_capture = _out_capture_lines(
                         name, out_pos, [a.python_name for a in out_schema_args
                                         if a.kwonly], indent='        ')
@@ -1157,11 +1165,11 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
                             f'    if out is not None:')
                         lines += out_capture
                         lines.append(
-                            f'        return _C.{name}({", ".join(fwd + ["out=out"])})')
+                            f'        return _C.{name}({", ".join(fwd + [f"{out_dest}=out"])})')
                     else:
                         lines.append('    if out is not None:')
                         lines += out_capture
-                        lines.append(f'        return _C.{name}({kw}, out=out)')
+                        lines.append(f'        return _C.{name}({kw}, {out_dest}=out)')
                 _capture_line(
                     lines,
                     name,

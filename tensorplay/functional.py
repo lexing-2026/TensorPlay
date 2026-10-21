@@ -2382,12 +2382,18 @@ def tanh(input, *, out=None):
             return _captured
     return _C.tanh(self=input)
 
-def relu(input):
+def relu(input, *, out=None):
+    if out is not None:
+        if _capturing():
+            _captured = _capture_call(relu, (input,), {'out': out})
+            if _captured is not None:
+                return _captured
+        return _C.relu(self=input, out=out)
     if _capturing():
         _captured = _capture_call(relu, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.relu(input)
+    return _C.relu(self=input)
 
 def relu_(input):
     if _capturing():
@@ -2402,7 +2408,7 @@ def threshold_backward(grad_output, input, threshold, *, out=None):
             _captured = _capture_call(threshold_backward, (grad_output, input, threshold), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.threshold_backward(grad_output=grad_output, self=input, threshold=threshold, out=out)
+        return _C.threshold_backward(grad_output=grad_output, self=input, threshold=threshold, grad_input=out)
     if _capturing():
         _captured = _capture_call(threshold_backward, (grad_output, input, threshold), {})
         if _captured is not None:
@@ -2428,7 +2434,7 @@ def gelu_backward(grad_output, input, approximate='none', *, out=None):
             _captured = _capture_call(gelu_backward, (grad_output, input, approximate), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.gelu_backward(grad_output=grad_output, self=input, approximate=approximate, out=out)
+        return _C.gelu_backward(grad_output=grad_output, self=input, approximate=approximate, grad_input=out)
     if _capturing():
         _captured = _capture_call(gelu_backward, (grad_output, input, approximate), {})
         if _captured is not None:
@@ -2454,7 +2460,7 @@ def silu_backward(grad_output, input, *, out=None):
             _captured = _capture_call(silu_backward, (grad_output, input), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.silu_backward(grad_output=grad_output, self=input, out=out)
+        return _C.silu_backward(grad_output=grad_output, self=input, grad_input=out)
     if _capturing():
         _captured = _capture_call(silu_backward, (grad_output, input), {})
         if _captured is not None:
@@ -2860,35 +2866,19 @@ def masked_select(input, mask, *, out=None):
 def zero_(input):
     return input.zero_()
 
-def _pool_geometry(kernel_size, stride, padding, dilation, ndim):
-    """Normalize pooling geometry to fixed-length lists.
-
-    Scalars and single-element sequences repeat to ``ndim`` entries; an empty
-    stride defaults to the kernel size.  Backends expect the full-length form.
-    """
-
-    def expand(x):
-        if isinstance(x, int) and not isinstance(x, bool):
-            return [x] * ndim
-        x = list(x)
-        if len(x) == 1:
-            return [x[0]] * ndim
-        return x
-
-    kernel_size = expand(kernel_size)
-    stride = expand(stride) if stride else kernel_size
-    padding = expand(padding)
-    dilation = expand(dilation)
-    return kernel_size, stride, padding, dilation
-
-
 def max_pool2d(input, kernel_size, stride=([]), padding=([0, 0]), dilation=([1, 1]), ceil_mode=False):
     if _capturing():
         _captured = _capture_call(max_pool2d, (input, kernel_size, stride, padding, dilation, ceil_mode), {})
         if _captured is not None:
             return _captured
-    kernel_size, stride, padding, dilation = _pool_geometry(
-        kernel_size, stride, padding, dilation, 2)
+    if isinstance(kernel_size, int) and not isinstance(kernel_size, bool):
+        kernel_size = [kernel_size]
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    if isinstance(dilation, int) and not isinstance(dilation, bool):
+        dilation = [dilation]
     return _C.max_pool2d(input, kernel_size, stride, padding, dilation, ceil_mode)
 
 def max_pool3d(input, kernel_size, stride=([]), padding=([0, 0, 0]), dilation=([1, 1, 1]), ceil_mode=False):
@@ -2896,8 +2886,14 @@ def max_pool3d(input, kernel_size, stride=([]), padding=([0, 0, 0]), dilation=([
         _captured = _capture_call(max_pool3d, (input, kernel_size, stride, padding, dilation, ceil_mode), {})
         if _captured is not None:
             return _captured
-    kernel_size, stride, padding, dilation = _pool_geometry(
-        kernel_size, stride, padding, dilation, 3)
+    if isinstance(kernel_size, int) and not isinstance(kernel_size, bool):
+        kernel_size = [kernel_size]
+    if isinstance(stride, int) and not isinstance(stride, bool):
+        stride = [stride]
+    if isinstance(padding, int) and not isinstance(padding, bool):
+        padding = [padding]
+    if isinstance(dilation, int) and not isinstance(dilation, bool):
+        dilation = [dilation]
     return _C.max_pool3d(input, kernel_size, stride, padding, dilation, ceil_mode)
 
 def max_pool2d_with_indices(input, kernel_size, stride=[], padding=[], dilation=[], ceil_mode=False, *, out=None):
@@ -2932,15 +2928,11 @@ def avg_pool2d(input, kernel_size, stride=[], padding=[], ceil_mode=False, count
             _captured = _capture_call(avg_pool2d, (input, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override), {'out': out})
             if _captured is not None:
                 return _captured
-        kernel_size, stride, padding, _ = _pool_geometry(
-            kernel_size, stride, padding, [1, 1], 2)
         return _C.avg_pool2d(input=input, kernel_size=kernel_size, stride=stride, padding=padding, ceil_mode=ceil_mode, count_include_pad=count_include_pad, divisor_override=divisor_override, out=out)
     if _capturing():
         _captured = _capture_call(avg_pool2d, (input, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override), {})
         if _captured is not None:
             return _captured
-    kernel_size, stride, padding, _ = _pool_geometry(
-        kernel_size, stride, padding, [1, 1], 2)
     return _C.avg_pool2d(input=input, kernel_size=kernel_size, stride=stride, padding=padding, ceil_mode=ceil_mode, count_include_pad=count_include_pad, divisor_override=divisor_override)
 
 def avg_pool3d(input, kernel_size, stride=[], padding=[], ceil_mode=False, count_include_pad=True, divisor_override=None, *, out=None):
@@ -2949,15 +2941,11 @@ def avg_pool3d(input, kernel_size, stride=[], padding=[], ceil_mode=False, count
             _captured = _capture_call(avg_pool3d, (input, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override), {'out': out})
             if _captured is not None:
                 return _captured
-        kernel_size, stride, padding, _ = _pool_geometry(
-            kernel_size, stride, padding, [1, 1, 1], 3)
         return _C.avg_pool3d(input=input, kernel_size=kernel_size, stride=stride, padding=padding, ceil_mode=ceil_mode, count_include_pad=count_include_pad, divisor_override=divisor_override, out=out)
     if _capturing():
         _captured = _capture_call(avg_pool3d, (input, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override), {})
         if _captured is not None:
             return _captured
-    kernel_size, stride, padding, _ = _pool_geometry(
-        kernel_size, stride, padding, [1, 1, 1], 3)
     return _C.avg_pool3d(input=input, kernel_size=kernel_size, stride=stride, padding=padding, ceil_mode=ceil_mode, count_include_pad=count_include_pad, divisor_override=divisor_override)
 
 def avg_pool3d_backward(grad_output, input, kernel_size, stride=[], padding=[], ceil_mode=False, count_include_pad=True, divisor_override=None, *, out=None):
@@ -2966,7 +2954,7 @@ def avg_pool3d_backward(grad_output, input, kernel_size, stride=[], padding=[], 
             _captured = _capture_call(avg_pool3d_backward, (grad_output, input, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.avg_pool3d_backward(grad_output=grad_output, input=input, kernel_size=kernel_size, stride=stride, padding=padding, ceil_mode=ceil_mode, count_include_pad=count_include_pad, divisor_override=divisor_override, out=out)
+        return _C.avg_pool3d_backward(grad_output=grad_output, input=input, kernel_size=kernel_size, stride=stride, padding=padding, ceil_mode=ceil_mode, count_include_pad=count_include_pad, divisor_override=divisor_override, grad_input=out)
     if _capturing():
         _captured = _capture_call(avg_pool3d_backward, (grad_output, input, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override), {})
         if _captured is not None:
@@ -2992,7 +2980,7 @@ def adaptive_avg_pool3d_backward(grad_output, input, *, out=None):
             _captured = _capture_call(adaptive_avg_pool3d_backward, (grad_output, input), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.adaptive_avg_pool3d_backward(grad_output=grad_output, input=input, out=out)
+        return _C.adaptive_avg_pool3d_backward(grad_output=grad_output, input=input, grad_input=out)
     if _capturing():
         _captured = _capture_call(adaptive_avg_pool3d_backward, (grad_output, input), {})
         if _captured is not None:
@@ -3066,7 +3054,7 @@ def fractional_max_pool2d_backward(grad_output, input, kernel_size, output_size,
             _captured = _capture_call(fractional_max_pool2d_backward, (grad_output, input, kernel_size, output_size, indices), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.fractional_max_pool2d_backward(grad_output=grad_output, self=input, kernel_size=kernel_size, output_size=output_size, indices=indices, out=out)
+        return _C.fractional_max_pool2d_backward(grad_output=grad_output, self=input, kernel_size=kernel_size, output_size=output_size, indices=indices, grad_input=out)
     if _capturing():
         _captured = _capture_call(fractional_max_pool2d_backward, (grad_output, input, kernel_size, output_size, indices), {})
         if _captured is not None:
@@ -3092,7 +3080,7 @@ def fractional_max_pool3d_backward(grad_output, input, kernel_size, output_size,
             _captured = _capture_call(fractional_max_pool3d_backward, (grad_output, input, kernel_size, output_size, indices), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.fractional_max_pool3d_backward(grad_output=grad_output, self=input, kernel_size=kernel_size, output_size=output_size, indices=indices, out=out)
+        return _C.fractional_max_pool3d_backward(grad_output=grad_output, self=input, kernel_size=kernel_size, output_size=output_size, indices=indices, grad_input=out)
     if _capturing():
         _captured = _capture_call(fractional_max_pool3d_backward, (grad_output, input, kernel_size, output_size, indices), {})
         if _captured is not None:
@@ -3190,7 +3178,7 @@ def nll_loss_backward(grad_output, input, target, weight=None, reduction=1, igno
             _captured = _capture_call(nll_loss_backward, (grad_output, input, target, weight, reduction, ignore_index, total_weight), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.nll_loss_backward(grad_output=grad_output, self=input, target=target, weight=weight, reduction=reduction, ignore_index=ignore_index, total_weight=total_weight, out=out)
+        return _C.nll_loss_backward(grad_output=grad_output, self=input, target=target, weight=weight, reduction=reduction, ignore_index=ignore_index, total_weight=total_weight, grad_input=out)
     if _capturing():
         _captured = _capture_call(nll_loss_backward, (grad_output, input, target, weight, reduction, ignore_index, total_weight), {})
         if _captured is not None:
@@ -3216,7 +3204,7 @@ def nll_loss2d_backward(grad_output, input, target, weight=None, reduction=1, ig
             _captured = _capture_call(nll_loss2d_backward, (grad_output, input, target, weight, reduction, ignore_index, total_weight), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.nll_loss2d_backward(grad_output=grad_output, self=input, target=target, weight=weight, reduction=reduction, ignore_index=ignore_index, total_weight=total_weight, out=out)
+        return _C.nll_loss2d_backward(grad_output=grad_output, self=input, target=target, weight=weight, reduction=reduction, ignore_index=ignore_index, total_weight=total_weight, grad_input=out)
     if _capturing():
         _captured = _capture_call(nll_loss2d_backward, (grad_output, input, target, weight, reduction, ignore_index, total_weight), {})
         if _captured is not None:
@@ -3256,7 +3244,7 @@ def mse_loss_backward(grad_output, input, target, reduction=1, *, out=None):
             _captured = _capture_call(mse_loss_backward, (grad_output, input, target, reduction), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.mse_loss_backward(grad_output=grad_output, self=input, target=target, reduction=reduction, out=out)
+        return _C.mse_loss_backward(grad_output=grad_output, self=input, target=target, reduction=reduction, grad_input=out)
     if _capturing():
         _captured = _capture_call(mse_loss_backward, (grad_output, input, target, reduction), {})
         if _captured is not None:
@@ -3299,7 +3287,7 @@ def max_pool2d_with_indices_backward(grad_output, input, kernel_size, stride=[],
             _captured = _capture_call(max_pool2d_with_indices_backward, (grad_output, input, kernel_size, stride, padding, dilation, ceil_mode, indices), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.max_pool2d_with_indices_backward(grad_output=grad_output, input=input, kernel_size=kernel_size, stride=stride, padding=padding, dilation=dilation, ceil_mode=ceil_mode, indices=indices, out=out)
+        return _C.max_pool2d_with_indices_backward(grad_output=grad_output, input=input, kernel_size=kernel_size, stride=stride, padding=padding, dilation=dilation, ceil_mode=ceil_mode, indices=indices, grad_input=out)
     if _capturing():
         _captured = _capture_call(max_pool2d_with_indices_backward, (grad_output, input, kernel_size, stride, padding, dilation, ceil_mode, indices), {})
         if _captured is not None:
@@ -3312,7 +3300,7 @@ def max_pool3d_with_indices_backward(grad_output, input, kernel_size, stride=[],
             _captured = _capture_call(max_pool3d_with_indices_backward, (grad_output, input, kernel_size, stride, padding, dilation, ceil_mode, indices), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.max_pool3d_with_indices_backward(grad_output=grad_output, input=input, kernel_size=kernel_size, stride=stride, padding=padding, dilation=dilation, ceil_mode=ceil_mode, indices=indices, out=out)
+        return _C.max_pool3d_with_indices_backward(grad_output=grad_output, input=input, kernel_size=kernel_size, stride=stride, padding=padding, dilation=dilation, ceil_mode=ceil_mode, indices=indices, grad_input=out)
     if _capturing():
         _captured = _capture_call(max_pool3d_with_indices_backward, (grad_output, input, kernel_size, stride, padding, dilation, ceil_mode, indices), {})
         if _captured is not None:
@@ -3325,7 +3313,7 @@ def avg_pool2d_backward(grad_output, input, kernel_size, stride=[], padding=[], 
             _captured = _capture_call(avg_pool2d_backward, (grad_output, input, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.avg_pool2d_backward(grad_output=grad_output, input=input, kernel_size=kernel_size, stride=stride, padding=padding, ceil_mode=ceil_mode, count_include_pad=count_include_pad, divisor_override=divisor_override, out=out)
+        return _C.avg_pool2d_backward(grad_output=grad_output, input=input, kernel_size=kernel_size, stride=stride, padding=padding, ceil_mode=ceil_mode, count_include_pad=count_include_pad, divisor_override=divisor_override, grad_input=out)
     if _capturing():
         _captured = _capture_call(avg_pool2d_backward, (grad_output, input, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override), {})
         if _captured is not None:
@@ -3345,7 +3333,7 @@ def adaptive_max_pool2d_backward(grad_output, input, *, out=None):
             _captured = _capture_call(adaptive_max_pool2d_backward, (grad_output, input), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.adaptive_max_pool2d_backward(grad_output=grad_output, input=input, out=out)
+        return _C.adaptive_max_pool2d_backward(grad_output=grad_output, input=input, grad_input=out)
     if _capturing():
         _captured = _capture_call(adaptive_max_pool2d_backward, (grad_output, input), {})
         if _captured is not None:
@@ -3367,7 +3355,7 @@ def adaptive_max_pool3d_backward(grad_output, input, indices, *, out=None):
             _captured = _capture_call(adaptive_max_pool3d_backward, (grad_output, input, indices), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.adaptive_max_pool3d_backward(grad_output=grad_output, input=input, indices=indices, out=out)
+        return _C.adaptive_max_pool3d_backward(grad_output=grad_output, input=input, indices=indices, grad_input=out)
     if _capturing():
         _captured = _capture_call(adaptive_max_pool3d_backward, (grad_output, input, indices), {})
         if _captured is not None:
@@ -4102,7 +4090,7 @@ def leaky_relu_backward(grad_output, input, negative_slope, self_is_result, *, o
             _captured = _capture_call(leaky_relu_backward, (grad_output, input, negative_slope, self_is_result), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.leaky_relu_backward(grad_output=grad_output, self=input, negative_slope=negative_slope, self_is_result=self_is_result, out=out)
+        return _C.leaky_relu_backward(grad_output=grad_output, self=input, negative_slope=negative_slope, self_is_result=self_is_result, grad_input=out)
     if _capturing():
         _captured = _capture_call(leaky_relu_backward, (grad_output, input, negative_slope, self_is_result), {})
         if _captured is not None:
@@ -4152,7 +4140,7 @@ def log_sigmoid_backward(grad_output, input, *, out=None):
             _captured = _capture_call(log_sigmoid_backward, (grad_output, input), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.log_sigmoid_backward(grad_output=grad_output, self=input, out=out)
+        return _C.log_sigmoid_backward(grad_output=grad_output, self=input, grad_input=out)
     if _capturing():
         _captured = _capture_call(log_sigmoid_backward, (grad_output, input), {})
         if _captured is not None:
@@ -4178,7 +4166,7 @@ def hardtanh_backward(grad_output, input, min_val, max_val, *, out=None):
             _captured = _capture_call(hardtanh_backward, (grad_output, input, min_val, max_val), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.hardtanh_backward(grad_output=grad_output, self=input, min_val=min_val, max_val=max_val, out=out)
+        return _C.hardtanh_backward(grad_output=grad_output, self=input, min_val=min_val, max_val=max_val, grad_input=out)
     if _capturing():
         _captured = _capture_call(hardtanh_backward, (grad_output, input, min_val, max_val), {})
         if _captured is not None:
@@ -4198,12 +4186,18 @@ def hardswish(input, *, out=None):
             return _captured
     return _C.hardswish(self=input)
 
-def hardswish_backward(grad_output, input):
+def hardswish_backward(grad_output, input, *, out=None):
+    if out is not None:
+        if _capturing():
+            _captured = _capture_call(hardswish_backward, (grad_output, input), {'out': out})
+            if _captured is not None:
+                return _captured
+        return _C.hardswish_backward(grad_output=grad_output, self=input, out=out)
     if _capturing():
         _captured = _capture_call(hardswish_backward, (grad_output, input), {})
         if _captured is not None:
             return _captured
-    return _C.hardswish_backward(grad_output, input)
+    return _C.hardswish_backward(grad_output=grad_output, self=input)
 
 def sec(input):
     if _capturing():
@@ -4266,7 +4260,7 @@ def hardsigmoid_backward(grad_output, input, *, out=None):
             _captured = _capture_call(hardsigmoid_backward, (grad_output, input), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.hardsigmoid_backward(grad_output=grad_output, self=input, out=out)
+        return _C.hardsigmoid_backward(grad_output=grad_output, self=input, grad_input=out)
     if _capturing():
         _captured = _capture_call(hardsigmoid_backward, (grad_output, input), {})
         if _captured is not None:
@@ -4292,7 +4286,7 @@ def softplus_backward(grad_output, input, beta, threshold, *, out=None):
             _captured = _capture_call(softplus_backward, (grad_output, input, beta, threshold), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.softplus_backward(grad_output=grad_output, self=input, beta=beta, threshold=threshold, out=out)
+        return _C.softplus_backward(grad_output=grad_output, self=input, beta=beta, threshold=threshold, grad_input=out)
     if _capturing():
         _captured = _capture_call(softplus_backward, (grad_output, input, beta, threshold), {})
         if _captured is not None:
@@ -4318,7 +4312,7 @@ def elu_backward(grad_output, alpha, scale, input_scale, is_result, self_or_resu
             _captured = _capture_call(elu_backward, (grad_output, alpha, scale, input_scale, is_result, self_or_result), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.elu_backward(grad_output=grad_output, alpha=alpha, scale=scale, input_scale=input_scale, is_result=is_result, self_or_result=self_or_result, out=out)
+        return _C.elu_backward(grad_output=grad_output, alpha=alpha, scale=scale, input_scale=input_scale, is_result=is_result, self_or_result=self_or_result, grad_input=out)
     if _capturing():
         _captured = _capture_call(elu_backward, (grad_output, alpha, scale, input_scale, is_result, self_or_result), {})
         if _captured is not None:
@@ -4332,14 +4326,18 @@ def selu(input):
             return _captured
     return _C.selu(input)
 
-def celu(input, alpha=1.0):
+def celu(input, alpha=1.0, *, out=None):
+    if out is not None:
+        if _capturing():
+            _captured = _capture_call(celu, (input, alpha), {'out': out})
+            if _captured is not None:
+                return _captured
+        return _C.celu(self=input, alpha=alpha, out=out)
     if _capturing():
         _captured = _capture_call(celu, (input, alpha), {})
         if _captured is not None:
             return _captured
-    if not isinstance(alpha, (tensorplay.Scalar, tensorplay.Tensor)):
-        alpha = tensorplay.Scalar(alpha)
-    return _C.celu(input, alpha)
+    return _C.celu(self=input, alpha=alpha)
 
 def mish(input, *, out=None):
     if out is not None:
@@ -4380,7 +4378,7 @@ def softshrink_backward(grad_output, input, lambd, *, out=None):
             _captured = _capture_call(softshrink_backward, (grad_output, input, lambd), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.softshrink_backward(grad_output=grad_output, self=input, lambd=lambd, out=out)
+        return _C.softshrink_backward(grad_output=grad_output, self=input, lambd=lambd, grad_input=out)
     if _capturing():
         _captured = _capture_call(softshrink_backward, (grad_output, input, lambd), {})
         if _captured is not None:
@@ -4406,7 +4404,7 @@ def hardshrink_backward(grad_out, input, lambd, *, out=None):
             _captured = _capture_call(hardshrink_backward, (grad_out, input, lambd), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.hardshrink_backward(grad_out=grad_out, self=input, lambd=lambd, out=out)
+        return _C.hardshrink_backward(grad_out=grad_out, self=input, lambd=lambd, grad_input=out)
     if _capturing():
         _captured = _capture_call(hardshrink_backward, (grad_out, input, lambd), {})
         if _captured is not None:
@@ -4432,7 +4430,7 @@ def glu_backward(grad_output, input, dim=-1, *, out=None):
             _captured = _capture_call(glu_backward, (grad_output, input, dim), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.glu_backward(grad_output=grad_output, self=input, dim=dim, out=out)
+        return _C.glu_backward(grad_output=grad_output, self=input, dim=dim, grad_input=out)
     if _capturing():
         _captured = _capture_call(glu_backward, (grad_output, input, dim), {})
         if _captured is not None:
@@ -4662,7 +4660,7 @@ def upsample_nearest1d_backward(grad_output, output_size, input_size, scales=Non
             _captured = _capture_call(upsample_nearest1d_backward, (grad_output, output_size, input_size, scales), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.upsample_nearest1d_backward(grad_output=grad_output, output_size=output_size, input_size=input_size, scales=scales, out=out)
+        return _C.upsample_nearest1d_backward(grad_output=grad_output, output_size=output_size, input_size=input_size, scales=scales, grad_input=out)
     if _capturing():
         _captured = _capture_call(upsample_nearest1d_backward, (grad_output, output_size, input_size, scales), {})
         if _captured is not None:
@@ -4688,7 +4686,7 @@ def upsample_nearest2d_backward(grad_output, output_size, input_size, scales_h=N
             _captured = _capture_call(upsample_nearest2d_backward, (grad_output, output_size, input_size, scales_h, scales_w), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.upsample_nearest2d_backward(grad_output=grad_output, output_size=output_size, input_size=input_size, scales_h=scales_h, scales_w=scales_w, out=out)
+        return _C.upsample_nearest2d_backward(grad_output=grad_output, output_size=output_size, input_size=input_size, scales_h=scales_h, scales_w=scales_w, grad_input=out)
     if _capturing():
         _captured = _capture_call(upsample_nearest2d_backward, (grad_output, output_size, input_size, scales_h, scales_w), {})
         if _captured is not None:
@@ -4714,7 +4712,7 @@ def upsample_nearest3d_backward(grad_output, output_size, input_size, scales_d=N
             _captured = _capture_call(upsample_nearest3d_backward, (grad_output, output_size, input_size, scales_d, scales_h, scales_w), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.upsample_nearest3d_backward(grad_output=grad_output, output_size=output_size, input_size=input_size, scales_d=scales_d, scales_h=scales_h, scales_w=scales_w, out=out)
+        return _C.upsample_nearest3d_backward(grad_output=grad_output, output_size=output_size, input_size=input_size, scales_d=scales_d, scales_h=scales_h, scales_w=scales_w, grad_input=out)
     if _capturing():
         _captured = _capture_call(upsample_nearest3d_backward, (grad_output, output_size, input_size, scales_d, scales_h, scales_w), {})
         if _captured is not None:
@@ -4740,7 +4738,7 @@ def upsample_linear1d_backward(grad_output, output_size, input_size, align_corne
             _captured = _capture_call(upsample_linear1d_backward, (grad_output, output_size, input_size, align_corners, scales), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.upsample_linear1d_backward(grad_output=grad_output, output_size=output_size, input_size=input_size, align_corners=align_corners, scales=scales, out=out)
+        return _C.upsample_linear1d_backward(grad_output=grad_output, output_size=output_size, input_size=input_size, align_corners=align_corners, scales=scales, grad_input=out)
     if _capturing():
         _captured = _capture_call(upsample_linear1d_backward, (grad_output, output_size, input_size, align_corners, scales), {})
         if _captured is not None:
@@ -4766,7 +4764,7 @@ def upsample_bilinear2d_backward(grad_output, output_size, input_size, align_cor
             _captured = _capture_call(upsample_bilinear2d_backward, (grad_output, output_size, input_size, align_corners, scales_h, scales_w), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.upsample_bilinear2d_backward(grad_output=grad_output, output_size=output_size, input_size=input_size, align_corners=align_corners, scales_h=scales_h, scales_w=scales_w, out=out)
+        return _C.upsample_bilinear2d_backward(grad_output=grad_output, output_size=output_size, input_size=input_size, align_corners=align_corners, scales_h=scales_h, scales_w=scales_w, grad_input=out)
     if _capturing():
         _captured = _capture_call(upsample_bilinear2d_backward, (grad_output, output_size, input_size, align_corners, scales_h, scales_w), {})
         if _captured is not None:
@@ -4792,7 +4790,7 @@ def upsample_bicubic2d_backward(grad_output, output_size, input_size, align_corn
             _captured = _capture_call(upsample_bicubic2d_backward, (grad_output, output_size, input_size, align_corners, scales_h, scales_w), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.upsample_bicubic2d_backward(grad_output=grad_output, output_size=output_size, input_size=input_size, align_corners=align_corners, scales_h=scales_h, scales_w=scales_w, out=out)
+        return _C.upsample_bicubic2d_backward(grad_output=grad_output, output_size=output_size, input_size=input_size, align_corners=align_corners, scales_h=scales_h, scales_w=scales_w, grad_input=out)
     if _capturing():
         _captured = _capture_call(upsample_bicubic2d_backward, (grad_output, output_size, input_size, align_corners, scales_h, scales_w), {})
         if _captured is not None:
@@ -4818,7 +4816,7 @@ def upsample_trilinear3d_backward(grad_output, output_size, input_size, align_co
             _captured = _capture_call(upsample_trilinear3d_backward, (grad_output, output_size, input_size, align_corners, scales_d, scales_h, scales_w), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.upsample_trilinear3d_backward(grad_output=grad_output, output_size=output_size, input_size=input_size, align_corners=align_corners, scales_d=scales_d, scales_h=scales_h, scales_w=scales_w, out=out)
+        return _C.upsample_trilinear3d_backward(grad_output=grad_output, output_size=output_size, input_size=input_size, align_corners=align_corners, scales_d=scales_d, scales_h=scales_h, scales_w=scales_w, grad_input=out)
     if _capturing():
         _captured = _capture_call(upsample_trilinear3d_backward, (grad_output, output_size, input_size, align_corners, scales_d, scales_h, scales_w), {})
         if _captured is not None:
@@ -6070,7 +6068,7 @@ def logit_backward(grad_output, input, eps=None, *, out=None):
             _captured = _capture_call(logit_backward, (grad_output, input, eps), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.logit_backward(grad_output=grad_output, self=input, eps=eps, out=out)
+        return _C.logit_backward(grad_output=grad_output, self=input, eps=eps, grad_input=out)
     if _capturing():
         _captured = _capture_call(logit_backward, (grad_output, input, eps), {})
         if _captured is not None:
@@ -6083,7 +6081,7 @@ def sigmoid_backward(grad_output, output, *, out=None):
             _captured = _capture_call(sigmoid_backward, (grad_output, output), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.sigmoid_backward(grad_output=grad_output, output=output, out=out)
+        return _C.sigmoid_backward(grad_output=grad_output, output=output, grad_input=out)
     if _capturing():
         _captured = _capture_call(sigmoid_backward, (grad_output, output), {})
         if _captured is not None:
@@ -6096,7 +6094,7 @@ def tanh_backward(grad_output, output, *, out=None):
             _captured = _capture_call(tanh_backward, (grad_output, output), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.tanh_backward(grad_output=grad_output, output=output, out=out)
+        return _C.tanh_backward(grad_output=grad_output, output=output, grad_input=out)
     if _capturing():
         _captured = _capture_call(tanh_backward, (grad_output, output), {})
         if _captured is not None:
@@ -6308,7 +6306,7 @@ def smooth_l1_loss_backward(grad_output, input, target, reduction, beta, *, out=
             _captured = _capture_call(smooth_l1_loss_backward, (grad_output, input, target, reduction, beta), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.smooth_l1_loss_backward(grad_output=grad_output, self=input, target=target, reduction=reduction, beta=beta, out=out)
+        return _C.smooth_l1_loss_backward(grad_output=grad_output, self=input, target=target, reduction=reduction, beta=beta, grad_input=out)
     if _capturing():
         _captured = _capture_call(smooth_l1_loss_backward, (grad_output, input, target, reduction, beta), {})
         if _captured is not None:
@@ -6334,7 +6332,7 @@ def huber_loss_backward(grad_output, input, target, reduction, delta, *, out=Non
             _captured = _capture_call(huber_loss_backward, (grad_output, input, target, reduction, delta), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.huber_loss_backward(grad_output=grad_output, self=input, target=target, reduction=reduction, delta=delta, out=out)
+        return _C.huber_loss_backward(grad_output=grad_output, self=input, target=target, reduction=reduction, delta=delta, grad_input=out)
     if _capturing():
         _captured = _capture_call(huber_loss_backward, (grad_output, input, target, reduction, delta), {})
         if _captured is not None:
@@ -6367,7 +6365,7 @@ def binary_cross_entropy_backward(grad_output, input, target, weight=None, reduc
             _captured = _capture_call(binary_cross_entropy_backward, (grad_output, input, target, weight, reduction), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.binary_cross_entropy_backward(grad_output=grad_output, self=input, target=target, weight=weight, reduction=reduction, out=out)
+        return _C.binary_cross_entropy_backward(grad_output=grad_output, self=input, target=target, weight=weight, reduction=reduction, grad_input=out)
     if _capturing():
         _captured = _capture_call(binary_cross_entropy_backward, (grad_output, input, target, weight, reduction), {})
         if _captured is not None:
@@ -6447,7 +6445,7 @@ def multi_margin_loss_backward(grad_output, input, target, p, margin, weight=Non
             _captured = _capture_call(multi_margin_loss_backward, (grad_output, input, target, p, margin, weight, reduction), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.multi_margin_loss_backward(grad_output=grad_output, self=input, target=target, p=p, margin=margin, weight=weight, reduction=reduction, out=out)
+        return _C.multi_margin_loss_backward(grad_output=grad_output, self=input, target=target, p=p, margin=margin, weight=weight, reduction=reduction, grad_input=out)
     if _capturing():
         _captured = _capture_call(multi_margin_loss_backward, (grad_output, input, target, p, margin, weight, reduction), {})
         if _captured is not None:
@@ -6486,7 +6484,7 @@ def multilabel_margin_loss_backward(grad_output, input, target, reduction, is_ta
             _captured = _capture_call(multilabel_margin_loss_backward, (grad_output, input, target, reduction, is_target), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.multilabel_margin_loss_backward(grad_output=grad_output, self=input, target=target, reduction=reduction, is_target=is_target, out=out)
+        return _C.multilabel_margin_loss_backward(grad_output=grad_output, self=input, target=target, reduction=reduction, is_target=is_target, grad_input=out)
     if _capturing():
         _captured = _capture_call(multilabel_margin_loss_backward, (grad_output, input, target, reduction, is_target), {})
         if _captured is not None:
@@ -7961,6 +7959,20 @@ def fused_rope(query, key, cos, sin, position_offset=0):
         if _captured is not None:
             return _captured
     return _C.fused_rope(query, key, cos, sin, position_offset)
+
+def _fused_rope_neox(input, cos, sin):
+    if _capturing():
+        _captured = _capture_call(_fused_rope_neox, (input, cos, sin), {})
+        if _captured is not None:
+            return _captured
+    return _C._fused_rope_neox(input, cos, sin)
+
+def _fused_rope_neox_backward(grad_out, input, cos, sin):
+    if _capturing():
+        _captured = _capture_call(_fused_rope_neox_backward, (grad_out, input, cos, sin), {})
+        if _captured is not None:
+            return _captured
+    return _C._fused_rope_neox_backward(grad_out, input, cos, sin)
 
 def acos_(input):
     if _capturing():
@@ -11508,7 +11520,7 @@ def _softmax_backward_data(grad_output, output, dim, input_dtype, *, out=None):
             _captured = _capture_call(_softmax_backward_data, (grad_output, output, dim, input_dtype), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C._softmax_backward_data(grad_output=grad_output, output=output, dim=dim, input_dtype=input_dtype, out=out)
+        return _C._softmax_backward_data(grad_output=grad_output, output=output, dim=dim, input_dtype=input_dtype, grad_input=out)
     if _capturing():
         _captured = _capture_call(_softmax_backward_data, (grad_output, output, dim, input_dtype), {})
         if _captured is not None:
@@ -13927,7 +13939,7 @@ def soft_margin_loss_backward(grad_output, input, target, reduction, *, out=None
             _captured = _capture_call(soft_margin_loss_backward, (grad_output, input, target, reduction), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.soft_margin_loss_backward(grad_output=grad_output, self=input, target=target, reduction=reduction, out=out)
+        return _C.soft_margin_loss_backward(grad_output=grad_output, self=input, target=target, reduction=reduction, grad_input=out)
     if _capturing():
         _captured = _capture_call(soft_margin_loss_backward, (grad_output, input, target, reduction), {})
         if _captured is not None:
@@ -14043,7 +14055,7 @@ def reflection_pad1d_backward(grad_output, input, padding, *, out=None):
             _captured = _capture_call(reflection_pad1d_backward, (grad_output, input, padding), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.reflection_pad1d_backward(grad_output=grad_output, self=input, padding=padding, out=out)
+        return _C.reflection_pad1d_backward(grad_output=grad_output, self=input, padding=padding, grad_input=out)
     if _capturing():
         _captured = _capture_call(reflection_pad1d_backward, (grad_output, input, padding), {})
         if _captured is not None:
@@ -14069,7 +14081,7 @@ def reflection_pad2d_backward(grad_output, input, padding, *, out=None):
             _captured = _capture_call(reflection_pad2d_backward, (grad_output, input, padding), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.reflection_pad2d_backward(grad_output=grad_output, self=input, padding=padding, out=out)
+        return _C.reflection_pad2d_backward(grad_output=grad_output, self=input, padding=padding, grad_input=out)
     if _capturing():
         _captured = _capture_call(reflection_pad2d_backward, (grad_output, input, padding), {})
         if _captured is not None:
@@ -14095,7 +14107,7 @@ def reflection_pad3d_backward(grad_output, input, padding, *, out=None):
             _captured = _capture_call(reflection_pad3d_backward, (grad_output, input, padding), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.reflection_pad3d_backward(grad_output=grad_output, self=input, padding=padding, out=out)
+        return _C.reflection_pad3d_backward(grad_output=grad_output, self=input, padding=padding, grad_input=out)
     if _capturing():
         _captured = _capture_call(reflection_pad3d_backward, (grad_output, input, padding), {})
         if _captured is not None:
@@ -14121,7 +14133,7 @@ def replication_pad1d_backward(grad_output, input, padding, *, out=None):
             _captured = _capture_call(replication_pad1d_backward, (grad_output, input, padding), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.replication_pad1d_backward(grad_output=grad_output, self=input, padding=padding, out=out)
+        return _C.replication_pad1d_backward(grad_output=grad_output, self=input, padding=padding, grad_input=out)
     if _capturing():
         _captured = _capture_call(replication_pad1d_backward, (grad_output, input, padding), {})
         if _captured is not None:
@@ -14147,7 +14159,7 @@ def replication_pad2d_backward(grad_output, input, padding, *, out=None):
             _captured = _capture_call(replication_pad2d_backward, (grad_output, input, padding), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.replication_pad2d_backward(grad_output=grad_output, self=input, padding=padding, out=out)
+        return _C.replication_pad2d_backward(grad_output=grad_output, self=input, padding=padding, grad_input=out)
     if _capturing():
         _captured = _capture_call(replication_pad2d_backward, (grad_output, input, padding), {})
         if _captured is not None:
@@ -14173,7 +14185,7 @@ def replication_pad3d_backward(grad_output, input, padding, *, out=None):
             _captured = _capture_call(replication_pad3d_backward, (grad_output, input, padding), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.replication_pad3d_backward(grad_output=grad_output, self=input, padding=padding, out=out)
+        return _C.replication_pad3d_backward(grad_output=grad_output, self=input, padding=padding, grad_input=out)
     if _capturing():
         _captured = _capture_call(replication_pad3d_backward, (grad_output, input, padding), {})
         if _captured is not None:
@@ -14291,7 +14303,7 @@ def _upsample_bilinear2d_aa_backward(grad_output, output_size, input_size, align
             _captured = _capture_call(_upsample_bilinear2d_aa_backward, (grad_output, output_size, input_size, align_corners, scales_h, scales_w), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C._upsample_bilinear2d_aa_backward(grad_output=grad_output, output_size=output_size, input_size=input_size, align_corners=align_corners, scales_h=scales_h, scales_w=scales_w, out=out)
+        return _C._upsample_bilinear2d_aa_backward(grad_output=grad_output, output_size=output_size, input_size=input_size, align_corners=align_corners, scales_h=scales_h, scales_w=scales_w, grad_input=out)
     if _capturing():
         _captured = _capture_call(_upsample_bilinear2d_aa_backward, (grad_output, output_size, input_size, align_corners, scales_h, scales_w), {})
         if _captured is not None:
@@ -14304,7 +14316,7 @@ def _upsample_bicubic2d_aa_backward(grad_output, output_size, input_size, align_
             _captured = _capture_call(_upsample_bicubic2d_aa_backward, (grad_output, output_size, input_size, align_corners, scales_h, scales_w), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C._upsample_bicubic2d_aa_backward(grad_output=grad_output, output_size=output_size, input_size=input_size, align_corners=align_corners, scales_h=scales_h, scales_w=scales_w, out=out)
+        return _C._upsample_bicubic2d_aa_backward(grad_output=grad_output, output_size=output_size, input_size=input_size, align_corners=align_corners, scales_h=scales_h, scales_w=scales_w, grad_input=out)
     if _capturing():
         _captured = _capture_call(_upsample_bicubic2d_aa_backward, (grad_output, output_size, input_size, align_corners, scales_h, scales_w), {})
         if _captured is not None:
@@ -14317,7 +14329,7 @@ def _upsample_lanczos2d_aa_backward(grad_output, output_size, input_size, align_
             _captured = _capture_call(_upsample_lanczos2d_aa_backward, (grad_output, output_size, input_size, align_corners, scales_h, scales_w), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C._upsample_lanczos2d_aa_backward(grad_output=grad_output, output_size=output_size, input_size=input_size, align_corners=align_corners, scales_h=scales_h, scales_w=scales_w, out=out)
+        return _C._upsample_lanczos2d_aa_backward(grad_output=grad_output, output_size=output_size, input_size=input_size, align_corners=align_corners, scales_h=scales_h, scales_w=scales_w, grad_input=out)
     if _capturing():
         _captured = _capture_call(_upsample_lanczos2d_aa_backward, (grad_output, output_size, input_size, align_corners, scales_h, scales_w), {})
         if _captured is not None:
@@ -14330,7 +14342,7 @@ def _upsample_nearest_exact1d_backward(grad_output, output_size, input_size, sca
             _captured = _capture_call(_upsample_nearest_exact1d_backward, (grad_output, output_size, input_size, scales), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C._upsample_nearest_exact1d_backward(grad_output=grad_output, output_size=output_size, input_size=input_size, scales=scales, out=out)
+        return _C._upsample_nearest_exact1d_backward(grad_output=grad_output, output_size=output_size, input_size=input_size, scales=scales, grad_input=out)
     if _capturing():
         _captured = _capture_call(_upsample_nearest_exact1d_backward, (grad_output, output_size, input_size, scales), {})
         if _captured is not None:
@@ -14343,7 +14355,7 @@ def _upsample_nearest_exact2d_backward(grad_output, output_size, input_size, sca
             _captured = _capture_call(_upsample_nearest_exact2d_backward, (grad_output, output_size, input_size, scales_h, scales_w), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C._upsample_nearest_exact2d_backward(grad_output=grad_output, output_size=output_size, input_size=input_size, scales_h=scales_h, scales_w=scales_w, out=out)
+        return _C._upsample_nearest_exact2d_backward(grad_output=grad_output, output_size=output_size, input_size=input_size, scales_h=scales_h, scales_w=scales_w, grad_input=out)
     if _capturing():
         _captured = _capture_call(_upsample_nearest_exact2d_backward, (grad_output, output_size, input_size, scales_h, scales_w), {})
         if _captured is not None:
@@ -14356,7 +14368,7 @@ def _upsample_nearest_exact3d_backward(grad_output, output_size, input_size, sca
             _captured = _capture_call(_upsample_nearest_exact3d_backward, (grad_output, output_size, input_size, scales_d, scales_h, scales_w), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C._upsample_nearest_exact3d_backward(grad_output=grad_output, output_size=output_size, input_size=input_size, scales_d=scales_d, scales_h=scales_h, scales_w=scales_w, out=out)
+        return _C._upsample_nearest_exact3d_backward(grad_output=grad_output, output_size=output_size, input_size=input_size, scales_d=scales_d, scales_h=scales_h, scales_w=scales_w, grad_input=out)
     if _capturing():
         _captured = _capture_call(_upsample_nearest_exact3d_backward, (grad_output, output_size, input_size, scales_d, scales_h, scales_w), {})
         if _captured is not None:
@@ -14408,7 +14420,7 @@ def _slow_conv2d_forward(input, weight, kernel_size, bias, stride, padding, *, o
             _captured = _capture_call(_slow_conv2d_forward, (input, weight, kernel_size, bias, stride, padding), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C._slow_conv2d_forward(self=input, weight=weight, kernel_size=kernel_size, bias=bias, stride=stride, padding=padding, out=out)
+        return _C._slow_conv2d_forward(self=input, weight=weight, kernel_size=kernel_size, bias=bias, stride=stride, padding=padding, output=out)
     if _capturing():
         _captured = _capture_call(_slow_conv2d_forward, (input, weight, kernel_size, bias, stride, padding), {})
         if _captured is not None:
@@ -14475,7 +14487,7 @@ def slow_conv3d_forward(input, weight, kernel_size, bias, stride, padding, *, ou
             _captured = _capture_call(slow_conv3d_forward, (input, weight, kernel_size, bias, stride, padding), {'out': out})
             if _captured is not None:
                 return _captured
-        return _C.slow_conv3d_forward(self=input, weight=weight, kernel_size=kernel_size, bias=bias, stride=stride, padding=padding, out=out)
+        return _C.slow_conv3d_forward(self=input, weight=weight, kernel_size=kernel_size, bias=bias, stride=stride, padding=padding, output=out)
     if _capturing():
         _captured = _capture_call(slow_conv3d_forward, (input, weight, kernel_size, bias, stride, padding), {})
         if _captured is not None:
