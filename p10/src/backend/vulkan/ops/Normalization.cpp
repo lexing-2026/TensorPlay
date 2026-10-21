@@ -1501,7 +1501,7 @@ Tensor scaled_dot_product_attention_kernel(
   const int64_t D = query.size(3);
   if (enable_gqa) {
     TP_CHECK(
-        Hkv < Hq && Hq % Hkv == 0,
+        Hq % Hkv == 0,
         "Vulkan sdpa: enable_gqa requires Hq to be a multiple of Hkv");
   }
   if (attn_mask_opt.has_value()) {
@@ -1891,12 +1891,51 @@ Tensor scaled_dot_product_attention_kernel(
  * same reason a plain one is, and a fully masked query row keeps its row of
  * zeros rather than a number over nothing.
  *
- * A grouped call is the exception.  The key and value are handed back with one
- * head per query head by adding a group axis behind the head axis and reading
- * the two as one axis afterwards, and the expansion leaves a fifth axis that no
- * image can carry.  Until the grouping has a route that stays in rank four, an
- * unequal head count is refused.
+ * A grouped call answers by handing each key and value to every query head it
+ * serves, which is the same mapping the forward reads through the group.
  */
+namespace {
+
+// One key head serving a contiguous block of query heads needs an axis for the
+// block.  A payload that a kernel walks by its axes tops out at four, so the
+// block above the head axis and the block below it are folded into a pair of
+// counts: the expansion stays three-dimensional whatever the rank, and the copy
+// of the operand still happens once.
+Tensor expand_grouped_heads(const Tensor& t, int64_t group) {
+  const int64_t batches = t.size(0);
+  const int64_t heads = t.size(1);
+  const int64_t tail = t.size(2) * t.size(3);
+  std::vector<int64_t> shape =
+      static_cast<std::vector<int64_t>>(t.shape());
+  shape[1] = heads * group;
+  return tpx::ops::reshape(
+      tpx::ops::reshape(
+          tpx::ops::expand(
+              tpx::ops::unsqueeze(
+                  tpx::ops::reshape(t, {batches, heads, tail}), 2),
+              {batches, heads, group, tail}),
+          {batches, heads * group, tail}),
+      shape);
+}
+
+// The gradient arriving at a key or a value answers every query head, so the
+// block of heads one key head served is added back together.  Reading the head
+// axis as that pair of counts is the same fold the expansion used.
+Tensor fold_grouped_heads(
+    const Tensor& t,
+    int64_t heads,
+    int64_t group) {
+  const int64_t batches = t.size(0);
+  const int64_t rows = t.size(2);
+  const int64_t width = t.size(3);
+  return tpx::ops::reshape(
+      tpx::ops::sum(
+          tpx::ops::reshape(t, {batches * heads, group, rows, width}), {1}),
+      {batches, heads, rows, width});
+}
+
+} // namespace
+
 std::tuple<Tensor, Tensor, Tensor> scaled_dot_product_attention_backward_kernel(
     const Tensor& grad_output,
     const Tensor& query,
@@ -1931,10 +1970,22 @@ std::tuple<Tensor, Tensor, Tensor> scaled_dot_product_attention_backward_kernel(
       "answered with");
   TP_CHECK(
       dropout_p == 0.0, "Vulkan sdpa backward does not support dropout yet");
+
+  // The same head grouping the forward reads: equal counts map heads one to
+  // one, one key head serves every query head, and above one key head the flag
+  // is the only route and the counts have to divide.
+  const int64_t query_heads = query.size(1);
+  const int64_t kv_heads = key.size(1);
+  if (enable_gqa) {
+    TP_CHECK(
+        query_heads % kv_heads == 0,
+        "Vulkan sdpa backward: enable_gqa requires the query head count to be a "
+        "multiple of the key/value head count");
+  }
   TP_CHECK(
-      !enable_gqa || query.size(1) == key.size(1),
-      "Vulkan sdpa backward: a grouped key/value count needs an expansion that "
-      "leaves no fifth axis behind, which no image can carry");
+      kv_heads == query_heads || enable_gqa || kv_heads == 1,
+      "Vulkan sdpa backward: key and value head counts must match or be "
+      "broadcastable through enable_gqa");
   if (attn_mask_opt.has_value()) {
     TP_CHECK(
         attn_mask_opt->dim() >= 2 &&
@@ -1947,16 +1998,48 @@ std::tuple<Tensor, Tensor, Tensor> scaled_dot_product_attention_backward_kernel(
   // The scale is the one the scores were built with, so an absent scale means
   // the head width's own; the gradient folds the same factor back onto the
   // query side.
-  return composite::sdpa_math_backward_composite(
+  if (kv_heads == query_heads) {
+    return composite::sdpa_math_backward_composite(
+        grad_output,
+        query,
+        key,
+        value,
+        attn_mask_opt,
+        dropout_p,
+        is_causal,
+        scale_opt,
+        enable_gqa);
+  }
+
+  // A grouped call is answered by the same composite with the block of heads
+  // each key serves read out first.  The expanded pair is carried in single
+  // precision, because that is the width the recomputation works in and the
+  // block has to be totalled in the width its parts were summed in; the answer
+  // then returns to the width the caller's key and value were given in.
+  const int64_t group = query_heads / kv_heads;
+  Tensor expanded_key = tpx::ops::to(
+      expand_grouped_heads(key, group), DType::Float32);
+  Tensor expanded_value = tpx::ops::to(
+      expand_grouped_heads(value, group), DType::Float32);
+  auto gradients = composite::sdpa_math_backward_composite(
       grad_output,
       query,
-      key,
-      value,
+      expanded_key,
+      expanded_value,
       attn_mask_opt,
       dropout_p,
       is_causal,
       scale_opt,
-      enable_gqa);
+      /*enable_gqa=*/false);
+  return {
+      std::get<0>(gradients),
+      tpx::ops::to(
+          fold_grouped_heads(std::get<1>(gradients), kv_heads, group),
+          key.dtype()),
+      tpx::ops::to(
+          fold_grouped_heads(std::get<2>(gradients), kv_heads, group),
+          value.dtype()),
+  };
 }
 
 } // namespace ops
