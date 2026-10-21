@@ -623,6 +623,194 @@ class TestVulkanScaledDotProductAttention(unittest.TestCase):
             rows=(4096, 4100), causal=True, gqa=True)
 
 
+def _sdpa_backward_reference(q, k, v, go, mask=None, causal=False, scale=None):
+    """The gradient of the attention that `_sdpa_reference` spells out.
+
+    The scores are taken again, so a fully masked query row is a row of zeros;
+    the probabilities then split the incoming gradient over the keys a row read.
+    """
+    q = q.astype(np.float64)
+    k = k.astype(np.float64)
+    v = v.astype(np.float64)
+    go = go.astype(np.float64)
+    s = 1.0 / np.sqrt(q.shape[-1]) if scale is None else scale
+    scores = (q * s) @ k.transpose(0, 1, 3, 2)
+    if causal:
+        keys = np.arange(k.shape[2])[None, None, None, :]
+        queries = np.arange(q.shape[-2])[None, None, :, None]
+        scores = np.where(keys <= queries, scores, -np.inf)
+    if mask is not None:
+        if mask.dtype == np.bool_:
+            scores = np.where(mask, scores, -np.inf)
+        else:
+            scores = scores + mask.astype(np.float64)
+    row = np.where(
+        np.isneginf(scores.max(-1, keepdims=True)), 0.0,
+        scores.max(-1, keepdims=True))
+    e = np.exp(scores - row)
+    denom = e.sum(-1, keepdims=True)
+    probs = np.divide(e, denom, out=np.zeros_like(e), where=(denom != 0))
+    d_probs = go @ v.transpose(0, 1, 3, 2)
+    d_value = probs.transpose(0, 1, 3, 2) @ go
+    d_scores = probs * (
+        d_probs - (d_probs * probs).sum(-1, keepdims=True))
+    d_query = (d_scores @ k) * s
+    d_key = d_scores.transpose(0, 1, 3, 2) @ (q * s)
+    return d_query, d_key, d_value
+
+
+def _sdpa_backward_check(
+    self,
+    B,
+    Hq,
+    Hkv,
+    Sq,
+    Skv,
+    D,
+    dtype=tensorplay.float32,
+    causal=False,
+    mask=None,
+    scale=None,
+):
+    """Every gradient of one attention call, against the same arithmetic.
+
+    The draws come from one numpy stream, so the host reference and the device
+    see the very same query, key, value and incoming gradient.
+    """
+    rng = np.random.default_rng(B * 977 + Hq * 43 + Sq * 7 + Skv + D)
+    np_dtype = np.float16 if dtype == tensorplay.float16 else np.float32
+    q_np = (rng.standard_normal((B, Hq, Sq, D)) * 1.5).astype(np_dtype)
+    k_np = (rng.standard_normal((B, Hkv, Skv, D)) * 1.5).astype(np_dtype)
+    v_np = (rng.standard_normal((B, Hkv, Skv, D)) * 1.5).astype(np_dtype)
+    go_np = (rng.standard_normal((B, Hq, Sq, D)) * 1.5).astype(np_dtype)
+    mask_np = None if mask is None else mask.numpy()
+
+    want = _sdpa_backward_reference(
+        q_np, k_np, v_np, go_np, mask=mask_np, causal=causal, scale=scale)
+
+    q = tensorplay.tensor(q_np, dtype=dtype).to("vulkan")
+    k = tensorplay.tensor(k_np, dtype=dtype).to("vulkan")
+    v = tensorplay.tensor(v_np, dtype=dtype).to("vulkan")
+    go = tensorplay.tensor(go_np, dtype=dtype).to("vulkan")
+    q.requires_grad_(True)
+    k.requires_grad_(True)
+    v.requires_grad_(True)
+    out = tensorplay.nn.functional.scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        attn_mask=(mask.to("vulkan") if mask is not None else None),
+        is_causal=causal,
+        scale=scale)
+    out.backward(go)
+    got = [q.grad, k.grad, v.grad]
+    atol = 2.0e-2 if dtype == tensorplay.float16 else 4.0e-3
+    for name, g, w in zip(("grad_query", "grad_key", "grad_value"), got, want):
+        self.assertIsNotNone(g, msg=name)
+        np.testing.assert_allclose(
+            g.cpu().numpy().astype(np.float64), w,
+            rtol=1.0e-2, atol=atol, err_msg=name)
+
+
+class TestVulkanSdpaBackward(unittest.TestCase):
+    # The gradient is the arithmetic the attention was made of, recomputed and
+    # differentiated: no fused backward exists on the device yet, so whatever a
+    # call can express -- a causal mask, an explicit one, a scale, a context
+    # longer than the query -- is differentiable for the same reason.
+
+    def test_plain_self_attention(self):
+        _sdpa_backward_check(self, B=1, Hq=4, Hkv=4, Sq=8, Skv=8, D=16)
+        _sdpa_backward_check(self, B=2, Hq=3, Hkv=3, Sq=5, Skv=5, D=8)
+
+    def test_causal(self):
+        _sdpa_backward_check(self, B=1, Hq=4, Hkv=4, Sq=9, Skv=9, D=16,
+                             causal=True)
+        _sdpa_backward_check(self, B=2, Hq=2, Hkv=2, Sq=3, Skv=11, D=8,
+                             causal=True)
+
+    def test_a_decode_row_grad_its_whole_context(self):
+        # One query row against a long context is the shape a generated token
+        # arrives in, and the gradient has to reach every key it read.
+        _sdpa_backward_check(self, B=1, Hq=4, Hkv=4, Sq=1, Skv=64, D=32)
+        _sdpa_backward_check(self, B=1, Hq=4, Hkv=4, Sq=1, Skv=64, D=32,
+                             causal=True)
+
+    def test_bool_mask(self):
+        Sq, Skv = 5, 9
+        keep = np.tril(np.ones((Sq, Skv)), k=Skv - Sq).astype(bool)
+        _sdpa_backward_check(
+            self, B=2, Hq=3, Hkv=3, Sq=Sq, Skv=Skv, D=8,
+            mask=tensorplay.tensor(keep))
+        rng = np.random.default_rng(11)
+        per_head = rng.random((2, 1, Sq, Skv)) > 0.3
+        per_head[:, :, 0, :] = True
+        _sdpa_backward_check(
+            self, B=2, Hq=3, Hkv=3, Sq=Sq, Skv=Skv, D=8,
+            mask=tensorplay.tensor(per_head))
+
+    def test_a_fully_masked_row_grads_nothing(self):
+        # A row that reads no key answers with zeros in the forward, so its
+        # gradient has to be zeros too rather than a number over nothing.
+        keep = np.ones((2, 1, 4, 6), dtype=bool)
+        keep[:, :, 1, :] = False
+        _sdpa_backward_check(
+            self, B=2, Hq=2, Hkv=2, Sq=4, Skv=6, D=8,
+            mask=tensorplay.tensor(keep))
+
+    def test_float_mask(self):
+        rng = np.random.default_rng(13)
+        _sdpa_backward_check(
+            self, B=2, Hq=2, Hkv=2, Sq=4, Skv=7, D=8,
+            mask=tensorplay.tensor(
+                (rng.standard_normal((2, 1, 4, 7)) * 2).astype(np.float32)))
+        _sdpa_backward_check(
+            self, B=1, Hq=3, Hkv=3, Sq=5, Skv=5, D=16,
+            mask=tensorplay.tensor(
+                (rng.standard_normal((5, 5)) * 2).astype(np.float32)))
+
+    def test_a_given_scale(self):
+        _sdpa_backward_check(self, B=1, Hq=4, Hkv=4, Sq=8, Skv=8, D=32,
+                             scale=0.125, causal=True)
+
+    def test_half_inputs(self):
+        _sdpa_backward_check(self, B=1, Hq=4, Hkv=4, Sq=8, Skv=8, D=32,
+                             dtype=tensorplay.float16)
+        _sdpa_backward_check(self, B=2, Hq=2, Hkv=2, Sq=6, Skv=6, D=16,
+                             dtype=tensorplay.float16, causal=True)
+
+    def test_a_request_the_device_cannot_answer_refuses(self):
+        import tensorplay.nn.functional as Fn
+        rng = np.random.default_rng(17)
+        q = tensorplay.tensor(
+            (rng.standard_normal((1, 4, 4, 8))).astype(np.float32),
+            ).to("vulkan")
+        k = tensorplay.tensor(
+            (rng.standard_normal((1, 2, 4, 8))).astype(np.float32),
+            ).to("vulkan")
+        v = tensorplay.tensor(
+            (rng.standard_normal((1, 2, 4, 8))).astype(np.float32),
+            ).to("vulkan")
+        q.requires_grad_(True)
+        k.requires_grad_(True)
+        v.requires_grad_(True)
+        # Grouped heads would be expanded through an axis no image can carry.
+        out = Fn.scaled_dot_product_attention(q, k, v, enable_gqa=True)
+        with self.assertRaisesRegex(
+                RuntimeError, "no fifth axis"):
+            out.backward(tensorplay.ones_like(out))
+        # A proportion to drop needs the mask the drop was decided by.
+        qs = q.detach().requires_grad_(True)
+        ks = k.detach().requires_grad_(True)
+        vs = v.detach().requires_grad_(True)
+        with self.assertRaisesRegex(RuntimeError, "does not support dropout"):
+            Fn.scaled_dot_product_attention(qs, ks, vs, dropout_p=0.2)
+
+    def test_the_gradient_of_a_long_context_reaches_every_head(self):
+        # A context wide enough that its scores have no image form is the
+        # linear route, where the walk over the keys is serial per row tile.
+        _sdpa_backward_check(self, B=1, Hq=2, Hkv=2, Sq=4, Skv=4096, D=8)
+
+
 def _rope_tables(head_dim, rows):
     half = head_dim // 2
     positions = np.arange(rows)
