@@ -3478,6 +3478,63 @@ std::tuple<Tensor, Tensor> max_dim_kernel_impl(const Tensor& self, int64_t dim0,
         const ctype* sp = sc.data_ptr<ctype>();                                         \
         ctype* vp = vals.data_ptr<ctype>();                                             \
         int64_t* ip = idxs.data_ptr<int64_t>();                                         \
+        /* A column walk reads one line per element and revisits the same lines    \
+           once per column.  A block of columns that fills one line instead reads  \
+           each line once and compares all of its lanes, so the rows stream past   \
+           the cache a single time.  Lanes stay the innermost axis, which keeps    \
+           each output's visits to the reduced axis in ascending order. */         \
+        constexpr int64_t kLanes = std::max<int64_t>(1, 64 / static_cast<int64_t>(sizeof(ctype))); \
+        if (inner >= kLanes) {                                                          \
+            const int64_t col_blocks = (inner + kLanes - 1) / kLanes;                   \
+            const int64_t block_grain = std::max<int64_t>(1, GRAIN_SIZE / d_size);      \
+            parallel_for(0, outer * col_blocks, block_grain, [&](int64_t b, int64_t e) { \
+                for (int64_t flat = b; flat < e; ++flat) {                             \
+                    const int64_t o = flat / col_blocks;                                \
+                    const int64_t c0 = (flat - o * col_blocks) * kLanes;                \
+                    const int64_t cols = std::min(kLanes, inner - c0);                  \
+                    const ctype* base = sp + o * d_size * inner + c0;                   \
+                    ctype* vrow = vp + o * inner + c0;                                  \
+                    int64_t* irow = ip + o * inner + c0;                                \
+                    if (cols == kLanes) {                                              \
+                        ctype best[kLanes];                                            \
+                        int64_t bi[kLanes];                                            \
+                        for (int64_t c = 0; c < kLanes; ++c) {                          \
+                            best[c] = base[c];                                         \
+                            bi[c] = 0;                                                 \
+                        }                                                               \
+                        for (int64_t i = 1; i < d_size; ++i) {                          \
+                            const ctype* row = base + i * inner;                        \
+                            for (int64_t c = 0; c < kLanes; ++c) {                      \
+                                const ctype x = row[c];                                 \
+                                const bool take = (best[c] == best[c]) &&               \
+                                                  (x != x || x CMP_OP best[c]);         \
+                                if (take) { best[c] = x; bi[c] = i; }                   \
+                            }                                                           \
+                        }                                                               \
+                        for (int64_t c = 0; c < kLanes; ++c) {                          \
+                            vrow[c] = best[c];                                          \
+                            irow[c] = bi[c];                                            \
+                        }                                                               \
+                    } else {                                                           \
+                        for (int64_t c = 0; c < cols; ++c) {                            \
+                            const ctype* lane = base + c;                               \
+                            ctype best = lane[0];                                       \
+                            int64_t bi = 0;                                             \
+                            for (int64_t i = 1; i < d_size; ++i) {                      \
+                                const ctype x = lane[i * inner];                        \
+                                if (best == best && (x != x || x CMP_OP best)) {        \
+                                    best = x;                                           \
+                                    bi = i;                                             \
+                                }                                                       \
+                            }                                                           \
+                            vrow[c] = best;                                             \
+                            irow[c] = bi;                                               \
+                        }                                                               \
+                    }                                                                   \
+                }                                                                       \
+            });                                                                         \
+            break;                                                                      \
+        }                                                                               \
         const int64_t line_grain = std::max<int64_t>(1, GRAIN_SIZE / d_size);           \
         parallel_for(0, outer * inner, line_grain, [&](int64_t b, int64_t e) {          \
             for (int64_t flat = b; flat < e; ++flat) {                                  \
