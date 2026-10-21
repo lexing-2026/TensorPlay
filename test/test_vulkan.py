@@ -6214,6 +6214,221 @@ class TestVulkanMaskCompaction(unittest.TestCase):
                                      self._device(np.array([True] * 6)))
 
 
+class TestVulkanMaskSpread(unittest.TestCase):
+    # The opposite walk of a compaction: instead of pulling the lanes a mask
+    # holds into a result of a length only the device knows, the mask pushes the
+    # leading elements of a source into a destination whose shape it cannot
+    # change.  The rank a lane gets from the count pass is the position in the
+    # source its selection takes, so the answer is one fixed sequence however
+    # the work is spread - and an element the mask leaves alone has to arrive
+    # untouched, which pins the copy the walk fuses with the spread.
+
+    @staticmethod
+    def _device(payload):
+        arr = np.asarray(payload)
+        # A list of numbers arrives as a double plane; the payload this walk
+        # spreads is a single-precision one, so the written values arrive whole.
+        if arr.dtype == np.float64:
+            arr = arr.astype(np.float32)
+        if arr.ndim and not arr.flags["C_CONTIGUOUS"]:
+            arr = np.ascontiguousarray(arr)
+        return tensorplay.from_numpy(arr).to("vulkan")
+
+    @staticmethod
+    def _host(tensor):
+        return tensor.cpu().numpy()
+
+    def _spread_matches(self, payload, mask, source, name):
+        payload, mask, source = (np.asarray(a) for a in (payload, mask, source))
+        got = self._spread(
+            self._device(payload), self._device(mask), self._device(source))
+        want = payload.copy().reshape(-1)
+        wanted_mask = np.broadcast_to(mask, payload.shape).reshape(-1) != 0
+        take = int(np.count_nonzero(wanted_mask))
+        want[wanted_mask] = source.reshape(-1)[:take]
+        np.testing.assert_array_equal(
+            self._host(got).reshape(-1), want, err_msg=name)
+
+    def _spread(self, destination, mask, source):
+        return tensorplay.masked_scatter(destination, mask, source)
+
+    def test_the_leading_source_elements_spread_in_the_order_the_mask_reads(self):
+        self._spread_matches(
+            [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+            [[True, False, True], [False, True, False]],
+            [10.0, 20.0, 30.0],
+            "a spread over a plane")
+        destination = self._device([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+        answer = self._spread(
+            destination, self._device([[True, False, True], [False, True, False]]),
+            self._device([10.0, 20.0, 30.0]))
+        np.testing.assert_array_equal(
+            self._host(answer), [[10.0, 2.0, 20.0], [4.0, 30.0, 6.0]])
+        np.testing.assert_array_equal(
+            self._host(destination), [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+            err_msg="an out-of-place spread leaves the destination alone")
+
+    def test_the_write_lands_in_the_destination_it_names(self):
+        destination = self._device([1.0, 2.0, 3.0, 4.0])
+        answer = destination.masked_scatter_(
+            self._device([False, True, True, False]), self._device([7.0, 8.0]))
+        np.testing.assert_array_equal(
+            self._host(answer), [1.0, 7.0, 8.0, 4.0])
+        self.assertIs(answer, destination)
+
+    def test_a_source_longer_than_the_selection_keeps_its_tail_and_a_short_one_is_named(self):
+        self._spread_matches(
+            [0.0, 0.0, 0.0], [True, False, True], [1.0, 2.0, 3.0, 4.0],
+            "a source with more elements than the mask takes")
+        with self.assertRaisesRegex(RuntimeError, "fewer elements"):
+            tensorplay.masked_scatter(
+                self._device([1.0, 2.0]), self._device([True, True]),
+                self._device([1.0]))
+
+    def test_a_mask_that_holds_nothing_or_everything_answers_with_what_the_destination_holds(self):
+        self._spread_matches([1.0, 2.0], [False, False], [9.0],
+                             "a spread that selects none")
+        self._spread_matches([1.0, 2.0], [True, True], [8.0, 7.0],
+                             "a spread that selects every lane")
+        self._spread_matches(np.zeros((2, 3), np.float32),
+                             np.zeros((2, 3), np.bool_), np.zeros(0),
+                             "a source with no elements and a mask that needs none")
+        empty = tensorplay.masked_scatter(
+            self._device(np.zeros((0, 3), np.float32)),
+            self._device(np.zeros((0, 3), np.bool_)),
+            self._device([1.0]))
+        self.assertEqual(tuple(self._host(empty).shape), (0, 3))
+
+    def test_a_mask_spreads_over_the_rows_it_broadcasts_to(self):
+        table = (np.arange(12, dtype=np.float32)).reshape(3, 4)
+        self._spread_matches(table, [False, True, False, True],
+                             np.arange(6, dtype=np.float32),
+                             "a row mask repeated over three rows")
+        self._spread_matches(table, np.array(True), np.arange(12, dtype=np.float32),
+                             "a scalar mask that names every lane")
+        self._spread_matches(table, np.zeros((3, 1), np.bool_),
+                             np.arange(4, dtype=np.float32),
+                             "a mask that selects nothing by column")
+
+    def test_a_spread_over_a_payload_of_several_planes_follows_the_row_major_order(self):
+        table = (np.arange(2 * 4 * 3, dtype=np.float32)).reshape(2, 4, 3)
+        truth = np.zeros((2, 4, 3), np.bool_)
+        truth[0, 1, 2] = True
+        truth[1, 0, 0] = True
+        truth[1, 3, 2] = True
+        answer = self._host(self._spread(
+            self._device(table), self._device(truth), self._device([500.0, 600.0, 700.0])))
+        # The lane the payload holds first is the one the mask reads first, so the
+        # selection in the second plane takes the second source element and every
+        # lane beside it arrives as the destination held it.
+        want = table.copy()
+        want[0, 1, 2] = 500.0
+        want[1, 0, 0] = 600.0
+        want[1, 3, 2] = 700.0
+        np.testing.assert_array_equal(answer, want)
+
+    def test_a_lane_at_the_edge_of_a_word_a_group_and_a_walk_takes_its_own_element(self):
+        size = 70000
+        for at in (0, 1, 3, 4, 5, 1023, 1024, 1027, 4095, 4096, 4097,
+                   65535, 65536, size - 1):
+            truth = np.zeros(size, np.bool_)
+            truth[at] = True
+            self._spread_matches(
+                np.zeros(size, np.float32), truth, [float(at) + 1.0],
+                f"the single lane set at {at} of {size}")
+
+    def test_a_sparse_and_a_dense_mask_over_a_long_payload_keep_the_source_in_line(self):
+        size = 70000
+        positions = np.arange(0, size, 7)
+        truth = np.zeros(size, np.bool_)
+        truth[positions] = True
+        source = (np.arange(positions.size, dtype=np.float32) + 100.0)
+        answer = self._host(self._spread(
+            self._device(np.zeros(size, np.float32)), self._device(truth),
+            self._device(source)))
+        np.testing.assert_array_equal(answer[positions], source)
+        self.assertEqual(float(np.count_nonzero(answer)), float(positions.size),
+                         "a spread writes only the lanes a mask names")
+        dense = (np.arange(100000) % 3) == 0
+        self._spread_matches(np.zeros(100000, np.float32), dense,
+                             np.arange(int(dense.sum()), dtype=np.float32),
+                             "a mask that names a third of a long payload")
+
+    def test_a_spread_undoes_a_compaction_of_the_same_mask(self):
+        truth = (np.arange(24) % 2) == 1
+        # Only a payload that holds zero where the mask does not name it comes
+        # back whole: the spread carries the lanes it is given, not the ones it
+        # was never told about.
+        payload = np.where(truth, np.arange(1, 25, dtype=np.float32), np.float32(0.0))
+        picked = tensorplay.masked_select(self._device(payload), self._device(truth))
+        answer = self._spread(self._device(np.zeros(24, np.float32)),
+                              self._device(truth), picked)
+        np.testing.assert_array_equal(self._host(answer), payload)
+
+    def test_a_mask_made_on_the_device_spreads_like_an_uploaded_one(self):
+        # A comparison of a payload beyond a texture's reach answers in dense
+        # storage, and the truth plane it writes belongs to the comparison rather
+        # than to the caller.  The spread reads that plane after the count pass
+        # has come back, so memory handed back between the two passes would be
+        # answered with whatever the next allocation wrote over it.
+        for size in (20000, 70000):
+            values = np.arange(size, dtype=np.float32) % 7
+            payload = self._device(values)
+            truth = payload > 3
+            named = (values > 3)
+            take = int(np.count_nonzero(named))
+            answer = self._host(tensorplay.masked_scatter(
+                payload, truth, self._device(
+                    np.arange(take, dtype=np.float32) + 100.0)))
+            want = values.copy()
+            want[named] = np.arange(take, dtype=np.float32) + 100.0
+            np.testing.assert_array_equal(
+                answer, want, err_msg=f"a mask the device made of {size} lanes")
+
+    def test_a_destination_of_either_storage_holds_the_answer(self):
+        # A payload a texture reaches and one only linear memory holds both have
+        # to answer, since the walk reads the flat order of whichever it got.
+        small = np.arange(6 * 7, dtype=np.float32).reshape(6, 7)
+        truth = (np.arange(42).reshape(6, 7) % 5) == 0
+        self._spread_matches(
+            small, truth, np.arange(int(truth.sum()), dtype=np.float32),
+            "a spread over a texture-sized payload")
+        large = np.arange(40000, dtype=np.float32) % 8
+        wide = (np.arange(40000) % 3) == 0
+        self._spread_matches(
+            large, wide, np.arange(int(wide.sum()), dtype=np.float32),
+            "a spread over a payload beyond a texture")
+
+    def test_a_destination_the_walk_cannot_answer_is_refused_loudly(self):
+        truth = np.array([True, False])
+        for dtype, needle in ((np.int64, "Float32"), (np.int32, "Float32"),
+                              (np.float16, "Float32")):
+            with self.assertRaisesRegex(RuntimeError, needle):
+                tensorplay.masked_scatter(
+                    self._device(np.arange(2, dtype=dtype)), self._device(truth),
+                    self._device(np.array([1.0, 2.0], np.float32)))
+        with self.assertRaisesRegex(RuntimeError, "same dtype"):
+            tensorplay.masked_scatter(
+                self._device([1.0]), self._device([True]),
+                self._device(np.array([1], np.int64)))
+        with self.assertRaisesRegex(RuntimeError, "broadcast"):
+            tensorplay.masked_scatter(
+                self._device([1.0, 2.0]),
+                self._device(np.ones((2, 2), np.bool_)),
+                self._device([1.0]))
+        with self.assertRaisesRegex(RuntimeError, "4"):
+            tensorplay.masked_scatter(
+                self._device(np.ones((2, 2, 2, 2, 2), np.float32)),
+                self._device(np.ones((2, 2, 2, 2, 2), np.bool_)),
+                self._device([1.0]))
+        # A source the host still holds has no flat order for the walk to read
+        # on the device, so the refusal says so rather than copying it aside.
+        with self.assertRaisesRegex(RuntimeError, "source"):
+            tensorplay.masked_scatter(
+                self._device([1.0]), self._device([True]),
+                tensorplay.tensor([1.0]))
+
+
 class TestVulkanRowAccumulation(unittest.TestCase):
     # A list of row codes may name one row several times, and every row it names
     # has to reach the destination.  Nothing on this device locks a row while it
