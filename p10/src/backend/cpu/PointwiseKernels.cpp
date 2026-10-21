@@ -3874,8 +3874,14 @@ bool lerp_tensor_fast(const Tensor& self, const Tensor& end,
         return false;
     }
     const DType dt = self.dtype();
+    // The reduced widths walk the same way: the answer is computed in single
+    // precision and stored at the width of the operands, which is what the
+    // scalar-weight form already does.  Leaving them out would send every
+    // reduced-weight pair through the composition, which is several
+    // full-tensor passes with temporaries.
     if (end.dtype() != dt || weight.dtype() != dt ||
-        (dt != DType::Float32 && dt != DType::Float64)) {
+        (dt != DType::Float32 && dt != DType::Float64 &&
+         dt != DType::Float16 && dt != DType::BFloat16)) {
         return false;
     }
     if (!result.defined()) {
@@ -3888,11 +3894,22 @@ bool lerp_tensor_fast(const Tensor& self, const Tensor& end,
                                       end.data_ptr<float>(),
                                       weight.data_ptr<float>(),
                                       result.data_ptr<float>(), n);
-    } else {
+    } else if (dt == DType::Float64) {
         lerp_tensor_contiguous<double>(self.data_ptr<double>(),
                                        end.data_ptr<double>(),
                                        weight.data_ptr<double>(),
                                        result.data_ptr<double>(), n);
+    } else if (dt == DType::Float16) {
+        lerp_tensor_contiguous<tensorplay::Half>(self.data_ptr<tensorplay::Half>(),
+                                                 end.data_ptr<tensorplay::Half>(),
+                                                 weight.data_ptr<tensorplay::Half>(),
+                                                 result.data_ptr<tensorplay::Half>(), n);
+    } else {
+        lerp_tensor_contiguous<tensorplay::BFloat16>(
+            self.data_ptr<tensorplay::BFloat16>(),
+            end.data_ptr<tensorplay::BFloat16>(),
+            weight.data_ptr<tensorplay::BFloat16>(),
+            result.data_ptr<tensorplay::BFloat16>(), n);
     }
     return true;
 }

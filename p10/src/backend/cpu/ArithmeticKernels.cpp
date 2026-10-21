@@ -4333,7 +4333,8 @@ bool addcmul_dense_into(const Tensor& self, const Tensor& tensor1,
                         const Tensor& tensor2, const Scalar& value,
                         Tensor& result) {
     const DType dt = self.dtype();
-    if ((dt != DType::Float32 && dt != DType::Float64) ||
+    if ((dt != DType::Float32 && dt != DType::Float64 &&
+         dt != DType::Float16 && dt != DType::BFloat16) ||
         tensor1.dtype() != dt || tensor2.dtype() != dt ||
         !self.is_contiguous() || !tensor1.is_contiguous() ||
         !tensor2.is_contiguous() || self.shape() != tensor1.shape() ||
@@ -4344,10 +4345,19 @@ bool addcmul_dense_into(const Tensor& self, const Tensor& tensor1,
         result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()),
                                dt, self.device());
     }
+    // The reduced widths answer in the same arithmetic the composition
+    // answers in -- every step rounds at the width of the operands -- so the
+    // dense walk stands in for the composition there as well.  Leaving them
+    // out would send every reduced-width pair through the strided
+    // composition, which is the slow walk this one replaces.
     if (dt == DType::Float32) {
         addcmul_dense_walk<float>(self, tensor1, tensor2, value, result);
-    } else {
+    } else if (dt == DType::Float64) {
         addcmul_dense_walk<double>(self, tensor1, tensor2, value, result);
+    } else if (dt == DType::Float16) {
+        addcmul_dense_walk<tensorplay::Half>(self, tensor1, tensor2, value, result);
+    } else {
+        addcmul_dense_walk<tensorplay::BFloat16>(self, tensor1, tensor2, value, result);
     }
     return true;
 }
@@ -4566,7 +4576,8 @@ bool addcdiv_dense_into(const Tensor& self, const Tensor& tensor1,
                         const Tensor& tensor2, const Scalar& value,
                         Tensor& result) {
     const DType dt = self.dtype();
-    if ((dt != DType::Float32 && dt != DType::Float64) ||
+    if ((dt != DType::Float32 && dt != DType::Float64 &&
+         dt != DType::Float16 && dt != DType::BFloat16) ||
         tensor1.dtype() != dt || tensor2.dtype() != dt ||
         !self.is_contiguous() || !tensor1.is_contiguous() ||
         !tensor2.is_contiguous() || self.shape() != tensor1.shape() ||
@@ -4577,10 +4588,17 @@ bool addcdiv_dense_into(const Tensor& self, const Tensor& tensor1,
         result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()),
                                dt, self.device());
     }
+    // The reduced widths answer in the same arithmetic the composition
+    // answers in -- every step rounds at the width of the operands -- so the
+    // dense walk stands in for the composition there as well.
     if (dt == DType::Float32) {
         addcdiv_dense_walk<float>(self, tensor1, tensor2, value, result);
-    } else {
+    } else if (dt == DType::Float64) {
         addcdiv_dense_walk<double>(self, tensor1, tensor2, value, result);
+    } else if (dt == DType::Float16) {
+        addcdiv_dense_walk<tensorplay::Half>(self, tensor1, tensor2, value, result);
+    } else {
+        addcdiv_dense_walk<tensorplay::BFloat16>(self, tensor1, tensor2, value, result);
     }
     return true;
 }

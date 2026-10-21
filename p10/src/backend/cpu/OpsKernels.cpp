@@ -13,6 +13,7 @@
 #include "Complex.h"
 #include "cpu/ComplexUnary.h"
 #include "cpu/FloatMathLoops.h"
+#include "cpu/VecBinaryMath.h"
 
 #include <vector>
 #include <algorithm>
@@ -923,30 +924,39 @@ struct XlogyPair {
         return tensorplay::special_math::calc_xlogy(x, y);
     }
 };
+// The pairwise maps below answer at the width of the operands they are
+// handed: the flat loop over a Float32 pair reads single-precision values,
+// so the answer has to be computed at that width too.  A map that always
+// computed in double precision would pay for a double-precision call per
+// element and then narrow the answer, which is the whole cost of the map.
 struct LogAddExpPair {
-    double operator()(double x, double y) const {
-        double m = std::max(x, y);
-        if (m == -std::numeric_limits<double>::infinity()) return m;
+    template <typename T>
+    T operator()(T x, T y) const {
+        T m = std::max(x, y);
+        if (m == -std::numeric_limits<T>::infinity()) return m;
         if (m != m) return m;  // NaN propagates
         return m + std::log1p(std::exp(-std::fabs(x - y)));
     }
 };
 struct LogAddExp2Pair {
-    double operator()(double x, double y) const {
-        double m = std::max(x, y);
-        if (m == -std::numeric_limits<double>::infinity()) return m;
+    template <typename T>
+    T operator()(T x, T y) const {
+        T m = std::max(x, y);
+        if (m == -std::numeric_limits<T>::infinity()) return m;
         if (m != m) return m;
-        return m + std::log1p(std::exp2(-std::fabs(x - y))) / M_LN2;
+        return m + std::log1p(std::exp2(-std::fabs(x - y))) / static_cast<T>(M_LN2);
     }
 };
 struct CopysignPair {
     double operator()(double x, double y) const { return std::copysign(x, y); }
 };
 struct HypotPair {
-    double operator()(double x, double y) const { return std::hypot(x, y); }
+    template <typename T>
+    T operator()(T x, T y) const { return std::hypot(x, y); }
 };
 struct Atan2Pair {
-    double operator()(double x, double y) const { return std::atan2(x, y); }
+    template <typename T>
+    T operator()(T x, T y) const { return std::atan2(x, y); }
 };
 
 Tensor xlogy_cpu(const Tensor& a, const Tensor& b) {
@@ -955,11 +965,86 @@ Tensor xlogy_cpu(const Tensor& a, const Tensor& b) {
 Tensor& xlogy_out_cpu(const Tensor& a, const Tensor& b, Tensor& out) {
     return binary_float_out_kernel(a, b, out, xlogy_cpu, XlogyPair{}, "xlogy");
 }
+// The pairwise maps whose answer is a library call per element answer
+// several elements at a time on the vector path.  The flat loop answers
+// them one element at a time, so a Float32 pair would pay for that call
+// once per element; the vector path walks eight at a time instead.
+//
+// The path is taken when both operands carry the same floating width, have
+// the same shape, are packed, and the destination is a packed tensor of that
+// width and shape that no operand reads through.  Everything else -- a
+// broadcast pair, a mixed pair, a reduced width -- is left to the flat loop.
+static bool pair_math_takes(const Tensor& a, const Tensor& b, const Tensor& out) {
+    if (!vecbinary::avx2_available() || a.dtype() != b.dtype() ||
+        out.dtype() != a.dtype() ||
+        (a.dtype() != DType::Float32 && a.dtype() != DType::Float64)) {
+        return false;
+    }
+    return a.shape() == b.shape() && a.shape() == out.shape() &&
+           a.is_contiguous() && b.is_contiguous() && out.is_contiguous() &&
+           cpu::binary_float_takes(a, b, out);
+}
+
+template <typename F>
+static Tensor pair_math_kernel(const Tensor& a, const Tensor& b, F f,
+                               const char* name, vecbinary::BOp op) {
+    if (vecbinary::avx2_available() && a.dtype() == b.dtype() &&
+        (a.dtype() == DType::Float32 || a.dtype() == DType::Float64) &&
+        a.shape() == b.shape() && a.is_contiguous() && b.is_contiguous()) {
+        Tensor result = Tensor::empty(
+            static_cast<std::vector<int64_t>>(a.shape()), a.dtype(),
+            a.device());
+        const int64_t n = result.numel();
+        if (n > 0) {
+            if (a.dtype() == DType::Float32) {
+                vecbinary::f32_chunk_avx2(op, a.data_ptr<float>(),
+                                          b.data_ptr<float>(),
+                                          result.data_ptr<float>(), 0, n);
+            } else {
+                vecbinary::f64_chunk_avx2(op, a.data_ptr<double>(),
+                                          b.data_ptr<double>(),
+                                          result.data_ptr<double>(), 0, n);
+            }
+        }
+        return result;
+    }
+    return binary_float_kernel(a, b, f, name);
+}
+
+// The same map with the destination the caller holds: the answer is laid on
+// it directly when it is packed and holds the width the map answers in.
+template <typename F>
+static Tensor& pair_math_out_kernel(const Tensor& a, const Tensor& b,
+                                    Tensor& out, F f, const char* name,
+                                    vecbinary::BOp op) {
+    if (pair_math_takes(a, b, out)) {
+        const int64_t n = out.numel();
+        if (n > 0) {
+            if (out.dtype() == DType::Float32) {
+                vecbinary::f32_chunk_avx2(op, a.data_ptr<float>(),
+                                          b.data_ptr<float>(),
+                                          out.data_ptr<float>(), 0, n);
+            } else {
+                vecbinary::f64_chunk_avx2(op, a.data_ptr<double>(),
+                                          b.data_ptr<double>(),
+                                          out.data_ptr<double>(), 0, n);
+            }
+        }
+        return out;
+    }
+    return binary_float_out_kernel(
+        a, b, out,
+        [=](const Tensor&, const Tensor&) { return pair_math_kernel(a, b, f, name, op); },
+        f, name);
+}
+
 Tensor logaddexp_cpu(const Tensor& a, const Tensor& b) {
-    return binary_float_kernel(a, b, LogAddExpPair{}, "logaddexp");
+    return pair_math_kernel(a, b, LogAddExpPair{}, "logaddexp",
+                             vecbinary::BOp::LogAddExp);
 }
 Tensor& logaddexp_out_cpu(const Tensor& a, const Tensor& b, Tensor& out) {
-    return binary_float_out_kernel(a, b, out, logaddexp_cpu, LogAddExpPair{}, "logaddexp");
+    return pair_math_out_kernel(a, b, out, LogAddExpPair{}, "logaddexp",
+                                 vecbinary::BOp::LogAddExp);
 }
 Tensor logaddexp2_cpu(const Tensor& a, const Tensor& b) {
     return binary_float_kernel(a, b, LogAddExp2Pair{}, "logaddexp2");
@@ -979,17 +1064,19 @@ Tensor copysign_scalar_cpu(const Tensor& self, const Scalar& other) {
     return copysign_cpu(self, Tensor::full({}, other, DType::Float32, self.device()));
 }
 Tensor hypot_cpu(const Tensor& a, const Tensor& b) {
-    return binary_float_kernel(a, b, HypotPair{}, "hypot");
+    return pair_math_kernel(a, b, HypotPair{}, "hypot", vecbinary::BOp::Hypot);
 }
 Tensor& hypot_out_cpu(const Tensor& a, const Tensor& b, Tensor& out) {
-    return binary_float_out_kernel(a, b, out, hypot_cpu, HypotPair{}, "hypot");
+    return pair_math_out_kernel(a, b, out, HypotPair{}, "hypot",
+                                 vecbinary::BOp::Hypot);
 }
 
 Tensor atan2_cpu(const Tensor& a, const Tensor& b) {
-    return binary_float_kernel(a, b, Atan2Pair{}, "atan2");
+    return pair_math_kernel(a, b, Atan2Pair{}, "atan2", vecbinary::BOp::Atan2);
 }
 Tensor& atan2_out_cpu(const Tensor& a, const Tensor& b, Tensor& out) {
-    return binary_float_out_kernel(a, b, out, atan2_cpu, Atan2Pair{}, "atan2");
+    return pair_math_out_kernel(a, b, out, Atan2Pair{}, "atan2",
+                                 vecbinary::BOp::Atan2);
 }
 // One representable step from `from` toward `to`, taken in the 16-bit layout the
 // reduced widths share.  Clearing the sign bit leaves a pattern that grows with
