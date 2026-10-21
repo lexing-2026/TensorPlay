@@ -4308,35 +4308,59 @@ Tensor& div_scalar_inplace_kernel(Tensor& self, const Scalar& other) {
 // traversal for every broadcasted/promotion path.  The latter is important:
 // composing mul() and add() here would reintroduce the Python/composite
 // implementation that this operator is meant to replace.
-Tensor addcmul_cpu(const Tensor& self, const Tensor& tensor1,
-                   const Tensor& tensor2, const Scalar& value) {
-    if (self.dtype() == DType::Float32 && tensor1.dtype() == DType::Float32 &&
-        tensor2.dtype() == DType::Float32 && self.is_contiguous() &&
-        tensor1.is_contiguous() && tensor2.is_contiguous() &&
-        self.shape() == tensor1.shape() && self.shape() == tensor2.shape()) {
-        Tensor result = Tensor::empty(
-            static_cast<std::vector<int64_t>>(self.shape()), DType::Float32, self.device());
-        const float* self_ptr = self.data_ptr<float>();
-        const float* tensor1_ptr = tensor1.data_ptr<float>();
-        const float* tensor2_ptr = tensor2.data_ptr<float>();
-        float* result_ptr = result.data_ptr<float>();
-        const float alpha = value.to<float>();
-        const int64_t n = self.numel();
-        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-            for (int64_t i = begin; i < end; ++i) {
-                result_ptr[i] = self_ptr[i] + alpha * tensor1_ptr[i] * tensor2_ptr[i];
-            }
-        });
-        return result;
-    }
+// The dense walk: element i of each operand lands on element i of the answer,
+// which the caller either hands over as the destination it wants filled or
+// leaves undefined for a block of its own.  The product is scaled before it is
+// applied, so the value is taken at the width the answer comes in.
+template <typename T>
+void addcmul_dense_walk(const Tensor& self, const Tensor& tensor1,
+                        const Tensor& tensor2, const Scalar& value,
+                        Tensor& result) {
+    const T* self_ptr = self.data_ptr<T>();
+    const T* tensor1_ptr = tensor1.data_ptr<T>();
+    const T* tensor2_ptr = tensor2.data_ptr<T>();
+    T* result_ptr = result.data_ptr<T>();
+    const T alpha = value.to<T>();
+    const int64_t n = self.numel();
+    parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        for (int64_t i = begin; i < end; ++i) {
+            result_ptr[i] = self_ptr[i] + alpha * tensor1_ptr[i] * tensor2_ptr[i];
+        }
+    });
+}
 
-    std::vector<int64_t> out_shape = broadcast_shapes(
-        static_cast<std::vector<int64_t>>(self.shape()),
-        static_cast<std::vector<int64_t>>(tensor1.shape()),
-        static_cast<std::vector<int64_t>>(tensor2.shape()));
-    DType result_dtype = promoteTypes(
-        promoteTypes(self.dtype(), tensor1.dtype()), tensor2.dtype());
-    Tensor result = Tensor::empty(out_shape, result_dtype, self.device());
+bool addcmul_dense_into(const Tensor& self, const Tensor& tensor1,
+                        const Tensor& tensor2, const Scalar& value,
+                        Tensor& result) {
+    const DType dt = self.dtype();
+    if ((dt != DType::Float32 && dt != DType::Float64) ||
+        tensor1.dtype() != dt || tensor2.dtype() != dt ||
+        !self.is_contiguous() || !tensor1.is_contiguous() ||
+        !tensor2.is_contiguous() || self.shape() != tensor1.shape() ||
+        self.shape() != tensor2.shape()) {
+        return false;
+    }
+    if (!result.defined()) {
+        result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()),
+                               dt, self.device());
+    }
+    if (dt == DType::Float32) {
+        addcmul_dense_walk<float>(self, tensor1, tensor2, value, result);
+    } else {
+        addcmul_dense_walk<double>(self, tensor1, tensor2, value, result);
+    }
+    return true;
+}
+
+// The composition for operands that need a promotion or a broadcast.  The
+// answer is laid down in `result`, which the caller either hands over as the
+// destination it wants filled or creates for itself.
+static void addcmul_composition(const Tensor& self, const Tensor& tensor1,
+                                const Tensor& tensor2, const Scalar& value,
+                                Tensor& result) {
+    const std::vector<int64_t> out_shape =
+        static_cast<std::vector<int64_t>>(result.shape());
+    const DType result_dtype = result.dtype();
     Tensor a = self.dtype() == result_dtype ? self : self.to(result_dtype);
     Tensor b = tensor1.dtype() == result_dtype ? tensor1 : tensor1.to(result_dtype);
     Tensor c = tensor2.dtype() == result_dtype ? tensor2 : tensor2.to(result_dtype);
@@ -4378,26 +4402,73 @@ Tensor addcmul_cpu(const Tensor& self, const Tensor& tensor1,
         default: TP_THROW(TypeError, "addcmul: unsupported dtype");
     }
     #undef ADDCMUL_CASE
+}
+
+// The width the answer comes in at.
+static DType addcmul_result_dtype(const Tensor& self, const Tensor& tensor1,
+                                  const Tensor& tensor2) {
+    return promoteTypes(
+        promoteTypes(self.dtype(), tensor1.dtype()), tensor2.dtype());
+}
+
+// A destination takes the composition when it already stands packed in the width
+// and the broadcast shape the promotion answers in.  A destination reached at a
+// stride is left to the copy: the walk laid over it is the scalar one, while a
+// packed answer of its own can be drawn by the dense walk and then handed over.
+// Each element of an operand is read before the store lands on it, so the very
+// view being written is allowed while a second window of those bytes is not; an
+// operand that the promotion carries to another width brings a block of its own
+// and cannot be in the way.
+static bool addcmul_composition_takes(const Tensor& self, const Tensor& tensor1,
+                                      const Tensor& tensor2, const Tensor& out) {
+    const DType want = addcmul_result_dtype(self, tensor1, tensor2);
+    const std::vector<int64_t> out_shape = broadcast_shapes(
+        static_cast<std::vector<int64_t>>(self.shape()),
+        static_cast<std::vector<int64_t>>(tensor1.shape()),
+        static_cast<std::vector<int64_t>>(tensor2.shape()));
+    if (out.dtype() != want || !out.is_contiguous() ||
+        static_cast<std::vector<int64_t>>(out.shape()) != out_shape) {
+        return false;
+    }
+    for (const Tensor& operand : {self, tensor1, tensor2}) {
+        if (operand.dtype() == want && !read_while_write_is_safe(operand, out)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+Tensor addcmul_cpu(const Tensor& self, const Tensor& tensor1,
+                   const Tensor& tensor2, const Scalar& value) {
+    Tensor dense;
+    if (addcmul_dense_into(self, tensor1, tensor2, value, dense)) {
+        return dense;
+    }
+    std::vector<int64_t> out_shape = broadcast_shapes(
+        static_cast<std::vector<int64_t>>(self.shape()),
+        static_cast<std::vector<int64_t>>(tensor1.shape()),
+        static_cast<std::vector<int64_t>>(tensor2.shape()));
+    Tensor result = Tensor::empty(out_shape,
+                                  addcmul_result_dtype(self, tensor1, tensor2),
+                                  self.device());
+    addcmul_composition(self, tensor1, tensor2, value, result);
     return result;
 }
 
 Tensor& addcmul_inplace_cpu(Tensor& self, const Tensor& tensor1,
                             const Tensor& tensor2, const Scalar& value) {
-    if (self.dtype() == DType::Float32 && tensor1.dtype() == DType::Float32 &&
-        tensor2.dtype() == DType::Float32 && self.is_contiguous() &&
-        tensor1.is_contiguous() && tensor2.is_contiguous() &&
-        self.shape() == tensor1.shape() && self.shape() == tensor2.shape()) {
-        float* self_ptr = self.data_ptr<float>();
-        const float* tensor1_ptr = tensor1.data_ptr<float>();
-        const float* tensor2_ptr = tensor2.data_ptr<float>();
-        const float alpha = value.to<float>();
-        const int64_t n = self.numel();
-        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-            for (int64_t i = begin; i < end; ++i) {
-                self_ptr[i] += alpha * tensor1_ptr[i] * tensor2_ptr[i];
-            }
-        });
-        return self;
+    // The in-place form is the same walk with the input as its own destination:
+    // element i is read before the answer lands on it, so an operand that is the
+    // very view being written stays correct, while a second window of those
+    // bytes is left to the strided composition below.
+    if (destination_takes_flat(self, self.device(), self.dtype(),
+                               static_cast<std::vector<int64_t>>(self.shape()),
+                               self, tensor1) &&
+        read_while_write_is_safe(tensor2, self)) {
+        Tensor destination = self;
+        if (addcmul_dense_into(self, tensor1, tensor2, value, destination)) {
+            return self;
+        }
     }
 
     std::vector<int64_t> out_shape = broadcast_shapes(
@@ -4451,43 +4522,77 @@ Tensor& addcmul_inplace_cpu(Tensor& self, const Tensor& tensor1,
 
 Tensor& addcmul_out_cpu(const Tensor& self, const Tensor& tensor1,
                         const Tensor& tensor2, const Scalar& value, Tensor& out) {
+    // The dense walk pairs element i of every operand with element i of the
+    // destination, so the destination has to be packed at the operands' own
+    // shape and width and no operand may be a second window of the bytes it
+    // writes; the very view being written is the exception, each element being
+    // read before the store lands on it.
+    if (destination_takes_flat(out, self.device(), self.dtype(),
+                               static_cast<std::vector<int64_t>>(self.shape()),
+                               self, tensor1) &&
+        read_while_write_is_safe(tensor2, out) &&
+        addcmul_dense_into(self, tensor1, tensor2, value, out)) {
+        return out;
+    }
+    if (addcmul_composition_takes(self, tensor1, tensor2, out)) {
+        addcmul_composition(self, tensor1, tensor2, value, out);
+        return out;
+    }
     write_out(out, addcmul_cpu(self, tensor1, tensor2, value));
     return out;
 }
 
-Tensor addcdiv_cpu(const Tensor& self, const Tensor& tensor1,
-                   const Tensor& tensor2, const Scalar& value) {
-    if (isIntegralType(tensor1.dtype(), true) && isIntegralType(tensor2.dtype(), true)) {
-        TP_THROW(RuntimeError, "Integer division with addcdiv is not supported");
-    }
-    if (self.dtype() == DType::Float32 && tensor1.dtype() == DType::Float32 &&
-        tensor2.dtype() == DType::Float32 && self.is_contiguous() &&
-        tensor1.is_contiguous() && tensor2.is_contiguous() &&
-        self.shape() == tensor1.shape() && self.shape() == tensor2.shape()) {
-        Tensor result = Tensor::empty(
-            static_cast<std::vector<int64_t>>(self.shape()), DType::Float32, self.device());
-        const float* self_ptr = self.data_ptr<float>();
-        const float* tensor1_ptr = tensor1.data_ptr<float>();
-        const float* tensor2_ptr = tensor2.data_ptr<float>();
-        float* result_ptr = result.data_ptr<float>();
-        const float alpha = value.to<float>();
-        const int64_t n = self.numel();
-        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-            for (int64_t i = begin; i < end; ++i) {
-                result_ptr[i] = self_ptr[i] + alpha * tensor1_ptr[i] / tensor2_ptr[i];
-            }
-        });
-        return result;
-    }
+// The dense walk, filling whichever tensor the caller is answering into.  The
+// divisor is applied last, so the scaled numerator is taken at the width the
+// answer comes in.
+template <typename T>
+void addcdiv_dense_walk(const Tensor& self, const Tensor& tensor1,
+                        const Tensor& tensor2, const Scalar& value,
+                        Tensor& result) {
+    const T* self_ptr = self.data_ptr<T>();
+    const T* tensor1_ptr = tensor1.data_ptr<T>();
+    const T* tensor2_ptr = tensor2.data_ptr<T>();
+    T* result_ptr = result.data_ptr<T>();
+    const T alpha = value.to<T>();
+    const int64_t n = self.numel();
+    parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        for (int64_t i = begin; i < end; ++i) {
+            result_ptr[i] = self_ptr[i] + alpha * tensor1_ptr[i] / tensor2_ptr[i];
+        }
+    });
+}
 
-    std::vector<int64_t> out_shape = broadcast_shapes(
-        static_cast<std::vector<int64_t>>(self.shape()),
-        static_cast<std::vector<int64_t>>(tensor1.shape()),
-        static_cast<std::vector<int64_t>>(tensor2.shape()));
-    DType result_dtype = promoteTypes(
-        promoteTypes(self.dtype(), tensor1.dtype()), tensor2.dtype());
-    if (isIntegralType(result_dtype)) result_dtype = DType::Float32;
-    Tensor result = Tensor::empty(out_shape, result_dtype, self.device());
+bool addcdiv_dense_into(const Tensor& self, const Tensor& tensor1,
+                        const Tensor& tensor2, const Scalar& value,
+                        Tensor& result) {
+    const DType dt = self.dtype();
+    if ((dt != DType::Float32 && dt != DType::Float64) ||
+        tensor1.dtype() != dt || tensor2.dtype() != dt ||
+        !self.is_contiguous() || !tensor1.is_contiguous() ||
+        !tensor2.is_contiguous() || self.shape() != tensor1.shape() ||
+        self.shape() != tensor2.shape()) {
+        return false;
+    }
+    if (!result.defined()) {
+        result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()),
+                               dt, self.device());
+    }
+    if (dt == DType::Float32) {
+        addcdiv_dense_walk<float>(self, tensor1, tensor2, value, result);
+    } else {
+        addcdiv_dense_walk<double>(self, tensor1, tensor2, value, result);
+    }
+    return true;
+}
+
+// The composition for operands that need a promotion or a broadcast, laid down
+// in whichever tensor the caller is answering into.
+static void addcdiv_composition(const Tensor& self, const Tensor& tensor1,
+                                const Tensor& tensor2, const Scalar& value,
+                                Tensor& result) {
+    const std::vector<int64_t> out_shape =
+        static_cast<std::vector<int64_t>>(result.shape());
+    const DType result_dtype = result.dtype();
     Tensor a = self.dtype() == result_dtype ? self : self.to(result_dtype);
     Tensor b = tensor1.dtype() == result_dtype ? tensor1 : tensor1.to(result_dtype);
     Tensor c = tensor2.dtype() == result_dtype ? tensor2 : tensor2.to(result_dtype);
@@ -4528,7 +4633,86 @@ Tensor addcdiv_cpu(const Tensor& self, const Tensor& tensor1,
         default: TP_THROW(TypeError, "addcdiv: unsupported dtype");
     }
     #undef ADDCDIV_CASE
+}
+
+// Integral operands are answered in float32, so that is the width the answer
+// comes in at even when every operand is a whole number.
+static DType addcdiv_result_dtype(const Tensor& self, const Tensor& tensor1,
+                                  const Tensor& tensor2) {
+    DType want = promoteTypes(
+        promoteTypes(self.dtype(), tensor1.dtype()), tensor2.dtype());
+    if (isIntegralType(want)) want = DType::Float32;
+    return want;
+}
+
+// A destination takes the composition when it already stands packed in that
+// width and shape; one reached at a stride is left to the copy, for the same
+// reason as the product form.  Each element of an operand is read before the
+// store lands on it, so the very view being written is allowed while a second
+// window of those bytes is not; an operand carried to another width brings a
+// block of its own.
+static bool addcdiv_composition_takes(const Tensor& self, const Tensor& tensor1,
+                                      const Tensor& tensor2, const Tensor& out) {
+    const DType want = addcdiv_result_dtype(self, tensor1, tensor2);
+    const std::vector<int64_t> out_shape = broadcast_shapes(
+        static_cast<std::vector<int64_t>>(self.shape()),
+        static_cast<std::vector<int64_t>>(tensor1.shape()),
+        static_cast<std::vector<int64_t>>(tensor2.shape()));
+    if (out.dtype() != want || !out.is_contiguous() ||
+        static_cast<std::vector<int64_t>>(out.shape()) != out_shape) {
+        return false;
+    }
+    for (const Tensor& operand : {self, tensor1, tensor2}) {
+        if (operand.dtype() == want && !read_while_write_is_safe(operand, out)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+Tensor addcdiv_cpu(const Tensor& self, const Tensor& tensor1,
+                   const Tensor& tensor2, const Scalar& value) {
+    if (isIntegralType(tensor1.dtype(), true) && isIntegralType(tensor2.dtype(), true)) {
+        TP_THROW(RuntimeError, "Integer division with addcdiv is not supported");
+    }
+    Tensor dense;
+    if (addcdiv_dense_into(self, tensor1, tensor2, value, dense)) {
+        return dense;
+    }
+    std::vector<int64_t> out_shape = broadcast_shapes(
+        static_cast<std::vector<int64_t>>(self.shape()),
+        static_cast<std::vector<int64_t>>(tensor1.shape()),
+        static_cast<std::vector<int64_t>>(tensor2.shape()));
+    Tensor result = Tensor::empty(out_shape,
+                                  addcdiv_result_dtype(self, tensor1, tensor2),
+                                  self.device());
+    addcdiv_composition(self, tensor1, tensor2, value, result);
     return result;
+}
+
+// The destination-taking form: the dense walk is one pass over the bytes it
+// writes, so a packed destination at the operands' own shape and width is
+// filled where it stands, with the same reading of an overlap as the fused
+// product form takes.  Everything else is computed and handed over.
+Tensor& addcdiv_out_cpu(const Tensor& self, const Tensor& tensor1,
+                        const Tensor& tensor2, const Scalar& value,
+                        Tensor& out) {
+    if (isIntegralType(tensor1.dtype(), true) && isIntegralType(tensor2.dtype(), true)) {
+        TP_THROW(RuntimeError, "Integer division with addcdiv is not supported");
+    }
+    if (destination_takes_flat(out, self.device(), self.dtype(),
+                               static_cast<std::vector<int64_t>>(self.shape()),
+                               self, tensor1) &&
+        read_while_write_is_safe(tensor2, out) &&
+        addcdiv_dense_into(self, tensor1, tensor2, value, out)) {
+        return out;
+    }
+    if (addcdiv_composition_takes(self, tensor1, tensor2, out)) {
+        addcdiv_composition(self, tensor1, tensor2, value, out);
+        return out;
+    }
+    write_out(out, addcdiv_cpu(self, tensor1, tensor2, value));
+    return out;
 }
 
 Tensor& addcdiv_inplace_cpu(Tensor& self, const Tensor& tensor1,
@@ -4536,21 +4720,14 @@ Tensor& addcdiv_inplace_cpu(Tensor& self, const Tensor& tensor1,
     if (isIntegralType(tensor1.dtype(), true) && isIntegralType(tensor2.dtype(), true)) {
         TP_THROW(RuntimeError, "Integer division with addcdiv is not supported");
     }
-    if (self.dtype() == DType::Float32 && tensor1.dtype() == DType::Float32 &&
-        tensor2.dtype() == DType::Float32 && self.is_contiguous() &&
-        tensor1.is_contiguous() && tensor2.is_contiguous() &&
-        self.shape() == tensor1.shape() && self.shape() == tensor2.shape()) {
-        float* self_ptr = self.data_ptr<float>();
-        const float* tensor1_ptr = tensor1.data_ptr<float>();
-        const float* tensor2_ptr = tensor2.data_ptr<float>();
-        const float alpha = value.to<float>();
-        const int64_t n = self.numel();
-        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-            for (int64_t i = begin; i < end; ++i) {
-                self_ptr[i] += alpha * tensor1_ptr[i] / tensor2_ptr[i];
-            }
-        });
-        return self;
+    if (destination_takes_flat(self, self.device(), self.dtype(),
+                               static_cast<std::vector<int64_t>>(self.shape()),
+                               self, tensor1) &&
+        read_while_write_is_safe(tensor2, self)) {
+        Tensor destination = self;
+        if (addcdiv_dense_into(self, tensor1, tensor2, value, destination)) {
+            return self;
+        }
     }
 
     std::vector<int64_t> out_shape = broadcast_shapes(
@@ -4614,6 +4791,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, ArithmeticKernels) {
     m.impl("addcmul_", addcmul_inplace_cpu);
     m.impl("addcmul.out", addcmul_out_cpu);
     m.impl("addcdiv", addcdiv_cpu);
+    m.impl("addcdiv.out", addcdiv_out_cpu);
     m.impl("addcdiv_", addcdiv_inplace_cpu);
     m.impl("fused_mul_add", fused_mul_add_kernel);
     m.impl("fused_mul_add.Scalar", fused_mul_add_scalar_kernel);

@@ -57,6 +57,8 @@ namespace ops = tensorplay::tpx::ops;
 // broadcasting, promotion and complex support without a second loop.
 Tensor sub_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha);
 Tensor mul_kernel(const Tensor& self, const Tensor& other);
+Tensor& add_out_kernel(const Tensor& self, const Tensor& other,
+                       const Scalar& alpha, Tensor& out);
 
 // --- Unary Kernels ---
 
@@ -3992,7 +3994,9 @@ void lerp_tensor_contiguous(const T* self, const T* end, const T* weight,
 }
 
 // Single-pass fused lerp for three same-shape dense f32/f64 operands;
-// anything else keeps the general broadcasting/promotion path.
+// anything else keeps the general broadcasting/promotion path.  The answer
+// lands in `result`, which the caller either hands over already filled with the
+// destination or leaves undefined for a block of its own.
 bool lerp_tensor_fast(const Tensor& self, const Tensor& end,
                       const Tensor& weight, Tensor& result) {
     if (!self.is_contiguous() || !end.is_contiguous() ||
@@ -4007,8 +4011,10 @@ bool lerp_tensor_fast(const Tensor& self, const Tensor& end,
         (dt != DType::Float32 && dt != DType::Float64)) {
         return false;
     }
-    result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()),
-                           dt, self.device());
+    if (!result.defined()) {
+        result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()),
+                               dt, self.device());
+    }
     const int64_t n = self.numel();
     if (dt == DType::Float32) {
         lerp_tensor_contiguous<float>(self.data_ptr<float>(),
@@ -4183,6 +4189,91 @@ Tensor lerp_scalar_kernel(const Tensor& self, const Tensor& end, const Scalar& w
     return e - (e - s) * (1.0 - w);
 }
 
+// The width the composition answers in; integral operands come back as float32.
+static DType lerp_composition_dtype(const Tensor& self, const Tensor& end,
+                                    const Tensor& weight) {
+    DType common = promoteTypes(
+        promoteTypes(self.dtype(), end.dtype()), weight.dtype());
+    if (isIntegralType(common)) common = DType::Float32;
+    return common;
+}
+
+// The composition ends in an addition, and that last step can be laid straight
+// on the destination: the answer then comes in the caller's own bytes instead of
+// being copied in from a block of its own.  The destination has to stand packed
+// at the broadcast shape and at the width the promotion answers in, and the one
+// operand the last step still reads may not be a second window of those bytes --
+// the very view being written is allowed, since each element is read before the
+// store lands on it.
+static bool lerp_composition_takes(const Tensor& self, const Tensor& end,
+                                   const Tensor& weight, const Tensor& out) {
+    if (out.device() != self.device() || !out.is_contiguous()) {
+        return false;
+    }
+    const DType common = lerp_composition_dtype(self, end, weight);
+    if (out.dtype() != common) {
+        return false;
+    }
+    const std::vector<int64_t> shape = broadcast_shapes(
+        static_cast<std::vector<int64_t>>(self.shape()),
+        static_cast<std::vector<int64_t>>(end.shape()),
+        static_cast<std::vector<int64_t>>(weight.shape()));
+    if (static_cast<std::vector<int64_t>>(out.shape()) != shape) {
+        return false;
+    }
+    return self.dtype() != common || read_while_write_is_safe(self, out);
+}
+
+// The composition laid down in `destination`: the difference and its scaling
+// come in as they always did, and the last addition writes where the caller
+// asked for the answer instead of into a block of its own.
+static void lerp_composition_into(const Tensor& self, const Tensor& end,
+                                  const Tensor& weight, Tensor& destination) {
+    const DType common = lerp_composition_dtype(self, end, weight);
+    Tensor s = self.dtype() == common ? self : self.to(common);
+    Tensor e = end.dtype() == common ? end : end.to(common);
+    Tensor w = weight.dtype() == common ? weight : weight.to(common);
+    add_out_kernel(s, mul_kernel(w, sub_kernel(e, s, 1.0)), 1.0, destination);
+}
+
+// The destination-taking forms.  A fused walk pairs element i of every operand
+// with element i of the answer, so the destination has to be packed at the
+// operands' own shape and width and no operand may be a second window of the
+// bytes it writes -- the very view being written is the one exception, since
+// each element is read before the store lands on it.  Where no fused walk
+// reaches, the composition still ends on the destination.  Anything else
+// computes the answer and hands it over, as before.
+Tensor& lerp_scalar_out_kernel(const Tensor& self, const Tensor& end,
+                               const Scalar& weight, Tensor& out) {
+    if (destination_takes_flat(out, self.device(), self.dtype(),
+                               static_cast<std::vector<int64_t>>(self.shape()),
+                               self, end)) {
+        if (lerp_scalar_fast(self, end, out, weight.to<double>())) {
+            return out;
+        }
+    }
+    return write_out(out, lerp_scalar_kernel(self, end, weight));
+}
+
+Tensor& lerp_tensor_out_kernel(const Tensor& self, const Tensor& end,
+                               const Tensor& weight, Tensor& out) {
+#if defined(__x86_64__)
+    if (destination_takes_flat(out, self.device(), self.dtype(),
+                               static_cast<std::vector<int64_t>>(self.shape()),
+                               self, end) &&
+        read_while_write_is_safe(weight, out)) {
+        if (lerp_tensor_fast(self, end, weight, out)) {
+            return out;
+        }
+    }
+#endif
+    if (lerp_composition_takes(self, end, weight, out)) {
+        lerp_composition_into(self, end, weight, out);
+        return out;
+    }
+    return write_out(out, lerp_tensor_kernel(self, end, weight));
+}
+
 Tensor& lerp_scalar_inplace_kernel(Tensor& self, const Tensor& end, const Scalar& weight) {
     if (self.dtype() == end.dtype() && lerp_same_shape(self, end) &&
         self.is_contiguous() && end.is_contiguous() &&
@@ -4197,6 +4288,26 @@ Tensor& lerp_scalar_inplace_kernel(Tensor& self, const Tensor& end, const Scalar
 }
 
 Tensor& lerp_tensor_inplace_kernel(Tensor& self, const Tensor& end, const Tensor& weight) {
+#if defined(__x86_64__)
+    // The input doubles as the destination here, so the walk is the one the
+    // fused form already answers: it reads element i of the input before laying
+    // the answer on it.  An operand that is a second window of those bytes, or a
+    // destination reached at a stride, is left to the composition below.
+    if (destination_takes_flat(self, self.device(), self.dtype(),
+                               static_cast<std::vector<int64_t>>(self.shape()),
+                               self, end) &&
+        read_while_write_is_safe(weight, self)) {
+        if (lerp_tensor_fast(self, end, weight, self)) {
+            return self;
+        }
+    }
+#endif
+    // Where no fused walk reaches, the composition's last addition still lands
+    // on the input rather than being copied onto it.
+    if (lerp_composition_takes(self, end, weight, self)) {
+        lerp_composition_into(self, end, weight, self);
+        return self;
+    }
     self.copy_(lerp_tensor_kernel(self, end, weight));
     return self;
 }
@@ -4365,6 +4476,8 @@ TENSORPLAY_LIBRARY_IMPL(CPU, PointwiseKernels) {
     m.impl("pow.Scalar", pow_scalar_tensor_kernel);
     m.impl("lerp", lerp_scalar_kernel);
     m.impl("lerp.Tensor", lerp_tensor_kernel);
+    m.impl("lerp.Scalar_out", lerp_scalar_out_kernel);
+    m.impl("lerp.Tensor_out", lerp_tensor_out_kernel);
     m.impl("lerp_.Scalar", lerp_scalar_inplace_kernel);
     m.impl("lerp_.Tensor", lerp_tensor_inplace_kernel);
     m.impl("abs_", abs_inplace_kernel);
