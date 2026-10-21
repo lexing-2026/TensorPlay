@@ -3572,9 +3572,8 @@ def _plain_scaled_dot_product_attention(query, key, value, is_causal):
     # normaliser: one head count, one token count, and a head width inside the
     # tiled range.  It is also the entry the matching fused backward hangs off,
     # so a training call routed here keeps the fast backward rather than
-    # falling back to the composed one.  The token counts may differ -- the
-    # schedule reads them independently, like the reference -- and everything
-    # else (grouped heads, an explicit normaliser) goes to the public call.
+    # falling back to the composed one.  Everything else (grouped heads, an
+    # explicit normaliser) goes to the public call.
     if (
         query.device.type == "cuda"
         and query.dim() == 4
@@ -3585,6 +3584,11 @@ def _plain_scaled_dot_product_attention(query, key, value, is_causal):
         and _attention_dtype(key) == _attention_dtype(query) == _attention_dtype(value)
         and key.size(-1) == query.size(-1) == value.size(-1)
         and key.size(0) == query.size(0) == value.size(0)
+        # The schedules behind the entry read one token count for all three
+        # operands, so a context of another length is not a shape it can
+        # express; such a call asks the public entry instead.
+        and key.size(2) == query.size(2)
+        and value.size(2) == key.size(2)
         and key.size(1) == query.size(1) == value.size(1)
     ):
         output, _ = _C._scaled_dot_product_attention_with_lse(
