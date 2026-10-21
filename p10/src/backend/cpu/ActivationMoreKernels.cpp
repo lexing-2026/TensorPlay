@@ -99,10 +99,19 @@ void softmax_backward_data_loop(const scalar_t* grad, const scalar_t* out,
     });
 }
 
+// The width the column walk itself runs at: a gradient narrower than single
+// precision is computed at single precision and narrowed to the answer afterwards.
+inline DType softmax_backward_walk_dtype(DType grad_dtype) {
+    return isReducedFloatingType(grad_dtype) ? DType::Float32 : grad_dtype;
+}
+
 // Shared body of the two backward-data kernels; log_mode selects the
-// log_softmax formula.  Reduced-width dtypes accumulate in float.
+// log_softmax formula.  Reduced-width dtypes accumulate in float.  A caller that
+// has already judged its own destination hands it over, so the columns are stored
+// where the values have to end up instead of being copied there.
 Tensor softmax_backward_data_core(const Tensor& grad_output, const Tensor& output,
-                                  int64_t dim, bool log_mode) {
+                                  int64_t dim, bool log_mode,
+                                  const Tensor* destination = nullptr) {
     Tensor g = grad_output.dim() == 0 ? grad_output.view({1}) : grad_output;
     Tensor o = output.dim() == 0 ? output.view({1}) : output;
     const int64_t nd = g.dim();
@@ -111,16 +120,17 @@ Tensor softmax_backward_data_core(const Tensor& grad_output, const Tensor& outpu
         TP_THROW(IndexError,
                  "dim must be non-negative and less than input dimensions");
     }
-    const DType compute_dt =
-        isReducedFloatingType(g.dtype()) ? DType::Float32 : g.dtype();
+    const DType compute_dt = softmax_backward_walk_dtype(g.dtype());
     if (compute_dt != DType::Float32 && compute_dt != DType::Float64) {
         TP_THROW(TypeError, "unsupported dtype for softmax backward");
     }
     if (o.dtype() != compute_dt) o = o.to(compute_dt);
     if (g.dtype() != compute_dt) g = g.to(compute_dt);
 
-    Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(g.shape()),
-                                  compute_dt, g.device());
+    Tensor result = destination != nullptr
+        ? *destination
+        : Tensor::empty(static_cast<std::vector<int64_t>>(g.shape()), compute_dt,
+                        g.device());
     if (g.numel() == 0) return result;
 
     const Tensor gc = g.contiguous();
@@ -166,6 +176,37 @@ inline DType softmax_backward_out_dtype(const Tensor& grad_output,
         out_dtype = DType::Float16;
     }
     return out_dtype;
+}
+
+// Whether the column walk can answer into the gradient the caller holds.  It
+// reads the gradient and the saved output at one offset and stores the answer at
+// that same offset, so the destination has to be packed with the shape those two
+// are walked at and of the walk's own width -- a gradient narrower than single
+// precision is computed wide and narrowed afterwards, which is a second pass over
+// other storage.  Each operand only collides with the destination when it is
+// reached inside the destination's own block: the walk sums a column before it
+// stores into it, then reads and writes that column element by element.
+inline bool softmax_backward_destination_takes(const Tensor& grad_output,
+                                               const Tensor& output, DType want,
+                                               const Tensor& grad_input) {
+    const DType compute_dt = softmax_backward_walk_dtype(grad_output.dtype());
+    if (want != compute_dt || grad_output.dim() == 0 ||
+        (compute_dt != DType::Float32 && compute_dt != DType::Float64)) {
+        return false;
+    }
+    const auto shape = static_cast<std::vector<int64_t>>(grad_output.shape());
+    if (!destination_takes(grad_input, grad_output.device(), compute_dt, shape) ||
+        !grad_input.is_contiguous()) {
+        return false;
+    }
+    if (grad_output.is_contiguous() &&
+        !read_while_write_is_safe(grad_output, grad_input)) {
+        return false;
+    }
+    // An operand of another width is materialised at the walk's own before the
+    // walk sees it, so it cannot be a byte of the destination.
+    return !output.is_contiguous() || output.dtype() != compute_dt ||
+           read_while_write_is_safe(output, grad_input);
 }
 
 template <typename scalar_t, typename opmath_t>
@@ -277,7 +318,7 @@ Tensor rrelu_with_noise_core(const Tensor& self, Tensor& noise, Scalar lower,
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// _softmax / _log_softmax (+ out)
+// _softmax / _log_softmax
 // ---------------------------------------------------------------------------
 
 Tensor _softmax_cpu(const Tensor& self, int64_t dim, bool half_to_float) {
@@ -288,24 +329,12 @@ Tensor _softmax_cpu(const Tensor& self, int64_t dim, bool half_to_float) {
     return softmax_kernel(self, dim, self.dtype());
 }
 
-Tensor& _softmax_out_cpu(const Tensor& self, int64_t dim, bool half_to_float,
-                         Tensor& out) {
-    write_out(out, _softmax_cpu(self, dim, half_to_float));
-    return out;
-}
-
 Tensor _log_softmax_cpu(const Tensor& self, int64_t dim, bool half_to_float) {
     if (half_to_float) {
         TP_THROW(RuntimeError,
                  "log_softmax with half to float conversion is not supported on CPU");
     }
     return log_softmax_kernel(self, dim, self.dtype());
-}
-
-Tensor& _log_softmax_out_cpu(const Tensor& self, int64_t dim, bool half_to_float,
-                             Tensor& out) {
-    write_out(out, _log_softmax_cpu(self, dim, half_to_float));
-    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -323,8 +352,21 @@ Tensor _softmax_backward_data_cpu(const Tensor& grad_output, const Tensor& outpu
 Tensor& _softmax_backward_data_out_cpu(const Tensor& grad_output,
                                        const Tensor& output, int64_t dim,
                                        DType input_dtype, Tensor& grad_input) {
-    write_out(grad_input, _softmax_backward_data_cpu(grad_output, output, dim, input_dtype));
-    return grad_input;
+    const DType want = softmax_backward_out_dtype(grad_output, input_dtype);
+    if (softmax_backward_destination_takes(grad_output, output, want, grad_input)) {
+        softmax_backward_data_core(grad_output, output, dim, false, &grad_input);
+        return grad_input;
+    }
+    if (want != softmax_backward_walk_dtype(grad_output.dtype()) &&
+        grad_input.dtype() == want) {
+        // The walk runs wide and the answer comes narrow: let the destination take
+        // that narrowing directly, rather than meeting a copy of a tensor the map
+        // narrowed for it.
+        return write_out(grad_input,
+                         softmax_backward_data_core(grad_output, output, dim, false));
+    }
+    return write_out(grad_input,
+                     _softmax_backward_data_cpu(grad_output, output, dim, input_dtype));
 }
 
 Tensor _log_softmax_backward_data_cpu(const Tensor& grad_output,
@@ -339,8 +381,22 @@ Tensor _log_softmax_backward_data_cpu(const Tensor& grad_output,
 Tensor& _log_softmax_backward_data_out_cpu(const Tensor& grad_output,
                                            const Tensor& output, int64_t dim,
                                            DType input_dtype, Tensor& grad_input) {
-    write_out(grad_input, _log_softmax_backward_data_cpu(grad_output, output, dim, input_dtype));
-    return grad_input;
+    const DType want = softmax_backward_out_dtype(grad_output, input_dtype);
+    if (softmax_backward_destination_takes(grad_output, output, want, grad_input)) {
+        softmax_backward_data_core(grad_output, output, dim, true, &grad_input);
+        return grad_input;
+    }
+    if (want != softmax_backward_walk_dtype(grad_output.dtype()) &&
+        grad_input.dtype() == want) {
+        // The walk runs wide and the answer comes narrow: let the destination take
+        // that narrowing directly, rather than meeting a copy of a tensor the map
+        // narrowed for it.
+        return write_out(grad_input,
+                         softmax_backward_data_core(grad_output, output, dim, true));
+    }
+    return write_out(grad_input,
+                     _log_softmax_backward_data_cpu(grad_output, output, dim,
+                                                    input_dtype));
 }
 
 // ---------------------------------------------------------------------------
@@ -634,11 +690,9 @@ Tensor& rrelu_with_noise__cpu(Tensor& self, Tensor& noise, const Scalar& lower,
 
 TENSORPLAY_LIBRARY_IMPL(CPU, ActivationMoreOps) {
     m.impl("_softmax", _softmax_cpu);
-    m.impl("_softmax.out", _softmax_out_cpu);
     m.impl("_softmax_backward_data", _softmax_backward_data_cpu);
     m.impl("_softmax_backward_data.out", _softmax_backward_data_out_cpu);
     m.impl("_log_softmax", _log_softmax_cpu);
-    m.impl("_log_softmax.out", _log_softmax_out_cpu);
     m.impl("_log_softmax_backward_data", _log_softmax_backward_data_cpu);
     m.impl("_log_softmax_backward_data.out", _log_softmax_backward_data_out_cpu);
     m.impl("_prelu_kernel", _prelu_kernel_cpu);

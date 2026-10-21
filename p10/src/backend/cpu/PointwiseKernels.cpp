@@ -3170,7 +3170,8 @@ static void softmax_strided_f64_512_unit(const SoftmaxStridedCtx<LogMode>& c, in
 #endif  // __x86_64__
 
 template <bool LogMode>
-static Tensor softmax_fused_kernel_impl(const Tensor& self, int64_t dim, DType out_dtype) {
+static Tensor softmax_fused_kernel_impl(const Tensor& self, int64_t dim, DType out_dtype,
+                                        const Tensor* destination = nullptr) {
     // A 0-dim input holds one normalization unit: the softmax dim does not
     // exist on the scalar shape, so the value normalizes as a one-element
     // row (softmax answers 1, log-softmax 0) and the scalar shape returns.
@@ -3195,7 +3196,12 @@ static Tensor softmax_fused_kernel_impl(const Tensor& self, int64_t dim, DType o
         // no transpose materialization.
         const int64_t size = input.size(d);
         const int64_t stride = input.stride(d);
-        Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(input.shape()), out_dtype, input.device());
+        // The walk stores each row where it reads it, so a packed destination of
+        // this shape is filled by the walk instead of receiving a copy of it.
+        Tensor result = destination != nullptr
+            ? *destination
+            : Tensor::empty(static_cast<std::vector<int64_t>>(input.shape()), out_dtype,
+                            input.device());
 
         // Iterate rows as (a, b) with a in [0, before), b in [0, after);
         // row data lives at a*(size*stride) + b + k*stride.
@@ -3283,14 +3289,19 @@ static Tensor softmax_fused_kernel_impl(const Tensor& self, int64_t dim, DType o
         return result;
     }
     if (!innermost) {
-        // Non-contiguous input: fall back to the transpose path.
+        // Non-contiguous input: fall back to the transpose path.  A caller's
+        // destination never reaches here -- it is offered only over a packed
+        // input, and this branch is what a stepped input takes.
         Tensor t = input.transpose(d, -1);
         if (!t.is_contiguous()) t = t.contiguous();
         Tensor result = softmax_fused_kernel_impl<LogMode>(t, t.dim() - 1, out_dtype);
         return result.transpose(d, -1).contiguous();
     }
 
-    Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(input.shape()), out_dtype, input.device());
+    Tensor result = destination != nullptr
+        ? *destination
+        : Tensor::empty(static_cast<std::vector<int64_t>>(input.shape()), out_dtype,
+                        input.device());
     int64_t rows = input.numel() / input.size(-1);
     int64_t size = input.size(-1);
 
@@ -3364,9 +3375,16 @@ static Tensor softmax_fused_kernel_impl(const Tensor& self, int64_t dim, DType o
     return result;
 }
 
-Tensor softmax_kernel(const Tensor& self, int64_t dim, DType dtype) {
-    DType out_dtype = (dtype != DType::Undefined) ? dtype : self.dtype();
+// The width the answer comes in: the one that was asked for, or the input's own
+// when it was not.  Whole numbers answer at single precision.
+static DType softmax_answer_dtype(DType self_dtype, DType asked) {
+    DType out_dtype = (asked != DType::Undefined) ? asked : self_dtype;
     if (isIntegralType(out_dtype)) out_dtype = DType::Float32;
+    return out_dtype;
+}
+
+Tensor softmax_kernel(const Tensor& self, int64_t dim, DType dtype) {
+    const DType out_dtype = softmax_answer_dtype(self.dtype(), dtype);
     if (isReducedFloatingType(out_dtype)) {
         return softmax_fused_kernel_impl<false>(self, dim, DType::Float32).to(out_dtype);
     }
@@ -3374,12 +3392,99 @@ Tensor softmax_kernel(const Tensor& self, int64_t dim, DType dtype) {
 }
 
 Tensor log_softmax_kernel(const Tensor& self, int64_t dim, DType dtype) {
-    DType out_dtype = (dtype != DType::Undefined) ? dtype : self.dtype();
-    if (isIntegralType(out_dtype)) out_dtype = DType::Float32;
+    const DType out_dtype = softmax_answer_dtype(self.dtype(), dtype);
     if (isReducedFloatingType(out_dtype)) {
         return softmax_fused_kernel_impl<true>(self, dim, DType::Float32).to(out_dtype);
     }
     return softmax_fused_kernel_impl<true>(self, dim, out_dtype);
+}
+
+// Whether two tensors are filled from separate blocks of storage.
+static bool stored_apart(const Tensor& first, const Tensor& second) {
+    const auto first_impl = first.unsafeGetTensorImpl();
+    const auto second_impl = second.unsafeGetTensorImpl();
+    if (!first_impl || !second_impl) return false;
+    const auto& first_storage = first_impl->storage();
+    const auto& second_storage = second_impl->storage();
+    return first_storage.defined() && second_storage.defined() &&
+           first_storage.data() != second_storage.data();
+}
+
+// Whether the row walk can answer into a tensor the caller holds.  The walk reads
+// a packed input and stores at the offsets it read them from, so the destination
+// has to be packed with the answer's own shape and width -- which the widths kept
+// below single precision are not, since those are computed wide and narrowed
+// afterwards.  Where the input is the destination's own block, the plain walk may
+// take it (an element is read before it is stored) but the logarithmic one may
+// not: it reads every element of a row again after the exponentials were stored
+// over them.
+static bool softmax_destination_takes(const Tensor& self, DType want,
+                                     const Tensor& out, bool log_mode) {
+    if (self.dim() == 0 || !self.is_contiguous() ||
+        isReducedFloatingType(want)) {
+        return false;
+    }
+    const auto shape = static_cast<std::vector<int64_t>>(self.shape());
+    if (!destination_takes(out, self.device(), want, shape) ||
+        !out.is_contiguous()) {
+        return false;
+    }
+    if (want != self.dtype()) {
+        // The walk reads a copy made for these operands, so nothing it reads is
+        // ever a byte of the destination.
+        return true;
+    }
+    return log_mode ? stored_apart(self, out)
+                    : read_while_write_is_safe(self, out);
+}
+
+// The map with its width settled, taken by the walk wherever the destination the
+// caller holds is one it can walk, and handed over afterwards wherever it is not.
+template <bool LogMode>
+Tensor& softmax_out_into(const Tensor& self, int64_t dim, DType asked, Tensor& out) {
+    const DType want = softmax_answer_dtype(self.dtype(), asked);
+    if (!isReducedFloatingType(want) &&
+        softmax_destination_takes(self, want, out, LogMode)) {
+        softmax_fused_kernel_impl<LogMode>(self, dim, want, &out);
+        return out;
+    }
+    if (isReducedFloatingType(want) && out.dtype() == want) {
+        // The walk runs wide and the answer comes narrow: let the destination take
+        // that narrowing directly, rather than meeting a copy of a tensor the map
+        // narrowed for it.
+        return write_out(out,
+                         softmax_fused_kernel_impl<LogMode>(self, dim, DType::Float32));
+    }
+    return write_out(out, LogMode ? log_softmax_kernel(self, dim, asked)
+                                  : softmax_kernel(self, dim, asked));
+}
+
+Tensor& softmax_out_kernel(const Tensor& self, int64_t dim, bool half_to_float,
+                          Tensor& out) {
+    if (half_to_float) {
+        TP_THROW(RuntimeError,
+                 "softmax with half to float conversion is not supported on CPU");
+    }
+    return softmax_out_into<false>(self, dim, self.dtype(), out);
+}
+
+Tensor& log_softmax_out_kernel(const Tensor& self, int64_t dim, bool half_to_float,
+                              Tensor& out) {
+    if (half_to_float) {
+        TP_THROW(RuntimeError,
+                 "log_softmax with half to float conversion is not supported on CPU");
+    }
+    return softmax_out_into<true>(self, dim, self.dtype(), out);
+}
+
+Tensor& softmax_int_out_kernel(const Tensor& self, int64_t dim,
+                              std::optional<DType> dtype, Tensor& out) {
+    return softmax_out_into<false>(self, dim, dtype.value_or(DType::Undefined), out);
+}
+
+Tensor& log_softmax_int_out_kernel(const Tensor& self, int64_t dim,
+                                  std::optional<DType> dtype, Tensor& out) {
+    return softmax_out_into<true>(self, dim, dtype.value_or(DType::Undefined), out);
 }
 
 // Dtype for an elementwise op between a tensor and a 0-dim operand created
@@ -4252,6 +4357,10 @@ TENSORPLAY_LIBRARY_IMPL(CPU, PointwiseKernels) {
     m.impl("threshold_backward", threshold_backward_kernel);
     m.impl("softmax", softmax_kernel);
     m.impl("log_softmax", log_softmax_kernel);
+    m.impl("_softmax.out", softmax_out_kernel);
+    m.impl("_log_softmax.out", log_softmax_out_kernel);
+    m.impl("softmax.int_out", softmax_int_out_kernel);
+    m.impl("log_softmax.int_out", log_softmax_int_out_kernel);
     m.impl("pow.Tensor_Tensor", pow_tensor_tensor_kernel);
     m.impl("pow.Scalar", pow_scalar_tensor_kernel);
     m.impl("lerp", lerp_scalar_kernel);
