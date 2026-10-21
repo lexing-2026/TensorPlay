@@ -741,6 +741,26 @@ static void scatter_lines(T* d, const int64_t* ip, const T* vp,
             const int64_t* idx_row = ip + g * idx_dim_size * idx_inner;
             const T* v_row = vp + g * idx_dim_size * idx_inner;
             T* d_slot = d + g * self_dim_size * self_inner;
+            if (t1 - t0 == 1) {
+                // One position beside the scattered axis: the axis is walked
+                // in order, one element at a time, the way the reference
+                // runtime walks it.
+                for (int64_t j = 0; j < idx_dim_size; ++j) {
+                    const int64_t pick = idx_row[0];
+                    if (pick < 0 || pick >= self_dim_size) {
+                        TP_THROW(IndexError, op, ": index out of range");
+                    }
+                    T* dst = d_slot + pick * self_inner + t0;
+                    if constexpr (Mode == ScatterMode::Assign) {
+                        *dst = v_row[0];
+                    } else {
+                        *dst += v_row[0];
+                    }
+                    idx_row += idx_inner;
+                    v_row += idx_inner;
+                }
+                continue;
+            }
             for (int64_t j = 0; j < idx_dim_size; ++j) {
                 for (int64_t t = t0; t < t1; ++t) {
                     const int64_t pick = idx_row[t];
