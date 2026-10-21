@@ -695,19 +695,50 @@ Tensor tpsa_repeat_cpu(const Tensor& self, const std::vector<int64_t>& repeats) 
     std::vector<int64_t> tstrides(out_nd, 1);
     for (int64_t i = out_nd - 2; i >= 0; --i) tstrides[i] = tstrides[i + 1] * target[i + 1];
 
-    parallel_for(0, total, GRAIN_SIZE, [&](int64_t lo, int64_t hi) {
+    // The innermost axis is copied in runs: the source axis of the same
+    // length is copied whole, once per repetition of it.  The axes above
+    // only choose which run of the source is copied, so their arithmetic
+    // is done once per group of runs instead of once per element.
+    const int64_t run = padded[out_nd - 1];
+    const int64_t runs = run > 0 ? target[out_nd - 1] / run : 0;
+    const int64_t group = run * runs;
+    const int64_t groups = group > 0 ? total / group : 0;
+    const int64_t inner_stride = padded_strides[out_nd - 1];
+    // A run of whole bytes that the source keeps contiguous moves with
+    // memcpy; anything else is walked element by element.
+    const bool byte_runs = inner_stride == 1 && self.itemsize() >= 1 &&
+                           !isQuantizedType(self.dtype());
+    const size_t item = self.itemsize();
+
+    parallel_for(0, groups, GRAIN_SIZE, [&](int64_t lo, int64_t hi) {
 #define TP_REPEAT_CASE(ctype, name)                                                     \
         case DType::name: {                                                             \
             const ctype* src = self.data_ptr<ctype>();                                  \
             ctype* dst = out.data_ptr<ctype>();                                         \
-            for (int64_t f = lo; f < hi; ++f) {                                         \
-                int64_t rem = f, off = 0;                                               \
-                for (int64_t i = 0; i < out_nd; ++i) {                                  \
+            for (int64_t g = lo; g < hi; ++g) {                                         \
+                int64_t rem = g * group, off = 0;                                       \
+                for (int64_t i = 0; i < out_nd - 1; ++i) {                              \
                     const int64_t c = rem / tstrides[i];                                \
                     rem %= tstrides[i];                                                 \
                     off += (c % padded[i]) * padded_strides[i];                         \
                 }                                                                       \
-                dst[f] = src[off];                                                      \
+                const ctype* s = src + off;                                            \
+                ctype* d = dst + g * group;                                             \
+                if (byte_runs) {                                                       \
+                    const size_t bytes = static_cast<size_t>(run) * item;               \
+                    const char* sb = reinterpret_cast<const char*>(s);                  \
+                    char* db = reinterpret_cast<char*>(d);                              \
+                    for (int64_t r = 0; r < runs; ++r) {                               \
+                        std::memcpy(db + static_cast<size_t>(r) * bytes, sb, bytes);  \
+                    }                                                                   \
+                } else {                                                                \
+                    for (int64_t r = 0; r < runs; ++r) {                               \
+                        for (int64_t j = 0; j < run; ++j) {                             \
+                            d[static_cast<int64_t>(r) * run + j] =                       \
+                                s[static_cast<int64_t>(j) * inner_stride];              \
+                        }                                                               \
+                    }                                                                   \
+                }                                                                       \
             }                                                                           \
             break;                                                                      \
         }
