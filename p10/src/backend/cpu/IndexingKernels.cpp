@@ -925,6 +925,21 @@ template <typename T>
 static void index_select_flat(T* d, const T* s, const int64_t* ip, int64_t n_idx,
                               int64_t outer, int64_t row, bool wrap_negative,
                               const char* op) {
+    if (outer == 1) {
+        // One outer slot: the copies of the index slot follow one after
+        // another, and the values are checked as they are read.
+        parallel_for(0, n_idx, GRAIN_SIZE, [&](int64_t kb, int64_t ke) {
+            for (int64_t k = kb; k < ke; ++k) {
+                int64_t v = ip[k];
+                if (v < 0 && wrap_negative) v += row;
+                if (v < 0 || v >= row) {
+                    TP_THROW(IndexError, op, ": index out of range");
+                }
+                d[k] = s[v];
+            }
+        });
+        return;
+    }
     parallel_for(0, n_idx, GRAIN_SIZE, [&](int64_t kb, int64_t ke) {
         for (int64_t k = kb; k < ke; ++k) {
             int64_t v = ip[k];
@@ -995,9 +1010,13 @@ static Tensor index_select_rows(const Tensor& self, int64_t dim,
         } else { \
             const int64_t slice_grain = std::max<int64_t>(1, GRAIN_SIZE / std::max<int64_t>(inner, 1)); \
             parallel_for(0, outer * n_idx, slice_grain, [&](int64_t b, int64_t e) { \
+                /* The outer slot and the index slot are kept in step, so \
+                   the walk does not divide for every slice. */ \
+                int64_t o = b / n_idx; \
+                int64_t k = b - o * n_idx; \
                 for (int64_t t = b; t < e; ++t) { \
-                    int64_t o = t / n_idx, k = t % n_idx; \
                     std::memcpy(d + static_cast<int64_t>(t) * inner, s + (o * row + ip[k]) * inner, inner * sizeof(ctype)); \
+                    if (++k == n_idx) { k = 0; ++o; } \
                 } \
             }); \
         } \
