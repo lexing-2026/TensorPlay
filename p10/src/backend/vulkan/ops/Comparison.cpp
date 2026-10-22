@@ -7,6 +7,7 @@
 #include <Utils.h>
 
 #include <cmath>
+#include <limits>
 #include <utility>
 #include <vector>
 
@@ -677,6 +678,159 @@ Tensor logical_not_kernel(const Tensor& self) {
   return compare_scalar(self, 0.0, "eq");
 }
 
+// ---------------------------------------------------------------------------
+// Infinity, sign and not-a-number probes
+// ---------------------------------------------------------------------------
+
+namespace {
+
+bool float_probe_dtype(DType dtype) {
+  return dtype == DType::Float32 || dtype == DType::Float16;
+}
+
+// A byte-wide or Bool lane has no linear comparison of its own, so it is
+// widened to the signed word before a walk reads it; the value it carries,
+// and with it the sign, is unchanged by the widening.
+Tensor probe_operand(const Tensor& self) {
+  const DType dtype = self.dtype();
+  if (dtype == DType::Bool || dtype == DType::Int8 || dtype == DType::UInt8) {
+    return self.to(DType::Int32);
+  }
+  return self;
+}
+
+Scalar positive_infinity() {
+  return Scalar(std::numeric_limits<double>::infinity());
+}
+
+Scalar negative_infinity() {
+  return Scalar(-std::numeric_limits<double>::infinity());
+}
+
+// An edge of the number line is one comparison against the value that names
+// it.  No integral lane ever carries an infinite value, so for those the
+// answer is the constant "false" the payload's own equality gives.
+Tensor infinity_edge(
+    const Tensor& self, const Scalar& edge, const char* name) {
+  validate_operand(self, name);
+  if (float_probe_dtype(self.dtype())) {
+    return self.eq(edge);
+  }
+  const Tensor operand = probe_operand(self);
+  return operand.ne(operand);
+}
+
+double default_positive_bound(DType dtype) {
+  return dtype == DType::Float16
+      ? 65504.0
+      : static_cast<double>(std::numeric_limits<float>::max());
+}
+
+double default_negative_bound(DType dtype) {
+  return dtype == DType::Float16
+      ? -65504.0
+      : static_cast<double>(std::numeric_limits<float>::lowest());
+}
+
+} // namespace
+
+// A lane is not a number exactly when it fails to equal itself.  Every width
+// answers this the same way, including an integral lane, which always equals
+// itself.
+Tensor isnan_kernel(const Tensor& self) {
+  validate_operand(self, "isnan");
+  const Tensor operand = probe_operand(self);
+  return operand.ne(operand);
+}
+
+// A floating lane answers both probes through its magnitude: the largest
+// magnitude is the infinite one, and everything below it is finite because a
+// comparison involving a not-a-number lane is false.
+Tensor isinf_kernel(const Tensor& self) {
+  validate_operand(self, "isinf");
+  if (float_probe_dtype(self.dtype())) {
+    return self.abs().eq(positive_infinity());
+  }
+  const Tensor operand = probe_operand(self);
+  return operand.ne(operand);
+}
+
+Tensor isfinite_kernel(const Tensor& self) {
+  validate_operand(self, "isfinite");
+  if (float_probe_dtype(self.dtype())) {
+    return self.abs().lt(positive_infinity());
+  }
+  const Tensor operand = probe_operand(self);
+  return operand.eq(operand);
+}
+
+// The sign probe asks whether the lane sits below zero, so neither a negative
+// zero nor a not-a-number lane reports a sign.
+Tensor signbit_kernel(const Tensor& self) {
+  validate_operand(self, "signbit");
+  const Tensor operand = probe_operand(self);
+  return operand.lt(Scalar(0));
+}
+
+Tensor isposinf_kernel(const Tensor& self) {
+  return infinity_edge(self, positive_infinity(), "isposinf");
+}
+
+Tensor isneginf_kernel(const Tensor& self) {
+  return infinity_edge(self, negative_infinity(), "isneginf");
+}
+
+// The replacements are read off the payload before any lane is written, so a
+// replacement that is itself infinite or not a number never feeds the other
+// conditions.  An integral payload holds no such lane and keeps its values.
+Tensor& nan_to_num_inplace_kernel(
+    Tensor& self,
+    const Scalar& nan,
+    const std::optional<Scalar>& posinf,
+    const std::optional<Scalar>& neginf) {
+  validate_operand(self, "nan_to_num_");
+  if (!float_probe_dtype(self.dtype())) {
+    return self;
+  }
+  const Scalar positive = posinf.has_value()
+      ? *posinf
+      : Scalar(default_positive_bound(self.dtype()));
+  const Scalar negative = neginf.has_value()
+      ? *neginf
+      : Scalar(default_negative_bound(self.dtype()));
+  const Tensor nan_mask = self.ne(self);
+  const Tensor positive_mask = self.eq(positive_infinity());
+  const Tensor negative_mask = self.eq(negative_infinity());
+  Tensor replaced = self.masked_fill(nan_mask, nan);
+  replaced = replaced.masked_fill(positive_mask, positive);
+  replaced = replaced.masked_fill(negative_mask, negative);
+  self.copy_(replaced);
+  return self;
+}
+
+Tensor nan_to_num_kernel(
+    const Tensor& self,
+    const Scalar& nan,
+    const std::optional<Scalar>& posinf,
+    const std::optional<Scalar>& neginf) {
+  validate_operand(self, "nan_to_num");
+  if (!float_probe_dtype(self.dtype())) {
+    return self.clone();
+  }
+  const Scalar positive = posinf.has_value()
+      ? *posinf
+      : Scalar(default_positive_bound(self.dtype()));
+  const Scalar negative = neginf.has_value()
+      ? *neginf
+      : Scalar(default_negative_bound(self.dtype()));
+  const Tensor nan_mask = self.ne(self);
+  const Tensor positive_mask = self.eq(positive_infinity());
+  const Tensor negative_mask = self.eq(negative_infinity());
+  Tensor replaced = self.masked_fill(nan_mask, nan);
+  replaced = replaced.masked_fill(positive_mask, positive);
+  return replaced.masked_fill(negative_mask, negative);
+}
+
 } // namespace ops
 } // namespace vulkan
 } // namespace tensorplay
@@ -704,6 +858,14 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, ComparisonKernels) {
   m.impl("logical_and", &tensorplay::vulkan::ops::logical_and_kernel);
   m.impl("logical_or", &tensorplay::vulkan::ops::logical_or_kernel);
   m.impl("logical_xor", &tensorplay::vulkan::ops::logical_xor_kernel);
+  m.impl("isnan", &tensorplay::vulkan::ops::isnan_kernel);
+  m.impl("isinf", &tensorplay::vulkan::ops::isinf_kernel);
+  m.impl("isfinite", &tensorplay::vulkan::ops::isfinite_kernel);
+  m.impl("signbit", &tensorplay::vulkan::ops::signbit_kernel);
+  m.impl("isposinf", &tensorplay::vulkan::ops::isposinf_kernel);
+  m.impl("isneginf", &tensorplay::vulkan::ops::isneginf_kernel);
+  m.impl("nan_to_num", &tensorplay::vulkan::ops::nan_to_num_kernel);
+  m.impl("nan_to_num_", &tensorplay::vulkan::ops::nan_to_num_inplace_kernel);
 }
 
 #endif /* USE_VULKAN */

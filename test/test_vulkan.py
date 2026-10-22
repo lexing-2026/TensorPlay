@@ -12905,5 +12905,160 @@ class TestVulkanFoldAtTheLaneAnIndexNames(unittest.TestCase):
                 0, self._codes(np.zeros((5, 4), np.int64)),
                 self._device(np.ones((5, 4), np.float32)), "maximum")
 
+class TestVulkanInfinityAndNotANumber(unittest.TestCase):
+    # The probes answer lane by lane in the payload's own width: a lane that
+    # leaves the finite range is told apart from one that only changed sign,
+    # and a lane that is not a number answers every ordering false.  Both
+    # storages need a case: a row past the image-axis limit lives in a buffer,
+    # where a half payload packs two lanes into one word.
+
+    LENGTHS = (64, 200003)
+    SPECIALS = np.array(
+        [np.inf, -np.inf, np.nan, 0.0, -0.0, 1.0, -1.0, 65504.0, -65504.0,
+         2.0 ** -24, 1.0009765625, 1e-8, 7.5], dtype=np.float32)
+    PROBES = {
+        "isinf": np.isinf,
+        "isfinite": np.isfinite,
+        "isnan": np.isnan,
+        # The sign probe asks whether a lane sits below zero, so a negative
+        # zero reports no sign.
+        "signbit": lambda values: values < 0,
+        "isposinf": lambda values: values == np.inf,
+        "isneginf": lambda values: values == -np.inf,
+    }
+
+    def _values(self, count, dtype, seed=21):
+        rng = np.random.default_rng(seed)
+        values = (rng.standard_normal(count) * 8.0).astype(dtype)
+        values[:self.SPECIALS.size] = self.SPECIALS.astype(dtype)
+        return values
+
+    def _device(self, values):
+        return tensorplay.from_numpy(values.copy()).to("vulkan")
+
+    def test_each_probe_answers_lane_by_lane_over_both_storages(self):
+        for dtype in (np.float32, np.float16):
+            for length in self.LENGTHS:
+                values = self._values(length, dtype)
+                device = self._device(values)
+                for name, want in self.PROBES.items():
+                    np.testing.assert_array_equal(
+                        getattr(tensorplay, name)(device).cpu().numpy(),
+                        want(values),
+                        err_msg=f"{name} over {np.dtype(dtype).name} "
+                                f"length {length}")
+
+    def test_a_rank_three_payload_keeps_its_own_geometry(self):
+        values = self._values(24, np.float16).reshape(2, 3, 4)
+        device = self._device(values)
+        for name, want in self.PROBES.items():
+            np.testing.assert_array_equal(
+                getattr(tensorplay, name)(device).cpu().numpy(), want(values),
+                err_msg=name)
+
+    def test_an_integral_or_bool_lane_never_leaves_the_number_line(self):
+        cases = (
+            (np.int8, np.array([0, 1, -1, -128, 127])),
+            (np.uint8, np.array([0, 1, 2, 255])),
+            (np.int32, np.array([0, 1, -1, -7, 1 << 30])),
+            (np.int64, np.array([0, 1, -1, -(1 << 60), 1 << 40])),
+            (np.bool_, np.array([True, False, True])),
+        )
+        for dtype, raw in cases:
+            values = raw.astype(dtype)
+            device = self._device(values)
+            for name in ("isinf", "isnan", "isposinf", "isneginf"):
+                np.testing.assert_array_equal(
+                    getattr(tensorplay, name)(device).cpu().numpy(),
+                    np.zeros(values.shape, dtype=bool),
+                    err_msg=f"{name} over {np.dtype(dtype).name}")
+            np.testing.assert_array_equal(
+                tensorplay.isfinite(device).cpu().numpy(),
+                np.ones(values.shape, dtype=bool),
+                err_msg=f"isfinite over {np.dtype(dtype).name}")
+            np.testing.assert_array_equal(
+                tensorplay.signbit(device).cpu().numpy(),
+                values.astype(np.int64) < 0,
+                err_msg=f"signbit over {np.dtype(dtype).name}")
+
+    def test_nan_to_num_takes_each_uncarried_value_to_its_bound(self):
+        for dtype in (np.float32, np.float16):
+            values = self._values(37, dtype)
+            device = self._device(values)
+            got = tensorplay.nan_to_num(device)
+            bound = np.finfo(dtype).max
+            want = values.copy()
+            want[np.isnan(want)] = 0.0
+            want[np.isposinf(want)] = bound
+            want[np.isneginf(want)] = -bound
+            np.testing.assert_array_equal(
+                got.cpu().numpy(), want, err_msg=np.dtype(dtype).name)
+            self.assertEqual(got.dtype, device.dtype)
+            # The allocating form leaves the payload it read untouched.
+            np.testing.assert_array_equal(device.cpu().numpy(), values)
+
+    def test_nan_to_num_takes_the_replacements_it_is_given(self):
+        values = np.array([np.nan, np.inf, -np.inf, 2.0], dtype=np.float32)
+        got = tensorplay.nan_to_num(
+            self._device(values), nan=2.5, posinf=9.0, neginf=-9.0)
+        np.testing.assert_array_equal(
+            got.cpu().numpy(), np.array([2.5, 9.0, -9.0, 2.0], np.float32))
+        half = tensorplay.nan_to_num(
+            self._device(values.astype(np.float16)),
+            nan=2.5, posinf=9.0, neginf=-9.0)
+        np.testing.assert_array_equal(
+            half.cpu().numpy(),
+            np.array([2.5, 9.0, -9.0, 2.0], np.float16))
+
+    def test_a_replacement_that_leaves_the_range_does_not_feed_another(self):
+        # A lane that is not a number takes the replacement it was given with
+        # no further question, even when that replacement is itself infinite.
+        values = np.array([np.nan, np.inf, -np.inf], dtype=np.float32)
+        got = tensorplay.nan_to_num(
+            self._device(values), nan=np.inf, posinf=5.0, neginf=-5.0)
+        np.testing.assert_array_equal(
+            got.cpu().numpy(), np.array([np.inf, 5.0, -5.0], np.float32))
+
+    def test_nan_to_num_in_place_rewrites_the_same_payload(self):
+        for dtype, length in ((np.float32, 64), (np.float16, 200003)):
+            values = self._values(length, dtype)
+            device = self._device(values)
+            device.nan_to_num_(nan=1.0)
+            bound = np.finfo(dtype).max
+            want = values.copy()
+            want[np.isnan(want)] = 1.0
+            want[np.isposinf(want)] = bound
+            want[np.isneginf(want)] = -bound
+            np.testing.assert_array_equal(
+                device.cpu().numpy(), want,
+                err_msg=np.dtype(dtype).name)
+
+    def test_an_integral_payload_keeps_its_values(self):
+        for dtype in (np.int32, np.int64, np.bool_):
+            values = (np.array([3, -4, 0], dtype=dtype) if dtype != np.bool_
+                      else np.array([True, False, True]))
+            device = self._device(values)
+            got = tensorplay.nan_to_num(
+                device, nan=7.0, posinf=8.0, neginf=-8.0)
+            np.testing.assert_array_equal(got.cpu().numpy(), values)
+            self.assertEqual(got.dtype, device.dtype)
+            device.nan_to_num_()
+            np.testing.assert_array_equal(device.cpu().numpy(), values)
+
+    def test_the_device_answers_what_the_host_answers(self):
+        for dtype in (np.float32, np.float16):
+            values = self._values(48, dtype)
+            host = tensorplay.from_numpy(values.copy())
+            device = self._device(values)
+            for name in self.PROBES:
+                np.testing.assert_array_equal(
+                    getattr(tensorplay, name)(device).cpu().numpy(),
+                    getattr(tensorplay, name)(host).numpy(),
+                    err_msg=f"{name} over {np.dtype(dtype).name}")
+            np.testing.assert_array_equal(
+                tensorplay.nan_to_num(device).cpu().numpy(),
+                tensorplay.nan_to_num(host).numpy(),
+                err_msg=f"nan_to_num over {np.dtype(dtype).name}")
+
 if __name__ == "__main__":
     unittest.main()

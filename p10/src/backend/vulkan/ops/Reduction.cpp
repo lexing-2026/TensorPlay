@@ -1454,50 +1454,6 @@ Tensor logsumexp_kernel(const Tensor& self, const std::vector<int64_t>& dim, boo
   return result + max_keep.reshape(result.shape());
 }
 
-Tensor isnan_kernel(const Tensor& self) {
-  TP_CHECK(
-      self.dtype() == DType::Float32,
-      "Vulkan isnan supports Float32 tensors only");
-  TP_CHECK(
-      self.dim() >= 1 && self.dim() <= 4,
-      "Vulkan isnan supports 1d to 4d tensors");
-
-  api::Context* const context = api::context();
-  api::vTensor v_input = convert(self);
-  api::vTensor v_output{context, v_input.sizes(), DType::Bool};
-  const struct IsnanBlock final {
-    ivec4 extents;
-    int fill0;
-    int fill1;
-    int fill2;
-  } block{
-      ivec4(
-          static_cast<int32_t>(v_output.extents()[0u]),
-          static_cast<int32_t>(v_output.extents()[1u]),
-          static_cast<int32_t>(v_output.extents()[2u]),
-          0),
-      0,
-      0,
-      0,
-  };
-
-  api::UniformParamsBuffer params(context, block);
-  api::PipelineBarrier pipeline_barrier{};
-  context->submit_compute_job(
-      VK_KERNEL(isnan),
-      pipeline_barrier,
-      v_output.extents(),
-      adaptive_work_group_size(v_output.extents()),
-      VK_NULL_HANDLE,
-      v_output.image(
-          pipeline_barrier,
-          api::PipelineStage::COMPUTE,
-          api::MemoryAccessType::WRITE),
-      v_input.image(pipeline_barrier, api::PipelineStage::COMPUTE),
-      params.buffer());
-  return convert(v_output);
-}
-
 //
 // p-norms: abs then pow(1/p) fold around the whole-tensor sum, matching
 // the norm formula the dim-listed CPU entry evaluates.  Infinite p needs
@@ -1805,7 +1761,6 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, ReductionKernels) {
       &tensorplay::vulkan::ops::count_nonzero_kernel);
   m.impl("cumprod", &tensorplay::vulkan::ops::cumprod_kernel);
   m.impl("logsumexp", &tensorplay::vulkan::ops::logsumexp_kernel);
-  m.impl("isnan", &tensorplay::vulkan::ops::isnan_kernel);
   m.impl("var.dim", &tensorplay::vulkan::ops::var_dim_kernel);
   m.impl("std.dim", &tensorplay::vulkan::ops::std_dim_kernel);
   m.impl("var", &tensorplay::vulkan::ops::var_kernel);
