@@ -13060,5 +13060,113 @@ class TestVulkanInfinityAndNotANumber(unittest.TestCase):
                 tensorplay.nan_to_num(host).numpy(),
                 err_msg=f"nan_to_num over {np.dtype(dtype).name}")
 
+class TestVulkanLogSigmoid(unittest.TestCase):
+    # log_sigmoid answers min(x, 0) - log(1 + exp(-|x|)) in one pass, so a lane
+    # far below zero keeps its value and a lane far above zero approaches zero
+    # without the exponential overflowing.  Both storages need a case: a row
+    # past the image-axis limit lives in a buffer, where a half payload packs
+    # two lanes into one word.  A count is read through the float formula it
+    # has no lane for, and the backward scales the gradient by sigmoid(-x).
+
+    LENGTHS = (64, 200003)
+    SPECIALS = np.array(
+        [-80.0, -50.0, -20.0, -5.0, -1.0, -1e-8, 0.0, 1e-8, 1.0, 5.0, 20.0,
+         50.0, 80.0, np.inf, -np.inf, np.nan], dtype=np.float32)
+
+    def _values(self, count, dtype, seed=33):
+        rng = np.random.default_rng(seed)
+        values = (rng.standard_normal(count) * 9.0).astype(dtype)
+        values[: self.SPECIALS.size] = self.SPECIALS.astype(dtype)
+        return values
+
+    def _device(self, values):
+        return tensorplay.from_numpy(values.copy()).to("vulkan")
+
+    @staticmethod
+    def _want(values):
+        wide = values.astype(np.float64)
+        return np.minimum(wide, 0.0) - np.log1p(np.exp(-np.abs(wide)))
+
+    def test_the_fold_is_negative_softplus_over_both_storages(self):
+        for dtype, tol in ((np.float32, 2e-6), (np.float16, 4e-3)):
+            for length in self.LENGTHS:
+                values = self._values(length, dtype)
+                device = self._device(values)
+                got = tensorplay.log_sigmoid(device)
+                self.assertEqual(got.dtype, device.dtype)
+                np.testing.assert_allclose(
+                    got.cpu().numpy().astype(np.float64), self._want(values),
+                    rtol=tol, atol=tol, equal_nan=True,
+                    err_msg=f"{np.dtype(dtype).name} length {length}")
+                # The allocating form leaves the payload it read untouched.
+                np.testing.assert_array_equal(device.cpu().numpy(), values)
+
+    def test_a_rank_three_or_four_payload_keeps_its_geometry(self):
+        for shape, dtype in (((2, 3, 4), np.float16), ((2, 3, 2, 5), np.float32)):
+            values = self._values(int(np.prod(shape)), dtype).reshape(shape)
+            got = tensorplay.log_sigmoid(self._device(values))
+            self.assertEqual(tuple(got.shape), shape)
+            np.testing.assert_allclose(
+                got.cpu().numpy().astype(np.float64), self._want(values),
+                rtol=4e-3 if dtype == np.float16 else 2e-6,
+                atol=4e-3 if dtype == np.float16 else 2e-6,
+                equal_nan=True, err_msg=str(shape))
+
+    def test_a_count_is_read_through_the_float_formula(self):
+        raw = np.array([-40, -7, -1, 0, 1, 7, 40, 1 << 20, -(1 << 20)])
+        for dtype in (np.int32, np.int64):
+            values = raw.astype(dtype)
+            device = self._device(values)
+            got = tensorplay.log_sigmoid(device)
+            self.assertEqual(got.dtype, tensorplay.float32)
+            np.testing.assert_allclose(
+                got.cpu().numpy(), self._want(values), rtol=1e-6, atol=1e-6,
+                err_msg=np.dtype(dtype).name)
+        # A count wide enough for linear storage takes the same road.
+        long_values = (np.arange(200003, dtype=np.int32) % 41 - 20).astype(
+            np.int32)
+        got = tensorplay.log_sigmoid(self._device(long_values))
+        np.testing.assert_allclose(
+            got.cpu().numpy().astype(np.float64), self._want(long_values),
+            rtol=1e-6, atol=1e-6)
+
+    def test_the_gradient_scales_by_the_sigmoid_of_the_negated_input(self):
+        for dtype, tol in ((np.float32, 2e-6), (np.float16, 4e-3)):
+            for length in self.LENGTHS:
+                values = self._values(length, dtype)
+                grad = (np.random.default_rng(7).standard_normal(length) * 2.0
+                        ).astype(dtype)
+                device = tensorplay.log_sigmoid_backward(
+                    self._device(grad), self._device(values))
+                self.assertEqual(device.dtype, self._device(values).dtype)
+                wide = values.astype(np.float64)
+                want = grad.astype(np.float64) / (1.0 + np.exp(wide))
+                np.testing.assert_allclose(
+                    device.cpu().numpy().astype(np.float64), want,
+                    rtol=tol, atol=tol, equal_nan=True,
+                    err_msg=f"{np.dtype(dtype).name} length {length}")
+
+    def test_the_device_answers_what_the_host_answers(self):
+        for dtype, tol in ((np.float32, 2e-6), (np.float16, 4e-3)):
+            values = self._values(48, dtype)
+            grad = (np.random.default_rng(11).standard_normal(48) * 2.0
+                    ).astype(dtype)
+            host = tensorplay.from_numpy(values.copy())
+            host_grad = tensorplay.from_numpy(grad.copy())
+            device = host.to("vulkan")
+            device_grad = host_grad.to("vulkan")
+            np.testing.assert_allclose(
+                tensorplay.log_sigmoid(device).cpu().numpy().astype(np.float64),
+                tensorplay.log_sigmoid(host).numpy().astype(np.float64),
+                rtol=tol, atol=tol, equal_nan=True,
+                err_msg=f"log_sigmoid over {np.dtype(dtype).name}")
+            np.testing.assert_allclose(
+                tensorplay.log_sigmoid_backward(
+                    device_grad, device).cpu().numpy().astype(np.float64),
+                tensorplay.log_sigmoid_backward(
+                    host_grad, host).numpy().astype(np.float64),
+                rtol=tol, atol=tol, equal_nan=True,
+                err_msg=f"log_sigmoid_backward over {np.dtype(dtype).name}")
+
 if __name__ == "__main__":
     unittest.main()
