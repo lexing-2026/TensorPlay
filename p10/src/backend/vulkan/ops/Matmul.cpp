@@ -1855,6 +1855,104 @@ Tensor baddbmm_kernel(
   return scaled.add(scaled_addend);
 }
 
+//
+// The batch stack contracted to one plane: every batch product folds onto a
+// single matrix before the addend weighs in, so the addend is read once rather
+// than per batch.  A zero weight on the addend carries no number of its own
+// across, so the seed is dropped rather than multiplied; a stack with no batch
+// at all answers the scaled addend alone, and nothing where the weight is
+// nothing.
+//
+Tensor addbmm_kernel(
+    const Tensor& self,
+    const Tensor& batch1,
+    const Tensor& batch2,
+    const Scalar& beta,
+    const Scalar& alpha) {
+  TP_CHECK(
+      (batch1.dtype() == DType::Float32 || batch1.dtype() == DType::Float16) &&
+          (batch2.dtype() == DType::Float32 || batch2.dtype() == DType::Float16),
+      "Vulkan addbmm supports Float32 and Float16 tensors only");
+  TP_CHECK(
+      batch1.dtype() == batch2.dtype(),
+      "Vulkan addbmm: operands must have the same element type");
+  TP_CHECK(batch1.dim() == 3, "Vulkan addbmm: batch1 must be 3d");
+  TP_CHECK(batch2.dim() == 3, "Vulkan addbmm: batch2 must be 3d");
+  const int64_t batches = batch1.size(0);
+  const int64_t rows = batch1.size(1);
+  const int64_t reach = batch1.size(2);
+  const int64_t cols = batch2.size(2);
+  TP_CHECK(
+      batches == batch2.size(0),
+      "Vulkan addbmm: batch dimensions do not match, got ", batches, " and ",
+      batch2.size(0));
+  TP_CHECK(
+      reach == batch2.size(1),
+      "Vulkan addbmm: matrix dimensions do not match (", rows, "x", reach,
+      " and ", batch2.size(1), "x", cols, ")");
+  TP_CHECK(
+      self.dtype() == batch1.dtype(),
+      "Vulkan addbmm: the addend must be read at the width the product answers");
+  TP_CHECK(
+      self.dim() <= 2,
+      "Vulkan addbmm: the addend must sit on the plane the product answers, got ",
+      self.dim(), " axes");
+
+  const std::vector<int64_t> plane{rows, cols};
+  const auto addend_sizes = static_cast<std::vector<int64_t>>(self.shape());
+  const bool addend_reaches_plane =
+      addend_sizes.empty() ||
+      (addend_sizes.size() == 1 &&
+       (addend_sizes[0] == 1 || addend_sizes[0] == cols)) ||
+      (addend_sizes.size() == 2 &&
+       (addend_sizes[0] == rows || addend_sizes[0] == 1) &&
+       (addend_sizes[1] == cols || addend_sizes[1] == 1));
+  TP_CHECK(
+      addend_reaches_plane,
+      "Vulkan addbmm: the addend cannot reach the ", rows, "x", cols,
+      " plane the product answers");
+
+  Tensor addend = self;
+  std::optional<Tensor> addend_owned;
+  if (!addend.device().is_vulkan()) {
+    addend_owned = addend.to(Device(DeviceType::Vulkan));
+    addend = *addend_owned;
+  }
+
+  const double beta_v = beta.to<double>();
+  if (batches == 0) {
+    // No product folds onto the plane, so the addend answers on its own at the
+    // shape the stack would have carried.
+    if (beta_v == 0.0) {
+      return Tensor::zeros(plane, batch1.dtype(), batch1.device());
+    }
+    Tensor seed = addend.shape() == Size(plane)
+        ? addend
+        : expand_kernel(addend, plane, false).contiguous();
+    return seed.mul(beta);
+  }
+
+  Tensor folded =
+      bmm_kernel(batch1, batch2).sum(std::vector<int64_t>{0}, false);
+  if (alpha.to<double>() != 1.0) {
+    folded = folded.mul(alpha);
+  }
+  if (beta_v == 0.0) {
+    return folded;
+  }
+  return folded.add(addend.mul(beta));
+}
+
+Tensor& addbmm_inplace_kernel(
+    Tensor& self,
+    const Tensor& batch1,
+    const Tensor& batch2,
+    const Scalar& beta,
+    const Scalar& alpha) {
+  self.copy_(addbmm_kernel(self, batch1, batch2, beta, alpha));
+  return self;
+}
+
 // Defined further down; a matrix against a vector folds to the decode
 // product, so the (2,1) case below can reach it before its definition.
 Tensor mv_kernel(const Tensor& self, const Tensor& vec);
@@ -2442,6 +2540,8 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, MatmulKernels) {
   m.impl("matmul", &tensorplay::vulkan::ops::matmul_kernel);
   m.impl("bmm", &tensorplay::vulkan::ops::bmm_kernel);
   m.impl("baddbmm", &tensorplay::vulkan::ops::baddbmm_kernel);
+  m.impl("addbmm", &tensorplay::vulkan::ops::addbmm_kernel);
+  m.impl("addbmm_", &tensorplay::vulkan::ops::addbmm_inplace_kernel);
   m.impl("linear", &tensorplay::vulkan::ops::linear_kernel);
   m.impl("mv", &tensorplay::vulkan::ops::mv_kernel);
   m.impl("dot", &tensorplay::vulkan::ops::dot_kernel);
