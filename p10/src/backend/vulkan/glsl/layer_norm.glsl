@@ -112,8 +112,6 @@ void main() {
     // only the current batch slice (depth = n * c_depth + c4i) contributes;
     // whole-tensor normalization additionally folds every batch slice in.
     const int n = pos.z / uBlock.c_depth;
-    const vec4 lane_mask = vec4(lessThan(
-        ivec4(0, 1, 2, 3), ivec4(uBlock.channels)));
     vec4 acc = vec4(0.0f);
     vec4 sq = vec4(0.0f);
     const int batch_lo = (uBlock.norm_batch == 1) ? 0 : n;
@@ -122,6 +120,11 @@ void main() {
         : (n + 1);
     for (int nz = batch_lo; nz < batch_hi; ++nz) {
       for (int c4i = 0; c4i < uBlock.c_depth; ++c4i) {
+        // Each channel texel masks its own lanes: the last texel carries
+        // padding lanes when the channel count is not a multiple of four.
+        const vec4 lane_mask = vec4(lessThan(
+            ivec4(c4i * 4) + ivec4(0, 1, 2, 3),
+            ivec4(uBlock.channels)));
         for (int i = 0; i < uBlock.span; ++i) {
           const int x = i % uBlock.in_sizes.x;
           const int y = i / uBlock.in_sizes.x;

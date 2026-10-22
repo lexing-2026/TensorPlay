@@ -14,7 +14,8 @@ layout(set = 0, binding = 2) uniform PRECISION restrict Block {
   // (W, H, C, N)
   ivec4 sizes;
   int c_depth; // ceil(C / 4)
-  int channels;
+  // Shared dispatch slot; the channel count is sizes.z.
+  int axis;
 }
 uBlock;
 
@@ -32,13 +33,15 @@ void main() {
   const int n = pos.z / uBlock.c_depth;
   const int c4 = pos.z % uBlock.c_depth;
 
-  const vec4 lane_mask = vec4(lessThan(
-      ivec4(c4 * 4) + ivec4(0, 1, 2, 3),
-      ivec4(uBlock.channels)));
   const vec4 neg_inf = vec4(-3.0e38f);
 
+  // Every input texel masks its own lanes: the last texel of a channel count
+  // that is not a multiple of four carries padding lanes.
   vec4 vmax = neg_inf;
   for (int i = 0; i < uBlock.c_depth; ++i) {
+    const vec4 lane_mask = vec4(lessThan(
+        ivec4(i * 4) + ivec4(0, 1, 2, 3),
+        ivec4(uBlock.sizes.z)));
     const vec4 v = texelFetch(
         uInput, ivec3(pos.x, pos.y, n * uBlock.c_depth + i), 0);
     vmax = max(vmax, mix(neg_inf, v, lane_mask));
@@ -47,6 +50,9 @@ void main() {
 
   float sum = 0.0f;
   for (int i = 0; i < uBlock.c_depth; ++i) {
+    const vec4 lane_mask = vec4(lessThan(
+        ivec4(i * 4) + ivec4(0, 1, 2, 3),
+        ivec4(uBlock.sizes.z)));
     const vec4 v = texelFetch(
         uInput, ivec3(pos.x, pos.y, n * uBlock.c_depth + i), 0);
     sum += dot(lane_mask, exp(v - max_val));
