@@ -1,3 +1,4 @@
+import math
 import unittest
 
 import numpy as np
@@ -13337,6 +13338,173 @@ class TestVulkanLogit(unittest.TestCase):
                     rtol=tol, atol=tol, equal_nan=True,
                     err_msg=f"logit_backward eps={eps} over "
                             f"{np.dtype(dtype).name}")
+
+
+class TestVulkanLogCumsumExp(unittest.TestCase):
+    # logcumsumexp answers the logarithm of the running sum of exponentiated
+    # elements along one axis, so every position depends on its whole prefix.
+    # The walk leads with the larger of the pair, answers with the incoming
+    # element when both are the same infinity, and lets an accumulator that is
+    # not a number stay one.  Both storages and both widths are covered, as is
+    # the shape-less input that has no axis to walk.
+
+    SHAPES = (
+        ((64,), 0),
+        ((3, 7), 0),
+        ((3, 7), -1),
+        ((2, 3, 4), 1),
+        ((2, 2, 3, 5), -1),
+    )
+    SPECIALS = np.array(
+        [-np.inf, -100.0, -1.0, -0.0, 0.0, 1.0, 100.0, np.inf, np.nan],
+        dtype=np.float32)
+
+    def _values(self, shape, dtype, seed=57):
+        rng = np.random.default_rng(seed)
+        count = int(np.prod(shape))
+        values = (rng.standard_normal(count) * 4.0).astype(dtype)
+        values[: self.SPECIALS.size] = self.SPECIALS.astype(dtype)
+        return values.reshape(shape)
+
+    def _device(self, values):
+        return tensorplay.from_numpy(values.copy()).to("vulkan")
+
+    @staticmethod
+    def _want(values, dim):
+        # Each step keeps the larger operand as the lead term and carries the
+        # smaller in a correction, all in single precision, which is the width
+        # the device walk accumulates in.  A half result is the rounded store
+        # of that accumulator at every position.
+        wide = values.astype(np.float32)
+        moved = np.moveaxis(wide, dim, -1)
+        flat = moved.reshape(-1, moved.shape[-1])
+        out = np.empty_like(flat)
+        for row in range(flat.shape[0]):
+            acc = -np.inf
+            for i in range(flat.shape[1]):
+                x = float(flat[row, i])
+                if math.isnan(acc):
+                    acc = float("nan")
+                else:
+                    lo = acc if acc < x else x
+                    hi = acc if x < acc else x
+                    if lo != hi or math.isfinite(lo):
+                        acc = np.float32(math.log1p(math.exp(lo - hi)) + hi)
+                    else:
+                        acc = np.float32(x)
+                out[row, i] = acc
+        result = np.moveaxis(out.reshape(moved.shape), -1, dim)
+        return result.astype(values.dtype, copy=False)
+
+    def test_the_scan_follows_the_running_log_sum_exp(self):
+        for dtype, tol in ((np.float32, 2e-6), (np.float16, 4e-3)):
+            for shape, dim in self.SHAPES:
+                values = self._values(shape, dtype)
+                device = self._device(values)
+                got = tensorplay.logcumsumexp(device, dim)
+                self.assertEqual(got.dtype, device.dtype)
+                np.testing.assert_allclose(
+                    got.cpu().numpy().astype(np.float64),
+                    self._want(values, dim).astype(np.float64),
+                    rtol=tol, atol=tol, equal_nan=True,
+                    err_msg=f"{np.dtype(dtype).name} {shape} dim {dim}")
+                # The allocating form leaves the payload it read untouched.
+                np.testing.assert_array_equal(device.cpu().numpy(), values)
+
+    def test_the_special_lanes_answer_the_reference(self):
+        rows = np.array([
+            [-np.inf, -np.inf, -np.inf],
+            [np.inf, np.inf, np.inf],
+            [-np.inf, 2.0, -np.inf],
+            [np.nan, -np.inf, 0.5],
+            [-np.inf, np.nan, -np.inf],
+            [np.inf, -np.inf, 0.0],
+        ], dtype=np.float32)
+        for dtype in (np.float32, np.float16):
+            values = rows.astype(dtype)
+            got = tensorplay.logcumsumexp(self._device(values), 1)
+            np.testing.assert_allclose(
+                got.cpu().numpy().astype(np.float64),
+                self._want(values, 1).astype(np.float64),
+                rtol=2e-6, atol=2e-6, equal_nan=True,
+                err_msg=np.dtype(dtype).name)
+
+    def test_linear_storage_walks_its_rows_the_same_way(self):
+        # A payload past the image-axis limit lives in a buffer; the long axis
+        # keeps its rows short, and the row itself stays a single walk.
+        for dtype, tol in ((np.float32, 2e-6), (np.float16, 4e-3)):
+            values = self._values((50000, 4), dtype)
+            got = tensorplay.logcumsumexp(self._device(values), 1)
+            np.testing.assert_allclose(
+                got.cpu().numpy().astype(np.float64),
+                self._want(values, 1).astype(np.float64),
+                rtol=tol, atol=tol, equal_nan=True,
+                err_msg=np.dtype(dtype).name)
+        long_values = (
+            np.random.default_rng(5).standard_normal(200003) * 3.0
+        ).astype(np.float32)
+        got = tensorplay.logcumsumexp(self._device(long_values), 0)
+        np.testing.assert_allclose(
+            got.cpu().numpy().astype(np.float64),
+            self._want(long_values, 0).astype(np.float64),
+            rtol=5e-5, atol=5e-5, equal_nan=True)
+
+    def test_a_requested_width_sets_the_result(self):
+        values = self._values((3, 7), np.float32)
+        got = tensorplay.logcumsumexp(
+            self._device(values), 0, dtype=tensorplay.float16)
+        self.assertEqual(got.dtype, tensorplay.float16)
+        np.testing.assert_allclose(
+            got.cpu().numpy().astype(np.float64),
+            self._want(values.astype(np.float16), 0).astype(np.float64),
+            rtol=4e-3, atol=4e-3, equal_nan=True)
+        half = self._values((3, 7), np.float16)
+        got = tensorplay.logcumsumexp(
+            self._device(half), -1, dtype=tensorplay.float32)
+        self.assertEqual(got.dtype, tensorplay.float32)
+        # The walk keeps the requested width, so the result is not rounded
+        # back to the payload's own width.
+        np.testing.assert_allclose(
+            got.cpu().numpy().astype(np.float64),
+            self._want(half.astype(np.float32), -1).astype(np.float64),
+            rtol=2e-6, atol=2e-6, equal_nan=True)
+
+    def test_a_scalar_has_no_axis_and_answers_with_itself(self):
+        host = tensorplay.from_numpy(np.array(2.5, dtype=np.float32))
+        device = host.to("vulkan")
+        for dim in (0, -1):
+            got = tensorplay.logcumsumexp(device, dim)
+            self.assertEqual(tuple(got.shape), ())
+            np.testing.assert_allclose(
+                got.cpu().numpy().astype(np.float64), np.float64(2.5),
+                rtol=2e-6, atol=2e-6)
+        narrow = tensorplay.logcumsumexp(device, 0, dtype=tensorplay.float16)
+        self.assertEqual(narrow.dtype, tensorplay.float16)
+        self.assertAlmostEqual(float(narrow.cpu().numpy()), 2.5, places=3)
+
+    def test_an_empty_payload_keeps_its_shape(self):
+        for shape, dim in (((0, 3), 1), ((3, 0), 0), ((2, 0, 4), -2)):
+            values = np.zeros(shape, dtype=np.float32)
+            got = tensorplay.logcumsumexp(self._device(values), dim)
+            self.assertEqual(tuple(got.shape), shape)
+
+    def test_a_count_is_refused(self):
+        values = np.arange(6, dtype=np.int32).reshape(2, 3)
+        with self.assertRaises(TypeError):
+            tensorplay.logcumsumexp(self._device(values), 1)
+
+    def test_the_device_answers_what_the_host_answers(self):
+        for dtype, tol in ((np.float32, 2e-6), (np.float16, 4e-3)):
+            values = self._values((6, 8), dtype)
+            host = tensorplay.from_numpy(values.copy())
+            device = host.to("vulkan")
+            np.testing.assert_allclose(
+                tensorplay.logcumsumexp(
+                    device, 1).cpu().numpy().astype(np.float64),
+                tensorplay.logcumsumexp(
+                    host, 1).numpy().astype(np.float64),
+                rtol=tol, atol=tol, equal_nan=True,
+                err_msg=np.dtype(dtype).name)
 
 
 if __name__ == "__main__":
