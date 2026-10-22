@@ -159,8 +159,14 @@ Tensor addbmm_cuda(const Tensor& self, const Tensor& batch1, const Tensor& batch
         ? detail::contiguous_clone(self.expand({n, m}))
         : detail::contiguous_clone(self.expand({n, m}).to(dt));
     if (b == 0 || p == 0) {
-        // No contraction happens; the seed (scaled by beta) is the answer.
-        if (beta_v == 0.0) result.zero_();
+        // No contraction happens, so the seed answers on its own at its own
+        // weight: a standing seed is scaled by beta, and no weight at all
+        // answers nothing rather than the seed's own numbers.
+        if (beta_v == 0.0) {
+            result.zero_();
+        } else if (beta_v != 1.0) {
+            result.mul_(beta);
+        }
         return result;
     }
     Tensor b1 = batch1.dtype() == dt ? batch1.contiguous() : batch1.to(dt).contiguous();
