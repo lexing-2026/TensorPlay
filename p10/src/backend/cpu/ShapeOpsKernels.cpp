@@ -368,33 +368,80 @@ Tensor flip_cpu(const Tensor& self, const std::vector<int64_t>& dims) {
     }
 
     Tensor sc = self.contiguous();
-    Tensor out = detail::clone_impl(self);
-    const auto out_strides = static_cast<std::vector<int64_t>>(out.strides());
-    int64_t n = sc.numel();
-    auto worker = [&](int64_t b, int64_t e) {
-        for (int64_t li = b; li < e; ++li) {
-            // Decode output linear index and map flipped coordinates back to
-            // the source offset.
-            int64_t r2 = li, srco = 0, outo = 0, mult = 1;
-            for (int64_t d2 = nd - 1; d2 >= 0; --d2) {
-                int64_t c = r2 % sc.size(d2);
-                r2 /= sc.size(d2);
-                int64_t sc3 = flip_mask[d2] ? (sc.size(d2) - 1 - c) : c;
-                srco += sc3 * mult;
-                outo += c * out_strides[d2];
-                mult *= sc.size(d2);
+    if (nd == 0 || sc.numel() == 0) return sc.clone();
+
+    // General flip: decode a row's coordinates once and move the whole
+    // innermost run as one block.  Only the reversed-run case touches
+    // elements individually, and the row decoding is then amortized over the
+    // entire run instead of being repeated per element.
+    Tensor out = empty_transform_output(sc);
+    const int64_t cols = sc.size(nd - 1);
+    const int64_t rows = sc.numel() / cols;
+    const bool flip_cols = flip_mask[nd - 1];
+    const char* src = static_cast<const char*>(sc.data_ptr());
+    char* dst = static_cast<char*>(out.data_ptr());
+    const int64_t row_grain = std::max<int64_t>(
+        1, GRAIN_SIZE / std::max<int64_t>(cols, 1));
+    auto copy_rows = [&]<typename cell_t>() {
+        const cell_t* s = reinterpret_cast<const cell_t*>(src);
+        cell_t* d = reinterpret_cast<cell_t*>(dst);
+        parallel_for(0, rows, row_grain, [&](int64_t b, int64_t e) {
+            for (int64_t r = b; r < e; ++r) {
+                int64_t rem = r, src_row = 0, mult = cols;
+                for (int64_t axis = nd - 2; axis >= 0; --axis) {
+                    const int64_t size = sc.size(axis);
+                    const int64_t coord = rem % size;
+                    rem /= size;
+                    src_row += (flip_mask[axis] ? size - 1 - coord : coord) * mult;
+                    mult *= size;
+                }
+                const cell_t* srow = s + src_row;
+                cell_t* drow = d + r * cols;
+                if (flip_cols) {
+                    for (int64_t j = 0; j < cols; ++j) {
+                        drow[j] = srow[cols - 1 - j];
+                    }
+                } else {
+                    std::memcpy(drow, srow,
+                                static_cast<size_t>(cols) * sizeof(cell_t));
+                }
             }
-            switch (sc.dtype()) {
-#define TP_FLIP_W(ctype, name_) \
-    case DType::name_: reinterpret_cast<ctype*>(out.data_ptr())[outo] = reinterpret_cast<const ctype*>(sc.data_ptr())[srco]; break;
-                TENSORPLAY_FORALL_SCALAR_TYPES_WITH_COMPLEX(TP_FLIP_W)
-                TENSORPLAY_FORALL_QINT_TYPES(TP_FLIP_W)
-#undef TP_FLIP_W
-                default: break;
-            }
-        }
+        });
     };
-    parallel_for(0, n, GRAIN_SIZE, worker);
+    switch (sc.itemsize()) {
+        case 1: copy_rows.template operator()<uint8_t>(); break;
+        case 2: copy_rows.template operator()<uint16_t>(); break;
+        case 4: copy_rows.template operator()<uint32_t>(); break;
+        case 8: copy_rows.template operator()<uint64_t>(); break;
+        case 16: copy_rows.template operator()<std::array<uint64_t, 2>>(); break;
+        default: {
+            const size_t cell = sc.itemsize();
+            parallel_for(0, rows, row_grain, [&](int64_t b, int64_t e) {
+                for (int64_t r = b; r < e; ++r) {
+                    int64_t rem = r, src_row = 0, mult = cols;
+                    for (int64_t axis = nd - 2; axis >= 0; --axis) {
+                        const int64_t size = sc.size(axis);
+                        const int64_t coord = rem % size;
+                        rem /= size;
+                        src_row +=
+                            (flip_mask[axis] ? size - 1 - coord : coord) * mult;
+                        mult *= size;
+                    }
+                    const char* srow = src + src_row * cell;
+                    char* drow = dst + r * cols * cell;
+                    if (flip_cols) {
+                        for (int64_t j = 0; j < cols; ++j) {
+                            std::memcpy(drow + j * cell,
+                                        srow + (cols - 1 - j) * cell, cell);
+                        }
+                    } else {
+                        std::memcpy(drow, srow, static_cast<size_t>(cols) * cell);
+                    }
+                }
+            });
+            break;
+        }
+    }
     return out;
 }
 
