@@ -12379,5 +12379,241 @@ class TestVulkanRangeOfAPayload(unittest.TestCase):
             tensorplay.tensor(np.array([True, False])).to("vulkan").aminmax()
 
 
+class TestVulkanExtremumOfAnUnnumberedLane(unittest.TestCase):
+    # A lane that is not a number is the answer a range or a greedy step has to
+    # give: it names both ends of the range and the position that holds it.  A
+    # fold that only compares trades it for the largest or the smallest number
+    # beside it, and the plane then looks better behaved on the device than it
+    # is.  The rule reaches every width that measures and both storages the
+    # folds walk, including the tile split a whole long row goes through.
+
+    WIDTHS = ((tensorplay.float32, np.float32),
+              (tensorplay.float16, np.float16))
+    PLANES = ((2, 3), (4, 5, 6), (2, 3, 4, 5))
+
+    @staticmethod
+    def _plane(shape, np_dtype, order):
+        rng = np.random.default_rng(order)
+        return (rng.standard_normal(shape) * 6).astype(np_dtype)
+
+    @staticmethod
+    def _hold(payload, flats, sign=1):
+        """Put a lane that is not a number at each flat position asked for."""
+        held = payload.copy()
+        for flat in flats:
+            np.put(held, flat % held.size, np.nan if sign > 0 else -np.nan)
+        return held
+
+    def _checked(self, host, call, label, dtype=None):
+        # The host fold is the authority on which lane wins; a lane that is not
+        # a number is only ever compared as "is it one", because the payload it
+        # carries is not part of the answer.
+        make = (lambda payload: tensorplay.tensor(payload, dtype=dtype)) if dtype \
+            else (lambda payload: tensorplay.tensor(payload))
+        want = call(make(host))
+        got = call(make(host).to("vulkan"))
+        ends = (got if isinstance(got, tuple) else (got,)), \
+               (want if isinstance(want, tuple) else (want,))
+        for index, (a, b) in enumerate(zip(*ends)):
+            held, asked = np.asarray(a.cpu()), np.asarray(b.cpu())
+            self.assertEqual(
+                tuple(held.shape), tuple(asked.shape),
+                f"{label}: end {index} changed its shape")
+            self.assertTrue(
+                a.device.is_vulkan(), f"{label}: end {index} left the device")
+            if asked.dtype.kind == "f":
+                self.assertEqual(
+                    a.dtype, b.dtype, f"{label}: end {index} changed its width")
+                np.testing.assert_array_equal(
+                    np.isnan(held), np.isnan(asked),
+                    err_msg=f"{label}: end {index} dropped or invented a lane "
+                            "that is not a number")
+                # A measured end is compared as the number it is: narrowing it
+                # to a count would hide a different lane held behind the whole
+                # part. An unnumbered lane already answered as one, so the
+                # compare only sees the numbered lanes left.
+                np.testing.assert_array_equal(
+                    held[~np.isnan(held)], asked[~np.isnan(asked)],
+                    err_msg=f"{label}: end {index}")
+            else:
+                # A position is a count the two ends carry in different widths.
+                np.testing.assert_array_equal(
+                    held.astype(np.int64), asked.astype(np.int64),
+                    err_msg=f"{label}: end {index}")
+
+    def test_an_unnumbered_lane_names_both_ends_of_the_range(self):
+        import tensorplay.functional as F
+        for dtype, np_dtype in self.WIDTHS:
+            for order, shape in enumerate(self.PLANES):
+                plane = self._plane(shape, np_dtype, 500 + order)
+                lanes = plane.size
+                for flats in ((0,), (lanes // 2,), (lanes - 1,), (1, lanes - 2)):
+                    payload = self._hold(plane, flats)
+                    self._checked(
+                        payload, lambda t: F.aminmax(t),
+                        f"the range of a {np_dtype.__name__} {shape} plane "
+                        f"holding a lane that is not a number at {flats}")
+                    # Both ends answer, and neither keeps a number beside it.
+                    low, high = tensorplay.tensor(
+                        payload, dtype=dtype).to("vulkan").aminmax()
+                    for name, end in (("low", low), ("high", high)):
+                        self.assertTrue(
+                            np.isnan(np.asarray(end.cpu())),
+                            f"{np_dtype.__name__} {shape} at {flats}: the {name} "
+                            "end answered a number")
+
+    def test_an_unnumbered_lane_names_both_ends_of_a_linear_row(self):
+        import tensorplay.functional as F
+        for length in (100000, 100001, 100003):
+            row = self._plane((length,), np.float32, 17)
+            for flat in (0, 256, length // 2, length - 257, length - 1):
+                payload = self._hold(row, (flat,))
+                self._checked(
+                    payload, lambda t: F.aminmax(t),
+                    f"the range of a {length}-lane row folded in tiles with the "
+                    f"unnumbered lane at {flat}")
+
+    def test_the_fold_names_the_lane_a_number_could_not(self):
+        # An unbounded measure is the easiest thing to mistake for the answer a
+        # row of unnumbered lanes gives, so both bounds sit beside the lane.
+        for dtype, np_dtype in self.WIDTHS:
+            payload = np.array([np.inf, np.nan, -np.inf, 1.5], dtype=np_dtype)
+            low, high = tensorplay.tensor(
+                payload, dtype=dtype).to("vulkan").aminmax()
+            for name, end in (("low", low), ("high", high)):
+                self.assertTrue(
+                    np.isnan(np.asarray(end.cpu())),
+                    f"a {np_dtype.__name__} range kept a bound instead of "
+                    "naming the lane that is not a number")
+            self._checked(payload, lambda t: t.aminmax(),
+                          f"a {np_dtype.__name__} range over both bounds and an "
+                          "unnumbered lane")
+
+    def test_one_axis_names_the_unnumbered_lane_where_it_is_kept(self):
+        import tensorplay.functional as F
+        for dtype, np_dtype in self.WIDTHS:
+            payload = self._plane((3, 4, 5), np_dtype, 91)
+            payload[1, 2, :] = np.nan
+            for axis in (0, 1, 2):
+                for kept in (False, True):
+                    self._checked(
+                        payload,
+                        lambda t, axis=axis, kept=kept: F.aminmax(t, [axis], kept),
+                        f"the range of axis {axis} of a {np_dtype.__name__} plane "
+                        "with a whole unnumbered row", dtype=dtype)
+            # Only the rows that hold the lane answer in kind.
+            kept = F.amax(tensorplay.tensor(payload, dtype=dtype).to("vulkan"), 2)
+            answered = np.asarray(kept.cpu())
+            self.assertEqual(
+                list(np.isnan(answered).flat),
+                [lane == 6 for lane in range(answered.size)],
+                f"a {np_dtype.__name__} axis fold spread the lane across the rows "
+                "that never held it")
+
+    def test_the_position_named_for_an_unnumbered_lane_is_the_earliest(self):
+        import tensorplay.functional as F
+        for dtype, np_dtype in self.WIDTHS:
+            plane = self._plane((2, 6), np_dtype, 33)
+            for flats, first in (((3,), 3), ((1, 4), 1), ((4, 1), 1),
+                                 ((5,), 5), ((0, 2), 0)):
+                payload = self._hold(plane, flats)
+                self._checked(payload, lambda t: F.argmax(t, 1),
+                              f"an argmax over a {np_dtype.__name__} row holding "
+                              f"unnumbered lanes at {flats}", dtype=dtype)
+                self._checked(payload, lambda t: F.argmin(t, 1),
+                              f"an argmin over a {np_dtype.__name__} row holding "
+                              f"unnumbered lanes at {flats}", dtype=dtype)
+                named = tensorplay.tensor(
+                    payload, dtype=dtype).to("vulkan")
+                self.assertEqual(
+                    int(F.argmax(named, 1).cpu()[0]), first,
+                    f"a {np_dtype.__name__} argmax did not name the earliest "
+                    f"unnumbered lane of {flats}")
+                self.assertEqual(
+                    int(F.argmin(named, 1).cpu()[0]), first,
+                    f"a {np_dtype.__name__} argmin did not name the earliest "
+                    f"unnumbered lane of {flats}")
+
+    def test_the_bound_and_the_position_name_the_same_lane(self):
+        # The bound and the position come from two walks over the same row, so
+        # reading the payload back at the position named has to give the bound
+        # answered: a row cannot be unnumbered at one end and numbered at the
+        # position the other end points at.
+        for dtype, np_dtype in self.WIDTHS:
+            payload = self._hold(self._plane((4, 5), np_dtype, 7), (2, 17))
+            device = tensorplay.tensor(payload, dtype=dtype).to("vulkan")
+            for name, asked in (("max", lambda t: t.max(1)),
+                                ("min", lambda t: t.min(1))):
+                bounds, positions = asked(device)
+                held = np.asarray(bounds.cpu())
+                walked = np.asarray(positions.cpu())
+                for row in range(payload.shape[0]):
+                    lane = payload[row, walked[row]]
+                    if np.isnan(held[row]):
+                        self.assertTrue(
+                            np.isnan(lane),
+                            f"a {np_dtype.__name__} {name}(1) answered an "
+                            "unnumbered bound for a numbered position")
+                    else:
+                        self.assertEqual(
+                            held[row], lane,
+                            f"a {np_dtype.__name__} {name}(1) bound and position "
+                            "named different lanes")
+
+    def test_a_plane_of_only_unnumbered_lanes_answers_in_kind(self):
+        import tensorplay.functional as F
+        for dtype, np_dtype in self.WIDTHS:
+            payload = np.full((2, 3), np.nan, dtype=np_dtype)
+            device = tensorplay.tensor(payload, dtype=dtype).to("vulkan")
+            low, high = device.aminmax()
+            for end in (low, high):
+                self.assertTrue(
+                    bool(np.isnan(np.asarray(end.cpu())).all()),
+                    f"a {np_dtype.__name__} plane of unnumbered lanes did not "
+                    "answer both ends in kind")
+            for name, asked in (("argmax", F.argmax), ("argmin", F.argmin)):
+                self.assertEqual(
+                    int(asked(device).cpu()), 0,
+                    f"a {np_dtype.__name__} {name} over a plane of unnumbered "
+                    "lanes named a position past the first")
+
+    def test_a_measured_fold_still_names_the_largest_number(self):
+        # The rule is about a lane that is not a number; every other answer a
+        # fold gives is the number it gave before, bounds included.
+        import tensorplay.functional as F
+        for dtype, np_dtype in self.WIDTHS:
+            for shape in self.PLANES + ((700,), (100003,)):
+                payload = self._plane(shape, np_dtype, 4 + len(shape))
+                for call, label in ((lambda t: F.aminmax(t), "range"),
+                                    (lambda t: t.max(), "high"),
+                                    (lambda t: F.argmax(t), "argmax"),
+                                    (lambda t: F.argmin(t), "argmin")):
+                    self._checked(payload, call,
+                                  f"a clean {np_dtype.__name__} {shape} {label}")
+            bounded = np.array(
+                [np.inf, -np.inf, 1.5, -7.25, 0.0], dtype=np_dtype)
+            for call, label in ((lambda t: t.max(), "high"),
+                                (lambda t: t.min(), "low"),
+                                (lambda t: t.aminmax(), "range")):
+                self._checked(bounded, call,
+                              f"a {np_dtype.__name__} {label} over both bounds")
+            self.assertEqual(
+                float(tensorplay.tensor(bounded, dtype=dtype).to("vulkan").max()),
+                float("inf"), f"a {np_dtype.__name__} high lost an unbound lane")
+
+    def test_a_counting_payload_keeps_its_own_ends(self):
+        # A count has no lane that is not a number, so the rule changes nothing
+        # it answers; both widths the fold walks keep their own ends.
+        import tensorplay.functional as F
+        rng = np.random.default_rng(5)
+        for dtype, np_dtype in ((tensorplay.int32, np.int32),
+                                (tensorplay.int64, np.int64)):
+            payload = rng.integers(-(2 ** 30), 2 ** 30, (3, 4, 5)).astype(np_dtype)
+            self._checked(payload, lambda t: F.aminmax(t),
+                          f"the range of a {np_dtype.__name__} plane")
+            self._checked(payload, lambda t: F.amax(t, 1),
+                          f"a {np_dtype.__name__} axis high")
+
+
 if __name__ == "__main__":
     unittest.main()
