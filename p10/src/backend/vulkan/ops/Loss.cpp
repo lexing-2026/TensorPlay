@@ -732,6 +732,72 @@ Tensor binary_cross_entropy_with_logits_kernel(
   return tpx::ops::mean(loss);
 }
 
+// A plane read onto the device and widened to the width a deviation walk keeps.
+Tensor loss_widened_operand(const Tensor& t) {
+  return loss_walk_operand(
+      t.device().is_vulkan() ? t : t.to(vulkan_device()));
+}
+
+// The loss one element answers is how far it sits from the value it was matched
+// with.  A difference needs no bound to refuse and no denominator to hold, so a
+// lane that is not a number carries through instead of stopping the walk.
+Tensor l1_loss_kernel(
+    const Tensor& self,
+    const Tensor& target,
+    int64_t reduction) {
+  constexpr const char* kName = "l1_loss";
+  TP_CHECK(
+      reduction >= 0 && reduction <= 2,
+      std::string("Vulkan ") + kName + ": invalid reduction mode");
+  TP_CHECK(
+      self.dtype() == DType::Float32 || self.dtype() == DType::Float16,
+      std::string("Vulkan ") + kName +
+          " supports Float32 and Float16 tensors only");
+  const Tensor deviation = tpx::ops::abs(
+      tpx::ops::sub(loss_widened_operand(self), loss_widened_operand(target)));
+  if (reduction == 0) {
+    return tpx::ops::to(deviation, self.dtype());
+  }
+  return tpx::ops::to(
+      reduction == 1 ? tpx::ops::mean(deviation) : tpx::ops::sum(deviation),
+      self.dtype());
+}
+
+// The whole-plane average keeps the count it divided by, so the gradient each
+// element hands back is the side of the deviation it sits on, carried by the
+// incoming gradient and shared by that same count.
+Tensor l1_loss_backward_kernel(
+    const Tensor& grad_output,
+    const Tensor& self,
+    const Tensor& target,
+    int64_t reduction) {
+  constexpr const char* kName = "l1_loss_backward";
+  TP_CHECK(
+      reduction >= 0 && reduction <= 2,
+      std::string("Vulkan ") + kName + ": invalid reduction mode");
+  TP_CHECK(
+      self.dtype() == DType::Float32 || self.dtype() == DType::Float16,
+      std::string("Vulkan ") + kName +
+          " supports Float32 and Float16 tensors only");
+  Tensor gradient = tpx::ops::mul(
+      tpx::ops::sign(
+          tpx::ops::sub(loss_widened_operand(self), loss_widened_operand(target))),
+      loss_widened_operand(grad_output));
+  if (reduction == 1 && self.numel() > 0) {
+    gradient = tpx::ops::mul(
+        gradient, Scalar(1.0 / static_cast<double>(self.numel())));
+  }
+  return tpx::ops::to(gradient, self.dtype());
+}
+
+// The two-argument form answers the average of the deviations, which is what a
+// plane matched with another plane is asked for when no mode is named.
+Tensor l1_loss_mean_kernel(
+    const Tensor& self,
+    const Tensor& target) {
+  return l1_loss_kernel(self, target, 1);
+}
+
 } // namespace ops
 } // namespace vulkan
 } // namespace tensorplay
@@ -754,6 +820,11 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, LossKernels) {
   m.impl(
       "binary_cross_entropy_with_logits",
       &tensorplay::vulkan::ops::binary_cross_entropy_with_logits_kernel);
+  m.impl("tp_l1_loss", &tensorplay::vulkan::ops::l1_loss_kernel);
+  m.impl(
+      "tp_l1_loss_backward",
+      &tensorplay::vulkan::ops::l1_loss_backward_kernel);
+  m.impl("l1_loss", &tensorplay::vulkan::ops::l1_loss_mean_kernel);
 }
 
 #endif /* USE_VULKAN */
