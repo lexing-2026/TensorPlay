@@ -16219,5 +16219,243 @@ class TestVulkanSwitchedQuadraticLoss(unittest.TestCase):
                     self._device(np.zeros(4, dtype=np.int64)), 1, 1.0)
 
 
+class TestVulkanDivergenceLoss(unittest.TestCase):
+    # The divergence one element answers is the weight its match carries against
+    # the log-likelihood read for it.  A lane carrying nothing answers nothing
+    # for that product, and a read that reaches the far end of the scale keeps
+    # the lane there: nothing times that is still that.  These tests hold both
+    # readings of the match, the slope each hands back, and the corners.
+
+    SHAPES = ((4,), (2, 5), (3, 4, 2), (2, 3, 4, 5))
+
+    @staticmethod
+    def _device(values):
+        return tensorplay.from_numpy(np.ascontiguousarray(values)).to("vulkan")
+
+    @staticmethod
+    def _host(values):
+        return tensorplay.from_numpy(np.ascontiguousarray(values))
+
+    @staticmethod
+    def _read(rng, shape):
+        # The walk reads log-probabilities, so every lane sits at or below zero.
+        return (rng.random(shape) - 1.0).astype(np.float32)
+
+    @staticmethod
+    def _carried(rng, shape):
+        weights = rng.random(shape).astype(np.float32)
+        # Some lanes carry no weight at all.
+        weights.ravel()[::7] = 0.0
+        return weights
+
+    @classmethod
+    def _divergence(cls, read, weights, log_weights):
+        x = np.asarray(read).astype(np.float64)
+        t = np.asarray(weights).astype(np.float64)
+        if log_weights:
+            return np.exp(t) * (t - x)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            weighted = np.where(t == 0.0, 0.0, t * np.log(t))
+        return weighted - t * x
+
+    @classmethod
+    def _slope(cls, read, weights, log_weights):
+        # Only the read is being matched against, so the slope a lane hands back
+        # is the weight it carries taken off its own exponent.
+        t = np.asarray(weights).astype(np.float64)
+        return -np.exp(t) if log_weights else -t
+
+    @staticmethod
+    def _reduced(loss, reduction):
+        if reduction == 0:
+            return loss
+        return loss.mean() if reduction == 1 else loss.sum()
+
+    @staticmethod
+    def _carried_gradient(slope, incoming, reduction):
+        gradient = slope * np.broadcast_to(
+            np.asarray(incoming).astype(np.float64), np.shape(slope))
+        lanes = np.size(slope)
+        return gradient / lanes if reduction == 1 and lanes else gradient
+
+    def test_a_lane_answers_its_weight_against_the_read(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(451)
+        for shape in self.SHAPES:
+            read = self._read(rng, shape)
+            weights = self._carried(rng, shape)
+            for log_weights in (False, True):
+                loss = self._divergence(read, weights, log_weights)
+                for reduction in (0, 1, 2):
+                    with self.subTest(shape=shape, reduction=reduction,
+                                      log_weights=log_weights):
+                        got = F.tp_kl_div(
+                            self._device(read), self._device(weights),
+                            reduction, log_weights).cpu().numpy()
+                        np.testing.assert_allclose(
+                            got, self._reduced(loss, reduction),
+                            rtol=2e-3, atol=2e-3)
+
+    def test_a_lane_holding_nothing_answers_the_product_of_nothing(self):
+        # A lane with no weight to carry answers nothing, however far the read
+        # for it reaches — and a read off the end of the scale keeps it there.
+        import tensorplay.functional as F
+        read = np.array([0.5, np.inf, -np.inf, 2.0, -1.0, np.nan], np.float32)
+        weights = np.array([0.0, 0.0, 0.0, 1.0, 0.5, 0.5], np.float32)
+        with self.subTest(kind="a weight of nothing on a plain read"):
+            np.testing.assert_allclose(
+                F.tp_kl_div(self._device(read), self._device(weights), 0,
+                            False).cpu().numpy(),
+                self._divergence(read, weights, False),
+                rtol=2e-3, atol=2e-3, equal_nan=True)
+        with self.subTest(kind="the same read taken as a log-likelihood"):
+            np.testing.assert_allclose(
+                F.tp_kl_div(self._device(read), self._device(weights), 0,
+                            True).cpu().numpy(),
+                self._divergence(read, weights, True),
+                rtol=2e-3, atol=2e-3, equal_nan=True)
+
+    def test_the_gradient_hands_back_the_weight_a_lane_carries(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(457)
+        for shape in ((4,), (2, 5), (3, 4, 2)):
+            read = self._read(rng, shape)
+            weights = self._carried(rng, shape)
+            incoming = (rng.random(shape) - 0.5).astype(np.float32)
+            slope = self._slope(read, weights, False)
+            logged = self._slope(read, weights, True)
+            for log_weights in (False, True):
+                for reduction in (0, 1, 2):
+                    with self.subTest(shape=shape, reduction=reduction,
+                                      log_weights=log_weights):
+                        got = F.tp_kl_div_backward(
+                            self._device(incoming), self._device(read),
+                            self._device(weights), reduction,
+                            log_weights).cpu().numpy()
+                        np.testing.assert_allclose(
+                            got,
+                            self._carried_gradient(
+                                logged if log_weights else slope,
+                                incoming, reduction),
+                            rtol=2e-3, atol=2e-3)
+
+    def test_the_device_walk_answers_the_host_walk(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(461)
+        read = self._read(rng, (3, 4, 2))
+        weights = self._carried(rng, (3, 4, 2))
+        incoming = (rng.random((3, 4, 2)) - 0.5).astype(np.float32)
+        for log_weights in (False, True):
+            for reduction in (0, 1, 2):
+                with self.subTest(kind="the loss", reduction=reduction,
+                                  log_weights=log_weights):
+                    np.testing.assert_allclose(
+                        F.tp_kl_div(self._device(read), self._device(weights),
+                                    reduction, log_weights).cpu().numpy(),
+                        F.tp_kl_div(self._host(read), self._host(weights),
+                                    reduction, log_weights).cpu().numpy(),
+                        rtol=2e-3, atol=2e-3)
+                with self.subTest(kind="the gradient", reduction=reduction,
+                                  log_weights=log_weights):
+                    np.testing.assert_allclose(
+                        F.tp_kl_div_backward(
+                            self._device(incoming), self._device(read),
+                            self._device(weights), reduction,
+                            log_weights).cpu().numpy(),
+                        F.tp_kl_div_backward(
+                            self._host(incoming), self._host(read),
+                            self._host(weights), reduction,
+                            log_weights).cpu().numpy(),
+                        rtol=2e-3, atol=2e-3)
+
+    def test_a_narrow_payload_keeps_its_own_width(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(467)
+        read = self._read(rng, (2, 5)).astype(np.float16)
+        weights = self._carried(rng, (2, 5)).astype(np.float16)
+        with self.subTest(kind="an unreduced divergence kept narrow"):
+            answered = F.tp_kl_div(self._device(read), self._device(weights), 0,
+                                   False)
+            self.assertEqual(answered.dtype, tensorplay.float16)
+        with self.subTest(kind="an averaged divergence kept narrow"):
+            average = F.tp_kl_div(self._device(read), self._device(weights), 1,
+                                  True)
+            self.assertEqual(average.dtype, tensorplay.float16)
+        with self.subTest(kind="a gradient kept narrow"):
+            gradient = F.tp_kl_div_backward(
+                self._device(np.ones((2, 5), np.float16)), self._device(read),
+                self._device(weights), 1, False)
+            self.assertEqual(gradient.dtype, tensorplay.float16)
+        with self.subTest(kind="a narrow answer close to the wide one"):
+            narrow = F.tp_kl_div(
+                self._device(read), self._device(weights), 1,
+                False).cpu().numpy()
+            np.testing.assert_allclose(
+                narrow,
+                self._reduced(
+                    self._divergence(read.astype(np.float32),
+                                     weights.astype(np.float32), False), 1),
+                rtol=2e-2, atol=2e-2)
+
+    def test_a_plane_without_lanes_answers_the_reduction(self):
+        import tensorplay.functional as F
+        empty = np.zeros((0, 4), np.float32)
+        with self.subTest(kind="an average of nothing"):
+            average = F.tp_kl_div(self._device(empty), self._device(empty), 1,
+                                  False)
+            self.assertEqual(tuple(average.shape), ())
+            self.assertTrue(np.isnan(average.cpu().numpy()))
+        with self.subTest(kind="a total of nothing"):
+            total = F.tp_kl_div(self._device(empty), self._device(empty), 2,
+                                False)
+            self.assertEqual(float(total.cpu().numpy()), 0.0)
+        with self.subTest(kind="an unreduced plane of nothing"):
+            answered = F.tp_kl_div(self._device(empty), self._device(empty), 0,
+                                   True)
+            self.assertEqual(tuple(answered.shape), (0, 4))
+
+    def test_the_frontend_carries_the_average_and_the_batch(self):
+        import tensorplay.nn.functional as nnF
+        rng = np.random.default_rng(471)
+        shape = (3, 4, 2)
+        read = self._read(rng, shape)
+        weights = self._carried(rng, shape)
+        for name, reduction in (("the average", "mean"),
+                                ("the batch", "batchmean"),
+                                ("the total", "sum")):
+            with self.subTest(kind=name):
+                loss = self._divergence(read, weights, False)
+                want = loss.sum() if reduction == "sum" else (
+                    loss.sum() / shape[0] if reduction == "batchmean"
+                    else loss.mean())
+                got = nnF.kl_div(self._device(read), self._device(weights),
+                                 reduction=reduction)
+                np.testing.assert_allclose(got.cpu().numpy(), want,
+                                           rtol=2e-3, atol=2e-3)
+
+    def test_a_walk_out_of_kind_or_mode_refuses(self):
+        import tensorplay.functional as F
+        read = self._device(np.array([-0.2, -0.5], np.float32))
+        weights = self._device(np.array([0.4, 0.6], np.float32))
+        with self.subTest(kind="an unknown reduction"):
+            with self.assertRaisesRegex(RuntimeError, "invalid reduction mode"):
+                F.tp_kl_div(read, weights, 5, False)
+        with self.subTest(kind="a gradient with an unknown reduction"):
+            with self.assertRaisesRegex(RuntimeError, "invalid reduction mode"):
+                F.tp_kl_div_backward(
+                    self._device(np.ones(2, np.float32)), read, weights, 3,
+                    False)
+        with self.subTest(kind="a count being read"):
+            with self.assertRaisesRegex(RuntimeError, "Float32 and Float16"):
+                F.tp_kl_div(
+                    self._device(np.arange(4, dtype=np.int64)),
+                    self._device(np.zeros(4, dtype=np.int64)), 1, False)
+        with self.subTest(kind="a count carrying the weight"):
+            with self.assertRaisesRegex(RuntimeError, "Float32 and Float16"):
+                F.tp_kl_div(
+                    self._device(np.zeros(4, np.float32)),
+                    self._device(np.arange(4, dtype=np.int32)), 1, True)
+
+
 if __name__ == "__main__":
     unittest.main()
