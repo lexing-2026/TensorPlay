@@ -920,7 +920,13 @@ Tensor count_nonzero_one_dim_cpu_impl(const Tensor& self, int64_t dim) {
     Tensor sc = self.contiguous();
     Tensor out = Tensor::empty(out_shape, DType::Int64, self.device());
     const int64_t tasks = outer * inner;
-    if (tasks == 0 || dim_size == 0) return out;
+    if (tasks == 0) return out;
+    if (dim_size == 0) {
+        // A row with no element holds no lane that stands, so every answer the
+        // walk would have written is a zero rather than whatever the allocator
+        // left behind.
+        return out.zero_();
+    }
 
     const scalar_t* in = sc.data_ptr<scalar_t>();
     int64_t* op = out.data_ptr<int64_t>();
