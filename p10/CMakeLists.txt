@@ -757,9 +757,14 @@ function(tp_add_cpu_kernel_isa_tier TIER)
         if(KERNEL_NAME STREQUAL "ComplexKernels")
             list(APPEND _defs TP_COMPLEX_KERNELS_NO_DISPATCH_DEFINITION)
         endif()
+        # The wrapper is only a line of #include, so the object's explicit
+        # inputs never name the file the tier actually compiles.  Without this
+        # dependency an edit to the implementation leaves the ISA copy at its
+        # old timestamp and the runtime keeps dispatching to stale code.
         set_source_files_properties("${_wrapper}" PROPERTIES
             COMPILE_DEFINITIONS "${_defs}"
             COMPILE_OPTIONS "${ARGN}"
+            OBJECT_DEPENDS "${IMPL}"
             SKIP_UNITY_BUILD_INCLUSION ON)
         set_property(GLOBAL APPEND PROPERTY TP_P10_ISA_TIER_SOURCES "${_wrapper}")
     endforeach()
