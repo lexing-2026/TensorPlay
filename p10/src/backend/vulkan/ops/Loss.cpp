@@ -798,6 +798,151 @@ Tensor l1_loss_mean_kernel(
   return l1_loss_kernel(self, target, 1);
 }
 
+// A deviation read for a walk that switches its own shape at a width: inside
+// the width the loss is half a square, scaled by the width where the square has
+// to meet the line it switches to, and outside it the loss is the deviation with
+// the area of that quadratic taken off.  Both forms answer the same number on
+// the width itself, so the walk keeps one branch or the other without a gap.
+Tensor smooth_l1_loss_kernel(
+    const Tensor& self,
+    const Tensor& target,
+    int64_t reduction,
+    double beta) {
+  constexpr const char* kName = "smooth_l1_loss";
+  TP_CHECK(
+      reduction >= 0 && reduction <= 2,
+      std::string("Vulkan ") + kName + ": invalid reduction mode");
+  TP_CHECK(
+      self.dtype() == DType::Float32 || self.dtype() == DType::Float16,
+      std::string("Vulkan ") + kName +
+          " supports Float32 and Float16 tensors only");
+  TP_CHECK(beta >= 0.0, "smooth_l1_loss does not support negative values for beta.");
+  if (beta == 0.0) {
+    // A width of nothing leaves the quadratic branch no lane to hold, so the
+    // loss is the deviation itself rather than a division by the width.
+    return l1_loss_kernel(self, target, reduction);
+  }
+  const Tensor difference = tpx::ops::sub(
+      loss_widened_operand(self), loss_widened_operand(target));
+  const Tensor magnitude = tpx::ops::abs(difference);
+  const Tensor loss = tpx::ops::where(
+      tpx::ops::le(magnitude, Scalar(beta)),
+      tpx::ops::mul(
+          tpx::ops::mul(difference, difference), Scalar(0.5 / beta)),
+      tpx::ops::sub(magnitude, Scalar(0.5 * beta)));
+  if (reduction == 0) {
+    return tpx::ops::to(loss, self.dtype());
+  }
+  return tpx::ops::to(
+      reduction == 1 ? tpx::ops::mean(loss) : tpx::ops::sum(loss),
+      self.dtype());
+}
+
+// The slope inside the width rises with the deviation, the slope outside it is
+// the side the deviation sits on, and the two agree on the width itself.
+Tensor smooth_l1_loss_backward_kernel(
+    const Tensor& grad_output,
+    const Tensor& self,
+    const Tensor& target,
+    int64_t reduction,
+    double beta) {
+  constexpr const char* kName = "smooth_l1_loss_backward";
+  TP_CHECK(
+      reduction >= 0 && reduction <= 2,
+      std::string("Vulkan ") + kName + ": invalid reduction mode");
+  TP_CHECK(
+      self.dtype() == DType::Float32 || self.dtype() == DType::Float16,
+      std::string("Vulkan ") + kName +
+          " supports Float32 and Float16 tensors only");
+  TP_CHECK(
+      beta >= 0.0, "smooth_l1_loss does not support negative values for beta.");
+  if (beta == 0.0) {
+    return l1_loss_backward_kernel(grad_output, self, target, reduction);
+  }
+  const Tensor difference = tpx::ops::sub(
+      loss_widened_operand(self), loss_widened_operand(target));
+  const Tensor magnitude = tpx::ops::abs(difference);
+  Tensor gradient = tpx::ops::mul(
+      tpx::ops::where(
+          tpx::ops::le(magnitude, Scalar(beta)),
+          tpx::ops::div(difference, Scalar(beta)),
+          tpx::ops::sign(difference)),
+      loss_widened_operand(grad_output));
+  if (reduction == 1 && self.numel() > 0) {
+    gradient = tpx::ops::mul(
+        gradient, Scalar(1.0 / static_cast<double>(self.numel())));
+  }
+  return tpx::ops::to(gradient, self.dtype());
+}
+
+// The same switch with the width carried by the line rather than by the square:
+// inside it the loss is half a square, outside it the deviation scaled by the
+// width with half a square taken off.
+Tensor huber_loss_kernel(
+    const Tensor& self,
+    const Tensor& target,
+    int64_t reduction,
+    double delta) {
+  constexpr const char* kName = "huber_loss";
+  TP_CHECK(
+      reduction >= 0 && reduction <= 2,
+      std::string("Vulkan ") + kName + ": invalid reduction mode");
+  TP_CHECK(
+      self.dtype() == DType::Float32 || self.dtype() == DType::Float16,
+      std::string("Vulkan ") + kName +
+          " supports Float32 and Float16 tensors only");
+  TP_CHECK(
+      delta > 0.0, "huber_loss does not support non-positive values for delta.");
+  const Tensor difference = tpx::ops::sub(
+      loss_widened_operand(self), loss_widened_operand(target));
+  const Tensor magnitude = tpx::ops::abs(difference);
+  const Tensor loss = tpx::ops::where(
+      tpx::ops::le(magnitude, Scalar(delta)),
+      tpx::ops::mul(tpx::ops::mul(difference, difference), Scalar(0.5)),
+      tpx::ops::mul(
+          tpx::ops::sub(magnitude, Scalar(0.5 * delta)), Scalar(delta)));
+  if (reduction == 0) {
+    return tpx::ops::to(loss, self.dtype());
+  }
+  return tpx::ops::to(
+      reduction == 1 ? tpx::ops::mean(loss) : tpx::ops::sum(loss),
+      self.dtype());
+}
+
+// Inside the width the gradient is the deviation itself, outside it the width
+// carried by the side the deviation sits on.
+Tensor huber_loss_backward_kernel(
+    const Tensor& grad_output,
+    const Tensor& self,
+    const Tensor& target,
+    int64_t reduction,
+    double delta) {
+  constexpr const char* kName = "huber_loss_backward";
+  TP_CHECK(
+      reduction >= 0 && reduction <= 2,
+      std::string("Vulkan ") + kName + ": invalid reduction mode");
+  TP_CHECK(
+      self.dtype() == DType::Float32 || self.dtype() == DType::Float16,
+      std::string("Vulkan ") + kName +
+          " supports Float32 and Float16 tensors only");
+  TP_CHECK(
+      delta > 0.0, "huber_loss does not support non-positive values for delta.");
+  const Tensor difference = tpx::ops::sub(
+      loss_widened_operand(self), loss_widened_operand(target));
+  const Tensor magnitude = tpx::ops::abs(difference);
+  Tensor gradient = tpx::ops::mul(
+      tpx::ops::where(
+          tpx::ops::le(magnitude, Scalar(delta)),
+          difference,
+          tpx::ops::mul(tpx::ops::sign(difference), Scalar(delta))),
+      loss_widened_operand(grad_output));
+  if (reduction == 1 && self.numel() > 0) {
+    gradient = tpx::ops::mul(
+        gradient, Scalar(1.0 / static_cast<double>(self.numel())));
+  }
+  return tpx::ops::to(gradient, self.dtype());
+}
+
 } // namespace ops
 } // namespace vulkan
 } // namespace tensorplay
@@ -825,6 +970,16 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, LossKernels) {
       "tp_l1_loss_backward",
       &tensorplay::vulkan::ops::l1_loss_backward_kernel);
   m.impl("l1_loss", &tensorplay::vulkan::ops::l1_loss_mean_kernel);
+  m.impl(
+      "smooth_l1_loss",
+      &tensorplay::vulkan::ops::smooth_l1_loss_kernel);
+  m.impl(
+      "smooth_l1_loss_backward",
+      &tensorplay::vulkan::ops::smooth_l1_loss_backward_kernel);
+  m.impl("huber_loss", &tensorplay::vulkan::ops::huber_loss_kernel);
+  m.impl(
+      "huber_loss_backward",
+      &tensorplay::vulkan::ops::huber_loss_backward_kernel);
 }
 
 #endif /* USE_VULKAN */
