@@ -348,7 +348,12 @@ Tensor flip_cpu(const Tensor& self, const std::vector<int64_t>& dims) {
         }
         const size_t block_bytes =
             static_cast<size_t>(inner) * self.itemsize();
-        parallel_for(0, outer * dim_size, GRAIN_SIZE,
+        // One work item is a whole block, so the grain has to be expressed in
+        // blocks: passing the element grain unchanged leaves every block
+        // reduction below the parallel threshold.
+        const int64_t block_grain = std::max<int64_t>(
+            1, GRAIN_SIZE / static_cast<int64_t>(block_bytes));
+        parallel_for(0, outer * dim_size, block_grain,
                      [&](int64_t begin, int64_t end) {
             for (int64_t block = begin; block < end; ++block) {
                 const int64_t outer_index = block / dim_size;
