@@ -244,11 +244,12 @@ Tensor addbmm_cpu(const Tensor& self, const Tensor& batch1, const Tensor& batch2
     const double beta_v = beta.toDouble();
     const double alpha_v = alpha.toDouble();
 
-    if (b == 0) {
-        // A stack with no batch leaves the accumulate chain unread, so the
-        // addend answers on its own at the plane the stack would have carried.
-        // The same epilogue as the general route reads it, which is what holds
-        // this corner to the weight: no weight on the addend answers nothing.
+    if (b == 0 || p == 0) {
+        // Nothing contracts onto the plane — no batch at all, or a reduction
+        // axis with no entry behind it — so the addend answers on its own at
+        // the plane the stack would have carried.  The same epilogue as the
+        // general route reads it, which is what holds this corner to the
+        // weight: no weight on the addend answers nothing.
         Tensor plane = dt == self.dtype()
             ? detail::contiguous_clone(self.expand({n, m}))
             : detail::contiguous_clone(self.expand({n, m}).to(dt));
