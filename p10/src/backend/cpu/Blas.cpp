@@ -134,8 +134,12 @@ void addbmm_epilogue(Tensor& out, const Tensor& self_acc, const Tensor& work,
     const int64_t total = out.numel();
     parallel_for(0, total, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
         for (int64_t i = begin; i < end; ++i) {
-            op[i] = static_cast<T>(beta * static_cast<double>(sp[i]) +
-                                   alpha * static_cast<double>(wp[i]));
+            // No weight on the addend carries no number of its across, not even
+            // an indeterminate one, so the seed stays unread.
+            op[i] = beta == 0.0
+                ? static_cast<T>(alpha * static_cast<double>(wp[i]))
+                : static_cast<T>(beta * static_cast<double>(sp[i]) +
+                                 alpha * static_cast<double>(wp[i]));
         }
     });
 }
@@ -239,6 +243,32 @@ Tensor addbmm_cpu(const Tensor& self, const Tensor& batch1, const Tensor& batch2
     const DType dt = promoteTypes(batch1.dtype(), batch2.dtype());
     const double beta_v = beta.toDouble();
     const double alpha_v = alpha.toDouble();
+
+    if (b == 0) {
+        // A stack with no batch leaves the accumulate chain unread, so the
+        // addend answers on its own at the plane the stack would have carried.
+        // The same epilogue as the general route reads it, which is what holds
+        // this corner to the weight: no weight on the addend answers nothing.
+        Tensor plane = dt == self.dtype()
+            ? detail::contiguous_clone(self.expand({n, m}))
+            : detail::contiguous_clone(self.expand({n, m}).to(dt));
+        const DType work_dt =
+            dt == DType::Float64 ? DType::Float64 : DType::Float32;
+        Tensor nothing = Tensor::zeros({n, m}, work_dt, self.device());
+        Tensor out = Tensor::empty({n, m}, dt, self.device());
+        if (dt == DType::Float32) {
+            addbmm_epilogue<float, float>(out, plane, nothing, beta_v, alpha_v);
+        } else if (dt == DType::Float64) {
+            addbmm_epilogue<double, double>(out, plane, nothing, beta_v, alpha_v);
+        } else if (dt == DType::Float16) {
+            addbmm_epilogue<Half, float>(out, plane, nothing, beta_v, alpha_v);
+        } else if (dt == DType::BFloat16) {
+            addbmm_epilogue<BFloat16, float>(out, plane, nothing, beta_v, alpha_v);
+        } else {
+            TP_THROW(TypeError, "addbmm: unsupported dtype");
+        }
+        return out;
+    }
 
 #if defined(USE_MKL) || defined(USE_BLAS)
     if (dt == DType::Float32 || dt == DType::Float64) {
