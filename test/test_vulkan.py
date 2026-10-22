@@ -6521,6 +6521,152 @@ class TestVulkanIntegralSum(unittest.TestCase):
             "a wide total narrowed to the wrong word")
 
 
+class TestVulkanCountingFolds(unittest.TestCase):
+    # How many lanes of a plane stand, and whether a span stands at all: a count
+    # and the two truth folds answer every check a decode makes about a mask, a
+    # window of real tokens or a lane a ban settled on.  A plane whose shape has no
+    # image form lives in words instead of texels, and a lane carried in a width the
+    # walk does not read has to reach the answer through the width it does.
+
+    @staticmethod
+    def _device(payload):
+        return tensorplay.from_numpy(np.ascontiguousarray(payload)).to("vulkan")
+
+    @staticmethod
+    def _host(payload):
+        return tensorplay.from_numpy(np.ascontiguousarray(payload))
+
+    @staticmethod
+    def _truth(shape, order):
+        return np.random.default_rng(order).random(shape) > 0.4
+
+    @staticmethod
+    def _measured(shape, order):
+        # A row long enough that no image axis holds it, so the payload answers
+        # from linear storage.
+        rng = np.random.default_rng(order)
+        return (rng.standard_normal(shape) * 8).astype(np.float32)
+
+    def _compare(self, got, wanted, message):
+        self.assertEqual(str(got.dtype), str(wanted.dtype), message)
+        self.assertEqual(tuple(got.shape), tuple(wanted.shape), message)
+        np.testing.assert_array_equal(
+            got.cpu().numpy(), wanted.cpu().numpy(), err_msg=message)
+
+    def test_a_count_names_the_lanes_of_every_width(self):
+        planes = (
+            np.array([[0.0, 1.5, -2.0, 0.0], [3.0, 0.0, 0.0, 4.5]], np.float32),
+            np.array([[0.0, 1.5, -2.0, 0.0], [3.0, 0.0, 0.0, 4.5]], np.float16),
+            np.array([[0, 3, -1, 0], [2, 0, 0, 5]], np.int32),
+            np.array([[0, 3, -1, 0], [2, 0, 0, 5]], np.int64),
+            np.array([[0, 3, -1, 0], [2, 0, 0, 5]], np.int8),
+            np.array([[True, False, True, True], [False, False, True, False]]),
+        )
+        for plane in planes:
+            self._compare(
+                self._device(plane).count_nonzero(),
+                self._host(plane).count_nonzero(),
+                f"a whole plane counted, {plane.dtype}")
+            for axis in (0, 1, -1):
+                self._compare(
+                    self._device(plane).count_nonzero(axis),
+                    self._host(plane).count_nonzero(axis),
+                    f"a plane counted over axis {axis}, {plane.dtype}")
+
+    def test_the_truth_folds_answer_for_every_element_type(self):
+        planes = (
+            (np.random.default_rng(71).standard_normal((3, 5)) * 4).astype(np.float32),
+            (np.random.default_rng(72).standard_normal((3, 5)) * 4).astype(np.float16),
+            np.random.default_rng(73).integers(-4, 5, (3, 5)).astype(np.int32),
+            np.random.default_rng(74).integers(-4, 5, (3, 5)).astype(np.int64),
+            np.random.default_rng(75).integers(-4, 5, (3, 5)).astype(np.int8),
+            self._truth((3, 5), 76),
+        )
+        for plane in planes:
+            for fold in ("all", "any"):
+                self._compare(
+                    getattr(self._device(plane), fold)(),
+                    getattr(self._host(plane), fold)(),
+                    f"a whole plane through {fold}, {plane.dtype}")
+                for axis, keepdim in ((0, False), (1, True), (-1, False)):
+                    self._compare(
+                        getattr(self._device(plane), fold)(axis, keepdim),
+                        getattr(self._host(plane), fold)(axis, keepdim),
+                        f"a plane through {fold} over axis {axis}, {plane.dtype}")
+
+    def test_a_row_past_the_reach_of_an_image_counts_from_linear_storage(self):
+        for width in (100001, 30000):
+            truth = self._truth((2, width), 77)
+            self._compare(
+                self._device(truth).count_nonzero(-1),
+                self._host(truth).count_nonzero(-1),
+                f"a row of {width} truth lanes")
+            self._compare(
+                self._device(truth).all(-1),
+                self._host(truth).all(-1),
+                f"a fold over {width} truth lanes")
+            measured = self._measured((1, 1, 1, width), 78)
+            self._compare(
+                self._device(measured).count_nonzero(-1),
+                self._host(measured).count_nonzero(-1),
+                f"a measured row of {width} lanes")
+            self._compare(
+                self._device(measured).any(0),
+                self._host(measured).any(0),
+                f"a measured plane through any, {width} lanes")
+
+    def test_a_signed_word_past_the_reach_of_a_fraction_keeps_its_total(self):
+        # Linear storage used to add a plane of whole numbers through single
+        # precision, which rounded each lane on the way in and narrowed the
+        # running total to the end of a signed word.
+        held = (np.arange(30000, dtype=np.int32) * 4096).reshape(1, 1, 1, 30000)
+        got = self._device(held).sum(-1)
+        self.assertEqual(str(got.dtype), "tensorplay.int64")
+        self.assertEqual(
+            int(got.cpu().numpy()[0, 0, 0]),
+            int(held.sum(dtype=np.int64)),
+            "a total no fraction could hold")
+        counted = self._device(held).count_nonzero()
+        self.assertEqual(
+            int(counted.cpu().numpy()), int(np.count_nonzero(held)))
+
+    def test_a_span_with_no_lane_answers_the_fold_without_a_lane(self):
+        for plane in (np.zeros((0, 3), np.float32),
+                      np.zeros((0, 3), np.bool_),
+                      np.zeros((2, 0, 3), np.float32)):
+            axis = 0 if plane.shape[0] == 0 else 1
+            self._compare(
+                self._device(plane).count_nonzero(axis),
+                self._host(plane).count_nonzero(axis),
+                f"a count over a span of no lanes, {plane.shape}")
+            for fold in ("all", "any"):
+                self._compare(
+                    getattr(self._device(plane), fold)(axis),
+                    getattr(self._host(plane), fold)(axis),
+                    f"{fold} over a span of no lanes, {plane.shape}")
+
+    def test_a_lane_that_is_not_a_number_stands(self):
+        plane = np.array(
+            [[np.nan, 0.0, -0.0, np.inf], [-np.inf, 2.5, 0.0, np.nan]],
+            np.float32)
+        self._compare(
+            self._device(plane).count_nonzero(),
+            self._host(plane).count_nonzero(),
+            "a plane of special lanes counted")
+        for fold in ("all", "any"):
+            self._compare(
+                getattr(self._device(plane), fold)(),
+                getattr(self._host(plane), fold)(),
+                f"a plane of special lanes through {fold}")
+        wide = self._measured((1, 1, 1, 30000), 79)
+        wide[0, 0, 0, 3] = np.nan
+        wide[0, 0, 0, 7] = 0.0
+        self._compare(
+            self._device(wide).count_nonzero(-1),
+            self._host(wide).count_nonzero(-1),
+            "a lane that is not a number in a row without an image form")
+
+
 class TestVulkanIntegerExtrema(unittest.TestCase):
     # The largest row code a window holds, the end of a position walk, the
     # widest count a page table names: an extremum of a counted plane answers
