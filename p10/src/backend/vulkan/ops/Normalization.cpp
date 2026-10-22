@@ -782,6 +782,395 @@ std::tuple<Tensor, Tensor, Tensor> group_norm_backward_kernel(
   return gradients;
 }
 
+// An affine term or a record that is actually there: an optional holding an
+// undefined tensor carries neither.
+bool instance_term_given(const std::optional<Tensor>& term) {
+  return term.has_value() && term->defined();
+}
+
+// Every channel plane of every sample owns both of its moments: the payload
+// folds to (N, C, S) so that one plane is one axis, its mean centers it, and the
+// mean of the squared deviations is its spread -- the deviations are the very
+// values the answer scales, so one walk serves both.  A plane that sits far from
+// zero would lose its spread if it were folded from a difference of two large
+// totals.
+//
+// The walk releases the plane mean and the spread a record keeps, which is the
+// unbiased one: the second moment scaled by S/(S-1).  A plane of a single
+// element has no unbiased spread, and a batch with no plane at all has no
+// average over it, so both answer as not a number rather than as zero.
+std::tuple<Tensor, Tensor, Tensor> instance_norm_plane_walk(
+    const Tensor& input,
+    const std::optional<Tensor>& weight_opt,
+    const std::optional<Tensor>& bias_opt,
+    int64_t N,
+    int64_t C,
+    int64_t S,
+    double eps) {
+  const auto reshape_to = [](const Tensor& t, std::vector<int64_t> shape) {
+    return dispatch_vk<Tensor>("reshape", t, shape);
+  };
+
+  // A narrow payload is walked at single precision and answers in its own; the
+  // affine terms join the walk at that same width.
+  Tensor wide = input.dtype() == DType::Float32
+      ? input
+      : tpx::ops::to(input, DType::Float32);
+  if (!wide.is_contiguous()) {
+    wide = wide.contiguous();
+  }
+
+  const std::vector<int64_t> plane_axis{2};
+  const Tensor folded = reshape_to(wide, std::vector<int64_t>{N, C, S});
+  const Tensor mean =
+      dispatch_vk<Tensor>("mean.dim", folded, plane_axis, true, DType::Float32);
+  const Tensor centered =
+      dispatch_vk<Tensor>("sub.Tensor", folded, mean, Scalar(1.0));
+  const Tensor second = dispatch_vk<Tensor>(
+      "mean.dim",
+      dispatch_vk<Tensor>("mul.Tensor", centered, centered),
+      plane_axis,
+      true,
+      DType::Float32);
+  const Tensor rstd = dispatch_vk<Tensor>(
+      "rsqrt",
+      dispatch_vk<Tensor>("add.Scalar", second, Scalar(eps), Scalar(1)));
+  Tensor scaled = dispatch_vk<Tensor>("mul.Tensor", centered, rstd);
+
+  const std::vector<int64_t> channel_shape{1, C, 1};
+  if (instance_term_given(weight_opt)) {
+    scaled = dispatch_vk<Tensor>(
+        "mul.Tensor",
+        scaled,
+        reshape_to(group_walk_operand(*weight_opt), channel_shape));
+  }
+  if (instance_term_given(bias_opt)) {
+    scaled = dispatch_vk<Tensor>(
+        "add.Tensor",
+        scaled,
+        reshape_to(group_walk_operand(*bias_opt), channel_shape),
+        Scalar(1));
+  }
+
+  // A span of one element divides the second moment by nothing, which is the
+  // answer a record expects rather than the zero the biased moment reads.
+  const double unbiased = S > 1
+      ? static_cast<double>(S) / static_cast<double>(S - 1)
+      : std::numeric_limits<double>::infinity();
+
+  return std::make_tuple(
+      tpx::ops::to(
+          reshape_to(scaled, static_cast<std::vector<int64_t>>(input.shape())),
+          input.dtype()),
+      reshape_to(mean, std::vector<int64_t>{N, C}),
+      dispatch_vk<Tensor>(
+          "mul.Scalar",
+          reshape_to(second, std::vector<int64_t>{N, C}),
+          Scalar(unbiased)));
+}
+
+// The record a later walk reads: the running average of the planes a channel
+// appears in, kept at the width the walk is and landing back in the width the
+// record has.  A record the caller holds on the host is carried onto the device
+// and written home again, because the record is the caller's own.
+void instance_record_update(
+    const std::optional<Tensor>& record_opt,
+    const Tensor& averages,
+    double momentum) {
+  if (!instance_term_given(record_opt)) {
+    return;
+  }
+  Tensor record = *record_opt;
+  std::optional<Tensor> resident;
+  if (!record.device().is_vulkan()) {
+    resident = record.to(Device(DeviceType::Vulkan));
+    record = *resident;
+  }
+  const Tensor kept = group_walk_operand(record);
+  const Tensor updated = dispatch_vk<Tensor>(
+      "add.Tensor",
+      dispatch_vk<Tensor>("mul.Scalar", kept, Scalar(1.0 - momentum)),
+      dispatch_vk<Tensor>("mul.Scalar", averages, Scalar(momentum)),
+      Scalar(1));
+  record.copy_(tpx::ops::to(updated, record.dtype()));
+  if (resident.has_value()) {
+    Tensor host_record = *record_opt;
+    host_record.copy_(*resident);
+  }
+}
+
+Tensor instance_norm_kernel(
+    const Tensor& input,
+    const std::optional<Tensor>& weight_opt,
+    const std::optional<Tensor>& bias_opt,
+    const std::optional<Tensor>& running_mean_opt,
+    const std::optional<Tensor>& running_var_opt,
+    bool use_input_stats,
+    double momentum,
+    double eps) {
+  TP_CHECK(
+      input.dtype() == DType::Float32 || input.dtype() == DType::Float16,
+      "Vulkan instance_norm supports Float32 and Float16 tensors only");
+  TP_CHECK(
+      input.dim() >= 3 && input.dim() <= 4,
+      "Vulkan instance_norm supports 3d to 4d tensors");
+  const int64_t N = input.size(0);
+  const int64_t C = input.size(1);
+  TP_CHECK(
+      C > 0,
+      "Vulkan instance_norm: the payload must carry at least one channel");
+  int64_t S = 1;
+  for (int64_t dim = 2; dim < input.dim(); ++dim) {
+    S *= input.size(dim);
+  }
+  const auto check_lanes = [](const std::optional<Tensor>& term,
+                              int64_t channels) {
+    if (instance_term_given(term)) {
+      TP_CHECK(
+          term->dim() == 1 && term->numel() == channels,
+          "Vulkan instance_norm: an affine parameter and a running record must "
+          "carry one lane per channel");
+    }
+  };
+  check_lanes(weight_opt, C);
+  check_lanes(bias_opt, C);
+  for (const std::optional<Tensor>& term : {weight_opt, bias_opt}) {
+    if (instance_term_given(term)) {
+      TP_CHECK(
+          term->dtype() == DType::Float32 || term->dtype() == DType::Float16,
+          "Vulkan instance_norm: an affine parameter is kept at Float32 or "
+          "Float16");
+    }
+  }
+  for (const std::optional<Tensor>& record :
+       {running_mean_opt, running_var_opt}) {
+    if (instance_term_given(record)) {
+      check_lanes(record, C);
+      TP_CHECK(
+          record->dtype() == DType::Float32 ||
+              record->dtype() == DType::Float16,
+          "Vulkan instance_norm: a running record is kept at Float32 or "
+          "Float16");
+    }
+  }
+
+  if (!use_input_stats) {
+    // The records name the plane: center on the saved mean, scale by the
+    // reciprocal of the saved spread, then let the affine terms ride.
+    TP_CHECK(
+        instance_term_given(running_mean_opt) &&
+            instance_term_given(running_var_opt),
+        "Vulkan instance_norm: a running mean and a running spread must both "
+        "be given when the planes are not read from the input");
+    Tensor wide = group_walk_operand(input);
+    Tensor scaled = dispatch_vk<Tensor>(
+        "mul.Tensor",
+        dispatch_vk<Tensor>(
+            "sub.Tensor",
+            dispatch_vk<Tensor>(
+                "reshape", wide, std::vector<int64_t>{N, C, S}),
+            dispatch_vk<Tensor>(
+                "reshape",
+                group_walk_operand(*running_mean_opt),
+                std::vector<int64_t>{1, C, 1}),
+            Scalar(1.0)),
+        dispatch_vk<Tensor>(
+            "rsqrt",
+            dispatch_vk<Tensor>(
+                "add.Scalar",
+                dispatch_vk<Tensor>(
+                    "reshape",
+                    group_walk_operand(*running_var_opt),
+                    std::vector<int64_t>{1, C, 1}),
+                Scalar(eps),
+                Scalar(1))));
+    if (instance_term_given(weight_opt)) {
+      scaled = dispatch_vk<Tensor>(
+          "mul.Tensor",
+          scaled,
+          dispatch_vk<Tensor>(
+              "reshape",
+              group_walk_operand(*weight_opt),
+              std::vector<int64_t>{1, C, 1}));
+    }
+    if (instance_term_given(bias_opt)) {
+      scaled = dispatch_vk<Tensor>(
+          "add.Tensor",
+          scaled,
+          dispatch_vk<Tensor>(
+              "reshape",
+              group_walk_operand(*bias_opt),
+              std::vector<int64_t>{1, C, 1}),
+          Scalar(1));
+    }
+    return tpx::ops::to(
+        dispatch_vk<Tensor>(
+            "reshape",
+            scaled,
+            static_cast<std::vector<int64_t>>(input.shape())),
+        input.dtype());
+  }
+
+  auto walked = instance_norm_plane_walk(
+      input, weight_opt, bias_opt, N, C, S, eps);
+
+  // A record averages the planes a channel appears in; a batch with no plane
+  // has no average, which is the not-a-number a running record answers.
+  const std::vector<int64_t> row_axis{0};
+  if (instance_term_given(running_mean_opt)) {
+    instance_record_update(
+        running_mean_opt,
+        dispatch_vk<Tensor>(
+            "mean.dim",
+            std::get<1>(walked),
+            row_axis,
+            false,
+            DType::Float32),
+        momentum);
+  }
+  if (instance_term_given(running_var_opt)) {
+    instance_record_update(
+        running_var_opt,
+        dispatch_vk<Tensor>(
+            "mean.dim",
+            std::get<2>(walked),
+            row_axis,
+            false,
+            DType::Float32),
+        momentum);
+  }
+  return std::get<0>(walked);
+}
+
+// The gradient of an instance normalization.  A plane's gradient is a group
+// gradient over exactly one channel: the two corrections that keep the mean and
+// the spread are folded over the plane, which is what a group of one channel
+// covers, so the walk of the group gradient is the walk of this one.
+//
+// A gradient read against the records needs no corrections at all -- the plane
+// it centers on is fixed -- so it scales the incoming gradient by the per-channel
+// reciprocal of the saved spread.  The parameter gradients need no records: a
+// channel folds its own lane over the rows it appears in and over its plane.
+std::tuple<Tensor, Tensor, Tensor> instance_norm_backward_kernel(
+    const Tensor& grad_output,
+    const Tensor& input,
+    const std::optional<Tensor>& weight_opt,
+    const std::optional<Tensor>& bias_opt,
+    const std::optional<Tensor>& running_mean_opt,
+    const std::optional<Tensor>& running_var_opt,
+    bool use_input_stats,
+    double eps) {
+  TP_CHECK(
+      input.dtype() == DType::Float32 || input.dtype() == DType::Float16,
+      "Vulkan instance_norm_backward supports Float32 and Float16 tensors only");
+  TP_CHECK(
+      grad_output.dtype() == input.dtype(),
+      "Vulkan instance_norm_backward: a gradient is read in the width the "
+      "activation is");
+  TP_CHECK(
+      input.dim() >= 3 && input.dim() <= 4,
+      "Vulkan instance_norm_backward supports 3d to 4d tensors");
+  TP_CHECK(
+      static_cast<std::vector<int64_t>>(grad_output.shape()) ==
+          static_cast<std::vector<int64_t>>(input.shape()),
+      "Vulkan instance_norm_backward: the gradient must name the planes it "
+      "weighs");
+  const int64_t N = input.size(0);
+  const int64_t C = input.size(1);
+  TP_CHECK(
+      C > 0,
+      "Vulkan instance_norm_backward: the payload must carry at least one "
+      "channel");
+  int64_t S = 1;
+  for (int64_t dim = 2; dim < input.dim(); ++dim) {
+    S *= input.size(dim);
+  }
+  const auto check_lanes = [](const std::optional<Tensor>& term,
+                              int64_t channels) {
+    if (instance_term_given(term)) {
+      TP_CHECK(
+          term->dim() == 1 && term->numel() == channels,
+          "Vulkan instance_norm_backward: an affine parameter and a running "
+          "record must carry one lane per channel");
+    }
+  };
+  check_lanes(weight_opt, C);
+  check_lanes(bias_opt, C);
+  check_lanes(running_mean_opt, C);
+  check_lanes(running_var_opt, C);
+  if (!use_input_stats) {
+    TP_CHECK(
+        instance_term_given(running_mean_opt) &&
+            instance_term_given(running_var_opt),
+        "Vulkan instance_norm_backward: a running mean and a running spread "
+        "must both be given when the planes are not read from the input");
+  }
+
+  if (use_input_stats) {
+    return group_norm_backward_kernel(
+        grad_output, input, C, weight_opt, bias_opt, eps);
+  }
+
+  const auto reshape_to = [](const Tensor& t, std::vector<int64_t> shape) {
+    return dispatch_vk<Tensor>("reshape", t, shape);
+  };
+  const auto fold = [](const Tensor& t, std::vector<int64_t> axes) {
+    return dispatch_vk<Tensor>(
+        "sum.dim_IntList", t, axes, false, DType::Float32);
+  };
+
+  const std::vector<int64_t> plane_shape{N, C, S};
+  const std::vector<int64_t> channel_shape{1, C, 1};
+  const Tensor dy = reshape_to(group_walk_operand(grad_output), plane_shape);
+  const Tensor spread = dispatch_vk<Tensor>(
+      "rsqrt",
+      dispatch_vk<Tensor>(
+          "add.Scalar",
+          reshape_to(group_walk_operand(*running_var_opt), channel_shape),
+          Scalar(eps),
+          Scalar(1)));
+
+  Tensor scale = spread;
+  if (instance_term_given(weight_opt)) {
+    scale = dispatch_vk<Tensor>(
+        "mul.Tensor", scale, reshape_to(group_walk_operand(*weight_opt),
+                                        channel_shape));
+  }
+  Tensor grad_input = tpx::ops::to(
+      reshape_to(
+          dispatch_vk<Tensor>("mul.Tensor", dy, scale),
+          static_cast<std::vector<int64_t>>(input.shape())),
+      input.dtype());
+
+  Tensor grad_weight;
+  if (instance_term_given(weight_opt)) {
+    const Tensor xhat = dispatch_vk<Tensor>(
+        "mul.Tensor",
+        dispatch_vk<Tensor>(
+            "sub.Tensor",
+            reshape_to(group_walk_operand(input), plane_shape),
+            reshape_to(group_walk_operand(*running_mean_opt), channel_shape),
+            Scalar(1.0)),
+        spread);
+    grad_weight = tpx::ops::to(
+        reshape_to(
+            fold(fold(dispatch_vk<Tensor>("mul.Tensor", dy, xhat),
+                       std::vector<int64_t>{2}),
+                 std::vector<int64_t>{0}),
+            std::vector<int64_t>{C}),
+        weight_opt->dtype());
+  }
+  Tensor grad_bias;
+  if (instance_term_given(bias_opt)) {
+    grad_bias = tpx::ops::to(
+        reshape_to(
+            fold(fold(dy, std::vector<int64_t>{2}), std::vector<int64_t>{0}),
+            std::vector<int64_t>{C}),
+        input.dtype());
+  }
+  return std::make_tuple(grad_input, grad_weight, grad_bias);
+}
+
 namespace {
 
 // Single-dispatch root-mean-square normalization over the trailing width
@@ -2420,6 +2809,12 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, NormalizationKernels) {
   m.impl(
       "native_group_norm_backward",
       &tensorplay::vulkan::ops::native_group_norm_backward_kernel);
+  m.impl(
+      "instance_norm",
+      &tensorplay::vulkan::ops::instance_norm_kernel);
+  m.impl(
+      "instance_norm_backward",
+      &tensorplay::vulkan::ops::instance_norm_backward_kernel);
 }
 
 TENSORPLAY_LIBRARY_IMPL(Vulkan, LlmKernels) {
