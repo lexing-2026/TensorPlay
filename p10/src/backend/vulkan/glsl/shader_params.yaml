@@ -1523,6 +1523,62 @@ scatter_add_buffer_half:
   parameter_names_with_default_values: {}
   shader_variants:
   - NAME: scatter_add_buffer_half
+scatter_reduce_buffer:
+  parameter_names_with_default_values:
+    OPERATOR: (ACC) + (VAL)
+    IDENTITY: 0.0
+    MEAN: false
+  shader_variants:
+  # A fold that names a lane decides what an emptied lane starts from, so each
+  # mode carries its own growth, its own identity and whether the destination
+  # counts as one of the contributions.  The extremum folds hand a lane that is
+  # not a number to both ends instead of trading it for the numeric lane.
+  - NAME: scatter_reduce_sum_buffer
+    OPERATOR: (ACC) + (VAL)
+    IDENTITY: 0.0
+    MEAN: false
+  - NAME: scatter_reduce_prod_buffer
+    OPERATOR: (ACC) * (VAL)
+    IDENTITY: 1.0
+    MEAN: false
+  - NAME: scatter_reduce_mean_buffer
+    OPERATOR: (ACC) + (VAL)
+    IDENTITY: 0.0
+    MEAN: true
+  - NAME: scatter_reduce_amin_buffer
+    OPERATOR: "((isnan(ACC) || (ACC) < (VAL)) ? (ACC) : (VAL))"
+    IDENTITY: uintBitsToFloat(0x7f800000u)
+    MEAN: false
+  - NAME: scatter_reduce_amax_buffer
+    OPERATOR: "((isnan(ACC) || (ACC) > (VAL)) ? (ACC) : (VAL))"
+    IDENTITY: uintBitsToFloat(0xff800000u)
+    MEAN: false
+scatter_reduce_buffer_half:
+  parameter_names_with_default_values:
+    OPERATOR: (ACC) + (VAL)
+    IDENTITY: 0.0
+    MEAN: false
+  shader_variants:
+  - NAME: scatter_reduce_sum_buffer_half
+    OPERATOR: (ACC) + (VAL)
+    IDENTITY: 0.0
+    MEAN: false
+  - NAME: scatter_reduce_prod_buffer_half
+    OPERATOR: (ACC) * (VAL)
+    IDENTITY: 1.0
+    MEAN: false
+  - NAME: scatter_reduce_mean_buffer_half
+    OPERATOR: (ACC) + (VAL)
+    IDENTITY: 0.0
+    MEAN: true
+  - NAME: scatter_reduce_amin_buffer_half
+    OPERATOR: "((isnan(ACC) || (ACC) < (VAL)) ? (ACC) : (VAL))"
+    IDENTITY: uintBitsToFloat(0x7f800000u)
+    MEAN: false
+  - NAME: scatter_reduce_amax_buffer_half
+    OPERATOR: "((isnan(ACC) || (ACC) > (VAL)) ? (ACC) : (VAL))"
+    IDENTITY: uintBitsToFloat(0xff800000u)
+    MEAN: false
 conv2d:
   parameter_names_with_default_values:
     HAS_BIAS: true

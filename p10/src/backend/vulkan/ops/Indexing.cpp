@@ -1800,6 +1800,209 @@ Tensor scatter_add_kernel(
   return out;
 }
 
+namespace {
+
+enum class ScatterFold { Sum, Prod, Mean, Amin, Amax };
+
+ScatterFold scatter_fold(const std::string& reduce) {
+  if (reduce == "sum") return ScatterFold::Sum;
+  if (reduce == "prod") return ScatterFold::Prod;
+  if (reduce == "mean") return ScatterFold::Mean;
+  if (reduce == "amin") return ScatterFold::Amin;
+  if (reduce == "amax") return ScatterFold::Amax;
+  TP_THROW(ValueError,
+           "reduce argument must be one of 'sum', 'prod', 'mean', 'amin', "
+           "'amax' but got: " + reduce);
+}
+
+const char* scatter_fold_name(ScatterFold fold) {
+  switch (fold) {
+    case ScatterFold::Sum: return "sum";
+    case ScatterFold::Prod: return "prod";
+    case ScatterFold::Mean: return "mean";
+    case ScatterFold::Amin: return "amin";
+    case ScatterFold::Amax: return "amax";
+  }
+  return "sum"; // unreachable
+}
+
+} // namespace
+
+//
+// Fold of a value into the element an index names: every entry of a list hands
+// its number to the element it names, and the element grows by that number the
+// way the fold says - a total, a product, an average, the largest or the
+// smallest.  Several entries can name one element, so the fold runs over the
+// destination the way the accumulating scatter does: one invocation owns one
+// whole word, walks the list in the order it states, and keeps every entry that
+// reaches a lane of its word.  That is what makes a repeated element answer the
+// same number for every caller, with no atomic and no clearing pass.
+//
+// Whether the element the destination already holds counts as one of the
+// contributions is the whole difference between keeping it and discarding it:
+// discarded, the lane starts from the identity of the fold, so the entries alone
+// decide it, and a lane the list never names keeps what it held.  An average
+// divides by the entries that reached the lane plus the one the destination
+// contributes when it is kept; the count rides along with the fold rather than
+// in a second payload, since a lane either was reached or was not.
+//
+Tensor& scatter_reduce_inplace_kernel(
+    Tensor& self,
+    int64_t dim,
+    const Tensor& index,
+    const Tensor& src,
+    const std::string& reduce,
+    bool include_self) {
+  NoGradGuard no_grad;
+  const ScatterFold fold = scatter_fold(reduce);
+  validate_gather_operand(self, "scatter_reduce");
+  validate_gather_operand(src, "scatter_reduce");
+  TP_CHECK(
+      index.dtype() == DType::Int32 || index.dtype() == DType::Int64,
+      "Vulkan scatter_reduce: index must be Int32 or Int64");
+  const int64_t rank = self.dim();
+  int64_t wrapped = dim < 0 ? dim + rank : dim;
+  TP_CHECK(
+      wrapped >= 0 && wrapped < rank,
+      "Vulkan scatter_reduce: dimension out of range");
+  check_scatter_geometry(self, wrapped, index);
+  TP_CHECK(
+      src.dtype() == self.dtype(),
+      "Vulkan scatter_reduce: the payload must hold the element type the "
+      "destination holds");
+  // A fold keeps the width it grows in, so a payload of another element type
+  // cannot be widened on the way in without answering a different number.
+  TP_CHECK(
+      src.dim() == index.dim(),
+      "Vulkan scatter_reduce: the payload must have the same rank as the list");
+
+  // The value of an entry is read where the entry stands, so the payload has to
+  // cover the list: it may reach further along an axis than the list does, and
+  // whatever lies past the list is never read.
+  Tensor payload = src;
+  for (int64_t axis = 0; axis < rank; ++axis) {
+    TP_CHECK(
+        index.size(axis) <= payload.size(axis),
+        "Vulkan scatter_reduce: the list reaches past the payload at dimension ",
+        axis);
+    if (payload.size(axis) > index.size(axis)) {
+      payload = payload.narrow(axis, 0, index.size(axis));
+    }
+  }
+  payload = payload.contiguous();
+
+  if (self.numel() == 0 || index.numel() == 0) {
+    return self;
+  }
+
+  const int64_t entries = index.numel();
+  TP_CHECK(
+      self.numel() <= std::numeric_limits<int32_t>::max() &&
+          entries <= std::numeric_limits<int32_t>::max(),
+      "Vulkan scatter_reduce: a payload holds more than two billion elements");
+  const int64_t lanes = self.dtype() == DType::Float16 ? 2 : 4;
+  const int64_t invocations = (self.numel() + lanes - 1) / lanes;
+  TP_CHECK(
+      invocations <= std::numeric_limits<int32_t>::max(),
+      "Vulkan scatter_reduce: the fold needs more than two billion invocations");
+  // One group of lanes reads the list once, so a walk of this shape costs that
+  // many passes; naming the ceiling keeps a call whose destination and list are
+  // both long from stalling the queue instead of answering.
+  const int64_t passes = (invocations + 255) / 256;
+  TP_CHECK(
+      entries <= (int64_t(1) << 28) / std::max<int64_t>(passes, 1),
+      "Vulkan scatter_reduce: this walk would read the list past the budget the "
+      "device gives it");
+
+  api::Context* const context = api::context();
+  api::vTensor v_self = convert(self);
+  api::vTensor v_indices =
+      upload_index_payload(index, api::StorageType::BUFFER);
+  api::vTensor v_src = scatter_source_payload(context, self, payload);
+  // One word per entry, holding the element of the destination it names, read in
+  // the order the list states so that a repeated element folds in that order.
+  api::vTensor v_names{
+      context,
+      {entries},
+      DType::Int32,
+      api::StorageType::BUFFER,
+      api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+
+  api::PipelineBarrier pipeline_barrier{};
+  record_scatter_pairs(
+      context,
+      pipeline_barrier,
+      self,
+      index,
+      wrapped,
+      v_names,
+      v_indices,
+      VK_KERNEL(scatter_add_dest));
+
+  // The fold owns a whole word of linear storage, so a destination that came
+  // out of an image runs on a dense copy of itself and carries that copy back.
+  const bool image_destination =
+      v_self.storage_type() != api::StorageType::BUFFER;
+  api::vTensor v_target = image_destination
+      ? to_buffer_storage_dispatch(context, v_self)
+      : v_self;
+
+  const struct FoldBlock final {
+    int32_t count; // elements of the destination
+    int32_t n;     // entries of the index list
+    int32_t keep;  // whether the destination is one of the contributions
+    int32_t fill;
+  } block{
+      static_cast<int32_t>(self.numel()),
+      static_cast<int32_t>(entries),
+      include_self ? 1 : 0,
+      0};
+  api::UniformParamsBuffer params(context, block);
+  const std::string variant =
+      std::string("scatter_reduce_") + scatter_fold_name(fold) + "_buffer";
+  context->submit_compute_job(
+      VK_KERNEL_FROM_STR(buffer_shader_for_dtype(variant, self.dtype())),
+      pipeline_barrier,
+      {buffer_dispatch_count(
+           safe_downcast_to_u32(self.numel()), self.dtype(), 4u),
+       1u,
+       1u},
+      {256u, 1u, 1u},
+      VK_NULL_HANDLE,
+      // The fold may start from what the destination holds, so the payload is
+      // bound in both directions.
+      v_target.buffer(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::READ | api::MemoryAccessType::WRITE),
+      v_names.buffer(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::READ),
+      v_src.buffer(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::READ),
+      params.buffer());
+  if (image_destination) {
+    Tensor carried = convert(v_target);
+    self.copy_(carried);
+  }
+  return self;
+}
+
+Tensor scatter_reduce_kernel(
+    const Tensor& self,
+    int64_t dim,
+    const Tensor& index,
+    const Tensor& src,
+    const std::string& reduce,
+    bool include_self) {
+  Tensor out = self.clone();
+  scatter_reduce_inplace_kernel(out, dim, index, src, reduce, include_self);
+  return out;
+}
+
 //
 // Fill of whole rows: the codes of a list name rows of the destination along one
 // axis, and every element of a named row takes the given number in place of what
@@ -2210,6 +2413,12 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, IndexingKernels) {
   m.impl(
       "scatter_add_",
       &tensorplay::vulkan::ops::scatter_add_inplace_kernel);
+  m.impl(
+      "scatter_reduce",
+      &tensorplay::vulkan::ops::scatter_reduce_kernel);
+  m.impl(
+      "scatter_reduce_.two",
+      &tensorplay::vulkan::ops::scatter_reduce_inplace_kernel);
 }
 
 #endif /* USE_VULKAN */
