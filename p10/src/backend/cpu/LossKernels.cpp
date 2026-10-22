@@ -358,26 +358,33 @@ Tensor l1_loss_backward_kernel(const Tensor& grad_output, const Tensor& input,
     return scale_grad(g, reduction, input.numel());
 }
 
-// z = |x - t|; z < beta ? 0.5 z^2 / beta : z - 0.5 beta (equal at z == beta).
+// z = |x - t|; z < beta ? 0.5 z^2 / beta : z - 0.5 beta. The switch is strict,
+// so the quadratic branch holds no lane when the width is nothing and every
+// lane answers the deviation itself.
 Tensor smooth_l1_loss_cpu(const Tensor& input, const Tensor& target,
                           int64_t reduction, double beta) {
     if (beta < 0)
         TP_THROW(ValueError, "smooth_l1_loss does not support negative values for beta.");
     Tensor diff = input - target;
     Tensor absd = diff.abs();
-    Tensor loss = Tensor::where(absd.le(Scalar(beta)), diff * diff * (0.5 / beta),
+    Tensor loss = Tensor::where(absd.lt(Scalar(beta)), diff * diff * (0.5 / beta),
                                 absd - 0.5 * beta);
     return loss_reduce(loss, reduction);
 }
 
-// x = input - target; |x| <= beta ? norm * x / beta : norm * sign(x),
-// with norm = 1/numel for mean reduction (inclusive/exclusive boundary
-// forms agree since both give norm * grad at |x| == beta).
+// x = input - target, with norm = 1/numel for mean reduction. The slope is a
+// three-way test on the signed deviation, and the two outer tests are reached
+// before the division, so a lane sitting on the width answers the full slope
+// and a width of nothing never divides.
 Tensor smooth_l1_loss_backward_cpu(const Tensor& grad_output, const Tensor& input,
                                    const Tensor& target, int64_t reduction, double beta) {
+    if (beta < 0)
+        TP_THROW(ValueError, "smooth_l1_loss does not support negative values for beta.");
     Tensor diff = input - target;
-    Tensor g = Tensor::where(diff.abs().le(Scalar(beta)), diff / beta, diff.sign()) * grad_output;
-    return scale_grad(g, reduction, input.numel());
+    Tensor slope = Tensor::where(
+        diff.le(Scalar(-beta)), Scalar(-1.0),
+        Tensor::where(diff.ge(Scalar(beta)), Scalar(1.0), diff / beta));
+    return scale_grad(slope * grad_output, reduction, input.numel());
 }
 
 // z = |x - t|; z < delta ? 0.5 z^2 : delta (z - 0.5 delta).

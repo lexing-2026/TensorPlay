@@ -802,7 +802,8 @@ Tensor l1_loss_mean_kernel(
 // the width the loss is half a square, scaled by the width where the square has
 // to meet the line it switches to, and outside it the loss is the deviation with
 // the area of that quadratic taken off.  Both forms answer the same number on
-// the width itself, so the walk keeps one branch or the other without a gap.
+// the width itself, so the walk holds the width lane on the line and leaves no
+// lane for the square when the width is nothing.
 Tensor smooth_l1_loss_kernel(
     const Tensor& self,
     const Tensor& target,
@@ -817,16 +818,11 @@ Tensor smooth_l1_loss_kernel(
       std::string("Vulkan ") + kName +
           " supports Float32 and Float16 tensors only");
   TP_CHECK(beta >= 0.0, "smooth_l1_loss does not support negative values for beta.");
-  if (beta == 0.0) {
-    // A width of nothing leaves the quadratic branch no lane to hold, so the
-    // loss is the deviation itself rather than a division by the width.
-    return l1_loss_kernel(self, target, reduction);
-  }
   const Tensor difference = tpx::ops::sub(
       loss_widened_operand(self), loss_widened_operand(target));
   const Tensor magnitude = tpx::ops::abs(difference);
   const Tensor loss = tpx::ops::where(
-      tpx::ops::le(magnitude, Scalar(beta)),
+      tpx::ops::lt(magnitude, Scalar(beta)),
       tpx::ops::mul(
           tpx::ops::mul(difference, difference), Scalar(0.5 / beta)),
       tpx::ops::sub(magnitude, Scalar(0.5 * beta)));
@@ -839,7 +835,9 @@ Tensor smooth_l1_loss_kernel(
 }
 
 // The slope inside the width rises with the deviation, the slope outside it is
-// the side the deviation sits on, and the two agree on the width itself.
+// the full side the deviation sits on.  The two outer tests are read before the
+// rise is divided by the width, so a lane sitting on the width keeps the full
+// slope and a width of nothing leaves no lane to divide.
 Tensor smooth_l1_loss_backward_kernel(
     const Tensor& grad_output,
     const Tensor& self,
@@ -856,17 +854,14 @@ Tensor smooth_l1_loss_backward_kernel(
           " supports Float32 and Float16 tensors only");
   TP_CHECK(
       beta >= 0.0, "smooth_l1_loss does not support negative values for beta.");
-  if (beta == 0.0) {
-    return l1_loss_backward_kernel(grad_output, self, target, reduction);
-  }
   const Tensor difference = tpx::ops::sub(
       loss_widened_operand(self), loss_widened_operand(target));
-  const Tensor magnitude = tpx::ops::abs(difference);
   Tensor gradient = tpx::ops::mul(
       tpx::ops::where(
-          tpx::ops::le(magnitude, Scalar(beta)),
-          tpx::ops::div(difference, Scalar(beta)),
-          tpx::ops::sign(difference)),
+          tpx::ops::le(difference, Scalar(-beta)), Scalar(-1.0),
+          tpx::ops::where(
+              tpx::ops::ge(difference, Scalar(beta)), Scalar(1.0),
+              tpx::ops::div(difference, Scalar(beta)))),
       loss_widened_operand(grad_output));
   if (reduction == 1 && self.numel() > 0) {
     gradient = tpx::ops::mul(
