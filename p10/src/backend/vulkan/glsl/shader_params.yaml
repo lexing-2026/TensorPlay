@@ -37,6 +37,11 @@ unary_op:
     OPERATOR: tanh(X)
   - NAME: sigmoid
     OPERATOR: 1.0f / (1.0f + exp(-X))
+  # min(X, 0) - log(1 + exp(-|X|)): the exponent never leaves the negative
+  # half-line, so the exponential cannot overflow, and a lane that is not a
+  # number stays one through the logarithm.
+  - NAME: log_sigmoid
+    OPERATOR: 'min(X, 0.0f) - log(1.0f + exp(-abs(X)))'
   - NAME: floor
     OPERATOR: floor(X)
   - NAME: sin
@@ -346,6 +351,8 @@ buffer_unary_op:
     OPERATOR: tanh(X)
   - NAME: buffer_sigmoid
     OPERATOR: 1.0f / (1.0f + exp(-X))
+  - NAME: buffer_log_sigmoid
+    OPERATOR: 'min(X, 0.0f) - log(1.0f + exp(-abs(X)))'
   - NAME: buffer_floor
     OPERATOR: floor(X)
   - NAME: buffer_sin
@@ -2521,6 +2528,12 @@ buffer_half_unary_op:
     INPLACE: false
   - NAME: buffer_log2_halfinplace
     OPERATOR: 'log2(X)'
+    INPLACE: true
+  - NAME: buffer_log_sigmoid_half
+    OPERATOR: 'min(X, 0.0f) - log(1.0f + exp(-abs(X)))'
+    INPLACE: false
+  - NAME: buffer_log_sigmoid_halfinplace
+    OPERATOR: 'min(X, 0.0f) - log(1.0f + exp(-abs(X)))'
     INPLACE: true
   - NAME: buffer_mish_half
     OPERATOR: 'X * tanh(log1p_approx(exp(X)))'

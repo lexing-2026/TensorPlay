@@ -365,6 +365,13 @@ Tensor& sigmoid_inplace_kernel(Tensor& self) {
   return unary_op_typed_inplace(self, "sigmoidinplace", "buffer_sigmoidinplace", "unary sigmoid");
 }
 
+// log_sigmoid: min(x, 0) - log(1 + exp(-|x|)), evaluated by one kernel so the
+// exponential and the logarithm share a single pass over the payload.
+Tensor log_sigmoid_kernel(const Tensor& self) {
+  return unary_op_typed(
+      self, "log_sigmoid", "buffer_log_sigmoid", false, "log_sigmoid");
+}
+
 Tensor relu_kernel(const Tensor& self) {
   return unary_op_typed(self, "relu", "buffer_relu", true, "unary relu");
 }
@@ -562,6 +569,7 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, UnaryOpKernels) {
   m.impl("tanh_", &tensorplay::vulkan::ops::tanh_inplace_kernel);
   m.impl("sigmoid", &tensorplay::vulkan::ops::sigmoid_kernel);
   m.impl("sigmoid_", &tensorplay::vulkan::ops::sigmoid_inplace_kernel);
+  m.impl("log_sigmoid", &tensorplay::vulkan::ops::log_sigmoid_kernel);
   m.impl("relu", &tensorplay::vulkan::ops::relu_kernel);
   m.impl("relu_", &tensorplay::vulkan::ops::relu_inplace_kernel);
   m.impl("rsqrt", &tensorplay::vulkan::ops::rsqrt_kernel);

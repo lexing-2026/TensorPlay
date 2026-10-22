@@ -395,6 +395,13 @@ std::tuple<Tensor, Tensor, Tensor> native_layer_norm_backward_kernel(
   return std::make_tuple(dx, dgamma, dbeta);
 }
 
+// Log-sigmoid backward: grad * sigmoid(-x) = grad / (1 + exp(x)).
+Tensor log_sigmoid_backward_kernel(
+    const Tensor& grad_output, const Tensor& self) {
+  validate_float(grad_output, "log_sigmoid_backward");
+  return mul_kernel(grad_output, sigmoid_kernel(neg_kernel(self)));
+}
+
 // Softplus forward: x*beta > threshold ? x : log1p(exp(x*beta))/beta.
 Tensor softplus_kernel(
     const Tensor& self,
@@ -447,6 +454,8 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, AutogradKernels) {
   m.impl("softplus", &tensorplay::vulkan::ops::softplus_kernel);
   m.impl("softplus_backward",
          &tensorplay::vulkan::ops::softplus_backward_kernel);
+  m.impl("log_sigmoid_backward",
+         &tensorplay::vulkan::ops::log_sigmoid_backward_kernel);
   m.impl("native_layer_norm_backward",
          &tensorplay::vulkan::ops::native_layer_norm_backward_kernel);
 }
