@@ -133,20 +133,40 @@ inline T sum(const T* x, int64_t begin, int64_t end) {
     using Vec = Vectorized<T>;
     constexpr int64_t W = static_cast<int64_t>(Vec::size());
     const int64_t n = end - begin;
-    if (n < 4 * W) {
+    if (n < 16 * W) {
         T s = T(0);
         for (int64_t i = begin; i < end; ++i) s += x[i];
         return s;
     }
+    // Sixteen accumulators keep the serial chain of any one of them at a
+    // sixteenth of the range length, so the fold rounds like a tree instead
+    // of a walk; the wider chain also schedules better than four.
     Vec a0(T(0)), a1(T(0)), a2(T(0)), a3(T(0));
+    Vec a4(T(0)), a5(T(0)), a6(T(0)), a7(T(0));
+    Vec a8(T(0)), a9(T(0)), a10(T(0)), a11(T(0));
+    Vec a12(T(0)), a13(T(0)), a14(T(0)), a15(T(0));
+    constexpr int64_t kStep = 16 * W;
     int64_t i = begin;
-    for (; i + 4 * W <= end; i += 4 * W) {
+    for (; i + kStep <= end; i += kStep) {
         a0 = a0 + Vec::loadu(x + i);
         a1 = a1 + Vec::loadu(x + i + W);
         a2 = a2 + Vec::loadu(x + i + 2 * W);
         a3 = a3 + Vec::loadu(x + i + 3 * W);
+        a4 = a4 + Vec::loadu(x + i + 4 * W);
+        a5 = a5 + Vec::loadu(x + i + 5 * W);
+        a6 = a6 + Vec::loadu(x + i + 6 * W);
+        a7 = a7 + Vec::loadu(x + i + 7 * W);
+        a8 = a8 + Vec::loadu(x + i + 8 * W);
+        a9 = a9 + Vec::loadu(x + i + 9 * W);
+        a10 = a10 + Vec::loadu(x + i + 10 * W);
+        a11 = a11 + Vec::loadu(x + i + 11 * W);
+        a12 = a12 + Vec::loadu(x + i + 12 * W);
+        a13 = a13 + Vec::loadu(x + i + 13 * W);
+        a14 = a14 + Vec::loadu(x + i + 14 * W);
+        a15 = a15 + Vec::loadu(x + i + 15 * W);
     }
-    Vec acc = (a0 + a1) + (a2 + a3);
+    Vec acc = (((a0 + a1) + (a2 + a3)) + ((a4 + a5) + (a6 + a7))) +
+              (((a8 + a9) + (a10 + a11)) + ((a12 + a13) + (a14 + a15)));
     for (; i + W <= end; i += W) {
         acc = acc + Vec::loadu(x + i);
     }
