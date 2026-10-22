@@ -73,9 +73,12 @@ Tensor take_along_dim_composite(const Tensor& self, const Tensor& indices, std::
     std::vector<int64_t> idx_target = target;
     std::vector<int64_t> self_target = target;
     self_target[d] = self.size(d);
-    Tensor idx_b = indices.expand(idx_target).contiguous();
+    // The index wrap is elementwise, so it commutes with the broadcast: doing
+    // it before the expand keeps the cost proportional to the index rather
+    // than to the expanded result, and leaves the broadcast a view.
+    Tensor idx_r = indices.remainder(Scalar(self.size(d)));
+    Tensor idx_b = idx_r.expand(idx_target);
     Tensor self_b = self.expand(self_target).contiguous();
-    idx_b = idx_b.remainder(Scalar(self_b.size(d)));
     return self_b.gather(d, idx_b);
 }
 
