@@ -15634,6 +15634,548 @@ class TestVulkanGroupNormBackward(unittest.TestCase):
                     self._device(payload.astype(np.int32)), 3)
 
 
+class TestVulkanInstanceNorm(unittest.TestCase):
+    # One channel plane of one sample owns both of its moments: the payload folds
+    # to (N, C, S) so that a plane is one axis, its mean centers it, and the mean
+    # of the squared deviations is its spread -- which is why a plane that sits
+    # far from zero keeps its spread.  A record kept for a later walk averages the
+    # planes a channel appears in, and the spread it keeps is the unbiased one:
+    # the second moment scaled by S/(S-1).  A plane of a single element therefore
+    # answers as not a number rather than as zero, and a batch with no plane has
+    # no average at all.  The affine terms ride per channel, a narrow payload is
+    # walked at single precision and answers in its own width, and a record the
+    # caller keeps on the host is written home again.
+
+    SHAPES = (
+        (2, 3, 5),
+        (1, 4, 3, 5),
+        (3, 6, 2, 3),
+        (2, 8, 7),
+        (5, 3, 4, 2),
+    )
+
+    @staticmethod
+    def _device(values):
+        return tensorplay.from_numpy(np.ascontiguousarray(values)).to("vulkan")
+
+    @staticmethod
+    def _host(values):
+        return tensorplay.from_numpy(np.ascontiguousarray(values))
+
+    @staticmethod
+    def _absent(values):
+        # A skipped answer arrives as a tensor with no element type.
+        return (values is None
+                or str(values.dtype).startswith("tensorplay.undefined"))
+
+    @classmethod
+    def _planes(cls, values):
+        # (N, C, S): a plane is one axis, everything it covers is one span.
+        wide = np.asarray(values).astype(np.float64)
+        spatial = int(np.prod(wide.shape[2:]))
+        return wide.reshape(wide.shape[0], wide.shape[1], spatial)
+
+    @classmethod
+    def _lane(cls, param, channels):
+        return np.asarray(param).astype(np.float64).reshape(1, channels, 1)
+
+    @classmethod
+    def _walk(cls, values, weight=None, bias=None, eps=1e-5):
+        wide = np.asarray(values).astype(np.float64)
+        planes = cls._planes(values)
+        mean = planes.mean(axis=2)
+        biased = ((planes - mean[..., None]) ** 2).mean(axis=2)
+        unbiased = biased * planes.shape[2] / (planes.shape[2] - 1.0)
+        rstd = 1.0 / np.sqrt(biased + eps)
+        out = (planes - mean[..., None]) * rstd[..., None]
+        if weight is not None:
+            out = out * cls._lane(weight, wide.shape[1])
+        if bias is not None:
+            out = out + cls._lane(bias, wide.shape[1])
+        return (out.reshape(wide.shape).astype(np.float32), mean, unbiased)
+
+    @classmethod
+    def _from_records(cls, values, mean, var, weight=None, bias=None, eps=1e-5):
+        wide = np.asarray(values).astype(np.float64)
+        planes = cls._planes(values)
+        rstd = (1.0 / np.sqrt(np.asarray(var).astype(np.float64) + eps)
+                )[None, :, None]
+        out = (planes - np.asarray(mean).astype(np.float64)[None, :, None]) * rstd
+        if weight is not None:
+            out = out * cls._lane(weight, wide.shape[1])
+        if bias is not None:
+            out = out + cls._lane(bias, wide.shape[1])
+        return out.reshape(wide.shape).astype(np.float32)
+
+    @classmethod
+    def _plane_gradient(cls, values, grad, weight=None, eps=1e-5):
+        planes = cls._planes(values)
+        drive = cls._planes(grad)
+        mean = planes.mean(axis=2, keepdims=True)
+        biased = ((planes - mean) ** 2).mean(axis=2, keepdims=True)
+        rstd = 1.0 / np.sqrt(biased + eps)
+        hat = (planes - mean) * rstd
+        gamma = (np.ones((1, planes.shape[1], 1), np.float64) if weight is None
+                 else cls._lane(weight, planes.shape[1]))
+        weighted = drive * gamma
+        dx = (rstd * (weighted - weighted.mean(axis=2, keepdims=True)
+                     - hat * (weighted * hat).mean(axis=2, keepdims=True)))
+        return (dx.reshape(np.asarray(values).shape).astype(np.float32),
+                (drive * hat).sum(axis=(0, 2)).astype(np.float32),
+                drive.sum(axis=(0, 2)).astype(np.float32))
+
+    @classmethod
+    def _record_gradient(cls, values, grad, mean, var, weight=None, eps=1e-5):
+        planes = cls._planes(values)
+        drive = cls._planes(grad)
+        saved_mean = np.asarray(mean).astype(np.float64)[None, :, None]
+        rstd = (1.0 / np.sqrt(np.asarray(var).astype(np.float64) + eps)
+                )[None, :, None]
+        hat = (planes - saved_mean) * rstd
+        gamma = (np.ones((1, planes.shape[1], 1), np.float64) if weight is None
+                 else cls._lane(weight, planes.shape[1]))
+        return ((drive * gamma * rstd).reshape(np.asarray(values).shape)
+                .astype(np.float32),
+                (drive * hat).sum(axis=(0, 2)).astype(np.float32),
+                drive.sum(axis=(0, 2)).astype(np.float32))
+
+    def _affine(self, channels, rng):
+        weight = (rng.random(channels) + 0.5).astype(np.float32)
+        bias = (rng.random(channels) - 0.5).astype(np.float32)
+        return weight, bias
+
+    def _payload(self, shape, rng):
+        return (rng.standard_normal(shape) * 0.9 + 1.3).astype(np.float32)
+
+    def _records(self, channels, rng):
+        mean = (rng.standard_normal(channels) * 0.2).astype(np.float32)
+        var = (rng.random(channels) + 0.5).astype(np.float32)
+        return mean, var
+
+    def test_a_plane_answers_its_own_moments(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(201)
+        for shape in self.SHAPES:
+            payload = self._payload(shape, rng)
+            weight, bias = self._affine(shape[1], rng)
+            for name, args in (("none", (None, None)),
+                               ("weight", (weight, None)),
+                               ("bias", (None, bias)),
+                               ("both", (weight, bias))):
+                with self.subTest(shape=shape, affine=name):
+                    want = self._walk(payload, *args)[0]
+                    terms = [None if a is None else self._device(a) for a in args]
+                    got = F.instance_norm(self._device(payload), terms[0],
+                                          terms[1], None, None, True, 0.1,
+                                          1e-5).cpu().numpy()
+                    np.testing.assert_allclose(
+                        got.astype(np.float64), want.astype(np.float64),
+                        rtol=1e-4, atol=1e-4,
+                        err_msg=f"plane of {shape} with affine {name}")
+
+    def test_a_record_keeps_the_running_average_of_a_channel(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(202)
+        for shape in self.SHAPES[:4]:
+            payload = self._payload(shape, rng)
+            weight, bias = self._affine(shape[1], rng)
+            kept_mean, kept_var = self._records(shape[1], rng)
+            _, mean, unbiased = self._walk(payload, weight, bias)
+            for momentum in (0.05, 0.2, 1.0):
+                with self.subTest(shape=shape, momentum=momentum):
+                    records = [self._device(kept_mean.copy()),
+                               self._device(kept_var.copy())]
+                    F.instance_norm(self._device(payload), self._device(weight),
+                                    self._device(bias), records[0], records[1],
+                                    True, momentum, 1e-5)
+                    np.testing.assert_allclose(
+                        records[0].cpu().numpy().astype(np.float64),
+                        (1.0 - momentum) * kept_mean.astype(np.float64)
+                        + momentum * mean.mean(axis=0),
+                        rtol=1e-4, atol=1e-5,
+                        err_msg="running mean of a channel")
+                    np.testing.assert_allclose(
+                        records[1].cpu().numpy().astype(np.float64),
+                        (1.0 - momentum) * kept_var.astype(np.float64)
+                        + momentum * unbiased.mean(axis=0),
+                        rtol=1e-4, atol=1e-5,
+                        err_msg="running spread kept unbiased")
+
+    def test_a_record_the_walk_leaves_alone_stands(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(203)
+        shape = (3, 4, 5)
+        payload = self._payload(shape, rng)
+        kept_mean, kept_var = self._records(shape[1], rng)
+        held = [self._device(kept_mean.copy()), self._device(kept_var.copy())]
+        before = [t.cpu().numpy().copy() for t in held]
+        F.instance_norm(self._device(payload), None, None, held[0], held[1],
+                        True, 0.0, 1e-5)
+        for index in (0, 1):
+            self.assertTrue(
+                np.array_equal(before[index], held[index].cpu().numpy()),
+                msg=f"record {index} moved under no weight")
+
+        read = [self._device(kept_mean.copy()), self._device(kept_var.copy())]
+        out = F.instance_norm(self._device(payload), None, None, read[0],
+                              read[1], False, 0.4, 1e-5)
+        self.assertEqual(out.device.is_vulkan(), True)
+        for index in (0, 1):
+            self.assertTrue(
+                np.array_equal(before[index], read[index].cpu().numpy()),
+                msg=f"record {index} moved while it was only read")
+
+    def test_a_saved_record_names_the_plane(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(204)
+        for shape in self.SHAPES:
+            payload = self._payload(shape, rng)
+            weight, bias = self._affine(shape[1], rng)
+            saved_mean, saved_var = self._records(shape[1], rng)
+            for name, args in (("none", (None, None)),
+                               ("weight", (weight, None)),
+                               ("bias", (None, bias)),
+                               ("both", (weight, bias))):
+                with self.subTest(shape=shape, affine=name):
+                    want = self._from_records(payload, saved_mean, saved_var,
+                                              *args)
+                    terms = [None if a is None else self._device(a) for a in args]
+                    got = F.instance_norm(self._device(payload), terms[0],
+                                          terms[1], self._device(saved_mean),
+                                          self._device(saved_var), False, 0.1,
+                                          1e-5).cpu().numpy()
+                    np.testing.assert_allclose(
+                        got.astype(np.float64), want.astype(np.float64),
+                        rtol=1e-4, atol=1e-4,
+                        err_msg=f"plane read from records, affine {name}")
+
+    def test_a_narrow_plane_keeps_its_own_width(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(205)
+        shape = (2, 5, 3, 4)
+        payload = self._payload(shape, rng)
+        weight, bias = self._affine(shape[1], rng)
+        want, mean, unbiased = self._walk(payload, weight, bias)
+
+        narrow = F.instance_norm(self._device(np.asarray(payload, np.float16)),
+                                 self._device(np.asarray(weight, np.float16)),
+                                 self._device(np.asarray(bias, np.float16)),
+                                 None, None, True, 0.1, 1e-5)
+        self.assertEqual(str(narrow.dtype), "tensorplay.float16")
+        np.testing.assert_allclose(
+            narrow.cpu().numpy().astype(np.float32).astype(np.float64),
+            want.astype(np.float64), rtol=6e-3, atol=6e-3,
+            err_msg="narrow plane answered narrow")
+
+        kept_mean = self._device(np.zeros(shape[1], np.float16))
+        kept_var = self._device(np.ones(shape[1], np.float16))
+        F.instance_norm(self._device(np.asarray(payload, np.float16)), None,
+                        None, kept_mean, kept_var, True, 0.3, 1e-5)
+        self.assertEqual(str(kept_mean.dtype), "tensorplay.float16")
+        np.testing.assert_allclose(
+            kept_mean.cpu().numpy().astype(np.float32).astype(np.float64),
+            0.3 * mean.mean(axis=0), rtol=6e-3, atol=6e-3,
+            err_msg="narrow record averaged wide and kept narrow")
+        np.testing.assert_allclose(
+            kept_var.cpu().numpy().astype(np.float32).astype(np.float64),
+            0.7 + 0.3 * unbiased.mean(axis=0), rtol=6e-3, atol=6e-3,
+            err_msg="narrow record of a spread")
+
+    def test_the_gradient_of_a_plane_walk(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(206)
+        for shape in self.SHAPES[:4]:
+            payload = self._payload(shape, rng)
+            grad = (rng.standard_normal(shape) * 0.4).astype(np.float32)
+            weight, bias = self._affine(shape[1], rng)
+            for name, args in (("none", (None, None)),
+                               ("weight", (weight, None)),
+                               ("bias", (None, bias)),
+                               ("both", (weight, bias))):
+                with self.subTest(shape=shape, affine=name):
+                    want = self._plane_gradient(payload, grad,
+                                                None if args[0] is None
+                                                else args[0])
+                    terms = [None if a is None else self._device(a) for a in args]
+                    got = F.instance_norm_backward(self._device(grad),
+                                                   self._device(payload),
+                                                   terms[0], terms[1], None,
+                                                   None, True, 1e-5)
+                    for index in (0, 1, 2):
+                        if index > 0 and args[index - 1] is None:
+                            self.assertTrue(
+                                self._absent(got[index]),
+                                msg=f"lane {index} answered when unasked")
+                            continue
+                        np.testing.assert_allclose(
+                            got[index].cpu().numpy().astype(np.float64),
+                            want[index].astype(np.float64),
+                            rtol=1e-4, atol=1e-4,
+                            err_msg=f"plane gradient lane {index}, {name}")
+                        self.assertFalse(self._absent(got[index]))
+
+    def test_the_gradient_read_against_the_records(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(207)
+        for shape in self.SHAPES[:4]:
+            payload = self._payload(shape, rng)
+            grad = (rng.standard_normal(shape) * 0.4).astype(np.float32)
+            weight, bias = self._affine(shape[1], rng)
+            saved_mean, saved_var = self._records(shape[1], rng)
+            for name, args in (("none", (None, None)),
+                               ("weight", (weight, None)),
+                               ("bias", (None, bias)),
+                               ("both", (weight, bias))):
+                with self.subTest(shape=shape, affine=name):
+                    dx, dw, db = self._record_gradient(payload, grad, saved_mean,
+                                                       saved_var, args[0])
+                    want = (dx, dw if args[0] is not None else None,
+                            db if args[1] is not None else None)
+                    terms = [None if a is None else self._device(a) for a in args]
+                    got = F.instance_norm_backward(
+                        self._device(grad), self._device(payload), terms[0],
+                        terms[1], self._device(saved_mean),
+                        self._device(saved_var), False, 1e-5)
+                    for index in (0, 1, 2):
+                        if want[index] is None:
+                            self.assertTrue(self._absent(got[index]))
+                            continue
+                        np.testing.assert_allclose(
+                            got[index].cpu().numpy().astype(np.float64),
+                            want[index].astype(np.float64),
+                            rtol=1e-4, atol=1e-4,
+                            err_msg=f"record gradient lane {index}, {name}")
+
+    def test_the_gradient_reaches_every_plane_of_the_walk(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(208)
+        shape = (2, 5, 3, 4)
+        payload = self._payload(shape, rng)
+        grad = (rng.standard_normal(shape) * 0.4).astype(np.float32)
+        weight, bias = self._affine(shape[1], rng)
+        want = self._plane_gradient(payload, grad, weight)
+
+        activation = self._device(payload)
+        activation.requires_grad_(True)
+        scale = self._device(weight)
+        scale.requires_grad_(True)
+        shift = self._device(bias)
+        shift.requires_grad_(True)
+        answered = F.instance_norm(activation, scale, shift, None, None, True,
+                                   0.1, 1e-5)
+        answered.backward(self._device(grad))
+        for label, got, expected in (("plane", activation.grad, want[0]),
+                                     ("weight", scale.grad, want[1]),
+                                     ("bias", shift.grad, want[2])):
+            np.testing.assert_allclose(
+                got.cpu().numpy().astype(np.float64),
+                expected.astype(np.float64), rtol=1e-4, atol=1e-4,
+                err_msg=f"gradient carried back to the {label}")
+
+        saved_mean, saved_var = self._records(shape[1], rng)
+        record_want = self._record_gradient(payload, grad, saved_mean,
+                                            saved_var, weight)
+        activation = self._device(payload)
+        activation.requires_grad_(True)
+        scale = self._device(weight)
+        scale.requires_grad_(True)
+        answered = F.instance_norm(activation, scale, None,
+                                   self._device(saved_mean),
+                                   self._device(saved_var), False, 0.1, 1e-5)
+        answered.backward(self._device(grad))
+        np.testing.assert_allclose(
+            activation.grad.cpu().numpy().astype(np.float64),
+            record_want[0].astype(np.float64), rtol=1e-4, atol=1e-4,
+            err_msg="gradient carried back over the records")
+        np.testing.assert_allclose(
+            scale.grad.cpu().numpy().astype(np.float64),
+            record_want[1].astype(np.float64), rtol=1e-4, atol=1e-4,
+            err_msg="weight carried back over the records")
+
+    def test_a_record_the_caller_keeps_on_the_host_is_written_home(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(209)
+        shape = (3, 4, 6)
+        payload = self._payload(shape, rng)
+        weight, bias = self._affine(shape[1], rng)
+        _, mean, unbiased = self._walk(payload, weight, bias)
+        kept_mean = self._host(np.zeros(shape[1], np.float32))
+        kept_var = self._host(np.ones(shape[1], np.float32))
+        out = F.instance_norm(self._device(payload), self._device(weight),
+                              self._device(bias), kept_mean, kept_var, True,
+                              0.25, 1e-5)
+        self.assertTrue(out.device.is_vulkan())
+        self.assertFalse(kept_mean.device.is_vulkan())
+        np.testing.assert_allclose(
+            kept_mean.numpy().astype(np.float64), 0.25 * mean.mean(axis=0),
+            rtol=1e-4, atol=1e-5, err_msg="host record of a mean")
+        np.testing.assert_allclose(
+            kept_var.numpy().astype(np.float64), 0.75 + 0.25 * unbiased.mean(axis=0),
+            rtol=1e-4, atol=1e-5, err_msg="host record of a spread")
+
+    def test_the_device_walk_answers_the_host_walk(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(210)
+        for shape in self.SHAPES:
+            payload = self._payload(shape, rng)
+            grad = (rng.standard_normal(shape) * 0.4).astype(np.float32)
+            weight, bias = self._affine(shape[1], rng)
+            saved_mean, saved_var = self._records(shape[1], rng)
+            with self.subTest(shape=shape):
+                host_records = [self._host(kept.copy())
+                                for kept in (saved_mean, saved_var)]
+                device_records = [self._device(kept.copy())
+                                  for kept in (saved_mean, saved_var)]
+                on_host = F.instance_norm(self._host(payload),
+                                          self._host(weight), self._host(bias),
+                                          host_records[0], host_records[1],
+                                          True, 0.15, 1e-5)
+                on_device = F.instance_norm(self._device(payload),
+                                            self._device(weight),
+                                            self._device(bias),
+                                            device_records[0],
+                                            device_records[1], True, 0.15, 1e-5)
+                np.testing.assert_allclose(
+                    on_device.cpu().numpy().astype(np.float64),
+                    on_host.numpy().astype(np.float64), rtol=1e-4, atol=1e-4,
+                    err_msg="plane walked on the device, not on the host")
+                for index in (0, 1):
+                    np.testing.assert_allclose(
+                        device_records[index].cpu().numpy().astype(np.float64),
+                        host_records[index].numpy().astype(np.float64),
+                        rtol=1e-4, atol=1e-5,
+                        err_msg=f"record {index} averaged another way")
+                host_grad = F.instance_norm_backward(
+                    self._host(grad), self._host(payload), self._host(weight),
+                    self._host(bias), host_records[0], host_records[1], False,
+                    1e-5)
+                device_grad = F.instance_norm_backward(
+                    self._device(grad), self._device(payload),
+                    self._device(weight), self._device(bias),
+                    device_records[0], device_records[1], False, 1e-5)
+                for index in (0, 1, 2):
+                    np.testing.assert_allclose(
+                        device_grad[index].cpu().numpy().astype(np.float64),
+                        host_grad[index].numpy().astype(np.float64),
+                        rtol=1e-4, atol=1e-4,
+                        err_msg=f"record gradient lane {index} differs")
+
+    def test_a_walk_over_no_plane_answers_as_not_a_number(self):
+        import tensorplay.functional as F
+        shape = (0, 4, 6)
+        kept_mean = self._device(np.zeros(4, np.float32))
+        kept_var = self._device(np.ones(4, np.float32))
+        out = F.instance_norm(self._device(np.zeros(shape, np.float32)), None,
+                              None, kept_mean, kept_var, True, 0.1, 1e-5)
+        self.assertEqual(tuple(out.shape), shape)
+        self.assertEqual(out.numel(), 0)
+        self.assertTrue(np.all(np.isnan(kept_mean.cpu().numpy())),
+                        msg="a mean averaged over no plane")
+        self.assertTrue(np.all(np.isnan(kept_var.cpu().numpy())),
+                        msg="a spread averaged over no plane")
+
+        # A plane of one element has no unbiased spread; its own center is that
+        # element, so the answer sits on the affine terms alone.
+        single = np.full((2, 3, 1), 5.0, np.float32)
+        one_mean = self._device(np.zeros(3, np.float32))
+        one_var = self._device(np.ones(3, np.float32))
+        answered = F.instance_norm(self._device(single), None, None, one_mean,
+                                   one_var, True, 0.5, 1e-5)
+        np.testing.assert_allclose(answered.cpu().numpy(),
+                                   np.zeros(single.shape, np.float32),
+                                   rtol=0, atol=1e-6)
+        np.testing.assert_allclose(one_mean.cpu().numpy(), np.full(3, 2.5),
+                                   rtol=0, atol=1e-6)
+        self.assertTrue(np.all(np.isnan(one_var.cpu().numpy())),
+                        msg="a plane of one element has no spread")
+
+        # A record only read answers the payload and is left standing.
+        read_mean = self._device(np.full(4, -0.5, np.float32))
+        read_var = self._device(np.full(4, 2.0, np.float32))
+        empty = F.instance_norm(self._device(np.zeros(shape, np.float32)), None,
+                                None, read_mean, read_var, False, 0.1, 1e-5)
+        self.assertEqual(empty.numel(), 0)
+        np.testing.assert_allclose(read_mean.cpu().numpy(),
+                                   np.full(4, -0.5, np.float32),
+                                   rtol=0, atol=0)
+
+    def test_a_shape_or_a_record_that_does_not_line_up_refuses(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(211)
+        shape = (2, 4, 3)
+        payload = self._payload(shape, rng)
+        grad = (rng.standard_normal(shape) * 0.4).astype(np.float32)
+        records = (self._device(np.zeros(4, np.float32)),
+                   self._device(np.ones(4, np.float32)))
+        device = self._device(payload)
+        with self.subTest(kind="a payload that counts"):
+            with self.assertRaisesRegex(
+                    RuntimeError, "Float32 and Float16"):
+                F.instance_norm(self._device(np.zeros(shape, np.int32)), None,
+                                None, None, None, True, 0.1, 1e-5)
+        with self.subTest(kind="a plane with no span to fold over"):
+            with self.assertRaisesRegex(
+                    RuntimeError, "supports 3d to 4d tensors"):
+                F.instance_norm(self._device(np.zeros((3, 4), np.float32)),
+                                None, None, None, None, True, 0.1, 1e-5)
+        with self.subTest(kind="no channels to name a plane"):
+            with self.assertRaisesRegex(
+                    RuntimeError, "at least one channel"):
+                F.instance_norm(self._device(np.zeros((2, 0, 4), np.float32)),
+                                None, None, None, None, True, 0.1, 1e-5)
+        with self.subTest(kind="records missing where they are read"):
+            with self.assertRaisesRegex(
+                    RuntimeError, "must both be given"):
+                F.instance_norm(device, None, None, None, None, False, 0.1, 1e-5)
+        with self.subTest(kind="one record missing"):
+            with self.assertRaisesRegex(
+                    RuntimeError, "must both be given"):
+                F.instance_norm(device, None, None, records[0], None, False,
+                                0.1, 1e-5)
+        with self.subTest(kind="a lane count that is not the channel count"):
+            with self.assertRaisesRegex(
+                    RuntimeError, "one lane per channel"):
+                F.instance_norm(device, self._device(np.ones(3, np.float32)),
+                                None, None, None, True, 0.1, 1e-5)
+        with self.subTest(kind="an affine term that counts"):
+            with self.assertRaisesRegex(
+                    RuntimeError, "affine parameter is kept at"):
+                F.instance_norm(device, self._device(np.ones(4, np.int32)),
+                                None, None, None, True, 0.1, 1e-5)
+        with self.subTest(kind="a record wider than the walk"):
+            with self.assertRaisesRegex(
+                    RuntimeError, "running record is kept at"):
+                F.instance_norm(device, None, None,
+                                self._host(np.zeros(4, np.float64)),
+                                self._host(np.ones(4, np.float64)), True, 0.1,
+                                1e-5)
+        with self.subTest(kind="a gradient of another width"):
+            with self.assertRaisesRegex(
+                    RuntimeError, "read in the width"):
+                F.instance_norm_backward(
+                    self._device(np.asarray(grad, np.float16)), device, None,
+                    None, None, None, True, 1e-5)
+        with self.subTest(kind="a gradient that misses a plane"):
+            with self.assertRaisesRegex(
+                    RuntimeError, "name the planes"):
+                F.instance_norm_backward(
+                    self._device(np.zeros((2, 4, 5), np.float32)), device, None,
+                    None, None, None, True, 1e-5)
+        with self.subTest(kind="records missing behind a gradient"):
+            with self.assertRaisesRegex(
+                    RuntimeError, "must both be given"):
+                F.instance_norm_backward(
+                    self._device(grad), device, None, None, None, None, False,
+                    1e-5)
+        with self.subTest(kind="a gradient over no channel"):
+            with self.assertRaisesRegex(
+                    RuntimeError, "at least one channel"):
+                F.instance_norm_backward(
+                    self._device(np.zeros((2, 0, 4), np.float32)),
+                    self._device(np.zeros((2, 0, 4), np.float32)), None, None,
+                    None, None, True, 1e-5)
+
+
 class TestVulkanBinaryCrossEntropy(unittest.TestCase):
     # A binary likelihood reads both planes as probabilities, so every lane has to
     # sit between the bounds a logarithm is taken of.  Each logarithm is clamped at
