@@ -70,10 +70,12 @@ Tensor mean_kernel(const Tensor& self, DType dtype) {
     DType out_dtype = (dtype == DType::Undefined) ? (isFloatingOrComplexType(self.dtype()) ? self.dtype() : DType::Float32) : dtype;
     if (mean_needs_opmath(out_dtype)) {
         Tensor s = sum_kernel(self, DType::Float32);
-        return (s / Scalar(self.numel())).to(out_dtype);
+        s /= Scalar(self.numel());
+        return s.to(out_dtype);
     }
     Tensor s = sum_kernel(self, out_dtype);
-    return s / Scalar(self.numel());
+    s /= Scalar(self.numel());
+    return s;
 }
 
 Tensor mean_dim_kernel(const Tensor& self, const std::vector<int64_t>& dims, bool keepdim, DType dtype) {
@@ -90,10 +92,12 @@ Tensor mean_dim_kernel(const Tensor& self, const std::vector<int64_t>& dims, boo
 
     if (mean_needs_opmath(out_dtype)) {
         Tensor s = sum_dim_kernel(self, dims, keepdim, DType::Float32);
-        return (s / Scalar(count)).to(out_dtype);
+        s /= Scalar(count);
+        return s.to(out_dtype);
     }
     Tensor s = sum_dim_kernel(self, dims, keepdim, out_dtype);
-    return s / Scalar(count);
+    s /= Scalar(count);
+    return s;
 }
 
 // Autograd helper for mean.dim.  The forward reduction already returns a
