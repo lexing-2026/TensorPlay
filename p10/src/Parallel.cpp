@@ -443,12 +443,13 @@ int performance_core_count() {
 // of cores.  A team spanning every logical CPU puts equal chunks on the slow
 // kind, and the slowest core paces the whole team through each region's
 // closing barrier; the straggler effect then dominates the compute itself.
-// When the performance cores are a large enough share of the part (two
-// fifths of the logical CPUs or more) the team is capped to exactly their
-// count.  Parts that do not name their core kinds fall back to the
-// frequency tiers: cap near the fast-tier size, never below half the logical
-// count.  Uniform parts keep the full team; explicit thread counts
-// (environment or set_num_threads) are never second-guessed.
+// The hybrid parts measured while writing this rule behaved the other way:
+// the efficiency cores still added throughput on compute- and bandwidth-fold
+// kernels alike, so both detection branches currently answer with the full
+// logical count and leave the team uncapped.  The detection stays so a part
+// that does straggle can be capped again without touching the call sites.
+// Explicit thread counts (environment or set_num_threads) are never
+// second-guessed.
 int hybrid_thread_cap() {
   static const int cached = []() -> int {
 #ifdef __linux__
@@ -456,7 +457,11 @@ int hybrid_thread_cap() {
       const int p_cores = performance_core_count();
       const int logical = static_cast<int>(std::thread::hardware_concurrency());
       if (p_cores > 0 && p_cores < logical && p_cores * 5 >= logical * 2) {
-        return p_cores;
+        // The full logical team won on every kernel family measured here,
+        // from single-region folds to the multi-region softmax family: the
+        // efficiency cores absorb more work than their straggler tail costs,
+        // and the fold grain keeps any one region's barrier short.
+        return logical;
       }
     }
     std::vector<int> max_freqs;
@@ -478,7 +483,8 @@ int hybrid_thread_cap() {
         int fast = 0;
         for (int f : max_freqs) fast += (f == top);
         const int logical = static_cast<int>(max_freqs.size());
-        return std::max(fast, logical / 2);
+        // Same shape as the core-type branch: the full team measured best.
+        return logical;
       }
     }
 #endif

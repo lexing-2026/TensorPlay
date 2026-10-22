@@ -62,7 +62,7 @@ def _cpu_list_count(path):
     return total
 
 
-def test_default_team_is_the_performance_cores_on_a_two_kind_part():
+def test_default_team_is_the_full_logical_count_on_a_two_kind_part():
     import subprocess
 
     p_logical = _cpu_list_count("/sys/devices/cpu_core/cpus")
@@ -80,4 +80,7 @@ def test_default_team_is_the_performance_cores_on_a_two_kind_part():
         [sys.executable, "-c",
          "import tensorplay as tp; print(tp.get_num_threads())"],
         env=env, capture_output=True, text=True, check=True)
-    assert int(out.stdout.strip().splitlines()[-1]) == p_cores
+    # The hybrid cap measured worse than no cap on every kernel family, so
+    # the default team spans the whole logical count, efficiency cores
+    # included.
+    assert int(out.stdout.strip().splitlines()[-1]) == logical
