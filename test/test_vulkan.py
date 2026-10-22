@@ -14853,5 +14853,247 @@ class TestVulkanKthValue(unittest.TestCase):
                     self._device(values).kthvalue(1, 0)
 
 
+class TestVulkanGroupNorm(unittest.TestCase):
+    # Group normalization folds a channel axis into a number of whole groups and
+    # centers each group on its own two moments.  The walk reads the payload as
+    # (N, G, (C/G)*HxW), so a group is one axis and everything a group covers is
+    # one span; the affine terms then ride on (N, C, HxW), where one channel owns
+    # one axis.  The moments are kept in the width the payload has, except for a
+    # narrow payload, whose moments stay at single precision while its answer
+    # returns to its own width.  A batch with no rows has nothing to walk and so
+    # answers with empty moment tables.
+
+    SHAPES = (
+        (2, 6, 4),
+        (1, 8, 3, 5),
+        (3, 4, 2, 3),
+        (2, 12, 7),
+        (5, 6, 1),
+        (1, 2, 2, 2),
+        (2, 8),
+    )
+
+    @staticmethod
+    def _device(values):
+        return tensorplay.from_numpy(np.ascontiguousarray(values)).to("vulkan")
+
+    @staticmethod
+    def _host(values):
+        return tensorplay.from_numpy(np.ascontiguousarray(values))
+
+    @staticmethod
+    def _walk(values, num_groups, weight=None, bias=None, eps=1e-5):
+        # The arithmetic definition, walked in double precision: the mean and the
+        # biased variance of everything a group covers, then the affine terms per
+        # channel.
+        wide = np.asarray(values).astype(np.float64)
+        rows, channels = wide.shape[0], wide.shape[1]
+        spatial = int(np.prod(wide.shape[2:])) if wide.ndim > 2 else 1
+        folded = wide.reshape(rows, num_groups, (channels // num_groups) * spatial)
+        mean = folded.mean(axis=-1, keepdims=True)
+        var = ((folded - mean) ** 2).mean(axis=-1, keepdims=True)
+        rstd = 1.0 / np.sqrt(var + eps)
+        out = ((folded - mean) * rstd).reshape(wide.shape)
+        shape = [1, channels] + [1] * (wide.ndim - 2)
+        if weight is not None:
+            out = out * np.asarray(weight).astype(np.float64).reshape(shape)
+        if bias is not None:
+            out = out + np.asarray(bias).astype(np.float64).reshape(shape)
+        return (out.astype(np.float32),
+                mean.reshape(rows, num_groups).astype(np.float32),
+                rstd.reshape(rows, num_groups).astype(np.float32))
+
+    def _affine(self, channels, rng):
+        weight = (rng.random(channels) + 0.5).astype(np.float32)
+        bias = (rng.random(channels) - 0.5).astype(np.float32)
+        return weight, bias
+
+    def test_a_group_answers_the_span_it_covers(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(101)
+        for shape in self.SHAPES:
+            payload = rng.standard_normal(shape).astype(np.float32)
+            weight, bias = self._affine(shape[1], rng)
+            for num_groups in (g for g in (1, 2, 3, 4, 6, 8)
+                               if shape[1] % g == 0):
+                for name, args in (
+                        ("none", (None, None)),
+                        ("weight", (weight, None)),
+                        ("bias", (None, bias)),
+                        ("both", (weight, bias))):
+                    with self.subTest(shape=shape, num_groups=num_groups,
+                                      affine=name):
+                        got = F.group_norm(
+                            self._device(payload), num_groups,
+                            weight=None if args[0] is None else self._device(args[0]),
+                            bias=None if args[1] is None else self._device(args[1]),
+                            eps=1e-5).cpu().numpy()
+                        want = self._walk(payload, num_groups, args[0], args[1])
+                        np.testing.assert_allclose(
+                            got, want[0], rtol=1e-4, atol=1e-4,
+                            err_msg=f"group of {num_groups} over {shape}")
+
+    def test_the_host_walk_answers_the_same(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(103)
+        for shape in ((2, 6, 4), (1, 8, 3, 5), (3, 4, 2, 3)):
+            payload = rng.standard_normal(shape).astype(np.float32)
+            weight, bias = self._affine(shape[1], rng)
+            for num_groups in (1, 2):
+                with self.subTest(shape=shape, num_groups=num_groups):
+                    device = F.group_norm(
+                        self._device(payload), num_groups,
+                        weight=self._device(weight), bias=self._device(bias),
+                        eps=1e-5).cpu().numpy()
+                    host = F.group_norm(
+                        self._host(payload), num_groups,
+                        weight=self._host(weight), bias=self._host(bias),
+                        eps=1e-5).numpy()
+                    np.testing.assert_allclose(
+                        device, host, rtol=1e-4, atol=1e-4)
+
+    def test_a_walk_releases_the_moments_it_walked(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(107)
+        for shape, num_groups in (((2, 6, 4), 3), ((1, 8, 3, 5), 4),
+                                  ((4, 8, 16, 16), 2), ((2, 8), 2)):
+            payload = rng.standard_normal(shape).astype(np.float32)
+            weight, bias = self._affine(shape[1], rng)
+            spatial = int(np.prod(shape[2:])) if len(shape) > 2 else 1
+            with self.subTest(shape=shape, num_groups=num_groups):
+                out, mean, rstd = F.native_group_norm(
+                    self._device(payload), self._device(weight),
+                    self._device(bias), shape[0], shape[1], spatial,
+                    num_groups, 1e-5)
+                want = self._walk(payload, num_groups, weight, bias)
+                self.assertEqual(tuple(mean.shape), (shape[0], num_groups))
+                self.assertEqual(tuple(rstd.shape), (shape[0], num_groups))
+                for got, expected, name in (
+                        (out.cpu().numpy(), want[0], "answer"),
+                        (mean.cpu().numpy(), want[1], "mean"),
+                        (rstd.cpu().numpy(), want[2], "reciprocal spread")):
+                    np.testing.assert_allclose(
+                        got, expected, rtol=1e-4, atol=1e-4,
+                        err_msg=f"{name} of group {num_groups}")
+
+    def test_a_narrow_lane_keeps_its_moments_wide(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(109)
+        for shape, num_groups in (((2, 6, 4), 3), ((1, 8, 3, 5), 4)):
+            payload = (rng.standard_normal(shape) * 3).astype(np.float16)
+            weight = (rng.random(shape[1]) + 0.5).astype(np.float16)
+            bias = (rng.random(shape[1]) - 0.5).astype(np.float16)
+            spatial = int(np.prod(shape[2:]))
+            with self.subTest(shape=shape):
+                out, mean, rstd = F.native_group_norm(
+                    self._device(payload), self._device(weight),
+                    self._device(bias), shape[0], shape[1], spatial,
+                    num_groups, 1e-5)
+                want = self._walk(payload, num_groups, weight, bias)
+                self.assertEqual(out.dtype, tensorplay.float16)
+                self.assertEqual(mean.dtype, tensorplay.float32)
+                self.assertEqual(rstd.dtype, tensorplay.float32)
+                np.testing.assert_allclose(
+                    out.cpu().numpy().astype(np.float32), want[0],
+                    rtol=2e-3, atol=2e-3)
+
+    def test_a_group_far_from_zero_keeps_its_spread(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(113)
+        # A spread read off a large offset is lost when the second moment is
+        # folded as the difference of two large sums.  The walk here subtracts
+        # the mean first and folds the deviations, so the answers spread over a
+        # group keeps the ratio the definition gives -- the reciprocal spread
+        # shrinks a group whose own spread is small beside eps.
+        for offset, spread in ((1e3, 1.0), (1e4, 1.0), (3e4, 0.5), (1e2, 1e-3)):
+            payload = (offset + spread *
+                       rng.standard_normal((2, 6, 8))).astype(np.float32)
+            with self.subTest(offset=offset, spread=spread):
+                got = F.group_norm(self._device(payload), 3,
+                                   eps=1e-5).cpu().numpy()
+                want = self._walk(payload, 3)[0]
+                self.assertTrue(np.isfinite(got).all(),
+                                "a far offset lost the spread")
+                np.testing.assert_allclose(
+                    got, want, rtol=2e-2, atol=2e-2)
+                np.testing.assert_allclose(
+                    got.reshape(2, 3, -1).std(axis=-1),
+                    want.reshape(2, 3, -1).std(axis=-1),
+                    rtol=2e-2, atol=2e-2)
+
+    def test_a_strided_payload_is_walked_in_its_own_order(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(127)
+        block = rng.standard_normal((2, 3, 4, 5)).astype(np.float32)
+        moved = np.ascontiguousarray(block.transpose(0, 3, 1, 2))
+        seen = self._device(block).permute(0, 3, 1, 2)
+        for num_groups in (1, 5):
+            with self.subTest(num_groups=num_groups, source="strided view"):
+                got = F.group_norm(seen, num_groups).cpu().numpy()
+                np.testing.assert_allclose(
+                    got, self._walk(moved, num_groups)[0],
+                    rtol=1e-4, atol=1e-4)
+
+    def test_a_batch_without_rows_walks_nothing(self):
+        import tensorplay.functional as F
+        for dtype in (np.float32, np.float16):
+            payload = np.zeros((0, 6, 4), dtype)
+            with self.subTest(dtype=dtype):
+                out, mean, rstd = F.native_group_norm(
+                    self._device(payload), None, None, 0, 6, 4, 3, 1e-5)
+                self.assertEqual(tuple(out.shape), (0, 6, 4))
+                self.assertEqual(tuple(mean.shape), (0, 3))
+                self.assertEqual(tuple(rstd.shape), (0, 3))
+                self.assertEqual(out.dtype, tensorplay.float16
+                                 if dtype is np.float16 else tensorplay.float32)
+                self.assertEqual(mean.dtype, tensorplay.float32)
+                self.assertEqual(rstd.dtype, tensorplay.float32)
+                got = F.group_norm(self._device(payload), 3)
+                self.assertEqual(tuple(got.shape), (0, 6, 4))
+
+    def test_a_group_or_parameter_out_of_shape_refuses(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(131)
+        payload = rng.standard_normal((2, 6, 4)).astype(np.float32)
+        device = self._device(payload)
+        with self.subTest(kind="channels not divisible"):
+            with self.assertRaisesRegex(
+                    RuntimeError, "channels must be divisible"):
+                F.group_norm(device, 4)
+        with self.subTest(kind="no groups"):
+            with self.assertRaisesRegex(
+                    RuntimeError, "channels must be divisible"):
+                F.group_norm(device, 0)
+        with self.subTest(kind="a parameter of the wrong length"):
+            with self.assertRaisesRegex(
+                    RuntimeError, "one lane per channel"):
+                F.group_norm(device, 3, weight=self._device(
+                    np.ones(5, np.float32)))
+        with self.subTest(kind="a parameter of the wrong rank"):
+            with self.assertRaisesRegex(
+                    RuntimeError, "one lane per channel"):
+                F.group_norm(device, 3, weight=self._device(
+                    np.ones((2, 3), np.float32)))
+        with self.subTest(kind="a spread with no lane"):
+            with self.assertRaisesRegex(
+                    RuntimeError, "the spatial span must be positive"):
+                F.group_norm(self._device(np.zeros((2, 4, 0), np.float32)), 2)
+        with self.subTest(kind="a payload with one axis"):
+            with self.assertRaisesRegex(
+                    RuntimeError, "supports 2d to 4d tensors"):
+                F.group_norm(self._device(np.zeros(4, np.float32)), 2)
+
+    def test_a_payload_that_is_not_a_measurement_refuses(self):
+        import tensorplay.functional as F
+        for values, pattern in (
+                (np.zeros((2, 4, 3), np.int32), "Float32 and Float16"),
+                (np.zeros((2, 4, 3), np.int64), "Float32 and Float16"),
+                (np.zeros((2, 4, 3), np.float64), "Not a supported Vulkan dtype"),
+                (np.zeros((1, 4, 2, 2, 2), np.float32), "ndim <= 4")):
+            with self.subTest(dtype=values.dtype, shape=values.shape):
+                with self.assertRaisesRegex(RuntimeError, pattern):
+                    F.group_norm(self._device(values), 2)
+
+
 if __name__ == "__main__":
     unittest.main()
