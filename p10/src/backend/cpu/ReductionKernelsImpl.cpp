@@ -11,6 +11,7 @@
 #include "cpu/CascadeSum.h"
 #include "cpu/Reduce.h"
 #include "cpu/vec/vec.h"
+#include "cpu/vec/vec_reduce.h"
 #include "cpu/VecComplex.h"
 #include <iostream>
 #include <numeric>
@@ -238,194 +239,44 @@ struct NormOps {
 // native path reduces squares directly; this is particularly important for
 // Muon's bfloat16 normalization step.
 
-// --- runtime-dispatched sum-of-squares (full-tensor contiguous) ------------
-#if defined(__x86_64__)
+// --- tier-compiled sum of squares over a contiguous stream ------------------
 namespace {
 
-inline bool normsq_avx512_available() {
-    static const bool ok = __builtin_cpu_supports("avx512f") != 0 &&
-                           __builtin_cpu_supports("avx512vl") != 0 &&
-                           __builtin_cpu_supports("avx512dq") != 0;
-    return ok;
-}
-
-__attribute__((target("avx512f")))
-float normsq_f32_chunk_avx512(const float* x, int64_t b, int64_t e) {
-    __m512 a0 = _mm512_setzero_ps(), a1 = _mm512_setzero_ps();
-    __m512 a2 = _mm512_setzero_ps(), a3 = _mm512_setzero_ps();
-    int64_t i = b;
-    for (; i + 64 <= e; i += 64) {
-        __m512 v;
-        v = _mm512_loadu_ps(x + i);          a0 = _mm512_fmadd_ps(v, v, a0);
-        v = _mm512_loadu_ps(x + i + 16);     a1 = _mm512_fmadd_ps(v, v, a1);
-        v = _mm512_loadu_ps(x + i + 32);     a2 = _mm512_fmadd_ps(v, v, a2);
-        v = _mm512_loadu_ps(x + i + 48);     a3 = _mm512_fmadd_ps(v, v, a3);
-    }
-    __m512 acc = _mm512_add_ps(_mm512_add_ps(a0, a1), _mm512_add_ps(a2, a3));
-    for (; i + 16 <= e; i += 16) {
-        __m512 v = _mm512_loadu_ps(x + i);
-        acc = _mm512_fmadd_ps(v, v, acc);
-    }
-    alignas(64) float buf[16];
-    _mm512_storeu_ps(buf, acc);
-    float s = ((buf[0] + buf[1]) + (buf[2] + buf[3])) +
-              ((buf[4] + buf[5]) + (buf[6] + buf[7])) +
-              ((buf[8] + buf[9]) + (buf[10] + buf[11])) +
-              ((buf[12] + buf[13]) + (buf[14] + buf[15]));
-    for (; i < e; ++i) { float v = x[i]; s += v * v; }
-    return s;
-}
-
-__attribute__((target("avx512f")))
-double normsq_f64_chunk_avx512(const double* x, int64_t b, int64_t e) {
-    __m512d a0 = _mm512_setzero_pd(), a1 = _mm512_setzero_pd();
-    int64_t i = b;
-    for (; i + 16 <= e; i += 16) {
-        __m512d v;
-        v = _mm512_loadu_pd(x + i);          a0 = _mm512_fmadd_pd(v, v, a0);
-        v = _mm512_loadu_pd(x + i + 8);      a1 = _mm512_fmadd_pd(v, v, a1);
-    }
-    __m512d acc = _mm512_add_pd(a0, a1);
-    alignas(64) double buf[8];
-    _mm512_storeu_pd(buf, acc);
-    double s = (buf[0] + buf[1]) + (buf[2] + buf[3]) +
-               (buf[4] + buf[5]) + (buf[6] + buf[7]);
-    for (; i < e; ++i) { double v = x[i]; s += v * v; }
-    return s;
-}
-
-// 256-bit twins.  A part without the 512-bit unit would otherwise fall back to
-// the iterator path, which accumulates one element at a time and runs an order
-// of magnitude below the streaming rate of the memory system.
-
-inline bool normsq_avx2_available() {
-    static const bool ok = __builtin_cpu_supports("avx2") != 0 &&
-                           __builtin_cpu_supports("fma") != 0;
-    return ok;
-}
-
-__attribute__((target("avx2,fma")))
-float normsq_f32_chunk_avx2(const float* x, int64_t b, int64_t e) {
-    __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
-    __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
-    int64_t i = b;
-    for (; i + 32 <= e; i += 32) {
-        __m256 v;
-        v = _mm256_loadu_ps(x + i);          a0 = _mm256_fmadd_ps(v, v, a0);
-        v = _mm256_loadu_ps(x + i + 8);      a1 = _mm256_fmadd_ps(v, v, a1);
-        v = _mm256_loadu_ps(x + i + 16);     a2 = _mm256_fmadd_ps(v, v, a2);
-        v = _mm256_loadu_ps(x + i + 24);     a3 = _mm256_fmadd_ps(v, v, a3);
-    }
-    __m256 acc = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
-    for (; i + 8 <= e; i += 8) {
-        __m256 v = _mm256_loadu_ps(x + i);
-        acc = _mm256_fmadd_ps(v, v, acc);
-    }
-    alignas(32) float buf[8];
-    _mm256_storeu_ps(buf, acc);
-    float s = ((buf[0] + buf[1]) + (buf[2] + buf[3])) +
-              ((buf[4] + buf[5]) + (buf[6] + buf[7]));
-    for (; i < e; ++i) { float v = x[i]; s += v * v; }
-    return s;
-}
-
-__attribute__((target("avx2,fma")))
-double normsq_f64_chunk_avx2(const double* x, int64_t b, int64_t e) {
-    __m256d a0 = _mm256_setzero_pd(), a1 = _mm256_setzero_pd();
-    __m256d a2 = _mm256_setzero_pd(), a3 = _mm256_setzero_pd();
-    int64_t i = b;
-    for (; i + 16 <= e; i += 16) {
-        __m256d v;
-        v = _mm256_loadu_pd(x + i);          a0 = _mm256_fmadd_pd(v, v, a0);
-        v = _mm256_loadu_pd(x + i + 4);      a1 = _mm256_fmadd_pd(v, v, a1);
-        v = _mm256_loadu_pd(x + i + 8);      a2 = _mm256_fmadd_pd(v, v, a2);
-        v = _mm256_loadu_pd(x + i + 12);     a3 = _mm256_fmadd_pd(v, v, a3);
-    }
-    __m256d acc = _mm256_add_pd(_mm256_add_pd(a0, a1), _mm256_add_pd(a2, a3));
-    for (; i + 4 <= e; i += 4) {
-        __m256d v = _mm256_loadu_pd(x + i);
-        acc = _mm256_fmadd_pd(v, v, acc);
-    }
-    alignas(32) double buf[4];
-    _mm256_storeu_pd(buf, acc);
-    double s = (buf[0] + buf[1]) + (buf[2] + buf[3]);
-    for (; i < e; ++i) { double v = x[i]; s += v * v; }
-    return s;
-}
-
-// Returns false when the caller should use the iterator path.  Emits the raw
-// sum of squares; the caller applies the square root in the element dtype.
-static bool try_normsq_real_avx512(const void* xv, int64_t n, DType dt,
-                                   double* out) {
-    if (!normsq_avx512_available() || n < 4096) return false;
-    constexpr int64_t kGrain = 32768;
-    if (dt == DType::Float32) {
-        const float* x = static_cast<const float*>(xv);
-        const int64_t nslots = (n + kGrain - 1) / kGrain;
-        std::vector<float> part(nslots, 0.f);
-        tensorplay::parallel::parallel_for(0, n, kGrain, [&](int64_t b, int64_t e) {
-            part[b / kGrain] = normsq_f32_chunk_avx512(x, b, e);
-        });
-        float s = 0.f;
-        for (int64_t k = 0; k < nslots; ++k) s += part[k];
-        *out = static_cast<double>(s);
-        return true;
-    }
-    if (dt == DType::Float64) {
-        const double* x = static_cast<const double*>(xv);
-        const int64_t nslots = (n + kGrain - 1) / kGrain;
-        std::vector<double> part(nslots, 0.0);
-        tensorplay::parallel::parallel_for(0, n, kGrain, [&](int64_t b, int64_t e) {
-            part[b / kGrain] = normsq_f64_chunk_avx512(x, b, e);
-        });
-        double s = 0.0;
-        for (int64_t k = 0; k < nslots; ++k) s += part[k];
-        *out = s;
-        return true;
-    }
-    return false;
-}
-
-static bool try_normsq_real_avx2(const void* xv, int64_t n, DType dt,
-                                 double* out) {
-    if (!normsq_avx2_available() || n < 4096) return false;
-    constexpr int64_t kGrain = 32768;
-    if (dt == DType::Float32) {
-        const float* x = static_cast<const float*>(xv);
-        const int64_t nslots = (n + kGrain - 1) / kGrain;
-        std::vector<float> part(nslots, 0.f);
-        tensorplay::parallel::parallel_for(0, n, kGrain, [&](int64_t b, int64_t e) {
-            part[b / kGrain] = normsq_f32_chunk_avx2(x, b, e);
-        });
-        float s = 0.f;
-        for (int64_t k = 0; k < nslots; ++k) s += part[k];
-        *out = static_cast<double>(s);
-        return true;
-    }
-    if (dt == DType::Float64) {
-        const double* x = static_cast<const double*>(xv);
-        const int64_t nslots = (n + kGrain - 1) / kGrain;
-        std::vector<double> part(nslots, 0.0);
-        tensorplay::parallel::parallel_for(0, n, kGrain, [&](int64_t b, int64_t e) {
-            part[b / kGrain] = normsq_f64_chunk_avx2(x, b, e);
-        });
-        double s = 0.0;
-        for (int64_t k = 0; k < nslots; ++k) s += part[k];
-        *out = s;
-        return true;
-    }
-    return false;
-}
-
-// Picks the widest vector unit the part reports and leaves the raw sum of
-// squares in *out; returns false when neither unit is present.
+// Streams the raw sum of squares over a contiguous buffer; returns false when
+// the caller should fall back to the iterator path (short inputs or a dtype
+// without a streaming path).  The caller applies the square root in the
+// element dtype.
 static bool try_normsq_real(const void* xv, int64_t n, DType dt, double* out) {
-    return try_normsq_real_avx512(xv, n, dt, out) ||
-           try_normsq_real_avx2(xv, n, dt, out);
+    if (n < 4096) return false;
+    constexpr int64_t kGrain = 32768;
+    if (dt == DType::Float32) {
+        const float* x = static_cast<const float*>(xv);
+        const int64_t nslots = (n + kGrain - 1) / kGrain;
+        std::vector<float> part(nslots, 0.f);
+        tensorplay::parallel::parallel_for(0, n, kGrain, [&](int64_t b, int64_t e) {
+            part[b / kGrain] = vec::sum_of_squares(x, b, e);
+        });
+        float s = 0.f;
+        for (int64_t k = 0; k < nslots; ++k) s += part[k];
+        *out = static_cast<double>(s);
+        return true;
+    }
+    if (dt == DType::Float64) {
+        const double* x = static_cast<const double*>(xv);
+        const int64_t nslots = (n + kGrain - 1) / kGrain;
+        std::vector<double> part(nslots, 0.0);
+        tensorplay::parallel::parallel_for(0, n, kGrain, [&](int64_t b, int64_t e) {
+            part[b / kGrain] = vec::sum_of_squares(x, b, e);
+        });
+        double s = 0.0;
+        for (int64_t k = 0; k < nslots; ++k) s += part[k];
+        *out = s;
+        return true;
+    }
+    return false;
 }
 
 }  // namespace
-#endif  // __x86_64__
 
 template <typename scalar_t, typename acc_t, typename out_t>
 void run_norm_reduce(TensorIterator& iter, double p) {
@@ -464,7 +315,6 @@ Tensor norm_kernel_impl(const Tensor& self, double p) {
         return out;
     }
 
-#if defined(__x86_64__)
     if (p == 2.0 && self.is_contiguous()) {
         double r = 0.0;
         if (try_normsq_real(self.data_ptr(), self.numel(), self.dtype(), &r)) {
@@ -474,7 +324,6 @@ Tensor norm_kernel_impl(const Tensor& self, double p) {
             return out;
         }
     }
-#endif
 
     #define TP_NORM_FULL_CASE(ctype, dtype_name) \
         case DType::dtype_name: \
@@ -556,11 +405,6 @@ inline bool reduce_avx512_available() {
     static const bool ok = __builtin_cpu_supports("avx512f") != 0 &&
                            __builtin_cpu_supports("avx512vl") != 0 &&
                            __builtin_cpu_supports("avx512dq") != 0;
-    return ok;
-}
-
-inline bool reduce_avx2_available() {
-    static const bool ok = __builtin_cpu_supports("avx2") != 0;
     return ok;
 }
 
@@ -1294,125 +1138,6 @@ static bool try_byte_reduce_dim_avx512(
 
 template <bool IsMax>
 __attribute__((target("avx512f")))
-static std::pair<float, int64_t> extremum_f32_row_avx512(
-    const float* input, int64_t n) {
-    constexpr int64_t width = 16;
-    const __m512 lane_values = _mm512_loadu_ps(input);
-    const __mmask16 initial_nan =
-        _mm512_cmp_ps_mask(lane_values, lane_values, _CMP_UNORD_Q);
-    if (initial_nan != 0) {
-        return {std::numeric_limits<float>::quiet_NaN(),
-                static_cast<int64_t>(__builtin_ctz(static_cast<unsigned>(initial_nan)))};
-    }
-    const __m512i lane_indices = _mm512_setr_epi32(
-        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
-    __m512 best_values = lane_values;
-    __m512i best_indices = lane_indices;
-    int64_t i = width;
-    for (; i + width <= n; i += width) {
-        const __m512 values = _mm512_loadu_ps(input + i);
-        const __mmask16 nan_mask = _mm512_cmp_ps_mask(values, values, _CMP_UNORD_Q);
-        if (nan_mask != 0) {
-            return {std::numeric_limits<float>::quiet_NaN(),
-                    i + static_cast<int64_t>(__builtin_ctz(static_cast<unsigned>(nan_mask)))};
-        }
-        const __m512i indices = _mm512_add_epi32(
-            lane_indices, _mm512_set1_epi32(static_cast<int>(i)));
-        const __mmask16 better = IsMax
-            ? _mm512_cmp_ps_mask(values, best_values, _CMP_GT_OQ)
-            : _mm512_cmp_ps_mask(values, best_values, _CMP_LT_OQ);
-        best_values = _mm512_mask_blend_ps(better, best_values, values);
-        best_indices = _mm512_mask_blend_epi32(better, best_indices, indices);
-    }
-
-    alignas(64) float values[width];
-    alignas(64) int32_t indices[width];
-    _mm512_storeu_ps(values, best_values);
-    _mm512_storeu_si512(indices, best_indices);
-    float best = values[0];
-    int64_t best_index = indices[0];
-    for (int lane = 1; lane < width; ++lane) {
-        const bool better = IsMax ? values[lane] > best : values[lane] < best;
-        if (better || (values[lane] == best && indices[lane] < best_index)) {
-            best = values[lane];
-            best_index = indices[lane];
-        }
-    }
-    for (; i < n; ++i) {
-        const float value = input[i];
-        if (std::isnan(value)) {
-            return {std::numeric_limits<float>::quiet_NaN(), i};
-        }
-        const bool better = IsMax ? value > best : value < best;
-        if (better || (value == best && i < best_index)) {
-            best = value;
-            best_index = i;
-        }
-    }
-    return {best, best_index};
-}
-
-template <bool IsMax>
-__attribute__((target("avx512f")))
-static std::pair<double, int64_t> extremum_f64_row_avx512(
-    const double* input, int64_t n) {
-    constexpr int64_t width = 8;
-    const __m512d lane_values = _mm512_loadu_pd(input);
-    const __mmask8 initial_nan =
-        _mm512_cmp_pd_mask(lane_values, lane_values, _CMP_UNORD_Q);
-    if (initial_nan != 0) {
-        return {std::numeric_limits<double>::quiet_NaN(),
-                static_cast<int64_t>(__builtin_ctz(static_cast<unsigned>(initial_nan)))};
-    }
-    const __m512i lane_indices = _mm512_setr_epi64(0, 1, 2, 3, 4, 5, 6, 7);
-    __m512d best_values = lane_values;
-    __m512i best_indices = lane_indices;
-    int64_t i = width;
-    for (; i + width <= n; i += width) {
-        const __m512d values = _mm512_loadu_pd(input + i);
-        const __mmask8 nan_mask = _mm512_cmp_pd_mask(values, values, _CMP_UNORD_Q);
-        if (nan_mask != 0) {
-            return {std::numeric_limits<double>::quiet_NaN(),
-                    i + static_cast<int64_t>(__builtin_ctz(static_cast<unsigned>(nan_mask)))};
-        }
-        const __m512i indices = _mm512_add_epi64(
-            lane_indices, _mm512_set1_epi64(i));
-        const __mmask8 better = IsMax
-            ? _mm512_cmp_pd_mask(values, best_values, _CMP_GT_OQ)
-            : _mm512_cmp_pd_mask(values, best_values, _CMP_LT_OQ);
-        best_values = _mm512_mask_blend_pd(better, best_values, values);
-        best_indices = _mm512_mask_blend_epi64(better, best_indices, indices);
-    }
-
-    alignas(64) double values[width];
-    alignas(64) int64_t indices[width];
-    _mm512_storeu_pd(values, best_values);
-    _mm512_storeu_si512(indices, best_indices);
-    double best = values[0];
-    int64_t best_index = indices[0];
-    for (int lane = 1; lane < width; ++lane) {
-        const bool better = IsMax ? values[lane] > best : values[lane] < best;
-        if (better || (values[lane] == best && indices[lane] < best_index)) {
-            best = values[lane];
-            best_index = indices[lane];
-        }
-    }
-    for (; i < n; ++i) {
-        const double value = input[i];
-        if (std::isnan(value)) {
-            return {std::numeric_limits<double>::quiet_NaN(), i};
-        }
-        const bool better = IsMax ? value > best : value < best;
-        if (better || (value == best && i < best_index)) {
-            best = value;
-            best_index = i;
-        }
-    }
-    return {best, best_index};
-}
-
-template <bool IsMax>
-__attribute__((target("avx512f")))
 static std::pair<int32_t, int64_t> extremum_i32_row_avx512(
     const int32_t* input, int64_t n) {
     constexpr int64_t width = 16;
@@ -1495,44 +1220,6 @@ static std::pair<int64_t, int64_t> extremum_i64_row_avx512(
         }
     }
     return {best, best_index};
-}
-
-template <bool IsMax>
-static bool try_extremum_lastdim_real_avx512(
-    const void* xv, void* vv, int64_t* indices, int64_t outer,
-    int64_t d_size, DType dt) {
-    if (!reduce_avx512_available() || d_size < 64 || outer <= 0) return false;
-    const int64_t row_grain = std::max<int64_t>(
-        1, GRAIN_SIZE / std::max<int64_t>(d_size, 1));
-    if (dt == DType::Float32) {
-        const float* input = static_cast<const float*>(xv);
-        float* values = static_cast<float*>(vv);
-        tensorplay::parallel::parallel_for(0, outer, row_grain,
-            [&](int64_t begin, int64_t end) {
-                for (int64_t row = begin; row < end; ++row) {
-                    auto result = extremum_f32_row_avx512<IsMax>(
-                        input + row * d_size, d_size);
-                    values[row] = result.first;
-                    indices[row] = result.second;
-                }
-            });
-        return true;
-    }
-    if (dt == DType::Float64) {
-        const double* input = static_cast<const double*>(xv);
-        double* values = static_cast<double*>(vv);
-        tensorplay::parallel::parallel_for(0, outer, row_grain,
-            [&](int64_t begin, int64_t end) {
-                for (int64_t row = begin; row < end; ++row) {
-                    auto result = extremum_f64_row_avx512<IsMax>(
-                        input + row * d_size, d_size);
-                    values[row] = result.first;
-                    indices[row] = result.second;
-                }
-            });
-        return true;
-    }
-    return false;
 }
 
 template <bool IsMax>
@@ -1624,134 +1311,14 @@ static void extremum_lastdim_rows_vec(const T* in, T* out_values,
     });
 }
 
-// 256-bit twins of the last-dimension extremum.  The fold carries the lane
-// index with the lane value, so a row resolves in one pass instead of folding
-// the value and then scanning the row again for its first occurrence.
+// Tier copies of the last-dimension extremum fold: the lane index travels
+// with the lane value, so a row resolves in one pass instead of folding the
+// value and then rescanning the row for its first occurrence.
 template <bool IsMax>
-__attribute__((target("avx2")))
-static std::pair<float, int64_t> extremum_f32_row_avx2(
-    const float* input, int64_t n) {
-    constexpr int64_t width = 8;
-    const __m256 lane_values = _mm256_loadu_ps(input);
-    const int initial_nan =
-        _mm256_movemask_ps(_mm256_cmp_ps(lane_values, lane_values, _CMP_UNORD_Q));
-    if (initial_nan != 0) {
-        return {std::numeric_limits<float>::quiet_NaN(),
-                static_cast<int64_t>(__builtin_ctz(static_cast<unsigned>(initial_nan)))};
-    }
-    const __m256i lane_indices = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
-    __m256 best_values = lane_values;
-    __m256i best_indices = lane_indices;
-    int64_t i = width;
-    for (; i + width <= n; i += width) {
-        const __m256 values = _mm256_loadu_ps(input + i);
-        const int nan_mask =
-            _mm256_movemask_ps(_mm256_cmp_ps(values, values, _CMP_UNORD_Q));
-        if (nan_mask != 0) {
-            return {std::numeric_limits<float>::quiet_NaN(),
-                    i + static_cast<int64_t>(__builtin_ctz(static_cast<unsigned>(nan_mask)))};
-        }
-        const __m256i indices = _mm256_add_epi32(
-            lane_indices, _mm256_set1_epi32(static_cast<int>(i)));
-        const __m256 better = IsMax
-            ? _mm256_cmp_ps(values, best_values, _CMP_GT_OQ)
-            : _mm256_cmp_ps(values, best_values, _CMP_LT_OQ);
-        best_values = _mm256_blendv_ps(best_values, values, better);
-        best_indices = _mm256_blendv_epi8(best_indices, indices,
-                                          _mm256_castps_si256(better));
-    }
-    alignas(32) float values[width];
-    alignas(32) int32_t indices[width];
-    _mm256_storeu_ps(values, best_values);
-    _mm256_storeu_si256(reinterpret_cast<__m256i*>(indices), best_indices);
-    float best = values[0];
-    int64_t best_index = indices[0];
-    for (int lane = 1; lane < width; ++lane) {
-        const bool better = IsMax ? values[lane] > best : values[lane] < best;
-        if (better || (values[lane] == best && indices[lane] < best_index)) {
-            best = values[lane];
-            best_index = indices[lane];
-        }
-    }
-    for (; i < n; ++i) {
-        const float value = input[i];
-        if (std::isnan(value)) {
-            return {std::numeric_limits<float>::quiet_NaN(), i};
-        }
-        const bool better = IsMax ? value > best : value < best;
-        if (better || (value == best && i < best_index)) {
-            best = value;
-            best_index = i;
-        }
-    }
-    return {best, best_index};
-}
-
-template <bool IsMax>
-__attribute__((target("avx2")))
-static std::pair<double, int64_t> extremum_f64_row_avx2(
-    const double* input, int64_t n) {
-    constexpr int64_t width = 4;
-    const __m256d lane_values = _mm256_loadu_pd(input);
-    const int initial_nan =
-        _mm256_movemask_pd(_mm256_cmp_pd(lane_values, lane_values, _CMP_UNORD_Q));
-    if (initial_nan != 0) {
-        return {std::numeric_limits<double>::quiet_NaN(),
-                static_cast<int64_t>(__builtin_ctz(static_cast<unsigned>(initial_nan)))};
-    }
-    const __m256i lane_indices = _mm256_setr_epi64x(0, 1, 2, 3);
-    __m256d best_values = lane_values;
-    __m256i best_indices = lane_indices;
-    int64_t i = width;
-    for (; i + width <= n; i += width) {
-        const __m256d values = _mm256_loadu_pd(input + i);
-        const int nan_mask =
-            _mm256_movemask_pd(_mm256_cmp_pd(values, values, _CMP_UNORD_Q));
-        if (nan_mask != 0) {
-            return {std::numeric_limits<double>::quiet_NaN(),
-                    i + static_cast<int64_t>(__builtin_ctz(static_cast<unsigned>(nan_mask)))};
-        }
-        const __m256i indices = _mm256_add_epi64(
-            lane_indices, _mm256_set1_epi64x(i));
-        const __m256d better = IsMax
-            ? _mm256_cmp_pd(values, best_values, _CMP_GT_OQ)
-            : _mm256_cmp_pd(values, best_values, _CMP_LT_OQ);
-        best_values = _mm256_blendv_pd(best_values, values, better);
-        best_indices = _mm256_blendv_epi8(best_indices, indices,
-                                          _mm256_castpd_si256(better));
-    }
-    alignas(32) double values[width];
-    alignas(32) int64_t indices[width];
-    _mm256_storeu_pd(values, best_values);
-    _mm256_storeu_si256(reinterpret_cast<__m256i*>(indices), best_indices);
-    double best = values[0];
-    int64_t best_index = indices[0];
-    for (int lane = 1; lane < width; ++lane) {
-        const bool better = IsMax ? values[lane] > best : values[lane] < best;
-        if (better || (values[lane] == best && indices[lane] < best_index)) {
-            best = values[lane];
-            best_index = indices[lane];
-        }
-    }
-    for (; i < n; ++i) {
-        const double value = input[i];
-        if (std::isnan(value)) {
-            return {std::numeric_limits<double>::quiet_NaN(), i};
-        }
-        const bool better = IsMax ? value > best : value < best;
-        if (better || (value == best && i < best_index)) {
-            best = value;
-            best_index = i;
-        }
-    }
-    return {best, best_index};
-}
-
-template <bool IsMax>
-static bool try_extremum_lastdim_real_avx2(
+static bool try_extremum_lastdim_real(
     const void* xv, void* vv, int64_t* indices, int64_t outer,
     int64_t d_size, DType dt) {
-    if (!reduce_avx2_available() || d_size < 32 || outer <= 0) return false;
+    if (d_size < 32 || outer <= 0) return false;
     const int64_t row_grain = std::max<int64_t>(
         1, GRAIN_SIZE / std::max<int64_t>(d_size, 1));
     if (dt == DType::Float32) {
@@ -1760,7 +1327,7 @@ static bool try_extremum_lastdim_real_avx2(
         tensorplay::parallel::parallel_for(0, outer, row_grain,
             [&](int64_t begin, int64_t end) {
                 for (int64_t row = begin; row < end; ++row) {
-                    auto result = extremum_f32_row_avx2<IsMax>(
+                    auto result = vec::row_extremum<IsMax>(
                         input + row * d_size, d_size);
                     values[row] = result.first;
                     indices[row] = result.second;
@@ -1774,7 +1341,7 @@ static bool try_extremum_lastdim_real_avx2(
         tensorplay::parallel::parallel_for(0, outer, row_grain,
             [&](int64_t begin, int64_t end) {
                 for (int64_t row = begin; row < end; ++row) {
-                    auto result = extremum_f64_row_avx2<IsMax>(
+                    auto result = vec::row_extremum<IsMax>(
                         input + row * d_size, d_size);
                     values[row] = result.first;
                     indices[row] = result.second;
@@ -3811,7 +3378,7 @@ std::tuple<Tensor, Tensor> max_dim_kernel_impl(const Tensor& self, int64_t dim0,
     Tensor idxs = Tensor::empty(out_shape, DType::Int64, sc.device());
 
 #if defined(__x86_64__)
-    if (inner == 1 && try_extremum_lastdim_real_avx512<true>(
+    if (inner == 1 && try_extremum_lastdim_real<true>(
             sc.data_ptr(), vals.data_ptr(), idxs.data_ptr<int64_t>(), outer, d_size,
             sc.dtype())) {
         return {vals, idxs};
@@ -3822,11 +3389,6 @@ std::tuple<Tensor, Tensor> max_dim_kernel_impl(const Tensor& self, int64_t dim0,
     }
     if (try_extremum_integral_dim_avx512<true>(
             sc, vals, idxs.data_ptr<int64_t>(), outer, d_size, inner)) {
-        return {vals, idxs};
-    }
-    if (inner == 1 && try_extremum_lastdim_real_avx2<true>(
-            sc.data_ptr(), vals.data_ptr(), idxs.data_ptr<int64_t>(), outer, d_size,
-            sc.dtype())) {
         return {vals, idxs};
     }
     if (inner == 1 && try_extremum_lastdim_vec<true>(
@@ -4042,7 +3604,7 @@ std::tuple<Tensor, Tensor> min_dim_kernel_impl(const Tensor& self, int64_t dim0,
     Tensor idxs = Tensor::empty(out_shape, DType::Int64, sc.device());
 
 #if defined(__x86_64__)
-    if (inner == 1 && try_extremum_lastdim_real_avx512<false>(
+    if (inner == 1 && try_extremum_lastdim_real<false>(
             sc.data_ptr(), vals.data_ptr(), idxs.data_ptr<int64_t>(), outer, d_size,
             sc.dtype())) {
         return {vals, idxs};
@@ -4053,11 +3615,6 @@ std::tuple<Tensor, Tensor> min_dim_kernel_impl(const Tensor& self, int64_t dim0,
     }
     if (try_extremum_integral_dim_avx512<false>(
             sc, vals, idxs.data_ptr<int64_t>(), outer, d_size, inner)) {
-        return {vals, idxs};
-    }
-    if (inner == 1 && try_extremum_lastdim_real_avx2<false>(
-            sc.data_ptr(), vals.data_ptr(), idxs.data_ptr<int64_t>(), outer, d_size,
-            sc.dtype())) {
         return {vals, idxs};
     }
     if (inner == 1 && try_extremum_lastdim_vec<false>(
@@ -4657,12 +4214,12 @@ Tensor any_dim_kernel_impl(const Tensor& self, const std::vector<int64_t>& dims,
 
 
 // Argmax/Argmin
-// Last-dimension argmax/argmin over the 256-bit row fold: the index travels
-// with the value, so a line resolves in one pass.
+// Last-dimension argmax/argmin: the index travels with the value in the row
+// fold, so a line resolves in one pass.
 template <bool IsMax>
-static bool try_argmax_lastdim_real_avx2(const void* xv, int64_t* indices,
-                                         int64_t outer, int64_t d_size, DType dt) {
-    if (!reduce_avx2_available() || d_size < 32 || outer <= 0) return false;
+static bool try_argmax_lastdim_real(const void* xv, int64_t* indices,
+                                    int64_t outer, int64_t d_size, DType dt) {
+    if (d_size < 32 || outer <= 0) return false;
     const int64_t row_grain = std::max<int64_t>(
         1, GRAIN_SIZE / std::max<int64_t>(d_size, 1));
     if (dt == DType::Float32) {
@@ -4670,7 +4227,7 @@ static bool try_argmax_lastdim_real_avx2(const void* xv, int64_t* indices,
         tensorplay::parallel::parallel_for(0, outer, row_grain,
             [&](int64_t begin, int64_t end) {
                 for (int64_t row = begin; row < end; ++row) {
-                    indices[row] = extremum_f32_row_avx2<IsMax>(
+                    indices[row] = vec::row_extremum<IsMax>(
                         input + row * d_size, d_size).second;
                 }
             });
@@ -4681,7 +4238,7 @@ static bool try_argmax_lastdim_real_avx2(const void* xv, int64_t* indices,
         tensorplay::parallel::parallel_for(0, outer, row_grain,
             [&](int64_t begin, int64_t end) {
                 for (int64_t row = begin; row < end; ++row) {
-                    indices[row] = extremum_f64_row_avx2<IsMax>(
+                    indices[row] = vec::row_extremum<IsMax>(
                         input + row * d_size, d_size).second;
                 }
             });
@@ -4771,7 +4328,7 @@ Tensor argmax_kernel_impl(const Tensor& self, std::optional<int64_t> dim, bool k
     Tensor out = Tensor::empty(out_shape, DType::Int64, self.device());
     int64_t* out_data = out.data_ptr<int64_t>();
 #if defined(__x86_64__)
-    if (inner == 1 && try_argmax_lastdim_real_avx2<true>(
+    if (inner == 1 && try_argmax_lastdim_real<true>(
             sc.data_ptr(), out_data, outer, d_size, sc.dtype())) {
         return out;
     }
@@ -4910,7 +4467,7 @@ Tensor argmin_kernel_impl(const Tensor& self, std::optional<int64_t> dim, bool k
     Tensor out = Tensor::empty(out_shape, DType::Int64, self.device());
     int64_t* out_data = out.data_ptr<int64_t>();
 #if defined(__x86_64__)
-    if (inner == 1 && try_argmax_lastdim_real_avx2<false>(
+    if (inner == 1 && try_argmax_lastdim_real<false>(
             sc.data_ptr(), out_data, outer, d_size, sc.dtype())) {
         return out;
     }
