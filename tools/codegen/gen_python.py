@@ -409,6 +409,15 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
         if not name.isidentifier() or keyword.iskeyword(name):
             continue
 
+        # A destination variant is reached through the destination argument
+        # of the ordinary wrapper.  It never owns a top-level function of
+        # its own: a group that carries nothing but destination variants has
+        # no ordinary wrapper to emit, and emitting one would hand the
+        # variant's name to a function that shadows a package submodule or a
+        # builtin.
+        if f.overload_name == 'out' or f.out_args:
+            continue
+
         # Overload-group facts used by the Python argument parser:
         #    keyword on the public function;
         #  - a base+dim reduction pair (sum/mean/prod/max/min/all/any/
@@ -922,12 +931,6 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
             continue
 
         if 'function' in f.variants:
-            if f is out_variant:
-                # The plain overload of the group owns the out-accepting
-                # wrapper; emitting from the .out overload itself would
-                # duplicate the schema's own `out` argument.  The plain
-                # overload marks the name as seen when it is visited.
-                continue
             seen.add(name)
 
             # A lone Tensor[] positional parameter renders as *args (the
