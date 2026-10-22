@@ -6833,9 +6833,17 @@ class TestVulkanIntegerExtrema(unittest.TestCase):
             err_msg="a whole plane folded through an empty axis list")
 
     def test_a_plane_without_lanes_has_no_fold(self):
+        # A fold that would answer the whole of a plane has no lane to start
+        # from, so it asks for the axis argument that would give it one instead
+        # of answering a number no lane was read for.
         for payload in (np.zeros((0, 4), np.int32), np.zeros((0,), np.int64)):
-            with self.assertRaisesRegex(RuntimeError, "empty"):
-                self._device(payload).max()
+            with self.subTest(shape=payload.shape):
+                with self.assertRaisesRegex(
+                        RuntimeError, "Expected reduction dim to be specified"):
+                    self._device(payload).max()
+                with self.assertRaisesRegex(
+                        IndexError, "to have non-zero size"):
+                    self._device(payload).max(0)
 
     def test_a_fold_that_names_a_position_is_refused_loudly(self):
         # The value of a counted plane is in hand here; the position that holds
@@ -12517,13 +12525,205 @@ class TestVulkanRangeOfAPayload(unittest.TestCase):
 
     def test_a_range_with_no_lane_or_no_number_refuses_by_name(self):
         with self.assertRaisesRegex(
-                RuntimeError, "do not support empty tensors"):
+                RuntimeError, "Expected reduction dim to be specified"):
             tensorplay.tensor(np.zeros((0, 4), np.float32)).to("vulkan").aminmax()
+        with self.assertRaisesRegex(
+                IndexError, "to have non-zero size"):
+            tensorplay.tensor(np.zeros((0, 4), np.float32)).to("vulkan").aminmax(0)
         # A plane of pure truth has no fold that orders its lanes, so the range
         # names the widths it does cover rather than answering zero and one.
         with self.assertRaisesRegex(
                 RuntimeError, "extrema support Float32, Float16"):
             tensorplay.tensor(np.array([True, False])).to("vulkan").aminmax()
+
+
+class TestVulkanFoldOfASpanWithoutLanes(unittest.TestCase):
+    # A span with no lane has no number to read, and yet the folds a decode
+    # builds around it still have to answer: a total starts at zero, a product
+    # starts at one, and an average divides nothing by nothing, which is not a
+    # number.  A fold that names a lane -- an end of a range, the position of a
+    # winner -- has no lane to name and says so with the error the shape itself
+    # names, not with a number no lane was read for.  A normalization walks its
+    # rows by counting them out of the length of the axis it walks, so a length
+    # of zero used to stop it with no answer at all; it now releases the empty
+    # payload its own shape names, on both storages.
+
+    SPANS = (
+        ((0, 3), 0),
+        ((0, 3), 1),
+        ((2, 0, 3), 1),
+        ((4, 0), 1),
+        ((0,), 0),
+    )
+    WIDE_SPANS = (
+        ((1, 1, 30000, 0), 3),
+        ((1, 1, 30000, 0), 2),
+    )
+
+    @staticmethod
+    def _device(payload):
+        return tensorplay.from_numpy(np.ascontiguousarray(payload)).to("vulkan")
+
+    @staticmethod
+    def _host(payload):
+        return tensorplay.from_numpy(np.ascontiguousarray(payload))
+
+    def _compare(self, got, wanted, message):
+        self.assertEqual(str(got.dtype), str(wanted.dtype), message)
+        self.assertEqual(tuple(got.shape), tuple(wanted.shape), message)
+        np.testing.assert_array_equal(
+            got.cpu().numpy(), wanted.cpu().numpy(), err_msg=message)
+
+    def test_the_starting_value_of_a_span_with_no_lane(self):
+        for shape, axis in self.SPANS + self.WIDE_SPANS:
+            for np_dtype in (np.float32, np.float16):
+                payload = np.zeros(shape, np_dtype)
+                label = f"{shape} over axis {axis}, {np_dtype.__name__}"
+                for keepdim in (False, True):
+                    self._compare(
+                        self._device(payload).sum(axis, keepdim=keepdim),
+                        self._host(payload).sum(axis, keepdim=keepdim),
+                        f"a total of no lane, {label}")
+                    self._compare(
+                        self._device(payload).prod(axis, keepdim=keepdim),
+                        self._host(payload).prod(axis, keepdim=keepdim),
+                        f"a product of no lane, {label}")
+                    self._compare(
+                        self._device(payload).mean(axis, keepdim=keepdim),
+                        self._host(payload).mean(axis, keepdim=keepdim),
+                        f"an average of no lane, {label}")
+
+    def test_a_fold_of_no_lane_answers_the_value_it_starts_from(self):
+        # Read directly, with no walk to compare against: the starting values a
+        # decode looks for when a window holds no token at all.
+        held = self._device(np.zeros((4, 0), np.float32))
+        np.testing.assert_array_equal(
+            held.sum(1).cpu().numpy(), np.zeros(4, np.float32),
+            err_msg="a total of no lane was not the value a sum starts at")
+        np.testing.assert_array_equal(
+            held.prod(1).cpu().numpy(), np.ones(4, np.float32),
+            err_msg="a product of no lane was not the value a product starts at")
+        for name, spread in (("variance", held.var(dim=1)),
+                             ("spread", held.std(dim=1)),
+                             ("average", held.mean(1))):
+            np.testing.assert_array_equal(
+                np.isnan(spread.cpu().numpy()), np.ones(4, np.bool_),
+                err_msg=f"a {name} of no lane was a number")
+
+    def test_a_normalization_of_no_lanes_answers_the_shape_it_walks(self):
+        for shape, axis in self.SPANS + self.WIDE_SPANS:
+            for np_dtype in (np.float32, np.float16):
+                payload = np.zeros(shape, np_dtype)
+                label = f"{shape} over axis {axis}, {np_dtype.__name__}"
+                for log_mode in (False, True):
+                    name = "log-softmax" if log_mode else "softmax"
+                    device = self._device(payload)
+                    answer = (device.log_softmax(axis) if log_mode
+                              else device.softmax(axis))
+                    self.assertEqual(tuple(answer.shape), shape,
+                                     f"a {name} of no lanes changed its shape, {label}")
+                    self.assertEqual(answer.numel(), 0,
+                                     f"a {name} of no lanes was not empty, {label}")
+                    plain = self._host(payload)
+                    self._compare(
+                        answer,
+                        plain.log_softmax(axis) if log_mode else plain.softmax(axis),
+                        f"a {name} of no lanes, {label}")
+
+    def test_a_fold_that_names_a_lane_says_so_where_a_lane_is_kept(self):
+        # A fold that names a lane is refused where the answer would carry one,
+        # and answers an empty payload where the kept shape has no lane either.
+        folds = (
+            ("amax", lambda t, axis: t.amax(axis)),
+            ("amin", lambda t, axis: t.amin(axis)),
+            ("max", lambda t, axis: t.max(axis)[0]),
+            ("min", lambda t, axis: t.min(axis)[0]),
+            ("range", lambda t, axis: t.aminmax(axis)[0]),
+            ("argmax", lambda t, axis: t.argmax(axis)),
+            ("argmin", lambda t, axis: t.argmin(axis)),
+            ("logsumexp", lambda t, axis: t.logsumexp(axis)),
+        )
+        for shape, axis in self.SPANS:
+            payload = np.zeros(shape, np.float32)
+            device = self._device(payload)
+            host = self._host(payload)
+            # The fold is refused only where an answer would have to name a
+            # lane; where the kept shape has no lane either, no lane is named.
+            names_a_lane = any(size == 0 for index, size in enumerate(shape)
+                               if index != axis)
+            for name, fold in folds:
+                with self.subTest(fold=name, span=(shape, axis)):
+                    if names_a_lane:
+                        self._compare(fold(device, axis), fold(host, axis),
+                                      f"a {name} that names a lane of no span")
+                    else:
+                        with self.assertRaisesRegex(
+                                IndexError, "to have non-zero size"):
+                            fold(device, axis)
+                        with self.assertRaisesRegex(
+                                IndexError, "to have non-zero size"):
+                            fold(host, axis)
+
+    def test_a_whole_fold_of_no_lanes_asks_for_the_axis_that_names_one(self):
+        refusals = (
+            ("amax", lambda t: t.amax(), RuntimeError,
+             "Expected reduction dim to be specified"),
+            ("amin", lambda t: t.amin(), RuntimeError,
+             "Expected reduction dim to be specified"),
+            ("max", lambda t: t.max(), RuntimeError,
+             "Expected reduction dim to be specified"),
+            ("min", lambda t: t.min(), RuntimeError,
+             "Expected reduction dim to be specified"),
+            ("argmax", lambda t: t.argmax(), IndexError,
+             "Expected reduction dim to be specified"),
+            ("argmin", lambda t: t.argmin(), IndexError,
+             "Expected reduction dim to be specified"),
+            ("range", lambda t: t.aminmax()[0], RuntimeError, None),
+        )
+        for shape, np_dtype in (((0, 3), np.float32), ((0,), np.float16)):
+            payload = np.zeros(shape, np_dtype)
+            device = self._device(payload)
+            host = self._host(payload)
+            for name, fold, error, text in refusals:
+                for side, tensor in (("device", device), ("host", host)):
+                    with self.subTest(fold=name, side=side,
+                                      shape=shape, dtype=np_dtype.__name__):
+                        if text is None:
+                            with self.assertRaises(error):
+                                fold(tensor)
+                        else:
+                            with self.assertRaisesRegex(error, text):
+                                fold(tensor)
+
+    def test_a_span_of_no_lane_still_answers_a_fold_of_a_whole_axis(self):
+        # An axis that holds lanes folded against an axis that holds none: the
+        # kept shape decides how many answers there are, and every one of them
+        # is the value the walk would have started from.
+        for shape, axis, answer_shape in (((0, 3), 0, (3,)), ((0, 3), 1, (0,)),
+                                          ((2, 0, 3), 1, (2, 3)),
+                                          ((4, 0), 1, (4,))):
+            payload = np.zeros(shape, np.float32)
+            device = self._device(payload)
+            with self.subTest(span=(shape, axis)):
+                self.assertEqual(tuple(device.sum(axis).shape), answer_shape)
+                self.assertEqual(tuple(device.prod(axis).shape), answer_shape)
+                self.assertEqual(
+                    tuple(device.count_nonzero(axis).shape), answer_shape)
+                self.assertEqual(tuple(device.softmax(axis).shape), shape)
+
+    def test_a_counted_span_folds_its_starting_value_too(self):
+        # A total and a product carry counts the way they carry measurements.
+        # The average of a count has no counted walk yet, so it is refused by
+        # name rather than answered with a number no lane was read for.
+        for np_dtype in (np.int32, np.int64):
+            payload = np.zeros((4, 0), np_dtype)
+            device = self._device(payload)
+            host = self._host(payload)
+            label = f"a span of no counted lanes, {np_dtype.__name__}"
+            self._compare(device.sum(1), host.sum(1), f"total {label}")
+            self._compare(device.prod(1), host.prod(1), f"product {label}")
+            with self.assertRaisesRegex(IndexError, "to have non-zero size"):
+                device.amax(1)
 
 
 class TestVulkanExtremumOfAnUnnumberedLane(unittest.TestCase):
