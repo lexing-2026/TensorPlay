@@ -98,6 +98,7 @@ inline int64_t wrap_dim_local(int64_t dim, int64_t ndim) {
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 static Tensor diff_helper(const Tensor& self, int64_t n, int64_t dim) {
+    if (n == 0) return self.clone();
     Tensor result = self;
     n = n > self.size(dim) ? self.size(dim) : n;
     for (int64_t i = 0; i < n; ++i) {
