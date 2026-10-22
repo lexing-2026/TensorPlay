@@ -13168,5 +13168,176 @@ class TestVulkanLogSigmoid(unittest.TestCase):
                 rtol=tol, atol=tol, equal_nan=True,
                 err_msg=f"log_sigmoid_backward over {np.dtype(dtype).name}")
 
+class TestVulkanLogit(unittest.TestCase):
+    # logit answers log(p / (1 - p)) in one walk, holding p inside
+    # [eps, 1 - eps] when a bound is given.  A lane at either end of the unit
+    # range has no finite ratio, a lane outside the range has no logarithm at
+    # all without a bound, and a lane that is not a number stays one through
+    # the clamp.  Both storages need a case, and a count is read through the
+    # float formula it has no lane for.
+
+    LENGTHS = (64, 200003)
+    SPECIALS = np.array(
+        [-np.inf, -2.0, -1.0, -1e-8, -0.0, 0.0, 1e-8, 0.01, 0.1, 0.5, 0.9,
+         0.99, 1.0, 1.0 + 1e-7, 2.0, np.inf, np.nan], dtype=np.float32)
+
+    def _values(self, count, dtype, seed=41):
+        rng = np.random.default_rng(seed)
+        values = rng.random(count).astype(dtype)
+        values[: self.SPECIALS.size] = self.SPECIALS.astype(dtype)
+        return values
+
+    def _device(self, values):
+        return tensorplay.from_numpy(values.copy()).to("vulkan")
+
+    @staticmethod
+    def _want(values, eps=None):
+        wide = values.astype(np.float64)
+        if eps is not None:
+            # The host fold keeps a lane that is not a number, so the
+            # comparison-based bounds leave it alone too.
+            wide = np.minimum(np.maximum(wide, eps), 1.0 - eps)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return np.log(wide / (1.0 - wide))
+
+    @staticmethod
+    def _grad_want(grad, values, eps=None):
+        g = grad.astype(np.float64)
+        s = values.astype(np.float64)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            slope = g / (s * (1.0 - s))
+        # Either end carries the whole slope rather than the quotient.
+        endpoint = np.where((s == 0.0) | (s == 1.0), g * np.inf, slope)
+        if eps is None:
+            return np.where((s < 0.0) | (s > 1.0), np.nan, endpoint)
+        # The bounds are read back at the payload's own width before the
+        # comparison, so a single-precision payload rounds them first.
+        lo = np.float32(eps)
+        hi = np.float32(np.float32(1.0) - lo)
+        return np.where((s < lo) | (s > hi), 0.0, endpoint)
+
+    def test_the_odd_ratio_is_one_walk_over_both_storages(self):
+        for dtype, tol in ((np.float32, 2e-6), (np.float16, 4e-3)):
+            for length in self.LENGTHS:
+                values = self._values(length, dtype)
+                device = self._device(values)
+                got = tensorplay.logit(device)
+                self.assertEqual(got.dtype, device.dtype)
+                np.testing.assert_allclose(
+                    got.cpu().numpy().astype(np.float64), self._want(values),
+                    rtol=tol, atol=tol, equal_nan=True,
+                    err_msg=f"{np.dtype(dtype).name} length {length}")
+                # The allocating form leaves the payload it read untouched.
+                np.testing.assert_array_equal(device.cpu().numpy(), values)
+
+    def test_a_rank_three_or_four_payload_keeps_its_geometry(self):
+        for shape, dtype in (((2, 3, 4), np.float16), ((2, 3, 2, 5), np.float32)):
+            values = self._values(int(np.prod(shape)), dtype).reshape(shape)
+            got = tensorplay.logit(self._device(values))
+            self.assertEqual(tuple(got.shape), shape)
+            np.testing.assert_allclose(
+                got.cpu().numpy().astype(np.float64), self._want(values),
+                rtol=4e-3 if dtype == np.float16 else 2e-6,
+                atol=4e-3 if dtype == np.float16 else 2e-6,
+                equal_nan=True, err_msg=str(shape))
+
+    def test_a_count_is_read_through_the_float_formula(self):
+        raw = np.array([-7, -1, 0, 1, 2, 1 << 20, -(1 << 20)])
+        for dtype in (np.int32, np.int64):
+            values = raw.astype(dtype)
+            device = self._device(values)
+            got = tensorplay.logit(device)
+            self.assertEqual(got.dtype, tensorplay.float32)
+            np.testing.assert_allclose(
+                got.cpu().numpy().astype(np.float64), self._want(values),
+                rtol=1e-6, atol=1e-6, equal_nan=True,
+                err_msg=np.dtype(dtype).name)
+        # A count wide enough for linear storage takes the same road.
+        long_values = (np.arange(200003, dtype=np.int32) % 5 - 2).astype(
+            np.int32)
+        got = tensorplay.logit(self._device(long_values))
+        np.testing.assert_allclose(
+            got.cpu().numpy().astype(np.float64), self._want(long_values),
+            rtol=1e-6, atol=1e-6, equal_nan=True)
+
+    def test_a_bound_holds_every_lane_inside_the_band(self):
+        for dtype, tol in ((np.float32, 2e-6), (np.float16, 4e-3)):
+            for length in self.LENGTHS:
+                values = self._values(length, dtype)
+                device = self._device(values)
+                for eps in (0.01, 0.0):
+                    got = tensorplay.logit(device, eps=eps)
+                    np.testing.assert_allclose(
+                        got.cpu().numpy().astype(np.float64),
+                        self._want(values, eps=eps),
+                        rtol=tol, atol=tol, equal_nan=True,
+                        err_msg=f"eps={eps} over {np.dtype(dtype).name} "
+                                f"length {length}")
+
+    def test_the_in_place_form_rewrites_the_same_payload(self):
+        for dtype, length in ((np.float32, 64), (np.float16, 200003)):
+            values = self._values(length, dtype)
+            device = self._device(values)
+            device.logit_(eps=0.02)
+            tol = 4e-3 if dtype == np.float16 else 2e-6
+            np.testing.assert_allclose(
+                device.cpu().numpy().astype(np.float64),
+                self._want(values, eps=0.02), rtol=tol, atol=tol,
+                equal_nan=True, err_msg=np.dtype(dtype).name)
+
+    def test_the_gradient_follows_the_inverse_slope(self):
+        values = np.array(
+            [-1.0, -0.0, 0.0, 1e-8, 0.005, 0.5, 0.995, 1.0, 1.0 + 1e-7,
+             2.0, np.nan], dtype=np.float32)
+        grad = np.array(
+            [2.0, 0.0, -3.0, 1.0, 0.5, -1.5, 2.5, 0.0, 1.0, -2.0, 1.0],
+            dtype=np.float32)
+        for eps in (None, 0.01, 0.0):
+            got = tensorplay.logit_backward(
+                self._device(grad), self._device(values), eps=eps)
+            np.testing.assert_allclose(
+                got.cpu().numpy().astype(np.float64),
+                self._grad_want(grad, values, eps),
+                rtol=2e-6, atol=2e-6, equal_nan=True, err_msg=f"eps={eps}")
+        # The same lanes over linear storage.
+        wide_values = np.resize(values, 200003)
+        wide_grad = np.resize(grad, 200003)
+        for eps in (None, 0.01):
+            got = tensorplay.logit_backward(
+                self._device(wide_grad), self._device(wide_values), eps=eps)
+            np.testing.assert_allclose(
+                got.cpu().numpy().astype(np.float64),
+                self._grad_want(wide_grad, wide_values, eps),
+                rtol=2e-6, atol=2e-6, equal_nan=True,
+                err_msg=f"eps={eps} over linear storage")
+
+    def test_the_device_answers_what_the_host_answers(self):
+        for dtype, tol in ((np.float32, 2e-6), (np.float16, 4e-3)):
+            values = self._values(48, dtype)
+            grad = (np.random.default_rng(13).standard_normal(48) * 2.0
+                    ).astype(dtype)
+            host = tensorplay.from_numpy(values.copy())
+            host_grad = tensorplay.from_numpy(grad.copy())
+            device = host.to("vulkan")
+            device_grad = host_grad.to("vulkan")
+            for eps in (None, 0.01, 0.0):
+                np.testing.assert_allclose(
+                    tensorplay.logit(
+                        device, eps=eps).cpu().numpy().astype(np.float64),
+                    tensorplay.logit(
+                        host, eps=eps).numpy().astype(np.float64),
+                    rtol=tol, atol=tol, equal_nan=True,
+                    err_msg=f"logit eps={eps} over {np.dtype(dtype).name}")
+                np.testing.assert_allclose(
+                    tensorplay.logit_backward(
+                        device_grad, device,
+                        eps=eps).cpu().numpy().astype(np.float64),
+                    tensorplay.logit_backward(
+                        host_grad, host, eps=eps).numpy().astype(np.float64),
+                    rtol=tol, atol=tol, equal_nan=True,
+                    err_msg=f"logit_backward eps={eps} over "
+                            f"{np.dtype(dtype).name}")
+
+
 if __name__ == "__main__":
     unittest.main()
