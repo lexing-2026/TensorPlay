@@ -37,6 +37,15 @@ using namespace tensorplay::parallel;
 
 namespace {
 
+// A half or bfloat16 lane is a class type of its own, so the builtin
+// floating-point trait does not recognize it even though the lane holds a
+// floating value.  Probes that distinguish finite lanes from infinite or
+// not-a-number ones must recognize both spellings.
+template <typename T>
+inline constexpr bool is_float_lane_v =
+    std::is_floating_point_v<T> || std::is_same_v<T, tensorplay::Half> ||
+    std::is_same_v<T, tensorplay::BFloat16>;
+
 inline DType scalar_promote(DType t, const Scalar& s) {
     // Weak scalar participation: scalars only promote the tensor dtype when
     // they carry a floating type of their own.
@@ -757,7 +766,7 @@ Tensor& logical_xor_out_cpu(const Tensor& a, const Tensor& b, Tensor& out) {
 Tensor isfinite_cpu(const Tensor& self) {
     return bool_unary_kernel(self, [](auto x) {
         using T = decltype(x);
-        if constexpr (std::is_floating_point_v<T>)
+        if constexpr (is_float_lane_v<T>)
             return std::isfinite(static_cast<double>(x));
         else return true;
     }, "isfinite");
@@ -766,7 +775,7 @@ Tensor isinf_cpu(const Tensor& self) {
     // Integral tensors never take infinite values
     return bool_unary_kernel(self, [](auto x) {
         using T = decltype(x);
-        if constexpr (std::is_floating_point_v<T>)
+        if constexpr (is_float_lane_v<T>)
             return std::isinf(static_cast<double>(x));
         else return false;
     }, "isinf");
@@ -905,7 +914,7 @@ Tensor nan_to_num_cpu(const Tensor& self, const Scalar& nan,
         parallel_for(0, n, GRAIN_SIZE, [&](int64_t b, int64_t e) { \
             for (int64_t i = b; i < e; ++i) { \
                 ctype v = sp[i]; \
-                if constexpr (std::is_floating_point_v<ctype>) { \
+                if constexpr (is_float_lane_v<ctype>) { \
                     double dv = static_cast<double>(v); \
                     if (dv != dv) v = static_cast<ctype>(nan_v); \
                     else if (v == std::numeric_limits<ctype>::infinity()) v = pv; \

@@ -218,6 +218,23 @@ class TestOpCoverage(TestCase):
                           nan=0.0, posinf=9.0, neginf=-9.0).tolist(),
             [1.0, 0.0, 9.0, -9.0])
 
+    def test_isfinite_family_over_a_narrow_lane(self):
+        inf, nan = float("inf"), float("nan")
+        narrow = tp.tensor([inf, -inf, nan, 1.5], dtype=tp.float16)
+        self.assertEqual(tp.isfinite(narrow).tolist(),
+                         [False, False, False, True])
+        self.assertEqual(tp.isinf(narrow).tolist(), [True, True, False, False])
+        whole = tp.tensor([5, -7, 0], dtype=tp.int64)
+        self.assertEqual(tp.isfinite(whole).tolist(), [True, True, True])
+        self.assertEqual(tp.isinf(whole).tolist(), [False, False, False])
+
+    def test_nan_to_num_replaces_a_narrow_lane(self):
+        inf, nan = float("inf"), float("nan")
+        narrow = tp.tensor([inf, -inf, nan, 65504.0, -2.0], dtype=tp.float16)
+        self.assertEqual(
+            tp.nan_to_num(narrow).tolist(),
+            [65504.0, -65504.0, 0.0, 65504.0, -2.0])
+
     def test_msort_fliplr_flipud(self):
         self.assertEqual(tp.msort(tp.tensor([[2.0, 1.0], [3.0, 0.0]])).tolist(),
                          [[2.0, 0.0], [3.0, 1.0]])
