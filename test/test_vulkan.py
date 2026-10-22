@@ -15925,5 +15925,292 @@ class TestVulkanAbsoluteDeviationLoss(unittest.TestCase):
                     self._device(np.zeros(4, dtype=np.int32)), 1)
 
 
+class TestVulkanSwitchedQuadraticLoss(unittest.TestCase):
+    # Two losses read the same deviation twice: a magnitude inside a width
+    # answers half a square, a magnitude outside it answers the deviation with
+    # the area of that square taken off.  These tests keep both branches, the
+    # lane that sits exactly on the width, the slope each side hands back, and
+    # the width that switches the whole loss over to a plain deviation.
+
+    SHAPES = ((4,), (2, 5), (3, 4, 2), (2, 3, 4, 5))
+
+    @staticmethod
+    def _device(values):
+        return tensorplay.from_numpy(np.ascontiguousarray(values)).to("vulkan")
+
+    @staticmethod
+    def _host(values):
+        return tensorplay.from_numpy(np.ascontiguousarray(values))
+
+    @staticmethod
+    def _plane(rng, shape):
+        # The plane straddles the width on both sides, so one walk reads the
+        # quadratic branch and the line it switches to.
+        return ((rng.random(shape) - 0.5) * 8.0).astype(np.float32)
+
+    @staticmethod
+    def _difference(values, labels):
+        return (np.asarray(values).astype(np.float64)
+                - np.asarray(labels).astype(np.float64))
+
+    @classmethod
+    def _smooth(cls, values, labels, width):
+        difference = cls._difference(values, labels)
+        magnitude = np.abs(difference)
+        return np.where(magnitude <= width,
+                        0.5 * difference * difference / width,
+                        magnitude - 0.5 * width)
+
+    @classmethod
+    def _smooth_slope(cls, values, labels, width):
+        difference = cls._difference(values, labels)
+        return np.where(np.abs(difference) <= width,
+                        difference / width,
+                        np.sign(difference))
+
+    @classmethod
+    def _huber(cls, values, labels, width):
+        difference = cls._difference(values, labels)
+        magnitude = np.abs(difference)
+        return np.where(magnitude <= width,
+                        0.5 * difference * difference,
+                        width * (magnitude - 0.5 * width))
+
+    @classmethod
+    def _huber_slope(cls, values, labels, width):
+        difference = cls._difference(values, labels)
+        return np.where(np.abs(difference) <= width,
+                        difference,
+                        width * np.sign(difference))
+
+    @staticmethod
+    def _reduced(loss, reduction):
+        if reduction == 0:
+            return loss
+        return loss.mean() if reduction == 1 else loss.sum()
+
+    @staticmethod
+    def _carried(slope, incoming, reduction):
+        gradient = slope * np.broadcast_to(
+            np.asarray(incoming).astype(np.float64), np.shape(slope))
+        lanes = np.size(slope)
+        return gradient / lanes if reduction == 1 and lanes else gradient
+
+    def test_a_deviation_inside_the_width_answers_half_its_square(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(401)
+        for shape in self.SHAPES:
+            payload = self._plane(rng, shape)
+            labels = self._plane(rng, shape)
+            for width in (1.0, 0.4):
+                loss = self._smooth(payload, labels, width)
+                for reduction in (0, 1, 2):
+                    with self.subTest(shape=shape, width=width,
+                                      reduction=reduction):
+                        got = F.smooth_l1_loss(
+                            self._device(payload), self._device(labels),
+                            reduction, width).cpu().numpy()
+                        np.testing.assert_allclose(
+                            got, self._reduced(loss, reduction),
+                            rtol=2e-2, atol=2e-2)
+
+    def test_a_lane_on_the_width_agrees_between_branches(self):
+        import tensorplay.functional as F
+        payload = self._device(np.array([1.0, -1.0], np.float32))
+        labels = self._device(np.array([0.0, 0.0], np.float32))
+        with self.subTest(kind="the smooth width"):
+            np.testing.assert_allclose(
+                F.smooth_l1_loss(payload, labels, 0, 1.0).cpu().numpy(),
+                np.array([0.5, 0.5]))
+        with self.subTest(kind="the scaled width"):
+            np.testing.assert_allclose(
+                F.huber_loss(payload, labels, 0, 1.0).cpu().numpy(),
+                np.array([0.5, 0.5]))
+
+    def test_a_gradient_hands_back_the_slope_its_side_of_the_width_is_on(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(409)
+        for shape in ((4,), (2, 5), (3, 4, 2)):
+            payload = self._plane(rng, shape)
+            labels = self._plane(rng, shape)
+            incoming = (rng.random(shape) - 0.5).astype(np.float32)
+            for width in (1.0, 0.4):
+                slope = self._smooth_slope(payload, labels, width)
+                for reduction in (0, 1, 2):
+                    with self.subTest(shape=shape, width=width,
+                                      reduction=reduction):
+                        got = F.smooth_l1_loss_backward(
+                            self._device(incoming), self._device(payload),
+                            self._device(labels), reduction,
+                            width).cpu().numpy()
+                        np.testing.assert_allclose(
+                            got, self._carried(slope, incoming, reduction),
+                            rtol=2e-2, atol=2e-2)
+
+    def test_the_wider_switch_scales_its_line_instead_of_its_square(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(419)
+        for shape in ((4,), (2, 5), (3, 4, 2)):
+            payload = self._plane(rng, shape)
+            labels = self._plane(rng, shape)
+            incoming = (rng.random(shape) - 0.5).astype(np.float32)
+            for width in (1.0, 0.5, 3.0):
+                loss = self._huber(payload, labels, width)
+                slope = self._huber_slope(payload, labels, width)
+                for reduction in (0, 1, 2):
+                    with self.subTest(kind="the loss", shape=shape,
+                                      width=width, reduction=reduction):
+                        got = F.huber_loss(
+                            self._device(payload), self._device(labels),
+                            reduction, width).cpu().numpy()
+                        np.testing.assert_allclose(
+                            got, self._reduced(loss, reduction),
+                            rtol=2e-2, atol=2e-2)
+                    with self.subTest(kind="the gradient", shape=shape,
+                                      width=width, reduction=reduction):
+                        got = F.huber_loss_backward(
+                            self._device(incoming), self._device(payload),
+                            self._device(labels), reduction,
+                            width).cpu().numpy()
+                        np.testing.assert_allclose(
+                            got, self._carried(slope, incoming, reduction),
+                            rtol=2e-2, atol=2e-2)
+
+    def test_a_width_of_nothing_answers_the_deviation(self):
+        # A width of nothing leaves the quadratic branch no lane to hold, so the
+        # loss falls back to the plain deviation rather than a division by the
+        # width.
+        import tensorplay.functional as F
+        payload = np.array([1.5, -2.0, 0.25, 3.0], np.float32)
+        labels = np.array([0.5, 0.0, 0.25, 1.0], np.float32)
+        deviation = np.abs(payload - labels)
+        with self.subTest(kind="the loss"):
+            np.testing.assert_allclose(
+                F.smooth_l1_loss(self._device(payload), self._device(labels),
+                                 1, 0.0).cpu().numpy(), deviation.mean(),
+                rtol=2e-3, atol=2e-3)
+        with self.subTest(kind="the gradient"):
+            np.testing.assert_allclose(
+                F.smooth_l1_loss_backward(
+                    self._device(np.ones(4, np.float32)),
+                    self._device(payload), self._device(labels), 0,
+                    0.0).cpu().numpy(),
+                np.sign(payload - labels))
+
+    def test_the_host_switched_loss_answers_the_same(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(421)
+        payload = self._plane(rng, (2, 5))
+        labels = self._plane(rng, (2, 5))
+        incoming = (rng.random((2, 5)) - 0.5).astype(np.float32)
+        for name, device_call, host_call in (
+                ("smooth loss", F.smooth_l1_loss, F.smooth_l1_loss),
+                ("huber loss", F.huber_loss, F.huber_loss),
+                ("huber gradient", F.huber_loss_backward, F.huber_loss_backward)):
+            for reduction in (0, 1, 2):
+                with self.subTest(kind=name, reduction=reduction):
+                    if "gradient" in name:
+                        answered = device_call(
+                            self._device(incoming), self._device(payload),
+                            self._device(labels), reduction, 0.8).cpu().numpy()
+                        on_host = host_call(
+                            self._host(incoming), self._host(payload),
+                            self._host(labels), reduction, 0.8).cpu().numpy()
+                    else:
+                        answered = device_call(
+                            self._device(payload), self._device(labels),
+                            reduction, 0.8).cpu().numpy()
+                        on_host = host_call(
+                            self._host(payload), self._host(labels),
+                            reduction, 0.8).cpu().numpy()
+                    np.testing.assert_allclose(
+                        answered, on_host, rtol=2e-2, atol=2e-2)
+
+    def test_a_narrow_plane_graduates_in_its_own_width(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(431)
+        payload = self._plane(rng, (2, 5)).astype(np.float16)
+        labels = self._plane(rng, (2, 5)).astype(np.float16)
+        with self.subTest(kind="an unreduced smooth loss kept narrow"):
+            answered = F.smooth_l1_loss(
+                self._device(payload), self._device(labels), 0, 0.8)
+            self.assertEqual(answered.dtype, tensorplay.float16)
+        with self.subTest(kind="an averaged huber loss kept narrow"):
+            average = F.huber_loss(
+                self._device(payload), self._device(labels), 1, 0.8)
+            self.assertEqual(average.dtype, tensorplay.float16)
+        with self.subTest(kind="a huber gradient kept narrow"):
+            gradient = F.huber_loss_backward(
+                self._device(np.ones((2, 5), np.float16)),
+                self._device(payload), self._device(labels), 1, 0.8)
+            self.assertEqual(gradient.dtype, tensorplay.float16)
+        with self.subTest(kind="a narrow answer close to the wide one"):
+            narrow = F.huber_loss(
+                self._device(payload), self._device(labels), 1,
+                0.8).cpu().numpy()
+            np.testing.assert_allclose(
+                narrow,
+                self._huber(payload.astype(np.float32),
+                            labels.astype(np.float32), 0.8).mean(),
+                rtol=2e-2, atol=2e-2)
+
+    def test_a_plane_without_lanes_answers_the_reduction(self):
+        import tensorplay.functional as F
+        empty = np.zeros((0, 4), np.float32)
+        with self.subTest(kind="a smooth average of nothing"):
+            average = F.smooth_l1_loss(self._device(empty), self._device(empty),
+                                       1, 1.0)
+            self.assertEqual(tuple(average.shape), ())
+            self.assertTrue(np.isnan(average.cpu().numpy()))
+        with self.subTest(kind="a huber total of nothing"):
+            total = F.huber_loss(self._device(empty), self._device(empty), 2, 1.0)
+            self.assertEqual(float(total.cpu().numpy()), 0.0)
+
+    def test_a_lane_that_is_not_a_number_carries_through(self):
+        import tensorplay.functional as F
+        payload = np.array([0.5, np.nan, -1.0], np.float32)
+        labels = np.array([0.0, 1.0, 2.0], np.float32)
+        with self.subTest(kind="a deviation inside the width"):
+            got = F.smooth_l1_loss(self._device(payload), self._device(labels),
+                                   0, 1.0).cpu().numpy()
+            np.testing.assert_allclose(
+                got, np.array([0.125, np.nan, 2.5]), equal_nan=True,
+                rtol=2e-3, atol=2e-3)
+        with self.subTest(kind="an average that carries it"):
+            average = F.huber_loss(self._device(payload), self._device(labels),
+                                   1, 1.0)
+            self.assertTrue(np.isnan(float(average.cpu().numpy())))
+
+    def test_a_width_out_of_range_or_a_count_refuses(self):
+        import tensorplay.functional as F
+        payload = self._device(np.array([0.2, 0.5], np.float32))
+        labels = self._device(np.array([0.0, 1.0], np.float32))
+        with self.subTest(kind="a negative smooth width"):
+            with self.assertRaisesRegex(
+                    RuntimeError, "does not support negative values for beta"):
+                F.smooth_l1_loss(payload, labels, 1, -0.5)
+        with self.subTest(kind="a gradient with a negative smooth width"):
+            with self.assertRaisesRegex(
+                    RuntimeError, "does not support negative values for beta"):
+                F.smooth_l1_loss_backward(
+                    self._device(np.ones(2, np.float32)), payload, labels, 1,
+                    -0.5)
+        for name, width in (("a zero scaled width", 0.0),
+                            ("a negative scaled width", -1.0)):
+            with self.subTest(kind=name):
+                with self.assertRaisesRegex(
+                        RuntimeError,
+                        "does not support non-positive values for delta"):
+                    F.huber_loss(payload, labels, 1, width)
+        with self.subTest(kind="an unknown reduction"):
+            with self.assertRaisesRegex(RuntimeError, "invalid reduction mode"):
+                F.smooth_l1_loss(payload, labels, 5, 1.0)
+        with self.subTest(kind="a count"):
+            with self.assertRaisesRegex(RuntimeError, "Float32 and Float16"):
+                F.huber_loss(
+                    self._device(np.arange(4, dtype=np.int64)),
+                    self._device(np.zeros(4, dtype=np.int64)), 1, 1.0)
+
+
 if __name__ == "__main__":
     unittest.main()
