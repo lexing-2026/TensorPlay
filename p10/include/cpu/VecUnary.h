@@ -634,6 +634,76 @@ static void f32_chunk_avx2(VOp op, VParams prm, const float* src, float* dst, in
                 }
             }
             break;
+        case VOp::Relu6:
+            TP_F32_SIMPLE_LOOP_8(_mm256_min_ps(_mm256_set1_ps(6.0f), _mm256_max_ps(zero, x)));
+            break;
+        case VOp::LeakyRelu: {
+            const __m256 slope = _mm256_set1_ps(static_cast<float>(prm.p0));
+            TP_F32_SIMPLE_LOOP_8(_mm256_blendv_ps(x, _mm256_mul_ps(slope, x),
+                                                  _mm256_cmp_ps(x, zero, _CMP_LT_OQ)));
+            break;
+        }
+        case VOp::Hardswish: {
+            const __m256 three = _mm256_set1_ps(3.0f);
+            const __m256 six = _mm256_set1_ps(6.0f);
+            TP_F32_SIMPLE_LOOP_8(_mm256_div_ps(
+                _mm256_mul_ps(x, _mm256_min_ps(six, _mm256_max_ps(zero, _mm256_add_ps(x, three)))), six));
+            break;
+        }
+        case VOp::Hardsigmoid: {
+            const __m256 three = _mm256_set1_ps(3.0f);
+            const __m256 six = _mm256_set1_ps(6.0f);
+            TP_F32_SIMPLE_LOOP_8(_mm256_div_ps(
+                _mm256_min_ps(six, _mm256_max_ps(zero, _mm256_add_ps(x, three))), six));
+            break;
+        }
+        case VOp::Log2:
+            TP_F32_SIMPLE_LOOP_8(tensorplay::tpsleef::log2(x));
+            break;
+        case VOp::Log10:
+            TP_F32_SIMPLE_LOOP_8(tensorplay::tpsleef::log10(x));
+            break;
+        case VOp::Sin:
+            TP_F32_SIMPLE_LOOP_8(tensorplay::tpsleef::sin(x));
+            break;
+        case VOp::Cos:
+            TP_F32_SIMPLE_LOOP_8(tensorplay::tpsleef::cos(x));
+            break;
+        case VOp::Tan:
+            TP_F32_SIMPLE_LOOP_8(tensorplay::tpsleef::tan(x));
+            break;
+        case VOp::Asin:
+            TP_F32_SIMPLE_LOOP_8(tensorplay::tpsleef::asin(x));
+            break;
+        case VOp::Acos:
+            TP_F32_SIMPLE_LOOP_8(tensorplay::tpsleef::acos(x));
+            break;
+        case VOp::Atan:
+            TP_F32_SIMPLE_LOOP_8(tensorplay::tpsleef::atan(x));
+            break;
+        case VOp::Erf:
+            TP_F32_SIMPLE_LOOP_8(v_erf_f32(x));
+            break;
+        case VOp::Erfc:
+            TP_F32_SIMPLE_LOOP_8(tensorplay::tpsleef::erfc(x));
+            break;
+        case VOp::Silu:
+            TP_F32_SIMPLE_LOOP_8(_mm256_mul_ps(
+                x, v_rcp_nr_ps(_mm256_add_ps(one, tensorplay::tpsleef::exp(_mm256_xor_ps(x, signbit))))));
+            break;
+        case VOp::Selu: {
+            const __m256 lambda = _mm256_set1_ps(static_cast<float>(1.0507009873554804934193349852946));
+            const __m256 alphalambda = _mm256_set1_ps(static_cast<float>(1.6732632423543772848170429916717 * 1.0507009873554804934193349852946));
+            TP_F32_SIMPLE_LOOP_8(_mm256_blendv_ps(
+                _mm256_mul_ps(alphalambda, tensorplay::tpsleef::expm1(x)),
+                _mm256_mul_ps(x, lambda), _mm256_cmp_ps(x, zero, _CMP_GT_OQ)));
+            break;
+        }
+        case VOp::Mish:
+            TP_F32_SIMPLE_LOOP_8(_mm256_mul_ps(
+                x, tensorplay::tpsleef::tanh(tensorplay::tpsleef::log(
+                       _mm256_add_ps(one, tensorplay::tpsleef::exp(x))))));
+            break;
         default:
             for (; i + 8 <= n; i += 8) {
                 __m256 x = _mm256_loadu_ps(s + i);
