@@ -124,6 +124,37 @@ inline Vectorized<int64_t> blend_lanes(
 }
 #endif
 
+// Streams the plain sum over x[begin, end) through four independent
+// accumulators and one horizontal fold.  The lane layout of the fold makes
+// the result independent of the chunk boundaries a caller splits at, which
+// keeps a parallel reduction reproducible for a fixed element count.
+template <typename T>
+inline T sum(const T* x, int64_t begin, int64_t end) {
+    using Vec = Vectorized<T>;
+    constexpr int64_t W = static_cast<int64_t>(Vec::size());
+    const int64_t n = end - begin;
+    if (n < 4 * W) {
+        T s = T(0);
+        for (int64_t i = begin; i < end; ++i) s += x[i];
+        return s;
+    }
+    Vec a0(T(0)), a1(T(0)), a2(T(0)), a3(T(0));
+    int64_t i = begin;
+    for (; i + 4 * W <= end; i += 4 * W) {
+        a0 = a0 + Vec::loadu(x + i);
+        a1 = a1 + Vec::loadu(x + i + W);
+        a2 = a2 + Vec::loadu(x + i + 2 * W);
+        a3 = a3 + Vec::loadu(x + i + 3 * W);
+    }
+    Vec acc = (a0 + a1) + (a2 + a3);
+    for (; i + W <= end; i += W) {
+        acc = acc + Vec::loadu(x + i);
+    }
+    T s = acc.reduce_add();
+    for (; i < end; ++i) s += x[i];
+    return s;
+}
+
 // Streams the sum of squares over x[begin, end) through four independent
 // accumulators and one horizontal fold; the caller decides where the square
 // root belongs.
