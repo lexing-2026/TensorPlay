@@ -3,6 +3,7 @@ import tensorplay as tp
 from tensorplay.testing._internal.common_utils import TestCase, run_tests
 from tensorplay.testing._internal.common_device_type import (
     instantiate_device_type_tests,
+    onlyCPU,
 )
 
 
@@ -48,6 +49,25 @@ class TestReduction(TestCase):
         am1 = x.argmax(dim=1)
         self.assertEqual(am1[0].item(), 1)
         self.assertEqual(am1[1].item(), 2)
+
+    @onlyCPU
+    def test_argmax_argmin_refuse_an_axis_the_payload_does_not_carry(self, device):
+        x = tp.tensor([[1.0, 5.0, 2.0], [4.0, 3.0, 6.0]], device=device)
+        for axis in (2, -3, 7):
+            for name in ("argmax", "argmin"):
+                with self.assertRaisesRegex(
+                        RuntimeError,
+                        r"Dimension out of range \(expected to be in range of "
+                        r"\[-2, 1\], but got " + str(axis) + r"\)"):
+                    getattr(tp, name)(x, axis)
+
+        # An axis inside the range answers from either end, and the range is
+        # settled before the walk asks whether the axis holds anything.
+        self.assertEqual(x.argmax(dim=-2)[0].item(), 1)
+        self.assertEqual(x.argmin(dim=-1)[1].item(), 1)
+        empty = tp.zeros((0, 3), device=device)
+        with self.assertRaisesRegex(IndexError, "non-zero size"):
+            tp.argmax(empty, 0)
 
     def test_sum_mean(self, device):
         x = tp.tensor([[1.0, 2.0], [3.0, 4.0]], device=device)
