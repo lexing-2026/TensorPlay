@@ -4444,6 +4444,9 @@ Tensor argmax_kernel_impl(const Tensor& self, std::optional<int64_t> dim, bool k
     
     int64_t d = dim.value();
     if (d < 0) d += self.dim();
+    TP_CHECK(d >= 0 && d < self.dim(),
+             "Dimension out of range (expected to be in range of [-", self.dim(), ", ",
+             self.dim() - 1, "], but got ", dim.value(), ")");
     if (self.size(d) == 0) {
         TP_THROW(IndexError, "argmax(): Expected reduction dim ", d, " to have non-zero size.");
     }
