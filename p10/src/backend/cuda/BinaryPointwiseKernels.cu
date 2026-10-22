@@ -66,9 +66,47 @@ Tensor divide_scalar_cuda(const Tensor& self, const Scalar& other) {
     return true_divide_scalar_cuda(self, other);
 }
 
+// A float remainder is exact in its own width; widening the operands to
+// double only costs instructions.
+struct RemainderTypedFn {
+    template <typename T>
+    __host__ __device__ T operator()(T x, T y) const {
+        T r;
+        if constexpr (std::is_integral_v<T>) {
+            r = static_cast<T>(x % y);
+        } else if constexpr (std::is_same_v<T, float>) {
+            r = ::fmodf(x, y);
+        } else if constexpr (std::is_same_v<T, double>) {
+            r = ::fmod(x, y);
+        } else {
+            r = static_cast<T>(::fmodf(static_cast<float>(x),
+                                       static_cast<float>(y)));
+        }
+        if (r != T(0) && ((r < T(0)) != (y < T(0))))
+            r = static_cast<T>(r + y);
+        return r;
+    }
+};
+
+struct FmodTypedFn {
+    template <typename T>
+    __host__ __device__ T operator()(T x, T y) const {
+        if constexpr (std::is_integral_v<T>) {
+            return static_cast<T>(x % y);
+        } else if constexpr (std::is_same_v<T, float>) {
+            return ::fmodf(x, y);
+        } else if constexpr (std::is_same_v<T, double>) {
+            return ::fmod(x, y);
+        } else {
+            return static_cast<T>(::fmodf(static_cast<float>(x),
+                                          static_cast<float>(y)));
+        }
+    }
+};
+
 Tensor remainder_tensor_cuda(const Tensor& self, const Tensor& other) {
     return binary_same_cuda(self, other,
-                            HFn2{},
+                            RemainderTypedFn{},
                             "remainder");
 }
 
@@ -86,7 +124,7 @@ Tensor remainder_scalar_tensor_cuda(const Scalar& self, const Tensor& other) {
 
 Tensor fmod_tensor_cuda(const Tensor& self, const Tensor& other) {
     return binary_same_cuda(self, other,
-                            HFn3{},
+                            FmodTypedFn{},
                             "fmod");
 }
 

@@ -259,8 +259,20 @@ Tensor copysign_scalar_cuda(const Tensor& self, const Scalar& other) {
     return copysign_cuda(self, Tensor::full({}, other, DType::Float32, self.device()));
 }
 
+// The float-wide square root is several times cheaper than the double one,
+// and the extra double digits cannot survive the float result anyway.
+struct HypotFloatPair {
+    __host__ __device__ double operator()(double x, double y) const {
+        return static_cast<double>(
+            ::hypotf(static_cast<float>(x), static_cast<float>(y)));
+    }
+};
+
 Tensor hypot_cuda(const Tensor& a, const Tensor& b) {
-    return binary_float_cuda(a, b, HFn43{}, "hypot");
+    if (promoteTypes(a.dtype(), b.dtype()) == DType::Float64) {
+        return binary_float_cuda(a, b, HFn43{}, "hypot");
+    }
+    return binary_float_cuda(a, b, HypotFloatPair{}, "hypot");
 }
 
 Tensor nextafter_cuda(const Tensor& a, const Tensor& b) {
