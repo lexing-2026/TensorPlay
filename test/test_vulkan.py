@@ -15690,5 +15690,240 @@ class TestVulkanBinaryCrossEntropy(unittest.TestCase):
                     self._device(np.array([0.0], np.float32)), reduction=5)
 
 
+class TestVulkanAbsoluteDeviationLoss(unittest.TestCase):
+    # The loss one element answers is how far it sits from the value it was
+    # matched with, so the walk holds no bound to refuse and no denominator to
+    # hold.  These tests keep the three reduction modes, the side a gradient
+    # takes from a deviation, the width a narrow payload keeps, and the two
+    # answers an empty plane gives.
+
+    SHAPES = ((4,), (2, 5), (3, 4, 2), (2, 3, 4, 5))
+
+    @staticmethod
+    def _device(values):
+        return tensorplay.from_numpy(np.ascontiguousarray(values)).to("vulkan")
+
+    @staticmethod
+    def _host(values):
+        return tensorplay.from_numpy(np.ascontiguousarray(values))
+
+    @staticmethod
+    def _plane(rng, shape):
+        # A deviation is read anywhere on the line, so the plane straddles zero.
+        return ((rng.random(shape) - 0.5) * 6.0).astype(np.float32)
+
+    @staticmethod
+    def _deviation(values, labels):
+        wide = np.asarray(values).astype(np.float64)
+        matched = np.broadcast_to(np.asarray(labels).astype(np.float64),
+                                  wide.shape)
+        return np.abs(wide - matched)
+
+    @staticmethod
+    def _reduced(deviation, reduction):
+        if reduction == 0:
+            return deviation
+        return deviation.mean() if reduction == 1 else deviation.sum()
+
+    @staticmethod
+    def _deviation_gradient(values, labels, incoming, reduction):
+        slope = np.sign(np.asarray(values).astype(np.float64)
+                        - np.asarray(labels).astype(np.float64))
+        gradient = slope * np.broadcast_to(
+            np.asarray(incoming).astype(np.float64), slope.shape)
+        if reduction == 1 and slope.size > 0:
+            gradient = gradient / slope.size
+        return gradient
+
+    def test_a_deviation_answers_the_loss_of_its_lane(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(301)
+        for shape in self.SHAPES:
+            payload = self._plane(rng, shape)
+            labels = self._plane(rng, shape)
+            deviation = self._deviation(payload, labels)
+            for reduction in (0, 1, 2):
+                with self.subTest(shape=shape, reduction=reduction):
+                    got = F.tp_l1_loss(
+                        self._device(payload), self._device(labels),
+                        reduction).cpu().numpy()
+                    np.testing.assert_allclose(
+                        got, self._reduced(deviation, reduction),
+                        rtol=2e-3, atol=2e-3)
+
+    def test_the_host_deviation_answers_the_same(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(307)
+        payload = self._plane(rng, (2, 5))
+        labels = self._plane(rng, (2, 5))
+        deviation = self._deviation(payload, labels)
+        for reduction in (0, 1, 2):
+            with self.subTest(reduction=reduction):
+                on_device = F.tp_l1_loss(
+                    self._device(payload), self._device(labels),
+                    reduction).cpu().numpy()
+                answered = F.tp_l1_loss(
+                    self._host(payload), self._host(labels),
+                    reduction).cpu().numpy()
+                np.testing.assert_allclose(
+                    on_device, answered, rtol=2e-3, atol=2e-3)
+                np.testing.assert_allclose(
+                    on_device, self._reduced(deviation, reduction),
+                    rtol=2e-3, atol=2e-3)
+
+    def test_a_narrower_plane_matches_onto_the_walk(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(311)
+        payload = self._plane(rng, (2, 3, 4))
+        labels = self._plane(rng, (3, 1))
+        with self.subTest(kind="a plane narrower than the payload"):
+            got = F.tp_l1_loss(self._device(payload), self._device(labels), 1)
+            np.testing.assert_allclose(
+                got.cpu().numpy(), self._deviation(payload, labels).mean(),
+                rtol=2e-3, atol=2e-3)
+        with self.subTest(kind="a label lane that repeats"):
+            got = F.tp_l1_loss(
+                self._device(np.array([1.5, -2.0, 0.25], np.float32)),
+                self._device(np.array(0.5, np.float32)), 2)
+            np.testing.assert_allclose(
+                got.cpu().numpy(), np.array([1.0, 2.5, 0.25]).sum(),
+                rtol=2e-3, atol=2e-3)
+
+    def test_a_gradient_hands_back_the_side_of_the_deviation(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(313)
+        for shape in ((4,), (2, 5), (3, 4, 2)):
+            payload = self._plane(rng, shape)
+            labels = self._plane(rng, shape)
+            incoming = (rng.random(shape) - 0.5).astype(np.float32)
+            for reduction in (0, 1, 2):
+                with self.subTest(shape=shape, reduction=reduction):
+                    got = F.tp_l1_loss_backward(
+                        self._device(incoming), self._device(payload),
+                        self._device(labels), reduction).cpu().numpy()
+                    np.testing.assert_allclose(
+                        got,
+                        self._deviation_gradient(
+                            payload, labels, incoming, reduction),
+                        rtol=2e-3, atol=2e-3)
+        with self.subTest(kind="an incoming carried as one lane"):
+            payload = self._plane(rng, (2, 5))
+            labels = self._plane(rng, (2, 5))
+            got = F.tp_l1_loss_backward(
+                self._device(np.array(0.75, np.float32)),
+                self._device(payload), self._device(labels), 1).cpu().numpy()
+            np.testing.assert_allclose(
+                got,
+                self._deviation_gradient(payload, labels, 0.75, 1),
+                rtol=2e-3, atol=2e-3)
+        with self.subTest(kind="a lane that matches exactly"):
+            got = F.tp_l1_loss_backward(
+                self._device(np.ones(3, np.float32)),
+                self._device(np.array([1.0, 2.0, 3.0], np.float32)),
+                self._device(np.array([1.0, 0.0, 0.0], np.float32)),
+                0).cpu().numpy()
+            np.testing.assert_allclose(got, np.array([0.0, 1.0, 1.0]))
+
+    def test_the_average_graduation_flows_back(self):
+        import tensorplay.nn.functional as nnF
+        rng = np.random.default_rng(317)
+        payload = tensorplay.from_numpy(self._plane(rng, (2, 5))).to("vulkan")
+        payload.requires_grad_(True)
+        labels = tensorplay.from_numpy(self._plane(rng, (2, 5))).to("vulkan")
+        average = nnF.l1_loss(payload, labels, reduction="mean")
+        average.backward(tensorplay.from_numpy(np.array(1.0, np.float32)).to("vulkan"))
+        flowed = payload.grad.detach().cpu().numpy().astype(np.float64)
+        np.testing.assert_allclose(
+            flowed,
+            np.sign(payload.detach().cpu().numpy().astype(np.float64)
+                    - labels.cpu().numpy().astype(np.float64)) / 10.0,
+            rtol=2e-3, atol=2e-3)
+
+    def test_a_narrow_plane_graduates_in_its_own_width(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(331)
+        payload = self._plane(rng, (3, 4)).astype(np.float16)
+        labels = self._plane(rng, (3, 4)).astype(np.float16)
+        with self.subTest(kind="an unreduced deviation kept narrow"):
+            answered = F.tp_l1_loss(self._device(payload), self._device(labels), 0)
+            self.assertEqual(answered.dtype, tensorplay.float16)
+        with self.subTest(kind="an average kept narrow"):
+            average = F.tp_l1_loss(self._device(payload), self._device(labels), 1)
+            self.assertEqual(average.dtype, tensorplay.float16)
+        with self.subTest(kind="a gradient kept narrow"):
+            gradient = F.tp_l1_loss_backward(
+                self._device(np.ones((3, 4), np.float16)),
+                self._device(payload), self._device(labels), 1)
+            self.assertEqual(gradient.dtype, tensorplay.float16)
+        with self.subTest(kind="a narrow answer close to the wide one"):
+            narrow = F.tp_l1_loss(
+                self._device(payload), self._device(labels), 1).cpu().numpy()
+            np.testing.assert_allclose(
+                narrow,
+                self._deviation(payload.astype(np.float32),
+                               labels.astype(np.float32)).mean(),
+                rtol=2e-2, atol=2e-2)
+
+    def test_a_plane_without_lanes_answers_the_reduction(self):
+        import tensorplay.functional as F
+        empty = np.zeros((0, 4), np.float32)
+        with self.subTest(kind="an average of nothing"):
+            average = F.tp_l1_loss(self._device(empty), self._device(empty), 1)
+            self.assertEqual(tuple(average.shape), ())
+            self.assertTrue(np.isnan(average.cpu().numpy()))
+        with self.subTest(kind="a total of nothing"):
+            total = F.tp_l1_loss(self._device(empty), self._device(empty), 2)
+            self.assertEqual(float(total.cpu().numpy()), 0.0)
+        with self.subTest(kind="an unreduced plane of nothing"):
+            answered = F.tp_l1_loss(self._device(empty), self._device(empty), 0)
+            self.assertEqual(tuple(answered.shape), (0, 4))
+
+    def test_a_lane_that_is_not_a_number_carries_through(self):
+        # A difference asks nothing of the lane it reads, so a missing
+        # measurement travels to the answer rather than stopping the walk.
+        import tensorplay.functional as F
+        payload = np.array([0.5, np.nan, -1.0], np.float32)
+        labels = np.array([0.0, 1.0, 2.0], np.float32)
+        with self.subTest(kind="an unreduced deviation"):
+            got = F.tp_l1_loss(self._device(payload), self._device(labels), 0)
+            np.testing.assert_allclose(
+                got.cpu().numpy(), np.array([0.5, np.nan, 3.0]),
+                rtol=2e-3, atol=2e-3, equal_nan=True)
+        with self.subTest(kind="an average that carries it"):
+            average = F.tp_l1_loss(self._device(payload), self._device(labels), 1)
+            self.assertTrue(np.isnan(float(average.cpu().numpy())))
+        with self.subTest(kind="a gradient on the missing lane"):
+            # The fold a gradient is taken from answers zero for a lane that is
+            # not a number, so the missing lane hands back no slope rather than
+            # carrying the gap into the gradient.
+            gradient = F.tp_l1_loss_backward(
+                self._device(np.ones(3, np.float32)), self._device(payload),
+                self._device(labels), 0).cpu().numpy()
+            np.testing.assert_allclose(gradient, np.array([1.0, 0.0, -1.0]))
+
+    def test_a_walk_out_of_kind_or_mode_refuses(self):
+        import tensorplay.functional as F
+        payload = self._device(np.array([0.2, 0.5], np.float32))
+        labels = self._device(np.array([0.0, 1.0], np.float32))
+        with self.subTest(kind="an unknown reduction"):
+            with self.assertRaisesRegex(RuntimeError, "invalid reduction mode"):
+                F.tp_l1_loss(payload, labels, 5)
+        with self.subTest(kind="a gradient with an unknown reduction"):
+            with self.assertRaisesRegex(RuntimeError, "invalid reduction mode"):
+                F.tp_l1_loss_backward(
+                    self._device(np.ones(2, np.float32)), payload, labels, 3)
+        with self.subTest(kind="a count"):
+            with self.assertRaisesRegex(RuntimeError, "Float32 and Float16"):
+                F.tp_l1_loss(
+                    self._device(np.arange(4, dtype=np.int64)),
+                    self._device(np.zeros(4, dtype=np.int64)), 1)
+        with self.subTest(kind="a count being graduated"):
+            with self.assertRaisesRegex(RuntimeError, "Float32 and Float16"):
+                F.tp_l1_loss_backward(
+                    self._device(np.ones(4, np.float32)),
+                    self._device(np.arange(4, dtype=np.int32)),
+                    self._device(np.zeros(4, dtype=np.int32)), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
