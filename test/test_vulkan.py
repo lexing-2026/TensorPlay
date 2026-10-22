@@ -8727,6 +8727,238 @@ class TestVulkanVectorProducts(unittest.TestCase):
                              self._device(np.zeros(4, np.int32)))
 
 
+class TestVulkanBatchSummedProduct(unittest.TestCase):
+    """A stack of products folded onto one plane: the sum the batches answer
+    before the addend weighs in, the shapes the addend may reach that plane
+    from, and the corners where nothing contracts at all."""
+
+    STACKS = ((1, 4, 5, 3), (3, 4, 5, 3), (5, 7, 3, 11), (2, 16, 16, 16),
+              (8, 13, 9, 5))
+
+    @staticmethod
+    def _device(values):
+        return tensorplay.from_numpy(np.asarray(values)).to("vulkan")
+
+    @staticmethod
+    def _host(values):
+        return tensorplay.from_numpy(np.asarray(values))
+
+    @staticmethod
+    def _stack(shape, seed):
+        rng = np.random.default_rng(seed)
+        batches, rows, reach, cols = shape
+        return (
+            (rng.standard_normal((batches, rows, reach)) * 0.5).astype(np.float32),
+            (rng.standard_normal((batches, reach, cols)) * 0.5).astype(np.float32),
+        )
+
+    @staticmethod
+    def _folded(lhs, rhs):
+        # The cross-batch contraction the stack answers, held wide so the
+        # tolerances below measure the walk rather than the arithmetic.
+        return np.einsum(
+            "bij,bjk->ik",
+            np.asarray(lhs).astype(np.float64), np.asarray(rhs).astype(np.float64))
+
+    def test_a_stack_folds_onto_the_plane(self):
+        for index, shape in enumerate(self.STACKS):
+            lhs, rhs = self._stack(shape, 120 + index)
+            seed = (np.random.default_rng(130 + index).standard_normal(
+                (shape[1], shape[3])) * 0.5).astype(np.float32)
+            folded = self._folded(lhs, rhs)
+            for label, weights, want in (
+                    ("both weights at one", {}, seed + folded),
+                    ("a doubled seed", {"beta": 2.0}, 2.0 * seed + folded),
+                    ("a tripled contraction", {"alpha": 3.0}, seed + 3.0 * folded),
+                    ("both weights", {"beta": -1.5, "alpha": 0.25},
+                     -1.5 * seed + 0.25 * folded),
+                    ("no contraction", {"alpha": 0.0}, seed),
+                    ("no seed", {"beta": 0.0}, folded),
+            ):
+                with self.subTest(shape=shape, weights=label):
+                    got = tensorplay.addbmm(
+                        self._device(seed), self._device(lhs), self._device(rhs),
+                        **weights).cpu().numpy()
+                    self.assertEqual(tuple(got.shape), (shape[1], shape[3]))
+                    np.testing.assert_allclose(
+                        got.astype(np.float64), want, rtol=1e-4, atol=1e-4,
+                        err_msg=f"stack folded with {label}")
+
+    def test_the_addend_reaches_the_plane_its_own_way(self):
+        lhs, rhs = self._stack((4, 3, 5, 6), 140)
+        folded = self._folded(lhs, rhs)
+        for label, seed in (
+                ("the plane itself", np.full((3, 6), 0.5, np.float32)),
+                ("one row of it", np.arange(6, dtype=np.float32)),
+                ("one column of it", np.arange(3, dtype=np.float32)[:, None]),
+                ("a corner of it", np.full((1, 1), 0.25, np.float32)),
+                ("a single number", np.float32(1.5)),
+        ):
+            with self.subTest(addend=label):
+                got = tensorplay.addbmm(
+                    self._device(seed), self._device(lhs),
+                    self._device(rhs)).cpu().numpy()
+                np.testing.assert_allclose(
+                    got.astype(np.float64), folded + np.broadcast_to(
+                        np.asarray(seed).astype(np.float64), (3, 6)),
+                    rtol=1e-4, atol=1e-4, err_msg=f"addend as {label}")
+
+    def test_an_indeterminate_addend_does_not_cross_a_zero_weight(self):
+        lhs, rhs = self._stack((3, 5, 4, 6), 150)
+        poisoned = (np.random.default_rng(151).standard_normal(
+            (5, 6)) * 0.5).astype(np.float32)
+        poisoned[2, 1] = np.nan
+        poisoned[4] = np.inf
+        got = tensorplay.addbmm(self._device(poisoned), self._device(lhs),
+                                self._device(rhs), beta=0.0).cpu().numpy()
+        np.testing.assert_allclose(
+            got.astype(np.float64), self._folded(lhs, rhs),
+            rtol=1e-4, atol=1e-4,
+            err_msg="a weightless addend still carried across")
+
+    def test_a_walk_that_contracts_nothing_answers_the_seed_its_own_weight(self):
+        # A stack with no batch, and a stack whose reduction axis holds no
+        # entry, both leave the addend standing alone — scaled by its weight,
+        # and nothing where the weight is nothing.
+        plane = np.full((3, 5), 3.0, np.float32)
+        for label, lhs, rhs in (
+                ("no batch", np.zeros((0, 3, 4), np.float32),
+                 np.zeros((0, 4, 5), np.float32)),
+                ("no entry to contract", np.zeros((2, 3, 0), np.float32),
+                 np.zeros((2, 0, 5), np.float32)),
+        ):
+            for beta, want in ((2.0, 6.0), (1.0, 3.0), (0.0, 0.0)):
+                with self.subTest(walk=label, beta=beta):
+                    got = tensorplay.addbmm(
+                        self._device(plane), self._device(lhs),
+                        self._device(rhs), beta=beta, alpha=1.0).cpu().numpy()
+                    self.assertEqual(got.shape, (3, 5))
+                    np.testing.assert_allclose(got, np.full((3, 5), want),
+                                               rtol=0, atol=1e-6,
+                                               err_msg=f"{label} at weight {beta}")
+            with self.subTest(walk=label, kind="an indeterminate seed"):
+                got = tensorplay.addbmm(
+                    self._device(np.full((3, 5), np.nan, np.float32)),
+                    self._device(lhs), self._device(rhs), beta=0.0,
+                    alpha=1.0).cpu().numpy()
+                np.testing.assert_allclose(got, np.zeros((3, 5)), rtol=0,
+                                           atol=0, err_msg=f"{label} unweighted")
+            with self.subTest(walk=label, kind="a row of a seed"):
+                got = tensorplay.addbmm(
+                    self._device(np.arange(5, dtype=np.float32)),
+                    self._device(lhs), self._device(rhs), beta=2.0,
+                    alpha=1.0).cpu().numpy()
+                self.assertEqual(got.shape, (3, 5))
+                np.testing.assert_allclose(
+                    got, 2.0 * np.broadcast_to(np.arange(5, dtype=np.float32),
+                                               (3, 5)), rtol=0, atol=1e-6,
+                    err_msg=f"{label} seeded by one row")
+
+    def test_the_device_walk_answers_the_host_walk(self):
+        for index, shape in enumerate(self.STACKS[:3]):
+            lhs, rhs = self._stack(shape, 160 + index)
+            seed = (np.random.default_rng(170 + index).standard_normal(
+                (shape[1], shape[3])) * 0.5).astype(np.float32)
+            for weights in ({}, {"beta": 0.0}, {"beta": 2.0, "alpha": -0.5}):
+                with self.subTest(shape=shape, weights=weights):
+                    np.testing.assert_allclose(
+                        tensorplay.addbmm(self._device(seed), self._device(lhs),
+                                          self._device(rhs),
+                                          **weights).cpu().numpy(),
+                        tensorplay.addbmm(self._host(seed), self._host(lhs),
+                                          self._host(rhs),
+                                          **weights).cpu().numpy(),
+                        rtol=1e-4, atol=1e-4)
+
+    def test_a_narrow_stack_keeps_its_own_width(self):
+        lhs, rhs = self._stack((4, 32, 48, 16), 180)
+        narrow_lhs, narrow_rhs = np.asarray(lhs, np.float16), np.asarray(rhs, np.float16)
+        narrow_seed = np.asarray(np.random.default_rng(181).standard_normal(
+            (32, 16)) * 0.5, np.float16)
+        answered = tensorplay.addbmm(self._device(narrow_seed),
+                                     self._device(narrow_lhs),
+                                     self._device(narrow_rhs))
+        self.assertEqual(answered.dtype, tensorplay.float16)
+        wide = self._folded(narrow_lhs, narrow_rhs) + narrow_seed.astype(np.float64)
+        np.testing.assert_allclose(
+            answered.cpu().numpy().astype(np.float32).astype(np.float64), wide,
+            rtol=2e-2, atol=2e-2, err_msg="a narrow stack folded wide")
+
+    def test_the_in_place_seed_keeps_its_own_plane(self):
+        lhs, rhs = self._stack((3, 5, 4, 6), 190)
+        seed = (np.random.default_rng(191).standard_normal((5, 6))
+                * 0.5).astype(np.float32)
+        held = self._device(seed)
+        held.addbmm_(self._device(lhs), self._device(rhs), beta=2.0, alpha=1.5)
+        self.assertTrue(held.device.is_vulkan())
+        np.testing.assert_allclose(
+            held.cpu().numpy().astype(np.float64),
+            2.0 * seed.astype(np.float64) + 1.5 * self._folded(lhs, rhs),
+            rtol=1e-4, atol=1e-4, err_msg="in place folded stack")
+
+    def test_the_gradient_reaches_every_batch_of_the_stack(self):
+        lhs, rhs = self._stack((3, 5, 4, 6), 200)
+        seed = (np.random.default_rng(201).standard_normal((5, 6))
+                * 0.5).astype(np.float32)
+        held = self._device(lhs).requires_grad_(True)
+        total = tensorplay.addbmm(self._device(seed), held, self._device(rhs),
+                                  beta=1.0, alpha=2.0).sum()
+        gradient = tensorplay.autograd.grad(total, held)[0]
+        self.assertTrue(gradient.device.is_vulkan())
+        want = np.stack([
+            2.0 * np.ones((5, 6), np.float64) @ matrix.astype(np.float64).T
+            for matrix in rhs])
+        np.testing.assert_allclose(
+            gradient.cpu().numpy().astype(np.float64), want,
+            rtol=1e-4, atol=1e-4, err_msg="gradient spread over the stack")
+
+    def test_a_walk_out_of_shape_or_kind_refuses(self):
+        lhs, rhs = self._stack((2, 3, 4, 5), 210)
+        plane = np.ones((3, 5), np.float32)
+        f32 = np.float32
+        with self.subTest(kind="a stack that is not three axes"):
+            with self.assertRaisesRegex(RuntimeError, "batch1 must be 3d"):
+                tensorplay.addbmm(self._device(plane),
+                                  self._device(np.zeros((2, 3, 4, 1), f32)),
+                                  self._device(rhs))
+        with self.subTest(kind="a stack that is not three axes on the far side"):
+            with self.assertRaisesRegex(RuntimeError, "batch2 must be 3d"):
+                tensorplay.addbmm(self._device(plane), self._device(lhs),
+                                  self._device(np.zeros((2, 4, 5, 1), f32)))
+        with self.subTest(kind="stacks of different counts"):
+            with self.assertRaisesRegex(
+                    RuntimeError, "batch dimensions do not match"):
+                tensorplay.addbmm(self._device(plane), self._device(lhs),
+                                  self._device(np.zeros((3, 4, 5), f32)))
+        with self.subTest(kind="matrices that do not meet"):
+            with self.assertRaisesRegex(
+                    RuntimeError, "matrix dimensions do not match"):
+                tensorplay.addbmm(self._device(plane), self._device(lhs),
+                                  self._device(np.zeros((2, 6, 5), f32)))
+        with self.subTest(kind="an addend off the plane"):
+            with self.assertRaisesRegex(RuntimeError, "cannot reach"):
+                tensorplay.addbmm(self._device(np.ones((6, 5), f32)),
+                                  self._device(lhs), self._device(rhs))
+        with self.subTest(kind="an addend stacked above the plane"):
+            with self.assertRaisesRegex(RuntimeError, "must sit on the plane"):
+                tensorplay.addbmm(self._device(np.ones((2, 3, 5), f32)),
+                                  self._device(lhs), self._device(rhs))
+        with self.subTest(kind="a stack of counts"):
+            with self.assertRaisesRegex(RuntimeError, "Float32 and Float16"):
+                tensorplay.addbmm(
+                    self._device(np.ones((3, 5), np.int64)),
+                    self._device(np.ones((2, 3, 4), np.int64)),
+                    self._device(np.ones((2, 4, 5), np.int64)))
+        with self.subTest(kind="a stack read at two widths"):
+            with self.assertRaisesRegex(RuntimeError, "same element type"):
+                tensorplay.addbmm(self._device(plane), self._device(lhs),
+                                  self._device(np.zeros((2, 4, 5), np.float16)))
+        with self.subTest(kind="an addend read at another width"):
+            with self.assertRaisesRegex(RuntimeError, "the addend must be read"):
+                tensorplay.addbmm(self._device(np.ones((3, 5), np.float16)),
+                                  self._device(lhs), self._device(rhs))
+
+
 class TestVulkanRepeatExpansion(unittest.TestCase):
     """Repeating an axis in place: the count the key-value heads reach the
     query head count by, and the half-width rotary table doubles."""
