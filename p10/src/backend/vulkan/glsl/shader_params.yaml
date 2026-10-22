@@ -152,6 +152,11 @@ binary_op_scalar:
     DTYPE: int
     OPERATOR: Y - X
     FORMAT: rgba32i
+  # logit(x) = log(x / (1 - x)), with x held inside [eps, 1 - eps].  A bound
+  # below zero is carried as -1, whose interval holds the whole unit range and
+  # still sends every lane outside that range to a non-number.
+  - NAME: logit
+    OPERATOR: 'log(mix(min(max(X, Y), 1.0f - Y), X, isnan(X)) / (1.0f - mix(min(max(X, Y), 1.0f - Y), X, isnan(X))))'
   # The exponent is the payload and the base the broadcast number, so the
   # operand order of the template is reversed here.  A whole-number exponent
   # keeps a negative base signed: pow() itself refuses a negative base, so the
@@ -565,6 +570,8 @@ buffer_binary_op_scalar:
   - NAME: buffer_rsub_scalar_i32
     DTYPE: int
     OPERATOR: Y - X
+  - NAME: buffer_logit
+    OPERATOR: 'log(mix(min(max(X, Y), 1.0f - Y), X, isnan(X)) / (1.0f - mix(min(max(X, Y), 1.0f - Y), X, isnan(X))))'
   - NAME: buffer_div_scalar_i32
     DTYPE: int
     OPERATOR: X / Y
@@ -2796,4 +2803,7 @@ buffer_half_binary_op_scalar:
   - NAME: buffer_rsub_scalar_halfinplace
     OPERATOR: 'Y - X'
     INPLACE: true
+  - NAME: buffer_logit_half
+    OPERATOR: 'log(mix(min(max(X, Y), 1.0f - Y), X, isnan(X)) / (1.0f - mix(min(max(X, Y), 1.0f - Y), X, isnan(X))))'
+    INPLACE: false
 

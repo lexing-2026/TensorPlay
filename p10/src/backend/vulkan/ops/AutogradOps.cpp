@@ -3,7 +3,10 @@
 #include "Common.h"
 #include "Convert.h"
 
+#include <cmath>
+#include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace tensorplay {
@@ -14,6 +17,7 @@ namespace ops {
 Tensor add_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha);
 Tensor sub_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha);
 Tensor mul_kernel(const Tensor& self, const Tensor& other);
+Tensor div_kernel(const Tensor& self, const Tensor& other);
 Tensor div_scalar_kernel(const Tensor& self, const Scalar& other);
 Tensor add_scalar_kernel(const Tensor& self, const Scalar& other, const Scalar& alpha);
 Tensor rsub_scalar_kernel(const Tensor& self, const Scalar& other, const Scalar& alpha);
@@ -29,11 +33,17 @@ Tensor gt_scalar_kernel(const Tensor& self, const Scalar& other);
 Tensor ge_scalar_kernel(const Tensor& self, const Scalar& other);
 Tensor lt_scalar_kernel(const Tensor& self, const Scalar& other);
 Tensor le_scalar_kernel(const Tensor& self, const Scalar& other);
+Tensor eq_scalar_kernel(const Tensor& self, const Scalar& other);
+Tensor logical_or_kernel(const Tensor& self, const Tensor& other);
 Tensor where_kernel(const Tensor& condition, const Tensor& self, const Tensor& other);
 Tensor where_scalar_other_kernel(
     const Tensor& condition,
     const Tensor& self,
     const Scalar& other);
+Tensor where_scalar_self_kernel(
+    const Tensor& condition,
+    const Scalar& self,
+    const Tensor& other);
 Tensor sum_dim_kernel(
     const Tensor& self,
     const std::vector<int64_t>& dims,
@@ -56,6 +66,19 @@ void validate_float(const Tensor& t, const char* name) {
 Tensor select_by_float_mask(const Tensor& mask, const Tensor& a, const Tensor& b) {
   // where(gt(mask, 0.5), a, b)
   return where_kernel(gt_scalar_kernel(mask, Scalar(0.5)), a, b);
+}
+
+// The band a clamped logit accepts, read back at the payload's own width: a
+// half payload rounds each bound the way its lanes were rounded before the
+// comparison, so a lane sitting on the bound is classified the same way.
+std::pair<double, double> logit_band(double e, DType dtype) {
+  float lo = static_cast<float>(e);
+  if (dtype == DType::Float16) {
+    lo = static_cast<float>(Half(lo));
+    return {static_cast<double>(lo),
+            static_cast<double>(Half(1.0f - lo))};
+  }
+  return {static_cast<double>(lo), static_cast<double>(1.0f - lo)};
 }
 
 } // namespace
@@ -402,6 +425,41 @@ Tensor log_sigmoid_backward_kernel(
   return mul_kernel(grad_output, sigmoid_kernel(neg_kernel(self)));
 }
 
+// Logit backward: grad / (x (1 - x)) inside the band, the whole slope at
+// either endpoint, and past the band a value that is not a number when the
+// forward did not clamp and zero when it did.  A bound that is not a number
+// leaves the band undecided on both sides, so only the endpoints stay special.
+Tensor logit_backward_kernel(
+    const Tensor& grad_output,
+    const Tensor& self,
+    const std::optional<Scalar>& eps) {
+  validate_float(grad_output, "logit_backward");
+  const double e = eps.has_value() ? eps->toDouble() : -1.0;
+  Tensor denom =
+      mul_kernel(self, rsub_scalar_kernel(self, Scalar(1.0), Scalar(1.0)));
+  Tensor slope = div_kernel(grad_output, denom);
+  Tensor endpoint = where_kernel(
+      logical_or_kernel(eq_scalar_kernel(self, Scalar(0.0)),
+                        eq_scalar_kernel(self, Scalar(1.0))),
+      mul_scalar_kernel(
+          grad_output, Scalar(std::numeric_limits<double>::infinity())),
+      slope);
+  if (e < 0) {
+    return where_scalar_self_kernel(
+        logical_or_kernel(lt_scalar_kernel(self, Scalar(0.0)),
+                          gt_scalar_kernel(self, Scalar(1.0))),
+        Scalar(std::numeric_limits<double>::quiet_NaN()), endpoint);
+  }
+  const std::pair<double, double> band = logit_band(e, self.dtype());
+  if (std::isnan(band.first)) {
+    return endpoint;
+  }
+  return where_scalar_self_kernel(
+      logical_or_kernel(lt_scalar_kernel(self, Scalar(band.first)),
+                        gt_scalar_kernel(self, Scalar(band.second))),
+      Scalar(0.0), endpoint);
+}
+
 // Softplus forward: x*beta > threshold ? x : log1p(exp(x*beta))/beta.
 Tensor softplus_kernel(
     const Tensor& self,
@@ -456,6 +514,8 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, AutogradKernels) {
          &tensorplay::vulkan::ops::softplus_backward_kernel);
   m.impl("log_sigmoid_backward",
          &tensorplay::vulkan::ops::log_sigmoid_backward_kernel);
+  m.impl("logit_backward",
+         &tensorplay::vulkan::ops::logit_backward_kernel);
   m.impl("native_layer_norm_backward",
          &tensorplay::vulkan::ops::native_layer_norm_backward_kernel);
 }

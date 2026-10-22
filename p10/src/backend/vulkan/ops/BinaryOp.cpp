@@ -1305,6 +1305,36 @@ Tensor rsub_scalar_kernel(const Tensor& self, const Scalar& other, const Scalar&
                           alpha, "rsub");
 }
 
+// logit(p) = log(p / (1 - p)), with p held inside [eps, 1 - eps] when a bound
+// is given.  The clamp is folded into the same walk: the block carries the
+// bound, and a bound below zero is carried as the sentinel -1, whose interval
+// contains the whole unit range while still sending every lane outside that
+// range to a non-number.  A count is read through the float formula, and a
+// bound that is not a number takes the sentinel as well, since it never takes
+// part in the host fold either.
+Tensor logit_kernel(const Tensor& self, const std::optional<Scalar>& eps) {
+  double e = -1.0;
+  if (eps.has_value()) {
+    const double v = eps->toDouble();
+    if (v >= 0.0) {
+      e = v;
+    }
+  }
+  const Tensor operand = isIntegralType(self.dtype(), true)
+      ? self.to(DType::Float32)
+      : self;
+  return binary_op_scalar(
+      "logit", "buffer_logit", operand, Scalar(e), Scalar(1.0), "logit");
+}
+
+// The in-place form has the same width as the allocating one, so the answer
+// lands in the payload the caller holds through the same copy that any other
+// in-place map uses.
+Tensor& logit_inplace_kernel(Tensor& self, const std::optional<Scalar>& eps) {
+  self.copy_(logit_kernel(self, eps));
+  return self;
+}
+
 Tensor true_divide_kernel(const Tensor& self, const Tensor& other) {
   return div_kernel(self, other);
 }
@@ -1386,6 +1416,8 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, BinaryOpKernels) {
   m.impl("logaddexp", &tensorplay::vulkan::ops::logaddexp_kernel);
   m.impl("rsub.Scalar", &tensorplay::vulkan::ops::rsub_scalar_kernel);
   m.impl("rsub.Tensor", &tensorplay::vulkan::ops::subtract_tensor_kernel);
+  m.impl("logit", &tensorplay::vulkan::ops::logit_kernel);
+  m.impl("logit_", &tensorplay::vulkan::ops::logit_inplace_kernel);
   m.impl("true_divide.Tensor", &tensorplay::vulkan::ops::true_divide_kernel);
   m.impl("true_divide.Scalar", &tensorplay::vulkan::ops::true_divide_scalar_kernel);
   m.impl("divide.Tensor", &tensorplay::vulkan::ops::divide_tensor_kernel);
