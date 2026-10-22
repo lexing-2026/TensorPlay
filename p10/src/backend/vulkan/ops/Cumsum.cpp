@@ -10,6 +10,12 @@ namespace tensorplay {
 namespace vulkan {
 namespace ops {
 
+// Copies a texture-stored payload into a dense buffer vTensor; defined in
+// BinaryOp.cpp and shared by every linear path.
+api::vTensor to_buffer_storage_dispatch(
+    api::Context* context,
+    const api::vTensor& src);
+
 // Forward declaration of the element type conversion entry point.
 Tensor to_dtype_kernel(
     const Tensor& self,
@@ -143,6 +149,75 @@ Tensor cumsum_linear(const Tensor& payload, const int64_t axis) {
   return convert(v_output);
 }
 
+/*
+ * Row-walking log-sum-exp scan over linear storage.  One invocation owns one
+ * scan row and carries the logarithm of the exponentiated prefix, so the walk
+ * is serial only within a row and the launch covers the rows in parallel.
+ * The walk always takes linear storage: a row's successive positions are then
+ * adjacent words, and a payload that lives in a texture is copied into a
+ * dense buffer first.  A half payload follows the same two-pass schedule as
+ * the sum scan, since its two lanes per word belong to different rows.
+ */
+Tensor logcumsumexp_linear(const Tensor& payload, const int64_t axis) {
+  api::Context* const context = api::context();
+  api::vTensor v_input =
+      to_buffer_storage_dispatch(context, convert(payload));
+
+  const int64_t axis_size = payload.size(axis);
+  int64_t inner = 1;
+  for (int64_t d = axis + 1; d < payload.dim(); ++d) {
+    inner *= payload.size(d);
+  }
+  api::vTensor v_output{
+      context,
+      v_input.sizes(),
+      payload.dtype(),
+      api::StorageType::BUFFER,
+      api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+  // Nothing to walk, and a row count that an empty axis would leave undefined.
+  if (payload.numel() == 0) {
+    return convert(v_output);
+  }
+  const int64_t rows = payload.numel() / axis_size;
+
+  const bool is_half = payload.dtype() == DType::Float16;
+  const int32_t passes = is_half ? 2 : 1;
+  api::PipelineBarrier pipeline_barrier{};
+  for (int32_t pass = 0; pass < passes; ++pass) {
+    const struct LogSumExpBufferBlock final {
+      int32_t axis_size;
+      int32_t inner;
+      int32_t rows;
+      int32_t word_lane;
+    } block{
+        static_cast<int32_t>(axis_size),
+        static_cast<int32_t>(inner),
+        static_cast<int32_t>(rows),
+        is_half ? pass : 0,
+    };
+    api::UniformParamsBuffer params(context, block);
+    context->submit_compute_job(
+        is_half ? VK_KERNEL_FROM_STR("logcumsumexp_buffer_half")
+                : VK_KERNEL_FROM_STR("logcumsumexp_buffer"),
+        pipeline_barrier,
+        {static_cast<uint32_t>(rows), 1u, 1u},
+        {256u, 1u, 1u},
+        VK_NULL_HANDLE,
+        v_output.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            is_half ? (api::MemoryAccessType::READ |
+                       api::MemoryAccessType::WRITE)
+                    : api::MemoryAccessType::WRITE),
+        v_input.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::READ),
+        params.buffer());
+  }
+  return convert(v_output);
+}
+
 } // namespace
 
 Tensor cumsum_kernel(
@@ -229,6 +304,31 @@ Tensor& cumsum_inplace_kernel(
   return self;
 }
 
+// The running value is the logarithm of the sum of the exponentiated prefix,
+// so the payload is read in a width a logarithm can hold.  A scalar has no
+// axis to walk and answers with itself, and an empty payload answers with an
+// empty result of the requested width.
+Tensor logcumsumexp_kernel(
+    const Tensor& self, int64_t dim, std::optional<DType> dtype) {
+  const DType out_dtype = dtype.value_or(self.dtype());
+  TP_CHECK_TYPE(
+      out_dtype == DType::Float32 || out_dtype == DType::Float16,
+      "Vulkan logcumsumexp supports Float32 and Float16 payloads");
+  if (self.dim() == 0) {
+    TP_CHECK(
+        dim == 0 || dim == -1,
+        "Vulkan logcumsumexp: dimension out of range");
+    return to_dtype_kernel(
+        self, out_dtype, /*non_blocking=*/false, /*copy=*/true, std::nullopt);
+  }
+  const int64_t axis = dim < 0 ? dim + self.dim() : dim;
+  TP_CHECK(
+      axis >= 0 && axis < self.dim(),
+      "Vulkan logcumsumexp: dimension out of range");
+  const Tensor payload = as_type(dense_payload(self), out_dtype);
+  return logcumsumexp_linear(payload, axis);
+}
+
 } // namespace ops
 } // namespace vulkan
 } // namespace tensorplay
@@ -236,6 +336,7 @@ Tensor& cumsum_inplace_kernel(
 TENSORPLAY_LIBRARY_IMPL(Vulkan, CumsumKernels) {
   m.impl("cumsum", &tensorplay::vulkan::ops::cumsum_kernel);
   m.impl("cumsum_", &tensorplay::vulkan::ops::cumsum_inplace_kernel);
+  m.impl("logcumsumexp", &tensorplay::vulkan::ops::logcumsumexp_kernel);
 }
 
 #endif /* USE_VULKAN */
