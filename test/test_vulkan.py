@@ -14063,5 +14063,184 @@ class TestVulkanChannelSoftmax(unittest.TestCase):
                     self._compare(name, fn, values, 0, True, tol)
 
 
+class TestVulkanVectorNorm(unittest.TestCase):
+    # A vector norm folds the magnitudes of a span.  The order picks the fold:
+    # the zero order counts the lanes that are not zero, where a lane that is
+    # not a number is not zero and so counts; the unit order sums magnitudes;
+    # every other finite order sums the magnitudes raised to that power before
+    # the root; and the two infinite orders fold the largest and the smallest
+    # magnitude, both of which carry a special lane outward.  An empty span
+    # answers with the identity of its fold, zero for a sum or a largest
+    # magnitude and infinity for a smallest one; a walk over named axes, and a
+    # whole payload that keeps its axes, then take the root of that identity,
+    # so a negative order there answers infinity, while a whole payload that
+    # sheds every axis reports the identity itself.  An empty axis that
+    # survives the walk leaves an empty answer.  A scalar has no axis at all,
+    # so its norm is its magnitude.  A half payload widens for the walk and
+    # narrows only its answer; a count has no magnitude to measure and is
+    # refused.  Both storages answer alike.
+
+    CASES = (
+        ((3, 5), None, False),
+        ((3, 5), [0], False),
+        ((3, 5), [-1], True),
+        ((2, 3, 4), [1], True),
+        ((2, 3, 4), [0, 2], False),
+        ((2, 3, 4), [], False),
+        ((2, 3, 4, 2), [-1, 1], True),
+    )
+    ORDERS = (0, 1, 2, 3, -1.5, float("inf"), float("-inf"))
+
+    @staticmethod
+    def _device(values, dense=False):
+        if dense:
+            return tensorplay.tensor(values.copy(), device="vulkan")
+        return tensorplay.from_numpy(values.copy()).to("vulkan")
+
+    @staticmethod
+    def _host(values):
+        return tensorplay.from_numpy(values.copy())
+
+    def _compare(self, values, ord, dim, keepdim, dense=False, tol=1e-5):
+        got = tensorplay.linalg_vector_norm(
+            self._device(values, dense), ord, dim, keepdim)
+        want = tensorplay.linalg_vector_norm(
+            self._host(values), ord, dim, keepdim)
+        self.assertEqual(got.dtype, want.dtype)
+        self.assertEqual(tuple(got.shape), tuple(want.shape))
+        np.testing.assert_allclose(
+            got.cpu().numpy().astype(np.float64),
+            want.numpy().astype(np.float64),
+            rtol=tol, atol=tol, equal_nan=True,
+            err_msg=f"order {ord} over dims {dim} of shape {values.shape}")
+        return got
+
+    def test_the_norm_follows_the_host_over_every_order_and_axis_set(self):
+        rng = np.random.default_rng(71)
+        for shape, dim, keepdim in self.CASES:
+            for dtype, tol in ((np.float32, 1e-5), (np.float16, 3e-3)):
+                values = rng.standard_normal(shape).astype(dtype)
+                for ord in self.ORDERS:
+                    with self.subTest(shape=shape, dim=dim, ord=ord,
+                                      dtype=dtype):
+                        self._compare(values, ord, dim, keepdim, tol=tol)
+
+    def test_both_storages_answer_the_same_norm(self):
+        rng = np.random.default_rng(73)
+        for dtype, tol in ((np.float32, 1e-5), (np.float16, 3e-3)):
+            values = rng.standard_normal((4, 6)).astype(dtype)
+            for ord in self.ORDERS:
+                for dim, keepdim in ((None, False), ([0], True), ([1], False)):
+                    with self.subTest(ord=ord, dim=dim, dtype=dtype):
+                        wide = self._compare(values, ord, dim, keepdim, tol=tol)
+                        tight = self._compare(
+                            values, ord, dim, keepdim, dense=True, tol=tol)
+                        np.testing.assert_allclose(
+                            tight.cpu().numpy().astype(np.float64),
+                            wide.cpu().numpy().astype(np.float64),
+                            rtol=tol, atol=tol, equal_nan=True)
+
+    def test_a_wider_answer_is_offered_on_request(self):
+        rng = np.random.default_rng(79)
+        values = rng.standard_normal((4, 5)).astype(np.float16)
+        for target in (tensorplay.float16, tensorplay.float32):
+            for ord in (1, 2, 3):
+                got = tensorplay.linalg_vector_norm(
+                    self._device(values), ord, [1], False, dtype=target)
+                want = tensorplay.linalg_vector_norm(
+                    self._host(values), ord, [1], False, dtype=target)
+                with self.subTest(target=target, ord=ord):
+                    self.assertEqual(got.dtype, target)
+                    np.testing.assert_allclose(
+                        got.cpu().numpy().astype(np.float64),
+                        want.numpy().astype(np.float64),
+                        rtol=1e-5, atol=1e-5)
+        # An answer may not be narrower than the payload it measured.
+        with self.assertRaises(TypeError):
+            tensorplay.linalg_vector_norm(
+                self._device(values.astype(np.float32)), 2, [1], False,
+                dtype=tensorplay.float16)
+
+    def test_a_scalar_has_no_axis_to_fold(self):
+        for dtype, tol in ((np.float32, 1e-5), (np.float16, 3e-3)):
+            for value in (3.0, 0.0, -2.5, float("nan"), float("inf")):
+                values = np.array(value, dtype=dtype)
+                for ord in self.ORDERS:
+                    with self.subTest(value=value, ord=ord, dtype=dtype):
+                        got = self._compare(values, ord, None, False, tol=tol)
+                        self.assertEqual(tuple(got.shape), ())
+
+    def test_an_empty_walk_answers_the_identity_of_its_fold(self):
+        empties = (
+            ((0,), None, False),
+            ((0,), None, True),
+            ((0,), [], True),
+            ((0,), [0], False),
+            ((0,), [0], True),
+            ((0, 3), None, True),
+            ((0, 3), [0], False),
+            ((0, 3), [0], True),
+            ((0, 3), [1], False),
+            ((2, 0, 3), [1], True),
+            ((2, 0, 3), [1, 2], False),
+        )
+        for dense in (False, True):
+            for shape, dim, keepdim in empties:
+                values = np.zeros(shape, dtype=np.float32)
+                for ord in self.ORDERS:
+                    with self.subTest(shape=shape, dim=dim, ord=ord,
+                                      dense=dense):
+                        got = self._compare(values, ord, dim, keepdim,
+                                            dense=dense)
+                        if not got.numel():
+                            continue
+                        # A walk over named axes, and a whole payload that
+                        # keeps its axes, both take the root of the identity.
+                        axis_walk = bool(dim) or keepdim
+                        want = (
+                            float("inf")
+                            if (ord < 0 if axis_walk
+                                else ord == float("-inf"))
+                            else 0.0)
+                        self.assertTrue(
+                            np.all(got.cpu().numpy() == want))
+
+    def test_the_special_lanes_reach_the_extrema(self):
+        values = np.array([[np.nan, 1.0, -2.0],
+                           [float("inf"), float("-inf"), 0.0]],
+                          dtype=np.float32)
+        for ord in self.ORDERS:
+            for dim, keepdim in ((None, False), ([0], True), ([1], False)):
+                for dense in (False, True):
+                    with self.subTest(ord=ord, dim=dim, dense=dense):
+                        self._compare(values, ord, dim, keepdim, dense=dense)
+
+    def test_a_zero_order_counts_every_lane_that_is_not_zero(self):
+        values = np.array([0.0, -0.0, 2.5, float("nan"), 0.0],
+                          dtype=np.float32)
+        got = self._compare(values, 0, None, False)
+        self.assertEqual(float(got.cpu().numpy()), 2.0)
+        got = self._compare(values, 0, [0], False)
+        np.testing.assert_allclose(got.cpu().numpy(), np.array(2.0))
+
+    def test_a_count_has_no_magnitude_to_measure(self):
+        for values in (np.arange(6, dtype=np.int32).reshape(2, 3),
+                       np.array([True, False, True])):
+            for ord in (1, 2):
+                with self.subTest(dtype=values.dtype, ord=ord):
+                    with self.assertRaises(TypeError):
+                        tensorplay.linalg_vector_norm(
+                            self._device(values), ord, [0], False)
+
+    def test_the_axis_list_must_name_distinct_axes(self):
+        values = np.arange(24, dtype=np.float32).reshape(2, 3, 4)
+        with self.assertRaises(ValueError):
+            tensorplay.linalg_vector_norm(self._device(values), 2, [1, 1])
+        with self.assertRaises(IndexError):
+            tensorplay.linalg_vector_norm(self._device(values), 2, [3])
+        with self.assertRaises(IndexError):
+            tensorplay.linalg_vector_norm(self._device(values), 2, [-4])
+
+
 if __name__ == "__main__":
     unittest.main()
