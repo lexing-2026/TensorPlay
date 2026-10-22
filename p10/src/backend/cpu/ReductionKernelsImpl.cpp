@@ -2132,18 +2132,20 @@ static bool try_extremum_integral_dim_avx512(
 }  // namespace
 
 // Full-tensor contiguous sum; returns false -> caller uses the iterator path.
-static bool try_sum_real_avx512(const void* xv, int64_t n, DType dt,
-                                double* out) {
-    if (!reduce_avx512_available() || n < 4096) return false;
+static bool try_sum_real(const void* xv, int64_t n, DType dt, double* out) {
+    if (n < 4096) return false;
     constexpr int64_t kGrain = 32768;
     if (dt == DType::Float32) {
         const float* x = static_cast<const float*>(xv);
         const int64_t nslots = (n + kGrain - 1) / kGrain;
-        std::vector<float> part(nslots, 0.f);
+        // The chunk sums are float, but the cross-chunk merge is double: it
+        // keeps the wide reduction from paying for its parallelism in
+        // rounding.
+        std::vector<double> part(nslots, 0.0);
         tensorplay::parallel::parallel_for(0, n, kGrain, [&](int64_t b, int64_t e) {
-            part[b / kGrain] = sum_f32_chunk_avx512(x, b, e);
+            part[b / kGrain] = vec::sum(x, b, e);
         });
-        float s = 0.f;
+        double s = 0.0;
         for (int64_t k = 0; k < nslots; ++k) s += part[k];
         *out = s;
         return true;
@@ -2153,7 +2155,7 @@ static bool try_sum_real_avx512(const void* xv, int64_t n, DType dt,
         const int64_t nslots = (n + kGrain - 1) / kGrain;
         std::vector<double> part(nslots, 0.0);
         tensorplay::parallel::parallel_for(0, n, kGrain, [&](int64_t b, int64_t e) {
-            part[b / kGrain] = sum_f64_chunk_avx512(x, b, e);
+            part[b / kGrain] = vec::sum(x, b, e);
         });
         double s = 0.0;
         for (int64_t k = 0; k < nslots; ++k) s += part[k];
@@ -2402,12 +2404,11 @@ Tensor sum_kernel_impl(const Tensor& self, DType dtype) {
         input = self.to(out_dtype);
     }
 
-#if defined(__x86_64__)
     if ((acc_dtype == DType::Float32 || acc_dtype == DType::Float64) &&
         input.dtype() == acc_dtype && input.is_contiguous() &&
         input.numel() > 0) {
         double s = 0.0;
-        if (try_sum_real_avx512(input.data_ptr(), input.numel(), acc_dtype, &s)) {
+        if (try_sum_real(input.data_ptr(), input.numel(), acc_dtype, &s)) {
             if (acc_dtype == DType::Float32) {
                 *out.data_ptr<float>() = static_cast<float>(s);
             } else {
@@ -2416,7 +2417,6 @@ Tensor sum_kernel_impl(const Tensor& self, DType dtype) {
             return out;
         }
     }
-#endif
 
     if (acc_dtype == DType::Float32 || acc_dtype == DType::Float64) {
         TensorIterator iter = TensorIterator::reduce_op(out, input);
