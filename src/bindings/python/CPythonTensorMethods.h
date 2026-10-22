@@ -3,8 +3,10 @@
 #include <Python.h>
 
 #include <cstdlib>
+#include <exception>
 #include <vector>
 
+#include "LocalDispatchKeySet.h"
 #include "TensorImpl.h"
 #include "CPythonBridge.h"
 #include "python_bindings.h"
@@ -288,15 +290,44 @@ inline PyObject* forward(PyObject* impl, PyObject* self_obj,
         return forward(g_forwarded[index], self_obj, args, nargs, kwnames);      \
     }
 
-TPX_FORWARDER(0)  TPX_FORWARDER(1)  TPX_FORWARDER(2)  TPX_FORWARDER(3)
-TPX_FORWARDER(4)  TPX_FORWARDER(5)  TPX_FORWARDER(6)  TPX_FORWARDER(7)
-TPX_FORWARDER(8)  TPX_FORWARDER(9)  TPX_FORWARDER(10) TPX_FORWARDER(11)
-TPX_FORWARDER(12) TPX_FORWARDER(13) TPX_FORWARDER(14) TPX_FORWARDER(15)
-TPX_FORWARDER(16) TPX_FORWARDER(17) TPX_FORWARDER(18) TPX_FORWARDER(19)
+TPX_FORWARDER(1)  TPX_FORWARDER(2)  TPX_FORWARDER(3)  TPX_FORWARDER(4)
+TPX_FORWARDER(5)  TPX_FORWARDER(6)  TPX_FORWARDER(7)  TPX_FORWARDER(8)
+TPX_FORWARDER(9)  TPX_FORWARDER(10) TPX_FORWARDER(11) TPX_FORWARDER(12)
+TPX_FORWARDER(13) TPX_FORWARDER(14) TPX_FORWARDER(15) TPX_FORWARDER(16)
+TPX_FORWARDER(17) TPX_FORWARDER(18) TPX_FORWARDER(19)
 
 TPX_FORWARDER(20)
 
 #undef TPX_FORWARDER
+
+// ``to(dtype)`` on a value that already has that dtype asks for a conversion
+// that changes nothing, and the answer is the value it was asked of.  Whether
+// that is the case is read from the value itself, so the question is answered
+// here instead of travelling through the argument handling of the general
+// conversion -- which has to be ready for a device, another tensor, a copy, a
+// layout or a memory order in the same slot.  Anything that is not this exact
+// spelling, including a positional ``copy`` or a keyword, is handed to the
+// general conversion untouched.
+inline PyObject* forward_to(PyObject* self_obj, PyObject* const* args,
+                            Py_ssize_t nargs, PyObject* kwnames) {
+    constexpr int kToMethod = 0;  // The position "to" is installed at.
+    if (nargs == 1 && (kwnames == nullptr || PyTuple_GET_SIZE(kwnames) == 0)) {
+        try {
+            const Tensor& self = tpx_py_tensor_cref(self_obj);
+            if (self.defined() && !self.is_batched() &&
+                !tensorplay::impl::python_dispatch_active() &&
+                self.dtype() == tpx_py_dtype(args[0])) {
+                Py_INCREF(self_obj);
+                return self_obj;
+            }
+        } catch (const std::exception&) {
+            // Not a dtype in the slot, or a value this reading cannot be taken
+            // of; the general conversion gives the argument its real answer.
+            PyErr_Clear();
+        }
+    }
+    return forward(g_forwarded[kToMethod], self_obj, args, nargs, kwnames);
+}
 
 }  // namespace detail
 
@@ -313,7 +344,7 @@ inline int install_forwarded_methods(PyObject* type_obj) {
     using Fn = PyObject* (*)(PyObject*, PyObject* const*, Py_ssize_t,
                               PyObject*);
     static const Fn fns[] = {
-        detail::forward_0,  detail::forward_1,  detail::forward_2,
+        detail::forward_to, detail::forward_1,  detail::forward_2,
         detail::forward_3,  detail::forward_4,  detail::forward_5,
         detail::forward_6,  detail::forward_7,  detail::forward_8,
         detail::forward_9,  detail::forward_10, detail::forward_11,

@@ -997,6 +997,16 @@ struct BelowConversionAutograd {
 } // namespace
 
 Tensor to(const Tensor& self, DType dtype, bool non_blocking, bool copy) {
+    // Naming the dtype the value already carries asks for no conversion, and a
+    // value that is not converted has no history to record: it comes back as it
+    // stands, so neither the run beneath autograd nor the record below it has
+    // anything to do.  A value under a batch rule, or one a dispatch hook is
+    // watching, is not that simple -- the hook is watching for the conversion
+    // itself -- so those take the general path.
+    if (!copy && self.defined() && self.dtype() == dtype &&
+        !tensorplay::impl::python_dispatch_active() && !self.is_batched()) {
+        return self;
+    }
     Tensor result;
     {
         BelowConversionAutograd below;
