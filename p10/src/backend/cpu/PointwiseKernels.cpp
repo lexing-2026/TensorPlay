@@ -3123,6 +3123,15 @@ static Tensor softmax_fused_kernel_impl(const Tensor& self, int64_t dim, DType o
     if (d < 0 || d >= input.dim()) {
         TP_THROW(IndexError, format_dim_range(input.dim(), dim));
     }
+    if (input.size(d) == 0) {
+        // A normalization unit with no lane has no value to weigh, so there is
+        // nothing to walk and no length to divide the row count by: the answer
+        // is the empty payload the shape names.
+        return destination != nullptr
+            ? *destination
+            : Tensor::empty(static_cast<std::vector<int64_t>>(input.shape()),
+                            out_dtype, input.device());
+    }
 
     bool innermost = input.is_contiguous() && (d == input.dim() - 1);
     if (!innermost && input.is_contiguous()) {

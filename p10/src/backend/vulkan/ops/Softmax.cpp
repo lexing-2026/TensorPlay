@@ -41,6 +41,13 @@ Tensor softmax_impl(
   api::vTensor v_output =
       allocate_output_like(context, v_input, v_input.sizes(), v_input.dtype());
 
+  // A normalization unit with no lane has no value to weigh: the empty payload
+  // released above is the whole answer, and there is no row count to divide out
+  // of an axis length of zero.
+  if (input_arg.size(dim) == 0) {
+    return convert(v_output);
+  }
+
   // Buffer-stored payloads (any axis beyond the 3-D image limit) reduce
   // through a linear row-walking variant.  A half payload normalizes two
   // elements per output word, so its grid counts words instead of rows.
