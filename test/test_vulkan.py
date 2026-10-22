@@ -14241,6 +14241,112 @@ class TestVulkanVectorNorm(unittest.TestCase):
         with self.assertRaises(IndexError):
             tensorplay.linalg_vector_norm(self._device(values), 2, [-4])
 
+    # The two older spellings of the same measurement: a whole payload and a
+    # payload with a listed set of axes.  An absent or empty list folds every
+    # axis, so the fold table an order selects is the only difference from the
+    # named-order entry.
+
+    def _norm_pair(self, values, p, dim, keepdim, dense=False):
+        device = self._device(values, dense)
+        host = self._host(values)
+        if dim is None:
+            return device.norm(p), host.norm(p)
+        return (device.norm(p, dim, keepdim), host.norm(p, dim, keepdim))
+
+    def _compare_norm(self, values, p, dim, keepdim, dense=False, tol=1e-5):
+        got, want = self._norm_pair(values, p, dim, keepdim, dense)
+        self.assertEqual(got.dtype, want.dtype)
+        self.assertEqual(tuple(got.shape), tuple(want.shape))
+        np.testing.assert_allclose(
+            got.cpu().numpy().astype(np.float64),
+            want.numpy().astype(np.float64),
+            rtol=tol, atol=tol, equal_nan=True,
+            err_msg=(f"norm {p} over dims {dim} (keepdim {keepdim}) of shape "
+                     f"{values.shape}"))
+        return got
+
+    def test_the_norm_entries_follow_the_same_fold_table(self):
+        rng = np.random.default_rng(83)
+        plans = (
+            ((3, 5), ((None, False), ([], False), ([], True), ([0], False),
+                      ([-1], True), ([0, 1], True))),
+            ((2, 3, 4), ((None, True), ([], False), ([0], False),
+                         ([-1], False), ([0, 2], False), ([1, 2], True))),
+        )
+        for shape, axes in plans:
+            for dtype, tol in ((np.float32, 1e-5), (np.float16, 3e-3)):
+                values = rng.standard_normal(shape).astype(dtype)
+                for p in self.ORDERS:
+                    for dim, keepdim in axes:
+                        with self.subTest(shape=shape, dtype=dtype, p=p,
+                                          dim=dim, keepdim=keepdim):
+                            self._compare_norm(values, p, dim, keepdim,
+                                               tol=tol)
+
+    def test_the_norm_entries_answer_for_a_scalar(self):
+        for dtype, tol in ((np.float32, 1e-5), (np.float16, 3e-3)):
+            for value in (2.5, 0.0, -4.0, float("nan"), float("inf")):
+                values = np.array(value, dtype=dtype)
+                for p in self.ORDERS:
+                    with self.subTest(value=value, p=p, dtype=dtype):
+                        got = self._compare_norm(values, p, None, False,
+                                                 tol=tol)
+                        self.assertEqual(tuple(got.shape), ())
+
+    def test_the_norm_entries_answer_the_empty_identity(self):
+        empties = (
+            ((0,), None, False),
+            ((0,), None, True),
+            ((0,), [], True),
+            ((0,), [0], False),
+            ((0, 3), [0], True),
+            ((0, 3), [1], False),
+            ((2, 0, 4), [], False),
+            ((2, 0, 4), [1], False),
+            ((2, 0, 4), [1], True),
+        )
+        for shape, dim, keepdim in empties:
+            values = np.zeros(shape, dtype=np.float32)
+            for p in self.ORDERS:
+                with self.subTest(shape=shape, dim=dim, p=p, keepdim=keepdim):
+                    got = self._compare_norm(values, p, dim, keepdim)
+                    if not got.numel():
+                        continue
+                    # Only a list that names an axis walks under a root; a
+                    # whole payload, and a list that names none, report the
+                    # identity of the fold itself.
+                    axis_walk = bool(dim)
+                    want = (
+                        float("inf")
+                        if (p < 0 if axis_walk else p == float("-inf"))
+                        else 0.0)
+                    self.assertTrue(np.all(got.cpu().numpy() == want))
+
+    def test_the_norm_entries_fold_the_special_lanes(self):
+        values = np.array([[np.nan, 1.0, -2.0],
+                           [float("inf"), 0.0, -float("inf")]],
+                          dtype=np.float32)
+        for p in self.ORDERS:
+            for dim, keepdim in ((None, False), ([], True), ([0], True),
+                                 ([1], False)):
+                for dense in (False, True):
+                    with self.subTest(p=p, dim=dim, dense=dense):
+                        self._compare_norm(values, p, dim, keepdim,
+                                           dense=dense)
+
+    def test_the_norm_entries_refuse_a_count_payload(self):
+        # A count has no magnitude to measure, so the fold is refused rather
+        # than composed out of integer powers.
+        for values in (np.arange(6, dtype=np.int32).reshape(2, 3),
+                       np.arange(6, dtype=np.int64).reshape(2, 3),
+                       np.array([True, False, True, False, True, False])):
+            for p in (1, 2, float("inf")):
+                with self.subTest(dtype=values.dtype, p=p):
+                    with self.assertRaises(TypeError):
+                        self._device(values).norm(p)
+                    with self.assertRaises(TypeError):
+                        self._device(values).norm(p, [0], False)
+
 
 if __name__ == "__main__":
     unittest.main()
