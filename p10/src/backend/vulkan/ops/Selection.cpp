@@ -191,6 +191,63 @@ Tensor argsort_kernel(
   return std::get<1>(sort_impl(self, dim, descending, -1));
 }
 
+// The k-th smallest entry of a span and the lane that holds it.  The ordered
+// walk keeps the earlier lane of a tie and parks a lane that is not a number
+// past every ordered one, so the answer is the single entry of a one-wide
+// window of that walk.  The order counts from one; the kept lane is numbered
+// from zero and reported on the wide count.
+std::tuple<Tensor, Tensor> kthvalue_kernel(
+    const Tensor& self,
+    int64_t k,
+    int64_t dim,
+    bool keepdim) {
+  TP_CHECK(
+      self.dtype() == DType::Float32 || self.dtype() == DType::Float16,
+      "Vulkan kthvalue supports Float32 and Float16 payloads only");
+  const int64_t rank = self.dim();
+  if (rank == 0) {
+    // A lone entry has one axis to name and one rank to hold.
+    if (dim != 0 && dim != -1) {
+      TP_THROW(
+          IndexError, "Dimension out of range for scalar kthvalue input: ",
+          dim);
+    }
+    if (k != 1) {
+      TP_THROW(
+          RuntimeError,
+          "kthvalue(): selected number k out of range for dim 0");
+    }
+    Tensor indices =
+        full_kernel({}, Scalar(0), DType::Int64, self.device(), false);
+    return {clone_kernel(self), std::move(indices)};
+  }
+  const int64_t axis = dim < 0 ? dim + rank : dim;
+  if (axis < 0 || axis >= rank) {
+    TP_THROW(
+        IndexError, "Dimension out of range (expected to be in range of [",
+        -rank, ", ", rank - 1, "], but got ", dim, ")");
+  }
+  const int64_t length = self.size(axis);
+  if (k < 1 || k > length) {
+    TP_THROW(
+        RuntimeError,
+        "kthvalue(): selected number k out of range for dim ", axis);
+  }
+  const auto window = sort_impl(self, axis, false, 1, k - 1);
+  Tensor values = std::get<0>(window);
+  Tensor indices = std::get<1>(window).to(DType::Int64);
+  if (!keepdim) {
+    std::vector<int64_t> kept;
+    kept.reserve(static_cast<size_t>(rank - 1));
+    for (int64_t d = 0; d < rank; ++d) {
+      if (d != axis) kept.push_back(self.size(d));
+    }
+    values = reshape_kernel(values, kept);
+    indices = reshape_kernel(indices, kept);
+  }
+  return {std::move(values), std::move(indices)};
+}
+
 std::tuple<Tensor, Tensor> topk_kernel(
     const Tensor& self, int64_t k, int64_t dim, bool largest, bool sorted,
     int64_t impl) {
@@ -209,6 +266,7 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, SelectionKernels) {
   m.impl("sort", &tensorplay::vulkan::ops::sort_kernel);
   m.impl("argsort", &tensorplay::vulkan::ops::argsort_kernel);
   m.impl("topk", &tensorplay::vulkan::ops::topk_kernel);
+  m.impl("kthvalue", &tensorplay::vulkan::ops::kthvalue_kernel);
 }
 
 #endif /* USE_VULKAN */
