@@ -33,12 +33,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, ROOT)
 
-from tools.codegen.api_types import cpp_arg_type  # noqa: E402
+from tools.codegen.api_types import stub_arg_type  # noqa: E402
 from tools.codegen.model import parse_native_yaml  # noqa: E402
 
 DEFAULT_PROJECT = os.path.join(ROOT, "config", "native_functions.yaml")
+COMPOSITE_DIR = os.path.join(ROOT, "p10", "src", "backend", "composite")
 COMPOSITE_OUT = os.path.join(
-    ROOT, "p10", "src", "backend", "composite", "VariantOutCompositesGenerated.cpp")
+    COMPOSITE_DIR, "VariantOutCompositesGenerated.cpp")
 REFUSED_FILE = os.path.join(HERE, "out_variants_refused.txt")
 
 BEGIN_MARK = "# --- the destination variants the runtime derives ---"
@@ -91,6 +92,28 @@ def read_autogen(path):
 # ---------------------------------------------------------------------------
 # The project's own entries
 # ---------------------------------------------------------------------------
+
+def read_registrations(directory):
+    """The spellings the composites already answer.
+
+    A variant that is carried in the schema file but has no answer is
+    answered here: the schema says the variant exists, so it should.
+    """
+    import glob
+    import re
+
+    names = set()
+    for path in sorted(glob.glob(os.path.join(directory, "*.cpp"))):
+        if os.path.abspath(path) == os.path.abspath(COMPOSITE_OUT):
+            # The file this tool writes is not an answer that is
+            # already there; it is the one being written.
+            continue
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+        for match in re.finditer(r'm\.impl\("([^"]+)"', text):
+            names.add(match.group(1))
+    return names
+
 
 def read_spellings(path):
     """The spellings the schema file carries, as they are written.
@@ -204,6 +227,13 @@ def is_keyword_only(arguments):
 # The pieces that are written
 # ---------------------------------------------------------------------------
 
+def _without_alias(text):
+    """An argument spelling with its write alias removed."""
+    for alias in ("(a!)", "(b!)", "(c!)", "(d!)", "(e!)"):
+        text = text.replace(alias, "")
+    return text
+
+
 def plain_arguments(base):
     """The arguments of a map, with the tensor it writes into made plain.
 
@@ -219,9 +249,7 @@ def plain_arguments(base):
     pairs = []
     for text, argument in zip(texts, base.args):
         if written is not None and argument.name == written.name:
-            text = text.replace("(a!)", "").replace("(b!)", "")
-            text = text.replace("(c!)", "").replace("(d!)", "")
-            text = text.replace("(e!)", "")
+            text = _without_alias(text)
             argument = _PlainArgument(argument)
         pairs.append((text, argument))
     return pairs
@@ -252,11 +280,16 @@ def destinations_of(base, in_place=False):
     if kind == "tuple":
         answers = [answer for answer in base.returns
                    if answer.type.is_tensor_like]
-        names = [f"Tensor({alias_letter(index)}!) out{index}"
-                 for index in range(len(answers))]
+        names = [
+            f"Tensor({alias_letter(index)}!)[] out{index}"
+            if answer.type.is_list
+            else f"Tensor({alias_letter(index)}!) out{index}"
+            for index, answer in enumerate(answers)]
         returns = "(" + ', '.join(
-            f"Tensor({alias_letter(index)}!)"
-            for index in range(len(answers))) + ")"
+            f"Tensor({alias_letter(index)}!)[]"
+            if answer.type.is_list
+            else f"Tensor({alias_letter(index)}!)"
+            for index, answer in enumerate(answers)) + ")"
         return names, returns
     return ["Tensor(a!) out"], "Tensor(a!)"
 
@@ -270,74 +303,35 @@ def schema_entry(operation, spelling, base, in_place=False):
     arguments = arguments_of(base.schema)
     if in_place:
         # The tensor the in-place form writes into is an ordinary input
-        # of the variant that carries a destination.
-        arguments = [argument.replace("(a!)", "").replace("(b!)", "")
-                     .replace("(c!)", "").replace("(d!)", "")
-                     .replace("(e!)", "") for argument in arguments]
+        # of the variant that carries a destination.  The other tensors
+        # the in-place form writes into keep writing into the caller's
+        # tensors; only the answer of the map moves to the destination.
+        written = base.self_arg()
+        arguments = [
+            _without_alias(argument)
+            if (argument.strip() != "*" and written is not None
+                and argument_name(argument) == written.name)
+            else argument
+            for argument in arguments]
+    # A destination variant answers into a tensor the caller holds; the
+    # marking flag describes how a fresh result is built, and no
+    # destination variant takes it.
+    arguments = [argument for argument in arguments
+                 if argument_name(argument) != "requires_grad"]
     keyword_only = is_keyword_only(arguments)
     if not keyword_only:
         arguments = arguments + ["*"]
     destinations, returns = destinations_of(base, in_place)
     arguments = arguments + destinations
+    kinds = ", ".join(base.variants) if base.variants else "function"
     return (f"- func: {operation}.{spelling}("
-            f"{', '.join(arguments)}) -> {returns}")
+            f"{', '.join(arguments)}) -> {returns}\n"
+            f"  variants: {kinds}")
 
 
 def wrapper_name(operation, spelling):
     """The C++ name of the wrapper a derived spelling needs."""
     return "out_wrap_" + re.sub(r"[^0-9A-Za-z_]", "_", f"{operation}_{spelling}")
-
-
-# The defaults the schema writes by name, and the C++ names they carry.
-SYMBOLIC_DEFAULTS = {
-    "Undefined": "DType::Undefined",
-    # The memory format is carried as a number by the C++ declaration, and
-    # the numbers are the ones the format names.
-    "contiguous_format": "0",
-    "channels_last": "2",
-    "preserve": "1",
-}
-
-
-# The widths a list of each kind is held in.
-LIST_TYPES = {
-    "Tensor": "std::vector<Tensor>",
-    "float": "std::vector<double>",
-    "bool": "std::vector<bool>",
-    "int": "std::vector<int64_t>",
-    "SymInt": "std::vector<int64_t>",
-}
-
-
-def cxx_default(text, argument):
-    """The default of an argument, as C++ writes it.
-
-    The schema writes a default the way a caller would spell it; the
-    wrapper writes it the way the C++ declaration takes it.
-    """
-    text = text.strip()
-    kind = argument.type.kind
-    if argument.type.is_list:
-        # A list default is written as a list, or as the one value every
-        # element of it takes; the C++ takes the list itself.
-        elements = text[1:-1].strip() if text.startswith("[") else ""
-        if not elements:
-            return LIST_TYPES.get(kind, "std::vector<int64_t>") + "{}"
-        return (LIST_TYPES.get(kind, "std::vector<int64_t>") + "{" +
-                elements + "}")
-    if text == "None":
-        return "std::nullopt"
-    if text == "True":
-        return "true"
-    if text == "False":
-        return "false"
-    if text in SYMBOLIC_DEFAULTS:
-        return SYMBOLIC_DEFAULTS[text]
-    if kind == "DType":
-        return f"DType::{text}"
-    if len(text) >= 2 and text[0] == "'" and text[-1] == "'":
-        return '"' + text[1:-1] + '"'
-    return text
 
 
 def arguments_with_types(base):
@@ -366,28 +360,33 @@ def wrapper(operation, spelling, base, in_place=False):
         if pairs is None:
             return None
     parameters = []
-    names = []
     values = []
     written = base.self_arg().name if (in_place and base.self_arg()) else None
-    for text, argument in pairs:
+    for _, argument in pairs:
         name = argument.name
-        declared = cpp_arg_type(argument.type)
+        if name == "requires_grad":
+            # The dispatcher does not carry the marking flag; the map is
+            # answered without marking the fresh result it builds.
+            values.append("false")
+            continue
+        # A composite answers through the dispatcher, whose ABI carries
+        # owning non-trivial values by const reference.
+        declared = stub_arg_type(argument.type)
         if name == written:
             # The in-place form writes into the tensor it is given, so
             # it is handed a copy of the caller's tensor.
             declared = "const std::vector<Tensor>&" if (
                 argument.type.is_list) else "const Tensor&"
         parameters.append(f"{declared} {name}")
-        if name == written:
-            values.append("answer")
-        elif "=" in text:
-            values.append(cxx_default(text.split("=", 1)[1], argument))
-        else:
-            values.append(name)
+        # Every parameter the wrapper declares is forwarded: a schema
+        # default describes what a caller may omit, not what the wrapper
+        # substitutes for the argument it was handed.
+        values.append("answer" if name == written else name)
     call = f"ops::{cxx_name(base.func_name)}({', '.join(values)})"
     kind = base.cpp_return_kind
     if in_place:
-        if base.self_arg().type.is_list:
+        self_is_list = base.self_arg().type.is_list
+        if self_is_list:
             prepare = (
                 "    std::vector<Tensor> answer;\n"
                 "    for (const Tensor& item : self) {\n"
@@ -395,16 +394,25 @@ def wrapper(operation, spelling, base, in_place=False):
                 "    }\n")
         else:
             prepare = "    Tensor answer = ops::clone(self);\n"
-        if kind == "list":
+        if self_is_list or kind == "list":
+            # A map that writes into a list of tensors is answered with
+            # the list of the tensors it wrote into.
             parameters.append("std::vector<Tensor> out")
+            if self_is_list:
+                written_answers = "    {call};\n"
+                source = "answer"
+            else:
+                written_answers = "    const auto answers = {call};\n"
+                source = "answers"
+            written_answers = written_answers.format(call=call)
             return (f"void {wrapper_name(operation, spelling)}("
                     f"{', '.join(parameters)}) {{\n"
                     f"{prepare}"
-                    f"    {call};\n"
+                    f"{written_answers}"
                     f"    for (size_t index = 0;\n"
-                    f"         index < answer.size() && index < out.size();\n"
+                    f"         index < {source}.size() && index < out.size();\n"
                     f"         ++index) {{\n"
-                    f"        write_out(out[index], answer[index]);\n"
+                    f"        write_out(out[index], {source}[index]);\n"
                     f"    }}\n"
                     f"}}\n")
         parameters.append("Tensor& out")
@@ -429,13 +437,31 @@ def wrapper(operation, spelling, base, in_place=False):
     if kind == "tuple":
         answers = [answer for answer in base.returns
                    if answer.type.is_tensor_like]
-        for index in range(len(answers)):
-            parameters.append(f"Tensor& out{index}")
-        lays = "\n".join(
-            f"    write_out(out{index}, std::get<{index}>(answers));"
-            for index in range(len(answers)))
+        for index, answer in enumerate(answers):
+            if answer.type.is_list:
+                parameters.append(f"std::vector<Tensor> out{index}")
+            else:
+                parameters.append(f"Tensor& out{index}")
+        lays = []
+        for index, answer in enumerate(answers):
+            if answer.type.is_list:
+                lays.append(
+                    f"    for (size_t item = 0;\n"
+                    f"         item < std::get<{index}>(answers).size()"
+                    f" && item < out{index}.size();\n"
+                    f"         ++item) {{\n"
+                    f"        write_out(out{index}[item], "
+                    f"std::get<{index}>(answers)[item]);\n"
+                    f"    }}")
+            else:
+                lays.append(
+                    f"    write_out(out{index}, "
+                    f"std::get<{index}>(answers));")
+        lays = "\n".join(lays)
         gives = ', '.join(f"out{index}" for index in range(len(answers)))
-        tensors = ', '.join(["Tensor"] * len(answers))
+        tensors = ', '.join(
+            "std::vector<Tensor>" if answer.type.is_list else "Tensor"
+            for answer in answers)
         return (f"std::tuple<{tensors}> "
                 f"{wrapper_name(operation, spelling)}("
                 f"{', '.join(parameters)}) {{\n"
@@ -484,8 +510,10 @@ def main():
     if os.path.exists(REFUSED_FILE):
         with open(REFUSED_FILE, encoding="utf-8") as handle:
             refused = {line.strip() for line in handle if line.strip()}
+    registered = read_registrations(COMPOSITE_DIR)
     for operation, spelling, source in derived:
-        if (operation, spelling) in carried:
+        if (operation, spelling) in carried and \
+                f"{operation}.{spelling}" in registered:
             continue
         base = by_name.get(base_name(source))
         in_place = False
@@ -505,9 +533,13 @@ def main():
         if text is None:
             mismatched.append((operation, spelling, base.func_name))
             continue
-        entries.append(schema_entry(operation, spelling, base, in_place))
-        wrappers.append(text)
-        written.append((operation, spelling, cxx_name(base.func_name)))
+        if (operation, spelling) not in carried:
+            entries.append(schema_entry(operation, spelling, base,
+                                      in_place))
+        if f"{operation}.{spelling}" not in registered:
+            wrappers.append(text)
+            written.append((operation, spelling,
+                            cxx_name(base.func_name)))
 
     print(f"derived spellings the reference declares: {len(derived)}")
     carried_count = sum(1 for operation, spelling, _ in derived
