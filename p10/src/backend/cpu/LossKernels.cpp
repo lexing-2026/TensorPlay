@@ -429,9 +429,12 @@ Tensor kl_div_backward_kernel(const Tensor& grad_output, const Tensor& input,
 // optional weight multiply and reduction.
 void bce_check_01(const Tensor& t, const char* what) {
     if (t.numel() == 0) return;
-    double bad = (t.lt(0.0).to(DType::Float64) + t.gt(1.0).to(DType::Float64))
-                     .sum().item().to<double>();
-    if (bad > 0)
+    // Counting only the lanes strictly below or above the bounds lets a lane
+    // that is not a number through, since it answers neither comparison.
+    // Refusing on the pair of comparisons instead keeps the two bounds and a
+    // NaN in the same gate.
+    Tensor inside = Tensor::logical_and(t.ge(0.0), t.le(1.0)).all();
+    if (!inside.item<bool>())
         TP_THROW(RuntimeError, std::string("all elements of ") + what +
                  " should be between 0 and 1");
 }
