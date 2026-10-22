@@ -15095,5 +15095,312 @@ class TestVulkanGroupNorm(unittest.TestCase):
                     F.group_norm(self._device(values), 2)
 
 
+class TestVulkanGroupNormBackward(unittest.TestCase):
+    # The gradient of a group normalization owes each lane two corrections: the
+    # mean of the weighted gradient over the span the lane's group covers, and
+    # the mean of that gradient times the centered and scaled activation.  The
+    # parameter gradients need no moments at all -- a channel folds its own lane
+    # over the spatial span and then over the rows it appears in, which is why
+    # they are walked in the four-axis form (N, G, C/G, HxW): the two folds leave
+    # the channels in their own order.  An answer a caller did not ask for stays
+    # undefined instead of being filled with zeros.
+
+    SHAPES = (
+        (2, 6, 4),
+        (1, 8, 3, 5),
+        (3, 4, 2, 3),
+        (2, 12, 7),
+        (2, 8),
+    )
+
+    @staticmethod
+    def _device(values):
+        return tensorplay.from_numpy(np.ascontiguousarray(values)).to("vulkan")
+
+    @staticmethod
+    def _host(values):
+        return tensorplay.from_numpy(np.ascontiguousarray(values))
+
+    @staticmethod
+    def _absent(values):
+        # A skipped answer arrives as a tensor with no element type.
+        return (values is None
+                or str(values.dtype).startswith("tensorplay.undefined"))
+
+    @staticmethod
+    def _definition(values, grad, num_groups, weight=None, eps=1e-5):
+        # The arithmetic definition, walked in double precision.
+        wide = np.asarray(values).astype(np.float64)
+        drive = np.asarray(grad).astype(np.float64)
+        rows, channels = wide.shape[0], wide.shape[1]
+        spatial = int(np.prod(wide.shape[2:])) if wide.ndim > 2 else 1
+        per_group = channels // num_groups
+        span = per_group * spatial
+        folded = wide.reshape(rows, num_groups, span)
+        mean = folded.mean(axis=-1, keepdims=True)
+        var = ((folded - mean) ** 2).mean(axis=-1, keepdims=True)
+        rstd = 1.0 / np.sqrt(var + eps)
+        hat = (folded - mean) * rstd
+        gamma = (np.ones(channels, np.float64) if weight is None
+                 else np.asarray(weight).astype(np.float64).reshape(channels))
+        # The group fold runs channel-major: lane d*spatial + s covers channel d.
+        weighted = drive.reshape(rows, num_groups, span) * np.repeat(
+            gamma.reshape(num_groups, per_group), spatial, axis=-1).reshape(
+                1, num_groups, span)
+        dx = (rstd * (weighted
+                      - weighted.mean(axis=-1, keepdims=True)
+                      - hat * (weighted * hat).mean(axis=-1,
+                                                    keepdims=True)))
+        dx = dx.reshape(wide.shape)
+        four = (rows, num_groups, per_group, spatial)
+        centered = ((folded - mean).reshape(four)
+                    * rstd.reshape(rows, num_groups, 1, 1))
+        dweight = (drive.reshape(four) * centered).sum(axis=(0, 3)).reshape(
+            channels)
+        dbias = drive.reshape(four).sum(axis=(0, 3)).reshape(channels)
+        return (dx.astype(np.float32), dweight.astype(np.float32),
+                dbias.astype(np.float32),
+                mean.reshape(rows, num_groups).astype(np.float32),
+                rstd.reshape(rows, num_groups).astype(np.float32))
+
+    def _affine(self, channels, rng):
+        weight = (rng.random(channels) + 0.5).astype(np.float32)
+        bias = (rng.random(channels) - 0.5).astype(np.float32)
+        return weight, bias
+
+    def test_a_gradient_answers_the_walk_of_its_span(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(151)
+        for shape in self.SHAPES:
+            payload = rng.standard_normal(shape).astype(np.float32)
+            grad = (rng.standard_normal(shape) * 0.7).astype(np.float32)
+            weight, bias = self._affine(shape[1], rng)
+            for num_groups in (g for g in (1, 2, 3, 4, 6, 8)
+                               if shape[1] % g == 0):
+                for name, args in (
+                        ("none", (None, None)),
+                        ("weight", (weight, None)),
+                        ("bias", (None, bias)),
+                        ("both", (weight, bias))):
+                    with self.subTest(shape=shape, num_groups=num_groups,
+                                      affine=name):
+                        def walked(on_device):
+                            make = (self._device if on_device
+                                    else self._host)
+                            outs = F.group_norm_backward(
+                                make(grad), make(payload), num_groups,
+                                weight=None if args[0] is None else make(args[0]),
+                                bias=None if args[1] is None else make(args[1]),
+                                eps=1e-5)
+                            return [None if self._absent(t)
+                                    else (t.cpu().numpy() if on_device
+                                          else t.numpy()) for t in outs]
+                        got = walked(True)
+                        want = walked(False)
+                        truth = self._definition(payload, grad, num_groups,
+                                                 args[0])
+                        for index, (label, tol) in enumerate(
+                                (("dx", 1e-3), ("dweight", 1e-2),
+                                 ("dbias", 1e-2))):
+                            self.assertEqual(
+                                (got[index] is None), (want[index] is None),
+                                f"{label} answered when the host stayed away")
+                            if got[index] is None:
+                                continue
+                            np.testing.assert_allclose(
+                                got[index], want[index], rtol=tol, atol=tol,
+                                err_msg=f"{label} of group {num_groups}")
+                            if args[0] is not None or index == 2:
+                                np.testing.assert_allclose(
+                                    got[index], truth[index], rtol=2e-2,
+                                    atol=2e-2, err_msg=f"{label} definition")
+
+    def test_a_gradient_answers_the_moments_it_saved(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(163)
+        for shape, num_groups in (((2, 6, 4), 3), ((1, 8, 3, 5), 4),
+                                  ((3, 4, 2, 3), 2), ((2, 12, 7), 3),
+                                  ((2, 8), 4)):
+            payload = rng.standard_normal(shape).astype(np.float32)
+            grad = rng.standard_normal(shape).astype(np.float32)
+            weight = (rng.random(shape[1]) + 0.5).astype(np.float32)
+            spatial = int(np.prod(shape[2:])) if len(shape) > 2 else 1
+            truth = self._definition(payload, grad, num_groups, weight)
+            with self.subTest(shape=shape, num_groups=num_groups):
+                dx, dweight, dbias = F.native_group_norm_backward(
+                    self._device(grad), self._device(payload),
+                    self._device(truth[3]), self._device(truth[4]),
+                    self._device(weight), shape[0], shape[1], spatial,
+                    num_groups, [True, True, True])
+                for got, expected, label in (
+                        (dx, truth[0], "dx"),
+                        (dweight, truth[1], "dweight"),
+                        (dbias, truth[2], "dbias")):
+                    np.testing.assert_allclose(
+                        got.cpu().numpy(), expected, rtol=2e-3, atol=2e-3,
+                        err_msg=f"{label} over {shape} group {num_groups}")
+
+    def test_the_gradient_moves_the_answer_it_walked(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(167)
+        shape, num_groups = (1, 4, 3), 2
+        payload = rng.standard_normal(shape).astype(np.float32)
+        grad = rng.standard_normal(shape).astype(np.float32)
+        weight, bias = self._affine(shape[1], rng)
+        dx = F.group_norm_backward(
+            self._device(grad), self._device(payload), num_groups,
+            weight=self._device(weight), bias=self._device(bias),
+            eps=1e-5)[0].cpu().numpy()
+
+        def walked(values):
+            answer = F.group_norm(
+                self._device(values), num_groups,
+                weight=self._device(weight), bias=self._device(bias),
+                eps=1e-5).cpu().numpy()
+            return float(np.sum(grad * answer))
+
+        step = 1e-2
+        flat = payload.reshape(-1)
+        for index in range(flat.size):
+            up = flat.copy()
+            down = flat.copy()
+            up[index] += step
+            down[index] -= step
+            numeric = (walked(up.reshape(shape))
+                       - walked(down.reshape(shape))) / (2 * step)
+            np.testing.assert_allclose(
+                dx.reshape(-1)[index], numeric, rtol=2e-2, atol=2e-3,
+                err_msg=f"lane {index} is not the slope of the walk")
+
+    def test_a_skipped_answer_stays_away(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(173)
+        shape, num_groups = (2, 6, 4), 3
+        payload = rng.standard_normal(shape).astype(np.float32)
+        grad = rng.standard_normal(shape).astype(np.float32)
+        weight = (rng.random(shape[1]) + 0.5).astype(np.float32)
+        truth = self._definition(payload, grad, num_groups, weight)
+        for mask in ([True, False, False], [False, True, False],
+                     [False, False, True], [True, True, False],
+                     [False, False, False]):
+            with self.subTest(mask=mask):
+                outs = F.native_group_norm_backward(
+                    self._device(grad), self._device(payload),
+                    self._device(truth[3]), self._device(truth[4]),
+                    self._device(weight), 2, 6, 4, num_groups, mask)
+                for index, (wanted, label) in enumerate(
+                        zip(mask, ("dx", "dweight", "dbias"))):
+                    if not wanted:
+                        self.assertTrue(
+                            self._absent(outs[index]),
+                            f"{label} answered although it was skipped")
+                        continue
+                    np.testing.assert_allclose(
+                        outs[index].cpu().numpy(), truth[index],
+                        rtol=2e-3, atol=2e-3, err_msg=label)
+
+    def test_a_narrow_lane_graduates_in_its_own_width(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(181)
+        for shape, num_groups in (((2, 6, 4), 3), ((1, 8, 3, 5), 4)):
+            payload = (rng.standard_normal(shape) * 2).astype(np.float16)
+            grad = (rng.standard_normal(shape) * 0.5).astype(np.float16)
+            weight = (rng.random(shape[1]) + 0.5).astype(np.float16)
+            spatial = int(np.prod(shape[2:]))
+            truth = self._definition(payload, grad, num_groups, weight)
+            with self.subTest(shape=shape):
+                _, mean, rstd = F.native_group_norm(
+                    self._device(payload), self._device(weight), None,
+                    shape[0], shape[1], spatial, num_groups, 1e-5)
+                self.assertEqual(mean.dtype, tensorplay.float32)
+                self.assertEqual(rstd.dtype, tensorplay.float32)
+                dx, dweight, dbias = F.native_group_norm_backward(
+                    self._device(grad), self._device(payload), mean, rstd,
+                    self._device(weight), shape[0], shape[1], spatial,
+                    num_groups, [True, True, True])
+                for got, expected, label in (
+                        (dx, truth[0], "dx"),
+                        (dweight, truth[1], "dweight"),
+                        (dbias, truth[2], "dbias")):
+                    self.assertEqual(got.dtype, tensorplay.float16, label)
+                    np.testing.assert_allclose(
+                        got.cpu().numpy().astype(np.float32), expected,
+                        rtol=4e-3, atol=4e-3,
+                        err_msg=f"{label} of a narrow lane")
+
+    def test_a_batch_without_rows_graduates_nothing(self):
+        import tensorplay.functional as F
+        payload = np.zeros((0, 6, 4), np.float32)
+        grad = np.zeros((0, 6, 4), np.float32)
+        weight = np.ones(6, np.float32)
+        with self.subTest(kind="moments released for no row"):
+            dx, dweight, dbias = F.native_group_norm_backward(
+                self._device(grad), self._device(payload),
+                self._device(np.zeros((0, 3), np.float32)),
+                self._device(np.zeros((0, 3), np.float32)),
+                self._device(weight), 0, 6, 4, 3, [True, True, True])
+            for got, shape in ((dx, (0, 6, 4)), (dweight, (6,)), (dbias, (6,))):
+                array = got.cpu().numpy()
+                self.assertEqual(tuple(array.shape), shape)
+                self.assertTrue(np.all(array == 0))
+        with self.subTest(kind="the walk of no row"):
+            outs = F.group_norm_backward(
+                self._device(grad), self._device(payload), 3,
+                weight=self._device(weight), bias=self._device(weight),
+                eps=1e-5)
+            # An activation with no row carries no gradient, but a parameter
+            # still answers one lane per channel, and every lane totals nothing.
+            for got, shape in zip(outs, ((0, 6, 4), (6,), (6,))):
+                self.assertFalse(self._absent(got))
+                array = got.cpu().numpy()
+                self.assertEqual(tuple(array.shape), shape)
+                self.assertTrue(np.all(array == 0), "a row-less walk paid a lane")
+
+    def test_a_gradient_out_of_shape_refuses(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(191)
+        payload = rng.standard_normal((2, 6, 4)).astype(np.float32)
+        grad = rng.standard_normal((2, 6, 4)).astype(np.float32)
+        moments = np.zeros((2, 3), np.float32)
+        device = self._device(payload)
+        grad_device = self._device(grad)
+        wide_moments = self._device(np.zeros((2, 2), np.float32))
+        with self.subTest(kind="a gradient of another width"):
+            with self.assertRaisesRegex(
+                    RuntimeError, "a gradient is read in the width"):
+                F.native_group_norm_backward(
+                    self._device(grad.astype(np.float16)), device,
+                    self._device(moments), self._device(moments), None,
+                    2, 6, 4, 3, [True, False, False])
+        with self.subTest(kind="moments that miss a group"):
+            with self.assertRaisesRegex(
+                    RuntimeError, "must name every group"):
+                F.native_group_norm_backward(
+                    grad_device, device, wide_moments, wide_moments, None,
+                    2, 6, 4, 3, [True, False, False])
+        with self.subTest(kind="a row count that is not the payload's"):
+            with self.assertRaisesRegex(
+                    RuntimeError, "do not match input"):
+                F.native_group_norm_backward(
+                    grad_device, device, self._device(moments),
+                    self._device(moments), None, 3, 6, 4, 3,
+                    [True, False, False])
+        with self.subTest(kind="channels not divisible"):
+            with self.assertRaisesRegex(
+                    RuntimeError, "channels must be divisible"):
+                F.group_norm_backward(grad_device, device, 4)
+        with self.subTest(kind="a payload with one axis"):
+            with self.assertRaisesRegex(
+                    RuntimeError, "supports 2d to 4d tensors"):
+                F.group_norm_backward(self._device(np.zeros(4, np.float32)),
+                                      self._device(np.zeros(4, np.float32)), 2)
+        with self.subTest(kind="a payload that counts"):
+            with self.assertRaisesRegex(
+                    RuntimeError, "Float32 and Float16"):
+                F.group_norm_backward(
+                    self._device(grad.astype(np.int32)),
+                    self._device(payload.astype(np.int32)), 3)
+
+
 if __name__ == "__main__":
     unittest.main()
