@@ -81,6 +81,47 @@ inline void where_f64_avx512(const bool* condition, const double* self,
     }
 }
 
+// 256-bit twins.  The select runs on the sign bit of a mask that is widened
+// from the byte-per-element condition, so eight lanes leave the condition
+// array in one load and no lane is branched on.
+__attribute__((target("avx2")))
+inline void where_f32_avx2(const bool* condition, const float* self,
+                           const float* other, float* result,
+                           int64_t begin, int64_t end) {
+    int64_t i = begin;
+    const __m128i zero = _mm_setzero_si128();
+    for (; i + 8 <= end; i += 8) {
+        const __m128i c = _mm_loadl_epi64(
+            reinterpret_cast<const __m128i*>(condition + i));
+        const __m256i m = _mm256_cvtepi8_epi32(_mm_cmpeq_epi8(c, zero));
+        const __m256 a = _mm256_loadu_ps(self + i);
+        const __m256 b = _mm256_loadu_ps(other + i);
+        _mm256_storeu_ps(result + i, _mm256_blendv_ps(a, b, _mm256_castsi256_ps(m)));
+    }
+    for (; i < end; ++i) {
+        result[i] = condition[i] ? self[i] : other[i];
+    }
+}
+
+__attribute__((target("avx2")))
+inline void where_f64_avx2(const bool* condition, const double* self,
+                           const double* other, double* result,
+                           int64_t begin, int64_t end) {
+    int64_t i = begin;
+    const __m128i zero = _mm_setzero_si128();
+    for (; i + 4 <= end; i += 4) {
+        const __m128i c = _mm_cvtsi32_si128(
+            *reinterpret_cast<const int*>(condition + i));
+        const __m256i m = _mm256_cvtepi8_epi64(_mm_cmpeq_epi8(c, zero));
+        const __m256d a = _mm256_loadu_pd(self + i);
+        const __m256d b = _mm256_loadu_pd(other + i);
+        _mm256_storeu_pd(result + i, _mm256_blendv_pd(a, b, _mm256_castsi256_pd(m)));
+    }
+    for (; i < end; ++i) {
+        result[i] = condition[i] ? self[i] : other[i];
+    }
+}
+
 // Half's widening to float walks a branchy subnormal path, so a comparison
 // written over the storage never vectorizes: every lane of it stays scalar.
 // Widening a whole vector at a time and comparing in float reaches the same
@@ -428,7 +469,7 @@ Tensor where_kernel_impl(const Tensor& condition, const Tensor& self,
         const int64_t n = result.numel();
         const bool* cond = condition.data_ptr<bool>();
 #if defined(__x86_64__) || defined(__i386__)
-        if (vecunary::avx512_available() && common_dtype == DType::Float32) {
+        if (common_dtype == DType::Float32 && vecunary::avx512_available()) {
             const float* a = self_casted.data_ptr<float>();
             const float* b = other_casted.data_ptr<float>();
             float* o = result.data_ptr<float>();
@@ -438,13 +479,33 @@ Tensor where_kernel_impl(const Tensor& condition, const Tensor& self,
                 });
             return result;
         }
-        if (vecunary::avx512_available() && common_dtype == DType::Float64) {
+        if (common_dtype == DType::Float32 && vecunary::avx2_available()) {
+            const float* a = self_casted.data_ptr<float>();
+            const float* b = other_casted.data_ptr<float>();
+            float* o = result.data_ptr<float>();
+            tensorplay::parallel::parallel_for(0, n, 8192,
+                [&](int64_t begin, int64_t end) {
+                    where_f32_avx2(cond, a, b, o, begin, end);
+                });
+            return result;
+        }
+        if (common_dtype == DType::Float64 && vecunary::avx512_available()) {
             const double* a = self_casted.data_ptr<double>();
             const double* b = other_casted.data_ptr<double>();
             double* o = result.data_ptr<double>();
             tensorplay::parallel::parallel_for(0, n, 8192,
                 [&](int64_t begin, int64_t end) {
                     where_f64_avx512(cond, a, b, o, begin, end);
+                });
+            return result;
+        }
+        if (common_dtype == DType::Float64 && vecunary::avx2_available()) {
+            const double* a = self_casted.data_ptr<double>();
+            const double* b = other_casted.data_ptr<double>();
+            double* o = result.data_ptr<double>();
+            tensorplay::parallel::parallel_for(0, n, 8192,
+                [&](int64_t begin, int64_t end) {
+                    where_f64_avx2(cond, a, b, o, begin, end);
                 });
             return result;
         }
