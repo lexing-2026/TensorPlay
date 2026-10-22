@@ -574,6 +574,214 @@ Tensor group_norm_kernel(
       eps));
 }
 
+// A payload the group walk reads: single precision, and dense in its own order.
+Tensor group_walk_operand(const Tensor& t) {
+  Tensor widened =
+      t.dtype() == DType::Float32 ? t : tpx::ops::to(t, DType::Float32);
+  return widened.is_contiguous() ? widened : widened.contiguous();
+}
+
+// The gradient of a group normalization whose moments the forward released.
+// With xhat the centered and scaled activation and w the per-channel weight,
+// one group of (C/G)*HxW lanes answers
+//
+//   dx = rstd * (w*dy - mean_g(w*dy) - xhat * mean_g(w*dy * xhat))
+//
+// so the two corrections are means over the span a group covers.  The
+// parameter gradients need no moments at all: a channel folds its own lane over
+// the rows it appears in and over the spatial span, which is why they are
+// walked in the four-axis form (N, G, C/G, HxW) -- a spatial fold and then a row
+// fold leave (G, C/G), the channels in their own order.
+std::tuple<Tensor, Tensor, Tensor> native_group_norm_backward_kernel(
+    const Tensor& grad_out,
+    const Tensor& input,
+    const Tensor& mean,
+    const Tensor& rstd,
+    const std::optional<Tensor>& weight_opt,
+    int64_t N,
+    int64_t C,
+    int64_t HxW,
+    int64_t group,
+    const std::vector<bool>& output_mask) {
+  TP_CHECK(
+      input.dtype() == DType::Float32 || input.dtype() == DType::Float16,
+      "Vulkan native_group_norm_backward supports Float32 and Float16 "
+      "tensors only");
+  TP_CHECK(
+      grad_out.dtype() == input.dtype(),
+      "Vulkan native_group_norm_backward: a gradient is read in the width "
+      "the activation is");
+  TP_CHECK(
+      input.dim() >= 2 && input.dim() <= 4,
+      "Vulkan native_group_norm_backward supports 2d to 4d tensors");
+  TP_CHECK(
+      N == input.size(0) && C == input.size(1) && N * C * HxW == input.numel(),
+      "Vulkan native_group_norm_backward: supplied dimensions do not match "
+      "input");
+  TP_CHECK(
+      group > 0 && C > 0 && C % group == 0,
+      "Vulkan native_group_norm_backward: channels must be divisible by a "
+      "positive num_groups");
+  TP_CHECK(
+      HxW > 0,
+      "Vulkan native_group_norm_backward: the spatial span must be positive");
+  const int64_t moments = N * group;
+  TP_CHECK(
+      mean.numel() == moments && rstd.numel() == moments,
+      "Vulkan native_group_norm_backward: the saved moments must name every "
+      "group of every row");
+
+  const bool has_weight = weight_opt.has_value() && weight_opt->defined();
+  const bool want_input = output_mask.empty() || output_mask[0];
+  const bool want_weight =
+      has_weight && (output_mask.size() <= 1 || output_mask[1]);
+  const bool want_bias = output_mask.size() > 2 && output_mask[2];
+
+  if (N == 0) {
+    // Nothing was walked, so nothing carries a gradient: the answers are the
+    // zeros the shapes of the operands name.
+    const std::vector<int64_t> channels{C};
+    return std::make_tuple(
+        want_input ? Tensor::zeros(
+                         static_cast<std::vector<int64_t>>(input.shape()),
+                         input.dtype(),
+                         input.device())
+                   : Tensor(),
+        want_weight ? Tensor::zeros(
+                          channels, weight_opt->dtype(), input.device())
+                    : Tensor(),
+        want_bias
+            ? Tensor::zeros(channels, input.dtype(), input.device())
+            : Tensor());
+  }
+
+  const auto reshape_to = [](const Tensor& t, std::vector<int64_t> shape) {
+    return dispatch_vk<Tensor>("reshape", t, shape);
+  };
+  const auto product = [](const Tensor& a, const Tensor& b) {
+    return dispatch_vk<Tensor>("mul.Tensor", a, b);
+  };
+  const auto difference = [](const Tensor& a, const Tensor& b) {
+    return dispatch_vk<Tensor>("sub.Tensor", a, b, Scalar(1.0));
+  };
+  const auto mean_over = [](const Tensor& t, std::vector<int64_t> axes) {
+    return dispatch_vk<Tensor>("mean.dim", t, axes, true, DType::Float32);
+  };
+  const auto total_over = [](const Tensor& t, std::vector<int64_t> axes) {
+    return dispatch_vk<Tensor>(
+        "sum.dim_IntList", t, axes, false, DType::Float32);
+  };
+
+  const Tensor dy = group_walk_operand(grad_out);
+  const Tensor x = group_walk_operand(input);
+  const Tensor mu = group_walk_operand(mean);
+  const Tensor rs = group_walk_operand(rstd);
+
+  const int64_t channels_per_group = C / group;
+  const int64_t span = channels_per_group * HxW;
+  const std::vector<int64_t> span_axis{2};
+  const std::vector<int64_t> spatial_axis{3};
+  const std::vector<int64_t> row_axis{0};
+
+  // The weight joins the gradient while the channels are still one axis, the
+  // way the forward let them ride.
+  Tensor weighted_gradient = reshape_to(dy, std::vector<int64_t>{N, C, HxW});
+  if (has_weight) {
+    weighted_gradient = product(
+        weighted_gradient,
+        reshape_to(group_walk_operand(*weight_opt),
+                   std::vector<int64_t>{1, C, 1}));
+  }
+
+  const Tensor dy3 =
+      reshape_to(weighted_gradient, std::vector<int64_t>{N, group, span});
+  const Tensor x3 = reshape_to(x, std::vector<int64_t>{N, group, span});
+  const Tensor mu3 = reshape_to(mu, std::vector<int64_t>{N, group, 1});
+  const Tensor rs3 = reshape_to(rs, std::vector<int64_t>{N, group, 1});
+  const Tensor xhat3 = product(difference(x3, mu3), rs3);
+
+  Tensor dx;
+  if (want_input) {
+    const Tensor row_mean = mean_over(dy3, span_axis);
+    const Tensor row_product_mean = mean_over(product(dy3, xhat3), span_axis);
+    const Tensor corrected = difference(
+        difference(dy3, row_mean), product(xhat3, row_product_mean));
+    dx = tpx::ops::to(
+        reshape_to(
+            reshape_to(product(corrected, rs3), std::vector<int64_t>{N, C, HxW}),
+            static_cast<std::vector<int64_t>>(input.shape())),
+        input.dtype());
+  }
+
+  Tensor dweight;
+  Tensor dbias;
+  const std::vector<int64_t> four{N, group, channels_per_group, HxW};
+  const Tensor dy4 = reshape_to(dy, four);
+  if (want_weight) {
+    const Tensor point = reshape_to(mu, std::vector<int64_t>{N, group, 1, 1});
+    const Tensor wide = reshape_to(rs, std::vector<int64_t>{N, group, 1, 1});
+    const Tensor xhat4 =
+        product(difference(reshape_to(x, four), point), wide);
+    dweight = tpx::ops::to(
+        reshape_to(
+            total_over(total_over(product(dy4, xhat4), spatial_axis), row_axis),
+            std::vector<int64_t>{C}),
+        weight_opt->dtype());
+  }
+  if (want_bias) {
+    dbias = tpx::ops::to(
+        reshape_to(
+            total_over(total_over(dy4, spatial_axis), row_axis),
+            std::vector<int64_t>{C}),
+        input.dtype());
+  }
+  return std::make_tuple(dx, dweight, dbias);
+}
+
+// The gradient of a group normalization that saved nothing: the moments are
+// walked from the activation the caller hands over, and the walk of the forward
+// releases them in the shape a gradient reads.
+std::tuple<Tensor, Tensor, Tensor> group_norm_backward_kernel(
+    const Tensor& grad_output,
+    const Tensor& input,
+    int64_t num_groups,
+    const std::optional<Tensor>& weight_opt,
+    const std::optional<Tensor>& bias_opt,
+    double eps) {
+  TP_CHECK(
+      input.dim() >= 2 && input.dim() <= 4,
+      "Vulkan group_norm_backward supports 2d to 4d tensors");
+  int64_t spatial = 1;
+  for (int64_t dim = 2; dim < input.dim(); ++dim) {
+    spatial *= input.size(dim);
+  }
+  const int64_t N = input.size(0);
+  const int64_t C = input.size(1);
+  const bool has_weight = weight_opt.has_value() && weight_opt->defined();
+  const bool has_bias = bias_opt.has_value() && bias_opt->defined();
+
+  auto moments = tensorplay::tpx::ops::native_group_norm(
+      input, weight_opt, bias_opt, N, C, spatial, num_groups, eps);
+  auto gradients = native_group_norm_backward_kernel(
+      grad_output,
+      input,
+      std::get<1>(moments),
+      std::get<2>(moments),
+      weight_opt,
+      N,
+      C,
+      spatial,
+      num_groups,
+      std::vector<bool>{true, has_weight, has_bias});
+  if (std::get<2>(gradients).defined() && has_bias &&
+      bias_opt->dtype() != std::get<2>(gradients).dtype()) {
+    // A parameter kept narrower than its activation answers in its own width.
+    std::get<2>(gradients) =
+        tpx::ops::to(std::get<2>(gradients), bias_opt->dtype());
+  }
+  return gradients;
+}
+
 namespace {
 
 // Single-dispatch root-mean-square normalization over the trailing width
@@ -2206,6 +2414,12 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, NormalizationKernels) {
   m.impl(
       "native_group_norm",
       &tensorplay::vulkan::ops::native_group_norm_kernel);
+  m.impl(
+      "group_norm_backward",
+      &tensorplay::vulkan::ops::group_norm_backward_kernel);
+  m.impl(
+      "native_group_norm_backward",
+      &tensorplay::vulkan::ops::native_group_norm_backward_kernel);
 }
 
 TENSORPLAY_LIBRARY_IMPL(Vulkan, LlmKernels) {
