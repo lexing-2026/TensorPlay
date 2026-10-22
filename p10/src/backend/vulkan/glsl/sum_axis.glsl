@@ -53,12 +53,14 @@ void main() {
     imageStore(uOutput, pos, acc * uBlock.scale);
   } else if (uBlock.axis == 2) {
     // Channel: (x, y, n) aggregates every channel of batch n.  Lanes beyond
-    // the channel count are masked, the lane results are collapsed, and the
-    // total is replicated so later stages see a consistent value per lane.
+    // the channel count are masked per channel texel, the lane results are
+    // collapsed, and the total is replicated so later stages see a consistent
+    // value per lane.
     const int n = pos.z;
-    const vec4 lane_mask = vec4(lessThan(
-        ivec4(0, 1, 2, 3), ivec4(uBlock.in_sizes.z)));
     for (int c4 = 0; c4 < uBlock.in_c_depth; ++c4) {
+      const vec4 lane_mask = vec4(lessThan(
+          ivec4(c4 * 4) + ivec4(0, 1, 2, 3),
+          ivec4(uBlock.in_sizes.z)));
       acc += lane_mask *
           texelFetch(uInput, ivec3(pos.x, pos.y, n * uBlock.in_c_depth + c4),
                      0);

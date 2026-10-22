@@ -49,24 +49,37 @@ void main() {
 
   vec4 mean = vec4(0.0f);
   vec4 sq = vec4(0.0f);
-  vec4 lane_mask = vec4(1.0f);
 
   if (uBlock.axis == 2) {
-    lane_mask = vec4(lessThan(
-        ivec4(0, 1, 2, 3), ivec4(uBlock.in_sizes.z)));
+    // Channel: every lane of every channel texel feeds the same line, so the
+    // line mean is collapsed across the lanes before it is squared.  Squaring
+    // the per-lane means would drop the cross-lane terms of the deviation sum.
     const int n = pos.z;
+    vec4 lane_sum = vec4(0.0f);
     for (int c4 = 0; c4 < uBlock.in_c_depth; ++c4) {
-      const vec4 v = lane_mask *
+      const vec4 lane_mask = vec4(lessThan(
+          ivec4(c4 * 4) + ivec4(0, 1, 2, 3),
+          ivec4(uBlock.in_sizes.z)));
+      lane_sum += lane_mask *
           texelFetch(
               uInput, ivec3(pos.x, pos.y, n * uBlock.in_c_depth + c4), 0);
-      mean += v;
-      sq += v * v;
     }
-    mean /= float(uBlock.count);
+    const float line_mean =
+        (lane_sum.x + lane_sum.y + lane_sum.z + lane_sum.w) /
+        float(uBlock.count);
+    float dev_sq = 0.0f;
+    for (int c4 = 0; c4 < uBlock.in_c_depth; ++c4) {
+      const vec4 lane_mask = vec4(lessThan(
+          ivec4(c4 * 4) + ivec4(0, 1, 2, 3),
+          ivec4(uBlock.in_sizes.z)));
+      const vec4 d = lane_mask *
+          (texelFetch(
+               uInput, ivec3(pos.x, pos.y, n * uBlock.in_c_depth + c4), 0) -
+           vec4(line_mean));
+      dev_sq += dot(d, d);
+    }
     const float var =
-        dot(sq / float(uBlock.count) - mean * mean, vec4(1.0f)) *
-        float(uBlock.count) /
-        float(max(uBlock.count - uBlock.correction, 1));
+        dev_sq / float(max(uBlock.count - uBlock.correction, 1));
     imageStore(uOutput, ivec3(pos.x, pos.y, n), vec4(var));
     return;
   }

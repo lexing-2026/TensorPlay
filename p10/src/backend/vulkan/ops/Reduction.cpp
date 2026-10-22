@@ -22,6 +22,14 @@ namespace ops {
 
 Tensor sub_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha);
 
+// Defined in Copy.cpp; the element type conversion entry point.
+Tensor to_dtype_kernel(
+    const Tensor& self,
+    DType dtype,
+    bool non_blocking,
+    bool copy,
+    std::optional<int64_t> memory_format);
+
 // Defined in View.cpp; materializes a strided view into a dense payload,
 // reading a linear payload through the gather's buffer variant.
 Tensor materialize_view(
@@ -1583,6 +1591,13 @@ std::optional<Tensor> var_half_single_axis(
   if (self.dtype() != DType::Float16 || dims.size() != 1) {
     return std::nullopt;
   }
+  // The fused walk divides by the degrees of freedom on the device; a
+  // degenerate line (correction at or above the element count) instead needs
+  // the ratio of its deviation sum to zero, which the ordinary composition
+  // answers as NaN or infinity.
+  if (self.size(dims[0]) - correction <= 0) {
+    return std::nullopt;
+  }
   return reduce_impl(self, dims, keepdim, /*mean_mode=*/false,
                      /*var_mode=*/true, correction);
 }
@@ -1596,8 +1611,14 @@ Tensor var_buffer_one_pass(
   for (const int64_t axis : dims) {
     count *= self.size(axis);
   }
+  // Degrees of freedom below zero leave nothing to average: the answer is the
+  // ratio of a non-negative deviation sum to zero, i.e. NaN for a constant
+  // line and infinity otherwise.
   const double denom =
-      static_cast<double>(std::max<int64_t>(count - correction, 1));
+      std::max(0.0, static_cast<double>(count - correction));
+  const double inverse_denom = denom > 0.0
+      ? 1.0 / denom
+      : std::numeric_limits<double>::infinity();
 
   // A half payload cannot carry the raw sums: the square sum of a long axis
   // leaves the finite range of the format well before the axis ends.  Several
@@ -1612,7 +1633,7 @@ Tensor var_buffer_one_pass(
       const Tensor mean_sq =
           reduce_impl(self.mul(self), dims, /*keepdim=*/true, true, false, 0);
       return mean_sq.sub(mean.mul(mean))
-          .mul(Scalar(static_cast<double>(count) / denom));
+          .mul(Scalar(static_cast<double>(count) * inverse_denom));
     }
     const Tensor sum =
         reduce_impl(self, dims, /*keepdim=*/true, false, false, 0);
@@ -1621,7 +1642,7 @@ Tensor var_buffer_one_pass(
     const Tensor sum_sq =
         reduce_impl(self.mul(self), dims, /*keepdim=*/true, false, false, 0);
     return sum_sq.sub(sum.mul(sum).mul(Scalar(1.0 / count)))
-        .mul(Scalar(1.0 / denom));
+        .mul(Scalar(inverse_denom));
   }();
 
   if (keepdim) {
@@ -1668,13 +1689,131 @@ Tensor var_kernel(const Tensor& self, int64_t correction) {
   Tensor centered_sq = square(broadcast_sub(self, mean));
   Tensor summed = reduce_impl(centered_sq, dims, false, false, false, 0);
   const double denom =
-      static_cast<double>(std::max<int64_t>(count - correction, 1));
-  return summed.mul(Scalar(1.0 / denom));
+      std::max(0.0, static_cast<double>(count - correction));
+  const double inverse_denom = denom > 0.0
+      ? 1.0 / denom
+      : std::numeric_limits<double>::infinity();
+  return summed.mul(Scalar(inverse_denom));
 }
 
 Tensor std_kernel(const Tensor& self, int64_t correction) {
   Tensor v = var_kernel(self, correction);
   return v.sqrt();
+}
+
+// The shape left after dropping (or collapsing to one) the reduced axes.
+std::vector<int64_t> kept_reduction_sizes(
+    const Tensor& self,
+    const std::vector<int64_t>& dims,
+    bool keepdim) {
+  std::vector<int64_t> sizes;
+  sizes.reserve(static_cast<size_t>(self.dim()));
+  for (int64_t axis = 0; axis < self.dim(); ++axis) {
+    const bool reduced = std::find(dims.begin(), dims.end(), axis) != dims.end();
+    if (!reduced) {
+      sizes.push_back(self.size(axis));
+    } else if (keepdim) {
+      sizes.push_back(1);
+    }
+  }
+  return sizes;
+}
+
+// Paired first and second moments over the same span.  The variance
+// denominator is the element count less the requested correction, floored at
+// zero: a degenerate line divides its deviation sum by zero, which answers
+// NaN for a constant line and infinity otherwise.  A scalar reduces no axis,
+// so its empty deviation sum answers NaN while the mean stays the value
+// itself.
+std::tuple<Tensor, Tensor> var_mean_pair(
+    const Tensor& self,
+    const std::vector<int64_t>& dims_in,
+    int64_t correction,
+    bool keepdim,
+    bool take_sqrt) {
+  const bool is_half = self.dtype() == DType::Float16;
+  const DType output_dtype =
+      is_half || self.dtype() == DType::Float32 ? self.dtype()
+                                                : DType::Float32;
+  Tensor input = self.dtype() == output_dtype ? self : self.to(output_dtype);
+  const Scalar nan(std::numeric_limits<double>::quiet_NaN());
+
+  if (input.dim() == 0) {
+    TP_CHECK(dims_in.empty(), "Vulkan var_mean: dimension out of range");
+    return {
+        full_kernel({}, nan, output_dtype, self.device(), false),
+        to_dtype_kernel(input, output_dtype, false, true, std::nullopt)};
+  }
+  TP_CHECK(
+      input.dim() >= 1 && input.dim() <= 4,
+      "Vulkan var_mean supports 1d to 4d tensors");
+
+  std::vector<int64_t> dims = normalized_dims(input, dims_in);
+  if (dims.empty()) {
+    dims.reserve(static_cast<size_t>(input.dim()));
+    for (int64_t axis = 0; axis < input.dim(); ++axis) {
+      dims.push_back(axis);
+    }
+  }
+  const std::vector<int64_t> out_sizes =
+      kept_reduction_sizes(input, dims, keepdim);
+  int64_t count = 1;
+  for (const int64_t axis : dims) {
+    count *= input.size(axis);
+  }
+  if (input.numel() == 0) {
+    // An empty walk has no mean to report: it answers NaN over a non-empty
+    // reduced axis, and an output that is itself empty over an unreduced one.
+    return {
+        full_kernel(out_sizes, nan, output_dtype, self.device(), false),
+        full_kernel(out_sizes, nan, output_dtype, self.device(), false)};
+  }
+
+  // Half statistics accumulate in single precision so that a long span
+  // cannot overflow the narrow format; only the answers narrow back.
+  const Tensor wide = is_half ? input.to(DType::Float32) : input;
+  const double denom =
+      std::max(0.0, static_cast<double>(count - correction));
+  const double inverse_denom = denom > 0.0
+      ? 1.0 / denom
+      : std::numeric_limits<double>::infinity();
+
+  Tensor mean_keep;
+  Tensor var_keep;
+  if (convert(wide).storage_type() == api::StorageType::BUFFER) {
+    // Linear elementwise kernels refuse broadcasts, so the centered walk is
+    // replaced by the equivalent raw-moment form
+    //   (sum(x^2) - sum(x)^2 / n) / (n - c).
+    const Tensor sum = reduce_impl(wide, dims, /*keepdim=*/true,
+                                   /*mean_mode=*/false, /*var_mode=*/false, 0);
+    const Tensor sum_sq = reduce_impl(wide.mul(wide), dims, /*keepdim=*/true,
+                                      /*mean_mode=*/false, /*var_mode=*/false,
+                                      0);
+    mean_keep = sum.mul(Scalar(1.0 / static_cast<double>(count)));
+    var_keep = sum_sq.sub(sum.mul(mean_keep)).mul(Scalar(inverse_denom));
+  } else {
+    mean_keep = reduce_impl(wide, dims, /*keepdim=*/true,
+                            /*mean_mode=*/true, /*var_mode=*/false, 0);
+    const Tensor centered_sq = square(broadcast_sub(wide, mean_keep));
+    var_keep = reduce_impl(centered_sq, dims, /*keepdim=*/true,
+                           /*mean_mode=*/false, /*var_mode=*/false, 0)
+                   .mul(Scalar(inverse_denom));
+  }
+
+  if (!keepdim) {
+    var_keep = repack_with_sizes(var_keep, out_sizes);
+    mean_keep = repack_with_sizes(mean_keep, out_sizes);
+  }
+  if (take_sqrt) {
+    var_keep = var_keep.sqrt();
+  }
+  if (var_keep.dtype() != output_dtype) {
+    var_keep = var_keep.to(output_dtype);
+  }
+  if (mean_keep.dtype() != output_dtype) {
+    mean_keep = mean_keep.to(output_dtype);
+  }
+  return std::make_tuple(var_keep, mean_keep);
 }
 
 } // namespace
@@ -1718,9 +1857,12 @@ Tensor var_dim_kernel(
   Tensor summed =
       reduce_impl(centered_sq, dims, keepdim, false, false, 0);
 
-  const double denom = static_cast<double>(
-      std::max<int64_t>(count - correction, 1));
-  return summed.mul(Scalar(1.0 / denom));
+  const double denom = std::max(
+      0.0, static_cast<double>(count - correction));
+  const double inverse_denom = denom > 0.0
+      ? 1.0 / denom
+      : std::numeric_limits<double>::infinity();
+  return summed.mul(Scalar(inverse_denom));
 }
 
 Tensor std_dim_kernel(
@@ -1729,6 +1871,22 @@ Tensor std_dim_kernel(
     int64_t correction,
     bool keepdim) {
   return var_dim_kernel(self, dim, correction, keepdim).sqrt();
+}
+
+std::tuple<Tensor, Tensor> var_mean_kernel(
+    const Tensor& self,
+    const std::vector<int64_t>& dim,
+    bool unbiased,
+    bool keepdim) {
+  return var_mean_pair(self, dim, unbiased ? 1 : 0, keepdim, false);
+}
+
+std::tuple<Tensor, Tensor> std_mean_kernel(
+    const Tensor& self,
+    const std::vector<int64_t>& dim,
+    bool unbiased,
+    bool keepdim) {
+  return var_mean_pair(self, dim, unbiased ? 1 : 0, keepdim, true);
 }
 
 } // namespace ops
@@ -1765,6 +1923,8 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, ReductionKernels) {
   m.impl("std.dim", &tensorplay::vulkan::ops::std_dim_kernel);
   m.impl("var", &tensorplay::vulkan::ops::var_kernel);
   m.impl("std", &tensorplay::vulkan::ops::std_kernel);
+  m.impl("var_mean", &tensorplay::vulkan::ops::var_mean_kernel);
+  m.impl("std_mean", &tensorplay::vulkan::ops::std_mean_kernel);
   m.impl("norm", &tensorplay::vulkan::ops::norm_kernel);
   m.impl("norm.dim", &tensorplay::vulkan::ops::norm_dim_kernel);
 }
