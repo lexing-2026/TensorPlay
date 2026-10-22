@@ -14348,5 +14348,164 @@ class TestVulkanVectorNorm(unittest.TestCase):
                         self._device(values).norm(p, [0], False)
 
 
+class TestVulkanKthValue(unittest.TestCase):
+    # The k-th smallest entry of a span, counted from one, together with the
+    # zero-based lane that holds it.  A tie names the earlier lane, and a lane
+    # that is not a number ranks past every ordered lane, so the last rank of a
+    # span that holds one answers with the earliest of them.  The answer keeps
+    # the element type of the payload it came from while the lane is a wide
+    # count.  A span is a listed axis of the payload, so a lone entry answers
+    # itself at the first rank.
+
+    CASES = (
+        ((7,), (0, -1)),
+        ((2, 5), (0, 1, -2, -1)),
+        ((3, 4, 2), (0, 1, 2, -1)),
+        ((2, 3, 4, 2), (3, -1)),
+    )
+
+    @staticmethod
+    def _device(values, dense=False):
+        if dense:
+            return tensorplay.tensor(values.copy(), device="vulkan")
+        return tensorplay.from_numpy(values.copy()).to("vulkan")
+
+    @staticmethod
+    def _host(values):
+        return tensorplay.from_numpy(values.copy())
+
+    def _compare(self, values, k, dim, keepdim, dense=False, tol=1e-5):
+        got = self._device(values, dense).kthvalue(k, dim, keepdim)
+        want = self._host(values).kthvalue(k, dim, keepdim)
+        self.assertEqual(got[0].dtype, want[0].dtype)
+        self.assertEqual(got[1].dtype, want[1].dtype)
+        self.assertEqual(tuple(got[0].shape), tuple(want[0].shape))
+        self.assertEqual(tuple(got[1].shape), tuple(want[1].shape))
+        np.testing.assert_array_equal(
+            got[1].cpu().numpy(), want[1].numpy(),
+            err_msg=f"lane of rank {k} at dim {dim} of shape {values.shape}")
+        np.testing.assert_allclose(
+            got[0].cpu().numpy().astype(np.float64),
+            want[0].numpy().astype(np.float64),
+            rtol=tol, atol=tol, equal_nan=True,
+            err_msg=f"value of rank {k} at dim {dim} of shape {values.shape}")
+        return got
+
+    def test_every_rank_of_the_span_follows_the_host(self):
+        rng = np.random.default_rng(101)
+        for shape, dims in self.CASES:
+            for dtype, tol in ((np.float32, 1e-5), (np.float16, 3e-3)):
+                values = (rng.standard_normal(shape) * 8).astype(dtype)
+                for dim in dims:
+                    length = shape[dim % len(shape)]
+                    for k in range(1, length + 1):
+                        for keepdim in (False, True):
+                            with self.subTest(shape=shape, dtype=dtype, dim=dim,
+                                              k=k, keepdim=keepdim):
+                                self._compare(values, k, dim, keepdim, tol=tol)
+
+    def test_both_storages_answer_the_same_selection(self):
+        rng = np.random.default_rng(103)
+        values = (rng.standard_normal((3, 6)) * 4).astype(np.float32)
+        for dim, ranks in ((0, (1, 2, 3)), (1, (1, 4, 6)), (-1, (2, 5, 6))):
+            keepdim = dim == 0
+            with self.subTest(dim=dim, ranks=ranks):
+                for k in ranks:
+                    wide = self._compare(values, k, dim, keepdim)
+                    tight = self._compare(values, k, dim, keepdim, dense=True)
+                    np.testing.assert_array_equal(
+                        tight[0].cpu().numpy(), wide[0].cpu().numpy())
+                    np.testing.assert_array_equal(
+                        tight[1].cpu().numpy(), wide[1].cpu().numpy())
+
+    def test_a_tie_names_the_earlier_lane(self):
+        values = np.array([2.0, 1.0, 2.0, 1.0, 2.0], dtype=np.float32)
+        ordered = [(1, 1.0, 1), (2, 1.0, 3), (3, 2.0, 0), (4, 2.0, 2),
+                   (5, 2.0, 4)]
+        for k, value, lane in ordered:
+            with self.subTest(k=k):
+                got = self._compare(values, k, 0, False)
+                self.assertEqual(float(got[0].cpu().numpy()), value)
+                self.assertEqual(int(got[1].cpu().numpy()), lane)
+
+    def test_a_lane_that_is_not_a_number_ranks_last(self):
+        values = np.array([np.nan, 1.0, np.nan, -2.0], dtype=np.float32)
+        # The ordered lanes come first, then the two lanes that are not a
+        # number, the earlier of them at the earlier rank.
+        ordered = [(1, -2.0, 3), (2, 1.0, 1), (3, float("nan"), 0),
+                   (4, float("nan"), 2)]
+        for k, value, lane in ordered:
+            for dtype in (np.float32, np.float16):
+                with self.subTest(k=k, dtype=dtype):
+                    got = self._compare(values.astype(dtype), k, 0, False,
+                                        tol=1e-5 if dtype is np.float32 else 3e-3)
+                    self.assertEqual(int(got[1].cpu().numpy()), lane)
+                    if np.isnan(value):
+                        self.assertTrue(np.isnan(float(got[0].cpu().numpy())))
+                    else:
+                        self.assertEqual(float(got[0].cpu().numpy()), value)
+        edges = np.array([float("inf"), float("-inf"), 1.0], np.float32)
+        for k, lane in ((1, 1), (2, 2), (3, 0)):
+            with self.subTest(k=k):
+                got = self._compare(edges, k, 0, False)
+                self.assertEqual(int(got[1].cpu().numpy()), lane)
+                self.assertEqual(float(got[0].cpu().numpy()),
+                                 [-float("inf"), 1.0, float("inf")][k - 1])
+
+    def test_a_lone_entry_answers_itself(self):
+        for value in (2.5, -1.0, 0.0, float("nan"), float("inf")):
+            for dim in (0, -1):
+                for keepdim in (False, True):
+                    with self.subTest(value=value, dim=dim, keepdim=keepdim):
+                        got = self._compare(np.array(value, np.float32), 1, dim,
+                                            keepdim)
+                        self.assertEqual(tuple(got[0].shape), ())
+                        self.assertEqual(int(got[1].cpu().numpy()), 0)
+
+    def test_the_selection_unlocks_a_median_over_an_axis(self):
+        rng = np.random.default_rng(107)
+        values = (rng.standard_normal((4, 5)) * 6).astype(np.float32)
+        values[1] = np.array([3.0, 3.0, -1.0, 3.0, np.nan], np.float32)
+        for dim in (0, 1, -1):
+            for keepdim in (False, True):
+                with self.subTest(dim=dim, keepdim=keepdim):
+                    got = self._device(values).median(dim, keepdim)
+                    want = self._host(values).median(dim, keepdim)
+                    self.assertEqual(got[1].dtype, want[1].dtype)
+                    self.assertEqual(tuple(got[0].shape), tuple(want[0].shape))
+                    np.testing.assert_array_equal(got[1].cpu().numpy(),
+                                                 want[1].numpy())
+                    np.testing.assert_allclose(
+                        got[0].cpu().numpy(), want[0].numpy(),
+                        rtol=1e-5, atol=1e-5, equal_nan=True)
+
+    def test_a_rank_or_axis_outside_the_span_refuses(self):
+        payload = self._device(np.zeros((2, 3), np.float32))
+        with self.assertRaisesRegex(RuntimeError, "out of range for dim"):
+            payload.kthvalue(0, 1)
+        with self.assertRaisesRegex(RuntimeError, "out of range for dim"):
+            payload.kthvalue(4, 1)
+        with self.assertRaisesRegex(RuntimeError, "out of range for dim"):
+            # An axis with no lane holds no rank at all.
+            self._device(np.zeros((2, 0), np.float32)).kthvalue(1, 1)
+        with self.assertRaisesRegex(IndexError, "Dimension out of range"):
+            payload.kthvalue(1, 2)
+        with self.assertRaisesRegex(IndexError, "Dimension out of range"):
+            payload.kthvalue(1, -3)
+        scalar = self._device(np.array(1.0, np.float32))
+        with self.assertRaisesRegex(IndexError, "for scalar kthvalue input"):
+            scalar.kthvalue(1, 1)
+        with self.assertRaisesRegex(RuntimeError, "out of range for dim"):
+            scalar.kthvalue(2, 0)
+
+    def test_a_count_has_no_order_to_walk(self):
+        for values in (np.arange(6, dtype=np.int32).reshape(2, 3),
+                       np.arange(6, dtype=np.int64).reshape(2, 3),
+                       np.array([True, False, True], np.bool_)):
+            with self.subTest(dtype=values.dtype):
+                with self.assertRaisesRegex(RuntimeError, "Float32 and Float16"):
+                    self._device(values).kthvalue(1, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
