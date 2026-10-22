@@ -355,6 +355,38 @@ inline __m256 v_softplus_f32(__m256 beta, __m256 threshold, __m256 x) {
     return _mm256_blendv_ps(sp, x, _mm256_cmp_ps(bx, threshold, _CMP_GT_OQ));
 }
 
+// Composites shared by the apply dispatcher and the per-op chunk loops, so
+// both shapes emit identical code.
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256 v_sigmoid_f32(__m256 x, __m256 one, __m256 signbit) {
+    // rcp+NR instead of divps.  Division corners reproduced: den==inf
+    // (x <= -88.7, exp overflowed) must yield +0 like 1/inf, and a NaN
+    // denominator must stay NaN -- hence the two mask repairs.
+    __m256 den = _mm256_add_ps(one, tensorplay::tpsleef::exp(_mm256_xor_ps(x, signbit)));
+    __m256 r = v_rcp_nr_ps(den);
+    __m256 not_inf = _mm256_cmp_ps(den, _mm256_set1_ps(INFINITY), _CMP_NEQ_OQ);
+    __m256 zeroed = _mm256_and_ps(not_inf, r);
+    __m256 is_nan = _mm256_cmp_ps(den, den, _CMP_UNORD_Q);
+    return _mm256_blendv_ps(zeroed, r, is_nan);
+}
+
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256 v_gelu_none_f32(__m256 x, __m256 one) {
+    const __m256 kAlpha = _mm256_set1_ps(static_cast<float>(0.70710678118654752440));
+    __m256 cdf = _mm256_add_ps(one, v_erf_f32(_mm256_mul_ps(kAlpha, x)));
+    return _mm256_mul_ps(_mm256_mul_ps(_mm256_set1_ps(0.5f), x), cdf);
+}
+
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256 v_gelu_tanh_f32(__m256 x, __m256 one) {
+    const __m256 kBeta = _mm256_set1_ps(static_cast<float>(1.41421356237309504880 * 1.12837916709551257390 * 0.5));
+    const __m256 kKappa = _mm256_set1_ps(0.044715f);
+    __m256 x_cube = _mm256_mul_ps(_mm256_mul_ps(x, x), x);
+    __m256 inner = _mm256_mul_ps(kBeta, _mm256_add_ps(x, _mm256_mul_ps(kKappa, x_cube)));
+    __m256 cdf = _mm256_add_ps(one, tensorplay::tpsleef::tanh(inner));
+    return _mm256_mul_ps(_mm256_mul_ps(_mm256_set1_ps(0.5f), x), cdf);
+}
+
 // Applies op to one AVX2 float vector.  Always-inline: only ever folded into
 // target-attributed callers below.
 __attribute__((target("avx2,fma"), always_inline))
@@ -404,30 +436,12 @@ inline __m256 apply_f32(VOp op, VParams prm, __m256 x) {
             // Callers guarantee all lanes > 0 here.
             return v_lgamma_pos_f32(x);
         }
-        case VOp::Sigmoid: {
-            // rcp+NR instead of divps.  Division corners reproduced: den==inf
-            // (x <= -88.7, exp overflowed) must yield +0 like 1/inf, and a NaN
-            // denominator must stay NaN -- hence the two mask repairs.
-            __m256 den = _mm256_add_ps(one, tensorplay::tpsleef::exp(_mm256_xor_ps(x, signbit)));
-            __m256 r = v_rcp_nr_ps(den);
-            __m256 not_inf = _mm256_cmp_ps(den, _mm256_set1_ps(INFINITY), _CMP_NEQ_OQ);
-            __m256 zeroed = _mm256_and_ps(not_inf, r);
-            __m256 is_nan = _mm256_cmp_ps(den, den, _CMP_UNORD_Q);
-            return _mm256_blendv_ps(zeroed, r, is_nan);
-        }
-        case VOp::GeluNone: {
-            const __m256 kAlpha = _mm256_set1_ps(static_cast<float>(0.70710678118654752440));
-            __m256 cdf = _mm256_add_ps(one, v_erf_f32(_mm256_mul_ps(kAlpha, x)));
-            return _mm256_mul_ps(_mm256_mul_ps(_mm256_set1_ps(0.5f), x), cdf);
-        }
-        case VOp::GeluTanh: {
-            const __m256 kBeta = _mm256_set1_ps(static_cast<float>(1.41421356237309504880 * 1.12837916709551257390 * 0.5));
-            const __m256 kKappa = _mm256_set1_ps(0.044715f);
-            __m256 x_cube = _mm256_mul_ps(_mm256_mul_ps(x, x), x);
-            __m256 inner = _mm256_mul_ps(kBeta, _mm256_add_ps(x, _mm256_mul_ps(kKappa, x_cube)));
-            __m256 cdf = _mm256_add_ps(one, tensorplay::tpsleef::tanh(inner));
-            return _mm256_mul_ps(_mm256_mul_ps(_mm256_set1_ps(0.5f), x), cdf);
-        }
+        case VOp::Sigmoid:
+            return v_sigmoid_f32(x, one, signbit);
+        case VOp::GeluNone:
+            return v_gelu_none_f32(x, one);
+        case VOp::GeluTanh:
+            return v_gelu_tanh_f32(x, one);
         case VOp::Silu: {
             // x * rcp_nr(den) matches x/den bit-for-bit in every corner here:
             // den==inf makes the NR chain NaN exactly like -inf/+inf division,
@@ -584,16 +598,46 @@ static void f32_chunk_avx2(VOp op, VParams prm, const float* src, float* dst, in
             }
             break;
         }
-        default:
+        case VOp::Exp:
+            TP_F32_SIMPLE_LOOP_8(tensorplay::tpsleef::exp(x));
+            break;
+        case VOp::Expm1:
+            TP_F32_SIMPLE_LOOP_8(tensorplay::tpsleef::expm1(x));
+            break;
+        case VOp::Log:
+            TP_F32_SIMPLE_LOOP_8(tensorplay::tpsleef::log(x));
+            break;
+        case VOp::Log1p:
+            TP_F32_SIMPLE_LOOP_8(tensorplay::tpsleef::log1p(x));
+            break;
+        case VOp::Tanh:
+            TP_F32_SIMPLE_LOOP_8(tensorplay::tpsleef::tanh(x));
+            break;
+        case VOp::Sigmoid:
+            TP_F32_SIMPLE_LOOP_8(v_sigmoid_f32(x, one, signbit));
+            break;
+        case VOp::GeluNone:
+            TP_F32_SIMPLE_LOOP_8(v_gelu_none_f32(x, one));
+            break;
+        case VOp::GeluTanh:
+            TP_F32_SIMPLE_LOOP_8(v_gelu_tanh_f32(x, one));
+            break;
+        case VOp::Lgamma:
             for (; i + 8 <= n; i += 8) {
                 __m256 x = _mm256_loadu_ps(s + i);
-                if (op == VOp::Lgamma && _mm256_movemask_ps(_mm256_cmp_ps(x, zero, _CMP_LE_OQ))) {
+                if (_mm256_movemask_ps(_mm256_cmp_ps(x, zero, _CMP_LE_OQ))) {
                     // Non-positive lane (or NaN): scalar fallback keeps the exact
                     // reflection-domain behaviour of std::lgamma.
                     for (int64_t j = i; j < i + 8; ++j) d[j] = scalar_apply(op, prm, s[j]);
                 } else {
-                    _mm256_storeu_ps(d + i, apply_f32(op, prm, x));
+                    _mm256_storeu_ps(d + i, v_lgamma_pos_f32(x));
                 }
+            }
+            break;
+        default:
+            for (; i + 8 <= n; i += 8) {
+                __m256 x = _mm256_loadu_ps(s + i);
+                _mm256_storeu_ps(d + i, apply_f32(op, prm, x));
             }
             break;
     }
