@@ -69,6 +69,19 @@ class TestBCEForward(unittest.TestCase):
                                        from_reference(bad_tgt, "cpu"))
             self.assertIn("between 0 and 1", str(cm.exception))
 
+    def test_nan_lane_raises(self):
+        # A lane that is not a number answers neither bound, so the gate that
+        # only counts lanes below 0 or above 1 lets it through and the loss
+        # silently becomes a number that is not a number.
+        for bad_in, bad_tgt in ((torch.tensor([float("nan")]), torch.tensor([1.0])),
+                                (torch.tensor([0.5]), torch.tensor([float("nan")]))):
+            with self.assertRaises(RuntimeError) as cm:
+                F.binary_cross_entropy(from_reference(bad_in, "cpu"),
+                                       from_reference(bad_tgt, "cpu"))
+            self.assertIn("between 0 and 1", str(cm.exception))
+            self.assertRaises(RuntimeError, torch_F.binary_cross_entropy,
+                              bad_in, bad_tgt)
+
 
 class TestBCEBackwardNative(unittest.TestCase):
     def _run(self, shape, reduction, dev, seed, with_weight):
