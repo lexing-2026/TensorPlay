@@ -938,6 +938,82 @@ Tensor huber_loss_backward_kernel(
   return tpx::ops::to(gradient, self.dtype());
 }
 
+// The divergence one element answers is the weight it carries against the
+// log-likelihood read for it.  Read the weight as a log-likelihood itself and
+// the walk keeps the same shape with the weight standing for its own exponent.
+// A lane carrying nothing answers nothing for the product, and the far end of
+// the scale the read reaches on its own carries through: nothing times that is
+// still that.
+Tensor kl_div_kernel(
+    const Tensor& input,
+    const Tensor& target,
+    int64_t reduction,
+    bool log_target) {
+  constexpr const char* kName = "kl_div";
+  TP_CHECK(
+      reduction >= 0 && reduction <= 2,
+      std::string("Vulkan ") + kName + ": invalid reduction mode");
+  TP_CHECK(
+      input.dtype() == DType::Float32 || input.dtype() == DType::Float16,
+      std::string("Vulkan ") + kName +
+          " supports Float32 and Float16 tensors only");
+  TP_CHECK(
+      target.dtype() == DType::Float32 || target.dtype() == DType::Float16,
+      std::string("Vulkan ") + kName +
+          " supports Float32 and Float16 tensors only");
+  const Tensor x = loss_widened_operand(input);
+  const Tensor t = loss_widened_operand(target);
+  Tensor loss;
+  if (log_target) {
+    loss = tpx::ops::mul(tpx::ops::exp(t), tpx::ops::sub(t, x));
+  } else {
+    // The product of nothing with the log of nothing answers nothing, which is
+    // more than the log alone reaches on its own.
+    const Tensor weighted = tpx::ops::where(
+        tpx::ops::eq(t, Scalar(0.0)), Scalar(0.0),
+        tpx::ops::mul(t, tpx::ops::log(t)));
+    loss = tpx::ops::sub(weighted, tpx::ops::mul(t, x));
+  }
+  if (reduction == 0) {
+    return tpx::ops::to(loss, input.dtype());
+  }
+  return tpx::ops::to(
+      reduction == 1 ? tpx::ops::mean(loss) : tpx::ops::sum(loss),
+      input.dtype());
+}
+
+// Only the read log-likelihood is being matched against, so the slope a lane
+// hands back is the weight it carries, taken off the log-likelihood it stands
+// for and shared by the count an average divided by.
+Tensor kl_div_backward_kernel(
+    const Tensor& grad_output,
+    const Tensor& input,
+    const Tensor& target,
+    int64_t reduction,
+    bool log_target) {
+  constexpr const char* kName = "kl_div_backward";
+  TP_CHECK(
+      reduction >= 0 && reduction <= 2,
+      std::string("Vulkan ") + kName + ": invalid reduction mode");
+  TP_CHECK(
+      input.dtype() == DType::Float32 || input.dtype() == DType::Float16,
+      std::string("Vulkan ") + kName +
+          " supports Float32 and Float16 tensors only");
+  TP_CHECK(
+      target.dtype() == DType::Float32 || target.dtype() == DType::Float16,
+      std::string("Vulkan ") + kName +
+          " supports Float32 and Float16 tensors only");
+  const Tensor t = loss_widened_operand(target);
+  Tensor gradient = tpx::ops::mul(
+      log_target ? tpx::ops::neg(tpx::ops::exp(t)) : tpx::ops::neg(t),
+      loss_widened_operand(grad_output));
+  if (reduction == 1 && input.numel() > 0) {
+    gradient = tpx::ops::mul(
+        gradient, Scalar(1.0 / static_cast<double>(input.numel())));
+  }
+  return tpx::ops::to(gradient, input.dtype());
+}
+
 } // namespace ops
 } // namespace vulkan
 } // namespace tensorplay
@@ -975,6 +1051,10 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, LossKernels) {
   m.impl(
       "huber_loss_backward",
       &tensorplay::vulkan::ops::huber_loss_backward_kernel);
+  m.impl("tp_kl_div", &tensorplay::vulkan::ops::kl_div_kernel);
+  m.impl(
+      "tp_kl_div_backward",
+      &tensorplay::vulkan::ops::kl_div_backward_kernel);
 }
 
 #endif /* USE_VULKAN */
