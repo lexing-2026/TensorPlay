@@ -3,8 +3,10 @@
 #include "Blocks.h"
 #include "Common.h"
 #include "Convert.h"
+#include "Factory.h"
 
 #include <optional>
+#include <tuple>
 
 namespace tensorplay {
 namespace vulkan {
@@ -218,6 +220,95 @@ Tensor logcumsumexp_linear(const Tensor& payload, const int64_t axis) {
   return convert(v_output);
 }
 
+/*
+ * Row-walking running extremum over linear storage.  One invocation owns one
+ * scan row and carries the winning value together with the position that value
+ * came from, so the walk is serial only within a row and the launch covers the
+ * rows in parallel.  The values keep the payload's own width; the indices
+ * answer in the backend's index width, a single word.  A half payload follows
+ * the same two-pass schedule as the sum scan, since its two lanes per word
+ * belong to different rows.
+ */
+std::tuple<Tensor, Tensor> cum_extremum_linear(
+    const Tensor& payload, const int64_t axis, const bool is_max) {
+  api::Context* const context = api::context();
+  api::vTensor v_input =
+      to_buffer_storage_dispatch(context, convert(payload));
+
+  const int64_t axis_size = payload.size(axis);
+  int64_t inner = 1;
+  for (int64_t d = axis + 1; d < payload.dim(); ++d) {
+    inner *= payload.size(d);
+  }
+  api::vTensor v_values{
+      context,
+      v_input.sizes(),
+      payload.dtype(),
+      api::StorageType::BUFFER,
+      api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+  api::vTensor v_indices{
+      context,
+      v_input.sizes(),
+      DType::Int32,
+      api::StorageType::BUFFER,
+      api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+  // Nothing to walk, and a row count that an empty axis would leave undefined.
+  if (payload.numel() == 0) {
+    return {convert(v_values), convert(v_indices)};
+  }
+  const int64_t rows = payload.numel() / axis_size;
+
+  const bool is_half = payload.dtype() == DType::Float16;
+  const char* const shader = payload.dtype() == DType::Float16
+      ? "cum_extremum_buffer_half"
+      : payload.dtype() == DType::Int64
+      ? "cum_extremum_buffer_i64"
+      : payload.dtype() == DType::Int32 ? "cum_extremum_buffer_i32"
+                                        : "cum_extremum_buffer";
+  const int32_t passes = is_half ? 2 : 1;
+  api::PipelineBarrier pipeline_barrier{};
+  for (int32_t pass = 0; pass < passes; ++pass) {
+    const struct CumExtremumBufferBlock final {
+      int32_t axis_size;
+      int32_t inner;
+      int32_t rows;
+      int32_t word_lane;
+      int32_t is_max;
+      int32_t fill;
+    } block{
+        static_cast<int32_t>(axis_size),
+        static_cast<int32_t>(inner),
+        static_cast<int32_t>(rows),
+        is_half ? pass : 0,
+        is_max ? 1 : 0,
+        0,
+    };
+    api::UniformParamsBuffer params(context, block);
+    context->submit_compute_job(
+        VK_KERNEL_FROM_STR(shader),
+        pipeline_barrier,
+        {static_cast<uint32_t>(rows), 1u, 1u},
+        {256u, 1u, 1u},
+        VK_NULL_HANDLE,
+        v_values.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            is_half ? (api::MemoryAccessType::READ |
+                       api::MemoryAccessType::WRITE)
+                    : api::MemoryAccessType::WRITE),
+        v_indices.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::WRITE),
+        v_input.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::READ),
+        params.buffer());
+  }
+  return {convert(v_values), convert(v_indices)};
+}
+
 } // namespace
 
 Tensor cumsum_kernel(
@@ -329,6 +420,63 @@ Tensor logcumsumexp_kernel(
   return logcumsumexp_linear(payload, axis);
 }
 
+// The running extremum keeps the payload's own width.  A byte-packed lane
+// widens into single precision, which holds every value it can carry exactly,
+// and the winning lane narrows back; the indices answer in the backend's index
+// width, one word.  A scalar has no axis to walk: its value is itself and the
+// sole position is zero.
+std::tuple<Tensor, Tensor> cum_extremum_kernel(
+    const Tensor& self, int64_t dim, bool is_max) {
+  const std::string name = is_max ? "cummax" : "cummin";
+  TP_CHECK(
+      self.dtype() == DType::Float32 || self.dtype() == DType::Float16 ||
+          self.dtype() == DType::Int32 || self.dtype() == DType::Int64 ||
+          self.dtype() == DType::Int8 || self.dtype() == DType::UInt8 ||
+          self.dtype() == DType::Bool,
+      "Vulkan ",
+      name,
+      " supports Float32, Float16, Int8, UInt8, Int32, Int64 and Bool "
+      "tensors");
+  if (self.dim() == 0) {
+    TP_CHECK(
+        dim == 0 || dim == -1, "Vulkan ", name, ": dimension out of range");
+    return {
+        to_dtype_kernel(self, self.dtype(), false, true, std::nullopt),
+        zeros_kernel({}, DType::Int32, self.device(), false)};
+  }
+  TP_CHECK(
+      self.dim() >= 1 && self.dim() <= 4,
+      "Vulkan ",
+      name,
+      " supports 1d to 4d tensors");
+  const int64_t axis = dim < 0 ? dim + self.dim() : dim;
+  TP_CHECK(
+      axis >= 0 && axis < self.dim(),
+      "Vulkan ",
+      name,
+      ": dimension out of range");
+
+  Tensor payload = dense_payload(self);
+  const bool byte_packed = payload.dtype() == DType::Int8 ||
+      payload.dtype() == DType::UInt8 || payload.dtype() == DType::Bool;
+  if (byte_packed) {
+    payload = as_type(payload, DType::Float32);
+  }
+  auto walked = cum_extremum_linear(payload, axis, is_max);
+  if (byte_packed) {
+    std::get<0>(walked) = as_type(std::get<0>(walked), self.dtype());
+  }
+  return walked;
+}
+
+std::tuple<Tensor, Tensor> cummax_kernel(const Tensor& self, int64_t dim) {
+  return cum_extremum_kernel(self, dim, /*is_max=*/true);
+}
+
+std::tuple<Tensor, Tensor> cummin_kernel(const Tensor& self, int64_t dim) {
+  return cum_extremum_kernel(self, dim, /*is_max=*/false);
+}
+
 } // namespace ops
 } // namespace vulkan
 } // namespace tensorplay
@@ -337,6 +485,8 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, CumsumKernels) {
   m.impl("cumsum", &tensorplay::vulkan::ops::cumsum_kernel);
   m.impl("cumsum_", &tensorplay::vulkan::ops::cumsum_inplace_kernel);
   m.impl("logcumsumexp", &tensorplay::vulkan::ops::logcumsumexp_kernel);
+  m.impl("cummax", &tensorplay::vulkan::ops::cummax_kernel);
+  m.impl("cummin", &tensorplay::vulkan::ops::cummin_kernel);
 }
 
 #endif /* USE_VULKAN */
