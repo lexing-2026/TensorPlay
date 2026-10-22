@@ -580,23 +580,8 @@ static std::tuple<Tensor, Tensor, Tensor> group_norm_backward_cpu_impl(
                 mean = static_cast<float>(normalization_stats_read(*mean_opt, row));
                 inv_std = static_cast<float>(normalization_stats_read(*rstd_opt, row));
             } else {
-#if defined(__x86_64__)
-                if (norm_row::avx512_ok() && group_size >= 16) {
-                    norm_row::stats_f32_512(in_ptr + group_offset, group_size, feps,
-                                            &mean, &inv_std);
-                } else
-#endif
-                {
-                    float sum = 0.0f, sq_sum = 0.0f;
-                    for (int64_t i = 0; i < group_size; ++i) {
-                        const float val = in_ptr[group_offset + i];
-                        sum += val;
-                        sq_sum += val * val;
-                    }
-                    mean = sum / group_size;
-                    const float var = (sq_sum / group_size) - mean * mean;
-                    inv_std = 1.0f / std::sqrt(var + feps);
-                }
+                norm_row::stats_f32(in_ptr + group_offset, group_size, feps,
+                                    &mean, &inv_std);
             }
 
             // 2. Per-channel reductions: sum(dy), sum(dy * x) fold into the
@@ -607,19 +592,8 @@ static std::tuple<Tensor, Tensor, Tensor> group_norm_backward_cpu_impl(
                 const int64_t c = c_start + d;
                 const int64_t c_offset = group_offset + d * spatial_size;
                 double sd = 0.0, dotp = 0.0;
-#if defined(__x86_64__)
-                if (norm_row::avx512_ok()) {
-                    norm_row::acc_dot2_f64_512(grad_out_ptr + c_offset, in_ptr + c_offset,
-                                               spatial_size, sd, dotp);
-                } else
-#endif
-                {
-                    for (int64_t s = 0; s < spatial_size; ++s) {
-                        const double y = static_cast<double>(grad_out_ptr[c_offset + s]);
-                        sd += y;
-                        dotp += y * static_cast<double>(in_ptr[c_offset + s]);
-                    }
-                }
+                norm_row::acc_dot2_f64(grad_out_ptr + c_offset, in_ptr + c_offset,
+                                       spatial_size, sd, dotp);
                 const float s_dy_c = static_cast<float>(sd);
                 const float s_dy_xhat_c = static_cast<float>((dotp - mean * sd) * inv_std);
                 if (gb_row) gb_row[c] += s_dy_c;
@@ -637,28 +611,16 @@ static std::tuple<Tensor, Tensor, Tensor> group_norm_backward_cpu_impl(
                     const int64_t c = c_start + d;
                     const int64_t c_offset = group_offset + d * spatial_size;
                     const float w = (w_ptr) ? w_ptr[c] : 1.0f;
-#if defined(__x86_64__)
-                    if (norm_row::avx512_ok()) {
-                        if (w_ptr) {
-                            norm_row::gn_bwd_plane_f32_512<true>(
-                                in_ptr + c_offset, grad_out_ptr + c_offset,
-                                grad_in_ptr + c_offset, spatial_size, mean,
-                                inv_std, w, term1, M, s_dy, s_dy_xhat);
-                        } else {
-                            norm_row::gn_bwd_plane_f32_512<false>(
-                                in_ptr + c_offset, grad_out_ptr + c_offset,
-                                grad_in_ptr + c_offset, spatial_size, mean,
-                                inv_std, 1.0f, term1, M, s_dy, s_dy_xhat);
-                        }
-                    } else
-#endif
-                    {
-                        for (int64_t s = 0; s < spatial_size; ++s) {
-                            const float dy = grad_out_ptr[c_offset + s] * w;
-                            const float x_hat = (in_ptr[c_offset + s] - mean) * inv_std;
-                            grad_in_ptr[c_offset + s] =
-                                term1 * (M * dy - s_dy - x_hat * s_dy_xhat);
-                        }
+                    if (w_ptr) {
+                        norm_row::gn_bwd_plane_f32<true>(
+                            in_ptr + c_offset, grad_out_ptr + c_offset,
+                            grad_in_ptr + c_offset, spatial_size, mean,
+                            inv_std, w, term1, M, s_dy, s_dy_xhat);
+                    } else {
+                        norm_row::gn_bwd_plane_f32<false>(
+                            in_ptr + c_offset, grad_out_ptr + c_offset,
+                            grad_in_ptr + c_offset, spatial_size, mean,
+                            inv_std, 1.0f, term1, M, s_dy, s_dy_xhat);
                     }
                 }
             }
@@ -1109,12 +1071,12 @@ static std::tuple<Tensor, Tensor, Tensor> layer_norm_backward_cpu_typed(
                 inv_std = static_cast<T>(normalization_stats_read(*rstd_opt, i));
             } else {
 #if defined(__x86_64__)
-            if (is_f32 && norm_row::avx512_ok() && inner_size >= 16) {
+            if (is_f32) {
                 // The branch runs only for T == float; reinterpret the row
                 // pointers so the generic instantiation still compiles.
-                norm_row::stats_f32_512(reinterpret_cast<const float*>(in_ptr + offset), inner_size, static_cast<float>(eps),
-                                        reinterpret_cast<float*>(&mean),
-                                        reinterpret_cast<float*>(&inv_std));
+                norm_row::stats_f32(reinterpret_cast<const float*>(in_ptr + offset), inner_size, static_cast<float>(eps),
+                                    reinterpret_cast<float*>(&mean),
+                                    reinterpret_cast<float*>(&inv_std));
             } else
 #endif
             {
@@ -1137,16 +1099,16 @@ static std::tuple<Tensor, Tensor, Tensor> layer_norm_backward_cpu_typed(
             T s_dy = T(0);
             T s_dy_x_hat = T(0);
 #if defined(__x86_64__)
-            if (is_f32 && norm_row::avx512_ok() && inner_size >= 16) {
+            if (is_f32 && inner_size >= 16) {
                 if (w_ptr) {
-                    norm_row::ln_bwd_stats_f32_512<true>(
+                    norm_row::ln_bwd_stats_f32<true>(
                         reinterpret_cast<const float*>(grad_out_ptr + offset),
                         reinterpret_cast<const float*>(in_ptr + offset),
                         reinterpret_cast<const float*>(w_ptr), inner_size,
                         reinterpret_cast<const float&>(mean), reinterpret_cast<const float&>(inv_std),
                         reinterpret_cast<float*>(&s_dy), reinterpret_cast<float*>(&s_dy_x_hat));
                 } else {
-                    norm_row::ln_bwd_stats_f32_512<false>(
+                    norm_row::ln_bwd_stats_f32<false>(
                         reinterpret_cast<const float*>(grad_out_ptr + offset),
                         reinterpret_cast<const float*>(in_ptr + offset), reinterpret_cast<const float*>(w_ptr), inner_size,
                         reinterpret_cast<const float&>(mean), reinterpret_cast<const float&>(inv_std),
@@ -1184,9 +1146,9 @@ static std::tuple<Tensor, Tensor, Tensor> layer_norm_backward_cpu_typed(
             const T term1 = inv_std / inner_size;
             const T M = static_cast<T>(inner_size);
 #if defined(__x86_64__)
-            if (is_f32 && norm_row::avx512_ok() && inner_size >= 16) {
+            if (is_f32 && inner_size >= 16) {
                 if (w_ptr) {
-                    norm_row::ln_bwd_apply_f32_512<true>(
+                    norm_row::ln_bwd_apply_f32<true>(
                         reinterpret_cast<const float*>(grad_out_ptr + offset),
                         reinterpret_cast<const float*>(in_ptr + offset),
                         reinterpret_cast<const float*>(w_ptr),
@@ -1198,7 +1160,7 @@ static std::tuple<Tensor, Tensor, Tensor> layer_norm_backward_cpu_typed(
                         reinterpret_cast<const float&>(s_dy),
                         reinterpret_cast<const float&>(s_dy_x_hat));
                 } else {
-                    norm_row::ln_bwd_apply_f32_512<false>(
+                    norm_row::ln_bwd_apply_f32<false>(
                         reinterpret_cast<const float*>(grad_out_ptr + offset),
                         reinterpret_cast<const float*>(in_ptr + offset), reinterpret_cast<const float*>(w_ptr),
                         reinterpret_cast<float*>(grad_in_ptr + offset),

@@ -523,6 +523,209 @@ inline void gn_bwd_plane_f32_512(const float* x, const float* dy, float* out,
     }
 }
 
+// ---------------------------------------------------------------------------
+// 256-bit twins of the backward and batch-norm primitives.  A part without the
+// 512-bit unit would otherwise run the plain loops below, which the compiler
+// cannot turn into vector code because the accumulators are references and the
+// reduction is not reassociable.
+// ---------------------------------------------------------------------------
+
+__attribute__((target("avx2,fma")))
+inline void plane_affine_f32_256(const float* in, float* out, int64_t n, float a, float b) {
+    const __m256 va = _mm256_set1_ps(a);
+    const __m256 vb = _mm256_set1_ps(b);
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 v = _mm256_loadu_ps(in + i);
+        _mm256_storeu_ps(out + i, _mm256_fmadd_ps(v, va, vb));
+    }
+    for (; i < n; ++i) out[i] = in[i] * a + b;
+}
+
+__attribute__((target("avx2,fma")))
+inline void acc_stats_f64_256(const float* p, int64_t n, double& s, double& q) {
+    __m256d s0 = _mm256_setzero_pd(), s1 = _mm256_setzero_pd();
+    __m256d q0 = _mm256_setzero_pd(), q1 = _mm256_setzero_pd();
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256d v0 = _mm256_cvtps_pd(_mm_loadu_ps(p + i));
+        __m256d v1 = _mm256_cvtps_pd(_mm_loadu_ps(p + i + 4));
+        s0 = _mm256_add_pd(s0, v0);
+        q0 = _mm256_fmadd_pd(v0, v0, q0);
+        s1 = _mm256_add_pd(s1, v1);
+        q1 = _mm256_fmadd_pd(v1, v1, q1);
+    }
+    s0 = _mm256_add_pd(s0, s1);
+    q0 = _mm256_add_pd(q0, q1);
+    alignas(32) double sb[4], qb[4];
+    _mm256_storeu_pd(sb, s0);
+    _mm256_storeu_pd(qb, q0);
+    for (int64_t k = 0; k < 4; ++k) { s += sb[k]; q += qb[k]; }
+    for (; i < n; ++i) { double v = static_cast<double>(p[i]); s += v; q += v * v; }
+}
+
+__attribute__((target("avx2,fma")))
+inline void acc_dot2_f64_256(const float* dy, const float* x, int64_t n,
+                             double& s, double& d) {
+    __m256d s0 = _mm256_setzero_pd(), d0 = _mm256_setzero_pd();
+    __m256d s1 = _mm256_setzero_pd(), d1 = _mm256_setzero_pd();
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256d y0 = _mm256_cvtps_pd(_mm_loadu_ps(dy + i));
+        __m256d y1 = _mm256_cvtps_pd(_mm_loadu_ps(dy + i + 4));
+        __m256d x0 = _mm256_cvtps_pd(_mm_loadu_ps(x + i));
+        __m256d x1 = _mm256_cvtps_pd(_mm_loadu_ps(x + i + 4));
+        s0 = _mm256_add_pd(s0, y0);
+        d0 = _mm256_fmadd_pd(y0, x0, d0);
+        s1 = _mm256_add_pd(s1, y1);
+        d1 = _mm256_fmadd_pd(y1, x1, d1);
+    }
+    s0 = _mm256_add_pd(s0, s1);
+    d0 = _mm256_add_pd(d0, d1);
+    alignas(32) double sb[4], db[4];
+    _mm256_storeu_pd(sb, s0);
+    _mm256_storeu_pd(db, d0);
+    for (int64_t k = 0; k < 4; ++k) { s += sb[k]; d += db[k]; }
+    for (; i < n; ++i) {
+        double y = static_cast<double>(dy[i]);
+        s += y;
+        d += y * static_cast<double>(x[i]);
+    }
+}
+
+__attribute__((target("avx2,fma")))
+inline void plane_bn_dx_f32_256(const float* x, const float* dy, float* out, int64_t n,
+                                float mean, float k, float grad_mean, float rstd, float w) {
+    const __m256 vm = _mm256_set1_ps(mean);
+    const __m256 vk = _mm256_set1_ps(k);
+    const __m256 vg = _mm256_set1_ps(grad_mean);
+    const __m256 vr = _mm256_set1_ps(rstd);
+    const __m256 vw = _mm256_set1_ps(w);
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 vx = _mm256_loadu_ps(x + i);
+        __m256 vdy = _mm256_loadu_ps(dy + i);
+        __m256 t = _mm256_mul_ps(_mm256_sub_ps(vx, vm), vk);
+        __m256 u = _mm256_sub_ps(_mm256_sub_ps(vdy, vg), t);
+        __m256 r = _mm256_mul_ps(u, vr);
+        _mm256_storeu_ps(out + i, _mm256_mul_ps(r, vw));
+    }
+    for (; i < n; ++i) {
+        out[i] = (dy[i] - grad_mean - (x[i] - mean) * k) * rstd * w;
+    }
+}
+
+__attribute__((target("avx2,fma")))
+inline void plane_scale_f32_256(const float* dy, float* out, int64_t n, float scale) {
+    const __m256 vs = _mm256_set1_ps(scale);
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        _mm256_storeu_ps(out + i, _mm256_mul_ps(_mm256_loadu_ps(dy + i), vs));
+    }
+    for (; i < n; ++i) out[i] = dy[i] * scale;
+}
+
+template <bool HW>
+__attribute__((target("avx2,fma")))
+inline void ln_bwd_stats_f32_256(const float* dy, const float* x, const float* w,
+                                 int64_t n, float mean, float rstd,
+                                 float* s_dy, float* s_dy_xhat) {
+    const __m256 vm = _mm256_set1_ps(mean);
+    const __m256 vr = _mm256_set1_ps(rstd);
+    __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+    __m256 b0 = _mm256_setzero_ps(), b1 = _mm256_setzero_ps();
+    int64_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m256 y0 = _mm256_loadu_ps(dy + i);
+        __m256 y1 = _mm256_loadu_ps(dy + i + 8);
+        if constexpr (HW) {
+            y0 = _mm256_mul_ps(y0, _mm256_loadu_ps(w + i));
+            y1 = _mm256_mul_ps(y1, _mm256_loadu_ps(w + i + 8));
+        }
+        __m256 x0 = _mm256_mul_ps(_mm256_sub_ps(_mm256_loadu_ps(x + i), vm), vr);
+        __m256 x1 = _mm256_mul_ps(_mm256_sub_ps(_mm256_loadu_ps(x + i + 8), vm), vr);
+        a0 = _mm256_add_ps(a0, y0);
+        a1 = _mm256_add_ps(a1, y1);
+        b0 = _mm256_fmadd_ps(y0, x0, b0);
+        b1 = _mm256_fmadd_ps(y1, x1, b1);
+    }
+    __m256 a = _mm256_add_ps(a0, a1);
+    __m256 b = _mm256_add_ps(b0, b1);
+    alignas(32) float ab[8], bb[8];
+    _mm256_storeu_ps(ab, a);
+    _mm256_storeu_ps(bb, b);
+    float sa = 0.f, sb = 0.f;
+    for (int64_t k = 0; k < 8; ++k) { sa += ab[k]; sb += bb[k]; }
+    for (; i < n; ++i) {
+        float y = dy[i];
+        if constexpr (HW) y *= w[i];
+        float xh = (x[i] - mean) * rstd;
+        sa += y;
+        sb += y * xh;
+    }
+    *s_dy = sa;
+    *s_dy_xhat = sb;
+}
+
+template <bool HW>
+__attribute__((target("avx2,fma")))
+inline void ln_bwd_apply_f32_256(const float* dy, const float* x, const float* w,
+                                 float* out, int64_t n, float mean, float rstd,
+                                 float term1, float M, float s_dy, float s_dy_xhat) {
+    const __m256 vm = _mm256_set1_ps(mean);
+    const __m256 vr = _mm256_set1_ps(rstd);
+    const __m256 vt1 = _mm256_set1_ps(term1);
+    const __m256 vmM = _mm256_set1_ps(M);
+    const __m256 vsd = _mm256_set1_ps(s_dy);
+    const __m256 vsx = _mm256_set1_ps(s_dy_xhat);
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 vdy = _mm256_loadu_ps(dy + i);
+        if constexpr (HW) vdy = _mm256_mul_ps(vdy, _mm256_loadu_ps(w + i));
+        __m256 xh = _mm256_mul_ps(_mm256_sub_ps(_mm256_loadu_ps(x + i), vm), vr);
+        __m256 t = _mm256_mul_ps(vdy, vmM);
+        t = _mm256_sub_ps(t, vsd);
+        t = _mm256_fnmadd_ps(xh, vsx, t);
+        _mm256_storeu_ps(out + i, _mm256_mul_ps(t, vt1));
+    }
+    for (; i < n; ++i) {
+        float y = dy[i];
+        if constexpr (HW) y *= w[i];
+        float xh = (x[i] - mean) * rstd;
+        out[i] = term1 * (M * y - s_dy - xh * s_dy_xhat);
+    }
+}
+
+template <bool UseW>
+__attribute__((target("avx2,fma")))
+inline void gn_bwd_plane_f32_256(const float* x, const float* dy, float* out,
+                                 int64_t spatial, float mean, float rstd, float wc,
+                                 float term1, float M, float s_dy, float s_dy_xhat) {
+    const __m256 vm = _mm256_set1_ps(mean);
+    const __m256 vr = _mm256_set1_ps(rstd);
+    const __m256 vw = _mm256_set1_ps(wc);
+    const __m256 vt1 = _mm256_set1_ps(term1);
+    const __m256 vmM = _mm256_set1_ps(M);
+    const __m256 vsd = _mm256_set1_ps(s_dy);
+    const __m256 vsx = _mm256_set1_ps(s_dy_xhat);
+    int64_t s = 0;
+    for (; s + 8 <= spatial; s += 8) {
+        __m256 vdy = _mm256_loadu_ps(dy + s);
+        if constexpr (UseW) vdy = _mm256_mul_ps(vdy, vw);
+        __m256 xh = _mm256_mul_ps(_mm256_sub_ps(_mm256_loadu_ps(x + s), vm), vr);
+        __m256 t = _mm256_mul_ps(vdy, vmM);
+        t = _mm256_sub_ps(t, vsd);
+        t = _mm256_fnmadd_ps(xh, vsx, t);
+        _mm256_storeu_ps(out + s, _mm256_mul_ps(t, vt1));
+    }
+    for (; s < spatial; ++s) {
+        float y = dy[s];
+        if constexpr (UseW) y *= wc;
+        float xh = (x[s] - mean) * rstd;
+        out[s] = term1 * (M * y - s_dy - xh * s_dy_xhat);
+    }
+}
+
 #endif  // __x86_64__
 
 // ---------------------------------------------------------------------------
@@ -626,6 +829,138 @@ inline void apply_f64(const double* in, double* out, int64_t n,
     }
 }
 
+
+inline void plane_affine_f32(const float* in, float* out, int64_t n, float a, float b) {
+#if defined(__x86_64__)
+    if (avx512_ok()) { plane_affine_f32_512(in, out, n, a, b); return; }
+    if (avx2_ok()) { plane_affine_f32_256(in, out, n, a, b); return; }
+#endif
+    for (int64_t i = 0; i < n; ++i) out[i] = in[i] * a + b;
+}
+
+inline void acc_stats_f64(const float* p, int64_t n, double& s, double& q) {
+#if defined(__x86_64__)
+    if (avx512_ok()) { acc_stats_f64_512(p, n, s, q); return; }
+    if (avx2_ok()) { acc_stats_f64_256(p, n, s, q); return; }
+#endif
+    for (int64_t i = 0; i < n; ++i) {
+        const double v = static_cast<double>(p[i]);
+        s += v;
+        q += v * v;
+    }
+}
+
+inline void acc_dot2_f64(const float* dy, const float* x, int64_t n,
+                         double& s, double& d) {
+#if defined(__x86_64__)
+    if (avx512_ok()) { acc_dot2_f64_512(dy, x, n, s, d); return; }
+    if (avx2_ok()) { acc_dot2_f64_256(dy, x, n, s, d); return; }
+#endif
+    for (int64_t i = 0; i < n; ++i) {
+        const double y = static_cast<double>(dy[i]);
+        s += y;
+        d += y * static_cast<double>(x[i]);
+    }
+}
+
+inline void plane_bn_dx_f32(const float* x, const float* dy, float* out, int64_t n,
+                            float mean, float k, float grad_mean, float rstd, float w) {
+#if defined(__x86_64__)
+    if (avx512_ok()) {
+        plane_bn_dx_f32_512(x, dy, out, n, mean, k, grad_mean, rstd, w);
+        return;
+    }
+    if (avx2_ok()) {
+        plane_bn_dx_f32_256(x, dy, out, n, mean, k, grad_mean, rstd, w);
+        return;
+    }
+#endif
+    for (int64_t i = 0; i < n; ++i) {
+        out[i] = (dy[i] - grad_mean - (x[i] - mean) * k) * rstd * w;
+    }
+}
+
+inline void plane_scale_f32(const float* dy, float* out, int64_t n, float scale) {
+#if defined(__x86_64__)
+    if (avx512_ok()) { plane_scale_f32_512(dy, out, n, scale); return; }
+    if (avx2_ok()) { plane_scale_f32_256(dy, out, n, scale); return; }
+#endif
+    for (int64_t i = 0; i < n; ++i) out[i] = dy[i] * scale;
+}
+
+template <bool HW>
+inline void ln_bwd_stats_f32(const float* dy, const float* x, const float* w,
+                             int64_t n, float mean, float rstd,
+                             float* s_dy, float* s_dy_xhat) {
+#if defined(__x86_64__)
+    if (avx512_ok()) {
+        ln_bwd_stats_f32_512<HW>(dy, x, w, n, mean, rstd, s_dy, s_dy_xhat);
+        return;
+    }
+    if (avx2_ok()) {
+        ln_bwd_stats_f32_256<HW>(dy, x, w, n, mean, rstd, s_dy, s_dy_xhat);
+        return;
+    }
+#endif
+    float sa = 0.f, sb = 0.f;
+    for (int64_t i = 0; i < n; ++i) {
+        float y = dy[i];
+        if constexpr (HW) y *= w[i];
+        const float xh = (x[i] - mean) * rstd;
+        sa += y;
+        sb += y * xh;
+    }
+    *s_dy = sa;
+    *s_dy_xhat = sb;
+}
+
+template <bool HW>
+inline void ln_bwd_apply_f32(const float* dy, const float* x, const float* w,
+                             float* out, int64_t n, float mean, float rstd,
+                             float term1, float M, float s_dy, float s_dy_xhat) {
+#if defined(__x86_64__)
+    if (avx512_ok()) {
+        ln_bwd_apply_f32_512<HW>(dy, x, w, out, n, mean, rstd, term1, M, s_dy,
+                                 s_dy_xhat);
+        return;
+    }
+    if (avx2_ok()) {
+        ln_bwd_apply_f32_256<HW>(dy, x, w, out, n, mean, rstd, term1, M, s_dy,
+                                 s_dy_xhat);
+        return;
+    }
+#endif
+    for (int64_t i = 0; i < n; ++i) {
+        float y = dy[i];
+        if constexpr (HW) y *= w[i];
+        const float xh = (x[i] - mean) * rstd;
+        out[i] = term1 * (M * y - s_dy - xh * s_dy_xhat);
+    }
+}
+
+template <bool UseW>
+inline void gn_bwd_plane_f32(const float* x, const float* dy, float* out,
+                             int64_t spatial, float mean, float rstd, float wc,
+                             float term1, float M, float s_dy, float s_dy_xhat) {
+#if defined(__x86_64__)
+    if (avx512_ok()) {
+        gn_bwd_plane_f32_512<UseW>(x, dy, out, spatial, mean, rstd, wc, term1, M,
+                                   s_dy, s_dy_xhat);
+        return;
+    }
+    if (avx2_ok()) {
+        gn_bwd_plane_f32_256<UseW>(x, dy, out, spatial, mean, rstd, wc, term1, M,
+                                   s_dy, s_dy_xhat);
+        return;
+    }
+#endif
+    for (int64_t s = 0; s < spatial; ++s) {
+        float y = dy[s];
+        if constexpr (UseW) y *= wc;
+        const float xh = (x[s] - mean) * rstd;
+        out[s] = term1 * (M * y - s_dy - xh * s_dy_xhat);
+    }
+}
 
 }  // namespace norm_row
 }  // namespace cpu

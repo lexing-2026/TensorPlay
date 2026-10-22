@@ -228,22 +228,8 @@ void bn_stats_contiguous(const Tensor& input, std::vector<double>& mean,
             parallel_for(0, C, 1, [&](int64_t cb, int64_t ce) {
                 for (int64_t c = cb; c < ce; ++c) {
                     double s = 0.0, q = 0.0;
-#if defined(__x86_64__)
-                    if (norm_row::avx512_ok()) {
-                        for (int64_t n = 0; n < N; ++n) {
-                            norm_row::acc_stats_f64_512(in + n * C * S + c * S, S, s, q);
-                        }
-                    } else
-#endif
-                    {
-                        for (int64_t n = 0; n < N; ++n) {
-                            const float* p = in + n * C * S + c * S;
-                            for (int64_t i = 0; i < S; ++i) {
-                                double v = static_cast<double>(p[i]);
-                                s += v;
-                                q += v * v;
-                            }
-                        }
+                    for (int64_t n = 0; n < N; ++n) {
+                        norm_row::acc_stats_f64(in + n * C * S + c * S, S, s, q);
                     }
                     const double m = s / count;
                     mean[c] = m;
@@ -317,12 +303,8 @@ void bn_apply_contiguous_typed(const Tensor& input, Tensor& out,
             scalar_t* op = outp + rc * S;
             if constexpr (native) {
                 if constexpr (std::is_same_v<scalar_t, float>) {
-#if defined(__x86_64__)
-                    if (norm_row::avx512_ok()) {
-                        norm_row::plane_affine_f32_512(ip, op, S, static_cast<float>(a), static_cast<float>(b));
-                        continue;
-                    }
-#endif
+                    norm_row::plane_affine_f32(ip, op, S, static_cast<float>(a), static_cast<float>(b));
+                    continue;
                 }
                 const opmath_t av = static_cast<opmath_t>(a);
                 const opmath_t bv = static_cast<opmath_t>(b);
@@ -680,26 +662,12 @@ void bn_backward_contiguous(const Tensor& grad_output, const Tensor& input,
                     const float mu = static_cast<float>(mean[c]);
                     const float r = static_cast<float>(invstd[c]);
                     double s = 0.0, dotp = 0.0;
-#if defined(__x86_64__)
-                    if (norm_row::avx512_ok()) {
-                        for (int64_t n = 0; n < N; ++n) {
-                            const int64_t off = n * C * S + c * S;
-                            norm_row::acc_dot2_f64_512(dy + off, in + off, S, s, dotp);
-                        }
-                        // acc_dot2 accumulates sum(dy * x); recenter it.
-                        dotp -= static_cast<double>(mu) * s;
-                    } else
-#endif
-                    {
-                        for (int64_t n = 0; n < N; ++n) {
-                            const int64_t off = n * C * S + c * S;
-                            for (int64_t i = 0; i < S; ++i) {
-                                const double y = static_cast<double>(dy[off + i]);
-                                s += y;
-                                dotp += y * static_cast<double>(in[off + i] - mu);
-                            }
-                        }
+                    for (int64_t n = 0; n < N; ++n) {
+                        const int64_t off = n * C * S + c * S;
+                        norm_row::acc_dot2_f64(dy + off, in + off, S, s, dotp);
                     }
+                    // acc_dot2 accumulates sum(dy * x); recenter it.
+                    dotp -= static_cast<double>(mu) * s;
                     if (gb) gb[c] = static_cast<float>(s);
                     if (gw) gw[c] = static_cast<float>(dotp * static_cast<double>(r));
                     if (gx) {
@@ -709,28 +677,14 @@ void bn_backward_contiguous(const Tensor& grad_output, const Tensor& input,
                             const float gm = static_cast<float>(s / M);
                             for (int64_t n = 0; n < N; ++n) {
                                 const int64_t off = n * C * S + c * S;
-#if defined(__x86_64__)
-                                if (norm_row::avx512_ok()) {
-                                    norm_row::plane_bn_dx_f32_512(in + off, dy + off, gx + off, S,
-                                                                  mu, k, gm, r, w);
-                                    continue;
-                                }
-#endif
-                                for (int64_t i = 0; i < S; ++i) {
-                                    gx[off + i] = (dy[off + i] - gm - (in[off + i] - mu) * k) * r * w;
-                                }
+                                norm_row::plane_bn_dx_f32(in + off, dy + off, gx + off, S,
+                                                          mu, k, gm, r, w);
                             }
                         } else {
                             const float scale = r * w;
                             for (int64_t n = 0; n < N; ++n) {
                                 const int64_t off = n * C * S + c * S;
-#if defined(__x86_64__)
-                                if (norm_row::avx512_ok()) {
-                                    norm_row::plane_scale_f32_512(dy + off, gx + off, S, scale);
-                                    continue;
-                                }
-#endif
-                                for (int64_t i = 0; i < S; ++i) gx[off + i] = dy[off + i] * scale;
+                                norm_row::plane_scale_f32(dy + off, gx + off, S, scale);
                             }
                         }
                     }
