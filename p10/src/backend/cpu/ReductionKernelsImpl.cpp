@@ -238,7 +238,7 @@ struct NormOps {
 // native path reduces squares directly; this is particularly important for
 // Muon's bfloat16 normalization step.
 
-// --- AVX-512 runtime-dispatched sum-of-squares (full-tensor contiguous) ----
+// --- runtime-dispatched sum-of-squares (full-tensor contiguous) ------------
 #if defined(__x86_64__)
 namespace {
 
@@ -294,6 +294,65 @@ double normsq_f64_chunk_avx512(const double* x, int64_t b, int64_t e) {
     return s;
 }
 
+// 256-bit twins.  A part without the 512-bit unit would otherwise fall back to
+// the iterator path, which accumulates one element at a time and runs an order
+// of magnitude below the streaming rate of the memory system.
+
+inline bool normsq_avx2_available() {
+    static const bool ok = __builtin_cpu_supports("avx2") != 0 &&
+                           __builtin_cpu_supports("fma") != 0;
+    return ok;
+}
+
+__attribute__((target("avx2,fma")))
+float normsq_f32_chunk_avx2(const float* x, int64_t b, int64_t e) {
+    __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+    __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+    int64_t i = b;
+    for (; i + 32 <= e; i += 32) {
+        __m256 v;
+        v = _mm256_loadu_ps(x + i);          a0 = _mm256_fmadd_ps(v, v, a0);
+        v = _mm256_loadu_ps(x + i + 8);      a1 = _mm256_fmadd_ps(v, v, a1);
+        v = _mm256_loadu_ps(x + i + 16);     a2 = _mm256_fmadd_ps(v, v, a2);
+        v = _mm256_loadu_ps(x + i + 24);     a3 = _mm256_fmadd_ps(v, v, a3);
+    }
+    __m256 acc = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
+    for (; i + 8 <= e; i += 8) {
+        __m256 v = _mm256_loadu_ps(x + i);
+        acc = _mm256_fmadd_ps(v, v, acc);
+    }
+    alignas(32) float buf[8];
+    _mm256_storeu_ps(buf, acc);
+    float s = ((buf[0] + buf[1]) + (buf[2] + buf[3])) +
+              ((buf[4] + buf[5]) + (buf[6] + buf[7]));
+    for (; i < e; ++i) { float v = x[i]; s += v * v; }
+    return s;
+}
+
+__attribute__((target("avx2,fma")))
+double normsq_f64_chunk_avx2(const double* x, int64_t b, int64_t e) {
+    __m256d a0 = _mm256_setzero_pd(), a1 = _mm256_setzero_pd();
+    __m256d a2 = _mm256_setzero_pd(), a3 = _mm256_setzero_pd();
+    int64_t i = b;
+    for (; i + 16 <= e; i += 16) {
+        __m256d v;
+        v = _mm256_loadu_pd(x + i);          a0 = _mm256_fmadd_pd(v, v, a0);
+        v = _mm256_loadu_pd(x + i + 4);      a1 = _mm256_fmadd_pd(v, v, a1);
+        v = _mm256_loadu_pd(x + i + 8);      a2 = _mm256_fmadd_pd(v, v, a2);
+        v = _mm256_loadu_pd(x + i + 12);     a3 = _mm256_fmadd_pd(v, v, a3);
+    }
+    __m256d acc = _mm256_add_pd(_mm256_add_pd(a0, a1), _mm256_add_pd(a2, a3));
+    for (; i + 4 <= e; i += 4) {
+        __m256d v = _mm256_loadu_pd(x + i);
+        acc = _mm256_fmadd_pd(v, v, acc);
+    }
+    alignas(32) double buf[4];
+    _mm256_storeu_pd(buf, acc);
+    double s = (buf[0] + buf[1]) + (buf[2] + buf[3]);
+    for (; i < e; ++i) { double v = x[i]; s += v * v; }
+    return s;
+}
+
 // Returns false when the caller should use the iterator path.  Emits the raw
 // sum of squares; the caller applies the square root in the element dtype.
 static bool try_normsq_real_avx512(const void* xv, int64_t n, DType dt,
@@ -325,6 +384,44 @@ static bool try_normsq_real_avx512(const void* xv, int64_t n, DType dt,
         return true;
     }
     return false;
+}
+
+static bool try_normsq_real_avx2(const void* xv, int64_t n, DType dt,
+                                 double* out) {
+    if (!normsq_avx2_available() || n < 4096) return false;
+    constexpr int64_t kGrain = 32768;
+    if (dt == DType::Float32) {
+        const float* x = static_cast<const float*>(xv);
+        const int64_t nslots = (n + kGrain - 1) / kGrain;
+        std::vector<float> part(nslots, 0.f);
+        tensorplay::parallel::parallel_for(0, n, kGrain, [&](int64_t b, int64_t e) {
+            part[b / kGrain] = normsq_f32_chunk_avx2(x, b, e);
+        });
+        float s = 0.f;
+        for (int64_t k = 0; k < nslots; ++k) s += part[k];
+        *out = static_cast<double>(s);
+        return true;
+    }
+    if (dt == DType::Float64) {
+        const double* x = static_cast<const double*>(xv);
+        const int64_t nslots = (n + kGrain - 1) / kGrain;
+        std::vector<double> part(nslots, 0.0);
+        tensorplay::parallel::parallel_for(0, n, kGrain, [&](int64_t b, int64_t e) {
+            part[b / kGrain] = normsq_f64_chunk_avx2(x, b, e);
+        });
+        double s = 0.0;
+        for (int64_t k = 0; k < nslots; ++k) s += part[k];
+        *out = s;
+        return true;
+    }
+    return false;
+}
+
+// Picks the widest vector unit the part reports and leaves the raw sum of
+// squares in *out; returns false when neither unit is present.
+static bool try_normsq_real(const void* xv, int64_t n, DType dt, double* out) {
+    return try_normsq_real_avx512(xv, n, dt, out) ||
+           try_normsq_real_avx2(xv, n, dt, out);
 }
 
 }  // namespace
@@ -370,7 +467,7 @@ Tensor norm_kernel_impl(const Tensor& self, double p) {
 #if defined(__x86_64__)
     if (p == 2.0 && self.is_contiguous()) {
         double r = 0.0;
-        if (try_normsq_real_avx512(self.data_ptr(), self.numel(), self.dtype(), &r)) {
+        if (try_normsq_real(self.data_ptr(), self.numel(), self.dtype(), &r)) {
             Tensor out = Tensor::empty({}, out_dtype, self.device());
             if (self.dtype() == DType::Float32) out.fill_(Scalar(std::sqrt(static_cast<float>(r))));
             else out.fill_(Scalar(std::sqrt(r)));

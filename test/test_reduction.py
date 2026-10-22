@@ -1,3 +1,5 @@
+import numpy as np
+
 import tensorplay as tp
 
 from tensorplay.testing._internal.common_utils import TestCase, run_tests
@@ -130,6 +132,25 @@ class TestReduction(TestCase):
                          [0.0, 1.0, 2.0, 3.0])
         self.assertEqual(tp.func.vmap(lambda t: tp.logsumexp(t, []))(scalars).tolist(),
                          [0.0, 1.0, 2.0, 3.0])
+
+    @onlyCPU
+    def test_norm_two_reads_the_stream_of_squares_in_vectors(self, device):
+        # Sizes straddle the width below which the scalar row walk is used, and
+        # the strided case keeps the iterator path honest against the
+        # contiguous one.
+        for dtype, np_dtype in ((tp.float32, "float32"), (tp.float64, "float64")):
+            for n in (1024, 4095, 65536, 1 << 20):
+                data = np.random.RandomState(n % 97 + 1).standard_normal(n) * 0.5
+                values = data.astype(np_dtype)
+                expected = float(np.sqrt(np.sum(values.astype("float64") ** 2)))
+                x = tp.tensor(values.copy(), dtype=dtype, device=device)
+                self.assertEqual(x.norm().item(), expected, atol=1e-4, rtol=1e-4)
+                self.assertEqual(tp.linalg.vector_norm(x, 2).item(), expected,
+                                 atol=1e-4, rtol=1e-4)
+        wide = np.random.RandomState(11).standard_normal((1024, 1024)).astype("float32")
+        expected = float(np.sqrt(np.sum(wide.astype("float64") ** 2)))
+        strided = tp.tensor(wide.copy(), device=device).t()
+        self.assertEqual(strided.norm().item(), expected, atol=1e-4, rtol=1e-4)
 
 
 instantiate_device_type_tests(TestReduction, globals())
