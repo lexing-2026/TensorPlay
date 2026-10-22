@@ -1210,7 +1210,28 @@ Tensor& trunc_out_cpu(const Tensor& self, Tensor& out) {
                             !isIntegralType(self.dtype()));
 }
 
+static Tensor relu_impl(const Tensor& self, const Tensor* destination);
+
 Tensor relu_kernel(const Tensor& self) {
+    if (isQuantizedType(self.dtype())) return quantized::activation(self, 10);
+
+    return relu_impl(self, nullptr);
+}
+
+// The destination-writing pair of relu: a judged destination is written by the
+// same contiguous-float pass, so an out= call stops allocating a temporary and
+// copying it over.
+Tensor& relu_out_cpu(const Tensor& self, Tensor& out) {
+    if (!isQuantizedType(self.dtype()) &&
+        vecunary::vec_ready() && self.dtype() == DType::Float32 &&
+        self.is_contiguous() && destination_writable(self, out, DType::Float32)) {
+        relu_impl(self, &out);
+        return out;
+    }
+    return write_out(out, relu_kernel(self));
+}
+
+static Tensor relu_impl(const Tensor& self, const Tensor* destination) {
     if (isQuantizedType(self.dtype())) return quantized::activation(self, 10);
 
     // oneDNN eltwise rejected here (was: numel >= 4096): primitive
@@ -1223,8 +1244,11 @@ Tensor relu_kernel(const Tensor& self) {
     // target attributes instead.  Non-AVX2 hosts fall through to the generic
     // kernel below.
     if (vecunary::vec_ready() && self.dtype() == DType::Float32 && self.is_contiguous()) {
-         Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
-         int64_t n = self.numel();
+        // A judged destination is written in place of a fresh tensor.
+        Tensor result = destination != nullptr
+            ? *destination
+            : Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
+        const int64_t n = self.numel();
         const float* src = self.data_ptr<float>();
         float* dst = result.data_ptr<float>();
         if (n <= kUnaryGrain) {
@@ -1244,7 +1268,7 @@ Tensor relu_kernel(const Tensor& self) {
         } else {
             return x < static_cast<T>(0) ? static_cast<T>(0) : x;
         }
-    }, vecunary::VOp::Relu);
+    }, vecunary::VOp::Relu, {}, destination);
 }
 
 Tensor& relu_inplace_kernel(Tensor& self) {
