@@ -14008,5 +14008,60 @@ class TestVulkanChannelReduction(unittest.TestCase):
                             name, values, dim, False, True, tol)
 
 
+class TestVulkanChannelSoftmax(unittest.TestCase):
+    # Softmax over the channel axis shares one maximum and one sum across the
+    # four lanes of a texel.  The channel count comes from the tensor shape,
+    # and a count that is not a multiple of four leaves padding lanes in the
+    # last texel; neither the maximum nor the sum may see them.  Counts on
+    # either side of a texel boundary are checked over both storage classes.
+
+    CASES = (
+        ((2, 3, 7), 0),
+        ((3, 3, 7), 0),
+        ((4, 3, 7), 0),
+        ((5, 3, 7), 0),
+        ((6, 3, 7), 0),
+        ((8, 3, 7), 0),
+        ((2, 5, 3, 4), 1),
+    )
+
+    @staticmethod
+    def _device(values, dense=False):
+        if dense:
+            return tensorplay.tensor(values.copy(), device="vulkan")
+        return tensorplay.from_numpy(values.copy()).to("vulkan")
+
+    def _compare(self, name, fn, values, dim, dense, tol):
+        device = self._device(values, dense)
+        host = tensorplay.from_numpy(values.copy())
+        np.testing.assert_allclose(
+            fn(device, dim).cpu().numpy().astype(np.float64),
+            fn(host, dim).numpy().astype(np.float64),
+            rtol=tol, atol=tol, equal_nan=True,
+            err_msg=f"{name} over a channel axis of shape {values.shape}")
+
+    def test_the_channel_row_normalizes_over_every_lane(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(61)
+        for shape, dim in self.CASES:
+            for dtype, tol in ((np.float32, 1e-5), (np.float16, 3e-3)):
+                values = rng.standard_normal(shape).astype(dtype)
+                for name, fn in (("softmax", F.softmax),
+                                 ("log_softmax", F.log_softmax)):
+                    with self.subTest(
+                            shape=shape, dim=dim, name=name, dtype=dtype):
+                        self._compare(name, fn, values, dim, False, tol)
+
+    def test_the_word_storage_agrees_on_a_channel_row(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(67)
+        for dtype, tol in ((np.float32, 1e-5), (np.float16, 3e-3)):
+            values = rng.standard_normal((5, 3, 7)).astype(dtype)
+            for name, fn in (("softmax", F.softmax),
+                             ("log_softmax", F.log_softmax)):
+                with self.subTest(name=name, dtype=dtype):
+                    self._compare(name, fn, values, 0, True, tol)
+
+
 if __name__ == "__main__":
     unittest.main()
