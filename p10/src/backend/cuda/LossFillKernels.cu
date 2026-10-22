@@ -712,6 +712,10 @@ Tensor smooth_l1_loss_cuda(const Tensor& input, const Tensor& target,
 Tensor smooth_l1_loss_backward_cuda(const Tensor& grad_output,
                                     const Tensor& input, const Tensor& target,
                                     int64_t reduction, double beta) {
+    if (beta < 0) {
+        TP_THROW(ValueError,
+                 "smooth_l1_loss does not support negative values for beta.");
+    }
     auto pr = pair_f64_dev(input, target);
     // The kernels read grad linearly: materialize its broadcast.
     const Tensor g = grad_output.shape() == pr.first.shape()
@@ -795,9 +799,12 @@ Tensor huber_loss_backward_cuda(const Tensor& grad_output,
 namespace {
 
 // Validates the 0/1 domain on the host by summing out-of-range indicators.
+// Counting the lanes strictly below or above the bounds lets a lane that is
+// not a number through, since it answers neither comparison, so the probe for
+// a missing measurement is summed alongside the two bounds.
 void bce_check_01_cuda(const Tensor& t, const char* what) {
     if (t.numel() == 0) return;
-    Tensor bad = (t.lt(Scalar(0.0)) + t.gt(Scalar(1.0))).sum();
+    Tensor bad = (t.lt(Scalar(0.0)) + t.gt(Scalar(1.0)) + Tensor::isnan(t)).sum();
     if (bad.item().to<double>() > 0) {
         TP_THROW(RuntimeError, std::string("all elements of ") + what +
                  " should be between 0 and 1");
