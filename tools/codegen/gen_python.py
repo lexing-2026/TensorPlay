@@ -7,6 +7,7 @@ Scalar normalization, device normalization, and compiler graph capture hooks.
 from __future__ import annotations
 
 import keyword
+import re
 
 from .api_types import py_default_for, python_default
 from .model import NativeFunction
@@ -72,6 +73,10 @@ _VARIADIC_TENSOR_LIST_FUNCTIONS = frozenset({
     'atleast_1d', 'atleast_2d', 'atleast_3d',
     'block_diag', 'broadcast_tensors', 'cartesian_prod', 'chain_matmul',
 })
+
+# Defaults that render as a plain literal can be compared directly in a
+# generated guard; anything else keeps the keyword forward untouched.
+_NUM_LITERAL_RE = re.compile(r'-?\d+(?:\.\d+)?$')
 
 # The ops whose public spelling becomes the adopted C trampoline (the
 # install_factory_fast_paths keys below).  Their eager calls skip the Python
@@ -1179,6 +1184,53 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
                     pos_names,
                     tuple(_param_name(a) for a in f.args if a.kwonly),
                 )
+                # Keyword-only options are forwarded by name, so a call that
+                # leaves every one of them at its schema default still pays
+                # the binding's keyword parsing.  Such a call can spell the
+                # positional arguments only and let the binding fill in the
+                # rest; the guard compares against those defaults so any
+                # explicit option keeps the named forward.
+                fast_parts = []
+                fast_ok = not merged and kw_route is None
+                if fast_ok:
+                    arity = sum(1 for a in f.args if not a.kwonly)
+                    fast_ok = all(
+                        sum(1 for a in g.args if not a.kwonly) == arity
+                        for g in group
+                        if g.overload_name != 'out' and not g.out_args)
+                if fast_ok:
+                    for a in f.args:
+                        if not a.kwonly:
+                            continue
+                        if not a.default:
+                            fast_ok = False
+                            break
+                        nm = _param_name(a)
+                        lit = python_default(a.type, a.default)
+                        if lit == 'None':
+                            fast_parts.append(f'{nm} is None')
+                        elif lit == 'False':
+                            fast_parts.append(f'not {nm}')
+                        elif lit == 'True':
+                            fast_parts.append(f'{nm}')
+                        elif _NUM_LITERAL_RE.match(lit):
+                            # A literal comparison would also fire on an
+                            # array-like argument and turn the truth test
+                            # into an elementwise one; the type check keeps
+                            # the fast path to the plain number it replaces.
+                            kind = 'float' if '.' in lit else 'int'
+                            fast_parts.append(
+                                f'type({nm}) is {kind} and {nm} == {lit}')
+                        elif len(lit) > 1 and lit[0] in "'\"":
+                            fast_parts.append(
+                                f'type({nm}) is str and {nm} == {lit}')
+                        else:
+                            fast_ok = False
+                            break
+                if fast_ok and fast_parts:
+                    lines.append(f'    if {" and ".join(fast_parts)}:')
+                    lines.append(
+                        f'        return _C.{name}({", ".join(pos_names)})')
                 if fwd is not None:
                     lines.append(f'    return _C.{name}({", ".join(fwd)})')
                 else:

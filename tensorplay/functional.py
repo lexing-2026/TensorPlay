@@ -1076,6 +1076,8 @@ def addcmul(input, tensor1, tensor2, *, value=1, out=None):
         _captured = _capture_call(addcmul, (input, tensor1, tensor2), {'value': value})
         if _captured is not None:
             return _captured
+    if type(value) is int and value == 1:
+        return _C.addcmul(input, tensor1, tensor2)
     return _C.addcmul(self=input, tensor1=tensor1, tensor2=tensor2, value=value)
 
 def addcmul_(input, tensor1, tensor2, value=1):
@@ -1092,6 +1094,8 @@ def addcdiv(input, tensor1, tensor2, *, value=1, out=None):
         _captured = _capture_call(addcdiv, (input, tensor1, tensor2), {'value': value})
         if _captured is not None:
             return _captured
+    if type(value) is int and value == 1:
+        return _C.addcdiv(input, tensor1, tensor2)
     return _C.addcdiv(self=input, tensor1=tensor1, tensor2=tensor2, value=value)
 
 def addcdiv_(input, tensor1, tensor2, value=1):
@@ -1797,6 +1801,8 @@ def quantile(input, q, dim=None, keepdim=False, *, interpolation='linear', out=N
         _captured = _capture_call(quantile, (input, q, dim, keepdim), {'interpolation': interpolation})
         if _captured is not None:
             return _captured
+    if type(interpolation) is str and interpolation == 'linear':
+        return _C.quantile(input, q, dim, keepdim)
     return _C.quantile(input, q, dim, keepdim, interpolation=interpolation)
 
 def nanquantile(input, q, dim=None, keepdim=False, *, interpolation='linear', out=None):
@@ -1810,6 +1816,8 @@ def nanquantile(input, q, dim=None, keepdim=False, *, interpolation='linear', ou
         _captured = _capture_call(nanquantile, (input, q, dim, keepdim), {'interpolation': interpolation})
         if _captured is not None:
             return _captured
+    if type(interpolation) is str and interpolation == 'linear':
+        return _C.nanquantile(input, q, dim, keepdim)
     return _C.nanquantile(input, q, dim, keepdim, interpolation=interpolation)
 
 def histogram(input, bins, *, weight=None, density=False, out=None):
@@ -1823,6 +1831,8 @@ def histogram(input, bins, *, weight=None, density=False, out=None):
         _captured = _capture_call(histogram, (input, bins), {'weight': weight, 'density': density})
         if _captured is not None:
             return _captured
+    if weight is None and not density:
+        return _C.histogram(input, bins)
     return _C.histogram(input, bins, weight=weight, density=density)
 
 def trapezoid(y, x=None, dx=1, dim=-1):
@@ -3555,6 +3565,8 @@ def multinomial(input, num_samples, replacement=False, *, generator=None, out=No
         _captured = _capture_call(multinomial, (input, num_samples, replacement), {'generator': generator})
         if _captured is not None:
             return _captured
+    if generator is None:
+        return _C.multinomial(input, num_samples, replacement)
     return _C.multinomial(self=input, num_samples=num_samples, replacement=replacement, generator=generator)
 
 def topk(input, k, dim=-1, largest=True, sorted=True, impl=0, *, out=None):
@@ -3588,6 +3600,8 @@ def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.
         _captured = _capture_call(scaled_dot_product_attention, (query, key, value, attn_mask, dropout_p, is_causal), {'scale': scale, 'enable_gqa': enable_gqa})
         if _captured is not None:
             return _captured
+    if scale is None and not enable_gqa:
+        return _C.scaled_dot_product_attention(query, key, value, attn_mask, dropout_p, is_causal)
     return _C.scaled_dot_product_attention(query=query, key=key, value=value, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale, enable_gqa=enable_gqa)
 
 def _scaled_dot_product_attention_with_lse(query, key, value, is_causal=False, impl=0):
@@ -4990,6 +5004,8 @@ def addbmm(input, batch1, batch2, *, beta=1, alpha=1, out=None):
         _captured = _capture_call(addbmm, (input, batch1, batch2), {'beta': beta, 'alpha': alpha})
         if _captured is not None:
             return _captured
+    if type(beta) is int and beta == 1 and type(alpha) is int and alpha == 1:
+        return _C.addbmm(input, batch1, batch2)
     return _C.addbmm(self=input, batch1=batch1, batch2=batch2, beta=beta, alpha=alpha)
 
 def addmv(input, mat, vec, *, beta=1, alpha=1, out=None):
@@ -5003,6 +5019,8 @@ def addmv(input, mat, vec, *, beta=1, alpha=1, out=None):
         _captured = _capture_call(addmv, (input, mat, vec), {'beta': beta, 'alpha': alpha})
         if _captured is not None:
             return _captured
+    if type(beta) is int and beta == 1 and type(alpha) is int and alpha == 1:
+        return _C.addmv(input, mat, vec)
     return _C.addmv(self=input, mat=mat, vec=vec, beta=beta, alpha=alpha)
 
 def addr(input, vec1, vec2, *, beta=1, alpha=1, out=None):
@@ -5016,6 +5034,8 @@ def addr(input, vec1, vec2, *, beta=1, alpha=1, out=None):
         _captured = _capture_call(addr, (input, vec1, vec2), {'beta': beta, 'alpha': alpha})
         if _captured is not None:
             return _captured
+    if type(beta) is int and beta == 1 and type(alpha) is int and alpha == 1:
+        return _C.addr(input, vec1, vec2)
     return _C.addr(self=input, vec1=vec1, vec2=vec2, beta=beta, alpha=alpha)
 
 def amax(input, dim=[], keepdim=False, *, out=None):
@@ -5526,6 +5546,8 @@ def nanmean(input, dim=None, keepdim=False, *, dtype=None, out=None):
         _captured = _capture_call(nanmean, (input, dim, keepdim), {'dtype': dtype})
         if _captured is not None:
             return _captured
+    if dtype is None:
+        return _C.nanmean(input, dim, keepdim)
     return _C.nanmean(self=input, dim=dim, keepdim=keepdim, dtype=dtype)
 
 def isclose(input, other, rtol=1e-05, atol=1e-08, equal_nan=False):
@@ -5666,6 +5688,8 @@ def searchsorted(sorted_sequence, input, *, out_int32=False, right=False, side=N
         _captured = _capture_call(searchsorted, (sorted_sequence, input), {'out_int32': out_int32, 'right': right, 'side': side, 'sorter': sorter})
         if _captured is not None:
             return _captured
+    if not out_int32 and not right and side is None and sorter is None:
+        return _C.searchsorted(sorted_sequence, input)
     return _C.searchsorted(sorted_sequence, input, out_int32=out_int32, right=right, side=side, sorter=sorter)
 
 def bucketize(input, boundaries, *, out_int32=False, right=False, out=None):
@@ -5679,6 +5703,8 @@ def bucketize(input, boundaries, *, out_int32=False, right=False, out=None):
         _captured = _capture_call(bucketize, (input, boundaries), {'out_int32': out_int32, 'right': right})
         if _captured is not None:
             return _captured
+    if not out_int32 and not right:
+        return _C.bucketize(input, boundaries)
     return _C.bucketize(input, boundaries, out_int32=out_int32, right=right)
 
 def scatter(input, dim, index, src, *, reduce=_MISSING, out=None):
@@ -7858,6 +7884,8 @@ def scatter_reduce(input, dim, index, src, reduce, *, include_self=True, out=Non
         _captured = _capture_call(scatter_reduce, (input, dim, index, src, reduce), {'include_self': include_self})
         if _captured is not None:
             return _captured
+    if include_self:
+        return _C.scatter_reduce(input, dim, index, src, reduce)
     return _C.scatter_reduce(input, dim, index, src, reduce, include_self=include_self)
 
 def index_reduce(input, dim, index, source, reduce, *, include_self=True, out=None):
@@ -7871,6 +7899,8 @@ def index_reduce(input, dim, index, source, reduce, *, include_self=True, out=No
         _captured = _capture_call(index_reduce, (input, dim, index, source, reduce), {'include_self': include_self})
         if _captured is not None:
             return _captured
+    if include_self:
+        return _C.index_reduce(input, dim, index, source, reduce)
     return _C.index_reduce(self=input, dim=dim, index=index, source=source, reduce=reduce, include_self=include_self)
 
 def _scatter_reduce_backward_self(grad, input, dim, index, src, reduce, include_self):
@@ -8919,6 +8949,8 @@ def isin(elements, test_elements, *, assume_unique=False, invert=False, out=None
         _captured = _capture_call(isin, (elements, test_elements), {'assume_unique': assume_unique, 'invert': invert})
         if _captured is not None:
             return _captured
+    if not assume_unique and not invert:
+        return _C.isin(elements, test_elements)
     return _C.isin(elements, test_elements, assume_unique=assume_unique, invert=invert)
 
 def unique_consecutive(input, return_inverse=False, return_counts=False, dim=None):
@@ -8946,6 +8978,8 @@ def scalar_tensor(s, *, dtype=None, device=None, pin_memory=False, out=None):
         _captured = _capture_call(scalar_tensor, (s,), {'dtype': dtype, 'device': device, 'pin_memory': pin_memory})
         if _captured is not None:
             return _captured
+    if dtype is None and device is None and not pin_memory:
+        return _C.scalar_tensor(s)
     return _C.scalar_tensor(s=s, dtype=dtype, device=device, pin_memory=pin_memory)
 
 def is_conj(input):
@@ -9222,6 +9256,8 @@ def expand_copy(input, size, *, implicit=False, out=None):
         _captured = _capture_call(expand_copy, (input, size), {'implicit': implicit})
         if _captured is not None:
             return _captured
+    if not implicit:
+        return _C.expand_copy(input, size)
     return _C.expand_copy(self=input, size=size, implicit=implicit)
 
 def reshape_as(input, other):
@@ -9618,6 +9654,8 @@ def range(start, end, step=1, *, dtype=None, device=None, out=None):
         _captured = _capture_call(range, (start, end, step), {'dtype': dtype, 'device': device})
         if _captured is not None:
             return _captured
+    if dtype is None and device is None:
+        return _C.range(start, end, step)
     return _C.range(start, end, step, dtype=dtype, device=device)
 
 def is_signed(input):
@@ -9690,6 +9728,8 @@ def empty_strided(size, stride, *, dtype=None, device=None, pin_memory=False, ou
         _captured = _capture_call(empty_strided, (size, stride), {'dtype': dtype, 'device': device, 'pin_memory': pin_memory})
         if _captured is not None:
             return _captured
+    if dtype is None and device is None and not pin_memory:
+        return _C.empty_strided(size, stride)
     return _C.empty_strided(size=size, stride=stride, dtype=dtype, device=device, pin_memory=pin_memory)
 
 def _cast_Byte(input, non_blocking=False):
@@ -9846,6 +9886,8 @@ def _new_zeros_with_same_feature_meta(input, other, *, self_num_batch_dims=0, ou
         _captured = _capture_call(_new_zeros_with_same_feature_meta, (input, other), {'self_num_batch_dims': self_num_batch_dims})
         if _captured is not None:
             return _captured
+    if type(self_num_batch_dims) is int and self_num_batch_dims == 0:
+        return _C._new_zeros_with_same_feature_meta(input, other)
     return _C._new_zeros_with_same_feature_meta(self=input, other=other, self_num_batch_dims=self_num_batch_dims)
 
 def _has_same_storage_numel(input, other):
@@ -10031,6 +10073,8 @@ def _cudnn_init_dropout_state(dropout, train, dropout_seed, *, dtype=None, layou
         _captured = _capture_call(_cudnn_init_dropout_state, (dropout, train, dropout_seed), {'dtype': dtype, 'layout': layout, 'device': device, 'pin_memory': pin_memory})
         if _captured is not None:
             return _captured
+    if dtype is None and layout is None and device is None and not pin_memory:
+        return _C._cudnn_init_dropout_state(dropout, train, dropout_seed)
     return _C._cudnn_init_dropout_state(dropout=dropout, train=train, dropout_seed=dropout_seed, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory)
 
 def _debug_has_internal_overlap(input):
@@ -10687,6 +10731,8 @@ def empty_permuted(size, physical_layout, *, dtype=None, layout=None, device=Non
         _captured = _capture_call(empty_permuted, (size, physical_layout), {'dtype': dtype, 'layout': layout, 'device': device, 'pin_memory': pin_memory})
         if _captured is not None:
             return _captured
+    if dtype is None and layout is None and device is None and pin_memory is None:
+        return _C.empty_permuted(size, physical_layout)
     return _C.empty_permuted(size=size, physical_layout=physical_layout, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory)
 
 def new_empty(input, size, dtype=None, layout=None, device=None, pin_memory=None):
@@ -10770,6 +10816,8 @@ def empty_quantized(size, qtensor, *, dtype=None, layout=None, device=None, pin_
         _captured = _capture_call(empty_quantized, (size, qtensor), {'dtype': dtype, 'layout': layout, 'device': device, 'pin_memory': pin_memory, 'memory_format': memory_format})
         if _captured is not None:
             return _captured
+    if dtype is None and layout is None and device is None and pin_memory is None and memory_format is None:
+        return _C.empty_quantized(size, qtensor)
     return _C.empty_quantized(size=size, qtensor=qtensor, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory, memory_format=memory_format)
 
 def floor_divide_(input, other):
@@ -10786,6 +10834,8 @@ def from_file(filename, shared=None, size=0, *, dtype=None, layout=None, device=
         _captured = _capture_call(from_file, (filename, shared, size), {'dtype': dtype, 'layout': layout, 'device': device, 'pin_memory': pin_memory})
         if _captured is not None:
             return _captured
+    if dtype is None and layout is None and device is None and pin_memory is None:
+        return _C.from_file(filename, shared, size)
     return _C.from_file(filename=filename, shared=shared, size=size, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory)
 
 def grid_sampler(input, grid, interpolation_mode, padding_mode, align_corners):
@@ -12211,6 +12261,8 @@ def sspaddmm(input, mat1, mat2, *, beta=1, alpha=1, out=None):
         _captured = _capture_call(sspaddmm, (input, mat1, mat2), {'beta': beta, 'alpha': alpha})
         if _captured is not None:
             return _captured
+    if type(beta) is int and beta == 1 and type(alpha) is int and alpha == 1:
+        return _C.sspaddmm(input, mat1, mat2)
     return _C.sspaddmm(self=input, mat1=mat1, mat2=mat2, beta=beta, alpha=alpha)
 
 def _chunk_cat(tensors, dim, num_chunks, *, out=None):
@@ -12273,6 +12325,8 @@ def hash_tensor(input, dim=[], *, keepdim=False, mode=0, out=None):
         _captured = _capture_call(hash_tensor, (input, dim), {'keepdim': keepdim, 'mode': mode})
         if _captured is not None:
             return _captured
+    if not keepdim and type(mode) is int and mode == 0:
+        return _C.hash_tensor(input, dim)
     return _C.hash_tensor(self=input, dim=dim, keepdim=keepdim, mode=mode)
 
 def sum_to_size(input, size):
@@ -12677,6 +12731,8 @@ def _efficientzerotensor(size, *, dtype=None, layout=None, device=None, pin_memo
         _captured = _capture_call(_efficientzerotensor, (size,), {'dtype': dtype, 'layout': layout, 'device': device, 'pin_memory': pin_memory})
         if _captured is not None:
             return _captured
+    if dtype is None and layout is None and device is None and pin_memory is None:
+        return _C._efficientzerotensor(size)
     return _C._efficientzerotensor(size=size, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory)
 
 def _standard_gamma_grad(input, output, *, out=None):
@@ -12844,6 +12900,8 @@ def _sparse_csr_sum(input, dim, keepdim=False, *, dtype=None, out=None):
         _captured = _capture_call(_sparse_csr_sum, (input, dim, keepdim), {'dtype': dtype})
         if _captured is not None:
             return _captured
+    if dtype is None:
+        return _C._sparse_csr_sum(input, dim, keepdim)
     return _C._sparse_csr_sum(self=input, dim=dim, keepdim=keepdim, dtype=dtype)
 
 def _sparse_csr_prod(input, dim, keepdim=False, *, dtype=None, out=None):
@@ -12857,6 +12915,8 @@ def _sparse_csr_prod(input, dim, keepdim=False, *, dtype=None, out=None):
         _captured = _capture_call(_sparse_csr_prod, (input, dim, keepdim), {'dtype': dtype})
         if _captured is not None:
             return _captured
+    if dtype is None:
+        return _C._sparse_csr_prod(input, dim, keepdim)
     return _C._sparse_csr_prod(self=input, dim=dim, keepdim=keepdim, dtype=dtype)
 
 def _sparse_softmax(input, dim, dtype=None, *, out=None):
@@ -12967,6 +13027,8 @@ def _sparse_addmm(input, mat1, mat2, *, beta=1, alpha=1, out=None):
         _captured = _capture_call(_sparse_addmm, (input, mat1, mat2), {'beta': beta, 'alpha': alpha})
         if _captured is not None:
             return _captured
+    if type(beta) is int and beta == 1 and type(alpha) is int and alpha == 1:
+        return _C._sparse_addmm(input, mat1, mat2)
     return _C._sparse_addmm(self=input, mat1=mat1, mat2=mat2, beta=beta, alpha=alpha)
 
 def sparse_sampled_addmm(input, mat1, mat2, *, beta=1, alpha=1, out=None):
@@ -12980,6 +13042,8 @@ def sparse_sampled_addmm(input, mat1, mat2, *, beta=1, alpha=1, out=None):
         _captured = _capture_call(sparse_sampled_addmm, (input, mat1, mat2), {'beta': beta, 'alpha': alpha})
         if _captured is not None:
             return _captured
+    if type(beta) is int and beta == 1 and type(alpha) is int and alpha == 1:
+        return _C.sparse_sampled_addmm(input, mat1, mat2)
     return _C.sparse_sampled_addmm(self=input, mat1=mat1, mat2=mat2, beta=beta, alpha=alpha)
 
 def _sparse_mm_reduce_impl(input, other, reduce):
@@ -13007,6 +13071,8 @@ def _addmm_activation(input, mat1, mat2, *, beta=1, alpha=1, use_gelu=False, out
         _captured = _capture_call(_addmm_activation, (input, mat1, mat2), {'beta': beta, 'alpha': alpha, 'use_gelu': use_gelu})
         if _captured is not None:
             return _captured
+    if type(beta) is int and beta == 1 and type(alpha) is int and alpha == 1 and not use_gelu:
+        return _C._addmm_activation(input, mat1, mat2)
     return _C._addmm_activation(self=input, mat1=mat1, mat2=mat2, beta=beta, alpha=alpha, use_gelu=use_gelu)
 
 def _scaled_mm(input, mat2, scale_a, scale_b, bias=None, scale_result=None, out_dtype=None, use_fast_accum=False, *, out=None):
@@ -13254,6 +13320,8 @@ def _sparse_coo_tensor_with_dims(sparse_dim, dense_dim, size, *, dtype=None, lay
         _captured = _capture_call(_sparse_coo_tensor_with_dims, (sparse_dim, dense_dim, size), {'dtype': dtype, 'layout': layout, 'device': device, 'pin_memory': pin_memory})
         if _captured is not None:
             return _captured
+    if dtype is None and layout is None and device is None and not pin_memory:
+        return _C._sparse_coo_tensor_with_dims(sparse_dim, dense_dim, size)
     return _C._sparse_coo_tensor_with_dims(sparse_dim=sparse_dim, dense_dim=dense_dim, size=size, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory)
 
 def _sparse_coo_tensor_with_dims_and_tensors(sparse_dim, dense_dim, size, indices, values, *, dtype=None, layout=None, device=None, pin_memory=False, is_coalesced=None, out=None):
@@ -13267,6 +13335,8 @@ def _sparse_coo_tensor_with_dims_and_tensors(sparse_dim, dense_dim, size, indice
         _captured = _capture_call(_sparse_coo_tensor_with_dims_and_tensors, (sparse_dim, dense_dim, size, indices, values), {'dtype': dtype, 'layout': layout, 'device': device, 'pin_memory': pin_memory, 'is_coalesced': is_coalesced})
         if _captured is not None:
             return _captured
+    if dtype is None and layout is None and device is None and not pin_memory and is_coalesced is None:
+        return _C._sparse_coo_tensor_with_dims_and_tensors(sparse_dim, dense_dim, size, indices, values)
     return _C._sparse_coo_tensor_with_dims_and_tensors(sparse_dim=sparse_dim, dense_dim=dense_dim, size=size, indices=indices, values=values, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory, is_coalesced=is_coalesced)
 
 def sparse_resize_(input, size, sparse_dim, dense_dim):
@@ -13820,6 +13890,8 @@ def _to_copy(input, *, dtype=None, layout=None, device=None, pin_memory=None, no
         _captured = _capture_call(_to_copy, (input,), {'dtype': dtype, 'layout': layout, 'device': device, 'pin_memory': pin_memory, 'non_blocking': non_blocking, 'memory_format': memory_format})
         if _captured is not None:
             return _captured
+    if dtype is None and layout is None and device is None and pin_memory is None and not non_blocking and memory_format is None:
+        return _C._to_copy(input)
     return _C._to_copy(self=input, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory, non_blocking=non_blocking, memory_format=memory_format)
 
 def to(input, dtype=None, layout=None, device=None, pin_memory=None, non_blocking=False, copy=False, memory_format=None):
@@ -14410,6 +14482,8 @@ def _histogramdd_bin_edges(input, bins, *, range=None, weight=None, density=Fals
         _captured = _capture_call(_histogramdd_bin_edges, (input, bins), {'range': range, 'weight': weight, 'density': density})
         if _captured is not None:
             return _captured
+    if range is None and weight is None and not density:
+        return _C._histogramdd_bin_edges(input, bins)
     return _C._histogramdd_bin_edges(self=input, bins=bins, range=range, weight=weight, density=density)
 
 def _histogramdd_from_bin_cts(input, bins, *, range=None, weight=None, density=False, out=None):
@@ -14423,6 +14497,8 @@ def _histogramdd_from_bin_cts(input, bins, *, range=None, weight=None, density=F
         _captured = _capture_call(_histogramdd_from_bin_cts, (input, bins), {'range': range, 'weight': weight, 'density': density})
         if _captured is not None:
             return _captured
+    if range is None and weight is None and not density:
+        return _C._histogramdd_from_bin_cts(input, bins)
     return _C._histogramdd_from_bin_cts(self=input, bins=bins, range=range, weight=weight, density=density)
 
 def _histogramdd_from_bin_tensors(input, bins, *, weight=None, density=False, out=None):
@@ -14436,6 +14512,8 @@ def _histogramdd_from_bin_tensors(input, bins, *, weight=None, density=False, ou
         _captured = _capture_call(_histogramdd_from_bin_tensors, (input, bins), {'weight': weight, 'density': density})
         if _captured is not None:
             return _captured
+    if weight is None and not density:
+        return _C._histogramdd_from_bin_tensors(input, bins)
     return _C._histogramdd_from_bin_tensors(self=input, bins=bins, weight=weight, density=density)
 
 def histogramdd(input, bins, range=None, weight=None, density=False):
@@ -14897,6 +14975,8 @@ def _convert_indices_from_coo_to_csr(input, size, *, out_int32=False, out=None):
         _captured = _capture_call(_convert_indices_from_coo_to_csr, (input, size), {'out_int32': out_int32})
         if _captured is not None:
             return _captured
+    if not out_int32:
+        return _C._convert_indices_from_coo_to_csr(input, size)
     return _C._convert_indices_from_coo_to_csr(self=input, size=size, out_int32=out_int32)
 
 def _convert_indices_from_csr_to_coo(crow_indices, col_indices, *, out_int32=False, transpose=False, out=None):
@@ -14910,6 +14990,8 @@ def _convert_indices_from_csr_to_coo(crow_indices, col_indices, *, out_int32=Fal
         _captured = _capture_call(_convert_indices_from_csr_to_coo, (crow_indices, col_indices), {'out_int32': out_int32, 'transpose': transpose})
         if _captured is not None:
             return _captured
+    if not out_int32 and not transpose:
+        return _C._convert_indices_from_csr_to_coo(crow_indices, col_indices)
     return _C._convert_indices_from_csr_to_coo(crow_indices=crow_indices, col_indices=col_indices, out_int32=out_int32, transpose=transpose)
 
 def nll_loss_nd(input, target, weight=None, reduction=1, ignore_index=-100):
@@ -15918,6 +16000,8 @@ def special_round(input, *, decimals=0, out=None):
         _captured = _capture_call(special_round, (input,), {'decimals': decimals})
         if _captured is not None:
             return _captured
+    if type(decimals) is int and decimals == 0:
+        return _C.special_round(input)
     return _C.special_round(self=input, decimals=decimals)
 
 def special_log1p(input, *, out=None):
@@ -16127,6 +16211,8 @@ def fft_fftfreq(n, d=1.0, *, dtype=None, layout=None, device=None, pin_memory=No
         _captured = _capture_call(fft_fftfreq, (n, d), {'dtype': dtype, 'layout': layout, 'device': device, 'pin_memory': pin_memory})
         if _captured is not None:
             return _captured
+    if dtype is None and layout is None and device is None and pin_memory is None:
+        return _C.fft_fftfreq(n, d)
     return _C.fft_fftfreq(n=n, d=d, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory)
 
 def fft_rfftfreq(n, d=1.0, *, dtype=None, layout=None, device=None, pin_memory=None, out=None):
@@ -16140,6 +16226,8 @@ def fft_rfftfreq(n, d=1.0, *, dtype=None, layout=None, device=None, pin_memory=N
         _captured = _capture_call(fft_rfftfreq, (n, d), {'dtype': dtype, 'layout': layout, 'device': device, 'pin_memory': pin_memory})
         if _captured is not None:
             return _captured
+    if dtype is None and layout is None and device is None and pin_memory is None:
+        return _C.fft_rfftfreq(n, d)
     return _C.fft_rfftfreq(n=n, d=d, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory)
 
 def fft_fftshift(input, dim=None):
@@ -16257,6 +16345,8 @@ def _linalg_svd(A, full_matrices=False, compute_uv=True, *, driver=None, out=Non
         _captured = _capture_call(_linalg_svd, (A, full_matrices, compute_uv), {'driver': driver})
         if _captured is not None:
             return _captured
+    if driver is None:
+        return _C._linalg_svd(A, full_matrices, compute_uv)
     return _C._linalg_svd(A=A, full_matrices=full_matrices, compute_uv=compute_uv, driver=driver)
 
 def _linalg_solve_ex(A, B, *, left=True, check_errors=False, out=None):
@@ -16270,6 +16360,8 @@ def _linalg_solve_ex(A, B, *, left=True, check_errors=False, out=None):
         _captured = _capture_call(_linalg_solve_ex, (A, B), {'left': left, 'check_errors': check_errors})
         if _captured is not None:
             return _captured
+    if left and not check_errors:
+        return _C._linalg_solve_ex(A, B)
     return _C._linalg_solve_ex(A=A, B=B, left=left, check_errors=check_errors)
 
 def _spsolve(A, B, left=True):
@@ -16414,6 +16506,8 @@ def segment_reduce(data, reduce, *, lengths=None, indices=None, offsets=None, ax
         _captured = _capture_call(segment_reduce, (data, reduce), {'lengths': lengths, 'indices': indices, 'offsets': offsets, 'axis': axis, 'unsafe': unsafe, 'initial': initial})
         if _captured is not None:
             return _captured
+    if lengths is None and indices is None and offsets is None and type(axis) is int and axis == 0 and not unsafe and initial is None:
+        return _C.segment_reduce(data, reduce)
     return _C.segment_reduce(data=data, reduce=reduce, lengths=lengths, indices=indices, offsets=offsets, axis=axis, unsafe=unsafe, initial=initial)
 
 def _segment_reduce_backward(grad_output, output, data, reduce, *, lengths=None, offsets=None, axis=0, initial=None, out=None):
@@ -16427,6 +16521,8 @@ def _segment_reduce_backward(grad_output, output, data, reduce, *, lengths=None,
         _captured = _capture_call(_segment_reduce_backward, (grad_output, output, data, reduce), {'lengths': lengths, 'offsets': offsets, 'axis': axis, 'initial': initial})
         if _captured is not None:
             return _captured
+    if lengths is None and offsets is None and type(axis) is int and axis == 0 and initial is None:
+        return _C._segment_reduce_backward(grad_output, output, data, reduce)
     return _C._segment_reduce_backward(grad_output=grad_output, output=output, data=data, reduce=reduce, lengths=lengths, offsets=offsets, axis=axis, initial=initial)
 
 def _segment_reduce(data, reduce, lengths=None, offsets=None, axis=0, initial=None):
@@ -17259,6 +17355,8 @@ def _foobar(input, arg1=True, arg2=True, *, arg3=True, out=None):
         _captured = _capture_call(_foobar, (input, arg1, arg2), {'arg3': arg3})
         if _captured is not None:
             return _captured
+    if arg3:
+        return _C._foobar(input, arg1, arg2)
     return _C._foobar(self=input, arg1=arg1, arg2=arg2, arg3=arg3)
 
 def _propagate_xla_data(input, output):
