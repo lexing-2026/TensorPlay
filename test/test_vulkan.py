@@ -13753,5 +13753,260 @@ class TestVulkanCumExtremum(unittest.TestCase):
                         want.indices.numpy().astype(np.int32))
 
 
+class TestVulkanMoments(unittest.TestCase):
+    # var_mean and std_mean answer the mean and the centered second moment in
+    # one call.  The variance divides the squared deviations by the element
+    # count less the correction, floored at zero: one element without a
+    # correction has no degrees of freedom left, so its variance is NaN, while
+    # a correction past the count leaves a positive deviation sum over a zero
+    # divisor.  An empty reduced axis answers NaN and an empty unreduced axis
+    # leaves an empty answer.  A scalar has no axis at all, so its variance is
+    # NaN while its mean is the value itself.  Counts and truth values widen to
+    # single precision; narrow floats narrow only their answers.  Both
+    # storages answer alike.
+
+    CASES = (
+        ((3, 5), [0], False),
+        ((3, 5), [-1], False),
+        ((2, 3, 4), [1], True),
+        ((2, 3, 4), [0, 2], False),
+        ((2, 3, 4), [], False),
+        ((2, 3, 4), [1, 1], False),
+    )
+
+    @staticmethod
+    def _device(values, dense=False):
+        if dense:
+            return tensorplay.tensor(values.copy(), device="vulkan")
+        return tensorplay.from_numpy(values.copy()).to("vulkan")
+
+    @staticmethod
+    def _host(values):
+        return tensorplay.from_numpy(values.copy())
+
+    def _compare(self, values, dim, keepdim, dense=False, tol=1e-5):
+        got_var, got_mean = tensorplay.var_mean(
+            self._device(values, dense), dim, keepdim=keepdim)
+        want_var, want_mean = tensorplay.var_mean(
+            self._host(values), dim, keepdim=keepdim)
+        self.assertEqual(tuple(got_var.shape), tuple(want_var.shape))
+        self.assertEqual(tuple(got_mean.shape), tuple(want_mean.shape))
+        np.testing.assert_allclose(
+            got_var.cpu().numpy().astype(np.float64),
+            want_var.numpy().astype(np.float64),
+            rtol=tol, atol=tol, equal_nan=True)
+        np.testing.assert_allclose(
+            got_mean.cpu().numpy().astype(np.float64),
+            want_mean.numpy().astype(np.float64),
+            rtol=tol, atol=tol, equal_nan=True)
+        return got_var, got_mean
+
+    def test_the_pair_follows_the_host_over_every_axis_set(self):
+        rng = np.random.default_rng(29)
+        for shape, dim, keepdim in self.CASES:
+            for dtype, tol in ((np.float32, 1e-5), (np.float16, 2e-3)):
+                values = rng.standard_normal(shape).astype(dtype)
+                with self.subTest(shape=shape, dim=dim, dtype=dtype):
+                    got_var, got_mean = self._compare(
+                        values, dim, keepdim, tol=tol)
+                    want_dtype = (tensorplay.float32
+                                  if dtype == np.float32
+                                  else tensorplay.float16)
+                    self.assertEqual(got_var.dtype, want_dtype)
+                    self.assertEqual(got_mean.dtype, want_dtype)
+
+    def test_counts_and_truth_values_answer_in_single_precision(self):
+        rng = np.random.default_rng(31)
+        counts = rng.integers(-8, 8, (4, 6)).astype(np.int32)
+        got_var, got_mean = self._compare(counts, [1], False)
+        self.assertEqual(got_var.dtype, tensorplay.float32)
+        self.assertEqual(got_mean.dtype, tensorplay.float32)
+        truth = rng.integers(0, 2, (4, 6)).astype(bool)
+        got_var, got_mean = self._compare(truth, [0], False)
+        self.assertEqual(got_var.dtype, tensorplay.float32)
+        self.assertEqual(got_mean.dtype, tensorplay.float32)
+
+    def test_a_line_without_degrees_of_freedom_answers_nan(self):
+        one = self._device(np.array([5.0], np.float32))
+        var, mean = tensorplay.var_mean(one, [0])
+        self.assertTrue(math.isnan(float(var.cpu())))
+        self.assertEqual(float(mean.cpu()), 5.0)
+        std, _ = tensorplay.std_mean(one, [0])
+        self.assertTrue(math.isnan(float(std.cpu())))
+        self.assertTrue(math.isnan(float(tensorplay.var(one, [0]).cpu())))
+        self.assertTrue(math.isnan(float(tensorplay.std(one, [0]).cpu())))
+
+        var, _ = tensorplay.var_mean(one, [0], False)
+        self.assertEqual(float(var.cpu()), 0.0)
+
+        # A correction past the count keeps a positive deviation sum over a
+        # zero divisor, which answers infinity.
+        two = self._device(np.array([5.0, 7.0], np.float32))
+        var, mean = tensorplay.var_mean(two, [0], correction=3)
+        self.assertTrue(math.isinf(float(var.cpu())))
+        self.assertEqual(float(mean.cpu()), 6.0)
+
+    def test_a_shape_less_payload_has_no_axis(self):
+        scalar = tensorplay.tensor(3.0, device="vulkan")
+        var, mean = tensorplay.var_mean(scalar, [])
+        self.assertTrue(math.isnan(float(var.cpu())))
+        self.assertEqual(float(mean.cpu()), 3.0)
+        var_keep, mean_keep = tensorplay.var_mean(scalar, [], keepdim=True)
+        self.assertEqual(tuple(var_keep.shape), ())
+        self.assertEqual(tuple(mean_keep.shape), ())
+        with self.assertRaises(RuntimeError):
+            tensorplay.var_mean(scalar, [0])
+
+    def test_an_empty_span_answers_nan_or_emptiness(self):
+        for shape, dim, out_shape in (
+                ((0, 3), [0], (3,)),
+                ((2, 0), [1], (2,)),
+                ((0, 3), [1], (0,)),
+                ((2, 0), [], ())):
+            payload = tensorplay.zeros(*shape, device="vulkan")
+            with self.subTest(shape=shape, dim=dim):
+                var, mean = tensorplay.var_mean(payload, dim)
+                self.assertEqual(tuple(var.shape), out_shape)
+                self.assertEqual(tuple(mean.shape), out_shape)
+                got = var.cpu().numpy()
+                if got.size:
+                    self.assertTrue(np.isnan(got).all())
+                    self.assertTrue(np.isnan(mean.cpu().numpy()).all())
+
+    def test_the_word_storage_answers_the_same(self):
+        rng = np.random.default_rng(37)
+        for dtype, tol in ((np.float32, 1e-5), (np.float16, 2e-3)):
+            values = rng.standard_normal((5, 7, 3)).astype(dtype)
+            for dim, keepdim in (([0], False), ([2], True), ([], False)):
+                with self.subTest(dtype=dtype, dim=dim):
+                    self._compare(values, dim, keepdim, dense=True, tol=tol)
+
+    def test_std_mean_is_the_root_of_the_variance(self):
+        rng = np.random.default_rng(41)
+        values = rng.standard_normal((4, 9)).astype(np.float32)
+        device = self._device(values)
+        std, mean = tensorplay.std_mean(device, [1])
+        var, var_mean_value = tensorplay.var_mean(device, [1])
+        np.testing.assert_allclose(
+            std.cpu().numpy(), np.sqrt(var.cpu().numpy()),
+            rtol=1e-6, atol=1e-6, equal_nan=True)
+        np.testing.assert_array_equal(
+            mean.cpu().numpy(), var_mean_value.cpu().numpy())
+        want_std, want_mean = tensorplay.std_mean(self._host(values), [1])
+        np.testing.assert_allclose(
+            std.cpu().numpy(), want_std.numpy(), rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(
+            mean.cpu().numpy(), want_mean.numpy(), rtol=1e-5, atol=1e-5)
+
+
+class TestVulkanChannelReduction(unittest.TestCase):
+    # The channel axis is the third from the end, and four consecutive
+    # channels share one texel.  A channel count that is not a multiple of
+    # four leaves padding lanes in the last texel, while a count above four
+    # spans several texels of the same line.  Sum and mean must ignore the
+    # padding lanes, and variance must fold the whole line into one mean
+    # before squaring the deviations: squaring per-texel means drops the
+    # cross-lane terms.  Both storage classes answer the same values.
+
+    SHAPES = (
+        ((5, 3, 7), [0]),   # tail of three padding lanes
+        ((6, 3, 7), [0]),   # tail of two padding lanes
+        ((8, 3, 7), [0]),   # no padding, two texels per line
+        ((2, 5, 3, 4), [1]),
+    )
+
+    @staticmethod
+    def _device(values, dense=False):
+        if dense:
+            return tensorplay.tensor(values.copy(), device="vulkan")
+        return tensorplay.from_numpy(values.copy()).to("vulkan")
+
+    @staticmethod
+    def _host(values):
+        return tensorplay.from_numpy(values.copy())
+
+    def _compare(self, name, values, dim, keepdim, dense, tol):
+        device = self._device(values, dense)
+        host = self._host(values)
+        if name in ("sum", "mean"):
+            got = getattr(device, name)(dim, keepdim=keepdim)
+            want = getattr(host, name)(dim, keepdim=keepdim)
+        elif name == "var":
+            got = tensorplay.var(device, dim, keepdim=keepdim)
+            want = tensorplay.var(host, dim, keepdim=keepdim)
+        else:
+            got = tensorplay.std(device, dim, keepdim=keepdim)
+            want = tensorplay.std(host, dim, keepdim=keepdim)
+        self.assertEqual(tuple(got.shape), tuple(want.shape))
+        np.testing.assert_allclose(
+            got.cpu().numpy().astype(np.float64),
+            want.numpy().astype(np.float64),
+            rtol=tol, atol=tol, equal_nan=True)
+        return got
+
+    def test_sum_and_mean_ignore_the_padding_lanes(self):
+        rng = np.random.default_rng(43)
+        for shape, dim in self.SHAPES:
+            values = rng.standard_normal(shape).astype(np.float32)
+            for keepdim in (False, True):
+                for name in ("sum", "mean"):
+                    with self.subTest(
+                            shape=shape, dim=dim, name=name,
+                            keepdim=keepdim):
+                        self._compare(
+                            name, values, dim, keepdim, False, 1e-5)
+
+    def test_the_variance_folds_the_whole_channel_line(self):
+        rng = np.random.default_rng(47)
+        for dtype, tol in ((np.float32, 1e-5), (np.float16, 3e-3)):
+            for shape, dim in self.SHAPES:
+                values = rng.standard_normal(shape).astype(dtype)
+                for keepdim in (False, True):
+                    for name in ("var", "std"):
+                        with self.subTest(
+                                shape=shape, dim=dim, name=name,
+                                dtype=dtype, keepdim=keepdim):
+                            self._compare(
+                                name, values, dim, keepdim, False, tol)
+
+    def test_a_channel_line_honours_the_correction(self):
+        rng = np.random.default_rng(53)
+        # The narrow fused walk divides on the device, so every reachable
+        # correction is checked against the widened host composition.
+        for dtype, tol in ((np.float32, 1e-5), (np.float16, 3e-3)):
+            values = rng.standard_normal((5, 3, 7)).astype(dtype)
+            for correction in (0, 2, 4):
+                with self.subTest(dtype=dtype, correction=correction):
+                    got = tensorplay.var(
+                        self._device(values), [0], correction=correction)
+                    want = tensorplay.var(
+                        self._host(values), [0], correction=correction)
+                    np.testing.assert_allclose(
+                        got.cpu().numpy().astype(np.float64),
+                        want.numpy().astype(np.float64),
+                        rtol=tol, atol=tol, equal_nan=True)
+
+    def test_a_line_without_degrees_of_freedom_answers_nan_or_infinity(self):
+        line = self._device(
+            np.arange(1, 6, dtype=np.float16).reshape(5, 1, 1))
+        self.assertTrue(math.isinf(
+            float(tensorplay.var(line, [0], correction=5).cpu())))
+        flat = self._device(
+            np.full((5, 1, 1), 2.5, dtype=np.float16))
+        self.assertTrue(math.isnan(
+            float(tensorplay.var(flat, [0], correction=5).cpu())))
+
+    def test_the_word_storage_agrees_on_a_channel_axis(self):
+        rng = np.random.default_rng(59)
+        for dtype, tol in ((np.float32, 1e-5), (np.float16, 3e-3)):
+            for shape, dim in (((5, 3, 7), [0]), ((2, 5, 3, 4), [1])):
+                values = rng.standard_normal(shape).astype(dtype)
+                for name in ("sum", "mean", "var", "std"):
+                    with self.subTest(
+                            shape=shape, dim=dim, name=name, dtype=dtype):
+                        self._compare(
+                            name, values, dim, False, True, tol)
+
+
 if __name__ == "__main__":
     unittest.main()
