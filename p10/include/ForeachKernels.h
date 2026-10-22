@@ -286,7 +286,7 @@ TP_DECLARE_FOREACH_CLAMP_OUT(minimum)
 
 void foreach_lerp_scalar_out_cuda(
         const std::vector<Tensor>& self, const std::vector<Tensor>& end,
-        Scalar weight, std::vector<Tensor> out);
+        const Scalar& weight, std::vector<Tensor> out);
 void foreach_lerp_list_out_cuda(
         const std::vector<Tensor>& self, const std::vector<Tensor>& end,
         const std::vector<Tensor>& weight, std::vector<Tensor> out);
@@ -295,7 +295,7 @@ void foreach_lerp_scalar_list_out_cuda(
         const std::vector<Scalar>& weights, std::vector<Tensor> out);
 
 void foreach_pow_scalar_out_cuda(
-        const std::vector<Tensor>& self, Scalar exponent,
+        const std::vector<Tensor>& self, const Scalar& exponent,
         std::vector<Tensor> out);
 void foreach_pow_list_out_cuda(
         const std::vector<Tensor>& self, const std::vector<Tensor>& exponent,
@@ -315,7 +315,7 @@ void foreach_##NAME##_scalar_list_out_cuda(                                  \
         std::vector<Tensor> out);                                             \
 void foreach_##NAME##_tensor_out_cuda(                                       \
         const std::vector<Tensor>& self, const std::vector<Tensor>& tensor1,  \
-        const std::vector<Tensor>& tensor2, const Scalar& value,                     \
+        const std::vector<Tensor>& tensor2, const Tensor& scalars,            \
         std::vector<Tensor> out);
 
 TP_DECLARE_FOREACH_TERNARY_OUT(addcmul)
@@ -333,10 +333,10 @@ void foreach_copy_out_cuda(
         const std::vector<Tensor>& self, const std::vector<Tensor>& src,
         bool non_blocking, std::vector<Tensor> out);
 void foreach_norm_out_cuda(
-        const std::vector<Tensor>& self, Scalar ord,
+        const std::vector<Tensor>& self, const Scalar& ord,
         std::optional<DType> dtype, std::vector<Tensor> out);
 void foreach_powsum_out_cuda(
-        const std::vector<Tensor>& self, Scalar ord,
+        const std::vector<Tensor>& self, const Scalar& ord,
         std::optional<DType> dtype, std::vector<Tensor> out);
 
 #define TP_DECLARE_MTA_UNARY(NAME)                                            \

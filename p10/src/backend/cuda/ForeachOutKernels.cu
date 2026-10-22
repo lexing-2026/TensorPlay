@@ -432,7 +432,7 @@ DEFINE_FOREACH_CLAMP_OUT_CUDA(minimum)
 // lerp overloads have differing weight types; write them out explicitly.
 void foreach_lerp_scalar_out_cuda(const std::vector<Tensor>& self,
                                   const std::vector<Tensor>& end,
-                                  Scalar weight,
+                                  const Scalar& weight,
                                   std::vector<Tensor> out) {
     copy_foreach_out_cuda(foreach_lerp_scalar_cuda(self, end, weight), std::move(out),
                           "_foreach_lerp.Scalar_out");
@@ -452,7 +452,8 @@ void foreach_lerp_scalar_list_out_cuda(const std::vector<Tensor>& self,
                           "_foreach_lerp.ScalarList_out");
 }
 
-void foreach_pow_scalar_out_cuda(const std::vector<Tensor>& self, Scalar exponent,
+void foreach_pow_scalar_out_cuda(const std::vector<Tensor>& self,
+                                 const Scalar& exponent,
                                  std::vector<Tensor> out) {
     copy_foreach_out_cuda(foreach_pow_scalar_cuda(self, exponent), std::move(out),
                           "_foreach_pow.Scalar_out");
@@ -493,12 +494,13 @@ void foreach_addcmul_scalar_list_out_cuda(const std::vector<Tensor>& self,
 }
 void foreach_addcmul_tensor_out_cuda(const std::vector<Tensor>& self,
                                      const std::vector<Tensor>& tensor1,
-                                     const std::vector<Tensor>& tensor2, const Scalar& value,
+                                     const std::vector<Tensor>& tensor2,
+                                     const Tensor& scalars,
                                      std::vector<Tensor> out) {
     std::vector<Tensor> result;
     result.reserve(self.size());
     for (size_t i = 0; i < self.size(); ++i)
-        result.push_back(self[i].addcmul(tensor1[i], tensor2[i], value));
+        result.push_back(self[i].addcmul(tensor1[i], tensor2[i], scalars.item()));
     copy_foreach_out_cuda(std::move(result), std::move(out), "_foreach_addcmul.Tensor_out");
 }
 void foreach_addcdiv_scalar_out_cuda(const std::vector<Tensor>& self,
@@ -524,12 +526,13 @@ void foreach_addcdiv_scalar_list_out_cuda(const std::vector<Tensor>& self,
 }
 void foreach_addcdiv_tensor_out_cuda(const std::vector<Tensor>& self,
                                      const std::vector<Tensor>& tensor1,
-                                     const std::vector<Tensor>& tensor2, const Scalar& value,
+                                     const std::vector<Tensor>& tensor2,
+                                     const Tensor& scalars,
                                      std::vector<Tensor> out) {
     std::vector<Tensor> result;
     result.reserve(self.size());
     for (size_t i = 0; i < self.size(); ++i)
-        result.push_back(self[i].addcdiv(tensor1[i], tensor2[i], value));
+        result.push_back(self[i].addcdiv(tensor1[i], tensor2[i], scalars.item()));
     copy_foreach_out_cuda(std::move(result), std::move(out), "_foreach_addcdiv.Tensor_out");
 }
 
@@ -551,12 +554,12 @@ void foreach_copy_out_cuda(const std::vector<Tensor>& self,
     copy_foreach_out_cuda(foreach_copy_cuda(self, src, non_blocking), std::move(out),
                           "_foreach_copy.out");
 }
-void foreach_norm_out_cuda(const std::vector<Tensor>& self, Scalar ord,
+void foreach_norm_out_cuda(const std::vector<Tensor>& self, const Scalar& ord,
                            std::optional<DType> dtype, std::vector<Tensor> out) {
     copy_foreach_out_cuda(foreach_norm_cuda(self, ord, dtype), std::move(out),
                           "_foreach_norm.Scalar_out");
 }
-void foreach_powsum_out_cuda(const std::vector<Tensor>& self, Scalar ord,
+void foreach_powsum_out_cuda(const std::vector<Tensor>& self, const Scalar& ord,
                              std::optional<DType> dtype, std::vector<Tensor> out) {
     copy_foreach_out_cuda(foreach_powsum_cuda(self, ord, dtype), std::move(out),
                           "_foreach_powsum.Scalar_out");

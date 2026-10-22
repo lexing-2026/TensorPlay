@@ -1077,7 +1077,7 @@ DEFINE_FOREACH_TERNARY_OUT(addcdiv)
 
 void foreach_lerp_scalar_out_cpu(const std::vector<Tensor>& self,
                                   const std::vector<Tensor>& end,
-                                  Scalar weight, std::vector<Tensor> out) {
+                                  const Scalar& weight, std::vector<Tensor> out) {
     copy_foreach_out_cpu(foreach_lerp_scalar_cpu(self, end, weight), std::move(out),
                          "_foreach_lerp.Scalar_out");
 }
@@ -1135,13 +1135,13 @@ void foreach_copy_out_cpu(const std::vector<Tensor>& self,
 void foreach_max_out_cpu(const std::vector<Tensor>& self, std::vector<Tensor> out) {
     copy_foreach_out_cpu(foreach_max_cpu(self), std::move(out), "_foreach_max.out");
 }
-void foreach_norm_out_cpu(const std::vector<Tensor>& self, Scalar ord,
+void foreach_norm_out_cpu(const std::vector<Tensor>& self, const Scalar& ord,
                           std::optional<DType> dtype,
                           std::vector<Tensor> out) {
     copy_foreach_out_cpu(foreach_norm_cpu(self, ord, dtype), std::move(out),
                          "_foreach_norm.Scalar_out");
 }
-void foreach_pow_scalar_out_cpu(const std::vector<Tensor>& self, Scalar exponent,
+void foreach_pow_scalar_out_cpu(const std::vector<Tensor>& self, const Scalar& exponent,
                                 std::vector<Tensor> out) {
     copy_foreach_out_cpu(foreach_pow_scalar_cpu(self, exponent), std::move(out),
                          "_foreach_pow.Scalar_out");
@@ -1158,7 +1158,7 @@ void foreach_pow_scalar_list_out_cpu(const std::vector<Tensor>& self,
     copy_foreach_out_cpu(foreach_pow_scalar_list_cpu(self, exponent), std::move(out),
                          "_foreach_pow.ScalarList_out");
 }
-void foreach_powsum_out_cpu(const std::vector<Tensor>& self, Scalar ord,
+void foreach_powsum_out_cpu(const std::vector<Tensor>& self, const Scalar& ord,
                             std::optional<DType> dtype,
                             std::vector<Tensor> out) {
     copy_foreach_out_cpu(foreach_powsum_cpu(self, ord, dtype), std::move(out),
@@ -1559,7 +1559,7 @@ static std::optional<std::vector<Tensor>> flat_unary_scalar_out(
         const std::vector<Tensor>& xs, S32&& s32, S64&& s64);
 
 void foreach_mul_scalar_out_fast_cpu(const std::vector<Tensor>& self,
-                                     Scalar s, std::vector<Tensor> out) {
+                                     const Scalar& s, std::vector<Tensor> out) {
     if (!flat_group_ok({&self}) || out.size() != self.size()) {
         foreach_mul_scalar_out_cpu(self, s, std::move(out));
         return;
@@ -1707,7 +1707,7 @@ static bool flat_binary_scalar_out_fill(
 }
 
 void foreach_add_scalar_out_fast_cpu(const std::vector<Tensor>& self,
-                                     Scalar s, std::vector<Tensor> out) {
+                                     const Scalar& s, std::vector<Tensor> out) {
     if (!flat_binary_scalar_out_fill(self, s, out,
             [](float* d, const float* x, float v, int64_t b, int64_t e) {
                 for (int64_t i = b; i < e; ++i) d[i] = x[i] + v;
@@ -1720,7 +1720,7 @@ void foreach_add_scalar_out_fast_cpu(const std::vector<Tensor>& self,
 }
 
 void foreach_sub_scalar_out_fast_cpu(const std::vector<Tensor>& self,
-                                     Scalar s, std::vector<Tensor> out) {
+                                     const Scalar& s, std::vector<Tensor> out) {
     if (!flat_binary_scalar_out_fill(self, s, out,
             [](float* d, const float* x, float v, int64_t b, int64_t e) {
                 for (int64_t i = b; i < e; ++i) d[i] = x[i] - v;
@@ -1733,7 +1733,7 @@ void foreach_sub_scalar_out_fast_cpu(const std::vector<Tensor>& self,
 }
 
 void foreach_div_scalar_out_fast_cpu(const std::vector<Tensor>& self,
-                                     Scalar s, std::vector<Tensor> out) {
+                                     const Scalar& s, std::vector<Tensor> out) {
     if (!flat_binary_scalar_out_fill(self, s, out,
             [](float* d, const float* x, float v, int64_t b, int64_t e) {
                 for (int64_t i = b; i < e; ++i) d[i] = x[i] / v;
@@ -1746,7 +1746,7 @@ void foreach_div_scalar_out_fast_cpu(const std::vector<Tensor>& self,
 }
 
 void foreach_pow_scalar_out_fast_cpu(const std::vector<Tensor>& self,
-                                     Scalar s, std::vector<Tensor> out) {
+                                     const Scalar& s, std::vector<Tensor> out) {
     if (!flat_binary_scalar_out_fill(self, s, out,
             [](float* d, const float* x, float v, int64_t b, int64_t e) {
                 for (int64_t i = b; i < e; ++i) d[i] = std::pow(x[i], v);
