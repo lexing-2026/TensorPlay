@@ -581,11 +581,13 @@ void sort_keys_radix_impl(const Tensor& self_c, Tensor& values,
     const int64_t n = self_c.numel();
     const auto device = self_c.device();
     auto stream = getCurrentCUDAStream().stream();
-    // Integer keys need no conversion when the whole array is one contiguous
-    // run: the flip the key encoding applies to signed values is exactly what
-    // the device radix sort applies to signed keys itself, so the sort reads
-    // the input and writes the sorted output directly.
-    if constexpr (std::is_integral_v<T> && !std::is_same_v<T, bool>) {
+    // Built-in numeric keys need no conversion when the whole array is one
+    // contiguous run: the flip the key encoding applies to signed values is
+    // exactly what the device radix sort applies to signed keys itself, and
+    // its floating point ordering is the one this path needs, so the sort
+    // reads the input and writes the sorted output directly.
+    if constexpr ((std::is_integral_v<T> && !std::is_same_v<T, bool>) ||
+                  std::is_same_v<T, float> || std::is_same_v<T, double>) {
         if (d_size == n && inner == 1) {
             const int n_items = static_cast<int>(n);
             size_t direct_bytes = 0;
