@@ -282,10 +282,79 @@ __global__ void index_put_direct_kernel(int64_t numel,
     }
 }
 
+// One index covering only the leading dimension: every destination row comes
+// from one source row, so the index is loaded once per row and the row moves
+// as contiguous 16-byte cells instead of being decoded element by element.
+__global__ void index_put_rows_kernel(int64_t row_cells, int64_t indexed_size,
+                                      char* __restrict__ dst,
+                                      const char* __restrict__ src,
+                                      const int64_t* __restrict__ ip) {
+    const int64_t row = blockIdx.y;
+    int64_t index = ip[row];
+    if (index < 0) index += indexed_size;
+    char* out = dst + index * row_cells * 16;
+    const char* in = src + row * row_cells * 16;
+    for (int64_t cell = blockIdx.x * blockDim.x + threadIdx.x; cell < row_cells;
+         cell += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+        reinterpret_cast<PutStorage16*>(out)[cell] =
+            reinterpret_cast<const PutStorage16*>(in)[cell];
+    }
+}
+
+__global__ void index_put_rows_kernel_i32(int64_t row_cells, int64_t indexed_size,
+                                          char* __restrict__ dst,
+                                          const char* __restrict__ src,
+                                          const int32_t* __restrict__ ip) {
+    const int64_t row = blockIdx.y;
+    int64_t index = ip[row];
+    if (index < 0) index += indexed_size;
+    char* out = dst + index * row_cells * 16;
+    const char* in = src + row * row_cells * 16;
+    for (int64_t cell = blockIdx.x * blockDim.x + threadIdx.x; cell < row_cells;
+         cell += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+        reinterpret_cast<PutStorage16*>(out)[cell] =
+            reinterpret_cast<const PutStorage16*>(in)[cell];
+    }
+}
+
+bool try_index_put_rows(Tensor& self, const std::vector<std::optional<Tensor>>& indices,
+                        const Tensor& value) {
+    if (indices.size() != 1 || !indices[0].has_value()) return false;
+    const Tensor& index = *indices[0];
+    if (index.dim() != 1 || self.dim() < 2 || !self.is_contiguous()) return false;
+    if (!index.is_contiguous()) return false;
+    if (index.dtype() != DType::Int64 && index.dtype() != DType::Int32) return false;
+    if (index.size(0) == 0 || index.size(0) != self.size(0)) return false;
+    if (index.size(0) > 65535) return false;
+    if (value.dim() != self.dim() || !value.is_contiguous() ||
+        value.sizes() != self.sizes()) {
+        return false;
+    }
+    const int64_t row_bytes =
+        (self.numel() / self.size(0)) * static_cast<int64_t>(elementSize(self.dtype()));
+    if (row_bytes <= 0 || row_bytes % 16 != 0) return false;
+    const int64_t row_cells = row_bytes / 16;
+    const dim3 grid(static_cast<unsigned>((row_cells + kThreads - 1) / kThreads),
+                    static_cast<unsigned>(index.size(0)));
+    auto stream = getCurrentCUDAStream().stream();
+    if (index.dtype() == DType::Int32) {
+        index_put_rows_kernel_i32<<<grid, kThreads, 0, stream>>>(
+            row_cells, self.size(0), static_cast<char*>(self.data_ptr()),
+            static_cast<const char*>(value.data_ptr()),
+            static_cast<const int32_t*>(index.data_ptr()));
+    } else {
+        index_put_rows_kernel<<<grid, kThreads, 0, stream>>>(
+            row_cells, self.size(0), static_cast<char*>(self.data_ptr()),
+            static_cast<const char*>(value.data_ptr()),
+            static_cast<const int64_t*>(index.data_ptr()));
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 template <int NumIndices>
 void launch_index_put_direct(const indexing::native::AdvancedIndex& info,
-                             const Tensor& value) {
-    const Tensor& dst = info.source;
+                             const Tensor& value) {    const Tensor& dst = info.source;
     const int64_t rank = dst.dim();
     TP_CHECK(rank <= kAdvancedIndexMaxDims,
              "index_put: tensor rank exceeds CUDA indexing limit");
@@ -544,6 +613,7 @@ Tensor& index_put_impl_cuda(Tensor& self,
         index_put_with_sort(self, indices, value, accumulate, unsafe);
         return self;
     }
+    if (try_index_put_rows(self, indices, value)) return self;
     indexing::native::AdvancedIndex info(self, indices);
     const auto shape = static_cast<std::vector<int64_t>>(info.source.shape());
     TP_CHECK(value.dim() <= static_cast<int64_t>(shape.size()),
