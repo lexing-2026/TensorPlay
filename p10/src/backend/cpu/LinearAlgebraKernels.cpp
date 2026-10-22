@@ -2184,11 +2184,100 @@ Tensor inner_kernel(const Tensor& self, const Tensor& other) {
     return product.reshape(out_shape);
 }
 
+#if defined(__x86_64__)
+// A column times a row writes the same row vector once per output row,
+// scaled by one entry of the column.  Laying the pass out that way keeps the
+// inner loop a unit-stride multiply by a broadcast factor, with no stride-0
+// dimension to re-address per element.  The row loops carry their own target
+// attribute so the TU keeps compiling without global ISA flags; the chunk
+// loops around them stay ISA-neutral and reach the wide code through these
+// calls.
+__attribute__((target("avx2,fma")))
+static void outer_scale_row_f32(const float* src, float* dst, int64_t n,
+                                float s) {
+    const __m256 v = _mm256_set1_ps(s);
+    int64_t i = 0;
+    for (; i + 32 <= n; i += 32) {
+        _mm256_storeu_ps(dst + i, _mm256_mul_ps(v, _mm256_loadu_ps(src + i)));
+        _mm256_storeu_ps(dst + i + 8, _mm256_mul_ps(v, _mm256_loadu_ps(src + i + 8)));
+        _mm256_storeu_ps(dst + i + 16, _mm256_mul_ps(v, _mm256_loadu_ps(src + i + 16)));
+        _mm256_storeu_ps(dst + i + 24, _mm256_mul_ps(v, _mm256_loadu_ps(src + i + 24)));
+    }
+    for (; i + 8 <= n; i += 8) {
+        _mm256_storeu_ps(dst + i, _mm256_mul_ps(v, _mm256_loadu_ps(src + i)));
+    }
+    for (; i < n; ++i) dst[i] = src[i] * s;
+}
+
+__attribute__((target("avx2,fma")))
+static void outer_scale_row_f64(const double* src, double* dst, int64_t n,
+                                double s) {
+    const __m256d v = _mm256_set1_pd(s);
+    int64_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        _mm256_storeu_pd(dst + i, _mm256_mul_pd(v, _mm256_loadu_pd(src + i)));
+        _mm256_storeu_pd(dst + i + 4, _mm256_mul_pd(v, _mm256_loadu_pd(src + i + 4)));
+        _mm256_storeu_pd(dst + i + 8, _mm256_mul_pd(v, _mm256_loadu_pd(src + i + 8)));
+        _mm256_storeu_pd(dst + i + 12, _mm256_mul_pd(v, _mm256_loadu_pd(src + i + 12)));
+    }
+    for (; i + 4 <= n; i += 4) {
+        _mm256_storeu_pd(dst + i, _mm256_mul_pd(v, _mm256_loadu_pd(src + i)));
+    }
+    for (; i < n; ++i) dst[i] = src[i] * s;
+}
+
+template <typename T, void (*ScaleRow)(const T*, T*, int64_t, T)>
+static void outer_avx2(const T* col, const T* row, T* out, int64_t rows,
+                       int64_t cols) {
+    parallel_for(0, rows * cols, 4096, [&](int64_t begin, int64_t end) {
+        int64_t r = begin / cols;
+        int64_t pos = begin;
+        int64_t col_at = begin - r * cols;
+        while (pos < end) {
+            const int64_t take = std::min(end - pos, cols - col_at);
+            ScaleRow(row + col_at, out + pos, take, col[r]);
+            pos += take;
+            col_at += take;
+            if (col_at == cols) {
+                col_at = 0;
+                ++r;
+            }
+        }
+    });
+}
+#endif
+
 Tensor outer_kernel(const Tensor& self, const Tensor& vec2) {
     if (self.dim() != 1 || vec2.dim() != 1) {
         TP_THROW(RuntimeError, "1D tensors expected, but got ", self.dim(), "D and ",
                  vec2.dim(), "D tensors");
     }
+#if defined(__x86_64__)
+    const int64_t rows = self.numel();
+    const int64_t cols = vec2.numel();
+    if (self.dtype() == vec2.dtype() && self.is_contiguous() &&
+        vec2.is_contiguous() && (rows == 0 || cols <= INT64_MAX / rows) &&
+        __builtin_cpu_supports("avx2")) {
+        if (self.dtype() == DType::Float32) {
+            Tensor out = Tensor::empty({rows, cols}, DType::Float32, self.device());
+            if (rows > 0 && cols > 0) {
+                outer_avx2<float, outer_scale_row_f32>(
+                    self.data_ptr<float>(), vec2.data_ptr<float>(),
+                    out.data_ptr<float>(), rows, cols);
+            }
+            return out;
+        }
+        if (self.dtype() == DType::Float64) {
+            Tensor out = Tensor::empty({rows, cols}, DType::Float64, self.device());
+            if (rows > 0 && cols > 0) {
+                outer_avx2<double, outer_scale_row_f64>(
+                    self.data_ptr<double>(), vec2.data_ptr<double>(),
+                    out.data_ptr<double>(), rows, cols);
+            }
+            return out;
+        }
+    }
+#endif
     // One entry of the product is one pair of readings, so the two vectors need
     // no shared element type; the broadcast product below decides the type its
     // entries are answered in.
