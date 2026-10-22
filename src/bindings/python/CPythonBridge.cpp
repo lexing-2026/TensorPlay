@@ -1995,6 +1995,31 @@ PyObject* tpx_py_wrap(const Tensor& t) {
     }
     return wrapped;
 }
+
+namespace {
+
+// Results handed back inside a list or tuple are, in the common case, freshly
+// built aliases (unbind, split, topk, ...): the identity table has no entry
+// for them yet, so registering one would only add a capsule, an instance dict
+// and a table node to each element.  A live wrapper for the same impl still
+// wins the lookup, so identity is preserved wherever a wrapper already exists.
+PyObject* wrap_unregistered(const Tensor& t) {
+    const void* impl = t.unsafeGetTensorImpl().get();
+    if (impl != nullptr) {
+        auto it = g_wrap_cache.find(impl);
+        if (it != g_wrap_cache.end()) {
+            if (wrapper_still_holds(it->second, impl)) {
+                Py_INCREF(it->second);
+                return it->second;
+            }
+            g_wrap_cache.erase(it);
+        }
+    }
+    return py::cast(t).release().ptr();
+}
+
+}  // namespace
+
 // Scalar results cross into Python as native numbers (bool/int/float/
 // complex, with a UInt64 widening for values outside the int64 range);
 // callers never see a boxed Scalar wrapper.
@@ -2159,26 +2184,26 @@ PyObject* tpx_py_wrap_optional_device(const std::optional<Device>& d) {
     return py::cast(d).release().ptr();
 }
 PyObject* tpx_py_wrap_tuple(const std::tuple<Tensor, Tensor>& t) {
-    PyObject* a = tpx_py_wrap(std::get<0>(t));
-    PyObject* b = tpx_py_wrap(std::get<1>(t));
+    PyObject* a = wrap_unregistered(std::get<0>(t));
+    PyObject* b = wrap_unregistered(std::get<1>(t));
     PyObject* tup = PyTuple_Pack(2, a, b);
     Py_XDECREF(a); Py_XDECREF(b);
     return tup;
 }
 PyObject* tpx_py_wrap_tuple3(const std::tuple<Tensor, Tensor, Tensor>& t) {
-    PyObject* a = tpx_py_wrap(std::get<0>(t));
-    PyObject* b = tpx_py_wrap(std::get<1>(t));
-    PyObject* c = tpx_py_wrap(std::get<2>(t));
+    PyObject* a = wrap_unregistered(std::get<0>(t));
+    PyObject* b = wrap_unregistered(std::get<1>(t));
+    PyObject* c = wrap_unregistered(std::get<2>(t));
     PyObject* tup = PyTuple_Pack(3, a, b, c);
     Py_XDECREF(a); Py_XDECREF(b); Py_XDECREF(c);
     return tup;
 }
 PyObject* tpx_py_wrap_tuple4(
     const std::tuple<Tensor, Tensor, Tensor, Tensor>& t) {
-    PyObject* a = tpx_py_wrap(std::get<0>(t));
-    PyObject* b = tpx_py_wrap(std::get<1>(t));
-    PyObject* c = tpx_py_wrap(std::get<2>(t));
-    PyObject* d = tpx_py_wrap(std::get<3>(t));
+    PyObject* a = wrap_unregistered(std::get<0>(t));
+    PyObject* b = wrap_unregistered(std::get<1>(t));
+    PyObject* c = wrap_unregistered(std::get<2>(t));
+    PyObject* d = wrap_unregistered(std::get<3>(t));
     PyObject* tup = PyTuple_Pack(4, a, b, c, d);
     Py_XDECREF(a); Py_XDECREF(b); Py_XDECREF(c); Py_XDECREF(d);
     return tup;
@@ -2187,7 +2212,7 @@ PyObject* tpx_py_wrap_list(const std::vector<Tensor>& v) {
     PyObject* list = PyList_New(static_cast<Py_ssize_t>(v.size()));
     for (size_t i = 0; i < v.size(); ++i) {
         // Steals a reference on success; wrap() gives us a new reference.
-        PyList_SET_ITEM(list, static_cast<Py_ssize_t>(i), tpx_py_wrap(v[i]));
+        PyList_SET_ITEM(list, static_cast<Py_ssize_t>(i), wrap_unregistered(v[i]));
     }
     return list;
 }
