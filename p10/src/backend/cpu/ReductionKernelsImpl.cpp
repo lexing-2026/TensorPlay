@@ -940,6 +940,78 @@ static void logical_reduce_f64_dim_row(
     }
 }
 
+// A reduction along the leading axis visits every row once, so the plane
+// is read along its rows and one byte per output column carries the answer
+// accumulated so far.  Reading a column at a time instead would turn the
+// walk into one strided access per element.  The rows are split across
+// threads and their partial answers folded together afterwards.  The
+// accumulator is inspected every few rows so a plane whose answer cannot
+// change any more stops early.
+template <typename ctype, bool WantAll>
+static void logical_reduce_dim0_rows(
+    const ctype* input, uint8_t* output, int64_t d_size, int64_t inner) {
+    const uint8_t init = WantAll ? 1 : 0;
+    auto settled = [&](const uint8_t* lanes) {
+        for (int64_t col = 0; col < inner; ++col) {
+            if constexpr (WantAll) {
+                if (lanes[col] != 0) return false;
+            } else {
+                if (lanes[col] == 0) return false;
+            }
+        }
+        return true;
+    };
+    auto scan_rows = [&](int64_t row_begin, int64_t row_end,
+                         std::vector<uint8_t>& acc) {
+        acc.assign(static_cast<size_t>(inner), init);
+        uint8_t* lanes = acc.data();
+        for (int64_t row = row_begin; row < row_end; ++row) {
+            const ctype* p = input + row * inner;
+            for (int64_t col = 0; col < inner; ++col) {
+                const uint8_t hit = static_cast<bool>(p[col]) ? 1 : 0;
+                if constexpr (WantAll) {
+                    lanes[col] &= hit;
+                } else {
+                    lanes[col] |= hit;
+                }
+            }
+            if (((row - row_begin) & 7) == 7 && settled(lanes)) break;
+        }
+    };
+    const int num_threads =
+        (d_size * inner < GRAIN_SIZE || get_num_threads() == 1 ||
+         in_parallel_region())
+        ? 1
+        : get_num_threads();
+    std::vector<std::vector<uint8_t>> partials(static_cast<size_t>(num_threads));
+    if (num_threads == 1) {
+        scan_rows(0, d_size, partials[0]);
+    } else {
+        const int64_t rows_per = (d_size + num_threads - 1) / num_threads;
+        parallel_for(0, num_threads, 1, [&](int64_t begin, int64_t end) {
+            for (int64_t t = begin; t < end; ++t) {
+                const int64_t row_begin = t * rows_per;
+                const int64_t row_end = std::min(d_size, row_begin + rows_per);
+                scan_rows(row_begin, row_end, partials[static_cast<size_t>(t)]);
+            }
+        });
+    }
+    uint8_t* acc = partials[0].data();
+    for (int t = 1; t < num_threads; ++t) {
+        const uint8_t* part = partials[static_cast<size_t>(t)].data();
+        for (int64_t col = 0; col < inner; ++col) {
+            if constexpr (WantAll) {
+                acc[col] &= part[col];
+            } else {
+                acc[col] |= part[col];
+            }
+        }
+    }
+    for (int64_t col = 0; col < inner; ++col) {
+        output[col] = acc[col];
+    }
+}
+
 template <bool WantAll>
 static bool try_logical_reduce_dim_avx512(
     const void* input, bool* output, int64_t outer, int64_t d_size,
@@ -3022,12 +3094,28 @@ bool any_reduce_parallel(const scalar_t* data, int64_t n) {
     return false;
 }
 
+// A lane is unnumbered when the word it carries cannot be ordered against
+// another lane, so no compare can hand it to an extremum: a walk has to ask
+// the question directly. The reduced widths are classes that carry their
+// payload through a float conversion, so the same test reaches them; a lane
+// of a count is always orderable and answers false, folding the question out
+// of the walks that count.
+template <typename T>
+inline bool lane_unnumbered(T value) {
+    if constexpr (std::is_floating_point_v<T> ||
+                  std::is_same_v<T, Half> || std::is_same_v<T, BFloat16>) {
+        return std::isnan(value);
+    }
+    return false;
+}
+
 template <typename scalar_t>
 int64_t argmin_reduce_parallel(const scalar_t* data, int64_t n) {
     auto serial_reduce = [&]() {
         scalar_t value = get_highest<scalar_t>();
         int64_t index = 0;
         for (int64_t i = 0; i < n; ++i) {
+            if (lane_unnumbered(data[i])) return i;
             if (data[i] < value) {
                 value = data[i];
                 index = i;
@@ -3048,6 +3136,8 @@ int64_t argmin_reduce_parallel(const scalar_t* data, int64_t n) {
         std::vector<scalar_t> chunk_values(
             static_cast<size_t>(chunk_count), get_highest<scalar_t>());
         std::vector<int64_t> chunk_indices(static_cast<size_t>(chunk_count), 0);
+        std::vector<int64_t> chunk_unnumbered(
+            static_cast<size_t>(chunk_count), -1);
         parallel_for(0, chunk_count, 1, [&](int64_t begin, int64_t end) {
             for (int64_t chunk = begin; chunk < end; ++chunk) {
                 const int64_t lo = chunk * chunk_size;
@@ -3055,6 +3145,10 @@ int64_t argmin_reduce_parallel(const scalar_t* data, int64_t n) {
                 scalar_t value = get_highest<scalar_t>();
                 int64_t index = lo;
                 for (int64_t i = lo; i < hi; ++i) {
+                    if (lane_unnumbered(data[i])) {
+                        chunk_unnumbered[static_cast<size_t>(chunk)] = i;
+                        break;
+                    }
                     if (data[i] < value) {
                         value = data[i];
                         index = i;
@@ -3065,6 +3159,13 @@ int64_t argmin_reduce_parallel(const scalar_t* data, int64_t n) {
             }
         });
 
+        // Chunks combine in ascending order, so the first chunk that holds an
+        // unnumbered lane names the earliest one and no compare after it can
+        // displace that answer.
+        for (int64_t chunk = 0; chunk < chunk_count; ++chunk) {
+            const int64_t held = chunk_unnumbered[static_cast<size_t>(chunk)];
+            if (held >= 0) return held;
+        }
         scalar_t value = get_highest<scalar_t>();
         int64_t index = 0;
         for (int64_t chunk = 0; chunk < chunk_count; ++chunk) {
@@ -4052,6 +4153,20 @@ Tensor all_dim_kernel_impl(const Tensor& self, const std::vector<int64_t>& dims,
         }
 #endif
 
+        if (outer == 1 && inner >= 16 && inner <= 262144) {
+            switch (self.dtype()) {
+#define TP_ALL_DIM_ROW_CASE(ctype, name) \
+                case DType::name: \
+                    logical_reduce_dim0_rows<ctype, true>( \
+                        input.data_ptr<ctype>(), out.data_ptr<bool>(), d_size, \
+                        inner); \
+                    return out;
+                TENSORPLAY_FORALL_SCALAR_TYPES(TP_ALL_DIM_ROW_CASE)
+#undef TP_ALL_DIM_ROW_CASE
+                default: break;
+            }
+        }
+
 #define TP_ALL_DIM_FAST_CASE(ctype, name) \
         case DType::name: { \
             const ctype* input_data = input.data_ptr<ctype>(); \
@@ -4170,6 +4285,20 @@ Tensor any_dim_kernel_impl(const Tensor& self, const std::vector<int64_t>& dims,
         }
 #endif
 
+        if (outer == 1 && inner >= 16 && inner <= 262144) {
+            switch (self.dtype()) {
+#define TP_ANY_DIM_ROW_CASE(ctype, name) \
+                case DType::name: \
+                    logical_reduce_dim0_rows<ctype, false>( \
+                        input.data_ptr<ctype>(), out.data_ptr<bool>(), d_size, \
+                        inner); \
+                    return out;
+                TENSORPLAY_FORALL_SCALAR_TYPES(TP_ANY_DIM_ROW_CASE)
+#undef TP_ANY_DIM_ROW_CASE
+                default: break;
+            }
+        }
+
 #define TP_ANY_DIM_FAST_CASE(ctype, name) \
         case DType::name: { \
             const ctype* input_data = input.data_ptr<ctype>(); \
@@ -4271,7 +4400,6 @@ Tensor argmax_kernel_impl(const Tensor& self, std::optional<int64_t> dim, bool k
         case DType::name: { \
             const ctype* data = self_contig.data_ptr<ctype>(); \
             int64_t n = self_contig.numel(); \
-            constexpr bool is_float = std::is_floating_point_v<ctype>; \
             constexpr int64_t kChunks = 32; \
             const int64_t chunk = std::max<int64_t>(1, (n + kChunks - 1) / kChunks); \
             ctype best_val = get_lowest<ctype>(); \
@@ -4289,10 +4417,8 @@ Tensor argmax_kernel_impl(const Tensor& self, std::optional<int64_t> dim, bool k
                     int64_t lpos = lo; \
                     int64_t lnan = -1; \
                     for (int64_t i = lo; i < hi; ++i) { \
-                        if constexpr (is_float) { \
-                            if (lnan < 0 && std::isnan(data[i])) { lnan = i; break; } \
-                        } \
-                        if (lnan < 0 && data[i] > lmax) { lmax = data[i]; lpos = i; } \
+                        if (lane_unnumbered(data[i])) { lnan = i; break; } \
+                        if (data[i] > lmax) { lmax = data[i]; lpos = i; } \
                     } \
                     chunk_val[c] = lmax; chunk_pos[c] = lpos; chunk_nan[c] = lnan; \
                 } \
@@ -4359,28 +4485,19 @@ Tensor argmax_kernel_impl(const Tensor& self, std::optional<int64_t> dim, bool k
                         for (int64_t c = 0; c < kLanes; ++c) { \
                             best[c] = base[c]; \
                             bidx[c] = 0; \
-                            bnan[c] = false; \
-                            if constexpr (std::is_floating_point_v<ctype>) { \
-                                bnan[c] = std::isnan(base[c]); \
-                            } \
+                            bnan[c] = lane_unnumbered(base[c]); \
                         } \
                         for (int64_t i = 1; i < d_size; ++i) { \
                             const ctype* row = base + i * inner; \
                             for (int64_t c = 0; c < kLanes; ++c) { \
+                                if (bnan[c]) continue; \
                                 const ctype x = row[c]; \
-                                if constexpr (std::is_floating_point_v<ctype>) { \
-                                    if (!bnan[c] && std::isnan(x)) { \
-                                        bnan[c] = true; \
-                                        bidx[c] = i; \
-                                    } else if (!bnan[c] && x > best[c]) { \
-                                        best[c] = x; \
-                                        bidx[c] = i; \
-                                    } \
-                                } else { \
-                                    if (x > best[c]) { \
-                                        best[c] = x; \
-                                        bidx[c] = i; \
-                                    } \
+                                if (lane_unnumbered(x)) { \
+                                    bnan[c] = true; \
+                                    bidx[c] = i; \
+                                } else if (x > best[c]) { \
+                                    best[c] = x; \
+                                    bidx[c] = i; \
                                 } \
                             } \
                         } \
@@ -4390,13 +4507,10 @@ Tensor argmax_kernel_impl(const Tensor& self, std::optional<int64_t> dim, bool k
                             const ctype* line = base + c; \
                             ctype max_val = line[0]; \
                             int64_t max_idx = 0; \
-                            bool has_nan = false; \
                             for (int64_t j = 0; j < d_size; ++j) { \
-                                ctype val = line[j * inner]; \
-                                if constexpr (std::is_floating_point_v<ctype>) { \
-                                    if (!has_nan && std::isnan(val)) { has_nan = true; max_idx = j; break; } \
-                                } \
-                                if (!has_nan && val > max_val) { max_val = val; max_idx = j; } \
+                                const ctype val = line[j * inner]; \
+                                if (lane_unnumbered(val)) { max_idx = j; break; } \
+                                if (val > max_val) { max_val = val; max_idx = j; } \
                             } \
                             orow[c] = max_idx; \
                         } \
@@ -4412,13 +4526,10 @@ Tensor argmax_kernel_impl(const Tensor& self, std::optional<int64_t> dim, bool k
                 const ctype* line = data + o * d_size * inner + in2; \
                 ctype max_val = line[0]; \
                 int64_t max_idx = 0; \
-                bool has_nan = false; \
                 for (int64_t j = 0; j < d_size; ++j) { \
-                    ctype val = line[j * inner]; \
-                    if constexpr (std::is_floating_point_v<ctype>) { \
-                        if (!has_nan && std::isnan(val)) { has_nan = true; max_idx = j; break; } \
-                    } \
-                    if (!has_nan && val > max_val) { max_val = val; max_idx = j; } \
+                    const ctype val = line[j * inner]; \
+                    if (lane_unnumbered(val)) { max_idx = j; break; } \
+                    if (val > max_val) { max_val = val; max_idx = j; } \
                 } \
                 out_data[flat] = max_idx; \
             } \
@@ -4503,15 +4614,21 @@ Tensor argmin_kernel_impl(const Tensor& self, std::optional<int64_t> dim, bool k
                     if (cols == kLanes) { \
                         ctype value[kLanes]; \
                         int64_t index[kLanes]; \
+                        bool unnumbered[kLanes]; \
                         for (int64_t c = 0; c < kLanes; ++c) { \
                             value[c] = get_highest<ctype>(); \
                             index[c] = 0; \
+                            unnumbered[c] = false; \
                         } \
                         for (int64_t i = 0; i < d_size; ++i) { \
                             const ctype* row = base + i * inner; \
                             for (int64_t c = 0; c < kLanes; ++c) { \
+                                if (unnumbered[c]) continue; \
                                 const ctype candidate = row[c]; \
-                                if (candidate < value[c]) { \
+                                if (lane_unnumbered(candidate)) { \
+                                    unnumbered[c] = true; \
+                                    index[c] = i; \
+                                } else if (candidate < value[c]) { \
                                     value[c] = candidate; \
                                     index[c] = i; \
                                 } \
@@ -4525,6 +4642,7 @@ Tensor argmin_kernel_impl(const Tensor& self, std::optional<int64_t> dim, bool k
                             int64_t index = 0; \
                             for (int64_t i = 0; i < d_size; ++i) { \
                                 const ctype candidate = line[i * inner]; \
+                                if (lane_unnumbered(candidate)) { index = i; break; } \
                                 if (candidate < value) { \
                                     value = candidate; \
                                     index = i; \
@@ -4548,6 +4666,7 @@ Tensor argmin_kernel_impl(const Tensor& self, std::optional<int64_t> dim, bool k
                 int64_t index = 0; \
                 for (int64_t i = 0; i < d_size; ++i) { \
                     const ctype candidate = line[i * inner]; \
+                    if (lane_unnumbered(candidate)) { index = i; break; } \
                     if (candidate < value) { \
                         value = candidate; \
                         index = i; \
