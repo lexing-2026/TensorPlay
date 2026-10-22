@@ -815,9 +815,44 @@ std::tuple<Tensor, Tensor> kthvalue_cpu(const Tensor& self, int64_t k,
             std::max<int64_t>(1, GRAIN_SIZE / std::max<int64_t>(d_size, 1)); \
         parallel_for(0, outer * inner, slice_grain, [&](int64_t b, int64_t e) { \
             std::vector<std::pair<ctype, int64_t>> buf(d_size); \
+            std::vector<ctype> vals; \
+            if constexpr (std::is_same_v<ctype, float> || std::is_same_v<ctype, double>) { \
+                vals.resize(static_cast<size_t>(d_size)); \
+            } \
             for (int64_t si = b; si < e; ++si) { \
                 const int64_t o = si / inner, in2 = si % inner; \
                 const ctype* src = sp + o * d_size * inner + in2; \
+                if constexpr (std::is_same_v<ctype, float> || std::is_same_v<ctype, double>) { \
+                    /* Selecting over a dense copy of the slice keeps every probe in \
+                       one short contiguous run and swaps a single element instead \
+                       of a value/index pair; the index follows from the original \
+                       slice under the same tie rule (value, then position).  Rows \
+                       holding a NaN keep the pair path, where the NaN ordering and \
+                       the index tie-break live. */ \
+                    bool has_nan = false; \
+                    for (int64_t j = 0; j < d_size; ++j) { \
+                        const ctype v = src[j * inner]; \
+                        vals[static_cast<size_t>(j)] = v; \
+                        has_nan |= std::isnan(v); \
+                    } \
+                    if (!has_nan) { \
+                        std::nth_element(vals.begin(), vals.begin() + (k - 1), vals.end()); \
+                        const ctype v = vals[static_cast<size_t>(k - 1)]; \
+                        int64_t less = 0; \
+                        for (int64_t j = 0; j < d_size; ++j) \
+                            less += (src[j * inner] < v) ? 1 : 0; \
+                        int64_t idx = 0; \
+                        while (src[idx * inner] != v) ++idx; \
+                        int64_t rank = (k - 1) - less; \
+                        for (int64_t j = idx + 1; rank > 0 && j < d_size; ++j) { \
+                            if (src[j * inner] == v && --rank == 0) idx = j; \
+                        } \
+                        const int64_t oi = keepdim ? si : (o * inner + in2); \
+                        vp[oi] = v; \
+                        ip[oi] = idx; \
+                        continue; \
+                    } \
+                } \
                 for (int64_t j = 0; j < d_size; ++j) buf[j] = {src[j * inner], j}; \
                 std::nth_element(buf.begin(), buf.begin() + (k - 1), buf.end(), KthValueLess<ctype>{}); \
                 const int64_t oi = keepdim ? si : (o * inner + in2); \
