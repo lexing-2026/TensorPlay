@@ -423,6 +423,157 @@ Tensor batch_norm_kernel(
   return convert(v_output);
 }
 
+// The width a normalization keeps its moments in.  The affine walk and the
+// backward pass that reads them both have to divide, so the moments of a narrow
+// payload stay at single precision while the activation goes back to its own.
+DType group_stats_dtype(DType input_dtype) {
+  return input_dtype == DType::Float16 || input_dtype == DType::BFloat16
+      ? DType::Float32
+      : input_dtype;
+}
+
+// Group normalization walked over the axis a group lives on: fold (N, C, *) to
+// (N, G, (C/G)*HxW) so that one axis carries a whole group, take the mean of
+// that axis, subtract it, and read the second moment as the mean of the squared
+// deviations -- the deviations are the very values the answer scales, so one
+// walk serves both.  A spread of a payload that sits far from zero would
+// otherwise be folded from a difference of two large sums and lose the spread
+// entirely.  The affine terms ride on the (N, C, HxW) fold, where one channel is
+// one axis and the span of a group is one lane.
+//
+// The moments are released as a walk would release them, not recomputed by a
+// second reader: the caller that saves them for a backward pass reads the same
+// (N, G) pair the fused kernels of the other normalizations answer in.
+std::tuple<Tensor, Tensor, Tensor> native_group_norm_kernel(
+    const Tensor& input,
+    const std::optional<Tensor>& weight_opt,
+    const std::optional<Tensor>& bias_opt,
+    int64_t N,
+    int64_t C,
+    int64_t HxW,
+    int64_t group,
+    double eps) {
+  TP_CHECK(
+      input.dtype() == DType::Float32 || input.dtype() == DType::Float16,
+      "Vulkan group_norm supports Float32 and Float16 tensors only");
+  TP_CHECK(
+      input.dim() >= 2 && input.dim() <= 4,
+      "Vulkan group_norm supports 2d to 4d tensors");
+  TP_CHECK(
+      N == input.size(0) && C == input.size(1) && N * C * HxW == input.numel(),
+      "Vulkan group_norm: supplied dimensions do not match input");
+  TP_CHECK(
+      group > 0 && C > 0 && C % group == 0,
+      "Vulkan group_norm: channels must be divisible by a positive num_groups");
+  TP_CHECK(HxW > 0, "Vulkan group_norm: the spatial span must be positive");
+  for (const std::optional<Tensor>& param : {weight_opt, bias_opt}) {
+    if (param.has_value() && param->defined()) {
+      TP_CHECK(
+          param->dim() == 1 && param->numel() == C,
+          "Vulkan group_norm: an affine parameter must carry one lane "
+          "per channel");
+    }
+  }
+
+  const DType stats_dtype = group_stats_dtype(input.dtype());
+
+  if (N == 0) {
+    // No activation to walk: the answer is the empty payload and the two empty
+    // moment tables its shape names.
+    const std::vector<int64_t> stats{0, group};
+    return std::make_tuple(
+        Tensor::empty(
+            static_cast<std::vector<int64_t>>(input.shape()),
+            input.dtype(),
+            input.device()),
+        Tensor::empty(stats, stats_dtype, input.device()),
+        Tensor::empty(stats, stats_dtype, input.device()));
+  }
+
+  // A narrow payload is walked at single precision and answers in its own; the
+  // affine terms join the walk at that same width.  A payload that is dense in
+  // some order other than its own is laid out before the fold, since the fold
+  // reads a flat span.
+  Tensor wide = input.dtype() == DType::Float32
+      ? input
+      : tpx::ops::to(input, DType::Float32);
+  if (!wide.is_contiguous()) {
+    wide = wide.contiguous();
+  }
+
+  const std::vector<int64_t> axes{2};
+  const int64_t span = (C / group) * HxW;
+  Tensor folded = dispatch_vk<Tensor>(
+      "reshape", wide, std::vector<int64_t>{N, group, span});
+  Tensor mean = dispatch_vk<Tensor>(
+      "mean.dim", folded, axes, true, DType::Float32);
+  Tensor centered = dispatch_vk<Tensor>(
+      "sub.Tensor", folded, mean, Scalar(1.0));
+  Tensor var = dispatch_vk<Tensor>(
+      "mean.dim",
+      dispatch_vk<Tensor>("mul.Tensor", centered, centered),
+      axes,
+      true,
+      DType::Float32);
+  Tensor rstd = dispatch_vk<Tensor>(
+      "rsqrt", dispatch_vk<Tensor>("add.Scalar", var, Scalar(eps), Scalar(1)));
+  Tensor scaled = dispatch_vk<Tensor>("mul.Tensor", centered, rstd);
+
+  Tensor out = dispatch_vk<Tensor>(
+      "reshape", scaled, std::vector<int64_t>{N, C, HxW});
+  const std::vector<int64_t> affine_shape{1, C, 1};
+  if (weight_opt.has_value() && weight_opt->defined()) {
+    out = dispatch_vk<Tensor>(
+        "mul.Tensor",
+        out,
+        dispatch_vk<Tensor>(
+            "reshape",
+            tpx::ops::to(*weight_opt, DType::Float32),
+            affine_shape));
+  }
+  if (bias_opt.has_value() && bias_opt->defined()) {
+    out = dispatch_vk<Tensor>(
+        "add.Tensor",
+        out,
+        dispatch_vk<Tensor>(
+            "reshape",
+            tpx::ops::to(*bias_opt, DType::Float32),
+            affine_shape),
+        Scalar(1));
+  }
+  out = dispatch_vk<Tensor>(
+      "reshape", out, static_cast<std::vector<int64_t>>(input.shape()));
+
+  return std::make_tuple(
+      tpx::ops::to(out, input.dtype()),
+      dispatch_vk<Tensor>("reshape", mean, std::vector<int64_t>{N, group}),
+      dispatch_vk<Tensor>("reshape", rstd, std::vector<int64_t>{N, group}));
+}
+
+Tensor group_norm_kernel(
+    const Tensor& input,
+    int64_t num_groups,
+    const std::optional<Tensor>& weight_opt,
+    const std::optional<Tensor>& bias_opt,
+    double eps) {
+  TP_CHECK(
+      input.dim() >= 2 && input.dim() <= 4,
+      "Vulkan group_norm supports 2d to 4d tensors");
+  int64_t spatial = 1;
+  for (int64_t dim = 2; dim < input.dim(); ++dim) {
+    spatial *= input.size(dim);
+  }
+  return std::get<0>(tensorplay::tpx::ops::native_group_norm(
+      input,
+      weight_opt,
+      bias_opt,
+      input.size(0),
+      input.size(1),
+      spatial,
+      num_groups,
+      eps));
+}
+
 namespace {
 
 // Single-dispatch root-mean-square normalization over the trailing width
@@ -2051,6 +2202,10 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, NormalizationKernels) {
   m.impl("native_layer_norm", &tensorplay::vulkan::ops::native_layer_norm_kernel);
   m.impl("batch_norm", &tensorplay::vulkan::ops::batch_norm_kernel);
   m.impl("rms_norm", &tensorplay::vulkan::ops::rms_norm_kernel);
+  m.impl("group_norm", &tensorplay::vulkan::ops::group_norm_kernel);
+  m.impl(
+      "native_group_norm",
+      &tensorplay::vulkan::ops::native_group_norm_kernel);
 }
 
 TENSORPLAY_LIBRARY_IMPL(Vulkan, LlmKernels) {
