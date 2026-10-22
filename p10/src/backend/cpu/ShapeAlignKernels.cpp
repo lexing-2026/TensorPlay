@@ -709,8 +709,14 @@ Tensor tpsa_repeat_cpu(const Tensor& self, const std::vector<int64_t>& repeats) 
     const bool byte_runs = inner_stride == 1 && self.itemsize() >= 1 &&
                            !isQuantizedType(self.dtype());
     const size_t item = self.itemsize();
+    // The grain counts groups, but the work is proportional to the elements
+    // a group holds: measuring a chunk by group count alone leaves a wide
+    // group's copy on one thread.  One chunk keeps about one grain's worth
+    // of elements instead.
+    const int64_t grain =
+        std::max<int64_t>(1, GRAIN_SIZE / std::max<int64_t>(1, group));
 
-    parallel_for(0, groups, GRAIN_SIZE, [&](int64_t lo, int64_t hi) {
+    parallel_for(0, groups, grain, [&](int64_t lo, int64_t hi) {
 #define TP_REPEAT_CASE(ctype, name)                                                     \
         case DType::name: {                                                             \
             const ctype* src = self.data_ptr<ctype>();                                  \
