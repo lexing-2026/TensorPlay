@@ -2003,6 +2003,16 @@ Tensor bincount_cpu_impl(const Tensor& self, const Tensor& weights,
     }
     Tensor result = Tensor::zeros({nbins}, DType::Int64, self.device());
     int64_t* rp = result.data_ptr<int64_t>();
+    // A tally per thread is as large as the number of bins, so it only pays
+    // off once the input is long enough to amortize it; below that the plain
+    // pass over the input is the cheaper way to count.
+    if (self_size <= GRAIN_SIZE ||
+        self_size <= static_cast<int64_t>(threads + 1) * nbins) {
+        for (int64_t i = 0; i < self_size; ++i) {
+            rp[static_cast<int64_t>(ip[i])] += 1;
+        }
+        return result;
+    }
     if (nbins <= (1 << 20)) {
         // A tally per thread, folded together at the end: the threads do not
         // share a bin, so no two of them write the same counter.
