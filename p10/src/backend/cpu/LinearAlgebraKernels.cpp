@@ -65,6 +65,7 @@ static MklAmdKernelWorkaround g_mkl_amd_workaround;
 } // namespace
 #endif // USE_MKL && (GCC || Clang)
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <cstdint>
 #include <limits>
@@ -643,6 +644,161 @@ bool matmul_onednn(const Tensor& src, const Tensor& weights, Tensor& dst) {
 
 } // anonymous namespace
 
+// The array library's product of two float tables, written into a contiguous
+// {M,N} destination.  Each operand may arrive row-major, column-major or in
+// some layout neither kernel speaks, in which case it is materialized first.
+static void mm_blas_f32(const Tensor& self_p, const Tensor& mat2_p,
+                        Tensor& result, int64_t M, int64_t N, int64_t K) {
+    bool transA = false;
+    bool transB = false;
+    int64_t lda = 0;
+    int64_t ldb = 0;
+
+    // A stride of {1, size(0)} is a column-major store of the same table,
+    // which the kernel reads as a transpose instead of a copy.
+    auto is_transposed = [](const Tensor& t) {
+        return t.stride(0) == 1 && t.stride(1) == t.size(0);
+    };
+
+    Tensor a_input = self_p;
+    if (self_p.is_contiguous()) {
+        lda = K;
+    } else if (is_transposed(self_p)) {
+        transA = true;
+        lda = M;
+    } else {
+        a_input = detail::contiguous_clone(self_p);
+        lda = K;
+    }
+
+    Tensor b_input = mat2_p;
+    if (mat2_p.is_contiguous()) {
+        ldb = N;
+    } else if (is_transposed(mat2_p)) {
+        transB = true;
+        ldb = K;
+    } else {
+        b_input = detail::contiguous_clone(mat2_p);
+        ldb = N;
+    }
+
+    const float* A = a_input.data_ptr<float>();
+    const float* B = b_input.data_ptr<float>();
+    float* C = result.data_ptr<float>();
+
+#if defined(USE_MKL) || defined(USE_BLAS)
+    CBLAS_TRANSPOSE TransA = transA ? CblasTrans : CblasNoTrans;
+    CBLAS_TRANSPOSE TransB = transB ? CblasTrans : CblasNoTrans;
+
+#ifdef USE_MKL
+    cblas_sgemm(CblasRowMajor, TransA, TransB,
+                M, N, K, 1.0f, A, lda, B, ldb, 0.0f, C, N);
+#else
+    cblas_sgemm(CblasRowMajor, TransA, TransB,
+                (int)M, (int)N, (int)K, 1.0f, A, (int)lda, B, (int)ldb, 0.0f, C, (int)N);
+#endif
+#else
+    // Fallback to naive (no transpose support in naive yet, force clone)
+    if (transA || transB) {
+        Tensor a_contig = self_p.contiguous();
+        Tensor b_contig = mat2_p.contiguous();
+        gemm_naive(M, N, K, 1.0f, a_contig.data_ptr<float>(), K, b_contig.data_ptr<float>(), N, 0.0f, C, N);
+    } else {
+        gemm_naive(M, N, K, 1.0f, A, K, B, N, 0.0f, C, N);
+    }
+#endif
+}
+
+#ifdef USE_ONEDNN
+namespace {
+
+// A float product has two routes: the blocked kernel of the convolution
+// library and the linked array library.  Neither is faster everywhere -- each
+// partitions the operands differently, and a partition that suits a shape
+// badly costs several times what the other route spends on it, so the choice
+// cannot be read off the dimensions.  Above the primitive set-up cost the
+// blocked kernel is the default, and a shape seen for the first time is timed
+// through both routes; the array library takes the shape over only when it is
+// faster by a margin past the spread of a single timing, so a shape the
+// default already handles well is never moved off it.
+enum class FloatRoute : uint8_t { kBlocked, kArray };
+
+struct FloatRouteKey {
+    int64_t M, N, K, lda, ldb, ldc, threads;
+    bool operator==(const FloatRouteKey& o) const {
+        return M == o.M && N == o.N && K == o.K && lda == o.lda &&
+               ldb == o.ldb && ldc == o.ldc && threads == o.threads;
+    }
+};
+
+struct FloatRouteKeyHash {
+    size_t operator()(const FloatRouteKey& k) const {
+        size_t h = std::hash<int64_t>()(k.M);
+        for (int64_t v : {k.N, k.K, k.lda, k.ldb, k.ldc, k.threads}) {
+            h = h * 31u + std::hash<int64_t>()(v);
+        }
+        return h;
+    }
+};
+
+// How much faster the array library has to be before it replaces the default.
+constexpr double kArrayRouteMargin = 1.05;
+
+std::mutex g_float_route_mutex;
+std::unordered_map<FloatRouteKey, FloatRoute, FloatRouteKeyHash> g_float_routes;
+
+double product_us(const std::function<void()>& once) {
+    const auto start = std::chrono::steady_clock::now();
+    once();
+    return std::chrono::duration<double, std::micro>(
+        std::chrono::steady_clock::now() - start).count();
+}
+
+FloatRoute choose_float_route(const Tensor& self_p, const Tensor& mat2_p,
+                              Tensor& result, const FloatRouteKey& key) {
+    {
+        std::lock_guard<std::mutex> lk(g_float_route_mutex);
+        auto it = g_float_routes.find(key);
+        if (it != g_float_routes.end()) return it->second;
+    }
+    // A shape timed while the team is already busy measures the interference
+    // rather than the kernel, and a caller nested in another kernel cannot
+    // afford extra products: leave those on the default without recording it.
+    if (in_parallel_region() || get_num_threads() <= 1) {
+        return FloatRoute::kBlocked;
+    }
+
+    // Both routes write the whole destination -- the product adds nothing to
+    // it -- so running one over the other only replaces an answer that was
+    // already correct, and the value left behind is the product either way.
+    bool blocked_worked = false;
+    product_us([&] { blocked_worked = mm_onednn(self_p, mat2_p, result); });
+    mm_blas_f32(self_p, mat2_p, result, key.M, key.N, key.K);
+    if (!blocked_worked) {
+        std::lock_guard<std::mutex> lk(g_float_route_mutex);
+        if (g_float_routes.size() >= 4096) g_float_routes.clear();
+        g_float_routes.emplace(key, FloatRoute::kArray);
+        return FloatRoute::kArray;
+    }
+    double blocked = product_us([&] { mm_onednn(self_p, mat2_p, result); });
+    double array = product_us(
+        [&] { mm_blas_f32(self_p, mat2_p, result, key.M, key.N, key.K); });
+    blocked = std::min(blocked, product_us([&] { mm_onednn(self_p, mat2_p, result); }));
+    array = std::min(array, product_us(
+        [&] { mm_blas_f32(self_p, mat2_p, result, key.M, key.N, key.K); }));
+
+    const FloatRoute route =
+        (array * kArrayRouteMargin < blocked) ? FloatRoute::kArray
+                                              : FloatRoute::kBlocked;
+    std::lock_guard<std::mutex> lk(g_float_route_mutex);
+    if (g_float_routes.size() >= 4096) g_float_routes.clear();
+    g_float_routes.emplace(key, route);
+    return route;
+}
+
+} // anonymous namespace
+#endif // USE_ONEDNN
+
 // Core GEMM writing into a caller-owned contiguous {M,N} result.  Shared by
 // mm_kernel (fresh alloc) and the batched-matmul loops (output slice views)
 // so the broadcast path never pays temp-alloc + copy_ per slice.
@@ -706,83 +862,30 @@ static void mm_into_impl(const Tensor& self_p, const Tensor& mat2_p,
         return static_cast<int64_t>(524288);
     }();
     #ifdef USE_ONEDNN
-    // Low-precision GEMM always prefers oneDNN (native bf16/f16 kernels with
-    // f32 accumulate); the scalar gemm_strided fallback is never competitive.
-    // f32 keeps the small-shape MKL shortcut via the MACs threshold.
+    // Low-precision products always take the blocked kernel (native bf16/f16
+    // kernels with f32 accumulate); the scalar gemm_strided fallback is never
+    // competitive.  A float product takes it above the set-up cost, and then
+    // only while the shape has not been measured onto the array library.
     const bool mm_low_precision = self_p.dtype() != DType::Float32;
-    // Decode is dominated by M=1 (and occasionally N=1) skinny GEMMs.
-    // oneDNN's primitive/runner path is slower than the already-linked BLAS
-    // kernel for these shapes; keep oneDNN for low precision and fat FP32
-    // matrices where its JIT path is beneficial.
+    // Decode is dominated by M=1 (and occasionally N=1) skinny products, whose
+    // partition the blocked kernel handles worse than the array library.
     const bool skinny_fp32 = self_p.dtype() == DType::Float32 && (M == 1 || N == 1);
-    if ((mm_low_precision || (!skinny_fp32 && (M * K * N) >= onednn_min_macs)) &&
-        mm_onednn(self_p, mat2_p, result)) {
+    bool take_blocked =
+        mm_low_precision || (!skinny_fp32 && (M * K * N) >= onednn_min_macs);
+    if (take_blocked && self_p.dtype() == DType::Float32) {
+        take_blocked = choose_float_route(
+                           self_p, mat2_p, result,
+                           {M, N, K, self_p.stride(0), mat2_p.stride(0),
+                            result.stride(0), get_num_threads()}) ==
+                       FloatRoute::kBlocked;
+    }
+    if (take_blocked && mm_onednn(self_p, mat2_p, result)) {
         return;
     }
     #endif
 
     if (self_p.dtype() == DType::Float32 && mat2_p.dtype() == DType::Float32) {
-        
-        bool transA = false;
-        bool transB = false;
-        int64_t lda = 0;
-        int64_t ldb = 0;
-        
-        // Helper to check for transposed layout (stride(0)=1, stride(1)=size(0))
-        // This corresponds to a Column-Major layout of a matrix of size (size(0), size(1))
-        // or a Transposed view of a Row-Major matrix.
-        auto is_transposed = [](const Tensor& t) {
-            return t.stride(0) == 1 && t.stride(1) == t.size(0);
-        };
-        
-        Tensor a_input = self_p;
-        if (self_p.is_contiguous()) {
-            lda = K;
-        } else if (is_transposed(self_p)) {
-            transA = true;
-            lda = M; 
-        } else {
-            a_input = detail::contiguous_clone(self_p);
-            lda = K;
-        }
-        
-        Tensor b_input = mat2_p;
-        if (mat2_p.is_contiguous()) {
-            ldb = N;
-        } else if (is_transposed(mat2_p)) {
-            transB = true;
-            ldb = K;
-        } else {
-            b_input = detail::contiguous_clone(mat2_p);
-            ldb = N;
-        }
-        
-        const float* A = a_input.data_ptr<float>();
-        const float* B = b_input.data_ptr<float>();
-        float* C = result.data_ptr<float>();
-        
-        #if defined(USE_MKL) || defined(USE_BLAS)
-            CBLAS_TRANSPOSE TransA = transA ? CblasTrans : CblasNoTrans;
-            CBLAS_TRANSPOSE TransB = transB ? CblasTrans : CblasNoTrans;
-            
-            #ifdef USE_MKL
-            cblas_sgemm(CblasRowMajor, TransA, TransB, 
-                        M, N, K, 1.0f, A, lda, B, ldb, 0.0f, C, N);
-            #else
-            cblas_sgemm(CblasRowMajor, TransA, TransB, 
-                        (int)M, (int)N, (int)K, 1.0f, A, (int)lda, B, (int)ldb, 0.0f, C, (int)N);
-            #endif
-            
-        #else
-            // Fallback to naive (no transpose support in naive yet, force clone)
-            if (transA || transB) {
-                 Tensor a_contig = self_p.contiguous();
-                 Tensor b_contig = mat2_p.contiguous();
-                 gemm_naive(M, N, K, 1.0f, a_contig.data_ptr<float>(), K, b_contig.data_ptr<float>(), N, 0.0f, C, N);
-            } else {
-                 gemm_naive(M, N, K, 1.0f, A, K, B, N, 0.0f, C, N);
-            }
-        #endif
+        mm_blas_f32(self_p, mat2_p, result, M, N, K);
         return;
     }
 
