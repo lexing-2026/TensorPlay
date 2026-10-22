@@ -698,6 +698,115 @@ dim3 cat_grid(ptrdiff_t nTensors) {
     return dim3(static_cast<unsigned>(2 * num_sm), static_cast<unsigned>(nTensors));
 }
 
+// Contiguous inputs make the concatenation a flat list of runs: input i
+// contributes its whole contiguous block for each outer position, and the
+// matching destination run starts at the input's offset along the join dim.
+// Each block owns one (outer position, input) pair and copies that run in
+// vector units, so no per-element coordinate math is needed.
+constexpr int kCatFlatBatch = 8;
+constexpr int kCatFlatThreads = 128;
+
+struct CatFlatMeta {
+    const char* src[kCatFlatBatch];
+    uint64_t src_outer[kCatFlatBatch];
+    uint64_t dst_base[kCatFlatBatch];
+    uint64_t chunks[kCatFlatBatch];
+};
+
+template <typename Chunk>
+__global__ void cat_flat_run_kernel(char* out, CatFlatMeta meta, int n_inputs,
+                                    uint64_t out_outer_bytes) {
+    const int64_t pair = blockIdx.y;
+    const int i = static_cast<int>(pair % n_inputs);
+    const int64_t o = pair / n_inputs;
+    const Chunk* src = reinterpret_cast<const Chunk*>(
+        meta.src[i] + o * meta.src_outer[i]);
+    Chunk* dst = reinterpret_cast<Chunk*>(
+        out + o * out_outer_bytes + meta.dst_base[i]);
+    const int64_t total = static_cast<int64_t>(meta.chunks[i]);
+    const int64_t step = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    for (int64_t c = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         c < total; c += step) {
+        dst[c] = src[c];
+    }
+}
+
+template <typename Chunk>
+void launch_cat_flat(char* out, const CatFlatMeta& meta, int n_inputs,
+                     uint64_t out_outer_bytes, uint64_t max_chunks,
+                     int64_t outer, cudaStream_t stream) {
+    const uint64_t per_block = static_cast<uint64_t>(kCatFlatThreads) * 4;
+    const unsigned blocks_x = static_cast<unsigned>(std::min<uint64_t>(
+        (max_chunks + per_block - 1) / per_block, 8192));
+    const dim3 grid(blocks_x, static_cast<unsigned>(outer * n_inputs));
+    cat_flat_run_kernel<Chunk><<<grid, kCatFlatThreads, 0, stream>>>(
+        out, meta, n_inputs, out_outer_bytes);
+}
+
+// Returns false when the layout or the alignment rules out the flat copy, in
+// which case the caller keeps the general batched path.
+bool try_cat_flat(const std::vector<const Tensor*>& inputs, int64_t dim,
+                  Tensor& out, int64_t outer, int64_t inner) {
+    if (inputs.size() < 2 ||
+        inputs.size() > static_cast<size_t>(kCatFlatBatch)) return false;
+    if (outer * static_cast<int64_t>(inputs.size()) > 65535) return false;
+    const int64_t isz = static_cast<int64_t>(out.itemsize());
+    const int64_t inner_bytes = inner * isz;
+    size_t chunk = 1;
+    if (inner_bytes % 16 == 0) chunk = 16;
+    else if (inner_bytes % 8 == 0) chunk = 8;
+    else if (inner_bytes % 4 == 0) chunk = 4;
+    else if (inner_bytes % 2 == 0) chunk = 2;
+    if (reinterpret_cast<uintptr_t>(out.data_ptr()) % chunk != 0) return false;
+    CatFlatMeta meta{};
+    const int64_t out_outer_bytes = out.size(dim) * inner_bytes;
+    uint64_t max_chunks = 0;
+    int64_t dim_offset = 0;
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        const Tensor& t = *inputs[i];
+        if (reinterpret_cast<uintptr_t>(t.data_ptr()) % chunk != 0) return false;
+        const int64_t run_bytes = t.size(dim) * inner_bytes;
+        meta.src[i] = static_cast<const char*>(t.data_ptr());
+        meta.src_outer[i] = static_cast<uint64_t>(run_bytes);
+        meta.dst_base[i] = static_cast<uint64_t>(dim_offset * inner_bytes);
+        meta.chunks[i] = static_cast<uint64_t>(run_bytes / static_cast<int64_t>(chunk));
+        max_chunks = std::max(max_chunks, meta.chunks[i]);
+        dim_offset += t.size(dim);
+    }
+    if (max_chunks == 0) return false;
+    auto stream = getCurrentCUDAStream().stream();
+    const int n_inputs = static_cast<int>(inputs.size());
+    switch (chunk) {
+        case 16:
+            launch_cat_flat<uint4>(reinterpret_cast<char*>(out.data_ptr()), meta,
+                                   n_inputs, out_outer_bytes, max_chunks, outer,
+                                   stream);
+            break;
+        case 8:
+            launch_cat_flat<uint2>(reinterpret_cast<char*>(out.data_ptr()), meta,
+                                   n_inputs, out_outer_bytes, max_chunks, outer,
+                                   stream);
+            break;
+        case 4:
+            launch_cat_flat<uint32_t>(reinterpret_cast<char*>(out.data_ptr()), meta,
+                                      n_inputs, out_outer_bytes, max_chunks, outer,
+                                      stream);
+            break;
+        case 2:
+            launch_cat_flat<uint16_t>(reinterpret_cast<char*>(out.data_ptr()), meta,
+                                      n_inputs, out_outer_bytes, max_chunks, outer,
+                                      stream);
+            break;
+        default:
+            launch_cat_flat<uint8_t>(reinterpret_cast<char*>(out.data_ptr()), meta,
+                                     n_inputs, out_outer_bytes, max_chunks, outer,
+                                     stream);
+            break;
+    }
+    checkCuda(cudaGetLastError(), "cat: flat run copy");
+    return true;
+}
+
 template <typename T, int batch_size, int stride_size>
 void parallel_cat(const Tensor& out, const std::vector<const Tensor*>& inputs,
                   int64_t dimension, int nDims) {
@@ -845,6 +954,22 @@ Tensor cat_kernel_cuda(const std::vector<Tensor>& tensors, int64_t dim) {
             break;
         default:
             break;
+    }
+
+    // Inputs that are all contiguous with the output dtype need no per-element
+    // coordinate math: the copy is a list of flat runs.
+    bool flat_ok = true;
+    std::vector<const Tensor*> flat_inputs;
+    for (const auto& t : tensors) {
+        if (join_detail::should_skip(t)) continue;
+        flat_inputs.push_back(&t);
+        flat_ok = flat_ok && t.is_contiguous() && t.dtype() == out_dtype;
+    }
+    if (flat_ok && flat_inputs.size() > 1) {
+        int64_t outer = 1, inner = 1;
+        for (int64_t d = 0; d < dim; ++d) outer *= out.size(d);
+        for (int64_t d = dim + 1; d < out.dim(); ++d) inner *= out.size(d);
+        if (try_cat_flat(flat_inputs, dim, out, outer, inner)) return out;
     }
 
     // The batched path covers one launch for any number of inputs: it needs the
