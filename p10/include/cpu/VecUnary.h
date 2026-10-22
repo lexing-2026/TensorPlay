@@ -935,6 +935,105 @@ static void f64_chunk_avx2(VOp op, VParams prm, const double* src, double* dst, 
             }
             break;
         }
+        case VOp::Exp:
+            TP_F64_SIMPLE_LOOP_4(tensorplay::tpsleef::exp(x));
+            break;
+        case VOp::Expm1:
+            TP_F64_SIMPLE_LOOP_4(tensorplay::tpsleef::expm1(x));
+            break;
+        case VOp::Log:
+            TP_F64_SIMPLE_LOOP_4(tensorplay::tpsleef::log(x));
+            break;
+        case VOp::Log1p:
+            TP_F64_SIMPLE_LOOP_4(tensorplay::tpsleef::log1p(x));
+            break;
+        case VOp::Log2:
+            TP_F64_SIMPLE_LOOP_4(tensorplay::tpsleef::log2(x));
+            break;
+        case VOp::Log10:
+            TP_F64_SIMPLE_LOOP_4(tensorplay::tpsleef::log10(x));
+            break;
+        case VOp::Tanh:
+            TP_F64_SIMPLE_LOOP_4(tensorplay::tpsleef::tanh(x));
+            break;
+        case VOp::Sigmoid:
+            TP_F64_SIMPLE_LOOP_4(_mm256_div_pd(
+                one, _mm256_add_pd(one, tensorplay::tpsleef::exp(_mm256_xor_pd(x, signbit)))));
+            break;
+        case VOp::Silu:
+            TP_F64_SIMPLE_LOOP_4(_mm256_div_pd(
+                x, _mm256_add_pd(one, tensorplay::tpsleef::exp(_mm256_xor_pd(x, signbit)))));
+            break;
+        case VOp::Mish:
+            TP_F64_SIMPLE_LOOP_4(_mm256_mul_pd(
+                x, tensorplay::tpsleef::tanh(tensorplay::tpsleef::log(
+                       _mm256_add_pd(one, tensorplay::tpsleef::exp(x))))));
+            break;
+        case VOp::GeluNone: {
+            const __m256d kAlpha = _mm256_set1_pd(0.70710678118654752440);
+            const __m256d half = _mm256_set1_pd(0.5);
+            TP_F64_SIMPLE_LOOP_4(_mm256_mul_pd(
+                _mm256_mul_pd(half, x),
+                _mm256_add_pd(one, tensorplay::tpsleef::erf(_mm256_mul_pd(kAlpha, x)))));
+            break;
+        }
+        case VOp::GeluTanh: {
+            const __m256d kBeta = _mm256_set1_pd(1.41421356237309504880 * 1.12837916709551257390 * 0.5);
+            const __m256d kKappa = _mm256_set1_pd(0.044715);
+            const __m256d half = _mm256_set1_pd(0.5);
+            TP_F64_SIMPLE_LOOP_4(_mm256_mul_pd(
+                _mm256_mul_pd(half, x),
+                _mm256_add_pd(one, tensorplay::tpsleef::tanh(_mm256_mul_pd(
+                    kBeta, _mm256_add_pd(x, _mm256_mul_pd(kKappa, _mm256_mul_pd(_mm256_mul_pd(x, x), x))))))));
+            break;
+        }
+        case VOp::Sin:
+            TP_F64_SIMPLE_LOOP_4(tensorplay::tpsleef::sin(x));
+            break;
+        case VOp::Cos:
+            TP_F64_SIMPLE_LOOP_4(tensorplay::tpsleef::cos(x));
+            break;
+        case VOp::Tan:
+            TP_F64_SIMPLE_LOOP_4(tensorplay::tpsleef::tan(x));
+            break;
+        case VOp::Asin:
+            TP_F64_SIMPLE_LOOP_4(tensorplay::tpsleef::asin(x));
+            break;
+        case VOp::Acos:
+            TP_F64_SIMPLE_LOOP_4(tensorplay::tpsleef::acos(x));
+            break;
+        case VOp::Atan:
+            TP_F64_SIMPLE_LOOP_4(tensorplay::tpsleef::atan(x));
+            break;
+        case VOp::Erf:
+            TP_F64_SIMPLE_LOOP_4(tensorplay::tpsleef::erf(x));
+            break;
+        case VOp::Erfc:
+            TP_F64_SIMPLE_LOOP_4(tensorplay::tpsleef::erfc(x));
+            break;
+        case VOp::Relu6:
+            TP_F64_SIMPLE_LOOP_4(_mm256_min_pd(_mm256_set1_pd(6.0), _mm256_max_pd(zero, x)));
+            break;
+        case VOp::LeakyRelu: {
+            const __m256d slope = _mm256_set1_pd(prm.p0);
+            TP_F64_SIMPLE_LOOP_4(_mm256_blendv_pd(x, _mm256_mul_pd(slope, x),
+                                                  _mm256_cmp_pd(x, zero, _CMP_LT_OQ)));
+            break;
+        }
+        case VOp::Hardswish: {
+            const __m256d three = _mm256_set1_pd(3.0);
+            const __m256d six = _mm256_set1_pd(6.0);
+            TP_F64_SIMPLE_LOOP_4(_mm256_div_pd(
+                _mm256_mul_pd(x, _mm256_min_pd(six, _mm256_max_pd(zero, _mm256_add_pd(x, three)))), six));
+            break;
+        }
+        case VOp::Hardsigmoid: {
+            const __m256d three = _mm256_set1_pd(3.0);
+            const __m256d six = _mm256_set1_pd(6.0);
+            TP_F64_SIMPLE_LOOP_4(_mm256_div_pd(
+                _mm256_min_pd(six, _mm256_max_pd(zero, _mm256_add_pd(x, three))), six));
+            break;
+        }
         default:
             for (; i + 4 <= n; i += 4) {
                 __m256d x = _mm256_loadu_pd(s + i);
