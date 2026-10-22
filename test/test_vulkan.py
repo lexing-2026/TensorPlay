@@ -13507,5 +13507,251 @@ class TestVulkanLogCumsumExp(unittest.TestCase):
                 err_msg=np.dtype(dtype).name)
 
 
+class TestVulkanCumExtremum(unittest.TestCase):
+    # cummax and cummin answer the running extremum along one axis together
+    # with the position each running value came from.  An incoming non-number
+    # takes the row over and never yields, and a later element that ties the
+    # running winner takes over too, so the index names the latest position
+    # attaining the extremum.  The values keep the payload's width; the places
+    # answer in the backend's index width, a single word.  Both storages, both
+    # float widths, the counting widths and the shape-less form are covered.
+
+    SHAPES = (
+        ((64,), 0),
+        ((3, 7), 0),
+        ((3, 7), -1),
+        ((2, 3, 4), 1),
+        ((2, 2, 3, 5), -1),
+    )
+
+    def _device(self, values):
+        return tensorplay.from_numpy(values.copy()).to("vulkan")
+
+    @staticmethod
+    def _want(values, dim, is_max):
+        floating = np.issubdtype(values.dtype, np.floating)
+        moved = np.moveaxis(values, dim, -1)
+        flat = moved.reshape(-1, moved.shape[-1])
+        out = np.empty_like(flat)
+        places = np.empty(flat.shape, dtype=np.int32)
+        for row in range(flat.shape[0]):
+            best = flat[row, 0]
+            best_at = 0
+            out[row, 0] = best
+            places[row, 0] = 0
+            for i in range(1, flat.shape[1]):
+                current = flat[row, i]
+                current_nan = floating and bool(np.isnan(current))
+                best_nan = floating and bool(np.isnan(best))
+                wins = current_nan or (
+                    not best_nan
+                    and (current >= best if is_max else current <= best))
+                if wins:
+                    best = current
+                    best_at = i
+                out[row, i] = best
+                places[row, i] = best_at
+        return (
+            np.moveaxis(out.reshape(moved.shape), -1, dim),
+            np.moveaxis(places.reshape(moved.shape), -1, dim))
+
+    @staticmethod
+    def _check(case, values, dim, is_max):
+        want_values, want_places = case._want(values, dim, is_max)
+        op = tensorplay.cummax if is_max else tensorplay.cummin
+        device = case._device(values)
+        got = op(device, dim)
+        case.assertEqual(got.values.dtype, device.dtype)
+        case.assertEqual(got.indices.dtype, tensorplay.int32)
+        if np.issubdtype(values.dtype, np.floating):
+            np.testing.assert_allclose(
+                got.values.cpu().numpy().astype(np.float64),
+                want_values.astype(np.float64),
+                rtol=0, atol=0, equal_nan=True,
+                err_msg=f"{np.dtype(values.dtype).name} {values.shape} "
+                        f"dim {dim} max {is_max}")
+        else:
+            np.testing.assert_array_equal(
+                got.values.cpu().numpy(), want_values,
+                err_msg=f"{np.dtype(values.dtype).name} {values.shape} "
+                        f"dim {dim} max {is_max}")
+        np.testing.assert_array_equal(
+            got.indices.cpu().numpy(), want_places,
+            err_msg=f"{np.dtype(values.dtype).name} {values.shape} "
+                    f"dim {dim} max {is_max}")
+
+    def _random(self, shape, dtype, seed=61):
+        rng = np.random.default_rng(seed)
+        count = int(np.prod(shape))
+        if np.issubdtype(dtype, np.floating):
+            values = (rng.standard_normal(count) * 4.0).astype(dtype)
+            values[:4] = np.array(
+                [-np.inf, np.nan, -0.0, np.inf], dtype=dtype)
+        else:
+            info = np.iinfo(dtype)
+            values = rng.integers(
+                info.min, info.max, count, dtype=dtype)
+        return values.reshape(shape)
+
+    def test_the_scan_follows_the_running_extremum(self):
+        for dtype in (np.float32, np.float16):
+            for shape, dim in self.SHAPES:
+                values = self._random(shape, dtype)
+                for is_max in (True, False):
+                    self._check(self, values, dim, is_max)
+                # The allocating forms leave the payload they read untouched.
+                device = self._device(values)
+                tensorplay.cummax(device, dim)
+                np.testing.assert_allclose(
+                    device.cpu().numpy().astype(np.float64),
+                    values.astype(np.float64),
+                    rtol=0, atol=0, equal_nan=True)
+
+    def test_a_later_tie_takes_over(self):
+        rows = np.array([
+            [3.0, 1.0, 3.0, 3.0, 0.0],
+            [2.0, 2.0, 2.0, 2.0, 2.0],
+            [-1.0, -1.0, 5.0, 5.0, -1.0],
+        ], dtype=np.float32)
+        got_max = tensorplay.cummax(self._device(rows), 1)
+        got_min = tensorplay.cummin(self._device(rows), 1)
+        np.testing.assert_array_equal(
+            got_max.indices.cpu().numpy(),
+            np.array([[0, 0, 2, 3, 3],
+                      [0, 1, 2, 3, 4],
+                      [0, 1, 2, 3, 3]], dtype=np.int32))
+        np.testing.assert_array_equal(
+            got_min.indices.cpu().numpy(),
+            np.array([[0, 1, 1, 1, 4],
+                      [0, 1, 2, 3, 4],
+                      [0, 1, 1, 1, 4]], dtype=np.int32))
+        self._check(self, rows, 1, True)
+        self._check(self, rows, 1, False)
+
+    def test_a_non_number_keeps_the_row(self):
+        rows = np.array([
+            [-np.inf, np.nan, 5.0, 0.0],
+            [np.nan, np.nan, 1.0, 0.0],
+            [1.0, np.nan, np.nan, 7.0],
+            [np.nan, -np.inf, 0.5, -2.0],
+        ], dtype=np.float32)
+        for dtype in (np.float32, np.float16):
+            payload = rows.astype(dtype)
+            for dim in (0, 1):
+                for is_max in (True, False):
+                    self._check(self, payload, dim, is_max)
+        got = tensorplay.cummax(self._device(rows), 1)
+        self.assertTrue(np.isnan(got.values.cpu().numpy()[2, 1:]).all())
+        # A non-number always takes over, so a run of them walks the index
+        # forward and the ordinary value after them never wins it back.
+        np.testing.assert_array_equal(
+            got.indices.cpu().numpy()[2, 1:], np.array([1, 2, 2]))
+
+    def test_a_wide_count_folds_in_its_own_type(self):
+        big = 1 << 60
+        base = np.array([
+            [big + 5, big + 3, -(1 << 61)],
+            [big + 1, -(1 << 62), big + 9],
+            [big + 7, big + 4, -(1 << 63)],
+        ], dtype=np.int64)
+        for dim in (0, 1, -1):
+            for is_max in (True, False):
+                self._check(self, base, dim, is_max)
+        # The same values through single precision would lose their order.
+        got = tensorplay.cummax(self._device(base), 0)
+        self.assertEqual(got.values.dtype, tensorplay.int64)
+        np.testing.assert_array_equal(
+            got.values.cpu().numpy(),
+            np.array([[big + 5, big + 3, -(1 << 61)],
+                      [big + 5, big + 3, big + 9],
+                      [big + 7, big + 4, big + 9]], dtype=np.int64))
+        np.testing.assert_array_equal(
+            got.indices.cpu().numpy(),
+            np.array([[0, 0, 0], [0, 0, 1], [2, 2, 1]], dtype=np.int32))
+
+    def test_a_byte_lane_keeps_its_width(self):
+        for dtype in (np.int8, np.uint8):
+            values = np.array([
+                [-3, 5, -128, 127, 0],
+                [9, -9, 9, 9, -9],
+            ], dtype=np.int64)
+            if dtype is np.uint8:
+                values = np.abs(values)
+            values = values.astype(dtype)
+            for dim in (0, 1):
+                for is_max in (True, False):
+                    self._check(self, values, dim, is_max)
+        mask = np.array([
+            [True, False, True, True],
+            [False, False, True, False],
+        ], dtype=bool)
+        for is_max in (True, False):
+            self._check(self, mask, 1, is_max)
+
+    def test_an_axis_beyond_the_payload_refuses(self):
+        values = np.zeros((3, 4), dtype=np.float32)
+        for dim in (2, -3):
+            with self.assertRaisesRegex(
+                    RuntimeError, "dimension out of range"):
+                tensorplay.cummax(self._device(values), dim)
+            with self.assertRaisesRegex(
+                    RuntimeError, "dimension out of range"):
+                tensorplay.cummin(self._device(values), dim)
+
+    def test_linear_storage_walks_its_rows_the_same_way(self):
+        for dtype in (np.float32, np.float16):
+            values = self._random((50000, 4), dtype)
+            for is_max in (True, False):
+                self._check(self, values, 1, is_max)
+        # A long row past every image limit stays a single walk.
+        long_values = (
+            np.random.default_rng(7).standard_normal(200003) * 3.0
+        ).astype(np.float32)
+        for is_max in (True, False):
+            self._check(self, long_values, 0, is_max)
+
+    def test_a_scalar_has_no_axis_and_answers_with_itself(self):
+        device = self._device(np.array(2.5, dtype=np.float32))
+        for dim in (0, -1):
+            for op in (tensorplay.cummax, tensorplay.cummin):
+                got = op(device, dim)
+                self.assertEqual(tuple(got.values.shape), ())
+                self.assertEqual(tuple(got.indices.shape), ())
+                self.assertAlmostEqual(float(got.values.cpu().numpy()), 2.5)
+                self.assertEqual(int(got.indices.cpu().numpy()), 0)
+        with self.assertRaisesRegex(RuntimeError, "dimension out of range"):
+            tensorplay.cummax(device, 1)
+
+    def test_an_empty_payload_keeps_its_shape(self):
+        for shape, dim in (((0, 3), 1), ((3, 0), 0), ((2, 0, 4), -2)):
+            values = np.zeros(shape, dtype=np.float32)
+            for op in (tensorplay.cummax, tensorplay.cummin):
+                got = op(self._device(values), dim)
+                self.assertEqual(tuple(got.values.shape), shape)
+                self.assertEqual(tuple(got.indices.shape), shape)
+
+    def test_the_device_answers_what_the_host_answers(self):
+        for dtype in (np.float32, np.float16, np.int32, np.int64):
+            values = self._random((6, 8), dtype)
+            host = tensorplay.from_numpy(values.copy())
+            device = host.to("vulkan")
+            for dim in (0, 1):
+                for op in (tensorplay.cummax, tensorplay.cummin):
+                    got = op(device, dim)
+                    want = op(host, dim)
+                    if np.issubdtype(dtype, np.floating):
+                        np.testing.assert_allclose(
+                            got.values.cpu().numpy().astype(np.float64),
+                            want.values.numpy().astype(np.float64),
+                            rtol=0, atol=0, equal_nan=True)
+                    else:
+                        np.testing.assert_array_equal(
+                            got.values.cpu().numpy(),
+                            want.values.numpy())
+                    np.testing.assert_array_equal(
+                        got.indices.cpu().numpy(),
+                        want.indices.numpy().astype(np.int32))
+
+
 if __name__ == "__main__":
     unittest.main()
