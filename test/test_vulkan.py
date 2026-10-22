@@ -15402,5 +15402,293 @@ class TestVulkanGroupNormBackward(unittest.TestCase):
                     self._device(payload.astype(np.int32)), 3)
 
 
+class TestVulkanBinaryCrossEntropy(unittest.TestCase):
+    # A binary likelihood reads both planes as probabilities, so every lane has to
+    # sit between the bounds a logarithm is taken of.  Each logarithm is clamped at
+    # -100, which is what keeps a lane exactly on a bound finite, and the gradient
+    # divides by the product of the two distances to those bounds held off zero.
+    # The logit form answers through log_sigmoid instead, so a saturated logit
+    # stays finite without ever forming a probability.  The walk reads single
+    # precision however narrow the payload is, and the answer returns to the width
+    # the payload has.
+
+    SHAPES = ((4,), (2, 5), (3, 4, 2), (2, 3, 4, 5))
+
+    @staticmethod
+    def _device(values):
+        return tensorplay.from_numpy(np.ascontiguousarray(values)).to("vulkan")
+
+    @staticmethod
+    def _host(values):
+        return tensorplay.from_numpy(np.ascontiguousarray(values))
+
+    @staticmethod
+    def _probabilities(rng, shape):
+        # A lane exactly on zero would answer the clamp, so the plane is held
+        # inside the bounds.
+        return (rng.random(shape) * 0.97 + 0.015).astype(np.float32)
+
+    @staticmethod
+    def _likelihood(x, t, weight=None):
+        wide = np.asarray(x).astype(np.float64)
+        labels = np.broadcast_to(np.asarray(t).astype(np.float64), wide.shape)
+        loss = ((labels - 1.0) * np.maximum(np.log1p(-wide), -100.0)
+                - labels * np.maximum(np.log(wide), -100.0))
+        if weight is not None:
+            loss = loss * np.broadcast_to(
+                np.asarray(weight).astype(np.float64), wide.shape)
+        return loss
+
+    @staticmethod
+    def _likelihood_gradient(x, t, weight=None):
+        wide = np.asarray(x).astype(np.float64)
+        labels = np.broadcast_to(np.asarray(t).astype(np.float64), wide.shape)
+        gradient = (wide - labels) / np.maximum((1.0 - wide) * wide, 1e-12)
+        if weight is not None:
+            gradient = gradient * np.broadcast_to(
+                np.asarray(weight).astype(np.float64), wide.shape)
+        return gradient
+
+    @staticmethod
+    def _logit_likelihood(x, t, weight=None, pos_weight=None):
+        wide = np.asarray(x).astype(np.float64)
+        labels = np.broadcast_to(np.asarray(t).astype(np.float64), wide.shape)
+        log_sigmoid = -np.logaddexp(0.0, -wide)
+        if pos_weight is not None:
+            log_sigmoid = log_sigmoid * ((np.broadcast_to(
+                np.asarray(pos_weight).astype(np.float64), wide.shape) - 1.0)
+                * labels + 1.0)
+        loss = (1.0 - labels) * wide - log_sigmoid
+        if weight is not None:
+            loss = loss * np.broadcast_to(
+                np.asarray(weight).astype(np.float64), wide.shape)
+        return loss
+
+    def test_a_probability_answers_the_loss_of_its_lane(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(211)
+        for shape in self.SHAPES:
+            payload = self._probabilities(rng, shape)
+            labels = (rng.random(shape) > 0.5).astype(np.float32)
+            weight = (rng.random(shape) + 0.5).astype(np.float32)
+            for reduction in (0, 1, 2):
+                for name, affine in (("none", None), ("weight", weight)):
+                    with self.subTest(shape=shape, reduction=reduction,
+                                      affine=name):
+                        got = F.binary_cross_entropy(
+                            self._device(payload), self._device(labels),
+                            weight=None if affine is None
+                            else self._device(affine),
+                            reduction=reduction).cpu().numpy()
+                        truth = self._likelihood(payload, labels, affine)
+                        if reduction == 1:
+                            truth = truth.mean()
+                        elif reduction == 2:
+                            truth = truth.sum()
+                        np.testing.assert_allclose(
+                            got, truth, rtol=2e-3, atol=2e-3,
+                            err_msg=f"reduction {reduction} of {shape}")
+
+    def test_the_host_likelihood_answers_the_same(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(223)
+        for shape in ((4,), (2, 5), (3, 4, 2)):
+            payload = self._probabilities(rng, shape)
+            labels = (rng.random(shape) > 0.5).astype(np.float32)
+            weight = (rng.random(shape) + 0.5).astype(np.float32)
+            for reduction in (0, 1, 2):
+                with self.subTest(shape=shape, reduction=reduction):
+                    device = F.binary_cross_entropy(
+                        self._device(payload), self._device(labels),
+                        weight=self._device(weight),
+                        reduction=reduction).cpu().numpy()
+                    host = F.binary_cross_entropy(
+                        self._host(payload), self._host(labels),
+                        weight=self._host(weight),
+                        reduction=reduction).numpy()
+                    self.assertEqual(device.dtype, host.dtype)
+                    np.testing.assert_allclose(device, host, rtol=2e-3,
+                                               atol=2e-3)
+
+    def test_a_narrower_plane_broadcasts_onto_the_walk(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(227)
+        payload = self._probabilities(rng, (2, 3, 4))
+        labels = (rng.random((3, 1)) > 0.5).astype(np.float32)
+        weight = (rng.random((3, 1)) + 0.5).astype(np.float32)
+        with self.subTest(kind="a plane narrower than the payload"):
+            got = F.binary_cross_entropy(
+                self._device(payload), self._device(labels),
+                weight=self._device(weight)).cpu().numpy()
+            np.testing.assert_allclose(
+                got, self._likelihood(payload, labels, weight).mean(),
+                rtol=2e-3, atol=2e-3)
+
+    def test_a_gradient_hands_back_the_slope_of_the_loss(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(229)
+        for shape in ((4,), (2, 5), (3, 4, 2)):
+            payload = self._probabilities(rng, shape)
+            labels = (rng.random(shape) > 0.5).astype(np.float32)
+            weight = (rng.random(shape) + 0.5).astype(np.float32)
+            incoming = (rng.random(shape) - 0.5).astype(np.float32)
+            for reduction in (0, 1, 2):
+                for name, affine in (("none", None), ("weight", weight)):
+                    with self.subTest(shape=shape, reduction=reduction,
+                                      affine=name):
+                        got = F.binary_cross_entropy_backward(
+                            self._device(incoming), self._device(payload),
+                            self._device(labels),
+                            weight=None if affine is None
+                            else self._device(affine),
+                            reduction=reduction).cpu().numpy()
+                        truth = self._likelihood_gradient(
+                            payload, labels, affine) * incoming.astype(np.float64)
+                        if reduction == 1:
+                            truth = truth / payload.size
+                        np.testing.assert_allclose(
+                            got, truth, rtol=2e-2, atol=2e-2,
+                            err_msg=f"reduction {reduction} of {shape}")
+                        host = F.binary_cross_entropy_backward(
+                            self._host(incoming), self._host(payload),
+                            self._host(labels),
+                            weight=None if affine is None
+                            else self._host(affine),
+                            reduction=reduction).numpy()
+                        np.testing.assert_allclose(got, host, rtol=2e-2,
+                                                   atol=2e-2)
+
+    def test_a_logit_answers_without_becoming_a_probability(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(233)
+        for shape in ((5,), (2, 6), (3, 4, 2)):
+            logits = (rng.standard_normal(shape) * 3).astype(np.float32)
+            labels = (rng.random(shape) > 0.5).astype(np.float32)
+            weight = (rng.random(shape) + 0.5).astype(np.float32)
+            pos_weight = (rng.random(shape) * 4 + 0.25).astype(np.float32)
+            for name, affine, positive in (
+                    ("plain", None, None),
+                    ("weight", weight, None),
+                    ("pos_weight", None, pos_weight),
+                    ("both", weight, pos_weight)):
+                with self.subTest(shape=shape, affine=name):
+                    got = F.binary_cross_entropy_with_logits(
+                        self._device(logits), self._device(labels),
+                        weight=None if affine is None else self._device(affine),
+                        pos_weight=None if positive is None
+                        else self._device(positive)).cpu().numpy()
+                    truth = self._logit_likelihood(
+                        logits, labels, affine, positive).mean()
+                    np.testing.assert_allclose(got, truth, rtol=2e-3, atol=2e-3)
+                    host = F.binary_cross_entropy_with_logits(
+                        self._host(logits), self._host(labels),
+                        weight=None if affine is None
+                        else self._host(affine),
+                        pos_weight=None if positive is None
+                        else self._host(positive)).numpy()
+                    np.testing.assert_allclose(got, host, rtol=2e-3, atol=2e-3)
+
+    def test_a_saturated_logit_stays_finite(self):
+        import tensorplay.functional as F
+        logits = np.array([-60.0, -30.0, -10.0, 0.0, 10.0, 30.0, 60.0],
+                          np.float32)
+        for label in (0.0, 1.0):
+            labels = np.full(logits.shape, label, np.float32)
+            with self.subTest(label=label):
+                got = F.binary_cross_entropy_with_logits(
+                    self._device(logits), self._device(labels)).cpu().numpy()
+                self.assertTrue(np.isfinite(got).all(),
+                                "a saturated logit lost its headroom")
+                np.testing.assert_allclose(
+                    got, self._logit_likelihood(logits, labels).mean(),
+                    rtol=1e-3, atol=1e-3)
+
+    def test_a_lane_on_a_bound_answers_the_clamp(self):
+        import tensorplay.functional as F
+        payload = np.array([0.0, 1.0, 0.5], np.float32)
+        labels = np.array([1.0, 0.0, 0.5], np.float32)
+        with self.subTest(kind="the loss of a bound lane"):
+            got = F.binary_cross_entropy(self._device(payload),
+                                         self._device(labels),
+                                         reduction=0).cpu().numpy()
+            np.testing.assert_allclose(got, [100.0, 100.0, 0.6931472],
+                                       rtol=1e-3, atol=1e-3)
+        with self.subTest(kind="the gradient of a bound lane"):
+            gradient = F.binary_cross_entropy_backward(
+                self._device(np.ones(3, np.float32)), self._device(payload),
+                self._device(labels), reduction=0).cpu().numpy()
+            self.assertTrue(np.isfinite(gradient).all(),
+                            "a bound lane divided by nothing")
+
+    def test_a_narrow_plane_graduates_in_its_own_width(self):
+        import tensorplay.functional as F
+        rng = np.random.default_rng(239)
+        payload = (rng.random((2, 5)) * 0.9 + 0.05).astype(np.float16)
+        labels = (rng.random((2, 5)) > 0.5).astype(np.float16)
+        weight = (rng.random((2, 5)) + 0.5).astype(np.float16)
+        incoming = (rng.random((2, 5)) - 0.5).astype(np.float16)
+        for reduction in (0, 1, 2):
+            with self.subTest(reduction=reduction, kind="the loss"):
+                got = F.binary_cross_entropy(
+                    self._device(payload), self._device(labels),
+                    weight=self._device(weight),
+                    reduction=reduction)
+                host = F.binary_cross_entropy(
+                    self._host(payload), self._host(labels),
+                    weight=self._host(weight), reduction=reduction)
+                self.assertEqual(got.dtype, host.dtype)
+                np.testing.assert_allclose(
+                    got.cpu().numpy().astype(np.float32),
+                    host.numpy().astype(np.float32), rtol=4e-3, atol=4e-3)
+        with self.subTest(kind="the gradient"):
+            got = F.binary_cross_entropy_backward(
+                self._device(incoming), self._device(payload),
+                self._device(labels), weight=self._device(weight),
+                reduction=1)
+            host = F.binary_cross_entropy_backward(
+                self._host(incoming), self._host(payload), self._host(labels),
+                weight=self._host(weight), reduction=1)
+            self.assertEqual(got.dtype, host.dtype)
+            np.testing.assert_allclose(
+                got.cpu().numpy().astype(np.float32),
+                host.numpy().astype(np.float32), rtol=4e-3, atol=4e-3)
+        with self.subTest(kind="a logit average kept wide"):
+            average = F.binary_cross_entropy_with_logits(
+                self._device(payload), self._device(labels))
+            self.assertEqual(average.dtype, tensorplay.float32)
+
+    def test_a_lane_outside_the_bounds_refuses(self):
+        import tensorplay.functional as F
+        labels = np.array([0.0, 1.0, 1.0], np.float32)
+        for name, payload, pattern in (
+                ("above one", np.array([0.2, 0.5, 1.5], np.float32),
+                 "all elements of input"),
+                ("below zero", np.array([0.2, -0.1, 0.7], np.float32),
+                 "all elements of input"),
+                ("not a measurement", np.array([0.2, np.nan, 0.7], np.float32),
+                 "all elements of input")):
+            with self.subTest(kind=name):
+                with self.assertRaisesRegex(
+                        RuntimeError, "should be between 0 and 1"):
+                    F.binary_cross_entropy(self._device(payload),
+                                           self._device(labels))
+        with self.subTest(kind="a label outside the bounds"):
+            with self.assertRaisesRegex(
+                    RuntimeError, "all elements of target"):
+                F.binary_cross_entropy(
+                    self._device(np.array([0.2, 0.5, 0.7], np.float32)),
+                    self._device(np.array([0.0, 2.0, 1.0], np.float32)))
+        with self.subTest(kind="a count"):
+            with self.assertRaisesRegex(RuntimeError, "Float32 and Float16"):
+                F.binary_cross_entropy(
+                    self._device(np.array([0, 1, 1], np.int32)),
+                    self._device(np.array([0, 1, 1], np.int32)))
+        with self.subTest(kind="an unknown reduction"):
+            with self.assertRaisesRegex(RuntimeError, "invalid reduction mode"):
+                F.binary_cross_entropy(
+                    self._device(np.array([0.2], np.float32)),
+                    self._device(np.array([0.0], np.float32)), reduction=5)
+
+
 if __name__ == "__main__":
     unittest.main()
