@@ -67,6 +67,58 @@ std::vector<int64_t> kept_reduction_sizes(
   return sizes;
 }
 
+// A span with no lane has no number to fold, so the fold answers the value its
+// accumulator would have started from and releases it across the shape the walk
+// keeps -- nothing is read and no walk runs.  Where the kept shape itself has no
+// lane, the same call releases an empty payload.
+Tensor laneless_fold_answer(
+    const Tensor& self,
+    const std::vector<int64_t>& dims,
+    bool keepdim,
+    const Scalar& identity,
+    DType answer_dtype) {
+  return full_kernel(
+      kept_reduction_sizes(self, dims, keepdim),
+      identity,
+      answer_dtype,
+      self.device(),
+      false);
+}
+
+// An extremum and an index name a lane of the span they fold, and a span with no
+// lane has none to name, so the fold is refused the way the shape refuses it.
+void require_lanes_to_name(
+    const Tensor& self,
+    const std::vector<int64_t>& dims) {
+  for (const int64_t axis : dims) {
+    if (self.size(axis) == 0) {
+      TP_THROW(
+          IndexError,
+          "Expected reduction dim ", axis, " to have non-zero size.");
+    }
+  }
+}
+
+// The width a product answers in: the one the caller asked for, or the one the
+// walk carries its running total in.  A payload with no product walk refuses the
+// fold here too, so an empty span answers no wider than a full one would.
+DType product_answer_dtype(DType source, DType asked) {
+  if (asked != DType::Undefined) {
+    TP_CHECK(
+        asked == DType::Float32 || asked == DType::Float16 ||
+            asked == DType::Int32 || asked == DType::Int64,
+        "Unsupported Vulkan product dtype");
+    return asked;
+  }
+  if (source == DType::Int32 || source == DType::Int64) {
+    return DType::Int64;
+  }
+  TP_CHECK(
+      source == DType::Float32 || source == DType::Float16,
+      "Vulkan products fold Float32, Float16 and counted tensors only");
+  return source;
+}
+
 //
 // A reduced payload inherits linear storage from its source, but storage is
 // otherwise a function of the shape alone: consumers pick their route by
@@ -342,9 +394,20 @@ Tensor reduce_impl(
       self.dim() >= 1 && self.dim() <= 4,
       "Vulkan reductions support 1d to 4d tensors");
   TP_CHECK(!dims_in.empty(), "Vulkan reductions require at least one dim");
-  TP_CHECK(self.numel() > 0, "Vulkan reductions do not support empty tensors");
 
   const std::vector<int64_t> dims = normalized_dims(self, dims_in);
+
+  if (self.numel() == 0) {
+    // A total of nothing is the value a running sum starts at; an average of
+    // nothing divides nothing by nothing, which is not a number.
+    return laneless_fold_answer(
+        self,
+        dims,
+        keepdim,
+        mean_mode ? Scalar(std::numeric_limits<double>::quiet_NaN())
+                  : Scalar(0.0),
+        self.dtype());
+  }
 
   Tensor current = self;
   for (const int64_t axis : dims) {
@@ -576,7 +639,6 @@ Tensor extremum_impl(
   TP_CHECK(
       self.dim() >= 1 && self.dim() <= 4,
       "Vulkan reductions support 1d to 4d tensors");
-  TP_CHECK(self.numel() > 0, "Vulkan reductions do not support empty tensors");
 
   std::vector<int64_t> dims = dims_in;
   if (dims.empty()) {
@@ -587,6 +649,28 @@ Tensor extremum_impl(
   }
   dims = normalized_dims(self, dims);
   TP_CHECK(!dims.empty(), "Vulkan reductions require at least one dim");
+
+  if (self.numel() == 0) {
+    // A product of nothing is the value a running product starts at.  An
+    // extremum names a lane instead, so a span with no lane has nothing for it
+    // to name and the fold is refused; where the emptiness sits in an axis the
+    // walk keeps, the answer has no lane either and releases empty.
+    if (kind != ExtremumKind::kProd) {
+      if (dims_in.empty()) {
+        TP_THROW(
+            RuntimeError,
+            "Expected reduction dim to be specified for input.numel() == 0. ",
+            "Specify the reduction dim with the 'dim' argument.");
+      }
+      require_lanes_to_name(self, dims);
+    }
+    return laneless_fold_answer(
+        self,
+        dims,
+        keepdim,
+        kind == ExtremumKind::kProd ? Scalar(1.0) : Scalar(0.0),
+        self.dtype());
+  }
 
   Tensor current = self;
   for (const int64_t axis : dims) {
@@ -911,7 +995,24 @@ Tensor arg_impl(
   TP_CHECK(
       self.dim() >= 1 && self.dim() <= 4,
       "Vulkan index reductions support 1d to 4d tensors");
-  TP_CHECK(self.numel() > 0, "Vulkan index reductions do not support empty tensors");
+
+  if (self.numel() == 0) {
+    // An index names a lane of the span it walks, and a span with no lane has
+    // none to name.  A whole-payload index has no axis named either, so it is
+    // refused before the walk; a named axis of its own answers the positions the
+    // walk keeps, which is a payload with no lanes in it.
+    if (!dim.has_value()) {
+      TP_THROW(
+          IndexError,
+          "Expected reduction dim to be specified for input.numel() == 0.");
+    }
+    const int64_t axis =
+        dim.value() < 0 ? dim.value() + self.dim() : dim.value();
+    TP_CHECK(
+        axis >= 0 && axis < self.dim(), "Vulkan index reduction: dim out of range");
+    require_lanes_to_name(self, {axis});
+    return laneless_fold_answer(self, {axis}, keepdim, Scalar(0), DType::Int64);
+  }
 
   if (!dim.has_value()) {
     Tensor flat = reshape_kernel(self, {static_cast<int64_t>(self.numel())});
@@ -1150,8 +1251,6 @@ Tensor integral_total(
   }
   dims = normalized_dims(self, dims);
   TP_CHECK(!dims.empty(), "Vulkan reductions require at least one dim");
-  TP_CHECK(
-      self.numel() > 0, "Vulkan reductions do not support empty tensors");
 
   const bool wide = wanted == DType::Undefined || wanted == DType::Int64;
   TP_CHECK(
@@ -1159,6 +1258,14 @@ Tensor integral_total(
           wanted == DType::Int32,
       "Vulkan sums of a counted payload answer in Int64, Float32, Float16 "
       "or Int32");
+
+  if (self.numel() == 0) {
+    // Nothing adds to nothing, and the width the total was asked to carry still
+    // names the answer.
+    return laneless_fold_answer(
+        self, dims, keepdim, Scalar(0.0),
+        wanted == DType::Undefined ? DType::Int64 : wanted);
+  }
 
   // A payload with no texel to read and no single-precision reach folds in the
   // pairs it is carried in, and the answer then moves to the width asked for.
@@ -1362,6 +1469,17 @@ std::tuple<Tensor, Tensor> aminmax_kernel(
 }
 
 Tensor prod_kernel(const Tensor& self, DType dtype) {
+  if (self.numel() == 0) {
+    // A product of nothing is the value a running product starts at, in the
+    // width the walk would have answered in.
+    std::vector<int64_t> axes;
+    for (int64_t axis = 0; axis < self.dim(); ++axis) {
+      axes.push_back(axis);
+    }
+    return laneless_fold_answer(
+        self, axes, false, Scalar(1),
+        product_answer_dtype(self.dtype(), dtype));
+  }
   if (self.dtype() == DType::Int64) {
     // A count wider than a word multiplies in the pairs it is carried in; the
     // answer then moves to the width the caller asked the product to carry.
@@ -1394,6 +1512,23 @@ Tensor prod_dim_kernel(
     const std::vector<int64_t>& dims,
     bool keepdim,
     DType dtype) {
+  if (self.numel() == 0) {
+    // The identity a running product starts at, released across the shape the
+    // walk keeps; no lane of an empty span is folded.  A span with no axis
+    // named folds every one, as the walks below do.
+    std::vector<int64_t> axes = dims;
+    if (axes.empty()) {
+      for (int64_t axis = 0; axis < self.dim(); ++axis) {
+        axes.push_back(axis);
+      }
+    }
+    return laneless_fold_answer(
+        self,
+        normalized_dims(self, axes),
+        keepdim,
+        Scalar(1),
+        product_answer_dtype(self.dtype(), dtype));
+  }
   if (self.dtype() == DType::Int64) {
     if (dtype == DType::Undefined || dtype == DType::Int64) {
       return wide_total_impl(self, dims, keepdim, TotalKind::kProd);
@@ -1738,12 +1873,22 @@ Tensor var_kernel(const Tensor& self, int64_t correction) {
       self.dtype() == DType::Float32 || self.dtype() == DType::Float16,
       "Vulkan var supports Float32 and Float16 tensors only");
   TP_CHECK(self.dim() >= 1 && self.dim() <= 4, "Vulkan var: 1d to 4d only");
-  TP_CHECK(self.numel() > 0, "Vulkan var does not support empty tensors");
 
   std::vector<int64_t> dims;
   dims.reserve(static_cast<size_t>(self.dim()));
   for (int64_t d = 0; d < self.dim(); ++d) {
     dims.push_back(d);
+  }
+
+  if (self.numel() == 0) {
+    // The spread of nothing divides a deviation sum of nothing by nothing, so
+    // the one answer the whole payload folds to is not a number.
+    return laneless_fold_answer(
+        self,
+        dims,
+        false,
+        Scalar(std::numeric_limits<double>::quiet_NaN()),
+        self.dtype());
   }
 
   if (auto fused = var_half_single_axis(self, dims, false, correction)) {
@@ -1883,9 +2028,20 @@ Tensor var_dim_kernel(
       self.dim() >= 1 && self.dim() <= 4,
       "Vulkan var supports 1d to 4d tensors");
   TP_CHECK(!dim.empty(), "Vulkan var requires at least one dim");
-  TP_CHECK(self.numel() > 0, "Vulkan var does not support empty tensors");
 
   const std::vector<int64_t> dims = normalized_dims(self, dim);
+
+  if (self.numel() == 0) {
+    // A spread of nothing divides the deviation sum of nothing by nothing, so it
+    // is not a number; the standard deviation takes its square root, which is
+    // not a number either.
+    return laneless_fold_answer(
+        self,
+        dims,
+        keepdim,
+        Scalar(std::numeric_limits<double>::quiet_NaN()),
+        self.dtype());
+  }
 
   // Element count along the reduced span: the product of the reduced axes'
   // lengths; the divisor of the two-pass variance.
