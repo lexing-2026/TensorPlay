@@ -27,21 +27,22 @@ inline bool topk_is_nan(T value) {
   }
 }
 
-template <typename T, bool HasNaN>
+template <typename T, bool HasNaN, bool Largest>
 struct TopKCompare {
-  bool largest;
-
   bool operator()(const std::pair<T, int64_t>& lhs,
                   const std::pair<T, int64_t>& rhs) const {
     if constexpr (HasNaN) {
       const bool lhs_nan = topk_is_nan(lhs.first);
       const bool rhs_nan = topk_is_nan(rhs.first);
-      if (largest) {
+      if constexpr (Largest) {
         return (lhs_nan && !rhs_nan) || (lhs.first > rhs.first);
       }
       return (!lhs_nan && rhs_nan) || (lhs.first < rhs.first);
     }
-    return largest ? (lhs.first > rhs.first) : (lhs.first < rhs.first);
+    if constexpr (Largest) {
+      return lhs.first > rhs.first;
+    }
+    return lhs.first < rhs.first;
   }
 };
 
@@ -56,6 +57,20 @@ inline void select_topk(std::vector<std::pair<T, int64_t>>& queue,
     if (sorted) {
       std::sort(queue.begin(), queue.begin() + k, compare);
     }
+  }
+}
+
+template <typename T, bool HasNaN>
+inline void select_topk_dir(std::vector<std::pair<T, int64_t>>& queue,
+                            int64_t k, bool sorted, bool largest) {
+  // Which end is the top is known before the queue is partitioned, so it picks
+  // a comparator rather than being asked of one: a selection runs the ordering
+  // hundreds of times per element, and a question asked that often is worth
+  // compiling away.
+  if (largest) {
+    select_topk(queue, k, sorted, TopKCompare<T, HasNaN, true>{});
+  } else {
+    select_topk(queue, k, sorted, TopKCompare<T, HasNaN, false>{});
   }
 }
 
@@ -87,9 +102,9 @@ void topk_kernel_cpu_impl(const Tensor& input, Tensor& values, Tensor& indices,
         has_nan |= topk_is_nan(value);
       }
       if (has_nan) {
-        select_topk(queue, k, sorted, TopKCompare<accscalar_t, true>{largest});
+        select_topk_dir<accscalar_t, true>(queue, k, sorted, largest);
       } else {
-        select_topk(queue, k, sorted, TopKCompare<accscalar_t, false>{largest});
+        select_topk_dir<accscalar_t, false>(queue, k, sorted, largest);
       }
       for (int64_t column = 0; column < k; ++column) {
         value_data[output_base + column * inner] =
