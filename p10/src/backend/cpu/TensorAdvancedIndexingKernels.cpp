@@ -11,8 +11,11 @@
 #include "AdvancedIndex.h"
 #include "Context.h"
 #include "IndexKernelUtils.h"
+#include "Parallel.h"
 
+#include <array>
 #include <atomic>
+#include <cstring>
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
 #endif
@@ -81,6 +84,94 @@ Tensor take_along_dim_composite(const Tensor& self, const Tensor& indices, std::
 Tensor index_cpu(const Tensor& self,
                  const std::vector<std::optional<Tensor>>& indices) {
     if (isQuantizedType(self.dtype())) { quantized::q_scale(self); return quantized::with_quantizer(index_cpu(quantized::storage_view(self), indices), self); }
+
+    // When every dimension carries a 1-D integer index of the same length the
+    // result is one gathered element per row: offsets are the row's index
+    // values dotted with the source strides, so broadcast preparation and the
+    // iterator are both unnecessary.
+    {
+        const int64_t nd = self.dim();
+        if (nd > 0 && static_cast<int64_t>(indices.size()) == nd &&
+            self.is_contiguous()) {
+            int64_t len = -1;
+            bool usable = true;
+            for (const auto& maybe : indices) {
+                if (!maybe.has_value() || !maybe->defined()) { usable = false; break; }
+                const Tensor& index = *maybe;
+                if (index.dim() != 1 || !index.is_contiguous() ||
+                    (index.dtype() != DType::Int64 &&
+                     index.dtype() != DType::Int32)) {
+                    usable = false;
+                    break;
+                }
+                if (len < 0) len = index.size(0);
+                else if (index.size(0) != len) { usable = false; break; }
+            }
+            if (usable && len > 0) {
+                std::vector<int64_t> src_strides(static_cast<size_t>(nd));
+                std::vector<const void*> index_data(static_cast<size_t>(nd));
+                std::vector<bool> index_i64(static_cast<size_t>(nd));
+                for (int64_t d = 0; d < nd; ++d) {
+                    src_strides[d] = self.stride(d);
+                    index_data[d] = indices[d]->data_ptr();
+                    index_i64[d] = indices[d]->dtype() == DType::Int64;
+                }
+                Tensor out = Tensor::empty({len}, self.dtype(), self.device());
+                const char* src = static_cast<const char*>(self.data_ptr());
+                char* dst = static_cast<char*>(out.data_ptr());
+                const size_t cell = self.itemsize();
+                auto gather_rows = [&](int64_t begin, int64_t end) {
+                    for (int64_t i = begin; i < end; ++i) {
+                        int64_t offset = 0;
+                        for (int64_t d = 0; d < nd; ++d) {
+                            const int64_t value = index_i64[d]
+                                ? static_cast<const int64_t*>(index_data[d])[i]
+                                : static_cast<const int32_t*>(index_data[d])[i];
+                            offset += value * src_strides[d];
+                        }
+                        std::memcpy(dst + i * cell, src + offset * cell, cell);
+                    }
+                };
+                auto gather_typed = [&]<typename cell_t>() {
+                    cell_t* typed_dst = reinterpret_cast<cell_t*>(dst);
+                    const cell_t* typed_src = reinterpret_cast<const cell_t*>(src);
+                    auto rows = [&](int64_t begin, int64_t end) {
+                        for (int64_t i = begin; i < end; ++i) {
+                            int64_t offset = 0;
+                            for (int64_t d = 0; d < nd; ++d) {
+                                const int64_t value = index_i64[d]
+                                    ? static_cast<const int64_t*>(index_data[d])[i]
+                                    : static_cast<const int32_t*>(index_data[d])[i];
+                                offset += value * src_strides[d];
+                            }
+                            typed_dst[i] = typed_src[offset];
+                        }
+                    };
+                    if (len > parallel::GRAIN_SIZE) {
+                        parallel::parallel_for(0, len, parallel::GRAIN_SIZE, rows);
+                    } else {
+                        rows(0, len);
+                    }
+                };
+                switch (cell) {
+                    case 1: gather_typed.operator()<uint8_t>(); break;
+                    case 2: gather_typed.operator()<uint16_t>(); break;
+                    case 4: gather_typed.operator()<uint32_t>(); break;
+                    case 8: gather_typed.operator()<uint64_t>(); break;
+                    case 16: gather_typed.operator()<std::array<uint64_t, 2>>(); break;
+                    default:
+                        if (len > parallel::GRAIN_SIZE) {
+                            parallel::parallel_for(0, len, parallel::GRAIN_SIZE,
+                                                   gather_rows);
+                        } else {
+                            gather_rows(0, len);
+                        }
+                        break;
+                }
+                return out;
+            }
+        }
+    }
 
     indexing::native::AdvancedIndex info(self, indices);
     Tensor output;
