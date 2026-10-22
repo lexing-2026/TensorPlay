@@ -6,8 +6,6 @@ the friendly error raised by TCAV when sklearn is absent (this environment has
 no sklearn).
 """
 
-import os
-
 import pytest
 
 import tensorplay as tensorplay
@@ -48,13 +46,12 @@ def test_concepts_to_str() -> None:
     assert concepts_to_str(concepts) == "0-1"
 
 
-def test_cav_construction() -> None:
+def test_cav_construction(tmp_path) -> None:
     concepts = _make_concepts()
-    cav = CAV(concepts, layer="linear", save_path="/tmp/lumen_cav_test")
+    cav = CAV(concepts, layer="linear", save_path=str(tmp_path))
     assert cav.layer == "linear"
     assert cav.model_id == "default_model_id"
     assert len(cav.concepts) == 2
-    os.makedirs("/tmp/lumen_cav_test", exist_ok=True)
 
 
 def test_concept_interpreter_base() -> None:
@@ -71,9 +68,9 @@ def test_dataset_to_dataloader() -> None:
     assert batches[0][0].shape == (2, 3)
 
 
-def test_tcav_construct() -> None:
+def test_tcav_construct(tmp_path) -> None:
     model = TinyModel()
-    tcav = TCAV(model, layers=["linear"], save_path="/tmp/lumen_cav_test")
+    tcav = TCAV(model, layers=["linear"], save_path=str(tmp_path))
     assert tcav.model is model
     assert tcav.layers == ["linear"]
 
@@ -90,9 +87,9 @@ def _sklearn_available() -> bool:
 @pytest.mark.skipif(
     _sklearn_available(), reason="sklearn installed; friendly error not exercised"
 )
-def test_tcav_sklearn_missing_error() -> None:
+def test_tcav_sklearn_missing_error(tmp_path) -> None:
     model = TinyModel()
-    tcav = TCAV(model, layers=["linear"])
+    tcav = TCAV(model, layers=["linear"], save_path=str(tmp_path))
     ds = TensorDataset(tensorplay.randn(8, 4))
     dl = dataset_to_dataloader(ds, batch_size=4)
     striped = Concept(0, "striped", dl)
