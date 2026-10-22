@@ -5,6 +5,7 @@
 #include "Convert.h"
 #include "Factory.h"
 #include "SizesAndStrides.h"
+#include "TypePromotion.h"
 #include "Utils.h"
 #include "../../../../include/Utils.h"
 
@@ -1889,6 +1890,152 @@ std::tuple<Tensor, Tensor> std_mean_kernel(
   return var_mean_pair(self, dim, unbiased ? 1 : 0, keepdim, true);
 }
 
+//
+// Vector p-norm over a listed span.  The order picks the fold: a zero order
+// counts nonzero lanes, the two extrema fold the absolute payload, and every
+// other order sums |x|^p before applying the p-th root.  The walk runs in
+// single precision so a half payload neither overflows a long accumulation
+// nor rounds each term before the fold; only the answer narrows back.
+//
+namespace {
+
+// A root taken by the scalar-exponent walk needs a payload of at least one
+// lane, so a folded scalar borrows a unit axis for the pass and drops it
+// again.
+Tensor scalar_root(const Tensor& value, double exponent) {
+  if (value.dim() != 0) {
+    return value.pow(Scalar(exponent));
+  }
+  const Tensor widened = reshape_kernel(value, {1});
+  return reshape_kernel(widened.pow(Scalar(exponent)), {});
+}
+
+} // namespace
+
+Tensor linalg_vector_norm_kernel(
+    const Tensor& self,
+    const Scalar& ord,
+    const std::optional<std::vector<int64_t>>& dim_in,
+    bool keepdim,
+    std::optional<DType> dtype) {
+  if (ord.isComplex()) {
+    TP_THROW(TypeError, "linalg norm order must be real");
+  }
+  if (!isFloatingOrComplexType(self.dtype())) {
+    TP_THROW(TypeError, "linalg norm expects a floating or complex input");
+  }
+  DType result_dtype = toRealValueType(self.dtype());
+  if (dtype.has_value()) {
+    if (!isFloatingOrComplexType(*dtype)) {
+      TP_THROW(TypeError, "linalg norm dtype must be floating or complex");
+    }
+    if (isComplexType(self.dtype()) != isComplexType(*dtype)) {
+      TP_THROW(
+          TypeError, "linalg norm dtype must preserve the input value kind");
+    }
+    if (promoteTypes(self.dtype(), *dtype) != *dtype) {
+      TP_THROW(TypeError, "linalg norm dtype must not narrow the input");
+    }
+    result_dtype = toRealValueType(*dtype);
+  }
+  TP_CHECK(
+      (self.dtype() == DType::Float32 || self.dtype() == DType::Float16) &&
+          (result_dtype == DType::Float32 ||
+           result_dtype == DType::Float16),
+      "Vulkan linalg_vector_norm supports Float32 and Float16 payloads only");
+
+  const double p = ord.toDouble();
+  const Tensor working =
+      self.dtype() == DType::Float32 ? self : self.to(DType::Float32);
+
+  // Every axis is reduced when the list is absent or empty; otherwise the
+  // listed axes wrap, must be in range and must name distinct axes.
+  const bool whole_walk = !dim_in.has_value() || dim_in->empty();
+  std::vector<int64_t> dims;
+  if (!whole_walk) {
+    std::vector<bool> seen(static_cast<size_t>(working.dim()), false);
+    dims.reserve(dim_in->size());
+    for (const int64_t d : *dim_in) {
+      const int64_t axis = d < 0 ? d + working.dim() : d;
+      if (axis < 0 || axis >= working.dim()) {
+        TP_THROW(IndexError, "linalg norm dimension is out of range");
+      }
+      if (seen[static_cast<size_t>(axis)]) {
+        TP_THROW(ValueError, "linalg norm dimensions must be unique");
+      }
+      seen[static_cast<size_t>(axis)] = true;
+      dims.push_back(axis);
+    }
+  } else {
+    dims.reserve(static_cast<size_t>(working.dim()));
+    for (int64_t axis = 0; axis < working.dim(); ++axis) {
+      dims.push_back(axis);
+    }
+  }
+
+  Tensor result;
+  if (working.dim() == 0) {
+    // No axis to fold: the answer is the magnitude itself, or whether the
+    // lone lane is nonzero for a zero order.
+    result = p == 0.0
+        ? working.ne(Scalar(0.0)).to(DType::Float32)
+        : working.abs();
+  } else {
+    TP_CHECK(
+        working.dim() <= 4,
+        "Vulkan linalg_vector_norm supports tensors up to 4d");
+    if (working.numel() == 0) {
+      // An empty span answers with the identity of its fold: zero for a sum
+      // and for a largest magnitude, infinity for a smallest one.  A walk
+      // over named axes then still takes its root, so a negative order turns
+      // the zero identity into infinity; a whole payload that sheds every axis
+      // reports the identity of the fold without that root.  An output that is
+      // itself empty keeps no values.
+      const std::vector<int64_t> out_sizes =
+          kept_reduction_sizes(working, dims, keepdim);
+      bool empty_output = false;
+      for (const int64_t size : out_sizes) {
+        empty_output = empty_output || size == 0;
+      }
+      const double infinity_value = std::numeric_limits<double>::infinity();
+      const bool axis_walk = !whole_walk || keepdim;
+      const bool identity_is_inf = !empty_output &&
+          (axis_walk ? p < 0.0 : p == -infinity_value);
+      result = full_kernel(
+          out_sizes, identity_is_inf ? infinity_value : 0.0, DType::Float32,
+          self.device(), false);
+    } else if (p == 0.0) {
+      // A lane that is not a number is not zero and so counts.
+      result = reduce_impl(
+          working.ne(Scalar(0.0)).to(DType::Float32), dims, keepdim,
+          /*mean_mode=*/false, /*var_mode=*/false, 0);
+    } else if (p == 1.0) {
+      result = reduce_impl(
+          working.abs(), dims, keepdim, /*mean_mode=*/false,
+          /*var_mode=*/false, 0);
+    } else if (p == 2.0) {
+      result = reduce_impl(
+                   working.mul(working), dims, keepdim, /*mean_mode=*/false,
+                   /*var_mode=*/false, 0)
+                   .sqrt();
+    } else if (std::isinf(p)) {
+      result = extremum_impl(
+          working.abs(), dims, keepdim,
+          p > 0 ? ExtremumKind::kMax : ExtremumKind::kMin);
+    } else {
+      const Tensor summed = reduce_impl(
+          working.abs().pow(Scalar(p)), dims, keepdim,
+          /*mean_mode=*/false, /*var_mode=*/false, 0);
+      result = scalar_root(summed, 1.0 / p);
+    }
+  }
+
+  if (result.dtype() != result_dtype) {
+    result = result.to(result_dtype);
+  }
+  return result;
+}
+
 } // namespace ops
 } // namespace vulkan
 } // namespace tensorplay
@@ -1927,6 +2074,9 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, ReductionKernels) {
   m.impl("std_mean", &tensorplay::vulkan::ops::std_mean_kernel);
   m.impl("norm", &tensorplay::vulkan::ops::norm_kernel);
   m.impl("norm.dim", &tensorplay::vulkan::ops::norm_dim_kernel);
+  m.impl(
+      "linalg_vector_norm",
+      &tensorplay::vulkan::ops::linalg_vector_norm_kernel);
 }
 
 #endif /* USE_VULKAN */
