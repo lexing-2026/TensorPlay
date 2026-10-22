@@ -23,6 +23,11 @@ namespace {
 Tensor& fill_impl(Tensor& self, Scalar value) {
   TP_CHECK(
       self.dim() <= 4, "Vulkan fill_ supports up to 4d tensors");
+  // A payload with no lanes has no lane to carry a value, and the byte stream
+  // that fills one would ask for a buffer of no bytes.
+  if (self.numel() == 0) {
+    return self;
+  }
 
   api::Context* const context = api::context();
 

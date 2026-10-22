@@ -49,6 +49,24 @@ std::vector<int64_t> shape_vector(const Tensor& t) {
   return std::vector<int64_t>(shape.begin(), shape.end());
 }
 
+// The shape left after dropping (or collapsing to one) the reduced axes.
+std::vector<int64_t> kept_reduction_sizes(
+    const Tensor& self,
+    const std::vector<int64_t>& dims,
+    bool keepdim) {
+  std::vector<int64_t> sizes;
+  sizes.reserve(static_cast<size_t>(self.dim()));
+  for (int64_t axis = 0; axis < self.dim(); ++axis) {
+    const bool reduced = std::find(dims.begin(), dims.end(), axis) != dims.end();
+    if (!reduced) {
+      sizes.push_back(self.size(axis));
+    } else if (keepdim) {
+      sizes.push_back(1);
+    }
+  }
+  return sizes;
+}
+
 //
 // A reduced payload inherits linear storage from its source, but storage is
 // otherwise a function of the shape alone: consumers pick their route by
@@ -973,7 +991,6 @@ Tensor bool_reduce_impl(
   TP_CHECK(
       self.dim() >= 1 && self.dim() <= 4,
       "Vulkan boolean reductions support 1d to 4d tensors");
-  TP_CHECK(self.numel() > 0, "Vulkan boolean reductions do not support empty tensors");
 
   std::vector<int64_t> dims = dims_in;
   if (dims.empty()) {
@@ -984,6 +1001,33 @@ Tensor bool_reduce_impl(
   }
   dims = normalized_dims(self, dims);
   TP_CHECK(!dims.empty(), "Vulkan boolean reductions require at least one dim");
+
+  if (self.numel() == 0) {
+    // A span with no lane asks for nothing: every lane of it stands and no lane
+    // of it stands, so each fold answers the value its own name carries over the
+    // shape the walk would have kept.
+    return full_kernel(
+        kept_reduction_sizes(self, dims, keepdim),
+        kind == BoolReduceKind::kAll ? Scalar(1) : Scalar(0),
+        DType::Bool,
+        self.device(),
+        false);
+  }
+
+  // Truth lanes hold 0 or 1, so both folds read the ends of the order those
+  // lanes keep: every lane standing is the least standing lane, any lane
+  // standing is the greatest.  The walk that compares lanes as they are carried
+  // needs a texel to read, so a payload held in linear storage takes those ends
+  // through the fold that walks a row and answers by whether the end stands.
+  if (convert(self).storage_type() == api::StorageType::BUFFER) {
+    const Tensor end = extremum_impl(
+        self.to(DType::Float32),
+        dims,
+        keepdim,
+        kind == BoolReduceKind::kAll ? ExtremumKind::kMin
+                                     : ExtremumKind::kMax);
+    return end.ne(Scalar(0.0));
+  }
 
   Tensor current = self;
   for (const int64_t axis : dims) {
@@ -1088,9 +1132,9 @@ bool totals_as_a_count(DType dtype) {
 // since a lane past the exact reach of single precision must not be rounded on
 // the way in; every narrower code (a truth lane, a byte) is exact in single
 // precision, so it steps through that width to reach the walk.  A payload with
-// no texture form has no such walk: it sums through the single-precision row
-// walk, exact while the running total stays inside the reach of a float, and
-// the total then crosses to the wide word by way of the signed one.
+// no texture form crosses to the wide word before the walk and folds in the
+// pairs it is carried in, so neither a lane past the reach of a float nor a
+// running total past it loses anything on the way to the answer.
 //
 Tensor integral_total(
     const Tensor& self,
@@ -1125,42 +1169,78 @@ Tensor integral_total(
         : total.to(wanted);
   }
 
-  const Tensor singles = self.to(DType::Float32);
-
   if (!wide) {
-    Tensor total = reduce_impl(singles, dims, keepdim, false, false, 0);
+    Tensor total =
+        reduce_impl(self.to(DType::Float32), dims, keepdim, false, false, 0);
     return wanted == DType::Float32 ? total : total.to(wanted);
   }
 
   if (convert(self).storage_type() == api::StorageType::TEXTURE_3D) {
     return self.dtype() == DType::Int32
         ? reduce_int64(self, dims, keepdim, "sum_int64")
-        : reduce_int64(singles, dims, keepdim, "sum_int64_float");
+        : reduce_int64(
+              self.to(DType::Float32), dims, keepdim, "sum_int64_float");
   }
-  return reduce_impl(singles, dims, keepdim, false, false, 0)
-      .to(DType::Int32)
-      .to(DType::Int64);
+  // A signed word crosses to the wide word as itself; every narrower code is
+  // exact in single precision, so it steps through that width on the way.
+  return wide_total_impl(
+      self.dtype() == DType::Int32
+          ? self.to(DType::Int64)
+          : self.to(DType::Float32).to(DType::Int64),
+      dims,
+      keepdim,
+      TotalKind::kSum);
 }
 
-Tensor count_impl(const Tensor& self, const std::vector<int64_t>& dims) {
-  if (self.dtype() == DType::Bool) {
-    // A truth lane holds 0 or 1, so the lanes a count asks for are exactly the
-    // lanes a total adds up.
-    return integral_total(self, dims, false, DType::Int64);
+//
+// The lanes a count asks for are the lanes that do not stand at zero.  A
+// payload read from a texel can be asked for its own number, and the walk that
+// does so carries the answer in wide words; every other payload names the
+// standing lanes with a probe against zero and adds them, which is the total a
+// truth payload already carries for its own lanes.
+//
+Tensor count_impl(const Tensor& self, const std::vector<int64_t>& dims_in) {
+  std::vector<int64_t> dims = dims_in;
+  if (dims.empty()) {
+    dims.reserve(static_cast<size_t>(self.dim()));
+    for (int64_t d = 0; d < self.dim(); ++d) {
+      dims.push_back(d);
+    }
   }
-  TP_CHECK(self.dtype() == DType::Float32 || self.dtype() == DType::Int32,
-           "Vulkan count_nonzero supports Float32 and Int32 tensors only");
-  return reduce_int64(self, dims, false,
-      self.dtype() == DType::Int32 ? "count_int64_i32" : "count_int64_float");
+  dims = normalized_dims(self, dims);
+  TP_CHECK(!dims.empty(), "Vulkan reductions require at least one dim");
+  if (self.numel() == 0) {
+    // A span with no lane holds no lane that stands.
+    return full_kernel(
+        kept_reduction_sizes(self, dims, false),
+        Scalar(0),
+        DType::Int64,
+        self.device(),
+        false);
+  }
+  const bool counted_in_texels =
+      self.dtype() == DType::Float32 || self.dtype() == DType::Int32;
+  if (counted_in_texels &&
+      convert(self).storage_type() == api::StorageType::TEXTURE_3D) {
+    return reduce_int64(
+        self,
+        dims,
+        false,
+        self.dtype() == DType::Int32 ? "count_int64_i32" : "count_int64_float");
+  }
+  return integral_total(
+      self.dtype() == DType::Bool ? self : self.ne(Scalar(0.0)),
+      dims,
+      false,
+      DType::Int64);
 }
 
 Tensor bool_mask_for_reduction(const Tensor& self) {
   if (self.dtype() == DType::Bool) {
     return self;
   }
-  TP_CHECK(
-      self.dtype() == DType::Float32,
-      "Vulkan boolean reductions support Float32 and Bool tensors only");
+  // A lane that is not zero stands, whatever width carries it, so every element
+  // type reaches the truth fold through the same probe.
   return self.ne(Scalar(0.0));
 }
 
@@ -1690,24 +1770,6 @@ Tensor var_kernel(const Tensor& self, int64_t correction) {
 Tensor std_kernel(const Tensor& self, int64_t correction) {
   Tensor v = var_kernel(self, correction);
   return v.sqrt();
-}
-
-// The shape left after dropping (or collapsing to one) the reduced axes.
-std::vector<int64_t> kept_reduction_sizes(
-    const Tensor& self,
-    const std::vector<int64_t>& dims,
-    bool keepdim) {
-  std::vector<int64_t> sizes;
-  sizes.reserve(static_cast<size_t>(self.dim()));
-  for (int64_t axis = 0; axis < self.dim(); ++axis) {
-    const bool reduced = std::find(dims.begin(), dims.end(), axis) != dims.end();
-    if (!reduced) {
-      sizes.push_back(self.size(axis));
-    } else if (keepdim) {
-      sizes.push_back(1);
-    }
-  }
-  return sizes;
 }
 
 // Paired first and second moments over the same span.  The variance
