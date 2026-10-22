@@ -176,5 +176,87 @@ class TestModules(unittest.TestCase):
                     assert_reference_close(x.grad, ref_grad, msg=f"grad {tag}")
 
 
+class TestZeroWidthSwitch(unittest.TestCase):
+    """The switch at a width of nothing.
+
+    The quadratic branch holds no lane when the width is nothing, so the loss
+    answers the plain deviation. Its gradient is a three-way test on the signed
+    deviation with the two outer tests read first, so a lane that matches
+    exactly is held by the negative one and hands back that side's full slope.
+    A division by the width answers neither.
+    """
+
+    def _pair(self, seed, tie=True):
+        torch.manual_seed(seed)
+        input_t = torch.randn(4, 5, dtype=torch.float64)
+        target_t = torch.randn(4, 5, dtype=torch.float64)
+        # Fix the first lane so that the walk either has a lane matching exactly
+        # to hold, or has none at all.
+        input_t.view(-1)[0] = target_t.view(-1)[0] + (0.0 if tie else 0.5)
+        return input_t, target_t
+
+    def test_forward_answers_the_deviation(self):
+        from tensorplay import _C
+        input_t, target_t = self._pair(17)
+        deviation = (input_t - target_t).abs()
+        for reduction, enum in (("none", 0), ("mean", 1), ("sum", 2)):
+            for dev in reference_devices():
+                ref = torch_F.smooth_l1_loss(input_t, target_t,
+                                             reduction=reduction, beta=0.0)
+                got = _C.smooth_l1_loss(from_reference(input_t, dev),
+                                        from_reference(target_t, dev),
+                                        enum, 0.0)
+                assert_reference_close(
+                    got, ref, msg=f"smooth_l1 beta=0 red={reduction} ({dev})")
+                want = deviation if reduction == "none" else (
+                    deviation.mean() if reduction == "mean" else deviation.sum())
+                assert_reference_close(
+                    got, want, msg=f"smooth_l1 beta=0 as deviation ({dev})")
+
+    def test_backward_answers_the_side_of_the_deviation(self):
+        from tensorplay import _C
+        input_t, target_t = self._pair(19, tie=False)
+        grad_t = torch.rand(4, 5, dtype=torch.float64)
+        ref = torch.ops.aten.smooth_l1_loss_backward(
+            grad_t, input_t, target_t, 0, 0.0)
+        want = torch.sign(input_t - target_t) * grad_t
+        for dev in reference_devices():
+            got = _C.smooth_l1_loss_backward(from_reference(grad_t, dev),
+                                             from_reference(input_t, dev),
+                                             from_reference(target_t, dev),
+                                             0, 0.0)
+            assert_reference_close(got, ref,
+                                   msg=f"smooth_l1_backward beta=0 vs reference ({dev})")
+            assert_reference_close(got, want,
+                                   msg=f"smooth_l1_backward beta=0 as side ({dev})")
+
+    def test_a_lane_that_matches_answers_the_negative_side(self):
+        from tensorplay import _C
+        input_t, target_t = self._pair(29)
+        grad_t = torch.rand(4, 5, dtype=torch.float64)
+        ref = torch.ops.aten.smooth_l1_loss_backward(
+            grad_t, input_t, target_t, 0, 0.0)
+        want = torch.where(input_t > target_t, grad_t, -grad_t)
+        got = _C.smooth_l1_loss_backward(from_reference(grad_t, "cpu"),
+                                        from_reference(input_t, "cpu"),
+                                        from_reference(target_t, "cpu"),
+                                        0, 0.0)
+        assert_reference_close(got, ref, msg="smooth_l1_backward beta=0 with a tie")
+        assert_reference_close(got, want,
+                               msg="smooth_l1_backward beta=0 tie on the negative side")
+
+    def test_a_negative_width_refuses_both_ways(self):
+        from tensorplay import _C
+        input_t, target_t = self._pair(23)
+        for dev in reference_devices():
+            x = from_reference(input_t, dev)
+            t = from_reference(target_t, dev)
+            incoming = from_reference(torch.rand_like(input_t), dev)
+            with self.assertRaises((ValueError, RuntimeError)):
+                _C.smooth_l1_loss(x, t, 1, -0.5)
+            with self.assertRaises((ValueError, RuntimeError)):
+                _C.smooth_l1_loss_backward(incoming, x, t, 1, -0.5)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

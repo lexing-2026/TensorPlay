@@ -15957,16 +15957,21 @@ class TestVulkanSwitchedQuadraticLoss(unittest.TestCase):
     def _smooth(cls, values, labels, width):
         difference = cls._difference(values, labels)
         magnitude = np.abs(difference)
-        return np.where(magnitude <= width,
-                        0.5 * difference * difference / width,
-                        magnitude - 0.5 * width)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            inside = 0.5 * difference * difference / width
+        return np.where(magnitude < width, inside, magnitude - 0.5 * width)
 
     @classmethod
     def _smooth_slope(cls, values, labels, width):
+        # Three tests on the signed deviation, read outside-in: a lane at or
+        # below the negative width hands back the full slope of that side, one
+        # at or above the width the full slope of its own side, and only a lane
+        # strictly inside the width is scaled by it.
         difference = cls._difference(values, labels)
-        return np.where(np.abs(difference) <= width,
-                        difference / width,
-                        np.sign(difference))
+        with np.errstate(divide="ignore", invalid="ignore"):
+            rising = difference / width
+        return np.where(difference <= -width, -1.0,
+                        np.where(difference >= width, 1.0, rising))
 
     @classmethod
     def _huber(cls, values, labels, width):
@@ -16079,7 +16084,7 @@ class TestVulkanSwitchedQuadraticLoss(unittest.TestCase):
     def test_a_width_of_nothing_answers_the_deviation(self):
         # A width of nothing leaves the quadratic branch no lane to hold, so the
         # loss falls back to the plain deviation rather than a division by the
-        # width.
+        # width, and every gradient lane is held by one of the outer tests.
         import tensorplay.functional as F
         payload = np.array([1.5, -2.0, 0.25, 3.0], np.float32)
         labels = np.array([0.5, 0.0, 0.25, 1.0], np.float32)
@@ -16090,12 +16095,14 @@ class TestVulkanSwitchedQuadraticLoss(unittest.TestCase):
                                  1, 0.0).cpu().numpy(), deviation.mean(),
                 rtol=2e-3, atol=2e-3)
         with self.subTest(kind="the gradient"):
+            # The lane that matches exactly is at the width, so it is held by
+            # the negative test and hands back the slope of that side.
             np.testing.assert_allclose(
                 F.smooth_l1_loss_backward(
                     self._device(np.ones(4, np.float32)),
                     self._device(payload), self._device(labels), 0,
                     0.0).cpu().numpy(),
-                np.sign(payload - labels))
+                self._smooth_slope(payload, labels, 0.0))
 
     def test_the_host_switched_loss_answers_the_same(self):
         import tensorplay.functional as F
