@@ -39,6 +39,18 @@
 
 #if defined(__x86_64__) || defined(__i386__)
 #define TP_VECBINARY_X86 1
+
+// The truncated remainder of two vectors.  The dispatcher picks the widest
+// body the running CPU has; the answer itself is exact, so several operands
+// share one call instead of one call per element.
+#ifdef __cplusplus
+extern "C" {
+#endif
+__m256 Sleef_fmodf8(__m256, __m256);
+__m256d Sleef_fmodd4(__m256d, __m256d);
+#ifdef __cplusplus
+}
+#endif
 #endif
 
 #if defined(TP_VECBINARY_X86) && defined(__x86_64__) \
@@ -51,7 +63,7 @@ namespace cpu {
 namespace vecbinary {
 
 // Which pairwise map the chunk answers.
-enum class BOp : int { Hypot, Atan2, LogAddExp };
+enum class BOp : int { Hypot, Atan2, LogAddExp, Remainder, Fmod };
 
 // The answer of the map at the width of the operands, one element at a
 // time.  It stands in for the tail of a chunk.
@@ -74,6 +86,17 @@ inline float scalar_f32_of<BOp::LogAddExp>(float x, float y) {
     if (m == -std::numeric_limits<float>::infinity()) return m;
     if (m != m) return m;  // NaN propagates
     return m + std::log1p(std::exp(-std::fabs(x - y)));
+}
+
+template <>
+inline float scalar_f32_of<BOp::Remainder>(float x, float y) {
+    const float mod = std::fmod(x, y);
+    return (mod != 0.0f && ((y < 0.0f) != (mod < 0.0f))) ? mod + y : mod;
+}
+
+template <>
+inline float scalar_f32_of<BOp::Fmod>(float x, float y) {
+    return std::fmod(x, y);
 }
 
 inline bool avx2_available() {
@@ -101,6 +124,12 @@ inline float scalar_f32(BOp op, float x, float y) {
             if (m != m) return m;
             return m + std::log1p(std::exp(-std::fabs(x - y)));
         }
+        case BOp::Remainder: {
+            const float mod = std::fmod(x, y);
+            return (mod != 0.0f && ((y < 0.0f) != (mod < 0.0f))) ? mod + y : mod;
+        }
+        case BOp::Fmod:
+            return std::fmod(x, y);
     }
     return 0.0f;
 }
@@ -117,6 +146,12 @@ inline double scalar_f64(BOp op, double x, double y) {
             if (m != m) return m;
             return m + std::log1p(std::exp(-std::fabs(x - y)));
         }
+        case BOp::Remainder: {
+            const double mod = std::fmod(x, y);
+            return (mod != 0.0 && ((y < 0.0) != (mod < 0.0))) ? mod + y : mod;
+        }
+        case BOp::Fmod:
+            return std::fmod(x, y);
     }
     return 0.0;
 }
@@ -144,6 +179,14 @@ inline uint16_t scalar_f16(BOp op, uint16_t a, uint16_t b) {
             return tensorplay::cpu::vecreduced::narrow_one(
                 m + std::log1p(std::exp(-std::fabs(x - y))));
         }
+        case BOp::Remainder: {
+            const float mod = std::fmod(x, y);
+            const float ans =
+                (mod != 0.0f && ((y < 0.0f) != (mod < 0.0f))) ? mod + y : mod;
+            return tensorplay::cpu::vecreduced::narrow_one(ans);
+        }
+        case BOp::Fmod:
+            return tensorplay::cpu::vecreduced::narrow_one(std::fmod(x, y));
     }
     return 0;
 }
@@ -175,6 +218,33 @@ inline __m256d log_add_exp_f64(__m256d x, __m256d y) {
     return _mm256_blendv_pd(sum, m, _mm256_cmp_pd(m, neg_inf, _CMP_EQ_OQ));
 }
 
+// The truncated remainder answers the dividend's sign; the modulo built on
+// it adds one divisor back where the two disagree, so the answer follows
+// the divisor's sign instead.
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256 remainder_f32(__m256 x, __m256 y) {
+    const __m256 mod = Sleef_fmodf8(x, y);
+    const __m256 zero = _mm256_setzero_ps();
+    // The two less-than masks differ exactly where the divisor and the
+    // truncated remainder disagree in sign.
+    const __m256 mixed = _mm256_xor_ps(_mm256_cmp_ps(y, zero, _CMP_LT_OQ),
+                                       _mm256_cmp_ps(mod, zero, _CMP_LT_OQ));
+    const __m256 adjust = _mm256_and_ps(
+        _mm256_cmp_ps(mod, zero, _CMP_NEQ_UQ), mixed);
+    return _mm256_blendv_ps(mod, _mm256_add_ps(mod, y), adjust);
+}
+
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256d remainder_f64(__m256d x, __m256d y) {
+    const __m256d mod = Sleef_fmodd4(x, y);
+    const __m256d zero = _mm256_setzero_pd();
+    const __m256d mixed = _mm256_xor_pd(_mm256_cmp_pd(y, zero, _CMP_LT_OQ),
+                                        _mm256_cmp_pd(mod, zero, _CMP_LT_OQ));
+    const __m256d adjust = _mm256_and_pd(
+        _mm256_cmp_pd(mod, zero, _CMP_NEQ_UQ), mixed);
+    return _mm256_blendv_pd(mod, _mm256_add_pd(mod, y), adjust);
+}
+
 // The chunk answers one map, so the map is named once rather than chosen
 // at every step.
 template <BOp op>
@@ -197,6 +267,12 @@ static void f32_chunk_avx2(const float* a, const float* b, float* d,
         } else if constexpr (op == BOp::Atan2) {
             r0 = tensorplay::tpsleef::atan2(x0, y0);
             r1 = tensorplay::tpsleef::atan2(x1, y1);
+        } else if constexpr (op == BOp::Remainder) {
+            r0 = remainder_f32(x0, y0);
+            r1 = remainder_f32(x1, y1);
+        } else if constexpr (op == BOp::Fmod) {
+            r0 = Sleef_fmodf8(x0, y0);
+            r1 = Sleef_fmodf8(x1, y1);
         } else {
             r0 = log_add_exp_f32(x0, y0);
             r1 = log_add_exp_f32(x1, y1);
@@ -212,6 +288,10 @@ static void f32_chunk_avx2(const float* a, const float* b, float* d,
             r = tensorplay::tpsleef::hypot(x, y);
         } else if constexpr (op == BOp::Atan2) {
             r = tensorplay::tpsleef::atan2(x, y);
+        } else if constexpr (op == BOp::Remainder) {
+            r = remainder_f32(x, y);
+        } else if constexpr (op == BOp::Fmod) {
+            r = Sleef_fmodf8(x, y);
         } else {
             r = log_add_exp_f32(x, y);
         }
@@ -244,6 +324,12 @@ static void f16_chunk_avx2(const uint16_t* a, const uint16_t* b,
         } else if constexpr (op == BOp::Atan2) {
             r0 = tensorplay::tpsleef::atan2(x0, y0);
             r1 = tensorplay::tpsleef::atan2(x1, y1);
+        } else if constexpr (op == BOp::Remainder) {
+            r0 = remainder_f32(x0, y0);
+            r1 = remainder_f32(x1, y1);
+        } else if constexpr (op == BOp::Fmod) {
+            r0 = Sleef_fmodf8(x0, y0);
+            r1 = Sleef_fmodf8(x1, y1);
         } else {
             r0 = log_add_exp_f32(x0, y0);
             r1 = log_add_exp_f32(x1, y1);
@@ -261,6 +347,10 @@ static void f16_chunk_avx2(const uint16_t* a, const uint16_t* b,
             r = tensorplay::tpsleef::hypot(x, y);
         } else if constexpr (op == BOp::Atan2) {
             r = tensorplay::tpsleef::atan2(x, y);
+        } else if constexpr (op == BOp::Remainder) {
+            r = remainder_f32(x, y);
+        } else if constexpr (op == BOp::Fmod) {
+            r = Sleef_fmodf8(x, y);
         } else {
             r = log_add_exp_f32(x, y);
         }
@@ -290,6 +380,12 @@ static void f64_chunk_avx2(const double* a, const double* b, double* d,
         } else if constexpr (op == BOp::Atan2) {
             r0 = tensorplay::tpsleef::atan2(x0, y0);
             r1 = tensorplay::tpsleef::atan2(x1, y1);
+        } else if constexpr (op == BOp::Remainder) {
+            r0 = remainder_f64(x0, y0);
+            r1 = remainder_f64(x1, y1);
+        } else if constexpr (op == BOp::Fmod) {
+            r0 = Sleef_fmodd4(x0, y0);
+            r1 = Sleef_fmodd4(x1, y1);
         } else {
             r0 = log_add_exp_f64(x0, y0);
             r1 = log_add_exp_f64(x1, y1);
@@ -305,6 +401,10 @@ static void f64_chunk_avx2(const double* a, const double* b, double* d,
             r = tensorplay::tpsleef::hypot(x, y);
         } else if constexpr (op == BOp::Atan2) {
             r = tensorplay::tpsleef::atan2(x, y);
+        } else if constexpr (op == BOp::Remainder) {
+            r = remainder_f64(x, y);
+        } else if constexpr (op == BOp::Fmod) {
+            r = Sleef_fmodd4(x, y);
         } else {
             r = log_add_exp_f64(x, y);
         }

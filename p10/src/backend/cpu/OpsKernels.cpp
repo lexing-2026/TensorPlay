@@ -500,22 +500,27 @@ Tensor true_divide_scalar_cpu(const Tensor& self, const Scalar& other) {
 Tensor divide_tensor_cpu(const Tensor& self, const Tensor& other) { return true_divide_core(self, other); }
 Tensor divide_scalar_cpu(const Tensor& self, const Scalar& other) { return true_divide_scalar_cpu(self, other); }
 
+template <vecbinary::BOp op, typename F>
+static Tensor fmod_like_pair_kernel(const Tensor& a, const Tensor& b, F f,
+                                    const char* name);
+
 Tensor remainder_tensor_cpu(const Tensor& self, const Tensor& other) {
     // Python modulo: sign follows the divisor
-    return binary_same_kernel(self, other, [](auto x, auto y) {
-        using T = decltype(x);
-        if constexpr (std::is_integral_v<T>) {
-            auto r = x % y;
-            if (r != T(0) && ((r < 0) != (y < 0))) r = static_cast<T>(r + y);
-            return static_cast<T>(r);
-        } else {
-            // Float/Half/BFloat16 route through fmod on double opmath.
-            double xf = static_cast<double>(x), yf = static_cast<double>(y);
-            double r = std::fmod(xf, yf);
-            if (r != 0.0 && ((r < 0.0) != (yf < 0.0))) r += yf;
-            return static_cast<T>(r);
-        }
-    }, "remainder");
+    return fmod_like_pair_kernel<vecbinary::BOp::Remainder>(self, other,
+        [](auto x, auto y) {
+            using T = decltype(x);
+            if constexpr (std::is_integral_v<T>) {
+                auto r = x % y;
+                if (r != T(0) && ((r < 0) != (y < 0))) r = static_cast<T>(r + y);
+                return static_cast<T>(r);
+            } else {
+                // Float/Half/BFloat16 route through fmod on double opmath.
+                double xf = static_cast<double>(x), yf = static_cast<double>(y);
+                double r = std::fmod(xf, yf);
+                if (r != 0.0 && ((r < 0.0) != (yf < 0.0))) r += yf;
+                return static_cast<T>(r);
+            }
+        }, "remainder");
 }
 Tensor remainder_scalar_cpu(const Tensor& self, const Scalar& other) {
     // Forcing the scalar into self's dtype would truncate a float divisor
@@ -531,14 +536,15 @@ Tensor remainder_scalar_tensor_cpu(const Scalar& self, const Tensor& other) {
 
 Tensor fmod_tensor_cpu(const Tensor& self, const Tensor& other) {
     // C fmod: sign follows the dividend
-    return binary_same_kernel(self, other, [](auto x, auto y) -> decltype(x) {
-        if constexpr (std::is_integral_v<decltype(x)>)
-            return static_cast<decltype(x)>(x % y);
-        else
-            // Covers float/double/Half/BFloat16 via double opmath.
-            return static_cast<decltype(x)>(std::fmod(static_cast<double>(x),
-                                                      static_cast<double>(y)));
-    }, "fmod");
+    return fmod_like_pair_kernel<vecbinary::BOp::Fmod>(self, other,
+        [](auto x, auto y) -> decltype(x) {
+            if constexpr (std::is_integral_v<decltype(x)>)
+                return static_cast<decltype(x)>(x % y);
+            else
+                // Covers float/double/Half/BFloat16 via double opmath.
+                return static_cast<decltype(x)>(std::fmod(static_cast<double>(x),
+                                                          static_cast<double>(y)));
+        }, "fmod");
 }
 Tensor fmod_scalar_cpu(const Tensor& self, const Scalar& other) {
     const DType dt = scalar_promote(self.dtype(), other);
@@ -1041,6 +1047,39 @@ static Tensor pair_math_kernel(const Tensor& a, const Tensor& b, F f,
         return result;
     }
     return binary_float_kernel(a, b, f, name);
+}
+
+// The same pairing for fmod and the modulo built on it.  Integral operands
+// keep their own semantics and stay on the flat map, as do pairs that are
+// broadcast, mixed-width, or not packed; the floating pairs that do fit are
+// answered a vector at a time.
+template <vecbinary::BOp op, typename F>
+static Tensor fmod_like_pair_kernel(const Tensor& a, const Tensor& b, F f,
+                                    const char* name) {
+    if (vecbinary::avx2_available() && a.dtype() == b.dtype() &&
+        (a.dtype() == DType::Float32 || a.dtype() == DType::Float64 ||
+         a.dtype() == DType::Float16) &&
+        a.shape() == b.shape() && a.is_contiguous() && b.is_contiguous()) {
+        Tensor result = Tensor::empty(
+            static_cast<std::vector<int64_t>>(a.shape()), a.dtype(),
+            a.device());
+        const int64_t n = result.numel();
+        if (n > 0) {
+            if (a.dtype() == DType::Float32) {
+                pair_math_walk<op>(a.data_ptr<float>(), b.data_ptr<float>(),
+                                   result.data_ptr<float>(), n);
+            } else if (a.dtype() == DType::Float64) {
+                pair_math_walk<op>(a.data_ptr<double>(), b.data_ptr<double>(),
+                                   result.data_ptr<double>(), n);
+            } else {
+                pair_math_walk<op>(
+                    a.data_ptr<tensorplay::Half>(), b.data_ptr<tensorplay::Half>(),
+                    result.data_ptr<tensorplay::Half>(), n);
+            }
+        }
+        return result;
+    }
+    return binary_same_kernel(a, b, f, name);
 }
 
 // The same map with the destination the caller holds: the answer is laid on
