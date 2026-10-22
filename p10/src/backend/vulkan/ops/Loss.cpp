@@ -557,6 +557,181 @@ Tensor mse_loss_backward_kernel(
       "mul", "buffer_mul", difference, incoming, Scalar(1.0), kName);
 }
 
+// An operand of a binary likelihood walk: read at single precision, however
+// narrow the payload it came from is.  A likelihood clamps a logarithm and
+// divides by the product of two lanes, both of which lose their meaning in a
+// narrow width.
+Tensor loss_walk_operand(const Tensor& t) {
+  return t.dtype() == DType::Float32 ? t : tpx::ops::to(t, DType::Float32);
+}
+
+// A plane read as probabilities has to sit between the bounds a logarithm is
+// taken of.  A lane outside them has no loss to answer, and a lane that is not a
+// measurement at all fails the same way: the pair of bounds is a test a missing
+// measurement answers neither way.
+void loss_check_probability(const Tensor& payload, const char* what) {
+  const Tensor inside = tpx::ops::logical_and(
+      tpx::ops::ge(payload, Scalar(0.0)),
+      tpx::ops::le(payload, Scalar(1.0)));
+  TP_CHECK(
+      tpx::ops::all(inside).to(Device(DeviceType::CPU)).item().to<bool>(),
+      std::string("all elements of ") + what + " should be between 0 and 1");
+}
+
+// A plane read as probabilities, brought onto the device and widened for the walk.
+Tensor loss_probability_operand(const Tensor& t, const char* what) {
+  const Tensor on_device =
+      t.device().is_vulkan() ? t : t.to(vulkan_device());
+  const Tensor walked = loss_walk_operand(on_device);
+  loss_check_probability(walked, what);
+  return walked;
+}
+
+// L = -w (t log(x) + (1-t) log(1-x)), with each logarithm clamped at -100 so a
+// lane that sits exactly on a bound answers a finite loss rather than an
+// infinity.  The two clamped logarithms are read once and shared by every
+// reduction mode; a per-lane weight rides the same walk the two planes do.
+Tensor binary_cross_entropy_kernel(
+    const Tensor& self,
+    const Tensor& target,
+    const std::optional<Tensor>& weight_opt,
+    int64_t reduction) {
+  constexpr const char* kName = "binary_cross_entropy";
+  TP_CHECK(
+      reduction >= 0 && reduction <= 2,
+      std::string("Vulkan ") + kName + ": invalid reduction mode");
+  TP_CHECK(
+      self.dtype() == DType::Float32 || self.dtype() == DType::Float16,
+      std::string("Vulkan ") + kName +
+          " supports Float32 and Float16 tensors only");
+  const bool has_weight = weight_opt.has_value() && weight_opt->defined();
+
+  const Tensor x = loss_probability_operand(self, "input");
+  const Tensor t = loss_probability_operand(target, "target");
+
+  const Tensor log_x = tpx::ops::clamp_min(tpx::ops::log(x), Scalar(-100.0));
+  const Tensor log_one_minus_x = tpx::ops::clamp_min(
+      tpx::ops::log1p(tpx::ops::neg(x)), Scalar(-100.0));
+  Tensor loss = tpx::ops::sub(
+      tpx::ops::mul(tpx::ops::add(t, Scalar(-1.0)), log_one_minus_x),
+      tpx::ops::mul(t, log_x));
+  if (has_weight) {
+    loss = tpx::ops::mul(
+        loss,
+        loss_walk_operand(
+            weight_opt->device().is_vulkan()
+                ? *weight_opt
+                : weight_opt->to(vulkan_device())));
+  }
+  if (reduction == 0) {
+    return tpx::ops::to(loss, self.dtype());
+  }
+  return tpx::ops::to(
+      reduction == 1 ? tpx::ops::mean(loss) : tpx::ops::sum(loss),
+      self.dtype());
+}
+
+// d(L)/d(x) = w (x - t) / max((1 - x) x, 1e-12), carried by whatever the loss is
+// answered with and shared by the count that was averaged for the mean form.
+// The denominator is held off zero rather than trusted: a lane exactly on a bound
+// would otherwise answer an infinity the loss itself keeps finite.
+Tensor binary_cross_entropy_backward_kernel(
+    const Tensor& grad_output,
+    const Tensor& self,
+    const Tensor& target,
+    const std::optional<Tensor>& weight_opt,
+    int64_t reduction) {
+  constexpr const char* kName = "binary_cross_entropy_backward";
+  TP_CHECK(
+      reduction >= 0 && reduction <= 2,
+      std::string("Vulkan ") + kName + ": invalid reduction mode");
+  TP_CHECK(
+      self.dtype() == DType::Float32 || self.dtype() == DType::Float16,
+      std::string("Vulkan ") + kName +
+          " supports Float32 and Float16 tensors only");
+  const bool has_weight = weight_opt.has_value() && weight_opt->defined();
+
+  const Tensor x = loss_walk_operand(
+      self.device().is_vulkan() ? self : self.to(vulkan_device()));
+  const Tensor t = loss_walk_operand(
+      target.device().is_vulkan() ? target : target.to(vulkan_device()));
+  const Tensor incoming = loss_walk_operand(
+      grad_output.device().is_vulkan() ? grad_output
+                                       : grad_output.to(vulkan_device()));
+
+  const Tensor denominator = tpx::ops::clamp_min(
+      tpx::ops::mul(tpx::ops::rsub(x, Scalar(1.0)), x), Scalar(1e-12));
+  Tensor gradient = tpx::ops::div(
+      tpx::ops::mul(incoming, tpx::ops::sub(x, t)), denominator);
+  if (has_weight) {
+    gradient = tpx::ops::mul(
+        gradient,
+        loss_walk_operand(
+            weight_opt->device().is_vulkan()
+                ? *weight_opt
+                : weight_opt->to(vulkan_device())));
+  }
+  if (reduction == 1 && self.numel() > 0) {
+    gradient = tpx::ops::mul(
+        gradient, Scalar(1.0 / static_cast<double>(self.numel())));
+  }
+  return tpx::ops::to(gradient, self.dtype());
+}
+
+// The loss a logit answers before it is pushed through a sigmoid:
+// (1-t) x - log_sigmoid(x) ((pos_weight - 1) t + 1), per-lane weighted and shared
+// by the count the walk covered.  Reading log_sigmoid rather than a sigmoid keeps
+// a saturated logit finite, which is the reason this form is answered on its own
+// instead of as a sigmoid and a likelihood in two walks.
+Tensor binary_cross_entropy_with_logits_kernel(
+    const Tensor& self,
+    const Tensor& target,
+    const std::optional<Tensor>& weight_opt,
+    const std::optional<Tensor>& pos_weight_opt) {
+  constexpr const char* kName = "binary_cross_entropy_with_logits";
+  TP_CHECK(
+      self.dtype() == DType::Float32 || self.dtype() == DType::Float16,
+      std::string("Vulkan ") + kName +
+          " supports Float32 and Float16 tensors only");
+  const bool has_weight = weight_opt.has_value() && weight_opt->defined();
+  const bool has_pos_weight =
+      pos_weight_opt.has_value() && pos_weight_opt->defined();
+  if (self.numel() == 0) {
+    // Nothing was walked, so the average is the zero an empty count hands back.
+    return Tensor::zeros(std::vector<int64_t>{}, DType::Float32, self.device());
+  }
+
+  const Tensor x = loss_walk_operand(
+      self.device().is_vulkan() ? self : self.to(vulkan_device()));
+  const Tensor t = loss_walk_operand(
+      target.device().is_vulkan() ? target : target.to(vulkan_device()));
+
+  Tensor log_sigmoid = tpx::ops::log_sigmoid(x);
+  if (has_pos_weight) {
+    const Tensor pos_weight = loss_walk_operand(
+        pos_weight_opt->device().is_vulkan()
+            ? *pos_weight_opt
+            : pos_weight_opt->to(vulkan_device()));
+    log_sigmoid = tpx::ops::mul(
+        log_sigmoid,
+        tpx::ops::add(
+            tpx::ops::mul(tpx::ops::add(pos_weight, Scalar(-1.0)), t),
+            Scalar(1.0)));
+  }
+  Tensor loss = tpx::ops::sub(
+      tpx::ops::mul(tpx::ops::rsub(t, Scalar(1.0)), x), log_sigmoid);
+  if (has_weight) {
+    loss = tpx::ops::mul(
+        loss,
+        loss_walk_operand(
+            weight_opt->device().is_vulkan()
+                ? *weight_opt
+                : weight_opt->to(vulkan_device())));
+  }
+  // The average of a likelihood is answered at single precision.
+  return tpx::ops::mean(loss);
+}
+
 } // namespace ops
 } // namespace vulkan
 } // namespace tensorplay
@@ -570,6 +745,15 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, LossKernels) {
   m.impl(
       "mse_loss_backward",
       &tensorplay::vulkan::ops::mse_loss_backward_kernel);
+  m.impl(
+      "binary_cross_entropy",
+      &tensorplay::vulkan::ops::binary_cross_entropy_kernel);
+  m.impl(
+      "binary_cross_entropy_backward",
+      &tensorplay::vulkan::ops::binary_cross_entropy_backward_kernel);
+  m.impl(
+      "binary_cross_entropy_with_logits",
+      &tensorplay::vulkan::ops::binary_cross_entropy_with_logits_kernel);
 }
 
 #endif /* USE_VULKAN */
