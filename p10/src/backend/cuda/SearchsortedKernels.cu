@@ -7,6 +7,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -44,6 +45,37 @@ __global__ void searchsorted_kernel(int64_t n, int64_t seq_len, bool right,
             if (go_right) lo = mid + 1; else hi = mid;
         }
         rp[i] = static_cast<OutT>(lo - base);
+    }
+}
+
+// One sorted run that fits on-chip is staged in shared memory once per block:
+// every probe of the binary search is then a shared-memory read instead of a
+// round trip to the caches, and the search itself never touches global memory
+// after the staging pass.
+constexpr int kSharedThreads = 1024;
+constexpr int64_t kSharedLimit = 48 * 1024;
+
+template <typename T, typename OutT>
+__global__ void searchsorted_shared_kernel(int n, int seq_len, bool right,
+                                           const T* __restrict__ sp,
+                                           const T* __restrict__ vp,
+                                           OutT* __restrict__ rp) {
+    extern __shared__ unsigned char storage[];
+    T* sorted = reinterpret_cast<T*>(storage);
+    for (int i = threadIdx.x; i < seq_len; i += blockDim.x) {
+        sorted[i] = sp[i];
+    }
+    __syncthreads();
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        const T v = vp[i];
+        int lo = 0, hi = seq_len;
+        while (lo < hi) {
+            const int mid = lo + ((hi - lo) >> 1);
+            const bool go_right = right ? !(sorted[mid] > v) : !(sorted[mid] >= v);
+            if (go_right) lo = mid + 1; else hi = mid;
+        }
+        rp[i] = static_cast<OutT>(lo);
     }
 }
 
@@ -99,6 +131,32 @@ void searchsorted_impl_cuda(const Tensor& seq_f, const Tensor& vals_f,
 
     auto run = [&](auto type_tag) {
         using T = decltype(type_tag);
+        const bool stage = is_1d_boundaries && n >= 32 && n <= INT32_MAX &&
+            seq_len <= INT32_MAX &&
+            seq_len * static_cast<int64_t>(sizeof(T)) <= kSharedLimit;
+        if (stage) {
+            const int block = n >= kSharedThreads
+                ? kSharedThreads
+                : static_cast<int>((n + 31) / 32 * 32);
+            const unsigned blocks = static_cast<unsigned>(
+                std::min<int64_t>((n + block - 1) / block, 1024));
+            const size_t shared_bytes = static_cast<size_t>(seq_len) * sizeof(T);
+            if (out_int32) {
+                searchsorted_shared_kernel<T, int32_t>
+                    <<<blocks, block, shared_bytes, stream>>>(
+                        static_cast<int>(n), static_cast<int>(seq_len), right,
+                        seq.data_ptr<T>(), vals.data_ptr<T>(),
+                        static_cast<int32_t*>(result.data_ptr()));
+            } else {
+                searchsorted_shared_kernel<T, int64_t>
+                    <<<blocks, block, shared_bytes, stream>>>(
+                        static_cast<int>(n), static_cast<int>(seq_len), right,
+                        seq.data_ptr<T>(), vals.data_ptr<T>(),
+                        static_cast<int64_t*>(result.data_ptr()));
+            }
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
         const unsigned blocks = static_cast<unsigned>(
             (n + kThreads - 1) / kThreads);
         if (out_int32) {
@@ -135,7 +193,9 @@ Tensor& searchsorted_out_cuda_impl(const Tensor& sorted_sequence,
                                    const Tensor& sorter_opt, Tensor& result) {
     bucketization::pre_check(sorted_sequence, self, result, out_int32, right,
                              side_opt, sorter_opt);
-    result.resize_(static_cast<std::vector<int64_t>>(self.shape()));
+    if (result.sizes() != self.sizes()) {
+        result.resize_(static_cast<std::vector<int64_t>>(self.shape()));
+    }
     const bool is_right = side_opt.has_value() ? *side_opt == "right" : right;
     if (self.numel() == 0) return result;
 
@@ -183,7 +243,8 @@ Tensor searchsorted_cuda(const Tensor& sorted_sequence, const Tensor& self,
                          const std::optional<std::string>& side_opt,
                          const std::optional<Tensor>& sorter_opt) {
     Tensor result = Tensor::empty(
-        {}, out_int32 ? DType::Int32 : DType::Int64, self.device());
+        static_cast<std::vector<int64_t>>(self.shape()),
+        out_int32 ? DType::Int32 : DType::Int64, self.device());
     searchsorted_out_cuda_impl(sorted_sequence, self, out_int32, right,
                                side_opt, sorter_opt.value_or(Tensor()),
                                result);
@@ -227,7 +288,8 @@ Tensor& bucketize_out_cuda(const Tensor& self, const Tensor& boundaries,
 Tensor bucketize_cuda(const Tensor& self, const Tensor& boundaries,
                       bool out_int32, bool right) {
     Tensor result = Tensor::empty(
-        {}, out_int32 ? DType::Int32 : DType::Int64, self.device());
+        static_cast<std::vector<int64_t>>(self.shape()),
+        out_int32 ? DType::Int32 : DType::Int64, self.device());
     bucketize_out_cuda(self, boundaries, out_int32, right, result);
     return result;
 }
