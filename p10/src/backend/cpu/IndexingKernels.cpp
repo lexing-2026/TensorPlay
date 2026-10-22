@@ -2263,6 +2263,56 @@ std::tuple<Tensor, Tensor, Tensor> unique_flat_cpu_template(
         }
     }
 
+    // Without an inverse there is no permutation to keep, so the answer is
+    // read from a sorted copy of the values themselves: a value buffer is a
+    // third of the size of a (value, index) pair, and comparing values needs
+    // no index tie-break.
+    if (!return_inverse) {
+        Tensor sorted = input.clone();
+        scalar_t* sorted_data = sorted.data_ptr<scalar_t>();
+        bool has_nan = false;
+        if constexpr (std::is_floating_point_v<scalar_t> ||
+                      std::is_same_v<scalar_t, Half> ||
+                      std::is_same_v<scalar_t, BFloat16>) {
+            has_nan = std::any_of(sorted_data, sorted_data + numel,
+                                  [](scalar_t v) { return sort_is_nan(v); });
+        }
+        if (has_nan) {
+            // NaNs sort after every other value and never equal each other,
+            // so each one stays a group of its own.
+            std::sort(sorted_data, sorted_data + numel, [](scalar_t a, scalar_t b) {
+                const bool na = sort_is_nan(a), nb = sort_is_nan(b);
+                if (na != nb) return nb;
+                if (na) return false;
+                return a < b;
+            });
+        } else {
+            std::sort(sorted_data, sorted_data + numel);
+        }
+        int64_t n_groups = 1;
+        for (int64_t i = 1; i < numel; ++i) {
+            if (sorted_data[i] != sorted_data[i - 1]) ++n_groups;
+        }
+        values = Tensor::empty({n_groups}, self.dtype(), self.device());
+        scalar_t* vp = values.data_ptr<scalar_t>();
+        int64_t* cp = return_counts
+            ? (counts.resize_({n_groups}), counts.data_ptr<int64_t>())
+            : nullptr;
+        int64_t g = 0;
+        int64_t group_start = 0;
+        vp[0] = sorted_data[0];
+        for (int64_t i = 1; i < numel; ++i) {
+            if (sorted_data[i] != sorted_data[i - 1]) {
+                if (cp) cp[g] = i - group_start;
+                group_start = i;
+                ++g;
+                vp[g] = sorted_data[i];
+            }
+        }
+        if (cp) cp[g] = numel - group_start;
+        return {values, inverse, counts};
+    }
+
     Tensor sorted_vals, order;
     std::tie(sorted_vals, order) = sort_cpu(input, 0, false);
     const scalar_t* sv = sorted_vals.data_ptr<scalar_t>();
