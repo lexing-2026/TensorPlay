@@ -31,6 +31,8 @@ BETA, THRESHOLD = 1.7, 3.0
 
 # name, the form that allocates, the form handed a destination, the arithmetic.
 MAPS = [
+    ("relu", lambda x: tp.relu(x), lambda x, out=None: tp.relu(x, out=out),
+     lambda v: np.maximum(v, 0.0)),
     ("gelu", lambda x: tp.gelu(x), lambda x, out=None: tp.gelu(x, out=out),
      lambda v: 0.5 * v * (1.0 + erf_(v / np.sqrt(2.0)))),
     ("gelu[tanh]", lambda x: tp.gelu(x, "tanh"),
