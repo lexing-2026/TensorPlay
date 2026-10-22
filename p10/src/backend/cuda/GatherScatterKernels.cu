@@ -139,10 +139,55 @@ __global__ void gather_tail_kernel(int64_t idx_dim_size, int64_t self_dim_size,
     }
 }
 
+// Index broadcast over the gather run: every column of an output row reuses
+// one index entry, so the broadcast view is read in place (one load per row)
+// instead of being materialised to the full output shape.
+constexpr int kBcastWork = 8;
+
+template <typename T, typename IndexT>
+__global__ void gather_bcast_kernel(int64_t idx_dim_size, int64_t run,
+                                    int64_t self_dim_size, int64_t self_inner,
+                                    const T* __restrict__ s,
+                                    const IndexT* __restrict__ ip,
+                                    T* __restrict__ d) {
+    const int64_t outer_off = blockIdx.z;
+    const int64_t row = blockIdx.y;
+    const int64_t out_base = (outer_off * idx_dim_size + row) * run;
+    int64_t idx = static_cast<int64_t>(ip[outer_off * idx_dim_size + row]);
+    if (idx < 0) idx += self_dim_size;
+    const T* __restrict__ srow = s + (outer_off * self_dim_size + idx) * self_inner;
+    const int64_t col0 =
+        static_cast<int64_t>(blockIdx.x) * (kContigThreads * kBcastWork) + threadIdx.x;
+#pragma unroll
+    for (int k = 0; k < kBcastWork; ++k) {
+        const int64_t t = col0 + static_cast<int64_t>(k) * kContigThreads;
+        if (t < run) d[out_base + t] = srow[t];
+    }
+}
+
 template <typename IndexT, typename T>
-void launch_gather_typed(bool contig, int64_t n, int64_t outer, int64_t idx_dim_size,
-                         int64_t idx_inner, int64_t self_dim_size, int64_t self_inner,
+void launch_gather_bcast_typed(int64_t outer, int64_t idx_dim_size, int64_t run,
+                               int64_t self_dim_size, int64_t self_inner,
+                               const T* s, const IndexT* ip, T* d, cudaStream_t stream) {
+    const dim3 grid(static_cast<unsigned>((run + kContigThreads * kBcastWork - 1) /
+                                          (kContigThreads * kBcastWork)),
+                    static_cast<unsigned>(idx_dim_size),
+                    static_cast<unsigned>(outer));
+    gather_bcast_kernel<T, IndexT><<<grid, kContigThreads, 0, stream>>>(
+        idx_dim_size, run, self_dim_size, self_inner, s, ip, d);
+}
+
+template <typename IndexT, typename T>
+void launch_gather_typed(bool bcast, bool contig, int64_t n, int64_t outer,
+                         int64_t idx_dim_size, int64_t idx_inner,
+                         int64_t self_dim_size, int64_t self_inner,
                          const T* s, const IndexT* ip, T* d, cudaStream_t stream) {
+    if (bcast) {
+        launch_gather_bcast_typed<IndexT, T>(outer, idx_dim_size, idx_inner,
+                                             self_dim_size, self_inner, s, ip, d,
+                                             stream);
+        return;
+    }
     if (contig) {
         const dim3 grid(static_cast<unsigned>(
                             (idx_inner + kContigThreads * kContigWork - 1) /
@@ -169,16 +214,17 @@ void launch_gather_typed(bool contig, int64_t n, int64_t outer, int64_t idx_dim_
 
 template <typename IndexT>
 void launch_gather_kernel_for_index(
-        int64_t n, int64_t outer, int64_t idx_dim_size, int64_t idx_inner,
+        bool bcast, int64_t n, int64_t outer, int64_t idx_dim_size, int64_t idx_inner,
         int64_t self_dim_size, int64_t self_inner, const Tensor& self,
         const Tensor& index, Tensor& result, cudaStream_t stream) {
-    const bool contig = scatter_gather_contig_eligible(outer, idx_dim_size, idx_inner);
+    const bool contig = !bcast &&
+        scatter_gather_contig_eligible(outer, idx_dim_size, idx_inner);
 #define TP_GA_CASE(ctype, name) \
     case DType::name: \
         launch_gather_typed<IndexT, ctype>( \
-            contig, n, outer, idx_dim_size, idx_inner, self_dim_size, self_inner, \
-            static_cast<const ctype*>(self.data_ptr()), index.data_ptr<IndexT>(), \
-            static_cast<ctype*>(result.data_ptr()), stream); \
+            bcast, contig, n, outer, idx_dim_size, idx_inner, self_dim_size, \
+            self_inner, static_cast<const ctype*>(self.data_ptr()), \
+            index.data_ptr<IndexT>(), static_cast<ctype*>(result.data_ptr()), stream); \
         break;
     switch (self.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_GA_CASE)
@@ -513,28 +559,52 @@ Tensor gather_cuda(const Tensor& self, int64_t dim, const Tensor& index) {
                      " (input: ", self.size(i), ", index: ", index.size(i), ")");
         }
     }
-    Tensor idx_c = (index.dtype() == DType::Int64 || index.dtype() == DType::Int32)
-        ? index.contiguous() : index.to(DType::Int64).contiguous();
     Tensor self_c = self.contiguous();
-    Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(idx_c.shape()), self.dtype(), self.device());
     int64_t outer = 1;
-    for (int64_t i = 0; i < dim; ++i) outer *= idx_c.size(i);
+    for (int64_t i = 0; i < dim; ++i) outer *= index.size(i);
     int64_t idx_inner = 1;
-    for (int64_t i = dim + 1; i < nd; ++i) idx_inner *= idx_c.size(i);
+    for (int64_t i = dim + 1; i < nd; ++i) idx_inner *= index.size(i);
     int64_t self_inner = 1;
     for (int64_t i = dim + 1; i < nd; ++i) self_inner *= self.size(i);
-    int64_t idx_dim_size = idx_c.size(dim);
-    int64_t n = result.numel();
+    int64_t idx_dim_size = index.size(dim);
     int64_t self_dim_size = self.size(dim);
+    const bool typed = index.dtype() == DType::Int64 || index.dtype() == DType::Int32;
+    // An index broadcast over the gathered run reuses one entry per output
+    // row; reading it through its strides avoids materialising the full
+    // output shape just to fetch that entry again for every column.
+    bool bcast = typed && idx_inner > 1 && outer <= 65535 &&
+                 idx_dim_size <= 65535 && index.stride(dim) == 1;
+    if (bcast) {
+        for (int64_t i = dim + 1; i < nd; ++i) {
+            if (index.size(i) != self.size(i) || index.stride(i) != 0) {
+                bcast = false;
+                break;
+            }
+        }
+    }
+    if (bcast) {
+        int64_t expected = idx_dim_size;
+        for (int64_t i = dim - 1; i >= 0; --i) {
+            if (index.stride(i) != expected) {
+                bcast = false;
+                break;
+            }
+            expected *= index.size(i);
+        }
+    }
+    Tensor idx_c = typed ? (bcast ? index : index.contiguous())
+                         : index.to(DType::Int64).contiguous();
+    Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(index.shape()), self.dtype(), self.device());
+    int64_t n = result.numel();
     if (n == 0) return result;
     auto stream = getCurrentCUDAStream().stream();
     if (idx_c.dtype() == DType::Int32) {
         launch_gather_kernel_for_index<int32_t>(
-            n, outer, idx_dim_size, idx_inner, self_dim_size, self_inner,
+            bcast, n, outer, idx_dim_size, idx_inner, self_dim_size, self_inner,
             self_c, idx_c, result, stream);
     } else {
         launch_gather_kernel_for_index<int64_t>(
-            n, outer, idx_dim_size, idx_inner, self_dim_size, self_inner,
+            bcast, n, outer, idx_dim_size, idx_inner, self_dim_size, self_inner,
             self_c, idx_c, result, stream);
     }
     CUDA_CHECK(cudaGetLastError());
