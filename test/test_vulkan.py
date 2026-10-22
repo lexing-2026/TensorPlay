@@ -12615,5 +12615,295 @@ class TestVulkanExtremumOfAnUnnumberedLane(unittest.TestCase):
                           f"a {np_dtype.__name__} axis high")
 
 
+
+class TestVulkanFoldAtTheLaneAnIndexNames(unittest.TestCase):
+    # A scatter that folds rather than adds hands the number of every entry of a
+    # list to the element it names and grows that element the way the fold says -
+    # a total, a product, an average, the largest or the smallest of them.  Several
+    # entries can name one element, so the fold walks the destination a whole word
+    # at a time and reads the list in the order it states: nothing is dropped, no
+    # race decides the answer, and the same call answers the same number twice over.
+    # Whether the element already held counts as one of the contributions is the
+    # whole difference between keeping it and discarding it.
+
+    MODES = ("sum", "prod", "mean", "amin", "amax")
+    SHAPES = ((5,), (5, 4), (2, 5, 3), (2, 3, 5, 2))
+
+    @staticmethod
+    def _device(payload):
+        arr = np.asarray(payload)
+        if arr.ndim and not arr.flags["C_CONTIGUOUS"]:
+            arr = np.ascontiguousarray(arr)
+        return tensorplay.from_numpy(arr).to("vulkan")
+
+    @staticmethod
+    def _codes(values, dtype=np.int64):
+        return TestVulkanFoldAtTheLaneAnIndexNames._device(
+            np.asarray(values, dtype=dtype))
+
+    @staticmethod
+    def _canvas(shape, dtype=np.float32, seed=0):
+        # Small whole numbers keep either element type and every intermediate
+        # exact, so an entry handed to the wrong element shows up as a wrong
+        # number rather than as rounding.
+        rng = np.random.default_rng([len(shape), seed, *shape])
+        return rng.integers(-3, 4, size=shape).astype(dtype)
+
+    @classmethod
+    def _list(cls, shape, dim, dtype=np.float32, seed=1):
+        axis = dim if dim >= 0 else dim + len(shape)
+        rng = np.random.default_rng([seed, *shape, axis])
+        return rng.integers(0, shape[axis], size=shape).astype(np.int64)
+
+    @classmethod
+    def _want(cls, base, dim, codes, src, mode, include_self):
+        axis = dim if dim >= 0 else dim + base.ndim
+        rows = base.shape[axis]
+        # A fold of a half payload is kept at full width and rounded on the way
+        # out, which is how the accumulating scatter already treats one.
+        acc = base.astype(
+            np.float32 if base.dtype == np.float16 else base.dtype).copy()
+        values = np.asarray(src, dtype=acc.dtype)
+        held = np.zeros(acc.shape, bool)
+        hits = np.zeros(acc.shape, np.int64)
+        start = {"sum": 0.0, "prod": 1.0, "mean": 0.0,
+                 "amin": float("inf"), "amax": float("-inf")}[mode]
+        for flat in range(codes.size):
+            code = int(codes.flat[flat])
+            if code < 0 or code >= rows:
+                continue
+            coord = list(np.unravel_index(flat, codes.shape))
+            slot = list(coord)
+            slot[axis] = code
+            slot = tuple(slot)
+            if not held[slot]:
+                held[slot] = True
+                if not include_self:
+                    acc[slot] = start
+            value = values[tuple(coord)]
+            current = acc[slot]
+            if mode == "sum" or mode == "mean":
+                acc[slot] = current + value
+            elif mode == "prod":
+                acc[slot] = current * value
+            elif mode == "amin":
+                acc[slot] = current if (np.isnan(current) or current < value) else value
+            else:
+                acc[slot] = current if (np.isnan(current) or current > value) else value
+            hits[slot] += 1
+        if mode == "mean":
+            divisor = hits + (1 if include_self else 0)
+            divisor[divisor == 0] = 1
+            acc = np.where(held, acc / divisor, acc)
+        return acc.astype(base.dtype)
+
+    @staticmethod
+    def _checked(got, want, mode, dtype, label):
+        # A fold of sums, products and extrema lands on the same number either
+        # way, and an average over small whole numbers lands on the nearest one
+        # the width can hold - which the division the device performs may reach
+        # from either side of it.
+        if mode != "mean":
+            np.testing.assert_array_equal(got, want, err_msg=label)
+            return
+        rtol = 2e-3 if dtype == np.float16 else 1e-6
+        np.testing.assert_allclose(got, want, rtol=rtol, err_msg=label)
+
+    def _folded(self, shape, dim, mode, include_self, dtype=np.float32, label=""):
+        base = self._canvas(shape, dtype, seed=2)
+        codes = self._list(shape, dim, dtype, seed=3)
+        src = self._canvas(shape, dtype, seed=4)
+        name = (f"{label} shape={shape} dim={dim} mode={mode} "
+                f"keep={include_self} dtype={np.dtype(dtype).name}")
+        got = self._device(base).scatter_reduce_(
+            dim, self._codes(codes), self._device(src), mode,
+            include_self=include_self).cpu().numpy()
+        self._checked(got, self._want(base, dim, codes, src, mode, include_self),
+                      mode, dtype, name)
+        return name
+
+    def test_every_fold_a_mode_states_is_answered_at_the_element_it_names(self):
+        for shape in self.SHAPES:
+            for dim in range(-len(shape), len(shape)):
+                for mode in self.MODES:
+                    for include_self in (True, False):
+                        self._folded(shape, dim, mode, include_self)
+
+    def test_a_fold_of_a_half_payload_is_answered_in_the_width_it_keeps(self):
+        for shape in ((5,), (5, 4), (3, 7)):
+            for mode in self.MODES:
+                self._folded(shape, 0, mode, True, np.float16)
+                self._folded(shape, -1, mode, False, np.float16)
+
+    def test_a_fold_at_the_host_answers_the_same_number(self):
+        for shape in self.SHAPES:
+            for dim in range(-len(shape), len(shape)):
+                for mode in self.MODES:
+                    for include_self in (True, False):
+                        base = self._canvas(shape, np.float32, seed=6)
+                        codes = self._list(shape, dim, np.float32, seed=7)
+                        src = self._canvas(shape, np.float32, seed=8)
+                        host = tensorplay.scatter_reduce(
+                            tensorplay.from_numpy(base.copy()), dim,
+                            tensorplay.from_numpy(codes),
+                            tensorplay.from_numpy(src), mode,
+                            include_self=include_self).cpu().numpy()
+                        np.testing.assert_array_equal(
+                            host,
+                            self._want(base, dim, codes, src, mode, include_self),
+                            err_msg=f"host: shape={shape} dim={dim} mode={mode}")
+
+    def test_an_answer_twice_over_is_the_same_answer(self):
+        base = self._canvas((5, 4), np.float32, seed=9)
+        codes = self._list((5, 4), 0, np.float32, seed=10)
+        src = self._canvas((5, 4), np.float32, seed=11)
+        first = self._device(base).scatter_reduce_(
+            0, self._codes(codes), self._device(src), "sum").cpu().numpy()
+        second = self._device(base).scatter_reduce_(
+            0, self._codes(codes), self._device(src), "sum").cpu().numpy()
+        np.testing.assert_array_equal(first, second)
+
+    def test_a_lane_the_list_never_names_keeps_what_it_held(self):
+        # Only the first row is named, so the rest stands as it did on a canvas
+        # nothing reached - which is the answer whether or not the fold kept it.
+        base = np.arange(20, dtype=np.float32).reshape(5, 4)
+        codes = np.zeros((1, 4), np.int64)
+        src = np.full((1, 4), 100.0, np.float32)
+        for mode in self.MODES:
+            for include_self in (True, False):
+                for dim in (0, 1):
+                    got = self._device(base).scatter_reduce_(
+                        dim, self._codes(codes), self._device(src), mode,
+                        include_self=include_self).cpu().numpy()
+                    self._checked(
+                        got, self._want(base, dim, codes, src, mode, include_self),
+                        mode, np.float32, f"mode={mode} keep={include_self} dim={dim}")
+                    if dim == 0:
+                        np.testing.assert_array_equal(got[1:], base[1:])
+
+    def test_a_fold_handed_the_same_element_several_times_is_answered_in_order(self):
+        # One lane named four times: the total is the sum of the four, the
+        # product their product, the average their average over four (plus the
+        # destination when it is kept).
+        base = np.array([[3.0, 5.0]], np.float32)
+        codes = np.array([[0], [0], [0], [0]], np.int64)
+        src = np.array([[1.0], [2.0], [3.0], [4.0]], np.float32)
+        for mode in self.MODES:
+            for include_self in (True, False):
+                got = self._device(base).scatter_reduce_(
+                    0, self._codes(codes), self._device(src), mode,
+                    include_self=include_self).cpu().numpy()
+                self._checked(
+                    got, self._want(base, 0, codes, src, mode, include_self),
+                    mode, np.float32, f"mode={mode} keep={include_self}")
+        answer = self._device(base).scatter_reduce_(
+            0, self._codes(codes), self._device(src), "sum").cpu().numpy()
+        self.assertEqual(answer[0][0], np.float32(13.0))
+        average = self._device(base).scatter_reduce_(
+            0, self._codes(codes), self._device(src), "mean",
+            include_self=False).cpu().numpy()
+        self.assertEqual(average[0][0], np.float32(2.5))
+
+    def test_a_fold_that_names_a_lane_that_is_not_a_number_hands_it_over(self):
+        # A lane that is not a number stays one: neither an entry beside it nor
+        # the destination can trade it away, and the order the list states makes
+        # no difference to which end of the fold holds it.
+        base = np.array([[1.0, 9.0]], np.float32)
+        codes = np.array([[0], [0]], np.int64)
+        for values in ((float("nan"), 3.0), (3.0, float("nan"))):
+            src = np.array([[values[0]], [values[1]]], np.float32)
+            for mode in ("amin", "amax"):
+                for include_self in (True, False):
+                    got = self._device(base).scatter_reduce_(
+                        0, self._codes(codes), self._device(src), mode,
+                        include_self=include_self).cpu().numpy()
+                    np.testing.assert_array_equal(
+                        got,
+                        self._want(base, 0, codes, src, mode, include_self),
+                        err_msg=f"mode={mode} keep={include_self} values={values}")
+                    self.assertTrue(np.isnan(got[0][0]))
+                    self.assertEqual(got[0][1], np.float32(9.0))
+
+    def test_a_payload_that_reaches_past_the_list_is_read_only_where_an_entry_stands(
+            self):
+        base = np.zeros((3, 2), np.float32)
+        codes = np.array([[0], [2]], np.int64)
+        src = np.array([[5.0], [7.0], [9.0], [1.0]], np.float32)
+        got = self._device(base).scatter_reduce_(
+            0, self._codes(codes), self._device(src), "sum").cpu().numpy()
+        np.testing.assert_array_equal(got, np.array([[5.0, 0.0],
+                                                     [0.0, 0.0],
+                                                     [7.0, 0.0]], np.float32))
+
+    def test_an_empty_list_answers_the_destination_as_it_stood(self):
+        base = self._canvas((5, 4), np.float32, seed=12)
+        codes = np.zeros((0, 4), np.int64)
+        src = np.zeros((0, 4), np.float32)
+        for mode in self.MODES:
+            for include_self in (True, False):
+                got = self._device(base).scatter_reduce_(
+                    0, self._codes(codes), self._device(src), mode,
+                    include_self=include_self).cpu().numpy()
+                np.testing.assert_array_equal(got, base)
+
+    def test_a_fold_answered_off_the_device_matches_the_one_off_it(self):
+        # The out-of-place spelling leaves the destination alone and answers a
+        # new tensor; the in-place one rewrites what it was given.
+        base = self._canvas((5, 4), np.float32, seed=13)
+        codes = self._list((5, 4), 0, np.float32, seed=14)
+        src = self._canvas((5, 4), np.float32, seed=15)
+        for mode in self.MODES:
+            kept = self._device(base)
+            answer = kept.scatter_reduce(
+                0, self._codes(codes), self._device(src), mode).cpu().numpy()
+            np.testing.assert_array_equal(kept.cpu().numpy(), base)
+            in_place = self._device(base).scatter_reduce_(
+                0, self._codes(codes), self._device(src), mode).cpu().numpy()
+            np.testing.assert_array_equal(answer, in_place)
+
+    def test_a_long_list_within_the_budget_is_answered_and_a_longer_one_refused(
+            self):
+        length = 4000000
+        rng = np.random.default_rng(17)
+        held = self._device(np.zeros((length,), np.float32))
+        held.scatter_reduce_(
+            0, self._codes(rng.integers(0, 7, size=(60000,))),
+            self._device(np.ones((60000,), np.float32)), "sum")
+        self.assertEqual(held.cpu().numpy().sum(), 60000.0)
+        canvas = self._device(np.zeros((length,), np.float32))
+        with self.assertRaisesRegex(RuntimeError, "budget"):
+            canvas.scatter_reduce_(
+                0, self._codes(rng.integers(0, 7, size=(200000,))),
+                self._device(np.ones((200000,), np.float32)), "sum")
+
+    def test_operands_that_do_not_line_up_are_answered_off_it(self):
+        payload = self._device(self._canvas((5, 4)))
+        codes = self._codes(np.zeros((5, 4), np.int64))
+        with self.assertRaisesRegex(RuntimeError, "same rank"):
+            payload.scatter_reduce(
+                0, codes, self._device(np.ones((5,), np.float32)), "sum")
+        with self.assertRaisesRegex(RuntimeError, "reaches past the payload"):
+            payload.scatter_reduce(
+                0, self._codes(np.zeros((4, 4), np.int64)),
+                self._device(np.zeros((3, 4), np.float32)), "sum")
+        # A payload of another width would be folded in the wrong arithmetic, so
+        # it is answered off it rather than widened on the way in.
+        with self.assertRaisesRegex(RuntimeError, "element type the"):
+            self._device(self._canvas((5, 4), np.float16)).scatter_reduce(
+                0, codes, self._device(np.ones((5, 4), np.float32)), "sum")
+        with self.assertRaisesRegex(RuntimeError, "Float32 and Float16"):
+            payload.scatter_reduce(
+                0, codes, self._device(np.ones((5, 4), np.int64)), "sum")
+
+    def test_a_mode_not_among_the_folds_is_answered_with_the_names_it_offers(self):
+        payload = self._device(self._canvas((5, 4)))
+        with self.assertRaisesRegex(
+                ValueError,
+                "reduce argument must be one of 'sum', 'prod', 'mean', 'amin', "
+                "'amax' but got: maximum"):
+            payload.scatter_reduce(
+                0, self._codes(np.zeros((5, 4), np.int64)),
+                self._device(np.ones((5, 4), np.float32)), "maximum")
+
 if __name__ == "__main__":
     unittest.main()
