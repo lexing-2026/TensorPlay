@@ -145,6 +145,93 @@ __global__ void index_select_slice_kernel(int64_t n_idx, int64_t outer,
     }
 }
 
+// Selecting along the trailing dimension: an index entry selects exactly one
+// element of the output row, so the index vector lines up with the output and
+// no coordinate split is needed.  Four 4-byte columns form a 16-byte cell: the
+// cell's index quadruple and its destination both move as one vector, which
+// keeps the instruction count per element low.
+constexpr int kTailThreads = 128;
+
+template <typename IndexT>
+__global__ void index_select_tail4_kernel(int64_t cells, int64_t row,
+                                          const uint32_t* __restrict__ s,
+                                          const IndexT* __restrict__ ip,
+                                          uint4* __restrict__ d) {
+    const int64_t o = blockIdx.y;
+    const int64_t c = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (c >= cells) return;
+    const int64_t base = c * 4;
+    int64_t iv[4];
+    if constexpr (sizeof(IndexT) == 4) {
+        const int4 v = *reinterpret_cast<const int4*>(ip + base);
+        iv[0] = v.x; iv[1] = v.y; iv[2] = v.z; iv[3] = v.w;
+    } else {
+        const longlong2 lo = *reinterpret_cast<const longlong2*>(ip + base);
+        const longlong2 hi = *reinterpret_cast<const longlong2*>(ip + base + 2);
+        iv[0] = lo.x; iv[1] = lo.y; iv[2] = hi.x; iv[3] = hi.y;
+    }
+#pragma unroll
+    for (int k = 0; k < 4; ++k) { TP_INDEX_RANGE_GUARD(iv[k], row); }
+    const uint32_t* src = s + o * row;
+    uint4 cell;
+    cell.x = src[iv[0]];
+    cell.y = src[iv[1]];
+    cell.z = src[iv[2]];
+    cell.w = src[iv[3]];
+    d[o * cells + c] = cell;
+}
+
+// Trailing-dimension select for every other element width: one output element
+// per thread, still without any coordinate division.
+template <typename T, typename IndexT>
+__global__ void index_select_tail_scalar_kernel(int64_t n_idx, int64_t row,
+                                                const T* __restrict__ s,
+                                                const IndexT* __restrict__ ip,
+                                                T* __restrict__ d) {
+    const int64_t o = blockIdx.y;
+    const int64_t k = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (k >= n_idx) return;
+    int64_t iv = static_cast<int64_t>(ip[k]);
+    TP_INDEX_RANGE_GUARD(iv, row);
+    d[o * n_idx + k] = s[o * row + iv];
+}
+
+template <typename IndexT> void launch_index_select_tail(
+        int64_t n_idx, int64_t row, int64_t outer, const Tensor& self,
+        const Tensor& index, Tensor& result, cudaStream_t stream) {
+    const int64_t isz = static_cast<int64_t>(self.itemsize());
+    if (isz == 4 && n_idx % 4 == 0) {
+        const int64_t cells = n_idx / 4;
+        const unsigned blocks = static_cast<unsigned>(
+            (cells + kTailThreads - 1) / kTailThreads);
+        index_select_tail4_kernel<IndexT><<<
+            dim3(blocks, static_cast<unsigned>(outer)), kTailThreads, 0, stream>>>(
+            cells, row, static_cast<const uint32_t*>(self.data_ptr()),
+            index.data_ptr<IndexT>(), static_cast<uint4*>(result.data_ptr()));
+        return;
+    }
+#define TP_IST_CASE(ctype, name) \
+    case DType::name: { \
+        const unsigned blocks = static_cast<unsigned>( \
+            (n_idx + kThreads - 1) / kThreads); \
+        index_select_tail_scalar_kernel<ctype, IndexT><<< \
+            dim3(blocks, static_cast<unsigned>(outer)), kThreads, 0, stream>>>( \
+            n_idx, row, static_cast<const ctype*>(self.data_ptr()), \
+            index.data_ptr<IndexT>(), static_cast<ctype*>(result.data_ptr())); \
+        break; \
+    }
+    switch (self.dtype()) {
+        TENSORPLAY_FORALL_SCALAR_TYPES(TP_IST_CASE)
+        TENSORPLAY_FORALL_FP8_TYPES(TP_IST_CASE)
+        TP_IST_CASE(tensorplay::complex<Half>, ComplexHalf)
+        TP_IST_CASE(tensorplay::complex<float>, ComplexFloat)
+        TP_IST_CASE(tensorplay::complex<double>, ComplexDouble)
+        TP_IST_CASE(tensorplay::complex<BFloat16>, BComplex32)
+        default: TP_THROW(TypeError, "index_select: unsupported dtype");
+    }
+#undef TP_IST_CASE
+}
+
 template <typename IndexT>
 void launch_index_select_for_index(
         int64_t total, int64_t n_idx, int64_t inner, int64_t row,
@@ -262,26 +349,31 @@ __global__ void index_fill_slice_kernel(int64_t n_idx, int64_t outer,
 // entries with `c_span` chunks of each row across its two block dimensions.
 // The payload size and pointer alignment that make the casts sound are checked
 // before every launch.
+//
+// The select variant maps (index, chunk block, outer) to the three grid
+// dimensions so every block of a chunk wave walks a different source row, and
+// gives each block one warp: a block then moves a single 512-byte run of its
+// source row, so all of its requests land in one contiguous segment.  The
+// output is stored with a streaming hint because this kernel writes it and
+// never reads it back.
+constexpr int kCellThreads = 32;
+
 template <typename IndexT>
-__global__ void index_select_slice_vec_kernel(int64_t n_idx, int64_t outer,
-                                              int64_t chunks, int64_t row,
-                                              const uint4* s, const IndexT* ip,
-                                              uint4* d) {
-    const int64_t c_span = blockDim.x;
-    const int64_t k_span = blockDim.y;
-    const int64_t k_stride = static_cast<int64_t>(gridDim.x) * k_span;
-    const int64_t o_stride = static_cast<int64_t>(gridDim.y);
-    for (int64_t o = blockIdx.y; o < outer; o += o_stride) {
-        for (int64_t k = static_cast<int64_t>(blockIdx.x) * k_span + threadIdx.y;
-             k < n_idx; k += k_stride) {
-            int64_t source_index = ip[k];
-            TP_INDEX_RANGE_GUARD(source_index, row);
-            const uint4* source = s + (o * row + source_index) * chunks;
-            uint4* destination = d + (o * n_idx + k) * chunks;
-            for (int64_t c = threadIdx.x; c < chunks; c += c_span) {
-                destination[c] = source[c];
-            }
-        }
+__global__ void index_select_cell_kernel(int64_t cells, int64_t n_idx,
+                                         int64_t row,
+                                         const uint4* __restrict__ s,
+                                         const IndexT* __restrict__ ip,
+                                         uint4* __restrict__ d) {
+    const int64_t o = blockIdx.z;
+    const int64_t k = blockIdx.x;
+    int64_t iv = static_cast<int64_t>(ip[k]);
+    TP_INDEX_RANGE_GUARD(iv, row);
+    const uint4* source = s + (o * row + iv) * cells;
+    uint4* destination = d + (o * n_idx + k) * cells;
+    const int64_t step = static_cast<int64_t>(blockDim.x) * gridDim.y;
+    for (int64_t c = static_cast<int64_t>(blockIdx.y) * blockDim.x + threadIdx.x;
+         c < cells; c += step) {
+        __stcs(destination + c, __ldg(source + c));
     }
 }
 
@@ -345,20 +437,20 @@ bool launch_index_select_slice_vec(int64_t n_idx, int64_t inner, int64_t row,
                                    int64_t outer, const Tensor& self,
                                    const Tensor& index, Tensor& result,
                                    cudaStream_t stream) {
+    if (n_idx > 2147483647 || outer > 65535) return false;
     const int64_t row_bytes =
         inner * static_cast<int64_t>(self.itemsize());
     if (row_bytes % 16 != 0) return false;
     if (!vec_slice_ok(self.data_ptr(), result.data_ptr())) return false;
-    const int64_t chunks = row_bytes / 16;
-    int c_span = 1, k_span = 1;
-    vec_slice_block(chunks, c_span, k_span);
-    const unsigned index_blocks = static_cast<unsigned>(
-        std::min<int64_t>((n_idx + k_span - 1) / k_span, 2147483647));
-    const unsigned outer_blocks = static_cast<unsigned>(
-        std::min<int64_t>(outer, 65535));
-    index_select_slice_vec_kernel<IndexT><<<dim3(index_blocks, outer_blocks),
-                                            dim3(c_span, k_span), 0, stream>>>(
-        n_idx, outer, chunks, row,
+    const int64_t cells = row_bytes / 16;
+    if (cells == 0) return true;
+    const unsigned chunk_blocks = static_cast<unsigned>(
+        std::min<int64_t>((cells + kCellThreads - 1) / kCellThreads, 65535));
+    index_select_cell_kernel<IndexT><<<
+        dim3(static_cast<unsigned>(n_idx), chunk_blocks,
+             static_cast<unsigned>(outer)),
+        kCellThreads, 0, stream>>>(
+        cells, n_idx, row,
         static_cast<const uint4*>(self.data_ptr()),
         index.data_ptr<IndexT>(), static_cast<uint4*>(result.data_ptr()));
     return true;
@@ -643,6 +735,17 @@ Tensor index_select_cuda(const Tensor& self, int64_t dim, const Tensor& index) {
     Tensor self_c = self.contiguous();
     auto stream = getCurrentCUDAStream().stream();
     const int slice_threads = slice_block_threads(inner);
+    if (inner == 1 && outer <= 65535) {
+        if (idx.dtype() == DType::Int32) {
+            launch_index_select_tail<int32_t>(n_idx, row, outer, self_c, idx,
+                                              result, stream);
+        } else {
+            launch_index_select_tail<int64_t>(n_idx, row, outer, self_c, idx,
+                                              result, stream);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return result;
+    }
     if (use_slice_kernel(inner, n_idx, outer)) {
         const bool chunked = idx.dtype() == DType::Int32
             ? launch_index_select_slice_vec<int32_t>(
