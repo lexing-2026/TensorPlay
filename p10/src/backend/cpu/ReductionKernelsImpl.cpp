@@ -249,12 +249,15 @@ namespace {
 static bool try_normsq_real(const void* xv, int64_t n, DType dt, double* out) {
     if (n < 4096) return false;
     constexpr int64_t kGrain = 32768;
+    // One slot per worker, indexed by the worker id: a chunk boundary is the
+    // team's even split, not a multiple of the grain, so the chunk start is
+    // not a slot number.
+    const int64_t nslots = std::max<int64_t>(get_num_threads(), 1);
     if (dt == DType::Float32) {
         const float* x = static_cast<const float*>(xv);
-        const int64_t nslots = (n + kGrain - 1) / kGrain;
         std::vector<float> part(nslots, 0.f);
         tensorplay::parallel::parallel_for(0, n, kGrain, [&](int64_t b, int64_t e) {
-            part[b / kGrain] = vec::sum_of_squares(x, b, e);
+            part[get_thread_num()] += vec::sum_of_squares(x, b, e);
         });
         float s = 0.f;
         for (int64_t k = 0; k < nslots; ++k) s += part[k];
@@ -263,10 +266,9 @@ static bool try_normsq_real(const void* xv, int64_t n, DType dt, double* out) {
     }
     if (dt == DType::Float64) {
         const double* x = static_cast<const double*>(xv);
-        const int64_t nslots = (n + kGrain - 1) / kGrain;
         std::vector<double> part(nslots, 0.0);
         tensorplay::parallel::parallel_for(0, n, kGrain, [&](int64_t b, int64_t e) {
-            part[b / kGrain] = vec::sum_of_squares(x, b, e);
+            part[get_thread_num()] += vec::sum_of_squares(x, b, e);
         });
         double s = 0.0;
         for (int64_t k = 0; k < nslots; ++k) s += part[k];
@@ -1372,38 +1374,39 @@ static bool try_extremum_lastdim_vec(const Tensor& input, Tensor& values,
     return false;
 }
 
-__attribute__((target("avx512f")))
-static void sum_f32_leading_range_avx512(
-    const float* input, float* output, int64_t rows, int64_t cols,
-    int64_t begin, int64_t end) {
+// Column-wise fold over a leading dimension: the output span gathers the
+// rows that share its columns, so the walk strides by the row length.  Four
+// accumulators per pass keep any one chain short, and the tier compilation
+// picks the lane width.
+template <typename T>
+static void sum_leading_range(const T* input, T* output, int64_t rows,
+                              int64_t cols, int64_t begin, int64_t end) {
+    using Vec = Vectorized<T>;
+    constexpr int64_t W = static_cast<int64_t>(Vec::size());
     int64_t col = begin;
-    for (; col + 64 <= end; col += 64) {
-        __m512 sum0 = _mm512_setzero_ps();
-        __m512 sum1 = _mm512_setzero_ps();
-        __m512 sum2 = _mm512_setzero_ps();
-        __m512 sum3 = _mm512_setzero_ps();
+    for (; col + 4 * W <= end; col += 4 * W) {
+        Vec s0(T(0)), s1(T(0)), s2(T(0)), s3(T(0));
         for (int64_t row = 0; row < rows; ++row) {
-            const float* row_input = input + row * cols + col;
-            sum0 = _mm512_add_ps(sum0, _mm512_loadu_ps(row_input));
-            sum1 = _mm512_add_ps(sum1, _mm512_loadu_ps(row_input + 16));
-            sum2 = _mm512_add_ps(sum2, _mm512_loadu_ps(row_input + 32));
-            sum3 = _mm512_add_ps(sum3, _mm512_loadu_ps(row_input + 48));
+            const T* p = input + row * cols + col;
+            s0 = s0 + Vec::loadu(p);
+            s1 = s1 + Vec::loadu(p + W);
+            s2 = s2 + Vec::loadu(p + 2 * W);
+            s3 = s3 + Vec::loadu(p + 3 * W);
         }
-        _mm512_storeu_ps(output + col, sum0);
-        _mm512_storeu_ps(output + col + 16, sum1);
-        _mm512_storeu_ps(output + col + 32, sum2);
-        _mm512_storeu_ps(output + col + 48, sum3);
+        s0.store(output + col);
+        s1.store(output + col + W);
+        s2.store(output + col + 2 * W);
+        s3.store(output + col + 3 * W);
     }
-    for (; col + 16 <= end; col += 16) {
-        __m512 sum = _mm512_setzero_ps();
+    for (; col + W <= end; col += W) {
+        Vec acc(T(0));
         for (int64_t row = 0; row < rows; ++row) {
-            sum = _mm512_add_ps(
-                sum, _mm512_loadu_ps(input + row * cols + col));
+            acc = acc + Vec::loadu(input + row * cols + col);
         }
-        _mm512_storeu_ps(output + col, sum);
+        acc.store(output + col);
     }
     for (; col < end; ++col) {
-        float sum = 0.0f;
+        T sum = T(0);
         for (int64_t row = 0; row < rows; ++row) {
             sum += input[row * cols + col];
         }
@@ -1411,49 +1414,10 @@ static void sum_f32_leading_range_avx512(
     }
 }
 
-__attribute__((target("avx512f")))
-static void sum_f64_leading_range_avx512(
-    const double* input, double* output, int64_t rows, int64_t cols,
-    int64_t begin, int64_t end) {
-    int64_t col = begin;
-    for (; col + 32 <= end; col += 32) {
-        __m512d sum0 = _mm512_setzero_pd();
-        __m512d sum1 = _mm512_setzero_pd();
-        __m512d sum2 = _mm512_setzero_pd();
-        __m512d sum3 = _mm512_setzero_pd();
-        for (int64_t row = 0; row < rows; ++row) {
-            const double* row_input = input + row * cols + col;
-            sum0 = _mm512_add_pd(sum0, _mm512_loadu_pd(row_input));
-            sum1 = _mm512_add_pd(sum1, _mm512_loadu_pd(row_input + 8));
-            sum2 = _mm512_add_pd(sum2, _mm512_loadu_pd(row_input + 16));
-            sum3 = _mm512_add_pd(sum3, _mm512_loadu_pd(row_input + 24));
-        }
-        _mm512_storeu_pd(output + col, sum0);
-        _mm512_storeu_pd(output + col + 8, sum1);
-        _mm512_storeu_pd(output + col + 16, sum2);
-        _mm512_storeu_pd(output + col + 24, sum3);
-    }
-    for (; col + 8 <= end; col += 8) {
-        __m512d sum = _mm512_setzero_pd();
-        for (int64_t row = 0; row < rows; ++row) {
-            sum = _mm512_add_pd(
-                sum, _mm512_loadu_pd(input + row * cols + col));
-        }
-        _mm512_storeu_pd(output + col, sum);
-    }
-    for (; col < end; ++col) {
-        double sum = 0.0;
-        for (int64_t row = 0; row < rows; ++row) {
-            sum += input[row * cols + col];
-        }
-        output[col] = sum;
-    }
-}
-
-static bool try_sum_dim_real_avx512(
-    const Tensor& input, Tensor& output, int64_t dim) {
-    if (!reduce_avx512_available() || !input.is_contiguous() ||
-        input.numel() == 0 || input.dim() == 0) {
+// Contiguous reduction over one non-trailing dimension; returns false when
+// the caller should use the iterator path.
+static bool try_sum_dim_real(const Tensor& input, Tensor& output, int64_t dim) {
+    if (!input.is_contiguous() || input.numel() == 0 || input.dim() == 0) {
         return false;
     }
     if (input.dtype() != DType::Float32 && input.dtype() != DType::Float64) {
@@ -1463,8 +1427,8 @@ static bool try_sum_dim_real_avx512(
     const int64_t ndim = input.dim();
     if (dim == ndim - 1) {
         const int64_t d_size = input.size(dim);
-        const int64_t vector_width = input.dtype() == DType::Float32 ? 16 : 8;
-        if (d_size < vector_width) return false;
+        constexpr int64_t kMinRow = 16;
+        if (d_size < kMinRow) return false;
         const int64_t rows = input.numel() / d_size;
         const int64_t row_grain = std::max<int64_t>(
             1, GRAIN_SIZE / std::max<int64_t>(d_size, 1));
@@ -1473,8 +1437,7 @@ static bool try_sum_dim_real_avx512(
             float* results = output.data_ptr<float>();
             parallel_for(0, rows, row_grain, [&](int64_t begin, int64_t end) {
                 for (int64_t row = begin; row < end; ++row) {
-                    results[row] = sum_f32_chunk_avx512(
-                        values + row * d_size, 0, d_size);
+                    results[row] = vec::sum(values + row * d_size, 0, d_size);
                 }
             });
         } else {
@@ -1482,8 +1445,7 @@ static bool try_sum_dim_real_avx512(
             double* results = output.data_ptr<double>();
             parallel_for(0, rows, row_grain, [&](int64_t begin, int64_t end) {
                 for (int64_t row = begin; row < end; ++row) {
-                    results[row] = sum_f64_chunk_avx512(
-                        values + row * d_size, 0, d_size);
+                    results[row] = vec::sum(values + row * d_size, 0, d_size);
                 }
             });
         }
@@ -1495,9 +1457,9 @@ static bool try_sum_dim_real_avx512(
     for (int64_t i = 0; i < dim; ++i) outer *= input.size(i);
     const int64_t rows = input.size(dim);
     const int64_t cols = input.numel() / (outer * rows);
-    const int64_t vector_width = input.dtype() == DType::Float32 ? 16 : 8;
-    const int64_t vector_columns = vector_width * 4;
-    if (cols < vector_width) return false;
+    const int64_t vector_columns =
+        static_cast<int64_t>(Vectorized<float>::size()) * 4;
+    if (cols < static_cast<int64_t>(Vectorized<float>::size())) return false;
     const int64_t approximate_grain = std::max<int64_t>(
         1, GRAIN_SIZE / std::max<int64_t>(rows, 1));
     const int64_t column_grain = std::max<int64_t>(
@@ -1516,7 +1478,7 @@ static bool try_sum_dim_real_avx512(
                 const int64_t chunk = task - row * chunks_per_row;
                 const int64_t col_begin = chunk * column_grain;
                 const int64_t col_end = std::min(cols, col_begin + column_grain);
-                sum_f32_leading_range_avx512(
+                sum_leading_range(
                     values + row * rows * cols, results + row * cols,
                     rows, cols, col_begin, col_end);
             }
@@ -1539,7 +1501,7 @@ static bool try_sum_dim_real_avx512(
                 const int64_t chunk = task - row * chunks_per_row;
                 const int64_t col_begin = chunk * column_grain;
                 const int64_t col_end = std::min(cols, col_begin + column_grain);
-                sum_f64_leading_range_avx512(
+                sum_leading_range(
                     values + row * rows * cols, results + row * cols,
                     rows, cols, col_begin, col_end);
             }
@@ -1553,7 +1515,6 @@ static bool try_sum_dim_real_avx512(
     }
     return true;
 }
-
 // Leading-dim contiguous reduction over a small row count. Each task owns a
 // contiguous span of the output and streams one full row segment at a time
 // with kUnroll independent vector accumulators. A round-robin walk over row
@@ -2135,15 +2096,18 @@ static bool try_extremum_integral_dim_avx512(
 static bool try_sum_real(const void* xv, int64_t n, DType dt, double* out) {
     if (n < 4096) return false;
     constexpr int64_t kGrain = 32768;
+    // One slot per worker, indexed by the worker id: a chunk boundary is the
+    // team's even split, not a multiple of the grain, so the chunk start is
+    // not a slot number.
+    const int64_t nslots = std::max<int64_t>(get_num_threads(), 1);
     if (dt == DType::Float32) {
         const float* x = static_cast<const float*>(xv);
-        const int64_t nslots = (n + kGrain - 1) / kGrain;
-        // The chunk sums are float, but the cross-chunk merge is double: it
+        // The chunk sums are float, but the cross-worker merge is double: it
         // keeps the wide reduction from paying for its parallelism in
         // rounding.
         std::vector<double> part(nslots, 0.0);
         tensorplay::parallel::parallel_for(0, n, kGrain, [&](int64_t b, int64_t e) {
-            part[b / kGrain] = vec::sum(x, b, e);
+            part[get_thread_num()] += vec::sum(x, b, e);
         });
         double s = 0.0;
         for (int64_t k = 0; k < nslots; ++k) s += part[k];
@@ -2152,10 +2116,9 @@ static bool try_sum_real(const void* xv, int64_t n, DType dt, double* out) {
     }
     if (dt == DType::Float64) {
         const double* x = static_cast<const double*>(xv);
-        const int64_t nslots = (n + kGrain - 1) / kGrain;
         std::vector<double> part(nslots, 0.0);
         tensorplay::parallel::parallel_for(0, n, kGrain, [&](int64_t b, int64_t e) {
-            part[b / kGrain] = vec::sum(x, b, e);
+            part[get_thread_num()] += vec::sum(x, b, e);
         });
         double s = 0.0;
         for (int64_t k = 0; k < nslots; ++k) s += part[k];
@@ -2529,12 +2492,10 @@ Tensor sum_dim_kernel_impl(const Tensor& self, const std::vector<int64_t>& dims,
         }
         if (dims.size() == 1) {
             const int64_t dim = dims[0] < 0 ? dims[0] + ndim : dims[0];
-#if defined(__x86_64__)
             if (input.dtype() == out_dtype &&
-                try_sum_dim_real_avx512(input, out, dim)) {
+                try_sum_dim_real(input, out, dim)) {
                 return out;
             }
-#endif
             bool handled = false;
             if (out_dtype == DType::Float16) {
                 handled = sum_detail::contiguous_sum_dim<float, Half>(input, out, dim);
