@@ -8398,6 +8398,102 @@ class TestVulkanForeachGroup(unittest.TestCase):
                 tensorplay.from_numpy(np.array([1.0, 2.0, 3.0],
                                                dtype=np.float32)).to("vulkan"))
 
+    def test_a_group_moves_into_the_shape_it_was_asked_to_answer(self):
+        destinations = [self._table((4,)), self._table((3, 2), start=1.0),
+                        self._table((5,), start=2.0)]
+        partners = [self._table((4,), start=5.0), self._table((3, 2), start=7.0),
+                    self._table((5,), start=9.0)]
+        for label, tables, moved in (
+                ("measured", destinations, partners),
+                ("counted", [table.astype(np.int32) for table in destinations],
+                 [table.astype(np.int32) for table in partners])):
+            want = [np.ascontiguousarray(one.astype(np.asarray(two).dtype))
+                    for one, two in zip(moved, tables)]
+            self._read_matches(
+                tables, want,
+                lambda group, device, moved=moved: self._read(
+                    tensorplay._foreach_copy(group, self._group(moved, device))),
+                f"_foreach_copy of a {label} group")
+
+    def test_a_move_answers_in_the_width_the_destination_holds(self):
+        # A fresh copy keeps the width the group was asked to answer in and takes
+        # its values from the partner, so a count written into a measurement stays
+        # a measurement.  The host lane hands back the partner as it stands, which
+        # keeps the partner's width instead, so this rule is pinned here alone.
+        destinations = [self._table((4,)), self._table((3, 2), start=1.0)]
+        partners = [table.astype(np.int32) for table in destinations]
+        want = [np.ascontiguousarray(one.astype(np.float32)) for one in partners]
+        group = self._group(destinations, "vulkan")
+        held = tensorplay._foreach_copy(
+            group, self._group(partners, "vulkan"))
+        self._answers(self._read(held), want,
+                      "_foreach_copy keeps the destination width", "vulkan")
+        self._answers(self._read(group), [np.ascontiguousarray(table)
+                                          for table in destinations],
+                      "_foreach_copy leaves the group alone", "vulkan")
+
+    def test_a_group_written_into_keeps_its_own_lanes(self):
+        destinations = [self._table((4,)), self._table((3, 2), start=1.0)]
+        partners = [self._table((4,), start=5.0), self._table((3, 2), start=7.0)]
+        want = [np.ascontiguousarray(one) for one in partners]
+        self._write_matches(
+            destinations, want,
+            lambda group, device: tensorplay._foreach_copy_(
+                group, self._group(partners, device)),
+            "_foreach_copy_ of a like group")
+
+        counted = [table.astype(np.int32) for table in destinations]
+        want = [np.ascontiguousarray(table.astype(np.int32))
+                for table in destinations]
+        self._write_matches(
+            counted, want,
+            lambda group, device: tensorplay._foreach_copy_(
+                group, self._group(destinations, device)),
+            "_foreach_copy_ of a measurement into a count")
+
+        want = [np.ascontiguousarray(table.astype(np.int32).astype(np.float32))
+                for table in partners]
+        self._write_matches(
+            destinations, want,
+            lambda group, device: tensorplay._foreach_copy_(
+                group, self._group(
+                    [table.astype(np.int32) for table in partners], device)),
+            "_foreach_copy_ of a count into a measurement")
+
+    def test_a_group_handed_back_as_it_stands_is_copied_out_of_itself(self):
+        tables = [self._table((4,)), self._table((3, 2), start=1.0),
+                  self._table((5,), dtype=np.int32, start=2.0)]
+        want = [np.ascontiguousarray(table) for table in tables]
+        self._read_matches(
+            tables, want,
+            lambda group, device: self._read(tensorplay._foreach_clone(group)),
+            "_foreach_clone of a group")
+
+    def test_a_group_set_to_nothing_answers_zeroes(self):
+        # The walk that sets a whole group to nothing is pinned in the form the
+        # frontend reaches.  The fresh-answer registration is kept beside it so a
+        # group asked on either lane answers the same key, but it has no wrapper
+        # of its own to call here.
+        tables = [self._table((4,)), self._table((3, 2), start=1.0),
+                  self._table((5,), dtype=np.int32, start=2.0)]
+        want = [np.zeros_like(np.ascontiguousarray(table)) for table in tables]
+        self._write_matches(
+            tables, want,
+            lambda group, device: tensorplay._foreach_zero_(group),
+            "_foreach_zero_ of a group")
+
+    def test_a_moving_group_refuses_a_partner_list_that_runs_short(self):
+        tables = [self._table((4,)), self._table((3, 2)), self._table((5,))]
+        for device in ("vulkan", "cpu"):
+            group = self._group(tables, device)
+            short = self._group(tables[:2], device)
+            with self.assertRaisesRegex(
+                    ValueError, "tensor list arguments must have the same length"):
+                tensorplay._foreach_copy(group, short)
+            with self.assertRaisesRegex(
+                    ValueError, "tensor list arguments must have the same length"):
+                tensorplay._foreach_copy_(group, short)
+
 
 class TestVulkanRowAccumulation(unittest.TestCase):
     # A list of row codes may name one row several times, and every row it names

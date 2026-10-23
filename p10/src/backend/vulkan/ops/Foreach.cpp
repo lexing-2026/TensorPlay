@@ -4,6 +4,7 @@
 
 #include "tensorplay/ops/TPXOpsGenerated.h"
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -547,6 +548,57 @@ void foreach_lerp_list_inplace_kernel(
   }
 }
 
+// The group that moves instead of folding: a payload carried into the lanes its
+// partner names, a fresh copy of every tensor, and a group set to nothing.  A
+// move keeps the width of the destination and converts the way in, so a partner
+// held in another element type answers beside it; a fresh copy keeps the shape
+// and the width the tensor already had.  The route a group takes is decided
+// before any lane is written, so a side naming fewer tensors is refused.
+std::vector<Tensor> foreach_clone_kernel(
+    const std::vector<Tensor>& self,
+    std::optional<int64_t> memory_format) {
+  return walk_each(self, [&](const Tensor& value) {
+    return tpx::ops::clone(value, memory_format);
+  });
+}
+
+std::vector<Tensor> foreach_copy_kernel(
+    const std::vector<Tensor>& self,
+    const std::vector<Tensor>& src,
+    bool non_blocking) {
+  return walk_pairs(self, src, [&](const Tensor& destination,
+                                   const Tensor& source) {
+    // The answer is the destination carried over, not the partner: a fresh copy
+    // keeps the width and the shape the group was asked to answer in, and the
+    // partner is written into it, converting on the way in.
+    Tensor fresh = tpx::ops::clone(destination);
+    tpx::ops::copy_(fresh, source, non_blocking);
+    return fresh;
+  });
+}
+
+void foreach_copy_inplace_kernel(
+    std::vector<Tensor> self,
+    const std::vector<Tensor>& src,
+    bool non_blocking) {
+  walk_pairs_inplace(
+      self, src, [&](Tensor& destination, const Tensor& source) {
+        tpx::ops::copy_(destination, source, non_blocking);
+      });
+}
+
+std::vector<Tensor> foreach_zero_kernel(const std::vector<Tensor>& self) {
+  return walk_each(self, [](const Tensor& value) {
+    Tensor fresh = tpx::ops::clone(value);
+    tpx::ops::zero_(fresh);
+    return fresh;
+  });
+}
+
+void foreach_zero_inplace_kernel(std::vector<Tensor> self) {
+  walk_each_inplace(self, [](Tensor& value) { tpx::ops::zero_(value); });
+}
+
 // A group raised to a count.  The exponent is either one count, one count per
 // tensor, or a payload of its own, and a shared base may be a count or a
 // payload held beside the walk.
@@ -804,6 +856,22 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, ForeachKernels) {
   m.impl(
       "_foreach_lerp_.List",
       &tensorplay::vulkan::ops::foreach_lerp_list_inplace_kernel);
+
+  m.impl(
+      "_foreach_clone",
+      &tensorplay::vulkan::ops::foreach_clone_kernel);
+  m.impl(
+      "_foreach_copy",
+      &tensorplay::vulkan::ops::foreach_copy_kernel);
+  m.impl(
+      "_foreach_copy_",
+      &tensorplay::vulkan::ops::foreach_copy_inplace_kernel);
+  m.impl(
+      "_foreach_zero",
+      &tensorplay::vulkan::ops::foreach_zero_kernel);
+  m.impl(
+      "_foreach_zero_",
+      &tensorplay::vulkan::ops::foreach_zero_inplace_kernel);
 
   m.impl(
       "_foreach_pow.Scalar",
