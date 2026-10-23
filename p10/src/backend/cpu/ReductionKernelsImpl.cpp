@@ -897,7 +897,7 @@ static void logical_reduce_f64_dim_row(
 // change any more stops early.
 template <typename ctype, bool WantAll>
 static void logical_reduce_dim0_rows(
-    const ctype* input, uint8_t* output, int64_t d_size, int64_t inner) {
+    const ctype* input, bool* output, int64_t d_size, int64_t inner) {
     const uint8_t init = WantAll ? 1 : 0;
     auto settled = [&](const uint8_t* lanes) {
         for (int64_t col = 0; col < inner; ++col) {
@@ -956,7 +956,7 @@ static void logical_reduce_dim0_rows(
         }
     }
     for (int64_t col = 0; col < inner; ++col) {
-        output[col] = acc[col];
+        output[col] = acc[col] != 0;
     }
 }
 
