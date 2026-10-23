@@ -2243,10 +2243,12 @@ Tensor index_fill_tensor_kernel(
 // the write the row scatter the same axis already drives.  A read that names
 // more than one axis, or compacts an axis by a mask, is answered instead by a
 // walk that turns every coordinate into an address of the flattened payload
-// and hands those addresses to the flat lookup.  The write keeps to the row
-// scatter: the addresses a walk composes name single lanes inside the payload,
-// and no row scatter describes them, while a write through the payload
-// narrowed to a line reaches a copy of it rather than the payload itself.
+// and hands those addresses to the flat lookup.  A write of several lists is
+// answered by neither: the addresses a walk composes name single lanes inside
+// the payload, and no row scatter describes them, while a write through the
+// payload narrowed to a line reaches a copy of it rather than the payload
+// itself.  The lanes one mask opens are the exception, because a mask names
+// them in the order the payload holds them.
 //
 namespace {
 
@@ -2261,24 +2263,30 @@ int64_t checked_code_axis(
       std::string("Vulkan ") + name +
           ": the tuple holds more indices than the payload has axes");
   int64_t axis = -1;
+  int64_t named = 0;
   for (size_t entry = 0; entry < indices.size(); ++entry) {
     if (!indices[entry].has_value() || !indices[entry]->defined()) {
       continue;
     }
-    TP_CHECK(
-        axis < 0,
-        std::string("Vulkan ") + name +
-            ": a tuple of several lists of codes is not answered on the device");
-    const Tensor& codes = *indices[entry];
-    // A list that arrived from the host is taken along by the row walk, which
-    // uploads it in the same move that narrows a wide code to a word; a list
-    // already on the device never crosses that transfer.
-    TP_CHECK(
-        codes.dtype() == DType::Int32 || codes.dtype() == DType::Int64,
-        std::string("Vulkan ") + name +
-            ": an index has to be a list of row codes");
+    ++named;
     axis = static_cast<int64_t>(entry);
   }
+  if (named == 0) {
+    return -1;
+  }
+  // The count is settled before the vocabulary, so a tuple of several indices
+  // says how many it carries rather than what the first of them holds.
+  TP_CHECK(
+      named <= 1,
+      std::string("Vulkan ") + name +
+          ": a tuple of several lists of codes is not answered on the device");
+  const Tensor& codes = *indices[static_cast<size_t>(axis)];
+  // A list that arrived from the host is taken along by the row walk, which
+  // uploads it in the same move that narrows a wide code to a word; a list
+  // already on the device never crosses that transfer.
+  TP_CHECK(
+      codes.dtype() == DType::Int32 || codes.dtype() == DType::Int64,
+      std::string("Vulkan ") + name + ": an index has to be a list of row codes");
   return axis;
 }
 
@@ -2395,6 +2403,20 @@ Tensor advanced_index_read(
   out_sizes.insert(
       out_sizes.begin() + first, block.begin(), block.end());
 
+  // The block the codes broadcast to can be wider than the axes it names, so
+  // the addresses carry the rank of the answer rather than that of the payload.
+  // A leading axis keeps its place; an axis after the block follows the block.
+  const int64_t width = static_cast<int64_t>(layout.size());
+  auto layout_slot = [first, indexed, &block](int64_t axis) {
+    if (axis < first) {
+      return axis;
+    }
+    if (axis >= first + indexed) {
+      return axis - indexed + static_cast<int64_t>(block.size());
+    }
+    return axis;
+  };
+
   Tensor addresses;
   for (int64_t axis = 0; axis < rank; ++axis) {
     const int64_t size = payload.size(axis);
@@ -2408,8 +2430,9 @@ Tensor advanced_index_read(
           tpx::ops::add(term, Scalar(size)),
           term);
     } else {
-      std::vector<int64_t> shape(static_cast<size_t>(rank), 1);
-      shape[static_cast<size_t>(axis)] = size;
+      std::vector<int64_t> shape(
+          static_cast<size_t>(width), 1);
+      shape[static_cast<size_t>(layout_slot(axis))] = size;
       term = tpx::ops::arange(
                    Scalar(0),
                    Scalar(size),
@@ -2427,6 +2450,102 @@ Tensor advanced_index_read(
   // The addresses broadcast to one lane per answer element as they are summed;
   // the lookup hands them back in the shape the tuple names.
   return tpx::ops::take(payload, addresses).reshape(out_sizes);
+}
+
+// The mask a tuple carries when it holds exactly one and that mask lines up
+// with the leading axes of the payload, brought to the payload's own shape.
+// Nothing is returned for a tuple of several indices or one whose index holds
+// counts rather than lanes.
+std::optional<Tensor> lone_flag_mask(
+    const Tensor& self,
+    const std::vector<std::optional<Tensor>>& indices) {
+  std::optional<Tensor> found;
+  int64_t consumed = 0;
+  for (const auto& entry : indices) {
+    if (!entry.has_value() || !entry->defined()) {
+      // An axis left whole still takes a place in the tuple, so the mask that
+      // follows it names the axis after that place.
+      if (!found.has_value()) {
+        ++consumed;
+      }
+      continue;
+    }
+    if (found.has_value()) {
+      return std::nullopt;
+    }
+    const Tensor& mask = *entry;
+    if (mask.dtype() != DType::Bool && mask.dtype() != DType::UInt8) {
+      return std::nullopt;
+    }
+    // A mask with no axis of its own opens a dimension rather than naming the
+    // lanes of one, which no walk of this payload answers.
+    TP_CHECK(
+        mask.dim() > 0,
+        "Vulkan index_put_: a mask has to name the lanes of an axis");
+    for (int64_t axis = 0; axis < mask.dim(); ++axis) {
+      TP_CHECK(
+          consumed + axis < self.dim() &&
+              mask.size(axis) == self.size(consumed + axis),
+          "Vulkan index_put_: the shape of the mask does not match the "
+          "tensor it writes");
+    }
+    consumed += mask.dim();
+    found = mask;
+  }
+  if (!found.has_value()) {
+    return std::nullopt;
+  }
+  Tensor flags = *found;
+  if (flags.device() != self.device()) {
+    flags = flags.to(self.device());
+  }
+  if (flags.dtype() != DType::Bool) {
+    flags = tpx::ops::ne(flags, Scalar(0));
+  }
+  // The axes the mask does not name are held one lane deep, so the write reads
+  // every lane the payload holds under each of its own.
+  std::vector<int64_t> shape = static_cast<std::vector<int64_t>>(flags.shape());
+  shape.insert(shape.end(), static_cast<size_t>(self.dim() - consumed), 1);
+  return flags.reshape(shape);
+}
+
+// The write that opens the lanes one mask selects.  A lone number is laid in
+// every lane the mask opens, and a payload is spread over them in the order the
+// mask walks the lanes, which is the order the compaction reads them.  Both
+// forms keep to the device, so no step of the write waits on the queue; the
+// spread is answered for the element type that travels as a fraction.
+Tensor& mask_write_inplace(
+    Tensor& self,
+    const Tensor& mask,
+    const Tensor& values,
+    bool accumulate) {
+  TP_CHECK(
+      values.dtype() == self.dtype(),
+      "Index put requires the source and destination dtypes match");
+  if (values.numel() == 1) {
+    // A number that stayed on the host costs one lane to bring along.
+    const Tensor filler =
+        values.device() == self.device() ? values : values.to(self.device());
+    // The lanes the mask opens take the number, the rest keep what they held;
+    // adding hands the opened lanes the sum of the pair instead.
+    const Tensor opened = accumulate ? tpx::ops::add(self, filler) : filler;
+    self.copy_(tpx::ops::where(mask, opened, self));
+    return self;
+  }
+  // A payload that arrived from elsewhere is left where it is, so the spread
+  // reports the pair of devices rather than copying through the host.
+  if (accumulate) {
+    // The lanes the mask closes hold nothing, so the sum leaves them alone.
+    self.copy_(tpx::ops::add(
+        self,
+        tpx::ops::masked_scatter(
+            tpx::ops::zeros_like(self, DType::Undefined, self.device(), false),
+            mask,
+            values)));
+    return self;
+  }
+  self.copy_(tpx::ops::masked_scatter(self, mask, values));
+  return self;
 }
 
 } // namespace
@@ -2468,6 +2587,9 @@ Tensor& index_put_impl__kernel(
     bool accumulate,
     bool unsafe) {
   (void)unsafe;
+  if (const auto mask = lone_flag_mask(self, indices)) {
+    return mask_write_inplace(self, *mask, values, accumulate);
+  }
   const int64_t axis = checked_code_axis(self, indices, "index_put_");
   if (axis < 0) {
     // The whole payload is named, so the write is a plain transfer; adding
