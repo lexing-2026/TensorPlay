@@ -946,19 +946,55 @@ __global__ void binary_row_flat_vec_kernel(
     apply_vec_group<T, VecSize, Op>(a0, b0, y_row, col, alpha, op);
 }
 
-// Launches the flat specialization when the output is a contiguous 2-D tensor
+// Scalar companion of the flat kernel, for rows the vector width does not
+// divide.  A row shifted by one element (the difference of two views of the
+// same row) has row bases that alternate out of phase with the store, so no
+// fixed packing works; what still works is dropping the coordinate math: the
+// row comes from blockIdx.y and each thread owns a run of columns, leaving one
+// add, two loads and a store per element.  The second load usually hits
+// cache, since the operands of a shifted pair overlap almost entirely.
+template <typename T, bool ASplat, bool BSplat, typename Op>
+__global__ void binary_row_flat_scalar_kernel(
+    int64_t inner,
+    const T* __restrict__ a, int64_t a_row_stride,
+    const T* __restrict__ b, int64_t b_row_stride,
+    T* __restrict__ y, typename BinaryOpMath<T>::type alpha, Op op) {
+    using M = typename BinaryOpMath<T>::type;
+    constexpr int kColsPerThread = 2;
+    const int64_t row = blockIdx.y;
+    const T* __restrict__ a_row = a + row * a_row_stride;
+    const T* __restrict__ b_row = b + row * b_row_stride;
+    T* __restrict__ y_row = y + row * inner;
+    const int64_t step = static_cast<int64_t>(blockDim.x) * gridDim.x * kColsPerThread;
+    for (int64_t col = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) * kColsPerThread;
+         col < inner; col += step) {
+#pragma unroll
+        for (int k = 0; k < kColsPerThread; ++k) {
+            const int64_t c = col + k;
+            if (c < inner) {
+                y_row[c] = static_cast<T>(op(
+                    static_cast<M>(ASplat ? a_row[0] : a_row[c]),
+                    static_cast<M>(BSplat ? b_row[0] : b_row[c]),
+                    static_cast<M>(alpha)));
+            }
+        }
+    }
+}
+
+// Launches a flat specialization when the output is a contiguous 2-D tensor
 // and both operands right-align to it with at most one row stride each.  A
 // trailing size-1 dim makes an operand a per-row splat; a trailing dim equal
-// to the row length is read as packed groups, which needs a unit inner stride
-// and 4-element-aligned row bases.  Returns false so the general row kernel
-// (or the per-element kernel) takes the shape instead.
+// to the row length is read either as packed groups (needs a row length and
+// row bases the vector width divides) or, when the shape is not packable, one
+// scalar column run per thread.  Returns false so the general row kernel (or
+// the per-element kernel) takes the shape instead.
 template <typename T, typename Op>
 inline bool try_row_flat(
     int64_t inner, int64_t rows, const Tensor& a, const Tensor& b, Tensor& y,
     typename BinaryOpMath<T>::type alpha, Op op, cudaStream_t stream) {
     constexpr int kVec = 4;
     const uintptr_t align_mask = sizeof(T) * kVec - 1;
-    if (y.dim() != 2 || inner % kVec != 0) return false;
+    if (y.dim() != 2) return false;
     if (rows <= 0 || rows > 65535 || a.dim() < 1 || b.dim() < 1) return false;
     if (a.dim() > 2 || b.dim() > 2) return false;
     // Broadcasting contract, right-aligned: the trailing dim spans the row or
@@ -971,28 +1007,57 @@ inline bool try_row_flat(
     if (b.dim() == 2 && b.size(0) != 1 && b.size(0) != rows) return false;
     const int64_t a_row_stride = (a.dim() == 2 && a.size(0) != 1) ? a.stride(0) : 0;
     const int64_t b_row_stride = (b.dim() == 2 && b.size(0) != 1) ? b.stride(0) : 0;
-    if (a_full &&
-        (a.stride(-1) != 1 || a_row_stride % kVec != 0 ||
-         (reinterpret_cast<uintptr_t>(a.data_ptr<T>()) & align_mask) != 0)) {
-        return false;
-    }
-    if (b_full &&
-        (b.stride(-1) != 1 || b_row_stride % kVec != 0 ||
-         (reinterpret_cast<uintptr_t>(b.data_ptr<T>()) & align_mask) != 0)) {
-        return false;
-    }
-    if ((reinterpret_cast<uintptr_t>(y.data_ptr<T>()) & align_mask) != 0) return false;
+    // Both kernels walk a row by adding one per column, so a row-spanning
+    // operand has to be unit-stride along it.
+    if (a_full && a.stride(-1) != 1) return false;
+    if (b_full && b.stride(-1) != 1) return false;
+    const bool packed = inner % kVec == 0 &&
+        (reinterpret_cast<uintptr_t>(y.data_ptr<T>()) & align_mask) == 0 &&
+        (!a_full || (a_row_stride % kVec == 0 &&
+                     (reinterpret_cast<uintptr_t>(a.data_ptr<T>()) & align_mask) == 0)) &&
+        (!b_full || (b_row_stride % kVec == 0 &&
+                     (reinterpret_cast<uintptr_t>(b.data_ptr<T>()) & align_mask) == 0));
 
-    const int64_t vec_inner = inner / kVec;
     // Short rows would leave most lanes idle in a full block; shrink the block
     // to a warp multiple that still covers the row.
+    const int64_t groups = packed ? inner / kVec : inner / 2;
     unsigned threads = 256;
-    if (vec_inner < static_cast<int64_t>(threads)) {
-        threads = static_cast<unsigned>(((vec_inner + 31) / 32) * 32);
+    if (groups < static_cast<int64_t>(threads)) {
+        threads = static_cast<unsigned>(((groups + 31) / 32) * 32);
+        if (threads == 0) threads = 32;
     }
-    const int64_t blocks_x = (vec_inner + threads - 1) / threads;
+    const int64_t blocks_x = (groups + threads - 1) / threads;
     if (blocks_x > 2147483647) return false;
+    if (blocks_x == 0) return false;
     dim3 grid(static_cast<unsigned>(blocks_x), static_cast<unsigned>(rows));
+    if (!packed) {
+        if (a_full) {
+            if (b_full) {
+                binary_row_flat_scalar_kernel<T, false, false, Op>
+                    <<<grid, threads, 0, stream>>>(
+                        inner, a.data_ptr<T>(), a_row_stride,
+                        b.data_ptr<T>(), b_row_stride, y.data_ptr<T>(), alpha, op);
+            } else {
+                binary_row_flat_scalar_kernel<T, false, true, Op>
+                    <<<grid, threads, 0, stream>>>(
+                        inner, a.data_ptr<T>(), a_row_stride,
+                        b.data_ptr<T>(), b_row_stride, y.data_ptr<T>(), alpha, op);
+            }
+        } else if (b_full) {
+            binary_row_flat_scalar_kernel<T, true, false, Op>
+                <<<grid, threads, 0, stream>>>(
+                    inner, a.data_ptr<T>(), a_row_stride,
+                    b.data_ptr<T>(), b_row_stride, y.data_ptr<T>(), alpha, op);
+        } else {
+            binary_row_flat_scalar_kernel<T, true, true, Op>
+                <<<grid, threads, 0, stream>>>(
+                    inner, a.data_ptr<T>(), a_row_stride,
+                    b.data_ptr<T>(), b_row_stride, y.data_ptr<T>(), alpha, op);
+        }
+        return true;
+    }
+
+    const int64_t vec_inner = inner / kVec;
     // The splat pattern is fixed for the whole launch, so select it at compile
     // time instead of branching per thread.
     if (a_full) {
