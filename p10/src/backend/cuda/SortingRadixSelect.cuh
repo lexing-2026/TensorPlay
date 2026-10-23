@@ -174,52 +174,62 @@ struct TopKRadixTraits<BFloat16> {
   }
 };
 template <typename Key>
-__device__ inline Key topk_set_bitfield(Key value, Key field, int pos) {
-  const Key mask = static_cast<Key>(3) << pos;
-  return (value & ~mask) | ((field & static_cast<Key>(3)) << pos);
+__device__ inline Key topk_set_bitfield(Key value, Key field, int pos,
+                                        int bits) {
+  const Key mask = static_cast<Key>((static_cast<Key>(1) << bits) - 1);
+  return (value & static_cast<Key>(~(mask << pos))) |
+         ((field & mask) << pos);
 }
 
-template <typename T, typename IndexType>
+// One digit of every element counted into a shared histogram.  A warp finds the
+// lanes that hold the same digit with one match-any, so the cost of a pass does
+// not grow with the number of buckets and a wide digit buys a proportionally
+// shorter scan.  Lanes whose value is outside the pattern still take part in the
+// match, so the warp stays converged, and only the lane first in a group adds
+// the group's size.
+template <typename T, typename IndexType, int RadixBits>
 __device__ inline void topk_count_radix_using_mask(
-    IndexType counts[4], IndexType* smem,
+    IndexType counts[1 << RadixBits], IndexType* smem,
     typename TopKRadixTraits<T>::key_type desired,
     typename TopKRadixTraits<T>::key_type desired_mask, int digit_pos,
     IndexType slice_size, IndexType within_slice_stride, const T* data) {
   using Key = typename TopKRadixTraits<T>::key_type;
-  for (int i = 0; i < 4; ++i) counts[i] = 0;
-  if (threadIdx.x < 4) smem[threadIdx.x] = 0;
+  constexpr int radix_size = 1 << RadixBits;
+  for (int i = 0; i < radix_size; ++i) counts[i] = 0;
+  for (int i = static_cast<int>(threadIdx.x); i < radix_size;
+       i += static_cast<int>(blockDim.x)) {
+    smem[i] = 0;
+  }
   __syncthreads();
 
-  unsigned long long active = __ballot_sync(0xffffffffffffffffull,
-                                            static_cast<IndexType>(threadIdx.x) < slice_size);
+  unsigned active = __ballot_sync(0xffffffffu,
+                                  static_cast<IndexType>(threadIdx.x) <
+                                      slice_size);
   for (IndexType i = static_cast<IndexType>(threadIdx.x); i < slice_size;) {
     const Key value = TopKRadixTraits<T>::encode(
         topk_load(&data[i * within_slice_stride]));
     const bool has_value = (value & desired_mask) == desired;
-    const Key digit = (value >> digit_pos) & static_cast<Key>(3);
-#pragma unroll
-    for (uint32_t j = 0; j < 4; ++j) {
-      counts[j] += static_cast<IndexType>(__popcll(__ballot_sync(
-          active, has_value && digit == static_cast<Key>(j))));
+    const unsigned bucket = has_value
+        ? static_cast<unsigned>(
+              (value >> digit_pos) & static_cast<Key>(radix_size - 1))
+        : static_cast<unsigned>(radix_size);
+    const unsigned same = __match_any_sync(active, bucket);
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    if (has_value && lane == __ffs(same) - 1) {
+      const IndexType group = static_cast<IndexType>(__popc(same));
+      if constexpr (sizeof(IndexType) == sizeof(uint32_t)) {
+        atomicAdd(&smem[bucket], group);
+      } else {
+        atomicAdd(reinterpret_cast<unsigned long long*>(&smem[bucket]),
+                  static_cast<unsigned long long>(group));
+      }
     }
     i += static_cast<IndexType>(blockDim.x);
     active = __ballot_sync(active, i < slice_size);
   }
-
-  if ((threadIdx.x & 31) == 0) {
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      if constexpr (sizeof(IndexType) == sizeof(uint32_t)) {
-        atomicAdd(&smem[i], counts[i]);
-      } else {
-        atomicAdd(reinterpret_cast<unsigned long long*>(&smem[i]),
-                  static_cast<unsigned long long>(counts[i]));
-      }
-    }
-  }
   __syncthreads();
 #pragma unroll
-  for (int i = 0; i < 4; ++i) counts[i] = smem[i];
+  for (int i = 0; i < radix_size; ++i) counts[i] = smem[i];
   __syncthreads();
 }
 
@@ -262,8 +272,8 @@ __device__ inline void topk_radix_select(
     const T* data, IndexType k, bool largest, IndexType slice_size,
     IndexType within_slice_stride, IndexType* smem, T* top_k) {
   using Key = typename TopKRadixTraits<T>::key_type;
-  constexpr int radix_size = 4;
-  constexpr int radix_bits = 2;
+  constexpr int radix_bits = 4;
+  constexpr int radix_size = 1 << radix_bits;
   constexpr int radix_mask = radix_size - 1;
   IndexType counts[radix_size];
   Key desired = 0;
@@ -272,16 +282,16 @@ __device__ inline void topk_radix_select(
 
   for (int digit_pos = TopKRadixTraits<T>::bit_count - radix_bits;
        digit_pos >= 0; digit_pos -= radix_bits) {
-    topk_count_radix_using_mask<T, IndexType>(
+    topk_count_radix_using_mask<T, IndexType, radix_bits>(
         counts, smem, desired, desired_mask, digit_pos, slice_size,
         within_slice_stride, data);
 
     auto found_unique = [&](int i, IndexType count) -> bool {
       if (count == 1 && k_to_find == 1) {
         desired = topk_set_bitfield(
-            desired, static_cast<Key>(i), digit_pos);
+            desired, static_cast<Key>(i), digit_pos, radix_bits);
         desired_mask = topk_set_bitfield(
-            desired_mask, static_cast<Key>(radix_mask), digit_pos);
+            desired_mask, static_cast<Key>(radix_mask), digit_pos, radix_bits);
         *top_k = topk_find_pattern<T, IndexType>(
             smem, data, slice_size, within_slice_stride, desired,
             desired_mask);
@@ -292,9 +302,9 @@ __device__ inline void topk_radix_select(
     auto found_non_unique = [&](int i, IndexType count) -> bool {
       if (count >= k_to_find) {
         desired = topk_set_bitfield(
-            desired, static_cast<Key>(i), digit_pos);
+            desired, static_cast<Key>(i), digit_pos, radix_bits);
         desired_mask = topk_set_bitfield(
-            desired_mask, static_cast<Key>(radix_mask), digit_pos);
+            desired_mask, static_cast<Key>(radix_mask), digit_pos, radix_bits);
         return true;
       }
       k_to_find -= count;
