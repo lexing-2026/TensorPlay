@@ -238,7 +238,7 @@ constexpr double kLanczos[9] = {
     -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7};
 constexpr double kHalfLogTwoPi = 0.91893853320467274178032973640562;
 
-// Natural logarithm of a float vector.
+// Natural logarithm of a float vector, and its base-2 and base-10 scalings.
 //
 // The input is split as 2^e * m with e = round(log2 x), so m lands in
 // [0.75, 1.5).  Rounding the exponent instead of truncating it is what keeps
@@ -250,60 +250,45 @@ constexpr double kHalfLogTwoPi = 0.91893853320467274178032973640562;
 // [-0.25, 0.5).  The fitted P keeps its constant term at 1, so the relative
 // error stays bounded as u approaches zero; the worst relative error over the
 // interval is 1.2e-8, about 0.1 ulp.
+//
+// The base only scales P and changes the exponent term, so all three come out
+// of one template.  Base 2 adds the integer exponent straight to the mantissa
+// term; the other two fold the log of their base into P, which keeps the
+// mantissa product free of an extra scaling multiply.
+enum class LogBase { E, Two, Ten };
+
+template <LogBase Base>
+constexpr float log_poly_scale() {
+    if constexpr (Base == LogBase::Two) {
+        return 1.44269504088896341f;
+    } else if constexpr (Base == LogBase::Ten) {
+        return 0.4342944819032518f;
+    } else {
+        return 1.0f;
+    }
+}
+
+// Fast drops the subnormal rescale and the domain fix-up; the caller then
+// guarantees every lane is a positive normal float.
+template <LogBase Base, bool Fast>
 __attribute__((target("avx2,fma"), always_inline))
-inline __m256 v_log_f32(__m256 x) {
-    // A subnormal leaves the exponent field at zero and its leading bit in the
-    // mantissa, so it is scaled into the normal range first and the factor is
-    // paid back out of the exponent.
-    const __m256 tiny = _mm256_cmp_ps(x, _mm256_set1_ps(1.1754944e-38f), _CMP_LT_OQ);
-    const __m256i ix = _mm256_castps_si256(
-        _mm256_blendv_ps(x, _mm256_mul_ps(x, _mm256_set1_ps(1.8446744e19f)), tiny));
+inline __m256 v_log_impl(__m256 x) {
+    constexpr float kScale = log_poly_scale<Base>();
+    __m256i ix;
+    __m256 tiny = _mm256_setzero_ps();
+    if constexpr (Fast) {
+        ix = _mm256_castps_si256(x);
+    } else {
+        // A subnormal leaves the exponent field at zero and its leading bit
+        // in the mantissa, so it is scaled into the normal range first and
+        // the factor is paid back out of the exponent.
+        tiny = _mm256_cmp_ps(x, _mm256_set1_ps(1.1754944e-38f), _CMP_LT_OQ);
+        ix = _mm256_castps_si256(
+            _mm256_blendv_ps(x, _mm256_mul_ps(x, _mm256_set1_ps(1.8446744e19f)), tiny));
+    }
     // Adding half a mantissa range before shifting rounds the exponent to
     // nearest.  Subtracting the exponent field from the original bit pattern
     // then leaves 0.75 <= m < 1.5.
-    const __m256i biased =
-        _mm256_srli_epi32(_mm256_add_epi32(ix, _mm256_set1_epi32(0x00400000)), 23);
-    const __m256 m = _mm256_castsi256_ps(_mm256_add_epi32(
-        _mm256_sub_epi32(ix, _mm256_slli_epi32(biased, 23)),
-        _mm256_set1_epi32(0x3F800000)));
-    __m256 e = _mm256_cvtepi32_ps(_mm256_sub_epi32(biased, _mm256_set1_epi32(127)));
-    e = _mm256_sub_ps(e, _mm256_and_ps(tiny, _mm256_set1_ps(64.0f)));
-
-    const __m256 u = _mm256_sub_ps(m, _mm256_set1_ps(1.0f));
-    __m256 p = _mm256_set1_ps(-4.413553457e-2f);
-    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(1.032194468e-1f));
-    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(-1.310681637e-1f));
-    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(1.448485294e-1f));
-    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(-1.665304757e-1f));
-    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(1.999078531e-1f));
-    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(-2.499990939e-1f));
-    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(3.333346255e-1f));
-    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(-5.000000213e-1f));
-    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(9.999999972e-1f));
-    // Two-part ln2 keeps the exponent contribution accurate for large |e|;
-    // the mantissa term is the whole answer when e is zero.
-    __m256 r = _mm256_fmadd_ps(e, _mm256_set1_ps(0.693145751953125f), _mm256_mul_ps(u, p));
-    r = _mm256_fmadd_ps(e, _mm256_set1_ps(1.428606765330187e-6f), r);
-
-    // log(0) is -inf, log(+inf) is +inf, and negative or NaN inputs give NaN.
-    // max(x, 0) returns 0 for a NaN first operand, so one compare covers both
-    // the negative and the unordered cases.
-    const __m256 zero = _mm256_setzero_ps();
-    const __m256 bad = _mm256_cmp_ps(_mm256_max_ps(x, zero), x, _CMP_NEQ_UQ);
-    r = _mm256_blendv_ps(r, _mm256_set1_ps(-INFINITY), _mm256_cmp_ps(x, zero, _CMP_EQ_OQ));
-    r = _mm256_blendv_ps(r, x, _mm256_cmp_ps(x, _mm256_set1_ps(3.4028235e38f), _CMP_GT_OQ));
-    return _mm256_blendv_ps(r, _mm256_set1_ps(NAN), bad);
-}
-
-// Range-restricted log for callers that have already proved every lane is a
-// positive normal float.  Dropping the subnormal rescale and the domain
-// fix-up removes five instructions; the exponent term also needs only one
-// ln2 FMA here, because its relative error is |ln2 - ln2f| / ln2 = 2.7e-9
-// whatever the exponent -- unlike in exp, where the reduced argument feeds
-// straight into the result and the error grows with the exponent.
-__attribute__((target("avx2,fma"), always_inline))
-inline __m256 v_log_f32_fast(__m256 x) {
-    const __m256i ix = _mm256_castps_si256(x);
     const __m256i biased =
         _mm256_srli_epi32(_mm256_add_epi32(ix, _mm256_set1_epi32(0x00400000)), 23);
     const __m256i ei = _mm256_sub_epi32(biased, _mm256_set1_epi32(127));
@@ -313,20 +298,122 @@ inline __m256 v_log_f32_fast(__m256 x) {
     // negative exponent because the arithmetic is modulo 2^32.
     const __m256 m = _mm256_castsi256_ps(
         _mm256_sub_epi32(ix, _mm256_slli_epi32(ei, 23)));
-    const __m256 e = _mm256_cvtepi32_ps(ei);
+    __m256 e = _mm256_cvtepi32_ps(ei);
+    if constexpr (!Fast) {
+        e = _mm256_sub_ps(e, _mm256_and_ps(tiny, _mm256_set1_ps(64.0f)));
+    }
+
     const __m256 u = _mm256_sub_ps(m, _mm256_set1_ps(1.0f));
-    __m256 p = _mm256_set1_ps(-4.413553457e-2f);
-    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(1.032194468e-1f));
-    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(-1.310681637e-1f));
-    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(1.448485294e-1f));
-    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(-1.665304757e-1f));
-    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(1.999078531e-1f));
-    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(-2.499990939e-1f));
-    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(3.333346255e-1f));
-    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(-5.000000213e-1f));
-    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(9.999999972e-1f));
-    return _mm256_fmadd_ps(e, _mm256_set1_ps(0.693147182464599609375f),
-                           _mm256_mul_ps(u, p));
+    __m256 p = _mm256_set1_ps(-4.413553457e-2f * kScale);
+    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(1.032194468e-1f * kScale));
+    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(-1.310681637e-1f * kScale));
+    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(1.448485294e-1f * kScale));
+    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(-1.665304757e-1f * kScale));
+    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(1.999078531e-1f * kScale));
+    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(-2.499990939e-1f * kScale));
+    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(3.333346255e-1f * kScale));
+    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(-5.000000213e-1f * kScale));
+    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(9.999999972e-1f * kScale));
+
+    __m256 r;
+    if constexpr (Base == LogBase::Two) {
+        r = _mm256_add_ps(e, _mm256_mul_ps(u, p));
+    } else {
+        // One FMA is enough here: the exponent term's relative error is
+        // |c - c_float| / c whatever the exponent, unlike in exp where the
+        // reduced argument feeds straight into the result.
+        constexpr float kHi = Base == LogBase::Ten ? 0.30102999566398119521f
+                                                   : 0.693147182464599609375f;
+        r = _mm256_fmadd_ps(e, _mm256_set1_ps(kHi), _mm256_mul_ps(u, p));
+    }
+
+    if constexpr (!Fast) {
+        // log(0) is -inf, log(+inf) is +inf, and negative or NaN inputs give
+        // NaN.  max(x, 0) returns 0 for a NaN first operand, so one compare
+        // covers both the negative and the unordered cases.
+        const __m256 zero = _mm256_setzero_ps();
+        const __m256 bad = _mm256_cmp_ps(_mm256_max_ps(x, zero), x, _CMP_NEQ_UQ);
+        r = _mm256_blendv_ps(r, _mm256_set1_ps(-INFINITY),
+                             _mm256_cmp_ps(x, zero, _CMP_EQ_OQ));
+        r = _mm256_blendv_ps(r, x,
+                             _mm256_cmp_ps(x, _mm256_set1_ps(3.4028235e38f), _CMP_GT_OQ));
+        r = _mm256_blendv_ps(r, _mm256_set1_ps(NAN), bad);
+    }
+    return r;
+}
+
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256 v_log_f32(__m256 x) {
+    return v_log_impl<LogBase::E, false>(x);
+}
+
+// Range-restricted variants for callers that have already proved every lane
+// is a positive normal float.
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256 v_log_f32_fast(__m256 x) {
+    return v_log_impl<LogBase::E, true>(x);
+}
+
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256 v_log2_f32(__m256 x) {
+    return v_log_impl<LogBase::Two, false>(x);
+}
+
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256 v_log2_f32_fast(__m256 x) {
+    return v_log_impl<LogBase::Two, true>(x);
+}
+
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256 v_log10_f32(__m256 x) {
+    return v_log_impl<LogBase::Ten, false>(x);
+}
+
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256 v_log10_f32_fast(__m256 x) {
+    return v_log_impl<LogBase::Ten, true>(x);
+}
+
+// One pass over a chunk for any of the three bases: a block of 32 whose lanes
+// are all positive normal floats takes the short chain, and anything else --
+// zero, negatives, subnormals, inf, NaN -- runs the guarded version for that
+// block only.
+template <LogBase Base>
+__attribute__((target("avx2,fma"), always_inline))
+inline void log_range_loop(const float* s, float* d, int64_t n, int64_t& i) {
+    const __m256 min_normal = _mm256_set1_ps(1.1754944e-38f);
+    const __m256 inf = _mm256_set1_ps(INFINITY);
+    for (; i + 32 <= n; i += 32) {
+        __m256 x0 = _mm256_loadu_ps(s + i);
+        __m256 x1 = _mm256_loadu_ps(s + i + 8);
+        __m256 x2 = _mm256_loadu_ps(s + i + 16);
+        __m256 x3 = _mm256_loadu_ps(s + i + 24);
+        // Ordered predicates, so a NaN lane fails the test.
+        __m256 good = _mm256_and_ps(
+            _mm256_and_ps(_mm256_cmp_ps(x0, min_normal, _CMP_GE_OQ),
+                          _mm256_cmp_ps(x0, inf, _CMP_LT_OQ)),
+            _mm256_and_ps(_mm256_cmp_ps(x1, min_normal, _CMP_GE_OQ),
+                          _mm256_cmp_ps(x1, inf, _CMP_LT_OQ)));
+        good = _mm256_and_ps(good, _mm256_and_ps(
+            _mm256_and_ps(_mm256_cmp_ps(x2, min_normal, _CMP_GE_OQ),
+                          _mm256_cmp_ps(x2, inf, _CMP_LT_OQ)),
+            _mm256_and_ps(_mm256_cmp_ps(x3, min_normal, _CMP_GE_OQ),
+                          _mm256_cmp_ps(x3, inf, _CMP_LT_OQ))));
+        if (_mm256_movemask_ps(good) == 0xff) {
+            _mm256_storeu_ps(d + i, v_log_impl<Base, true>(x0));
+            _mm256_storeu_ps(d + i + 8, v_log_impl<Base, true>(x1));
+            _mm256_storeu_ps(d + i + 16, v_log_impl<Base, true>(x2));
+            _mm256_storeu_ps(d + i + 24, v_log_impl<Base, true>(x3));
+        } else {
+            _mm256_storeu_ps(d + i, v_log_impl<Base, false>(x0));
+            _mm256_storeu_ps(d + i + 8, v_log_impl<Base, false>(x1));
+            _mm256_storeu_ps(d + i + 16, v_log_impl<Base, false>(x2));
+            _mm256_storeu_ps(d + i + 24, v_log_impl<Base, false>(x3));
+        }
+    }
+    for (; i + 8 <= n; i += 8) {
+        _mm256_storeu_ps(d + i, v_log_impl<Base, false>(_mm256_loadu_ps(s + i)));
+    }
 }
 
 __attribute__((target("avx2,fma"), always_inline))
@@ -845,46 +932,15 @@ static void f32_chunk_avx2(VOp op, VParams prm, const float* src, float* dst, in
         case VOp::Expm1:
             TP_F32_SIMPLE_LOOP_8(tensorplay::tpsleef::expm1(x));
             break;
-        case VOp::Log: {
-            // Same blocking rule as exp: a block of 32 whose lanes are all
-            // positive normal floats takes the short chain, and anything
-            // else -- zero, negatives, subnormals, inf, NaN -- runs the
-            // guarded version for that block only.
-            const __m256 min_normal = _mm256_set1_ps(1.1754944e-38f);
-            const __m256 inf = _mm256_set1_ps(INFINITY);
-            for (; i + 32 <= n; i += 32) {
-                __m256 x0 = _mm256_loadu_ps(s + i);
-                __m256 x1 = _mm256_loadu_ps(s + i + 8);
-                __m256 x2 = _mm256_loadu_ps(s + i + 16);
-                __m256 x3 = _mm256_loadu_ps(s + i + 24);
-                // Ordered predicates, so a NaN lane fails the test.
-                __m256 good = _mm256_and_ps(
-                    _mm256_and_ps(_mm256_cmp_ps(x0, min_normal, _CMP_GE_OQ),
-                                  _mm256_cmp_ps(x0, inf, _CMP_LT_OQ)),
-                    _mm256_and_ps(_mm256_cmp_ps(x1, min_normal, _CMP_GE_OQ),
-                                  _mm256_cmp_ps(x1, inf, _CMP_LT_OQ)));
-                good = _mm256_and_ps(good, _mm256_and_ps(
-                    _mm256_and_ps(_mm256_cmp_ps(x2, min_normal, _CMP_GE_OQ),
-                                  _mm256_cmp_ps(x2, inf, _CMP_LT_OQ)),
-                    _mm256_and_ps(_mm256_cmp_ps(x3, min_normal, _CMP_GE_OQ),
-                                  _mm256_cmp_ps(x3, inf, _CMP_LT_OQ))));
-                if (_mm256_movemask_ps(good) == 0xff) {
-                    _mm256_storeu_ps(d + i, v_log_f32_fast(x0));
-                    _mm256_storeu_ps(d + i + 8, v_log_f32_fast(x1));
-                    _mm256_storeu_ps(d + i + 16, v_log_f32_fast(x2));
-                    _mm256_storeu_ps(d + i + 24, v_log_f32_fast(x3));
-                } else {
-                    _mm256_storeu_ps(d + i, v_log_f32(x0));
-                    _mm256_storeu_ps(d + i + 8, v_log_f32(x1));
-                    _mm256_storeu_ps(d + i + 16, v_log_f32(x2));
-                    _mm256_storeu_ps(d + i + 24, v_log_f32(x3));
-                }
-            }
-            for (; i + 8 <= n; i += 8) {
-                _mm256_storeu_ps(d + i, v_log_f32(_mm256_loadu_ps(s + i)));
-            }
+        case VOp::Log:
+            log_range_loop<LogBase::E>(s, d, n, i);
             break;
-        }
+        case VOp::Log2:
+            log_range_loop<LogBase::Two>(s, d, n, i);
+            break;
+        case VOp::Log10:
+            log_range_loop<LogBase::Ten>(s, d, n, i);
+            break;
         case VOp::Log1p:
             TP_F32_SIMPLE_LOOP_8(tensorplay::tpsleef::log1p(x));
             break;
@@ -1001,12 +1057,6 @@ static void f32_chunk_avx2(VOp op, VParams prm, const float* src, float* dst, in
                 _mm256_min_ps(six, _mm256_max_ps(zero, _mm256_add_ps(x, three))), six));
             break;
         }
-        case VOp::Log2:
-            TP_F32_SIMPLE_LOOP_8(tensorplay::tpsleef::log2(x));
-            break;
-        case VOp::Log10:
-            TP_F32_SIMPLE_LOOP_8(tensorplay::tpsleef::log10(x));
-            break;
         case VOp::Sin:
             TP_F32_SIMPLE_LOOP_8(tensorplay::tpsleef::sin(x));
             break;
