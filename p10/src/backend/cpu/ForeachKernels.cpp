@@ -272,6 +272,16 @@ std::vector<Scalar> unpack_packed_scalar_tensor(const Tensor& scalars,
     return result;
 }
 
+// One count shared by a whole group reaches every tensor unchanged, so it has
+// to name a single lane; a payload of another shape would leave the walk
+// pairing tensors against lanes it never asked for.
+void check_lone_count(const Tensor& scalar) {
+    TP_CHECK_VALUE(scalar.dim() == 0 && scalar.numel() == 1,
+                   "scalar tensor expected to be 0 dim but it has ",
+                   scalar.dim(), " dimensions and ", scalar.numel(),
+                   " elements");
+}
+
 template <typename F>
 std::vector<Tensor> map_tensors(const std::vector<Tensor>& self, F&& fn) {
     std::vector<Tensor> result;
@@ -450,6 +460,7 @@ std::vector<Tensor> foreach_add_scalar_list_cpu(const std::vector<Tensor>& self,
     return map_scalar_lists(self, scalars, [&](const Tensor& value, Scalar scalar) { return value.add(scalar); });
 }
 std::vector<Tensor> foreach_add_tensor_cpu(const std::vector<Tensor>& self, const Tensor& other, const Scalar& alpha) {
+    check_lone_count(other);
     return map_tensors(self, [&](const Tensor& value) { return value.add(other, alpha); });
 }
 void foreach_add_scalar_inplace_cpu(std::vector<Tensor> self, Scalar scalar) {
@@ -462,6 +473,7 @@ void foreach_add_scalar_list_inplace_cpu(std::vector<Tensor> self, const std::ve
     map_scalar_lists_inplace(std::move(self), scalars, [&](Tensor& value, Scalar scalar) { value.add_(scalar); });
 }
 void foreach_add_tensor_inplace_cpu(std::vector<Tensor> self, const Tensor& other, const Scalar& alpha) {
+    check_lone_count(other);
     // Broadcast singleton fast path (optimizer state-step bumps): one flat
     // schedule instead of 100+ dispatcher round trips.
     if (other.defined() && other.numel() == 1 && other.is_contiguous() &&
@@ -492,9 +504,11 @@ std::vector<Tensor> foreach_##NAME##_scalar_list_cpu(const std::vector<Tensor>& 
     return map_scalar_lists(self, scalars, [&](const Tensor& value, const Scalar& scalar) { return value.METHOD(scalar); }); \
 } \
 std::vector<Tensor> foreach_##NAME##_tensor_cpu(const std::vector<Tensor>& self, const Tensor& other) { \
+    check_lone_count(other); \
     return map_tensors(self, [&](const Tensor& value) { return value.METHOD(other); }); \
 } \
 void foreach_##NAME##_tensor_inplace_cpu(std::vector<Tensor> self, const Tensor& other) { \
+    check_lone_count(other); \
     map_tensors_inplace(std::move(self), [&](Tensor& value) { value.copy_(value.METHOD(other)); }); \
 } \
 void foreach_##NAME##_scalar_inplace_cpu(std::vector<Tensor> self, const Scalar& scalar) { \
@@ -524,9 +538,11 @@ std::vector<Tensor> foreach_sub_scalar_list_cpu(const std::vector<Tensor>& self,
     return map_scalar_lists(self, scalars, [&](const Tensor& value, Scalar scalar) { return value.sub(scalar); });
 }
 std::vector<Tensor> foreach_sub_tensor_cpu(const std::vector<Tensor>& self, const Tensor& other, const Scalar& alpha) {
+    check_lone_count(other);
     return map_tensors(self, [&](const Tensor& value) { return value.sub(other, alpha); });
 }
 void foreach_sub_tensor_inplace_cpu(std::vector<Tensor> self, const Tensor& other, const Scalar& alpha) {
+    check_lone_count(other);
     if (other.defined() && other.numel() == 1 && other.is_contiguous() &&
         !self.empty() && self[0].dtype() == other.dtype() &&
         (other.dtype() == DType::Float32 || other.dtype() == DType::Float64)) {
