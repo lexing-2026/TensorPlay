@@ -84,6 +84,12 @@ namespace detail {
 // Round-to-nearest-even conversion from f32 to bf16 (host fallback)
 inline uint16_t float_to_bfloat16_bits(float f) {
   uint32_t bits = TP_BIT_CAST(uint32_t, f);
+  // A not-a-number keeps its standing instead of being rounded: a payload
+  // that fills the low bits would carry into the exponent and sign and land
+  // on a number of some order.
+  if ((bits & 0x7F800000u) == 0x7F800000u && (bits & 0x007FFFFFu) != 0) {
+    return static_cast<uint16_t>(0x7FC0u);
+  }
   uint32_t rounded = bits + 0x7FFFu + ((bits >> 16) & 1u);
   return static_cast<uint16_t>(rounded >> 16);
 }

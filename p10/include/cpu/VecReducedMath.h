@@ -11,8 +11,7 @@
 // The hardware rounding and the software rounding agree: both round to
 // nearest with ties to even, both carry a value too small for the layout to
 // zero, and both leave an infinity or a not-a-number as one.  A
-// not-a-number keeps its standing rather than its payload, which is what
-// the reference runtime does as well.
+// not-a-number keeps its standing rather than its payload.
 //
 // Design notes:
 // * The crossings below are single translation-unit-local functions built
@@ -74,21 +73,33 @@ inline __m256 widen_bf16_8(const uint16_t* p) {
             _mm_loadu_si128(reinterpret_cast<const __m128i*>(p))), 16));
 }
 
-// The single-precision answer, held in the other reduced width.  The
-// rounding is to nearest with ties to even: the bit that is about to be
-// dropped breaks the tie.
+// The eight answers held in `v`, gathered into the low half of the result.
 __attribute__((target("avx2"), always_inline))
-inline void store_bf16_8(uint16_t* p, __m256 v) {
+inline __m256i narrow_bf16_8(__m256 v) {
     const __m256i bits = _mm256_castps_si256(v);
     const __m256i tie = _mm256_and_si256(
         _mm256_srli_epi32(bits, 16), _mm256_set1_epi32(1));
     const __m256i rounded = _mm256_add_epi32(
         _mm256_add_epi32(bits, _mm256_set1_epi32(0x7FFF)), tie);
+    // A not-a-number keeps its standing instead of being rounded: a payload
+    // that fills the low bits would carry into the exponent and sign and
+    // land on a number of some order.
+    const __m256i ordered =
+        _mm256_castps_si256(_mm256_cmp_ps(v, v, _CMP_ORD_Q));
+    return _mm256_blendv_epi8(_mm256_set1_epi32(0x7FC0),
+                              _mm256_srli_epi32(rounded, 16), ordered);
+}
+
+// The single-precision answer, held in the other reduced width.  The
+// rounding is to nearest with ties to even: the bit that is about to be
+// dropped breaks the tie.
+__attribute__((target("avx2"), always_inline))
+inline void store_bf16_8(uint16_t* p, __m256 v) {
     // The answer is the upper half of each lane.  Moving those halves down
     // leaves numbers that are not signed, so the packing that gathers them
     // does not read a negative answer as a number to be held in range.
     const __m256i packed = _mm256_packus_epi32(
-        _mm256_srli_epi32(rounded, 16), _mm256_setzero_si256());
+        narrow_bf16_8(v), _mm256_setzero_si256());
     // The packing spreads the answers over the two halves of the register;
     // the halves are put back in order, so the answers are the eight
     // sixteen-bit words that follow one another.
@@ -96,6 +107,17 @@ inline void store_bf16_8(uint16_t* p, __m256 v) {
         reinterpret_cast<__m128i*>(p),
         _mm256_castsi256_si128(
             _mm256_permute4x64_epi64(packed, 0x08)));
+}
+
+// Sixteen answers landed by one store: the two packs are gathered into the
+// quarters of one register, each pack keeping its own order.
+__attribute__((target("avx2"), always_inline))
+inline void store_bf16_16(uint16_t* p, __m256 lo, __m256 hi) {
+    const __m256i packed = _mm256_packus_epi32(narrow_bf16_8(lo),
+                                               narrow_bf16_8(hi));
+    _mm256_storeu_si256(
+        reinterpret_cast<__m256i*>(p),
+        _mm256_permute4x64_epi64(packed, 0xD8));
 }
 
 #else
