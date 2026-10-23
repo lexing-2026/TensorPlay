@@ -996,7 +996,8 @@ static bool pair_math_takes(const Tensor& a, const Tensor& b, const Tensor& out)
         return false;
     }
     const DType dt = a.dtype();
-    if (dt != DType::Float32 && dt != DType::Float64 && dt != DType::Float16) {
+    if (dt != DType::Float32 && dt != DType::Float64 &&
+        dt != DType::Float16 && dt != DType::BFloat16) {
         return false;
     }
     if (a.shape() != b.shape() || a.shape() != out.shape() ||
@@ -1013,13 +1014,18 @@ static bool pair_math_takes(const Tensor& a, const Tensor& b, const Tensor& out)
 // thread, and the thread answers the elements of that chunk.
 template <vecbinary::BOp op, typename T>
 static void pair_math_walk(const T* a, const T* b, T* d, int64_t n) {
-    parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+    parallel_for_balanced(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
         if constexpr (std::is_same_v<T, float>) {
-            vecbinary::f32_chunk_avx2<op>(a + begin, b + begin, d + begin, 0,
-                                           end - begin);
+            vecbinary::f32_chunk_avx2<op>(
+                a + begin, b + begin, d + begin, 0, end - begin);
         } else if constexpr (std::is_same_v<T, double>) {
             vecbinary::f64_chunk_avx2<op>(a + begin, b + begin, d + begin, 0,
                                            end - begin);
+        } else if constexpr (std::is_same_v<T, tensorplay::BFloat16>) {
+            vecbinary::bf16_chunk_avx2<op>(
+                reinterpret_cast<const uint16_t*>(a + begin),
+                reinterpret_cast<const uint16_t*>(b + begin),
+                reinterpret_cast<uint16_t*>(d + begin), 0, end - begin);
         } else {
             vecbinary::f16_chunk_avx2<op>(
                 reinterpret_cast<const uint16_t*>(a + begin),
@@ -1034,7 +1040,7 @@ static Tensor pair_math_kernel(const Tensor& a, const Tensor& b, F f,
                                const char* name) {
     if (vecbinary::avx2_available() && a.dtype() == b.dtype() &&
         (a.dtype() == DType::Float32 || a.dtype() == DType::Float64 ||
-         a.dtype() == DType::Float16) &&
+         a.dtype() == DType::Float16 || a.dtype() == DType::BFloat16) &&
         a.shape() == b.shape() && a.is_contiguous() && b.is_contiguous()) {
         Tensor result = Tensor::empty(
             static_cast<std::vector<int64_t>>(a.shape()), a.dtype(),
@@ -1047,6 +1053,11 @@ static Tensor pair_math_kernel(const Tensor& a, const Tensor& b, F f,
             } else if (a.dtype() == DType::Float64) {
                 pair_math_walk<op>(a.data_ptr<double>(), b.data_ptr<double>(),
                                    result.data_ptr<double>(), n);
+            } else if (a.dtype() == DType::BFloat16) {
+                pair_math_walk<op>(
+                    a.data_ptr<tensorplay::BFloat16>(),
+                    b.data_ptr<tensorplay::BFloat16>(),
+                    result.data_ptr<tensorplay::BFloat16>(), n);
             } else {
                 pair_math_walk<op>(
                     a.data_ptr<tensorplay::Half>(), b.data_ptr<tensorplay::Half>(),
@@ -1067,7 +1078,7 @@ static Tensor fmod_like_pair_kernel(const Tensor& a, const Tensor& b, F f,
                                     const char* name) {
     if (vecbinary::avx2_available() && a.dtype() == b.dtype() &&
         (a.dtype() == DType::Float32 || a.dtype() == DType::Float64 ||
-         a.dtype() == DType::Float16) &&
+         a.dtype() == DType::Float16 || a.dtype() == DType::BFloat16) &&
         a.shape() == b.shape() && a.is_contiguous() && b.is_contiguous()) {
         Tensor result = Tensor::empty(
             static_cast<std::vector<int64_t>>(a.shape()), a.dtype(),
@@ -1080,6 +1091,11 @@ static Tensor fmod_like_pair_kernel(const Tensor& a, const Tensor& b, F f,
             } else if (a.dtype() == DType::Float64) {
                 pair_math_walk<op>(a.data_ptr<double>(), b.data_ptr<double>(),
                                    result.data_ptr<double>(), n);
+            } else if (a.dtype() == DType::BFloat16) {
+                pair_math_walk<op>(
+                    a.data_ptr<tensorplay::BFloat16>(),
+                    b.data_ptr<tensorplay::BFloat16>(),
+                    result.data_ptr<tensorplay::BFloat16>(), n);
             } else {
                 pair_math_walk<op>(
                     a.data_ptr<tensorplay::Half>(), b.data_ptr<tensorplay::Half>(),
@@ -1105,6 +1121,11 @@ static Tensor& pair_math_out_kernel(const Tensor& a, const Tensor& b,
             } else if (out.dtype() == DType::Float64) {
                 pair_math_walk<op>(a.data_ptr<double>(), b.data_ptr<double>(),
                                    out.data_ptr<double>(), n);
+            } else if (out.dtype() == DType::BFloat16) {
+                pair_math_walk<op>(
+                    a.data_ptr<tensorplay::BFloat16>(),
+                    b.data_ptr<tensorplay::BFloat16>(),
+                    out.data_ptr<tensorplay::BFloat16>(), n);
             } else {
                 pair_math_walk<op>(
                     a.data_ptr<tensorplay::Half>(), b.data_ptr<tensorplay::Half>(),
