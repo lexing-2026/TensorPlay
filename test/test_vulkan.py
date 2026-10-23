@@ -7761,6 +7761,230 @@ class TestVulkanMaskSpread(unittest.TestCase):
                 tensorplay.tensor([1.0]))
 
 
+class TestVulkanForeachGroup(unittest.TestCase):
+    # A group walk hands one entry of the arithmetic table to every tensor a list
+    # names, so the shape and the width a tensor holds are the shape and the width
+    # its answer keeps.  What the walk adds is a contract and nothing else: two
+    # lists have to pair up by position, and the count a whole group shares has to
+    # name a single lane.  The arithmetic itself is answered by the kernels a lone
+    # tensor reaches, so every walk here is held against the host lane instead of
+    # trusted on its own - and an answer that is a fresh group has to leave the
+    # group it walked untouched, which is what pins the walk as out-of-place.
+
+    @staticmethod
+    def _table(shape, dtype=np.float32, start=0.0):
+        return (((np.arange(int(np.prod(shape)), dtype=np.float32) % 13) / 4.0
+                 + start)).astype(dtype)
+
+    @staticmethod
+    def _group(tables, device):
+        return [tensorplay.from_numpy(np.ascontiguousarray(table)).to(device)
+                for table in tables]
+
+    @staticmethod
+    def _read(group):
+        return [held.cpu().numpy() for held in group]
+
+    def _answers(self, held, want, label, device, rtol=1e-5, atol=1e-6):
+        self.assertEqual(len(held), len(want), msg=f"{label} on {device}")
+        for index, (answer, truth) in enumerate(zip(held, want)):
+            self.assertEqual(tuple(answer.shape), truth.shape,
+                             msg=f"{label} entry {index} on {device}")
+            self.assertEqual(answer.dtype, truth.dtype,
+                             msg=f"{label} entry {index} on {device}")
+            if np.issubdtype(truth.dtype, np.integer):
+                np.testing.assert_array_equal(
+                    answer, truth, err_msg=f"{label} entry {index} on {device}")
+            else:
+                np.testing.assert_allclose(
+                    answer, truth, rtol=rtol, atol=atol,
+                    err_msg=f"{label} entry {index} on {device}")
+
+    def _read_matches(self, tables, want, answer, label, rtol=1e-5, atol=1e-6):
+        # The walk is answered twice per case: once as the group it has to hand
+        # back, once as the group it was handed, which a walk that wrote through
+        # its own reads would show up on immediately.
+        for device in ("vulkan", "cpu"):
+            group = self._group(tables, device)
+            self._answers(answer(group, device), want, label, device, rtol, atol)
+            self._answers(self._read(group), [np.ascontiguousarray(table)
+                                              for table in tables],
+                          label + " leaves the group alone", device, rtol, atol)
+
+    def _write_matches(self, tables, want, write, label, rtol=1e-5, atol=1e-6):
+        for device in ("vulkan", "cpu"):
+            group = self._group(tables, device)
+            self.assertIsNone(write(group, device), msg=f"{label} on {device}")
+            self._answers(self._read(group), want, label, device, rtol, atol)
+
+    def test_a_count_reaches_every_tensor_of_the_group(self):
+        tables = [self._table((3,)), self._table((2, 4)), self._table((5,))]
+        count = 1.5
+        for op, sign in ((tensorplay._foreach_add, lambda t: t + count),
+                         (tensorplay._foreach_sub, lambda t: t - count),
+                         (tensorplay._foreach_mul, lambda t: t * count),
+                         (tensorplay._foreach_div, lambda t: t / count)):
+            want = [sign(np.ascontiguousarray(table)) for table in tables]
+            self._read_matches(
+                tables, want,
+                lambda group, device, op=op: self._read(op(group, count)),
+                f"{op.__name__} by one count")
+
+    def test_a_weight_scales_a_partner_before_it_lands(self):
+        tables = [self._table((4,)), self._table((3, 2))]
+        partners = [self._table((4,), start=1.0), self._table((3, 2), start=2.0)]
+        for op, sign in ((tensorplay._foreach_add, lambda t, p: t + 2.0 * p),
+                         (tensorplay._foreach_sub, lambda t, p: t - 2.0 * p)):
+            want = [sign(np.ascontiguousarray(table), np.ascontiguousarray(partner))
+                    for table, partner in zip(tables, partners)]
+            self._read_matches(
+                tables, want,
+                lambda group, device, op=op: self._read(
+                    op(group, self._group(partners, device), alpha=2.0)),
+                f"{op.__name__} of a weighted group")
+
+    def test_partners_pair_with_tensors_by_position(self):
+        tables = [self._table((3,)), self._table((2, 4)), self._table((5,))]
+        partners = [self._table((3,), start=1.0), self._table((2, 4), start=3.0),
+                    self._table((5,), start=5.0)]
+        for op, sign in ((tensorplay._foreach_add, lambda t, p: t + p),
+                         (tensorplay._foreach_sub, lambda t, p: t - p),
+                         (tensorplay._foreach_mul, lambda t, p: t * p),
+                         (tensorplay._foreach_div, lambda t, p: t / p)):
+            want = [sign(np.ascontiguousarray(table), np.ascontiguousarray(partner))
+                    for table, partner in zip(tables, partners)]
+            self._read_matches(
+                tables, want,
+                lambda group, device, op=op: self._read(
+                    op(group, self._group(partners, device))),
+                f"{op.__name__} of a matching group")
+
+    def test_each_tensor_takes_the_count_it_is_named(self):
+        tables = [self._table((6,)), self._table((2, 3)), self._table((4,))]
+        counts = [1.5, -2.0, 0.25]
+        for op, sign in ((tensorplay._foreach_add, lambda t, c: t + c),
+                         (tensorplay._foreach_sub, lambda t, c: t - c),
+                         (tensorplay._foreach_mul, lambda t, c: t * c),
+                         (tensorplay._foreach_div, lambda t, c: t / c)):
+            want = [sign(np.ascontiguousarray(table), count)
+                    for table, count in zip(tables, counts)]
+            self._read_matches(
+                tables, want,
+                lambda group, device, op=op: self._read(op(group, counts)),
+                f"{op.__name__} by a list of counts")
+
+    def test_one_count_spreads_over_the_group_from_wherever_it_is_held(self):
+        tables = [self._table((3,)), self._table((2, 4))]
+        for host_held in (False, True):
+            # A count the host still holds crosses as the one lane it is; a
+            # count already on the walk's own device is read where it stands.
+            want = [np.ascontiguousarray(table) + 0.5 * 2.0 for table in tables]
+            self._read_matches(
+                tables, want,
+                lambda group, device, host_held=host_held: self._read(
+                    tensorplay._foreach_add(
+                        group,
+                        tensorplay.tensor(np.float32(2.0)) if host_held else
+                        tensorplay.tensor(np.float32(2.0)).to(device),
+                        alpha=0.5)),
+                "a shared count " + ("held by the host" if host_held
+                                    else "held by the device"))
+
+    def test_the_walk_writes_where_the_tensor_stands(self):
+        tables = [self._table((7,)), self._table((2, 3))]
+        partners = [self._table((7,), start=1.0), self._table((2, 3), start=2.0)]
+        want = [np.ascontiguousarray(table) * np.ascontiguousarray(partner)
+                for table, partner in zip(tables, partners)]
+        self._write_matches(
+            tables, want,
+            lambda group, device: tensorplay._foreach_mul_(
+                group, self._group(partners, device)),
+            "a product written into the group")
+        want = [np.ascontiguousarray(table) - 1.5 for table in tables]
+        self._write_matches(
+            tables, want,
+            lambda group, device: tensorplay._foreach_sub_(group, 1.5),
+            "a count written into the group")
+        want = [np.ascontiguousarray(table) + count for table, count
+                in zip(tables, [0.5, -0.25])]
+        self._write_matches(
+            tables, want,
+            lambda group, device: tensorplay._foreach_add_(group, [0.5, -0.25]),
+            "a list of counts written into the group")
+        want = [np.ascontiguousarray(table) + 2.0 * np.ascontiguousarray(partner)
+                for table, partner in zip(tables, partners)]
+        self._write_matches(
+            tables, want,
+            lambda group, device: tensorplay._foreach_add_(
+                group, self._group(partners, device), alpha=2.0),
+            "a weighted group written into the group")
+        want = [np.ascontiguousarray(table) / 2.0 for table in tables]
+        self._write_matches(
+            tables, want,
+            lambda group, device: tensorplay._foreach_div_(
+                group, tensorplay.tensor(np.float32(2.0)).to(device)),
+            "a shared count written into the group")
+
+    def test_a_group_keeps_the_width_it_holds(self):
+        for dtype, count in ((np.float16, 2.0), (np.int32, 3), (np.int64, 3)):
+            tables = [self._table((5,), dtype), self._table((2, 3), dtype)]
+            for op, sign in ((tensorplay._foreach_add, lambda t, c: t + c),
+                             (tensorplay._foreach_sub, lambda t, c: t - c),
+                             (tensorplay._foreach_mul, lambda t, c: t * c)):
+                want = [sign(np.ascontiguousarray(table), count)
+                        for table in tables]
+                want = [held.astype(np.asarray(table).dtype)
+                        for held, table in zip(want, tables)]
+                self._read_matches(
+                    tables, want,
+                    lambda group, device, op=op: self._read(op(group, count)),
+                    f"{op.__name__} over a {np.dtype(dtype).name} group",
+                    rtol=1e-3, atol=1e-3)
+
+    def test_a_group_of_many_tensors_keeps_each_answer_apart(self):
+        tables = [self._table((count,), start=index)
+                  for index, count in enumerate([1, 2, 3, 5, 8, 13, 21, 34])]
+        want = [np.ascontiguousarray(table) * 0.5 for table in tables]
+        self._read_matches(
+            tables, want,
+            lambda group, device: self._read(tensorplay._foreach_mul(group, 0.5)),
+            "a group of eight tensors")
+
+    def test_lists_that_do_not_pair_are_refused(self):
+        tables = [self._table((3,)), self._table((2, 4)), self._table((5,))]
+        for device in ("vulkan", "cpu"):
+            group = self._group(tables, device)
+            with self.assertRaisesRegex(
+                    ValueError, "tensor list arguments must have the same length"):
+                tensorplay._foreach_add(group, self._group(tables[:1], device))
+            with self.assertRaisesRegex(
+                    ValueError, "tensor and scalar lists must have the same length"):
+                tensorplay._foreach_mul(group, [1.5, 2.0])
+
+    def test_a_count_wider_than_one_lane_is_refused(self):
+        # The count a whole group shares has nowhere to pair up with, so a
+        # payload of several lanes is refused rather than broadcast by position.
+        tables = [self._table((3,)), self._table((2, 4))]
+        for device in ("vulkan", "cpu"):
+            group = self._group(tables, device)
+            with self.assertRaisesRegex(ValueError, "expected to be 0 dim"):
+                tensorplay._foreach_add(group, tensorplay.tensor([1.0, 2.0]).to(device))
+            with self.assertRaisesRegex(ValueError, "expected to be 0 dim"):
+                tensorplay._foreach_sub_(
+                    group, tensorplay.tensor([1.0, 2.0, 3.0]).to(device))
+
+    def test_a_group_of_any_size_is_answered_entry_by_entry(self):
+        # One tensor is the smallest group a walk can be handed, and it has to
+        # reach the same entry of the table the walk uses for a group of many.
+        tables = [self._table((2, 3))]
+        want = [np.ascontiguousarray(tables[0]) - 0.75]
+        self._read_matches(
+            tables, want,
+            lambda group, device: self._read(
+                tensorplay._foreach_sub(group, 0.75)),
+            "a group of one tensor")
+
+
 class TestVulkanRowAccumulation(unittest.TestCase):
     # A list of row codes may name one row several times, and every row it names
     # has to reach the destination.  Nothing on this device locks a row while it

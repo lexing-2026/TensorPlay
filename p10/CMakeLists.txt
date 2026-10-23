@@ -692,6 +692,7 @@ if(USE_VULKAN)
         src/backend/vulkan/ops/Copy.cpp
         src/backend/vulkan/ops/Cumsum.cpp
         src/backend/vulkan/ops/Factory.cpp
+        src/backend/vulkan/ops/Foreach.cpp
         src/backend/vulkan/ops/Glu.cpp
         src/backend/vulkan/ops/Gru.cpp
         src/backend/vulkan/ops/MaskedFill.cpp
