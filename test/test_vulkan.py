@@ -13639,6 +13639,157 @@ class TestVulkanInfinityAndNotANumber(unittest.TestCase):
                 tensorplay.nan_to_num(host).numpy(),
                 err_msg=f"nan_to_num over {np.dtype(dtype).name}")
 
+class TestVulkanFrac(unittest.TestCase):
+    # frac answers what a lane keeps once the part toward zero is taken away,
+    # so the answer carries the sign of its lane and never leaves (-1, 1).  A
+    # count holds no fraction of itself and is turned away rather than read
+    # wide and answered with a zero.  Both storages need a case: a row past
+    # the image axis limit lives in a buffer, where a half payload shares one
+    # word with its neighbour and a length that is not a multiple of four
+    # leaves a tail a single invocation owns.
+
+    LENGTHS = (64, 200003)
+    SPECIALS = np.array(
+        [-0.0, 0.0, -3.0, 3.0, -17.0, 0.99999994, -0.99999994, 2.5, -2.5,
+         65504.0, -65504.0, np.inf, -np.inf, np.nan],
+        dtype=np.float32)
+
+    def _values(self, count, dtype, seed=41):
+        rng = np.random.default_rng(seed)
+        values = (rng.standard_normal(count) * 12.0).astype(dtype)
+        values[: self.SPECIALS.size] = self.SPECIALS.astype(dtype)
+        return values
+
+    def _device(self, values):
+        return tensorplay.from_numpy(values.copy()).to("vulkan")
+
+    @staticmethod
+    def _want(values):
+        wide = values.astype(np.float64)
+        return wide - np.trunc(wide)
+
+    def test_a_lane_keeps_what_the_whole_toward_zero_leaves(self):
+        for dtype in (np.float32, np.float16):
+            for length in self.LENGTHS:
+                values = self._values(length, dtype)
+                payload = self._device(values)
+                answer = tensorplay.frac(payload)
+                self.assertEqual(answer.dtype, payload.dtype)
+                self.assertEqual(tuple(answer.shape), (length,))
+                np.testing.assert_allclose(
+                    answer.cpu().numpy().astype(np.float64),
+                    self._want(values), rtol=0, atol=0, equal_nan=True,
+                    err_msg=f"{np.dtype(dtype).name} length {length}")
+                # The allocating form leaves the payload it read standing.
+                np.testing.assert_array_equal(payload.cpu().numpy(), values)
+
+    def test_the_answer_carries_the_sign_of_its_lane_and_stays_inside_one(self):
+        for dtype in (np.float32, np.float16):
+            values = self._values(256, dtype)[self.SPECIALS.size:]
+            answer = tensorplay.frac(self._device(values)).cpu().numpy()
+            self.assertTrue(
+                np.all(np.abs(answer) < 1.0),
+                msg="a fraction left the open unit interval")
+            live = answer != 0.0
+            np.testing.assert_array_equal(
+                np.signbit(answer[live]), np.signbit(values[live]),
+                err_msg=f"{np.dtype(dtype).name} kept another sign")
+
+    def test_a_lane_with_no_fraction_answers_zero(self):
+        whole = np.array(
+            [-0.0, 0.0, -1.0, 1.0, -256.0, 256.0, 65504.0, -65504.0],
+            np.float32)
+        answer = tensorplay.frac(self._device(whole)).cpu().numpy()
+        np.testing.assert_array_equal(answer, np.zeros(whole.shape, np.float32))
+        # A lane that is not a number and an endless lane both answer a
+        # fraction that cannot be named.
+        endless = np.array([np.inf, -np.inf, np.nan], np.float32)
+        self.assertTrue(
+            np.all(np.isnan(
+                tensorplay.frac(self._device(endless)).cpu().numpy())))
+
+    def test_the_walk_writes_into_the_payload_it_read(self):
+        for dtype in (np.float32, np.float16):
+            for length in self.LENGTHS:
+                values = self._values(length, dtype, seed=length)
+                payload = self._device(values)
+                answer = tensorplay.frac_(payload)
+                self.assertEqual(tuple(answer.shape), (length,))
+                np.testing.assert_allclose(
+                    payload.cpu().numpy().astype(np.float64),
+                    self._want(values), rtol=0, atol=0, equal_nan=True,
+                    err_msg=f"{np.dtype(dtype).name} length {length} in place")
+
+    def test_a_count_has_no_fraction_to_take(self):
+        import tensorplay.functional as F
+        counting = {
+            "int32": np.arange(-4, 5, dtype=np.int32),
+            "int64": np.arange(-4, 5, dtype=np.int64),
+            "bool": np.arange(9) % 2 == 0,
+        }
+        for label, values in counting.items():
+            payload = self._device(values)
+            with self.subTest(kind=f"frac over {label}"):
+                with self.assertRaisesRegex(RuntimeError, "measured payload"):
+                    F.frac(payload)
+            with self.subTest(kind=f"frac_ over {label}"):
+                with self.assertRaisesRegex(RuntimeError, "measured payload"):
+                    F.frac_(payload)
+
+    def test_the_gradient_of_a_fraction_is_the_gradient_it_was_given(self):
+        for dtype in (np.float32, np.float16):
+            values = (np.random.default_rng(9).standard_normal(200003) * 9.0
+                      ).astype(dtype)
+            grad = (np.random.default_rng(10).standard_normal(200003) * 3.0
+                    ).astype(dtype)
+            payload = self._device(values).requires_grad_(True)
+            tensorplay.frac(payload).backward(self._device(grad))
+            np.testing.assert_array_equal(
+                payload.grad.cpu().numpy(), grad,
+                err_msg=np.dtype(dtype).name)
+
+    def test_a_view_is_answered_in_its_own_shape(self):
+        base = (np.random.default_rng(13).standard_normal((4, 7, 5)) * 12.0
+                ).astype(np.float32)
+        payload = self._device(base)
+        for label, view, want in (
+                ("a transpose", payload.transpose(0, 2),
+                 np.transpose(base, (2, 1, 0))),
+                ("a strided slice", payload[:, 1:5, ::2], base[:, 1:5, ::2]),
+                ("a narrow plane", payload.narrow(2, 1, 3), base[:, :, 1:4])):
+            answer = tensorplay.frac(view)
+            self.assertEqual(tuple(answer.shape), want.shape)
+            np.testing.assert_allclose(
+                answer.cpu().numpy(), self._want(want), rtol=0, atol=0,
+                equal_nan=True, err_msg=label)
+
+    def test_the_device_answers_what_the_host_answers(self):
+        for dtype in (np.float32, np.float16):
+            for length in self.LENGTHS:
+                values = self._values(length, dtype, seed=length + 5)
+                host = tensorplay.from_numpy(values.copy())
+                np.testing.assert_allclose(
+                    tensorplay.frac(self._device(values)).cpu().numpy(
+                    ).astype(np.float64),
+                    tensorplay.frac(host).numpy().astype(np.float64),
+                    rtol=0, atol=0, equal_nan=True,
+                    err_msg=f"frac over {np.dtype(dtype).name} length {length}")
+                inplace_host = tensorplay.from_numpy(values.copy())
+                np.testing.assert_allclose(
+                    tensorplay.frac_(
+                        self._device(values)).cpu().numpy().astype(np.float64),
+                    tensorplay.frac_(inplace_host).numpy().astype(np.float64),
+                    rtol=0, atol=0, equal_nan=True,
+                    err_msg=f"frac_ over {np.dtype(dtype).name}")
+
+    def test_a_payload_with_no_lane_answers_no_lane(self):
+        for shape in ((0,), (0, 5), (2, 0, 3)):
+            answer = tensorplay.frac(
+                self._device(np.zeros(shape, np.float32)))
+            self.assertEqual(tuple(answer.shape), shape)
+            self.assertEqual(answer.numel(), 0)
+
+
 class TestVulkanLogSigmoid(unittest.TestCase):
     # log_sigmoid answers min(x, 0) - log(1 + exp(-|x|)) in one pass, so a lane
     # far below zero keeps its value and a lane far above zero approaches zero
