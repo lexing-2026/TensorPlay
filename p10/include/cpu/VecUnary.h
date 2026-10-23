@@ -295,6 +295,40 @@ inline __m256 v_log_f32(__m256 x) {
     return _mm256_blendv_ps(r, _mm256_set1_ps(NAN), bad);
 }
 
+// Range-restricted log for callers that have already proved every lane is a
+// positive normal float.  Dropping the subnormal rescale and the domain
+// fix-up removes five instructions; the exponent term also needs only one
+// ln2 FMA here, because its relative error is |ln2 - ln2f| / ln2 = 2.7e-9
+// whatever the exponent -- unlike in exp, where the reduced argument feeds
+// straight into the result and the error grows with the exponent.
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256 v_log_f32_fast(__m256 x) {
+    const __m256i ix = _mm256_castps_si256(x);
+    const __m256i biased =
+        _mm256_srli_epi32(_mm256_add_epi32(ix, _mm256_set1_epi32(0x00400000)), 23);
+    const __m256i ei = _mm256_sub_epi32(biased, _mm256_set1_epi32(127));
+    // Removing the exponent field leaves x / 2^ei in [0.75, 1.5).  Taking the
+    // bias out first keeps the mantissa rebuild to one shift and one
+    // subtract; the shift is a logical one, which is still correct for a
+    // negative exponent because the arithmetic is modulo 2^32.
+    const __m256 m = _mm256_castsi256_ps(
+        _mm256_sub_epi32(ix, _mm256_slli_epi32(ei, 23)));
+    const __m256 e = _mm256_cvtepi32_ps(ei);
+    const __m256 u = _mm256_sub_ps(m, _mm256_set1_ps(1.0f));
+    __m256 p = _mm256_set1_ps(-4.413553457e-2f);
+    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(1.032194468e-1f));
+    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(-1.310681637e-1f));
+    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(1.448485294e-1f));
+    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(-1.665304757e-1f));
+    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(1.999078531e-1f));
+    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(-2.499990939e-1f));
+    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(3.333346255e-1f));
+    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(-5.000000213e-1f));
+    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(9.999999972e-1f));
+    return _mm256_fmadd_ps(e, _mm256_set1_ps(0.693147182464599609375f),
+                           _mm256_mul_ps(u, p));
+}
+
 __attribute__((target("avx2,fma"), always_inline))
 inline __m256 v_lgamma_pos_f32(__m256 x) {
     // Valid only where every lane > 0.  Reflection for x < 1:
@@ -769,9 +803,46 @@ static void f32_chunk_avx2(VOp op, VParams prm, const float* src, float* dst, in
         case VOp::Expm1:
             TP_F32_SIMPLE_LOOP_8(tensorplay::tpsleef::expm1(x));
             break;
-        case VOp::Log:
-            TP_F32_SIMPLE_LOOP_8(v_log_f32(x));
+        case VOp::Log: {
+            // Same blocking rule as exp: a block of 32 whose lanes are all
+            // positive normal floats takes the short chain, and anything
+            // else -- zero, negatives, subnormals, inf, NaN -- runs the
+            // guarded version for that block only.
+            const __m256 min_normal = _mm256_set1_ps(1.1754944e-38f);
+            const __m256 inf = _mm256_set1_ps(INFINITY);
+            for (; i + 32 <= n; i += 32) {
+                __m256 x0 = _mm256_loadu_ps(s + i);
+                __m256 x1 = _mm256_loadu_ps(s + i + 8);
+                __m256 x2 = _mm256_loadu_ps(s + i + 16);
+                __m256 x3 = _mm256_loadu_ps(s + i + 24);
+                // Ordered predicates, so a NaN lane fails the test.
+                __m256 good = _mm256_and_ps(
+                    _mm256_and_ps(_mm256_cmp_ps(x0, min_normal, _CMP_GE_OQ),
+                                  _mm256_cmp_ps(x0, inf, _CMP_LT_OQ)),
+                    _mm256_and_ps(_mm256_cmp_ps(x1, min_normal, _CMP_GE_OQ),
+                                  _mm256_cmp_ps(x1, inf, _CMP_LT_OQ)));
+                good = _mm256_and_ps(good, _mm256_and_ps(
+                    _mm256_and_ps(_mm256_cmp_ps(x2, min_normal, _CMP_GE_OQ),
+                                  _mm256_cmp_ps(x2, inf, _CMP_LT_OQ)),
+                    _mm256_and_ps(_mm256_cmp_ps(x3, min_normal, _CMP_GE_OQ),
+                                  _mm256_cmp_ps(x3, inf, _CMP_LT_OQ))));
+                if (_mm256_movemask_ps(good) == 0xff) {
+                    _mm256_storeu_ps(d + i, v_log_f32_fast(x0));
+                    _mm256_storeu_ps(d + i + 8, v_log_f32_fast(x1));
+                    _mm256_storeu_ps(d + i + 16, v_log_f32_fast(x2));
+                    _mm256_storeu_ps(d + i + 24, v_log_f32_fast(x3));
+                } else {
+                    _mm256_storeu_ps(d + i, v_log_f32(x0));
+                    _mm256_storeu_ps(d + i + 8, v_log_f32(x1));
+                    _mm256_storeu_ps(d + i + 16, v_log_f32(x2));
+                    _mm256_storeu_ps(d + i + 24, v_log_f32(x3));
+                }
+            }
+            for (; i + 8 <= n; i += 8) {
+                _mm256_storeu_ps(d + i, v_log_f32(_mm256_loadu_ps(s + i)));
+            }
             break;
+        }
         case VOp::Log1p:
             TP_F32_SIMPLE_LOOP_8(tensorplay::tpsleef::log1p(x));
             break;
