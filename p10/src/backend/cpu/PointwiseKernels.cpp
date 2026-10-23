@@ -3779,6 +3779,18 @@ void lerp_tensor_f32_avx2(const float* self, const float* end,
     // working set on the stack.  Of two answers the second does not wait on
     // the first, so the machine overlaps them.
     for (; i + 16 <= n; i += 16) {
+        if constexpr (Stream) {
+            // One line of each operand, asked for the distance eight of these
+            // steps covers: the answer waits on the memory rather than on the
+            // selects, and the destination is left out because it goes past
+            // the cache anyway.
+            _mm_prefetch(reinterpret_cast<const char*>(self + i + 128),
+                         _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(end + i + 128),
+                         _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(weight + i + 128),
+                         _MM_HINT_T0);
+        }
         const __m256 s0 = _mm256_loadu_ps(self + i);
         const __m256 e0 = _mm256_loadu_ps(end + i);
         const __m256 w0 = _mm256_loadu_ps(weight + i);

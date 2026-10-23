@@ -4588,6 +4588,26 @@ void addcmul_f32_avx2(const float* self, const float* tensor1,
     // multiplication of one do not wait on the next, so a wider step keeps
     // more of the walk in flight.
     for (; i + 32 <= end; i += 32) {
+        if constexpr (Stream) {
+            // A walk with this much to carry waits on the memory rather than
+            // on the arithmetic, so the pair of lines each operand reads four
+            // blocks ahead is asked for while this block is answered.  The
+            // destination is left out: it goes past the cache anyway, and
+            // fetching a line only to overwrite it is the cost the streamed
+            // store exists to avoid.
+            _mm_prefetch(reinterpret_cast<const char*>(self + i + 128),
+                         _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(self + i + 144),
+                         _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(tensor1 + i + 128),
+                         _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(tensor1 + i + 144),
+                         _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(tensor2 + i + 128),
+                         _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(tensor2 + i + 144),
+                         _MM_HINT_T0);
+        }
         const __m256 s0 = _mm256_loadu_ps(self + i);
         const __m256 x0 = _mm256_loadu_ps(tensor1 + i);
         const __m256 y0 = _mm256_loadu_ps(tensor2 + i);
@@ -4659,6 +4679,23 @@ void addcdiv_f32_avx2(const float* self, const float* tensor1,
     // The division is the long pole, so four of them are in flight before
     // the first answer is stored.
     for (; i + 32 <= end; i += 32) {
+        if constexpr (Stream) {
+            // The three operands are asked for four blocks ahead, the way the
+            // multiply asks for them: the answer waits on the lines, not on
+            // the arithmetic.
+            _mm_prefetch(reinterpret_cast<const char*>(self + i + 128),
+                         _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(self + i + 144),
+                         _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(tensor1 + i + 128),
+                         _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(tensor1 + i + 144),
+                         _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(tensor2 + i + 128),
+                         _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(tensor2 + i + 144),
+                         _MM_HINT_T0);
+        }
         const __m256 s0 = _mm256_loadu_ps(self + i);
         const __m256 x0 = _mm256_loadu_ps(tensor1 + i);
         const __m256 y0 = _mm256_loadu_ps(tensor2 + i);
