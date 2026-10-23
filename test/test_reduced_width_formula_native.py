@@ -189,3 +189,48 @@ def test_the_pairwise_maps_answer_in_single_precision(device, name):
 
     assert np.allclose(to_values(got), np.array(want, dtype=np.float32),
                        rtol=BOUND, atol=BOUND, equal_nan=True)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("name", ["hypot", "atan2", "logaddexp",
+                                  "remainder", "fmod"])
+def test_the_pairwise_maps_answer_the_other_reduced_width(device, name):
+    # The other reduced width travels the pair maps the way the half width
+    # does: both operands are widened to single precision, the map is taken
+    # there, and the answer is narrowed once.
+    #
+    # The formula is stated on the operands as they are actually stored.  A
+    # remainder is the difference of two nearly equal numbers, so operands one
+    # rounding apart ask for a different answer rather than a rounded one.
+    rng = np.random.default_rng(11)
+    count = 4096
+    a_tp = tp.from_numpy(rng.standard_normal(count).astype(np.float32)
+                         ).to(tp.bfloat16).to(device)
+    b_tp = tp.from_numpy(rng.standard_normal(count).astype(np.float32)
+                         ).to(tp.bfloat16).to(device)
+    x = to_values(a_tp)
+    y = to_values(b_tp)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        if name == "hypot":
+            want = np.hypot(x, y)
+        elif name == "atan2":
+            want = np.arctan2(x, y)
+        elif name == "logaddexp":
+            both_infinite = np.isinf(x) & (x == y)
+            want = np.maximum(x, y) + np.log1p(np.exp(-np.abs(x - y)))
+            want = np.where(both_infinite, x, want)
+        elif name == "remainder":
+            # The answer carries the sign of the divisor: the truncated
+            # remainder is moved by one divisor when the two signs differ.
+            mod = np.fmod(x, y)
+            moved = (mod != 0) & (np.signbit(y) != np.signbit(mod))
+            want = np.where(moved, mod + y, mod)
+        else:
+            want = np.fmod(x, y)
+
+    got = to_values(getattr(tp, name)(a_tp, b_tp))
+
+    # A narrowed answer sits within half a unit in its last place of the
+    # single-precision map, well inside the bound this width carries.
+    assert np.allclose(got, want, rtol=2e-2, atol=2e-2, equal_nan=True)
