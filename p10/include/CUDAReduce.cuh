@@ -626,9 +626,12 @@ inline ReduceConfig make_reduce_config(const TensorIterator& iter) {
         }
     }
 
-    // Groups of outputs reduce the number of independent blocks. Keep short
-    // reductions scalar so launch and final-fold costs do not dominate.
-    if (!reduction_on_fastest_dimension && config.num_inputs >= 32768 &&
+    // Groups of outputs share one thread, so a quarter as many slots carry the
+    // block fold and the staging.  The grouping is taken whenever the reducing
+    // dimension is not the one the addresses run along, whatever the row length:
+    // the width is clamped below by the shapes and strides that do not divide
+    // evenly, so a short or misaligned reduction simply keeps a smaller group.
+    if (!reduction_on_fastest_dimension &&
         iter.strides(1)[config.num_reduce_dims] == static_cast<int64_t>(sizeof(InputT))) {
         int width = 4;
         auto restrict_width = [&](uint64_t value) {
@@ -1568,10 +1571,14 @@ struct MinMaxOps {
         return combine(acc, static_cast<AccT>(value));
     }
     __device__ AccT combine(AccT a, AccT b) const {
-        if (reduce_isnan(a)) return a;
-        if (reduce_isnan(b)) return b;
-        if constexpr (MaxMode) return a > b ? a : b;
-        else return a < b ? a : b;
+        // One select carries the whole rule: a NaN accumulator keeps its own
+        // payload, a NaN in the other slot survives because every ordered
+        // comparison against it is false, and a tie falls through to b.  The
+        // same rule as a chain of early returns costs a dependent branch per
+        // element, and a strided reduction is then limited by how fast one
+        // lane runs its chain rather than by how fast it loads.
+        if constexpr (MaxMode) return (reduce_isnan(a) || a > b) ? a : b;
+        else return (reduce_isnan(a) || a < b) ? a : b;
     }
     __device__ OutputT project(AccT value) const { return static_cast<OutputT>(value); }
 };
@@ -1655,23 +1662,15 @@ struct MinMaxPairOps {
         return combine(acc, pair_type{converted, converted});
     }
     __device__ pair_type combine(pair_type a, pair_type b) const {
-        AccT min_val = a.min_val;
-        AccT max_val = a.max_val;
-        if (reduce_isnan(min_val)) {
-            // keep NaN
-        } else if (reduce_isnan(b.min_val)) {
-            min_val = b.min_val;
-        } else if (b.min_val < min_val) {
-            min_val = b.min_val;
-        }
-        if (reduce_isnan(max_val)) {
-            // keep NaN
-        } else if (reduce_isnan(b.max_val)) {
-            max_val = b.max_val;
-        } else if (b.max_val > max_val) {
-            max_val = b.max_val;
-        }
-        return {min_val, max_val};
+        // One select per end carries the whole rule, the same as the scalar
+        // extreme ops: an accumulator that already holds a NaN keeps it, a NaN
+        // in the other slot survives because every ordered comparison against
+        // it is false, and equal values fall through to b.  Written as a chain
+        // of tests it costs a dependent branch per element on both ends, and a
+        // strided reduction is then limited by that chain instead of its loads.
+        return {
+            (reduce_isnan(a.min_val) || a.min_val < b.min_val) ? a.min_val : b.min_val,
+            (reduce_isnan(a.max_val) || a.max_val > b.max_val) ? a.max_val : b.max_val};
     }
     __device__ OutputT project(pair_type value) const {
         return static_cast<OutputT>(value.max_val);
