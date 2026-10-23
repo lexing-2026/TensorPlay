@@ -408,6 +408,30 @@ inline __m256 v_exp_f32(__m256 x) {
     return _mm256_mul_ps(_mm256_mul_ps(p, s1), s2);
 }
 
+// Range-restricted exp for callers that have already proved every lane lies
+// in [-87, 88].  The result is then always a normal float, so the exponent
+// field alone carries the scale: no input floor, no exponent clamp, no
+// second scale multiply.  One FMA against the float-rounded ln2 leaves the
+// reduced argument within 2.4e-7 of the exact one across that whole range,
+// which the polynomial's own 4.1e-7 budget absorbs.
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256 v_exp_f32_fast(__m256 x) {
+    const __m256 log2e = _mm256_set1_ps(1.44269504088896341f);
+    const __m256 ln2 = _mm256_set1_ps(0.693147182464599609375f);
+    __m256i ki = _mm256_cvtps_epi32(_mm256_mul_ps(x, log2e));
+    __m256 k = _mm256_cvtepi32_ps(ki);
+    __m256 r = _mm256_fnmadd_ps(k, ln2, x);
+    __m256 p = _mm256_set1_ps(8.3572001485e-3f);
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(4.1833804078e-2f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.6666630825e-1f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(4.9999748990e-1f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0f));
+    const __m256 s = _mm256_castsi256_ps(
+        _mm256_slli_epi32(_mm256_add_epi32(ki, _mm256_set1_epi32(127)), 23));
+    return _mm256_mul_ps(p, s);
+}
+
 // erf on float lanes.  Coefficients live in cpu/vec/ErfPoly.h so the vector
 // class and this kernel evaluate the same function.
 __attribute__((target("avx2,fma"), always_inline))
@@ -701,9 +725,47 @@ static void f32_chunk_avx2(VOp op, VParams prm, const float* src, float* dst, in
             }
             break;
         }
-        case VOp::Exp:
-            TP_F32_SIMPLE_LOOP_8(v_exp_f32(x));
+        case VOp::Exp: {
+            // Whole blocks that stay inside the range where exp is a normal
+            // float take the short chain; a block holding anything else
+            // (overflow, underflow, NaN, inf) runs the guarded version, so
+            // the result does not depend on how the data is blocked.
+            const __m256 exp_lo = _mm256_set1_ps(-87.0f);
+            const __m256 exp_hi = _mm256_set1_ps(88.0f);
+            for (; i + 32 <= n; i += 32) {
+                __m256 x0 = _mm256_loadu_ps(s + i);
+                __m256 x1 = _mm256_loadu_ps(s + i + 8);
+                __m256 x2 = _mm256_loadu_ps(s + i + 16);
+                __m256 x3 = _mm256_loadu_ps(s + i + 24);
+                // Unordered-quiet predicates, so a NaN lane fails the range
+                // test instead of being dropped by a min/max reduction.
+                __m256 bad = _mm256_or_ps(
+                    _mm256_or_ps(_mm256_cmp_ps(x0, exp_lo, _CMP_NGE_UQ),
+                                 _mm256_cmp_ps(x0, exp_hi, _CMP_NLE_UQ)),
+                    _mm256_or_ps(_mm256_cmp_ps(x1, exp_lo, _CMP_NGE_UQ),
+                                 _mm256_cmp_ps(x1, exp_hi, _CMP_NLE_UQ)));
+                bad = _mm256_or_ps(bad, _mm256_or_ps(
+                    _mm256_or_ps(_mm256_cmp_ps(x2, exp_lo, _CMP_NGE_UQ),
+                                 _mm256_cmp_ps(x2, exp_hi, _CMP_NLE_UQ)),
+                    _mm256_or_ps(_mm256_cmp_ps(x3, exp_lo, _CMP_NGE_UQ),
+                                 _mm256_cmp_ps(x3, exp_hi, _CMP_NLE_UQ))));
+                if (_mm256_movemask_ps(bad) == 0) {
+                    _mm256_storeu_ps(d + i, v_exp_f32_fast(x0));
+                    _mm256_storeu_ps(d + i + 8, v_exp_f32_fast(x1));
+                    _mm256_storeu_ps(d + i + 16, v_exp_f32_fast(x2));
+                    _mm256_storeu_ps(d + i + 24, v_exp_f32_fast(x3));
+                } else {
+                    _mm256_storeu_ps(d + i, v_exp_f32(x0));
+                    _mm256_storeu_ps(d + i + 8, v_exp_f32(x1));
+                    _mm256_storeu_ps(d + i + 16, v_exp_f32(x2));
+                    _mm256_storeu_ps(d + i + 24, v_exp_f32(x3));
+                }
+            }
+            for (; i + 8 <= n; i += 8) {
+                _mm256_storeu_ps(d + i, v_exp_f32(_mm256_loadu_ps(s + i)));
+            }
             break;
+        }
         case VOp::Expm1:
             TP_F32_SIMPLE_LOOP_8(tensorplay::tpsleef::expm1(x));
             break;
