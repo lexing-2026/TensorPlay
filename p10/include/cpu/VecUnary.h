@@ -468,8 +468,12 @@ inline __m256 v_exp_f32_fast(__m256 x) {
 
 // erf on float lanes.  Coefficients live in cpu/vec/ErfPoly.h so the vector
 // class and this kernel evaluate the same function.
+// Fast selects the range-restricted exp for the decay term; the caller then
+// guarantees |x| <= 9.3, which keeps -x*x above the point where exp stops
+// returning a normal float.
+template <bool Fast>
 __attribute__((target("avx2,fma"), always_inline))
-inline __m256 v_erf_f32(__m256 x) {
+inline __m256 v_erf_f32_impl(__m256 x) {
     const __m256 sign_bit = _mm256_set1_ps(-0.0f);
     const __m256 one = _mm256_set1_ps(1.0f);
     const __m256 abs_x = _mm256_andnot_ps(sign_bit, x);
@@ -487,9 +491,25 @@ inline __m256 v_erf_f32(__m256 x) {
     p = _mm256_mul_ps(p, t);
     // exp(-x*x) decays to zero, so the tail saturates at one without any
     // explicit clamp; the sign is restored at the end.
-    const __m256 decay = v_exp_f32(_mm256_xor_ps(sign_bit, _mm256_mul_ps(x, x)));
+    const __m256 arg = _mm256_xor_ps(sign_bit, _mm256_mul_ps(x, x));
+    __m256 decay;
+    if constexpr (Fast) {
+        decay = v_exp_f32_fast(arg);
+    } else {
+        decay = v_exp_f32(arg);
+    }
     const __m256 r = _mm256_sub_ps(one, _mm256_mul_ps(p, decay));
     return _mm256_or_ps(_mm256_and_ps(sign_bit, x), r);
+}
+
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256 v_erf_f32(__m256 x) {
+    return v_erf_f32_impl<false>(x);
+}
+
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256 v_erf_f32_fast(__m256 x) {
+    return v_erf_f32_impl<true>(x);
 }
 // elu takes its three coefficients as arguments instead of reading prm itself.
 // The chunk loops below broadcast the parameters once per chunk; deriving them
@@ -542,11 +562,22 @@ inline __m256 v_sigmoid_f32_fast(__m256 x, __m256 one, __m256 signbit) {
     return v_rcp_nr_ps(den);
 }
 
+template <bool Fast>
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256 v_gelu_none_f32_impl(__m256 x, __m256 one) {
+    const __m256 kAlpha = _mm256_set1_ps(static_cast<float>(0.70710678118654752440));
+    __m256 cdf = _mm256_add_ps(one, v_erf_f32_impl<Fast>(_mm256_mul_ps(kAlpha, x)));
+    return _mm256_mul_ps(_mm256_mul_ps(_mm256_set1_ps(0.5f), x), cdf);
+}
+
 __attribute__((target("avx2,fma"), always_inline))
 inline __m256 v_gelu_none_f32(__m256 x, __m256 one) {
-    const __m256 kAlpha = _mm256_set1_ps(static_cast<float>(0.70710678118654752440));
-    __m256 cdf = _mm256_add_ps(one, v_erf_f32(_mm256_mul_ps(kAlpha, x)));
-    return _mm256_mul_ps(_mm256_mul_ps(_mm256_set1_ps(0.5f), x), cdf);
+    return v_gelu_none_f32_impl<false>(x, one);
+}
+
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256 v_gelu_none_f32_fast(__m256 x, __m256 one) {
+    return v_gelu_none_f32_impl<true>(x, one);
 }
 
 __attribute__((target("avx2,fma"), always_inline))
@@ -898,9 +929,40 @@ static void f32_chunk_avx2(VOp op, VParams prm, const float* src, float* dst, in
             }
             break;
         }
-        case VOp::GeluNone:
-            TP_F32_SIMPLE_LOOP_8(v_gelu_none_f32(x, one));
+        case VOp::GeluNone: {
+            // The erf inside scales by 1/sqrt(2), so |x| <= 13 is what keeps
+            // its decay argument above the short chain's floor.
+            const __m256 limit = _mm256_set1_ps(13.0f);
+            for (; i + 32 <= n; i += 32) {
+                __m256 x0 = _mm256_loadu_ps(s + i);
+                __m256 x1 = _mm256_loadu_ps(s + i + 8);
+                __m256 x2 = _mm256_loadu_ps(s + i + 16);
+                __m256 x3 = _mm256_loadu_ps(s + i + 24);
+                __m256 bad = _mm256_or_ps(
+                    _mm256_or_ps(
+                        _mm256_cmp_ps(_mm256_andnot_ps(signbit, x0), limit, _CMP_NLE_UQ),
+                        _mm256_cmp_ps(_mm256_andnot_ps(signbit, x1), limit, _CMP_NLE_UQ)),
+                    _mm256_or_ps(
+                        _mm256_cmp_ps(_mm256_andnot_ps(signbit, x2), limit, _CMP_NLE_UQ),
+                        _mm256_cmp_ps(_mm256_andnot_ps(signbit, x3), limit, _CMP_NLE_UQ)));
+                if (_mm256_movemask_ps(bad) == 0) {
+                    _mm256_storeu_ps(d + i, v_gelu_none_f32_fast(x0, one));
+                    _mm256_storeu_ps(d + i + 8, v_gelu_none_f32_fast(x1, one));
+                    _mm256_storeu_ps(d + i + 16, v_gelu_none_f32_fast(x2, one));
+                    _mm256_storeu_ps(d + i + 24, v_gelu_none_f32_fast(x3, one));
+                } else {
+                    _mm256_storeu_ps(d + i, v_gelu_none_f32(x0, one));
+                    _mm256_storeu_ps(d + i + 8, v_gelu_none_f32(x1, one));
+                    _mm256_storeu_ps(d + i + 16, v_gelu_none_f32(x2, one));
+                    _mm256_storeu_ps(d + i + 24, v_gelu_none_f32(x3, one));
+                }
+            }
+            for (; i + 8 <= n; i += 8) {
+                __m256 x = _mm256_loadu_ps(s + i);
+                _mm256_storeu_ps(d + i, v_gelu_none_f32(x, one));
+            }
             break;
+        }
         case VOp::GeluTanh:
             TP_F32_SIMPLE_LOOP_8(v_gelu_tanh_f32(x, one));
             break;
@@ -963,9 +1025,39 @@ static void f32_chunk_avx2(VOp op, VParams prm, const float* src, float* dst, in
         case VOp::Atan:
             TP_F32_SIMPLE_LOOP_8(tensorplay::tpsleef::atan(x));
             break;
-        case VOp::Erf:
-            TP_F32_SIMPLE_LOOP_8(v_erf_f32(x));
+        case VOp::Erf: {
+            // |x| <= 9 keeps -x*x inside the range where the short exp chain
+            // is valid; past it erf has saturated and the guarded form runs.
+            const __m256 limit = _mm256_set1_ps(9.0f);
+            for (; i + 32 <= n; i += 32) {
+                __m256 x0 = _mm256_loadu_ps(s + i);
+                __m256 x1 = _mm256_loadu_ps(s + i + 8);
+                __m256 x2 = _mm256_loadu_ps(s + i + 16);
+                __m256 x3 = _mm256_loadu_ps(s + i + 24);
+                __m256 bad = _mm256_or_ps(
+                    _mm256_or_ps(
+                        _mm256_cmp_ps(_mm256_andnot_ps(signbit, x0), limit, _CMP_NLE_UQ),
+                        _mm256_cmp_ps(_mm256_andnot_ps(signbit, x1), limit, _CMP_NLE_UQ)),
+                    _mm256_or_ps(
+                        _mm256_cmp_ps(_mm256_andnot_ps(signbit, x2), limit, _CMP_NLE_UQ),
+                        _mm256_cmp_ps(_mm256_andnot_ps(signbit, x3), limit, _CMP_NLE_UQ)));
+                if (_mm256_movemask_ps(bad) == 0) {
+                    _mm256_storeu_ps(d + i, v_erf_f32_fast(x0));
+                    _mm256_storeu_ps(d + i + 8, v_erf_f32_fast(x1));
+                    _mm256_storeu_ps(d + i + 16, v_erf_f32_fast(x2));
+                    _mm256_storeu_ps(d + i + 24, v_erf_f32_fast(x3));
+                } else {
+                    _mm256_storeu_ps(d + i, v_erf_f32(x0));
+                    _mm256_storeu_ps(d + i + 8, v_erf_f32(x1));
+                    _mm256_storeu_ps(d + i + 16, v_erf_f32(x2));
+                    _mm256_storeu_ps(d + i + 24, v_erf_f32(x3));
+                }
+            }
+            for (; i + 8 <= n; i += 8) {
+                _mm256_storeu_ps(d + i, v_erf_f32(_mm256_loadu_ps(s + i)));
+            }
             break;
+        }
         case VOp::Erfc:
             TP_F32_SIMPLE_LOOP_8(tensorplay::tpsleef::erfc(x));
             break;
