@@ -11,6 +11,7 @@
 #include "Parallel.h"
 #include "Context.h"
 #include "cpu/RangeKernels.h"
+#include "cpu/vec/intrinsics.h"
 #include "TensorIterator.h"
 #include <vector>
 #include <cmath>
@@ -152,6 +153,85 @@ DType infer_full_dtype(const Scalar& fill_value) {
     return globalContext().defaultDType();
 }
 
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+// A dense fill moves destination bytes and nothing else: no operand is read and
+// the written bytes are not read back, so the walk is a pure store stream and
+// its cost is how many bytes one store instruction carries.  This file is
+// compiled for the baseline instruction set, which puts four single-precision
+// values in a store, so the wide form lives in its own target-tagged function
+// and is reached only when the running part answers for it.  A chunk whose
+// edges are not whole vectors is finished element by element on both ends,
+// which is also what keeps the aligned stores on aligned addresses.
+__attribute__((target("avx2")))
+void fill_span_wide(float* data, int64_t begin, int64_t end, float value) {
+    const __m256 block = _mm256_set1_ps(value);
+    int64_t at = begin;
+    while (at < end && (reinterpret_cast<uintptr_t>(data + at) & 31u) != 0u) {
+        data[at] = value;
+        ++at;
+    }
+    for (; at + 8 <= end; at += 8) _mm256_store_ps(data + at, block);
+    for (; at < end; ++at) data[at] = value;
+}
+
+__attribute__((target("avx2")))
+void fill_span_wide(double* data, int64_t begin, int64_t end, double value) {
+    const __m256d block = _mm256_set1_pd(value);
+    int64_t at = begin;
+    while (at < end && (reinterpret_cast<uintptr_t>(data + at) & 31u) != 0u) {
+        data[at] = value;
+        ++at;
+    }
+    for (; at + 4 <= end; at += 4) _mm256_store_pd(data + at, block);
+    for (; at < end; ++at) data[at] = value;
+}
+#endif
+
+// A value whose storage is one byte repeated needs no element interpretation
+// to be written: every dtype's zero is like this, and so is every one-byte
+// element.  The span then goes to the library's byte fill, which reaches the
+// same bytes and picks the store sequence the running part is fastest at; on a
+// 64 MiB walk that measured ahead of the wide vector stores below.  A value
+// whose bytes differ, negative zero included, answers -1 and takes a loop.
+template <typename ctype>
+inline int uniform_fill_byte(ctype value) {
+    const unsigned char* bytes = reinterpret_cast<const unsigned char*>(&value);
+    for (size_t i = 1; i < sizeof(ctype); ++i) {
+        if (bytes[i] != bytes[0]) return -1;
+    }
+    return bytes[0];
+}
+
+// The store form for a whole walk, settled once per call rather than per
+// chunk: one byte repeated, wide vector stores, or plain element stores.
+struct FillForm {
+    int fill_byte;
+    bool wide;
+};
+
+// One span of a dense fill, in the store form the call settled on.
+template <typename ctype>
+inline void fill_dense_span(ctype* data, int64_t begin, int64_t end, ctype value,
+                            FillForm form) {
+    if (form.fill_byte >= 0) {
+        unsigned char* bytes = reinterpret_cast<unsigned char*>(data) +
+                               static_cast<size_t>(begin) * sizeof(ctype);
+        std::memset(bytes, form.fill_byte,
+                    static_cast<size_t>(end - begin) * sizeof(ctype));
+        return;
+    }
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+    if (form.wide) {
+        if constexpr (std::is_same_v<ctype, float> ||
+                      std::is_same_v<ctype, double>) {
+            fill_span_wide(data, begin, end, value);
+            return;
+        }
+    }
+#endif
+    std::fill(data + begin, data + end, value);
+}
+
 } // namespace
 
 Tensor full_kernel(const std::vector<int64_t>& size, Scalar fill_value, DType dtype, Device device, bool pin_memory) {
@@ -172,13 +252,15 @@ Tensor& fill_kernel(Tensor& self, const Scalar& value) {
     // Chunks are handed to the intra-op pool once the element count clears
     // the grain threshold; smaller fills stay on the calling thread.
     if (self.is_contiguous()) {
+        const bool wide = tp_cpu_supports_avx2();
         #define OP_CASE(ctype, name) \
         case DType::name: { \
             const ctype val = value.to<ctype>(); \
+            const FillForm form{uniform_fill_byte(val), wide}; \
             ctype* data = self.data_ptr<ctype>(); \
             parallel::parallel_for(0, self.numel(), parallel::GRAIN_SIZE, \
-                [data, val](int64_t begin, int64_t end) { \
-                    std::fill(data + begin, data + end, val); \
+                [data, val, form](int64_t begin, int64_t end) { \
+                    fill_dense_span(data, begin, end, val, form); \
                 }); \
             break; \
         }
