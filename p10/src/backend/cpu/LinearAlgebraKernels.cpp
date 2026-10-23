@@ -1017,7 +1017,8 @@ Tensor addmm_kernel(const Tensor& input, const Tensor& mat1, const Tensor& mat2,
         TP_THROW(RuntimeError, "mat1 and mat2 shapes cannot be multiplied (", mat1.size(0), "x", mat1.size(1),
                  " and ", mat2.size(0), "x", mat2.size(1), ")");
     }
-    // self-vs-mat2 first, then mat1-vs-mat2 (LinearAlgebra.cpp:185-186).
+    // The seed is matched against the right operand before the two operands are
+    // matched against each other, because that is the order the messages name.
     if (input.dtype() != mat2.dtype()) {
         TP_THROW(RuntimeError, "self and mat2 must have the same dtype, but got ",
                  scalarTypeName(input.dtype()), " and ", scalarTypeName(mat2.dtype()));
@@ -1029,8 +1030,27 @@ Tensor addmm_kernel(const Tensor& input, const Tensor& mat1, const Tensor& mat2,
 
     int64_t M = mat1.size(0);
     int64_t N = mat2.size(1);
+    const int64_t K = mat1.size(1);
     double alpha_v = alpha.toDouble();
     double beta_v = beta.toDouble();
+
+    // A zero-sized answer has no values to produce, and an empty reduction has
+    // no terms, so only the seed scaled by beta is left.  Neither is put to the
+    // GEMM primitive: a reduction of length zero leaves the destination exactly
+    // as it was handed over, so the beta factor it was supposed to apply never
+    // arrives.
+    if (M == 0 || N == 0) {
+        return Tensor::empty({M, N}, mat1.dtype(), mat1.device());
+    }
+    if (K == 0) {
+        Tensor result = detail::contiguous_clone(expand_gemm_input(input, {M, N}));
+        if (beta_v == 0.0) {
+            result.zero_();
+        } else if (beta_v != 1.0) {
+            result.mul_(beta_v);
+        }
+        return result;
+    }
 
     // out = beta * input + alpha * (mat1 @ mat2)
     //

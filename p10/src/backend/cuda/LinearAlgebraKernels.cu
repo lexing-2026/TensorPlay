@@ -376,7 +376,8 @@ Tensor addmm_kernel_cuda(const Tensor& input, const Tensor& mat1, const Tensor& 
         TP_THROW(RuntimeError, "mat1 and mat2 shapes cannot be multiplied (", mat1.size(0), "x", mat1.size(1),
                  " and ", mat2.size(0), "x", mat2.size(1), ")");
     }
-    // self-vs-mat2 first, then mat1-vs-mat2 (LinearAlgebra.cpp:185-186).
+    // The seed is matched against the right operand before the two operands are
+    // matched against each other, because that is the order the messages name.
     if (input.dtype() != mat2.dtype()) {
         TP_THROW(RuntimeError, "self and mat2 must have the same dtype, but got ",
                  scalarTypeName(input.dtype()), " and ", scalarTypeName(mat2.dtype()));
@@ -387,8 +388,29 @@ Tensor addmm_kernel_cuda(const Tensor& input, const Tensor& mat1, const Tensor& 
     }
     int64_t M = mat1.size(0);
     int64_t N = mat2.size(1);
+    const int64_t K = mat1.size(1);
     double alpha_v = alpha.toDouble();
     double beta_v = beta.toDouble();
+
+    // A zero-sized answer has no values to produce, and an empty reduction has
+    // no terms, so only the seed scaled by beta is left.  Neither is a question
+    // for the GEMM library: algorithm selection refuses a zero-sized dimension,
+    // and a reduction of length zero leaves the destination exactly as it was
+    // handed over, which drops the scaling beta was supposed to apply.
+    if (M == 0 || N == 0) {
+        return Tensor::empty({M, N}, mat1.dtype(), mat1.device());
+    }
+    if (K == 0) {
+        Tensor result = beta_v == 0.0
+            ? Tensor::empty({M, N}, mat1.dtype(), mat1.device())
+            : expand_gemm_input_cuda(input, {M, N}).clone().contiguous();
+        if (beta_v == 0.0) {
+            result.zero_();
+        } else if (beta_v != 1.0) {
+            result.mul_(beta_v);
+        }
+        return result;
+    }
 
     // out = beta * input + alpha * (self @ other)
     if (beta_v == 0.0) {
