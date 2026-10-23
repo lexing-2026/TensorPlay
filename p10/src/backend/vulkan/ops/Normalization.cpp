@@ -2035,9 +2035,16 @@ constexpr int64_t kFlashSharedBytes =
 // Element index range a 32-bit offset in a buffer kernel can reach.
 constexpr int64_t kLinearIndexLimit = 2147483647;
 
-// Texel lanes of a score matrix above which that one intermediate costs more
-// than an on-device deployment can spare for it (64 MB in single precision).
-constexpr int64_t kScoreTexelBudget = 4LL << 20;
+// Score lanes of one query/key window above which the walk stops paying for
+// the score matrix it no longer writes down.  Compared across that boundary on
+// a window of thirty-two query heads over eight key heads with a head dimension
+// of one hundred twenty-eight: the chain at 511 lanes per axis against the walk
+// at 512 costs 6.1 versus 2.6 ms in half precision at one batch, 7.7 versus 2.2
+// in single, and 22.2 versus 10.2 in half precision at four batches.  The floor
+// is the low end of what was measured rather than a proven crossover.  Below it
+// a window is too small for the serial key pass to overlap, so the per-texel
+// parallelism of the chain wins.
+constexpr int64_t kFlashWalkLaneFloor = 1LL << 18;
 
 // Row tiles the walk needs before the serial pass it takes over the keys, one
 // per tile, still leaves the device with enough workgroups to fill.
@@ -2337,15 +2344,16 @@ Tensor scaled_dot_product_attention_kernel(
   api::vTensor v_key = convert(key);
   api::vTensor v_value = convert(value);
 
-  // Both of the routes below write one score per (query row, key) pair before
-  // it is normalized: the fused chain hands that matrix to a texture, the
-  // composition to a buffer.  The walk keeps it off the device altogether, at
-  // the cost of a serial pass over the keys per row tile.  So it runs when the
-  // matrix has no image form at all, or when it is large enough that giving it
-  // one is the point of the exercise, and the shapes below that keep the
-  // per-texel parallelism of the chain.
-  const int64_t score_lanes =
-      static_cast<int64_t>(sdpa_planes(Hq, B)) * Sq * Skv;
+  // Both of the routes below derive one score per (query row, key) pair before
+  // it is normalized: the fused chain hands that matrix to a texture, the walk
+  // keeps it on-chip and pays a serial pass over the keys per row tile instead.
+  // Which one is cheaper is a property of the window, not of how many copies of
+  // it the batch carries -- the chain's cost per output element grows with the
+  // key window because every element of a row re-reads the row's scores, while
+  // the walk's cost per row is paid once.  So the walk runs when the window is
+  // wide enough for that saving to outweigh its serial tail, and when the key
+  // window is no longer than the query window: an inversion there leaves the
+  // last row tile walking the whole key range while every other tile idles.
   const int64_t row_tiles =
       static_cast<int64_t>(
           api::utils::div_up(
@@ -2367,7 +2375,9 @@ Tensor scaled_dot_product_attention_kernel(
                   .limits.maxComputeSharedMemorySize) &&
       B * Hq * Sq * D <= kLinearIndexLimit &&
       B * Hkv * Skv * D <= kLinearIndexLimit;
-  if (walk_reachable && (no_image_form || score_lanes > kScoreTexelBudget)) {
+  const bool walk_pays_off =
+      Skv <= Sq && static_cast<int64_t>(Sq) * Skv >= kFlashWalkLaneFloor;
+  if (walk_reachable && (no_image_form || walk_pays_off)) {
     std::optional<Tensor> flash_mask;
     if (attn_mask_opt.has_value()) {
       TP_CHECK(
