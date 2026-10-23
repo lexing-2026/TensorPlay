@@ -43,6 +43,13 @@ constexpr uint32_t kTagMmWidthPackedTransposed = 12u;
 constexpr uint32_t kTagMmHeightPackedTransposed = 13u;
 constexpr uint32_t kTagMmWidthPackedBatched = 14u;
 constexpr uint32_t kTagMmHeightPackedBatched = 15u;
+// A weight swept width-first by a decode product, gathered either out of its
+// own [out, in] rows or out of the columns of an [in, out] operand.  These need
+// tags of their own rather than the activation pair above: one storage can
+// reach this translation unit as both a [out, in] weight and an [in, out]
+// matrix, and the two gathers describe different payloads.
+constexpr uint32_t kTagMmWidthPackedWeight = 16u;
+constexpr uint32_t kTagMmWidthPackedWeightTransposed = 17u;
 
 constexpr uint32_t kBatchTagShift = 16u;
 
@@ -554,6 +561,174 @@ Tensor gemv_decode(
 }
 
 /*
+ * Decode products over a width-first weight sweep.
+ *
+ * The split reduction above reads a weight that carries the reduction axis down
+ * the texture height, so one invocation strides from texel to texel a whole
+ * image row apart while its neighbouring lanes read that same row one element
+ * each.  A few output rows make the product a pure stream -- every weight texel
+ * is read exactly once and nothing is reused -- so that scattered walk, not the
+ * arithmetic, sets the time.
+ *
+ * The sweep reads a weight carrying the reduction axis along the texture width
+ * instead: consecutive lanes take consecutive texels of one output column, so a
+ * workgroup row fetches one contiguous stretch per step.  Every lane sums a
+ * slice of the reduction for the columns of its own row, keeping one partial per
+ * product row in an accumulator lane, and the slices fold across that row in
+ * shared memory.  The epilogue rides the same pass, so there is no partial arena
+ * and no second dispatch.
+ */
+constexpr uint32_t kGemvWidthLanes = 32u; // reduction lanes per output column
+constexpr uint32_t kGemvWidthColumns = 8u; // output columns per workgroup
+// The sweep kernel hands its partials through a shared array of this many
+// vec4 slots, so widening either axis past it would write out of bounds.
+static_assert(
+    kGemvWidthLanes * kGemvWidthColumns <= 256u,
+    "Vulkan gemv_width: the workgroup's lanes no longer fit its shared slots");
+
+/*
+ * Whether a decode shape goes to the sweep.  The row axis has to stay narrow
+ * enough for one accumulator to hold a partial per row, and the reduction long
+ * enough that sweeping the weight once still dominates everything the reuse
+ * would have saved.
+ */
+bool gemv_width_route(int64_t M, int64_t N, int64_t K, DType dtype) {
+  return M >= 1 && M <= kGemvMaxRows && N >= 1 &&
+      K >= kGemvMinReduction &&
+      (dtype == DType::Float32 || dtype == DType::Float16);
+}
+
+Tensor gemv_walk_width(
+    const api::vTensor& v_lhs,
+    const api::vTensor& v_rhs,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    const std::optional<Tensor>& bias,
+    Scalar beta,
+    Scalar alpha,
+    DType dtype) {
+  api::Context* const context = api::context();
+
+  const uint32_t k_texels =
+      api::utils::div_up(api::utils::safe_downcast_to_u32(K), 4u);
+  // The dispatch counts threads, not workgroups.  One workgroup row owns the
+  // whole reduction for its block of output columns: the sweep stores its
+  // folded result directly, so a second row over the same columns would race
+  // the first for the store.  Parallelism therefore comes from the output
+  // width, and a lane walks the reduction in `lanes`-sized strides.
+  const uint32_t column_lanes =
+      api::utils::div_up(
+          api::utils::safe_downcast_to_u32(N), kGemvWidthColumns) *
+      kGemvWidthColumns;
+
+  api::vTensor v_output{context, {M, N}, dtype};
+
+  // The addend broadcasts over singleton rows and columns the way the wider
+  // product's epilogue does, and a zero beta term never fetches it, so a
+  // bias-free sweep rebinds an operand texture already in the set instead of
+  // allocating an addend the kernel cannot read.
+  std::optional<Tensor> addend;
+  if (bias.has_value()) {
+    addend = addend_for_result(*bias, api::StorageType::TEXTURE_3D);
+  }
+  api::vTensor v_bias =
+      addend.has_value() ? convert(*addend) : v_lhs;
+  const std::vector<int64_t> bias_sizes = addend.has_value()
+      ? shape_of(*addend)
+      : std::vector<int64_t>({1, 1});
+
+  const struct GemvWidthBlock final {
+    ivec4 out_sizes; // (W=N, H=M, C=1, N=1) logical product sizes
+    ivec4 bias_sizes; // (W, H, C, N) logical sizes of the addend
+    int k_texels; // reduction texels per output column: ceil(K / 4)
+    int fill;
+    float alpha;
+    float beta;
+  } block{
+      api::utils::make_whcn_ivec4(v_output.sizes()),
+      api::utils::make_whcn_ivec4(bias_sizes),
+      static_cast<int32_t>(k_texels),
+      0,
+      alpha.to<float>(),
+      bias.has_value() ? beta.to<float>() : 0.0f,
+  };
+
+  api::UniformParamsBuffer params(context, block);
+  api::PipelineBarrier pipeline_barrier{};
+
+  const api::utils::uvec3 global_size{kGemvWidthLanes, column_lanes, 1u};
+
+  context->submit_compute_job(
+      kernel_for("gemv_width", dtype),
+      pipeline_barrier,
+      global_size,
+      {kGemvWidthLanes, kGemvWidthColumns, 1u},
+      VK_NULL_HANDLE,
+      v_output.image(
+          pipeline_barrier, api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::WRITE),
+      v_lhs.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+      v_rhs.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+      v_bias.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+      params.buffer());
+
+  return convert(v_output);
+}
+
+/*
+ * The weight in the texel layout the product about to run reads.  The sweep
+ * wants one output column per image row with the reduction along the width; the
+ * tiled kernel and the split reduction want one output column per texel lane
+ * with the reduction down the height.  `weight_is_input_major` names how the
+ * dense weight actually sits -- [in, out] for a matrix product's right operand,
+ * [out, in] for the row-per-output-feature order a linear layer stores -- and an
+ * operand already in the layout the route reads goes through unpacked.
+ *
+ * The dispatch below recovers the route from the operand's own layout, so a
+ * packing choice and a kernel choice cannot diverge.
+ */
+api::vTensor product_weight_operand(
+    const Tensor& weight,
+    const api::vTensor& v_weight,
+    bool weight_is_input_major,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    DType dtype) {
+  const bool width_sweep = gemv_width_route(M, N, K, dtype);
+  const api::GPUMemoryLayout wanted = width_sweep
+      ? api::GPUMemoryLayout::TENSOR_WIDTH_PACKED
+      : api::GPUMemoryLayout::TENSOR_HEIGHT_PACKED;
+  if (v_weight.gpu_memory_layout() == wanted) {
+    return v_weight;
+  }
+  if (width_sweep) {
+    return weight_is_input_major
+        ? packed_cached(
+              weight, shape_of(weight),
+              api::GPUMemoryLayout::TENSOR_WIDTH_PACKED,
+              kTagMmWidthPackedWeightTransposed,
+              [&] { return pack_lhs_width_transposed(weight); })
+        : packed_cached(
+              weight, shape_of(weight),
+              api::GPUMemoryLayout::TENSOR_WIDTH_PACKED,
+              kTagMmWidthPackedWeight,
+              [&] { return pack_lhs_width(weight); });
+  }
+  return weight_is_input_major
+      ? packed_cached(
+            weight, shape_of(weight),
+            api::GPUMemoryLayout::TENSOR_HEIGHT_PACKED, kTagMmHeightPacked,
+            [&] { return pack_rhs_height(weight); })
+      : packed_cached(
+            weight, shape_of(weight),
+            api::GPUMemoryLayout::TENSOR_HEIGHT_PACKED,
+            kTagMmHeightPackedTransposed,
+            [&] { return pack_rhs_height_transposed(weight); });
+}
+
+/*
  * Decode products over a buffer-stored weight.  A weight whose extents pass
  * the device's 3-D image axis limit has no texture form at all, so the split
  * pass reads it as a row-major linear payload: one invocation per output
@@ -581,8 +756,10 @@ api::vTensor gemv_operand_lhs(const Tensor& src) {
           api::GPUMemoryLayout::TENSOR_WIDTH_PACKED)
       ? v_src
       : packed_cached(
-            src, shape_of(src),
-            api::GPUMemoryLayout::TENSOR_WIDTH_PACKED, kTagMmWidthPacked,
+            src,
+            shape_of(src),
+            api::GPUMemoryLayout::TENSOR_WIDTH_PACKED,
+            kTagMmWidthPacked,
             [&] { return pack_lhs_width(src); });
 }
 
@@ -1177,8 +1354,17 @@ Tensor product_dispatch(
     DType dtype) {
   api::Context* const context = api::context();
 
-  // Decode-shape products take the split-reduction path; see gemv_decode.
+  // Decode-shape products take a reduction split across invocations instead of
+  // the tiled kernel.  Which reduction depends on the weight operand handed in:
+  // one that carries its reduction axis along the texture width sweeps in a
+  // single pass, a height-packed one splits and folds.
   if (M <= kGemvMaxRows && K >= kGemvMinReduction) {
+    if (v_rhs.gpu_memory_layout() ==
+            api::GPUMemoryLayout::TENSOR_WIDTH_PACKED &&
+        gemv_width_route(M, N, K, dtype)) {
+      return gemv_walk_width(
+          v_lhs, v_rhs, M, N, K, bias, beta, alpha, dtype);
+    }
     return gemv_decode(
         v_lhs, v_rhs, M, N, K, bias, beta, alpha, dtype);
   }
@@ -1342,14 +1528,8 @@ Tensor mm_impl(
             api::GPUMemoryLayout::TENSOR_WIDTH_PACKED, kTagMmWidthPacked,
             [&] { return pack_lhs_width(lhs_source); });
 
-  api::vTensor rhs =
-      (v_other.gpu_memory_layout() ==
-       api::GPUMemoryLayout::TENSOR_HEIGHT_PACKED)
-      ? v_other
-      : packed_cached(
-            mat2, shape_of(mat2),
-            api::GPUMemoryLayout::TENSOR_HEIGHT_PACKED, kTagMmHeightPacked,
-            [&] { return pack_rhs_height(mat2); });
+  api::vTensor rhs = product_weight_operand(
+      mat2, v_other, /*weight_is_input_major=*/true, M, N, K, self.dtype());
 
   return product_dispatch(
       lhs, rhs, M, N, K, std::move(bias), beta, alpha, self.dtype());
@@ -2052,7 +2232,6 @@ Tensor matmul_kernel(const Tensor& self_in, const Tensor& other_in) {
     }
 
     api::vTensor v_lhs;
-    api::vTensor v_rhs;
     if (lhs_transposed) {
       v_lhs = packed_cached(
           lhs_src, shape_of(lhs_src),
@@ -2065,18 +2244,17 @@ Tensor matmul_kernel(const Tensor& self_in, const Tensor& other_in) {
           api::GPUMemoryLayout::TENSOR_WIDTH_PACKED, kTagMmWidthPacked,
           [&] { return pack_lhs_width(lhs_src); });
     }
-    if (rhs_transposed) {
-      v_rhs = packed_cached(
-          rhs_src, shape_of(rhs_src),
-          api::GPUMemoryLayout::TENSOR_HEIGHT_PACKED,
-          kTagMmHeightPackedTransposed,
-          [&] { return pack_rhs_height_transposed(rhs_src); });
-    } else {
-      v_rhs = packed_cached(
-          rhs_src, shape_of(rhs_src),
-          api::GPUMemoryLayout::TENSOR_HEIGHT_PACKED, kTagMmHeightPacked,
-          [&] { return pack_rhs_height(rhs_src); });
-    }
+    // A transposed view hands its dense twin to the gather, so the weight
+    // reaches the route in whichever of the two orientations that dense tensor
+    // really sits in.
+    api::vTensor v_rhs = product_weight_operand(
+        rhs_src,
+        v_rhs_dense,
+        /*weight_is_input_major=*/!rhs_transposed,
+        M,
+        N,
+        K,
+        self_in.dtype());
 
     return product_dispatch(
         v_lhs,
@@ -2293,11 +2471,16 @@ Tensor linear_kernel(
         Scalar(1.0),
         input.dtype());
   } else {
-    api::vTensor v_rhs = packed_cached(
-        weight, shape_of(weight),
-        api::GPUMemoryLayout::TENSOR_HEIGHT_PACKED,
-        kTagMmHeightPackedTransposed,
-        [&] { return pack_rhs_height_transposed(weight); });
+    // The layer's own [out, in] rows are the sweep's columns; the packed
+    // operand carries whichever orientation the route reads.
+    api::vTensor v_rhs = product_weight_operand(
+        weight,
+        v_weight,
+        /*weight_is_input_major=*/false,
+        M,
+        N,
+        K,
+        input.dtype());
 
     out2 = product_dispatch(
         v_lhs, v_rhs, M, N, K, bias_arg, Scalar(1.0), Scalar(1.0),
