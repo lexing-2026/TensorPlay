@@ -2040,11 +2040,15 @@ constexpr int64_t kLinearIndexLimit = 2147483647;
 // a window of thirty-two query heads over eight key heads with a head dimension
 // of one hundred twenty-eight: the chain at 511 lanes per axis against the walk
 // at 512 costs 6.1 versus 2.6 ms in half precision at one batch, 7.7 versus 2.2
-// in single, and 22.2 versus 10.2 in half precision at four batches.  The floor
-// is the low end of what was measured rather than a proven crossover.  Below it
-// a window is too small for the serial key pass to overlap, so the per-texel
-// parallelism of the chain wins.
-constexpr int64_t kFlashWalkLaneFloor = 1LL << 18;
+// in single, and 22.2 versus 10.2 in half precision at four batches.  The walk
+// keeps that edge all the way down to a window of 256 lanes per axis -- 1.5
+// versus 0.7, 3.4 versus 2.1, 4.1 versus 2.0 at 256, 384 and 448 -- and gives it
+// back below there, where widening the batch to four turns the same 160-lane
+// window into 2.4 for the chain against 2.9 for the walk.  The floor sits at
+// that turn: below it a window is too narrow for the serial key pass to repay
+// the operand passes the walk needs first, so the per-texel parallelism of the
+// chain wins.
+constexpr int64_t kFlashWalkLaneFloor = 1LL << 16;
 
 // Row tiles the walk needs before the serial pass it takes over the keys, one
 // per tile, still leaves the device with enough workgroups to fill.
