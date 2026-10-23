@@ -364,6 +364,50 @@ __global__ void sort_radix_fill_positions_kernel(int64_t n, int64_t* positions) 
     for (; i < n; i += stride) positions[i] = i;
 }
 
+// The keys of several runs packed into one sequence, each element's run number
+// kept in the low bits of its position so that a pass over those bits can put
+// the runs back in order afterwards.  The run number has to survive inside the
+// same word as the position, which is why the pair is a 32-bit word.
+template <typename T>
+__global__ void sort_radix_pack_runs_kernel(int64_t n, int64_t d_size, int64_t inner,
+                                            int run_bits, const T* in,
+                                            typename SortRadixTraits<T>::key_type* keys,
+                                            uint32_t* runs) {
+    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    for (; i < n; i += stride) {
+        const int64_t run = i / d_size;
+        const int64_t j = i - run * d_size;
+        const int64_t o = run / inner;
+        const int64_t in2 = run - o * inner;
+        keys[i] = SortRadixTraits<T>::encode(in[(o * d_size + j) * inner + in2]);
+        runs[i] = static_cast<uint32_t>((j << run_bits) | run);
+    }
+}
+
+template <typename T>
+__global__ void sort_radix_unpack_runs_kernel(int64_t n, int64_t d_size, int64_t inner,
+                                              int run_bits, uint32_t run_mask,
+                                              const T* in, const uint32_t* runs,
+                                              T* vals, int64_t* idxs) {
+    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    for (; i < n; i += stride) {
+        const int64_t run = i / d_size;
+        const int64_t j = i - run * d_size;
+        const int64_t o = run / inner;
+        const int64_t in2 = run - o * inner;
+        const int64_t dst = (o * d_size + j) * inner + in2;
+        const uint32_t packed = runs[i];
+        const int64_t src_run = packed & run_mask;
+        const int64_t src_j = packed >> run_bits;
+        const int64_t so = src_run / inner;
+        const int64_t sin2 = src_run - so * inner;
+        vals[dst] = in[(so * d_size + src_j) * inner + sin2];
+        idxs[dst] = src_j;
+    }
+}
+
 template <typename T>
 void sort_radix_impl(const Tensor& self_c, Tensor& values, Tensor& indices,
                      int64_t d_size, int64_t slices, int64_t inner, bool descending) {
@@ -423,6 +467,63 @@ void sort_radix_impl(const Tensor& self_c, Tensor& values, Tensor& indices,
     }
     using Key = typename SortRadixTraits<T>::key_type;
     const DType key_dtype = sizeof(Key) == 8 ? DType::UInt64 : DType::UInt32;
+    // A handful of long runs leaves a run-per-block walk with one block on each
+    // and the rest of the machine idle.  One global sort over every run orders
+    // all of them at once, with the run number carried in the low bits of the
+    // position; a stable pass over those bits then restores the run boundaries
+    // without disturbing the order the first pass settled within each run.
+    int run_bits = 0;
+    while ((int64_t(1) << run_bits) < slices) ++run_bits;
+    if (slices > 1 && slices < 128 &&
+        (static_cast<uint64_t>(d_size) << run_bits) <=
+            static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
+        Tensor run_keys_a = Tensor::empty({n}, key_dtype, device);
+        Tensor run_keys_b = Tensor::empty({n}, key_dtype, device);
+        Tensor runs_a = Tensor::empty({n}, DType::UInt32, device);
+        Tensor runs_b = Tensor::empty({n}, DType::UInt32, device);
+        const int run_blocks = static_cast<int>((n + kThreads - 1) / kThreads);
+        sort_radix_pack_runs_kernel<T><<<run_blocks, kThreads, 0, stream>>>(
+            n, d_size, inner, run_bits, static_cast<const T*>(self_c.data_ptr()),
+            run_keys_a.data_ptr<Key>(), runs_a.data_ptr<uint32_t>());
+        const int run_items = static_cast<int>(n);
+        const int key_bits = SortRadixTraits<T>::bit_count;
+        size_t pairs_bytes = 0;
+        size_t run_bytes = 0;
+        CUDA_CHECK(descending
+            ? cub::DeviceRadixSort::SortPairsDescending(
+                  nullptr, pairs_bytes, run_keys_a.data_ptr<Key>(),
+                  run_keys_b.data_ptr<Key>(), runs_a.data_ptr<uint32_t>(),
+                  runs_b.data_ptr<uint32_t>(), run_items, 0, key_bits, stream)
+            : cub::DeviceRadixSort::SortPairs(
+                  nullptr, pairs_bytes, run_keys_a.data_ptr<Key>(),
+                  run_keys_b.data_ptr<Key>(), runs_a.data_ptr<uint32_t>(),
+                  runs_b.data_ptr<uint32_t>(), run_items, 0, key_bits, stream));
+        CUDA_CHECK(cub::DeviceRadixSort::SortKeys(
+            nullptr, run_bytes, runs_b.data_ptr<uint32_t>(),
+            runs_a.data_ptr<uint32_t>(), run_items, 0, run_bits, stream));
+        Tensor runs_tmp = Tensor::empty(
+            {static_cast<int64_t>(
+                std::max<size_t>(std::max(pairs_bytes, run_bytes), 1))},
+            DType::UInt8, device);
+        CUDA_CHECK(descending
+            ? cub::DeviceRadixSort::SortPairsDescending(
+                  runs_tmp.data_ptr(), pairs_bytes, run_keys_a.data_ptr<Key>(),
+                  run_keys_b.data_ptr<Key>(), runs_a.data_ptr<uint32_t>(),
+                  runs_b.data_ptr<uint32_t>(), run_items, 0, key_bits, stream)
+            : cub::DeviceRadixSort::SortPairs(
+                  runs_tmp.data_ptr(), pairs_bytes, run_keys_a.data_ptr<Key>(),
+                  run_keys_b.data_ptr<Key>(), runs_a.data_ptr<uint32_t>(),
+                  runs_b.data_ptr<uint32_t>(), run_items, 0, key_bits, stream));
+        CUDA_CHECK(cub::DeviceRadixSort::SortKeys(
+            runs_tmp.data_ptr(), run_bytes, runs_b.data_ptr<uint32_t>(),
+            runs_a.data_ptr<uint32_t>(), run_items, 0, run_bits, stream));
+        sort_radix_unpack_runs_kernel<T><<<run_blocks, kThreads, 0, stream>>>(
+            n, d_size, inner, run_bits, (uint32_t(1) << run_bits) - 1,
+            static_cast<const T*>(self_c.data_ptr()),
+            runs_a.data_ptr<uint32_t>(), static_cast<T*>(values.data_ptr()),
+            indices.data_ptr<int64_t>());
+        return;
+    }
     Tensor keys_a = Tensor::empty({n}, key_dtype, device);
     Tensor keys_b = Tensor::empty({n}, key_dtype, device);
     Tensor pos_a = Tensor::empty({n}, DType::Int64, device);
