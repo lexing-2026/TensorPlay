@@ -531,6 +531,17 @@ inline __m256 v_sigmoid_f32(__m256 x, __m256 one, __m256 signbit) {
     return _mm256_blendv_ps(zeroed, r, is_nan);
 }
 
+// Sigmoid for blocks whose lanes are all inside [-87, 87].  Negating a lane
+// keeps the exp argument inside the range where the result is a normal
+// float, so the denominator is finite and at least one and neither of the
+// two division-corner repairs in the general form has anything to repair.
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256 v_sigmoid_f32_fast(__m256 x, __m256 one, __m256 signbit) {
+    const __m256 den =
+        _mm256_add_ps(one, v_exp_f32_fast(_mm256_xor_ps(x, signbit)));
+    return v_rcp_nr_ps(den);
+}
+
 __attribute__((target("avx2,fma"), always_inline))
 inline __m256 v_gelu_none_f32(__m256 x, __m256 one) {
     const __m256 kAlpha = _mm256_set1_ps(static_cast<float>(0.70710678118654752440));
@@ -849,9 +860,44 @@ static void f32_chunk_avx2(VOp op, VParams prm, const float* src, float* dst, in
         case VOp::Tanh:
             TP_F32_SIMPLE_LOOP_8(tensorplay::tpsleef::tanh(x));
             break;
-        case VOp::Sigmoid:
-            TP_F32_SIMPLE_LOOP_8(v_sigmoid_f32(x, one, signbit));
+        case VOp::Sigmoid: {
+            // Blocks inside [-87, 87] cannot make the denominator overflow or
+            // turn NaN, so they take the form without the corner repairs.
+            const __m256 sig_lo = _mm256_set1_ps(-87.0f);
+            const __m256 sig_hi = _mm256_set1_ps(87.0f);
+            for (; i + 32 <= n; i += 32) {
+                __m256 x0 = _mm256_loadu_ps(s + i);
+                __m256 x1 = _mm256_loadu_ps(s + i + 8);
+                __m256 x2 = _mm256_loadu_ps(s + i + 16);
+                __m256 x3 = _mm256_loadu_ps(s + i + 24);
+                __m256 bad = _mm256_or_ps(
+                    _mm256_or_ps(_mm256_cmp_ps(x0, sig_lo, _CMP_NGE_UQ),
+                                 _mm256_cmp_ps(x0, sig_hi, _CMP_NLE_UQ)),
+                    _mm256_or_ps(_mm256_cmp_ps(x1, sig_lo, _CMP_NGE_UQ),
+                                 _mm256_cmp_ps(x1, sig_hi, _CMP_NLE_UQ)));
+                bad = _mm256_or_ps(bad, _mm256_or_ps(
+                    _mm256_or_ps(_mm256_cmp_ps(x2, sig_lo, _CMP_NGE_UQ),
+                                 _mm256_cmp_ps(x2, sig_hi, _CMP_NLE_UQ)),
+                    _mm256_or_ps(_mm256_cmp_ps(x3, sig_lo, _CMP_NGE_UQ),
+                                 _mm256_cmp_ps(x3, sig_hi, _CMP_NLE_UQ))));
+                if (_mm256_movemask_ps(bad) == 0) {
+                    _mm256_storeu_ps(d + i, v_sigmoid_f32_fast(x0, one, signbit));
+                    _mm256_storeu_ps(d + i + 8, v_sigmoid_f32_fast(x1, one, signbit));
+                    _mm256_storeu_ps(d + i + 16, v_sigmoid_f32_fast(x2, one, signbit));
+                    _mm256_storeu_ps(d + i + 24, v_sigmoid_f32_fast(x3, one, signbit));
+                } else {
+                    _mm256_storeu_ps(d + i, v_sigmoid_f32(x0, one, signbit));
+                    _mm256_storeu_ps(d + i + 8, v_sigmoid_f32(x1, one, signbit));
+                    _mm256_storeu_ps(d + i + 16, v_sigmoid_f32(x2, one, signbit));
+                    _mm256_storeu_ps(d + i + 24, v_sigmoid_f32(x3, one, signbit));
+                }
+            }
+            for (; i + 8 <= n; i += 8) {
+                __m256 x = _mm256_loadu_ps(s + i);
+                _mm256_storeu_ps(d + i, v_sigmoid_f32(x, one, signbit));
+            }
             break;
+        }
         case VOp::GeluNone:
             TP_F32_SIMPLE_LOOP_8(v_gelu_none_f32(x, one));
             break;
