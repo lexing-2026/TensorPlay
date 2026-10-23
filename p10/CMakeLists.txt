@@ -451,6 +451,10 @@ if(USE_CUDA OR USE_ROCM)
         src/backend/cuda/ReduceMinValuesKernels.cu
         src/backend/cuda/ReduceAMinMaxKernels.cu
         src/backend/cuda/ReduceMomentKernels.cu
+        src/backend/cuda/ReduceNormKernels.cu
+        src/backend/cuda/ReduceLogicKernels.cu
+        src/backend/cuda/ReduceArgMaxKernels.cu
+        src/backend/cuda/ReduceArgMinKernels.cu
         src/backend/cuda/CumminmaxKernels.cu
         src/backend/cuda/SummaryOpsKernels.cu
         src/backend/cuda/RenormKernels.cu
