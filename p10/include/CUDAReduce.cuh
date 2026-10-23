@@ -208,9 +208,12 @@ struct alignas(sizeof(T) * N) aligned_vector {
     T val[N];
 };
 
+// Bounds an extremum scan starts from.  A float-family type, reduced precision
+// included, bounds at infinity: an infinite element has to survive a run whose
+// only other value is the identity, and a finite bound would swallow it.
 template <typename T>
 __host__ __device__ inline T reduction_lower_bound() {
-    if constexpr (std::is_floating_point_v<T>) {
+    if constexpr (std::is_floating_point_v<T> || is_half_like_v<T>) {
         return -std::numeric_limits<T>::infinity();
     } else {
         return std::numeric_limits<T>::lowest();
@@ -219,7 +222,7 @@ __host__ __device__ inline T reduction_lower_bound() {
 
 template <typename T>
 __host__ __device__ inline T reduction_upper_bound() {
-    if constexpr (std::is_floating_point_v<T>) {
+    if constexpr (std::is_floating_point_v<T> || is_half_like_v<T>) {
         return std::numeric_limits<T>::infinity();
     } else {
         return std::numeric_limits<T>::max();
@@ -1655,9 +1658,9 @@ struct ExtremumOps {
     }
 };
 
-// Fused min+max for non-float aminmax: a MinMaxPair accumulator carries both
-// extrema through one pass.  NaN semantics match MinMaxOps (a NaN claims its side
-// and sticks).  The float family uses PackedAminMaxOps instead.
+// Fused min+max for aminmax: a MinMaxPair accumulator carries both extrema
+// through one pass.  NaN semantics match MinMaxOps (a NaN claims its side and
+// sticks).
 template <typename ScalarT, typename AccT, typename OutputT>
 struct MinMaxPairOps {
     using pair_type = MinMaxPair<AccT>;
@@ -1885,84 +1888,24 @@ struct PackedArgMinOps {
 
 };
 
-// Fused min+max for aminmax: ONE 64-bit word carries both extremum keys —
-// [max key (high 32) | stored min key (low 32)] — so a single shuffle chain
-// per fold level serves two reductions that would otherwise each re-read the
-// whole input.  Each half is its own independent extremum scan:
-//   * the high half keeps extremum_value_key as-is (order-preserving), so
-//     integer max selects the largest value and canonical qNaN outranks +inf;
-//   * the low half stores ~key (order-reversing), so the same integer max
-//     selects the smallest value; NaN maps to all-ones there, outranking
-//     every finite stored key, so a NaN claims both outputs;
-//   * no real key lands on 0 or all-ones (the float key map never emits
-//     either), so 0ull is the identity for both halves at once.
-// The per-half max combine is componentwise, hence associative and
-// order-independent.  Float family only (the key map is a float encoding);
-// row length must fit int32 (host-side guard).
-template <typename OutputT>
-struct PackedAminMaxOps {
-    using acc_type = unsigned long long;
-
-    __device__ static unsigned long long pack(float value) {
-        const unsigned key = extremum_value_key(value);
-        const unsigned min_stored =
-            (key == 0xFFC00000u) ? 0xFFFFFFFFu : ~key;
-        return (static_cast<unsigned long long>(key) << 32) | min_stored;
-    }
-
-    __device__ static unsigned long long half_max(unsigned long long a,
-                                                  unsigned long long b) {
-        const unsigned a_hi = static_cast<unsigned>(a >> 32);
-        const unsigned b_hi = static_cast<unsigned>(b >> 32);
-        const unsigned hi = a_hi > b_hi ? a_hi : b_hi;
-        const unsigned a_lo = static_cast<unsigned>(a);
-        const unsigned b_lo = static_cast<unsigned>(b);
-        const unsigned lo = a_lo > b_lo ? a_lo : b_lo;
-        return (static_cast<unsigned long long>(hi) << 32) | lo;
-    }
-
-    template <typename V>
-    __device__ unsigned long long reduce(
-            unsigned long long acc, V value, int64_t) const {
-        return half_max(acc, pack(static_cast<float>(value)));
-    }
-
-    __device__ unsigned long long combine(unsigned long long a,
-                                          unsigned long long b) const {
-        return half_max(a, b);
-    }
-
-    __device__ OutputT project(unsigned long long word) const {
-        return static_cast<OutputT>(extremum_key_value(
-            static_cast<unsigned>(word >> 32)));
-    }
-
-    __device__ OutputT project_second(unsigned long long word) const {
-        const unsigned stored = static_cast<unsigned>(word);
-        if (stored == 0xFFFFFFFFu) {
-            // the all-ones min slot encodes the winning NaN
-            return static_cast<OutputT>(extremum_key_value(0xFFC00000u));
-        }
-        return static_cast<OutputT>(extremum_key_value(~stored));
-    }
-};
-
 template <typename ScalarT, typename AccT, typename OutputT>
 struct AllOps {
-    __device__ int reduce(int acc, ScalarT value, int64_t) const {
+    using acc_type = bool;
+    __device__ bool reduce(bool acc, ScalarT value, int64_t) const {
         return acc && static_cast<bool>(value);
     }
-    __device__ int combine(int a, int b) const { return a && b; }
-    __device__ OutputT project(int value) const { return static_cast<OutputT>(value != 0); }
+    __device__ bool combine(bool a, bool b) const { return a && b; }
+    __device__ OutputT project(bool value) const { return static_cast<OutputT>(value); }
 };
 
 template <typename ScalarT, typename AccT, typename OutputT>
 struct AnyOps {
-    __device__ int reduce(int acc, ScalarT value, int64_t) const {
+    using acc_type = bool;
+    __device__ bool reduce(bool acc, ScalarT value, int64_t) const {
         return acc || static_cast<bool>(value);
     }
-    __device__ int combine(int a, int b) const { return a || b; }
-    __device__ OutputT project(int value) const { return static_cast<OutputT>(value != 0); }
+    __device__ bool combine(bool a, bool b) const { return a || b; }
+    __device__ OutputT project(bool value) const { return static_cast<OutputT>(value); }
 };
 
 template <typename ScalarT, typename AccT, typename OutputT,

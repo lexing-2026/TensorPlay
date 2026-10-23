@@ -146,10 +146,9 @@ using same_dtype_acc_t = std::conditional_t<
 template <typename T, bool MaxMode>
 Tensor minmax_same_dtype(
         const Tensor& input, const ReductionSpec& spec, bool keepdim) {
-    // Empty inputs are legal here: callers (max_kernel/min_kernel for full
-    // reductions, max_dim_kernel/min_dim_kernel for dim reductions) already
-    // reduction over non-empty dims of a zero-element tensor, which yields
-    // an empty result (run_reduction_typed returns it untouched).
+    // Empty inputs are legal here: the callers either take the full-reduction
+    // path or reduce over non-empty dims of a zero-element tensor, and both
+    // yield an empty result that run_reduction_typed returns untouched.
     using AccT = same_dtype_acc_t<T>;
     using Ops = MinMaxOps<T, AccT, T, MaxMode>;
     const AccT identity = MaxMode

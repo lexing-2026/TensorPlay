@@ -124,38 +124,27 @@ namespace {
 
 using namespace reduce_family;
 
-// aminmax: both extreme values out of one pass.  The float family with an
-// int32-fitting logical extent runs the packed two-keys-per-word form (one
-// shuffle chain carries both outputs); every other dtype carries a
-// MinMaxPair accumulator through the same single read.
+// aminmax: both extreme values out of one pass.  A MinMaxPair accumulator
+// carries both ends through the same single read.
 template <typename T>
 std::tuple<Tensor, Tensor> aminmax_same_dtype(
         const Tensor& input, const ReductionSpec& spec, bool keepdim) {
     using ValueT = same_dtype_acc_t<T>;
-    if constexpr (std::is_same_v<ValueT, float>) {
-        if (spec.reduced_numel <= ((int64_t{1} << 31) - 1)) {
-            Tensor min_values = Tensor::empty(
-                reduction_output_shape(input, spec, keepdim), input.dtype(),
-                input.device());
-            Tensor max_values = run_reduction_typed<T, unsigned long long, T>(
-                input, spec, keepdim, input.dtype(),
-                reduction::PackedAminMaxOps<T>{}, 0ull, &min_values);
-            return {min_values, max_values};
-        }
-    }
     Tensor min_values = Tensor::empty(
         reduction_output_shape(input, spec, keepdim), input.dtype(),
         input.device());
-    // An extreme never overflows, so a whole run carries the input type of the
-    // values it bounds: widening an integer pair to 64 bits doubles the state
-    // every lane folds, shuffles and stages through shared memory, and buys a
-    // range no element of the run can ever need.
-    using StateT = reduction::MinMaxPair<ValueT>;
-    using Ops = reduction::MinMaxPairOps<T, ValueT, T>;
+    // An extreme never overflows, so a run is bounded at the width of the
+    // values it holds: widening a pair doubles the state every lane folds,
+    // shuffles and stages through shared memory, and buys a range no element
+    // of the run can ever need.  Bool is the exception -- a two-bit pair
+    // aligns worse than it saves, so it keeps the wider accumulator.
+    using AccScalarT = std::conditional_t<std::is_same_v<T, bool>, ValueT, T>;
+    using StateT = reduction::MinMaxPair<AccScalarT>;
+    using Ops = reduction::MinMaxPairOps<T, AccScalarT, T>;
     Tensor max_values = run_reduction_typed<T, StateT, T>(
         input, spec, keepdim, input.dtype(), Ops{},
-        StateT{reduction::reduction_upper_bound<ValueT>(),
-               reduction::reduction_lower_bound<ValueT>()},
+        StateT{reduction::reduction_upper_bound<AccScalarT>(),
+               reduction::reduction_lower_bound<AccScalarT>()},
         &min_values);
     return {min_values, max_values};
 }

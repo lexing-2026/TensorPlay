@@ -13,8 +13,8 @@ Tensor all_same_dtype(
     if (input.numel() == 0) {
         return Tensor::ones(reduction_output_shape(input, spec, keepdim), DType::Bool, input.device());
     }
-    return run_reduction_typed<T, int, bool>(
-        input, spec, keepdim, DType::Bool, AllOps<T, int, bool>{}, 1);
+    return run_reduction_typed<T, bool, bool>(
+        input, spec, keepdim, DType::Bool, AllOps<T, bool, bool>{}, true);
 }
 
 template <typename T>
@@ -23,8 +23,8 @@ Tensor any_same_dtype(
     if (input.numel() == 0) {
         return Tensor::zeros(reduction_output_shape(input, spec, keepdim), DType::Bool, input.device());
     }
-    return run_reduction_typed<T, int, bool>(
-        input, spec, keepdim, DType::Bool, AnyOps<T, int, bool>{}, 0);
+    return run_reduction_typed<T, bool, bool>(
+        input, spec, keepdim, DType::Bool, AnyOps<T, bool, bool>{}, false);
 }
 
 } // namespace
