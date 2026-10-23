@@ -49,6 +49,9 @@ Tensor where_kernel(
 // the transpose kernel below.
 Tensor flip_kernel(const Tensor& self, const std::vector<int64_t>& dims);
 
+// Defined in Reduction.cpp; totals every lane of a payload into one.
+Tensor sum_kernel(const Tensor& self, DType dtype);
+
 // Defined in BinaryOp.cpp; copies a texture payload into a dense buffer.
 api::vTensor to_buffer_storage_dispatch(
     api::Context* context,
@@ -1324,6 +1327,39 @@ Tensor diagonal_kernel(
   return materialize_view(self, sizes, out_strides, storage_offset);
 }
 
+// The trace of a matrix: the diagonal folded into a single lane.  A count
+// totals into the wider count its answer names; a narrow measured lane is
+// folded in a width that can hold the whole total and is rounded back to the
+// width the payload was read in, so one rounding covers the whole walk.
+Tensor trace_kernel(const Tensor& self) {
+  TP_CHECK(
+      self.dim() == 2,
+      "Vulkan trace expects a matrix, but got a tensor with ",
+      self.dim(),
+      " dimensions");
+  const bool counts =
+      self.dtype() == DType::Int32 || self.dtype() == DType::Int64;
+  TP_CHECK(
+      counts || self.dtype() == DType::Float32 ||
+          self.dtype() == DType::Float16,
+      "Vulkan trace supports Float32, Float16, Int32 and Int64 matrices only");
+  const Tensor line = diagonal_kernel(self, 0, 0, 1);
+  if (counts) {
+    return sum_kernel(line, DType::Int64);
+  }
+  if (self.dtype() == DType::Float16) {
+    return to_dtype_kernel(
+        sum_kernel(
+            to_dtype_kernel(line, DType::Float32, false, false, std::nullopt),
+            DType::Undefined),
+        DType::Float16,
+        false,
+        false,
+        std::nullopt);
+  }
+  return sum_kernel(line, DType::Undefined);
+}
+
 } // namespace ops
 } // namespace vulkan
 } // namespace tensorplay
@@ -1344,6 +1380,7 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, ShapeKernels) {
   m.impl("roll", &tensorplay::vulkan::ops::roll_kernel);
   m.impl("rot90", &tensorplay::vulkan::ops::rot90_kernel);
   m.impl("diagonal", &tensorplay::vulkan::ops::diagonal_kernel);
+  m.impl("trace", &tensorplay::vulkan::ops::trace_kernel);
   m.impl("select.int", &tensorplay::vulkan::ops::select_kernel);
   m.impl("cat", &tensorplay::vulkan::ops::cat_kernel);
   m.impl("constant_pad_nd", &tensorplay::vulkan::ops::constant_pad_nd_kernel);
