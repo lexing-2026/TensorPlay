@@ -215,37 +215,24 @@ struct Vectorized<float> {
         _mm256_and_ps(_mm256_set1_ps(-0.0f), sign));
   }
   Vectorized<float> erf() const {
-    // Two forms, both evaluated and then selected between, so no lane takes
-    // a branch; see cpu/vec/ErfPoly.h for why the split is there.
+    // One five-term form covers the whole range: the reciprocal argument maps
+    // [0, inf) onto (0, 1], so a single polynomial serves both the linear
+    // region and the tail and no lane takes a branch.
     namespace poly = tensorplay::vecmath;
     const __m256 sign_bit = _mm256_set1_ps(-0.0f);
     const __m256 one = _mm256_set1_ps(1.0f);
     const __m256 abs_x = _mm256_andnot_ps(sign_bit, values);
-    const __m256 sq = _mm256_mul_ps(values, values);
-
-    __m256 near = _mm256_set1_ps(poly::kErfSeries[6]);
-    for (int i = 5; i >= 0; --i)
-      near = _mm256_fmadd_ps(near, sq, _mm256_set1_ps(poly::kErfSeries[i]));
-    near = _mm256_mul_ps(values, near);
-
     const __m256 t = _mm256_div_ps(
         one, _mm256_fmadd_ps(_mm256_set1_ps(poly::kErfTailScale), abs_x, one));
-    __m256 tail = _mm256_set1_ps(poly::kErfTail[4]);
+    __m256 p = _mm256_set1_ps(poly::kErfTail[4]);
     for (int i = 3; i >= 0; --i)
-      tail = _mm256_fmadd_ps(tail, t, _mm256_set1_ps(poly::kErfTail[i]));
-    tail = _mm256_mul_ps(tail, t);
-    tail = _mm256_sub_ps(
-        one,
-        _mm256_mul_ps(tail, tensorplay::tpsleef::exp(_mm256_xor_ps(sign_bit, sq))));
-    // the tail was evaluated on |x|, and erf is odd
-    tail = _mm256_or_ps(_mm256_and_ps(sign_bit, values), tail);
-
-    return _mm256_blendv_ps(
-        tail,
-        near,
-        _mm256_cmp_ps(abs_x, _mm256_set1_ps(poly::kErfSplit), _CMP_LT_OQ));
-  }
-  Vectorized<float> erfc() const {
+      p = _mm256_fmadd_ps(p, t, _mm256_set1_ps(poly::kErfTail[i]));
+    p = _mm256_mul_ps(p, t);
+    const __m256 decay = tensorplay::tpsleef::exp(
+        _mm256_xor_ps(sign_bit, _mm256_mul_ps(values, values)));
+    const __m256 r = _mm256_sub_ps(one, _mm256_mul_ps(p, decay));
+    return _mm256_or_ps(_mm256_and_ps(sign_bit, values), r);
+  }  Vectorized<float> erfc() const {
     return tensorplay::tpsleef::erfc(values);
   }
   Vectorized<float> exp() const {

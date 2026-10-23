@@ -354,11 +354,6 @@ inline __m256 v_rcp_nr_ps(__m256 d) {
     return _mm256_mul_ps(r, _mm256_fnmadd_ps(d, r, _mm256_set1_ps(2.0f)));
 }
 
-// erf on float lanes: a series near zero and a rational tail away from it,
-// selected per lane.  Coefficients and the reason for the split live in
-// cpu/vec/ErfPoly.h; the vector class evaluates the same function, so a
-// kernel and its compiled counterpart agree.
-__attribute__((target("avx2,fma"), always_inline))
 // Fast float exp: x = k*ln2 + r with |r| <= ln2/2, exp(r) from a
 // fifth-order polynomial and 2^k from the exponent field.
 //
@@ -413,6 +408,8 @@ inline __m256 v_exp_f32(__m256 x) {
     return _mm256_mul_ps(_mm256_mul_ps(p, s1), s2);
 }
 
+// erf on float lanes.  Coefficients live in cpu/vec/ErfPoly.h so the vector
+// class and this kernel evaluate the same function.
 __attribute__((target("avx2,fma"), always_inline))
 inline __m256 v_erf_f32(__m256 x) {
     const __m256 sign_bit = _mm256_set1_ps(-0.0f);
@@ -1293,39 +1290,24 @@ inline __m512 v_rcp_nr_ps(__m512 d) {
     return _mm512_mul_ps(r, _mm512_fnmadd_ps(d, r, _mm512_set1_ps(2.0f)));
 }
 
-// erf on float lanes: a series near zero and a rational tail away from it,
-// selected per lane.  Coefficients and the reason for the split live in
-// cpu/vec/ErfPoly.h; the vector class evaluates the same function, so a
-// kernel and its compiled counterpart agree.
+// erf on float lanes.  Coefficients live in cpu/vec/ErfPoly.h so the vector
+// class and this kernel evaluate the same function.  The AVX-512 tier has no
+// inlined exponential, so the decay factor comes from the library entry point.
 __attribute__((target("avx512f,avx512dq"), always_inline))
 inline __m512 v_erf_f32_512(__m512 x) {
-    namespace poly = tensorplay::vecmath;
     const __m512 sign_bit = _mm512_set1_ps(-0.0f);
     const __m512 one = _mm512_set1_ps(1.0f);
     const __m512 abs_x = _mm512_andnot_ps(sign_bit, x);
-    const __m512 sq = _mm512_mul_ps(x, x);
-
-    __m512 near = _mm512_set1_ps(poly::kErfSeries[6]);
-    for (int i = 5; i >= 0; --i)
-        near = _mm512_fmadd_ps(near, sq, _mm512_set1_ps(poly::kErfSeries[i]));
-    near = _mm512_mul_ps(x, near);
-
     const __m512 t = _mm512_div_ps(
-        one, _mm512_fmadd_ps(_mm512_set1_ps(poly::kErfTailScale), abs_x, one));
-    __m512 tail = _mm512_set1_ps(poly::kErfTail[4]);
+        one, _mm512_fmadd_ps(_mm512_set1_ps(tensorplay::vecmath::kErfTailScale), abs_x, one));
+    __m512 p = _mm512_set1_ps(tensorplay::vecmath::kErfTail[4]);
     for (int i = 3; i >= 0; --i)
-        tail = _mm512_fmadd_ps(tail, t, _mm512_set1_ps(poly::kErfTail[i]));
-    tail = _mm512_mul_ps(tail, t);
-    tail = _mm512_sub_ps(
-        one,
-        _mm512_mul_ps(tail, tensorplay::tpsleef::exp(_mm512_xor_ps(sign_bit, sq))));
-    tail = _mm512_or_ps(_mm512_and_ps(sign_bit, x), tail);
-
-    return _mm512_mask_blend_ps(
-        _mm512_cmp_ps_mask(abs_x, _mm512_set1_ps(poly::kErfSplit), _CMP_LT_OQ),
-        tail, near);
+        p = _mm512_fmadd_ps(p, t, _mm512_set1_ps(tensorplay::vecmath::kErfTail[i]));
+    p = _mm512_mul_ps(p, t);
+    const __m512 decay = tensorplay::tpsleef::exp(_mm512_xor_ps(sign_bit, _mm512_mul_ps(x, x)));
+    const __m512 r = _mm512_sub_ps(one, _mm512_mul_ps(p, decay));
+    return _mm512_or_ps(_mm512_and_ps(sign_bit, x), r);
 }
-
 __attribute__((target("avx512f,avx512dq"), always_inline))
 inline __m512 gelu_poly_f32_512(__m512 x) {
     const __m512 one = _mm512_set1_ps(1.0f);
