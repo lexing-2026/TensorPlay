@@ -598,6 +598,63 @@ __attribute__((target("avx2,fma"), always_inline))
 inline __m256 v_erf_f32_fast(__m256 x) {
     return v_erf_f32_impl<true>(x);
 }
+
+// erfc on float lanes.  The tail form erfc(x) = Q(t) * t * exp(-x*x) with
+// t = 1/(1 + p|x|) is evaluated directly, so the answer never comes out of
+// subtracting two numbers near one and keeps its relative accuracy all the
+// way down to the underflow bound.  Q is a ten-term fit holding 7e-9
+// relative over t in [0.2, 1]; its value at t = 0 is the leading
+// coefficient, so inputs past the fitted range decay towards zero instead of
+// blowing up, and the exp factor has underflowed by then anyway.
+template <bool Fast>
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256 v_erfc_f32_impl(__m256 x) {
+    const __m256 sign_bit = _mm256_set1_ps(-0.0f);
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 abs_x = _mm256_andnot_ps(sign_bit, x);
+    const __m256 t = _mm256_div_ps(
+        one, _mm256_fmadd_ps(_mm256_set1_ps(0.3275911f), abs_x, one));
+    __m256 q = _mm256_set1_ps(1.7310578515e-2f);
+    q = _mm256_fmadd_ps(q, t, _mm256_set1_ps(-4.6872685983e-2f));
+    q = _mm256_fmadd_ps(q, t, _mm256_set1_ps(-4.4495100226e-2f));
+    q = _mm256_fmadd_ps(q, t, _mm256_set1_ps(2.1182032722e-1f));
+    q = _mm256_fmadd_ps(q, t, _mm256_set1_ps(-1.5454427326e-1f));
+    q = _mm256_fmadd_ps(q, t, _mm256_set1_ps(2.3693767973e-1f));
+    q = _mm256_fmadd_ps(q, t, _mm256_set1_ps(6.6187245797e-2f));
+    q = _mm256_fmadd_ps(q, t, _mm256_set1_ps(1.7168252403e-1f));
+    q = _mm256_fmadd_ps(q, t, _mm256_set1_ps(1.7206103609e-1f));
+    q = _mm256_fmadd_ps(q, t, _mm256_set1_ps(1.8510092770e-1f));
+    q = _mm256_fmadd_ps(q, t, _mm256_set1_ps(1.8481174722e-1f));
+    const __m256 sq = _mm256_mul_ps(x, x);
+    // The square rounds, and that rounding is multiplied by the square
+    // itself inside the exponent -- at |x| = 10 it is already 7e-6 relative.
+    // Carrying the lost bit out and folding it back as a first-order factor
+    // puts the argument back on the exact square.
+    const __m256 sq_err = _mm256_fnmadd_ps(x, x, sq);
+    const __m256 arg = _mm256_xor_ps(sign_bit, sq);
+    __m256 decay;
+    if constexpr (Fast) {
+        decay = v_exp_f32_fast(arg);
+    } else {
+        decay = v_exp_f32(arg);
+    }
+    decay = _mm256_fmadd_ps(decay, sq_err, decay);
+    const __m256 tail = _mm256_mul_ps(_mm256_mul_ps(q, t), decay);
+    // erfc(-x) = 2 - erfc(x).  The subtraction is safe because the tail is at
+    // most one, so two minus it never cancels.
+    const __m256 neg = _mm256_cmp_ps(x, _mm256_setzero_ps(), _CMP_LT_OQ);
+    return _mm256_blendv_ps(tail, _mm256_sub_ps(_mm256_set1_ps(2.0f), tail), neg);
+}
+
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256 v_erfc_f32(__m256 x) {
+    return v_erfc_f32_impl<false>(x);
+}
+
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256 v_erfc_f32_fast(__m256 x) {
+    return v_erfc_f32_impl<true>(x);
+}
 // elu takes its three coefficients as arguments instead of reading prm itself.
 // The chunk loops below broadcast the parameters once per chunk; deriving them
 // inside the vector loop means a double load, a narrowing convert and a
@@ -1108,9 +1165,38 @@ static void f32_chunk_avx2(VOp op, VParams prm, const float* src, float* dst, in
             }
             break;
         }
-        case VOp::Erfc:
-            TP_F32_SIMPLE_LOOP_8(tensorplay::tpsleef::erfc(x));
+        case VOp::Erfc: {
+            // |x| <= 9 keeps -x*x above the short exp chain's floor.
+            const __m256 limit = _mm256_set1_ps(9.0f);
+            for (; i + 32 <= n; i += 32) {
+                __m256 x0 = _mm256_loadu_ps(s + i);
+                __m256 x1 = _mm256_loadu_ps(s + i + 8);
+                __m256 x2 = _mm256_loadu_ps(s + i + 16);
+                __m256 x3 = _mm256_loadu_ps(s + i + 24);
+                __m256 bad = _mm256_or_ps(
+                    _mm256_or_ps(
+                        _mm256_cmp_ps(_mm256_andnot_ps(signbit, x0), limit, _CMP_NLE_UQ),
+                        _mm256_cmp_ps(_mm256_andnot_ps(signbit, x1), limit, _CMP_NLE_UQ)),
+                    _mm256_or_ps(
+                        _mm256_cmp_ps(_mm256_andnot_ps(signbit, x2), limit, _CMP_NLE_UQ),
+                        _mm256_cmp_ps(_mm256_andnot_ps(signbit, x3), limit, _CMP_NLE_UQ)));
+                if (_mm256_movemask_ps(bad) == 0) {
+                    _mm256_storeu_ps(d + i, v_erfc_f32_fast(x0));
+                    _mm256_storeu_ps(d + i + 8, v_erfc_f32_fast(x1));
+                    _mm256_storeu_ps(d + i + 16, v_erfc_f32_fast(x2));
+                    _mm256_storeu_ps(d + i + 24, v_erfc_f32_fast(x3));
+                } else {
+                    _mm256_storeu_ps(d + i, v_erfc_f32(x0));
+                    _mm256_storeu_ps(d + i + 8, v_erfc_f32(x1));
+                    _mm256_storeu_ps(d + i + 16, v_erfc_f32(x2));
+                    _mm256_storeu_ps(d + i + 24, v_erfc_f32(x3));
+                }
+            }
+            for (; i + 8 <= n; i += 8) {
+                _mm256_storeu_ps(d + i, v_erfc_f32(_mm256_loadu_ps(s + i)));
+            }
             break;
+        }
         case VOp::Silu:
             TP_F32_SIMPLE_LOOP_8(_mm256_mul_ps(
                 x, v_rcp_nr_ps(_mm256_add_ps(one, v_exp_f32(_mm256_xor_ps(x, signbit))))));
