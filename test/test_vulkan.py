@@ -8875,6 +8875,176 @@ class TestVulkanAmpScale(unittest.TestCase):
         self.assertEqual(scaler.get_scale(), 8.0)
 
 
+class TestVulkanOptimizerGroups(unittest.TestCase):
+    # An optimizer group descends every parameter from its own gradient and the
+    # running state that is carried beside it in the same position.  The
+    # arithmetic is a walk over the payload, so the device lane answers it with
+    # the kernels a lone tensor reaches; what these tests pin is that the lists
+    # pair up by position, that a momentum buffer and the two Adam moments keep
+    # their running values across steps, and that the walk refuses a group whose
+    # layout it cannot address.  Every case is held against the host lane on the
+    # same tables.
+
+    @staticmethod
+    def _tables(count, shape=(2, 3)):
+        tables = []
+        for index in range(count):
+            lane = np.arange(int(np.prod(shape)), dtype=np.float32) + 1.0
+            tables.append(
+                ((lane * (0.5 + 0.25 * index)).astype(np.float32))
+                .reshape(shape))
+        return tables
+
+    @staticmethod
+    def _steps(count, shape=(2, 3), start=0.0):
+        lanes = []
+        for index in range(count):
+            lane = np.arange(int(np.prod(shape)), dtype=np.float32)
+            lanes.append(
+                (((lane % 5.0) - 2.0) / (2.0 + start + index))
+                .astype(np.float32).reshape(shape))
+        return lanes
+
+    @staticmethod
+    def _group(tables, device):
+        return [tensorplay.from_numpy(np.array(table, copy=True)).to(device)
+                for table in tables]
+
+    @staticmethod
+    def _zeros(count, shape, device):
+        return [tensorplay.zeros(shape, dtype=tensorplay.float32,
+                                 device=device) for _ in range(count)]
+
+    @staticmethod
+    def _read(group):
+        return [held.cpu().numpy() for held in group]
+
+    def _answers(self, held, want, label, rtol=1e-5, atol=1e-6):
+        self.assertEqual(len(held), len(want), msg=label)
+        for index, (answer, truth) in enumerate(zip(held, want)):
+            self.assertEqual(tuple(answer.shape), truth.shape,
+                             msg=f"{label} entry {index}")
+            self.assertEqual(answer.dtype, truth.dtype,
+                             msg=f"{label} entry {index}")
+            np.testing.assert_allclose(
+                answer, truth, rtol=rtol, atol=atol,
+                err_msg=f"{label} entry {index}")
+
+    def test_a_plain_group_descends_every_parameter(self):
+        tables = self._tables(2)
+        grads = self._steps(2, start=1.0)
+        answers = {}
+        for device in ("vulkan", "cpu"):
+            params = self._group(tables, device)
+            held = self._group(grads, device)
+            returned = tensorplay._foreach_sgd(
+                params, held, [], 0.125, 0.0, 0.0, 0.0, False, True)
+            self.assertEqual(len(returned), 2, msg=device)
+            answers[device] = self._read(params)
+        self._answers(answers["vulkan"], answers["cpu"],
+                      "plain sgd group")
+        for answer, table, grad in zip(answers["vulkan"], tables, grads):
+            np.testing.assert_allclose(
+                answer, table - np.float32(0.125) * grad,
+                rtol=1e-6, atol=1e-7,
+                err_msg="plain sgd group against the step it states")
+
+    def test_a_momentum_group_keeps_its_buffer(self):
+        tables = self._tables(2)
+        first = self._steps(2, start=1.0)
+        second = self._steps(2, start=3.0)
+        for nesterov in (False, True):
+            answers = {}
+            for device in ("vulkan", "cpu"):
+                params = self._group(tables, device)
+                buffers = self._zeros(2, tables[0].shape, device)
+                tensorplay._foreach_sgd(
+                    params, self._group(first, device), buffers,
+                    0.05, 0.9, 0.1, 0.01, nesterov, True)
+                tensorplay._foreach_sgd(
+                    params, self._group(second, device), buffers,
+                    0.05, 0.9, 0.1, 0.01, nesterov, False)
+                answers[device] = (self._read(params), self._read(buffers))
+            label = f"momentum sgd group (nesterov={nesterov})"
+            self._answers(answers["vulkan"][0], answers["cpu"][0],
+                          label + " parameters")
+            self._answers(answers["vulkan"][1], answers["cpu"][1],
+                          label + " buffers")
+
+    def test_an_adam_group_advances_its_moments(self):
+        tables = self._tables(2)
+        first = self._steps(2, start=1.0)
+        second = self._steps(2, start=3.0)
+        for amsgrad in (False, True):
+            answers = {}
+            for device in ("vulkan", "cpu"):
+                params = self._group(tables, device)
+                moments = self._zeros(2, tables[0].shape, device)
+                squares = self._zeros(2, tables[0].shape, device)
+                maxima = (self._zeros(2, tables[0].shape, device)
+                          if amsgrad else [])
+                tensorplay._foreach_adam(
+                    params, self._group(first, device), moments, squares,
+                    maxima, [1, 3], 0.01, 0.9, 0.999, 1e-8, 0.02, amsgrad)
+                tensorplay._foreach_adam(
+                    params, self._group(second, device), moments, squares,
+                    maxima, [2, 4], 0.01, 0.9, 0.999, 1e-8, 0.02, amsgrad)
+                answers[device] = (self._read(params), self._read(moments),
+                                   self._read(squares), self._read(maxima))
+            label = f"adam group (amsgrad={amsgrad})"
+            self._answers(answers["vulkan"][0], answers["cpu"][0],
+                          label + " parameters")
+            self._answers(answers["vulkan"][1], answers["cpu"][1],
+                          label + " first moments")
+            self._answers(answers["vulkan"][2], answers["cpu"][2],
+                          label + " second moments")
+            self._answers(answers["vulkan"][3], answers["cpu"][3],
+                          label + " maximum second moments")
+
+    def test_a_group_that_does_not_pair_up_is_refused(self):
+        device = "vulkan"
+        params = self._group(self._tables(2), device)
+        one = self._group(self._tables(1), device)
+        with self.assertRaises(ValueError):
+            tensorplay._foreach_sgd(
+                params, one, [], 0.1, 0.0, 0.0, 0.0, False, True)
+        # A momentum step reads a buffer for every parameter it descends.
+        with self.assertRaises(ValueError):
+            tensorplay._foreach_sgd(
+                params, self._group(self._steps(2), device), [],
+                0.1, 0.9, 0.0, 0.0, False, True)
+        with self.assertRaises(ValueError):
+            tensorplay._foreach_adam(
+                params, self._group(self._steps(2), device),
+                self._zeros(2, (2, 3), device), self._zeros(2, (2, 3), device),
+                [], [1], 0.1, 0.9, 0.999, 1e-8, 0.0, False)
+        with self.assertRaises(ValueError):
+            tensorplay._foreach_adam(
+                params, self._group(self._steps(2), device),
+                self._zeros(2, (2, 3), device), self._zeros(2, (2, 3), device),
+                [], [1, 2], 0.1, 0.9, 0.999, 1e-8, 0.0, True)
+
+    def test_a_half_or_mislaid_group_is_refused(self):
+        device = "vulkan"
+        half = tensorplay.tensor(
+            [1.0, 2.0], dtype=tensorplay.float16, device=device)
+        with self.assertRaisesRegex(NotImplementedError, "float32"):
+            tensorplay._foreach_sgd(
+                [half], [half.clone()], [], 0.1, 0.0, 0.0, 0.0, False, True)
+        params = self._group(self._tables(1), device)
+        mismatched = self._group([self._tables(1, shape=(3, 2))[0]], device)
+        with self.assertRaises(NotImplementedError):
+            tensorplay._foreach_sgd(
+                params, mismatched, [], 0.1, 0.0, 0.0, 0.0, False, True)
+        half_moment = tensorplay.zeros(
+            (2, 3), dtype=tensorplay.float16, device=device)
+        with self.assertRaises(NotImplementedError):
+            tensorplay._foreach_adam(
+                params, self._group(self._steps(1), device), [half_moment],
+                self._zeros(1, (2, 3), device), [], [1],
+                0.1, 0.9, 0.999, 1e-8, 0.0, False)
+
+
 class TestVulkanRowAccumulation(unittest.TestCase):
     # A list of row codes may name one row several times, and every row it names
     # has to reach the destination.  Nothing on this device locks a row while it

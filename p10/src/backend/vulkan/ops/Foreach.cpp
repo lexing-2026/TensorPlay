@@ -4,6 +4,7 @@
 
 #include "tensorplay/ops/TPXOpsGenerated.h"
 
+#include <cmath>
 #include <optional>
 #include <string>
 #include <vector>
@@ -740,6 +741,179 @@ Tensor& amp_update_scale_kernel(
   return self;
 }
 
+// An optimizer group updates every parameter from its own gradient and state,
+// so the lists have to pair up by position and every entry has to hold the
+// same shape, width and device as the parameter it belongs to.  The checks run
+// before the first write: a state that does not match its parameter would
+// otherwise be addressed through the wrong layout.
+void check_optimizer_pair(
+    const Tensor& param, const Tensor& grad, const char* op_name) {
+  if (!param.defined() || !grad.defined()) {
+    TP_THROW(
+        ValueError,
+        std::string(op_name) + ": parameters and gradients must be defined");
+  }
+  if (!param.device().is_vulkan() || param.device() != grad.device() ||
+      !param.is_contiguous() || !grad.is_contiguous() ||
+      param.shape() != grad.shape() || param.dtype() != grad.dtype() ||
+      param.dtype() != DType::Float32) {
+    TP_THROW(
+        NotImplementedError,
+        std::string(op_name) +
+            ": requires contiguous float32 parameter/gradient pairs with "
+            "matching layout on the device");
+  }
+}
+
+void check_optimizer_state(
+    const Tensor& param,
+    const Tensor& state,
+    const char* op_name,
+    const char* what) {
+  if (!state.defined()) {
+    TP_THROW(
+        ValueError,
+        std::string(op_name) + ": required optimizer state is undefined");
+  }
+  if (!state.is_contiguous() || state.shape() != param.shape() ||
+      state.dtype() != param.dtype() || state.device() != param.device()) {
+    TP_THROW(
+        NotImplementedError,
+        std::string(op_name) + ": " + what +
+            " must match its parameter layout");
+  }
+}
+
+// Descend one step per parameter: an optional weight decay folds into the
+// gradient, an optional momentum buffer keeps its running value (the first
+// step starts it from the gradient itself, and only then does the dampening
+// factor apply), and a Nesterov step reads the gradient through that buffer.
+// Every term is a walk over the whole payload, so the update stays on the
+// device.
+std::vector<Tensor> foreach_sgd_kernel(
+    std::vector<Tensor> params,
+    const std::vector<Tensor>& grads,
+    std::vector<Tensor> momentum_buffers,
+    double lr,
+    double momentum,
+    double dampening,
+    double weight_decay,
+    bool nesterov,
+    bool first_momentum_step) {
+  const size_t count = params.size();
+  const bool has_momentum = momentum != 0.0;
+  if (grads.size() != count ||
+      ((has_momentum || !momentum_buffers.empty()) &&
+       momentum_buffers.size() != count)) {
+    TP_THROW(ValueError, "_foreach_sgd: tensor list sizes must match");
+  }
+  for (size_t i = 0; i < count; ++i) {
+    check_optimizer_pair(params[i], grads[i], "_foreach_sgd");
+    if (has_momentum) {
+      check_optimizer_state(
+          params[i], momentum_buffers[i], "_foreach_sgd", "momentum buffer");
+    }
+  }
+  if (params.empty()) return params;
+
+  const bool has_wd = weight_decay != 0.0;
+  for (size_t i = 0; i < count; ++i) {
+    Tensor& param = params[i];
+    Tensor grad = has_wd
+        ? tpx::ops::add(grads[i], tpx::ops::mul(param, weight_decay))
+        : grads[i];
+    if (has_momentum) {
+      Tensor& buffer = momentum_buffers[i];
+      const Tensor value = first_momentum_step
+          ? grad
+          : tpx::ops::add(
+                tpx::ops::mul(buffer, momentum),
+                tpx::ops::mul(grad, 1.0 - dampening));
+      tpx::ops::copy_(buffer, value);
+      grad = nesterov ? tpx::ops::add(grad, tpx::ops::mul(value, momentum))
+                      : value;
+    }
+    tpx::ops::copy_(params[i], tpx::ops::sub(param, tpx::ops::mul(grad, lr)));
+  }
+  return params;
+}
+
+// Descend one Adam step per parameter: the weight decay folds into the
+// gradient, the two moment averages keep their running values, the AMSGrad
+// maximum keeps the larger second average, and the bias-corrected step divides
+// by the corrected root of that average plus the epsilon.  The bias correction
+// is one count per parameter, so its constants are folded before the walk.
+std::vector<Tensor> foreach_adam_kernel(
+    std::vector<Tensor> params,
+    const std::vector<Tensor>& grads,
+    std::vector<Tensor> exp_avgs,
+    std::vector<Tensor> exp_avg_sqs,
+    std::vector<Tensor> max_exp_avg_sqs,
+    const std::vector<int64_t>& steps,
+    double lr,
+    double beta1,
+    double beta2,
+    double eps,
+    double weight_decay,
+    bool amsgrad) {
+  const size_t count = params.size();
+  if (steps.size() != count ||
+      exp_avgs.size() != count || exp_avg_sqs.size() != count ||
+      (amsgrad && max_exp_avg_sqs.size() != count) ||
+      (!max_exp_avg_sqs.empty() && max_exp_avg_sqs.size() != count)) {
+    TP_THROW(
+        ValueError,
+        "_foreach_adam: tensor and step list sizes must match the parameter "
+        "list");
+  }
+  for (size_t i = 0; i < count; ++i) {
+    check_optimizer_pair(params[i], grads[i], "_foreach_adam");
+    check_optimizer_state(
+        params[i], exp_avgs[i], "_foreach_adam", "first moment");
+    check_optimizer_state(
+        params[i], exp_avg_sqs[i], "_foreach_adam", "second moment");
+    if (amsgrad) {
+      check_optimizer_state(
+          params[i], max_exp_avg_sqs[i], "_foreach_adam",
+          "maximum second moment");
+    }
+  }
+  if (params.empty()) return params;
+
+  const bool has_wd = weight_decay != 0.0;
+  for (size_t i = 0; i < count; ++i) {
+    Tensor& param = params[i];
+    const double correction1 =
+        1.0 - std::pow(beta1, static_cast<double>(steps[i]));
+    const double correction2 =
+        1.0 - std::pow(beta2, static_cast<double>(steps[i]));
+    const Tensor grad = has_wd
+        ? tpx::ops::add(grads[i], tpx::ops::mul(param, weight_decay))
+        : grads[i];
+    const Tensor first = tpx::ops::add(
+        tpx::ops::mul(exp_avgs[i], beta1),
+        tpx::ops::mul(grad, 1.0 - beta1));
+    tpx::ops::copy_(exp_avgs[i], first);
+    const Tensor second = tpx::ops::add(
+        tpx::ops::mul(exp_avg_sqs[i], beta2),
+        tpx::ops::mul(tpx::ops::mul(grad, grad), 1.0 - beta2));
+    tpx::ops::copy_(exp_avg_sqs[i], second);
+    Tensor carried = second;
+    if (amsgrad) {
+      carried = tpx::ops::maximum(max_exp_avg_sqs[i], second);
+      tpx::ops::copy_(max_exp_avg_sqs[i], carried);
+    }
+    const Tensor denom = tpx::ops::add(
+        tpx::ops::div(tpx::ops::sqrt(carried), std::sqrt(correction2)), eps);
+    tpx::ops::copy_(
+        param,
+        tpx::ops::sub(
+            param, tpx::ops::div(tpx::ops::mul(first, lr / correction1),
+                                 denom)));
+  }
+  return params;
+}
+
 // A group raised to a count.  The exponent is either one count, one count per
 // tensor, or a payload of its own, and a shared base may be a count or a
 // payload held beside the walk.
@@ -1033,6 +1207,8 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, ForeachKernels) {
       &tensorplay::vulkan::ops::amp_foreach_non_finite_check_and_unscale_kernel);
   m.impl(
       "_amp_update_scale_", &tensorplay::vulkan::ops::amp_update_scale_kernel);
+  m.impl("_foreach_sgd", &tensorplay::vulkan::ops::foreach_sgd_kernel);
+  m.impl("_foreach_adam", &tensorplay::vulkan::ops::foreach_adam_kernel);
 
   m.impl(
       "_foreach_pow.Scalar",
