@@ -629,6 +629,17 @@ std::vector<Tensor> foreach_powsum_kernel(
   });
 }
 
+// A group of products: every tensor is the left hand of a product of its own and
+// the partner list names the right hand it is multiplied by, so the shapes one
+// tensor pairs under need not agree with the shapes another does.
+std::vector<Tensor> foreach_mm_kernel(
+    const std::vector<Tensor>& self,
+    const std::vector<Tensor>& mat2) {
+  return walk_pairs(self, mat2, [](const Tensor& left, const Tensor& right) {
+    return tpx::ops::mm(left, right);
+  });
+}
+
 // A group raised to a count.  The exponent is either one count, one count per
 // tensor, or a payload of its own, and a shared base may be a count or a
 // payload held beside the walk.
@@ -912,6 +923,10 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, ForeachKernels) {
   m.impl(
       "_foreach_powsum.Scalar",
       &tensorplay::vulkan::ops::foreach_powsum_kernel);
+
+  m.impl(
+      "_foreach_mm",
+      &tensorplay::vulkan::ops::foreach_mm_kernel);
 
   m.impl(
       "_foreach_pow.Scalar",

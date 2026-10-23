@@ -8608,6 +8608,30 @@ class TestVulkanForeachGroup(unittest.TestCase):
                 tensorplay._foreach_powsum(group, 2, dtype=tensorplay.float32)),
             "_foreach_powsum of a counted group held in a measuring width")
 
+    def test_a_group_of_products_answers_each_product_it_names(self):
+        # Every tensor is the left hand of a product of its own, so one tensor may
+        # pair under shapes another tensor never sees; the answer is the product
+        # the pair of shapes names.
+        lefts = [self._table((3, 4)), self._table((2, 2), start=1.0),
+                 self._table((5, 3), start=2.0)]
+        rights = [self._table((4, 2), start=5.0), self._table((2, 5), start=7.0),
+                  self._table((3, 1), start=9.0)]
+        want = [np.ascontiguousarray(one @ two) for one, two in zip(lefts, rights)]
+        self._read_matches(
+            lefts, want,
+            lambda group, device: self._read(
+                tensorplay._foreach_mm(group, self._group(rights, device))),
+            "_foreach_mm of a group")
+
+    def test_a_group_of_products_refuses_a_partner_list_that_runs_short(self):
+        lefts = [self._table((3, 4)), self._table((2, 2)), self._table((5, 3))]
+        rights = [self._table((4, 2)), self._table((2, 5))]
+        for device in ("vulkan", "cpu"):
+            with self.assertRaisesRegex(
+                    ValueError, "tensor list arguments must have the same length"):
+                tensorplay._foreach_mm(
+                    self._group(lefts, device), self._group(rights, device))
+
 
 class TestVulkanRowAccumulation(unittest.TestCase):
     # A list of row codes may name one row several times, and every row it names
