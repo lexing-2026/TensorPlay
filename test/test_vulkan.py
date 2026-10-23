@@ -6983,17 +6983,21 @@ class TestVulkanAdvancedIndexing(unittest.TestCase):
         self.assertEqual(tuple(got.shape), (0, 6))
 
     def test_a_code_outside_the_rows_reads_nothing(self):
-        # Both storages settle the range in the walk: a code that names no row
-        # answers zeros instead of asking the host where the rows stop.
-        small = self._device(self._table((5, 4)))
+        # Both storages settle the range in the walk: a code past the end names
+        # no row and answers zeros, while a code below zero counts back from the
+        # end of the axis it names, which is how the host reads it.  A host that
+        # asked for either bound would pay a queue sync for every step.
+        table = self._table((5, 4))
+        small = self._device(table)
         np.testing.assert_array_equal(
             self._read(small, 0, self._codes([0, 7, -2])).cpu().numpy(),
-            np.array([[0, 1, 2, 3], [0, 0, 0, 0], [0, 0, 0, 0]], np.float32),
+            np.array([[0, 1, 2, 3], [0, 0, 0, 0], table[3]], np.float32),
             err_msg="an image payload")
-        big = self._device(self._table((20000, 3)))
+        big_table = self._table((20000, 3))
+        big = self._device(big_table)
         np.testing.assert_array_equal(
             self._read(big, 0, self._codes([0, 20000, -1])).cpu().numpy(),
-            np.array([[0, 1, 2], [0, 0, 0], [0, 0, 0]], np.float32),
+            np.array([[0, 1, 2], [0, 0, 0], big_table[19999]], np.float32),
             err_msg="a linear payload")
 
     def _write_matches(self, shape, axis, np_dtype=np.float32):
@@ -7096,18 +7100,191 @@ class TestVulkanAdvancedIndexing(unittest.TestCase):
             t2.cpu().numpy(), np.array([[-3, -3], [0, 0], [-3, -3]], np.float32),
             err_msg="a subscript write that spells its whole axis")
 
-    def test_a_shape_the_walk_would_have_to_guess_is_answered_off_it(self):
+    def test_an_index_of_nothing_but_numbers_is_answered_off_it(self):
         payload = self._device(self._table((5, 4)))
-        # A mask names rows by counting them, which is a compaction the walk
-        # does not do; neither does a tuple of lists that has to be broadcast
-        # against itself.
-        with self.assertRaisesRegex(RuntimeError, "list of row codes"):
-            tensorplay.index(
-                payload, [self._device(np.array([True, False, True, False, False]))])
-        with self.assertRaisesRegex(RuntimeError, "list of row codes"):
+        # A mask now compacts to the rows it selects and several lists fold into
+        # one address per answer, so the only tuple a read refuses here is one
+        # whose index holds neither counts nor lanes.
+        with self.assertRaisesRegex((RuntimeError, IndexError), "long, int, byte or bool"):
             tensorplay.index(payload, [self._device(np.ones(2, np.float32))])
+
+
+class TestVulkanIndexWalk(unittest.TestCase):
+    # A tuple that reaches past one row of one axis is read by turning every
+    # coordinate it names into an address of the payload flattened to a line, so
+    # a single lookup gathers what several axes would have taken together.  A
+    # mask is first compacted to the positions of the lanes it selects, several
+    # lists broadcast against each other into one block, and lists that sit apart
+    # hand that block to the front of the answer, which is the order a walk over
+    # the whole payload leaves it in.  Nothing here needs a shader of its own:
+    # the compaction, the counting and the lookup are answered elsewhere in this
+    # backend, and the addresses are counts wider than a word because a
+    # payload's own reach is.
+
+    @staticmethod
+    def _table(shape, dtype=np.float32):
+        return (np.arange(int(np.prod(shape)), dtype=np.float32)
+                .reshape(shape) % 17).astype(dtype)
+
+    @staticmethod
+    def _device(payload):
+        arr = np.asarray(payload)
+        if arr.ndim and not arr.flags["C_CONTIGUOUS"]:
+            arr = np.ascontiguousarray(arr)
+        return tensorplay.from_numpy(arr).to("vulkan")
+
+    @staticmethod
+    def _codes(values, dtype=np.int64):
+        return TestVulkanIndexWalk._device(np.array(values, dtype=dtype))
+
+    def _read_matches(self, table, keys, label):
+        # The tuple is read on both lanes and against the arithmetic the answer
+        # has to match, so a walk that lands an address off by one stride of its
+        # own axis shows up rather than looking plausible in isolation.
+        want = table[tuple(slice(None) if key is None else key
+                           for key in keys)]
+        for device in ("vulkan", "cpu"):
+            payload = tensorplay.from_numpy(np.ascontiguousarray(table)).to(device)
+            indices = [None if key is None else
+                       tensorplay.from_numpy(np.asarray(key)).to(device)
+                       for key in keys]
+            got = tensorplay.index(payload, indices)
+            self.assertEqual(tuple(got.shape), want.shape,
+                             msg=f"{label} on {device}")
+            np.testing.assert_array_equal(
+                got.cpu().numpy(), want, err_msg=f"{label} on {device}")
+
+    def test_two_lists_fold_into_one_address_per_answer(self):
+        table = self._table((3, 4, 5))
+        self._read_matches(table, [np.array([0, 1]), np.array([1, 2])],
+                           "two lists of one length")
+        self._read_matches(
+            table,
+            [np.array([0, 2, 1]), np.array([3, 0, 1]), np.array([1, 2, 4])],
+            "three lists")
+
+    def test_lists_broadcast_against_each_other(self):
+        table = self._table((3, 4, 5))
+        self._read_matches(table,
+                           [np.array([[0], [1], [2]]), np.array([1, 2, 3])],
+                           "a grid of codes")
+        self._read_matches(table,
+                           [np.array([0, 2]), np.array([[3], [0], [1]])],
+                           "lists of one length held in different shapes")
+        self._read_matches(table, [np.array([0, 1, 2]), np.zeros((2, 3), np.int64)],
+                           "a list broadcast over a grid")
+    def test_an_axis_left_whole_keeps_its_own_lanes(self):
+        table = self._table((3, 4, 5))
+        self._read_matches(table, [None, np.array([0, 2])], "a middle list")
+        self._read_matches(table, [None, np.array([1])], "one row of a middle axis")
+        self._read_matches(table, [np.array([0, 2]), None],
+                           "a list that names the first axis")
+
+    def test_a_mask_compacts_the_lanes_it_selects(self):
+        table = self._table((3, 4, 5))
+        self._read_matches(table, [table % 3 == 0], "a mask over the whole payload")
+        self._read_matches(table, [np.array([True, False, True])],
+                           "a mask over one axis")
+        self._read_matches(table, [None, np.array([True, False, True, False])],
+                           "a mask over a middle axis")
+        self._read_matches(table, [table[:, :, 0] % 2 == 0],
+                           "a mask that covers two axes")
+
+    def test_lists_that_sit_apart_move_their_block_first(self):
+        table = self._table((3, 4, 5))
+        self._read_matches(table,
+                           [np.array([0, 1]), None, np.array([0, 1])],
+                           "codes at both ends of a tuple")
+        self._read_matches(table,
+                           [np.array([0, 2]), None, np.array([True, False, True, False, False])],
+                           "a list and a mask at both ends")
+        wide = self._table((2, 3, 4, 5))
+        self._read_matches(wide,
+                           [np.array([0, 1]), None, np.array([1, 3]), None],
+                           "a rank four payload with the block in the middle")
+
+    def test_a_negative_code_counts_back_from_the_axis_it_names(self):
+        table = self._table((3, 4, 5))
+        self._read_matches(table, [np.array([-1, 0])],
+                           "a lone list with a code below zero")
+        self._read_matches(table, [np.array([-1, 0]), np.array([-2, 3])],
+                           "two lists with codes below zero")
+        self._read_matches(table, [None, np.array([-1, -3]), np.array([-1])],
+                           "codes below zero across an axis left whole")
+
+    def test_a_half_payload_is_walked_the_same_way(self):
+        table = self._table((3, 4, 5), np.float16)
+        self._read_matches(table, [np.array([0, 2]), np.array([1, 3])],
+                           "a half payload under two lists")
+        self._read_matches(table, [table % 2 == 0],
+                           "a half payload under a mask")
+
+    def test_a_counting_payload_is_walked_the_same_way(self):
+        table = np.arange(60, dtype=np.int64).reshape(3, 4, 5)
+        self._read_matches(table, [np.array([0, 2]), np.array([1, 3])],
+                           "a payload of counts under two lists")
+        self._read_matches(table, [table % 7 == 0],
+                           "a payload of counts under a mask")
+
+    def test_a_tuple_that_names_nothing_answers_no_lanes(self):
+        table = self._table((3, 4, 5))
+        self._read_matches(table,
+                           [np.zeros(0, np.int64), np.zeros(0, np.int64)],
+                           "two empty lists")
+        self._read_matches(table, [np.zeros((3, 4, 5), bool)],
+                           "a mask with no lane selected")
+        self._read_matches(table, [None, np.zeros(0, np.int64)],
+                           "an empty list over a middle axis")
+
+    def test_the_walk_carries_a_list_left_on_the_host(self):
+        table = self._table((3, 4, 5))
+        payload = self._device(table)
+        codes = tensorplay.tensor([0, 2], dtype=tensorplay.int64)
+        grid = tensorplay.tensor([[1], [3]], dtype=tensorplay.int64)
+        self.assertEqual(codes.device.type, "cpu")
+        got = tensorplay.index(payload, [codes, grid])
+        np.testing.assert_array_equal(
+            got.cpu().numpy(), table[[0, 2], [[1], [3]]],
+            err_msg="lists that stayed on the host")
+
+    def test_a_subscript_walks_the_payload_the_same_way(self):
+        table = self._table((3, 4, 5))
+        payload = self._device(table)
+        np.testing.assert_array_equal(
+            payload[self._codes([0, 2]), self._codes([1, 3])].cpu().numpy(),
+            table[[0, 2], [1, 3]], err_msg="a subscript of two lists")
+        mask = table[:, :, 0] % 2 == 0
+        np.testing.assert_array_equal(
+            payload[self._device(mask)].cpu().numpy(), table[mask],
+            err_msg="a subscript under a mask")
+
+    def test_a_tuple_the_walk_cannot_follow_is_answered_off_it(self):
+        payload = self._device(self._table((3, 4, 5)))
+        with self.assertRaisesRegex((RuntimeError, IndexError), "long, int, byte or bool"):
+            tensorplay.index(payload, [self._device(np.ones(2, np.float32))])
+        with self.assertRaisesRegex((RuntimeError, IndexError), "shape of the mask"):
+            tensorplay.index(payload, [self._device(np.array([True, False]))])
+        with self.assertRaisesRegex((RuntimeError, IndexError), "shape mismatch"):
+            tensorplay.index(payload,
+                             [self._codes([0, 1]), self._codes([0, 1, 2])])
+        with self.assertRaisesRegex((RuntimeError, IndexError), "too many indices"):
+            tensorplay.index(payload, [self._codes([0]), self._codes([0]),
+                                       self._codes([0]), self._codes([0])])
+
+    def test_a_write_of_points_the_walk_names_stays_refused(self):
+        # The addresses a walk composes name single lanes, and the payload is
+        # held in a form a write through it narrowed to a line does not reach,
+        # so the scatter keeps to whole rows and this stays refused rather than
+        # answered by carrying the payload through two copies.
+        payload = self._device(np.zeros((3, 4, 5), np.float32))
         with self.assertRaisesRegex(RuntimeError, "several lists"):
-            tensorplay.index(payload, [self._codes([0, 1]), self._codes([0, 1])])
+            tensorplay.index_put_(
+                payload, [self._codes([0, 1]), self._codes([0, 1])],
+                self._device(np.zeros((2, 5), np.float32)), False)
+        with self.assertRaisesRegex(RuntimeError, "list of row codes"):
+            tensorplay.index_put_(
+                payload, [self._device(np.zeros((3, 4, 5), bool))],
+                self._device(np.zeros(4, np.float32)), False)
 
 
 class TestVulkanMaskCompaction(unittest.TestCase):
