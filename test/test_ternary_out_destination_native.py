@@ -8,7 +8,9 @@ element by element straight onto the destination.  Where they do not -- one
 operand broadcast, one operand carried to another width, a width narrower than
 single precision -- the answer is composed and its last step is laid on the
 destination, so the elements are still stored once, where the caller asked for
-them.
+them.  A destination too wide for the cache the walk works in is stored past the
+cache, which lays whole blocks and leaves the elements at the edges of every
+span to the step that answers one at a time.
 
 What is refused: a destination reached at a stride, because a strided store is
 the slow scalar walk while a packed answer can be drawn by the fast one and then
@@ -334,3 +336,63 @@ def test_inplace_forms_answer_the_input_themselves():
             else:
                 step(e, w if name == "addcmul" else d, value=VALUE)
             assert agree(read(target), want, rtol, fs, fe, fw, fd), (name, dtype)
+
+
+def test_out_answers_a_destination_too_wide_to_stay_in_cache():
+    """A destination too wide for the share of the last level cache the team
+    holds is stored past the cache, which spares the walk fetching every line it
+    is about to overwrite.  Such a store only lays whole blocks, so the elements
+    ahead of the first block of every span and behind its last are the ones an
+    edge can drop, and the answer has to hold them all.
+
+    Four streams of this length are past that share on a part with a few tens of
+    megabytes of last level cache, which is the width the streamed route is
+    chosen at; a narrower answer takes the fetched route and has to agree with
+    the same elements either way."""
+    n = 2097159  # four float32 streams of eight megabytes, and odd
+    rng = np.random.default_rng(11)
+    base = rng.standard_normal(n).astype(np.float32)
+    one = rng.standard_normal(n).astype(np.float32)
+    two = np.abs(rng.standard_normal(n).astype(np.float32)) + 0.5
+    weight = np.abs(rng.standard_normal(n).astype(np.float32))
+    s, e, w = at(tp.float32, base), at(tp.float32, one), at(tp.float32, two)
+    lw = at(tp.float32, weight)
+
+    packed_answer = tp.zeros([n], dtype=tp.float32)
+    tp._C.addcmul(s, e, w, value=VALUE, out=packed_answer)
+    assert packed_answer.equal(tp._C.addcmul(s, e, w, value=VALUE))
+
+    # The same map onto a destination that does not begin on a whole block.
+    offset = tp.zeros([n + 1], dtype=tp.float32)[1:]
+    tp._C.addcmul(s, e, w, value=VALUE, out=offset)
+    assert offset.equal(packed_answer)
+
+    # An operand the walk reads and writes at this width keeps the fetch: the
+    # lines it holds are wanted again by the walk itself.
+    own = at(tp.float32, base)
+    tp._C.addcmul(own, e, w, value=VALUE, out=own)
+    assert own.equal(packed_answer)
+
+    # The tensor-weight map answers two blocks per step, so its edges are the
+    # elements between the blocks of the span the thread was handed.
+    interpolated = tp.zeros([n], dtype=tp.float32)
+    tp._C.lerp(s, e, lw, out=interpolated)
+    assert interpolated.equal(tp._C.lerp(s, e, lw))
+
+    shifted = tp.zeros([n + 1], dtype=tp.float32)[1:]
+    tp._C.lerp(s, e, lw, out=shifted)
+    assert shifted.equal(interpolated)
+
+    held = at(tp.float32, base)
+    tp._C.lerp(held, e, lw, out=held)
+    assert held.equal(interpolated)
+
+    # The divided map answers four blocks per step, and its edges are held to
+    # the same rule.
+    divided = tp.zeros([n], dtype=tp.float32)
+    tp._C.addcdiv(s, e, w, value=VALUE, out=divided)
+    assert divided.equal(tp._C.addcdiv(s, e, w, value=VALUE))
+
+    shifted_division = tp.zeros([n + 1], dtype=tp.float32)[1:]
+    tp._C.addcdiv(s, e, w, value=VALUE, out=shifted_division)
+    assert shifted_division.equal(divided)

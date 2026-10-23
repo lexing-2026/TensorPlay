@@ -18,6 +18,7 @@
 #include "cpu/VecComplex.h"
 #include "cpu/VecReducedMath.h"
 #include "cpu/VecBinaryMath.h"
+#include "cpu/StreamDestination.h"
 #include <iostream>
 #include <vector>
 #include <cmath>
@@ -4565,12 +4566,24 @@ void addcdiv_bf16_walk(const tensorplay::BFloat16* self,
 // The single precision and the double precision walks walk eight and four
 // elements at a time.  The scaled product is rounded before it is applied,
 // the same way the scalar walk rounds it.
+template <bool Stream>
 __attribute__((target("avx2,fma"), noinline))
 void addcmul_f32_avx2(const float* self, const float* tensor1,
                       const float* tensor2, float alpha, float* result,
                       int64_t begin, int64_t end) {
     const __m256 scale = _mm256_set1_ps(alpha);
+    using tensorplay::cpu::streamdst::lay_f32_block;
     int64_t i = begin;
+    if constexpr (Stream) {
+        // A streamed store writes a whole 32-byte block, and the span the
+        // thread was handed begins wherever the split left it, so the
+        // elements before the first block are answered one at a time.
+        while (i < end &&
+               (reinterpret_cast<uintptr_t>(result + i) & 31u) != 0) {
+            result[i] = self[i] + alpha * tensor1[i] * tensor2[i];
+            ++i;
+        }
+    }
     // Four answers are built before any of them is stored: the loads and the
     // multiplication of one do not wait on the next, so a wider step keeps
     // more of the walk in flight.
@@ -4587,17 +4600,14 @@ void addcmul_f32_avx2(const float* self, const float* tensor1,
         const __m256 s3 = _mm256_loadu_ps(self + i + 24);
         const __m256 x3 = _mm256_loadu_ps(tensor1 + i + 24);
         const __m256 y3 = _mm256_loadu_ps(tensor2 + i + 24);
-        _mm256_storeu_ps(
+        lay_f32_block<Stream>(
             result + i, _mm256_fmadd_ps(_mm256_mul_ps(scale, x0), y0, s0));
-        _mm256_storeu_ps(
-            result + i + 8,
-            _mm256_fmadd_ps(_mm256_mul_ps(scale, x1), y1, s1));
-        _mm256_storeu_ps(
-            result + i + 16,
-            _mm256_fmadd_ps(_mm256_mul_ps(scale, x2), y2, s2));
-        _mm256_storeu_ps(
-            result + i + 24,
-            _mm256_fmadd_ps(_mm256_mul_ps(scale, x3), y3, s3));
+        lay_f32_block<Stream>(
+            result + i + 8, _mm256_fmadd_ps(_mm256_mul_ps(scale, x1), y1, s1));
+        lay_f32_block<Stream>(
+            result + i + 16, _mm256_fmadd_ps(_mm256_mul_ps(scale, x2), y2, s2));
+        lay_f32_block<Stream>(
+            result + i + 24, _mm256_fmadd_ps(_mm256_mul_ps(scale, x3), y3, s3));
     }
     for (; i + 16 <= end; i += 16) {
         const __m256 s0 = _mm256_loadu_ps(self + i);
@@ -4606,30 +4616,46 @@ void addcmul_f32_avx2(const float* self, const float* tensor1,
         const __m256 s1 = _mm256_loadu_ps(self + i + 8);
         const __m256 x1 = _mm256_loadu_ps(tensor1 + i + 8);
         const __m256 y1 = _mm256_loadu_ps(tensor2 + i + 8);
-        _mm256_storeu_ps(
+        lay_f32_block<Stream>(
             result + i, _mm256_fmadd_ps(_mm256_mul_ps(scale, x0), y0, s0));
-        _mm256_storeu_ps(
-            result + i + 8,
-            _mm256_fmadd_ps(_mm256_mul_ps(scale, x1), y1, s1));
+        lay_f32_block<Stream>(
+            result + i + 8, _mm256_fmadd_ps(_mm256_mul_ps(scale, x1), y1, s1));
     }
     for (; i + 8 <= end; i += 8) {
         const __m256 s = _mm256_loadu_ps(self + i);
         const __m256 x = _mm256_loadu_ps(tensor1 + i);
         const __m256 y = _mm256_loadu_ps(tensor2 + i);
-        _mm256_storeu_ps(
+        lay_f32_block<Stream>(
             result + i, _mm256_fmadd_ps(_mm256_mul_ps(scale, x), y, s));
     }
     for (; i < end; ++i) {
         result[i] = self[i] + alpha * tensor1[i] * tensor2[i];
     }
+    if constexpr (Stream) {
+        // The streamed blocks are complete once this returns; what reads the
+        // destination afterwards has to see them in order.
+        _mm_sfence();
+    }
 }
 
+template <bool Stream>
 __attribute__((target("avx2,fma"), noinline))
 void addcdiv_f32_avx2(const float* self, const float* tensor1,
                       const float* tensor2, float alpha, float* result,
                       int64_t begin, int64_t end) {
     const __m256 scale = _mm256_set1_ps(alpha);
+    using tensorplay::cpu::streamdst::lay_f32_block;
     int64_t i = begin;
+    if constexpr (Stream) {
+        // A streamed store writes a whole 32-byte block, and the span the
+        // thread was handed begins wherever the split left it, so the
+        // elements before the first block are answered one at a time.
+        while (i < end &&
+               (reinterpret_cast<uintptr_t>(result + i) & 31u) != 0) {
+            result[i] = self[i] + alpha * tensor1[i] / tensor2[i];
+            ++i;
+        }
+    }
     // The division is the long pole, so four of them are in flight before
     // the first answer is stored.
     for (; i + 32 <= end; i += 32) {
@@ -4645,16 +4671,16 @@ void addcdiv_f32_avx2(const float* self, const float* tensor1,
         const __m256 s3 = _mm256_loadu_ps(self + i + 24);
         const __m256 x3 = _mm256_loadu_ps(tensor1 + i + 24);
         const __m256 y3 = _mm256_loadu_ps(tensor2 + i + 24);
-        _mm256_storeu_ps(
+        lay_f32_block<Stream>(
             result + i,
             _mm256_add_ps(s0, _mm256_div_ps(_mm256_mul_ps(scale, x0), y0)));
-        _mm256_storeu_ps(
+        lay_f32_block<Stream>(
             result + i + 8,
             _mm256_add_ps(s1, _mm256_div_ps(_mm256_mul_ps(scale, x1), y1)));
-        _mm256_storeu_ps(
+        lay_f32_block<Stream>(
             result + i + 16,
             _mm256_add_ps(s2, _mm256_div_ps(_mm256_mul_ps(scale, x2), y2)));
-        _mm256_storeu_ps(
+        lay_f32_block<Stream>(
             result + i + 24,
             _mm256_add_ps(s3, _mm256_div_ps(_mm256_mul_ps(scale, x3), y3)));
     }
@@ -4665,10 +4691,10 @@ void addcdiv_f32_avx2(const float* self, const float* tensor1,
         const __m256 s1 = _mm256_loadu_ps(self + i + 8);
         const __m256 x1 = _mm256_loadu_ps(tensor1 + i + 8);
         const __m256 y1 = _mm256_loadu_ps(tensor2 + i + 8);
-        _mm256_storeu_ps(
+        lay_f32_block<Stream>(
             result + i,
             _mm256_add_ps(s0, _mm256_div_ps(_mm256_mul_ps(scale, x0), y0)));
-        _mm256_storeu_ps(
+        lay_f32_block<Stream>(
             result + i + 8,
             _mm256_add_ps(s1, _mm256_div_ps(_mm256_mul_ps(scale, x1), y1)));
     }
@@ -4676,12 +4702,17 @@ void addcdiv_f32_avx2(const float* self, const float* tensor1,
         const __m256 s = _mm256_loadu_ps(self + i);
         const __m256 x = _mm256_loadu_ps(tensor1 + i);
         const __m256 y = _mm256_loadu_ps(tensor2 + i);
-        _mm256_storeu_ps(
+        lay_f32_block<Stream>(
             result + i,
             _mm256_add_ps(s, _mm256_div_ps(_mm256_mul_ps(scale, x), y)));
     }
     for (; i < end; ++i) {
         result[i] = self[i] + alpha * tensor1[i] / tensor2[i];
+    }
+    if constexpr (Stream) {
+        // The streamed blocks are complete once this returns; what reads the
+        // destination afterwards has to see them in order.
+        _mm_sfence();
     }
 }
 
@@ -4786,12 +4817,18 @@ void addcmul_dense_walk(const Tensor& self, const Tensor& tensor1,
             const float scale = static_cast<float>(alpha);
             // The fixed split, not the drawn ranges: a range of this walk is
             // answered in about the time the team spends queueing for the
-            // shared counter, so the queue bounds the walk.  The four streams
-            // went from 0.126 to 0.069 ns per element at full width once the
-            // split replaced the draw.
+            // shared counter, so the queue bounds the walk.
+            if (tensorplay::cpu::streamdst::ternary_works_past_cache(
+                    n, result_ptr, self_ptr, tensor1_ptr, tensor2_ptr)) {
+                parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                    addcmul_f32_avx2<true>(self_ptr, tensor1_ptr, tensor2_ptr,
+                                           scale, result_ptr, begin, end);
+                });
+                return;
+            }
             parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-                addcmul_f32_avx2(self_ptr, tensor1_ptr, tensor2_ptr, scale,
-                                 result_ptr, begin, end);
+                addcmul_f32_avx2<false>(self_ptr, tensor1_ptr, tensor2_ptr,
+                                        scale, result_ptr, begin, end);
             });
             return;
         }
@@ -5079,9 +5116,17 @@ void addcdiv_dense_walk(const Tensor& self, const Tensor& tensor1,
     } else if constexpr (std::is_same_v<T, float>) {
         if (tensorplay::cpu::vecbinary::avx2_available()) {
             const float scale = static_cast<float>(alpha);
+            if (tensorplay::cpu::streamdst::ternary_works_past_cache(
+                    n, result_ptr, self_ptr, tensor1_ptr, tensor2_ptr)) {
+                parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                    addcdiv_f32_avx2<true>(self_ptr, tensor1_ptr, tensor2_ptr,
+                                           scale, result_ptr, begin, end);
+                });
+                return;
+            }
             parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-                addcdiv_f32_avx2(self_ptr, tensor1_ptr, tensor2_ptr, scale,
-                                 result_ptr, begin, end);
+                addcdiv_f32_avx2<false>(self_ptr, tensor1_ptr, tensor2_ptr,
+                                        scale, result_ptr, begin, end);
             });
             return;
         }

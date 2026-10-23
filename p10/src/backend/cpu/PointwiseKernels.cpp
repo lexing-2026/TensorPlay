@@ -16,6 +16,7 @@
 #include "cpu/SoftmaxStridedKernels.h"
 #include "cpu/VecComplex.h"
 #include "cpu/ActivationUnaryKernels.h"
+#include "cpu/StreamDestination.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
 #include <iostream>
 #include <cmath>
@@ -3753,13 +3754,25 @@ void lerp_f64_avx2(const double* self, const double* end, double* result,
 
 // Tensor-weight lerp: the weight varies per lane, so the small-weight
 // selection and the base operand are blended per lane instead of hoisted.
+// The streamed variant writes its destination past the cache, which asks for
+// whole aligned blocks: the span is given as its own pointers and length, so
+// the elements before the first block are answered one at a time.
+template <bool Stream>
 __attribute__((target("avx2,fma")))
 void lerp_tensor_f32_avx2(const float* self, const float* end,
                           const float* weight, float* result, int64_t n) {
     const __m256 half = _mm256_set1_ps(0.5f);
     const __m256 one = _mm256_set1_ps(1.0f);
     const __m256 abs_mask = _mm256_set1_ps(-0.0f);
+    using tensorplay::cpu::streamdst::lay_f32_block;
     int64_t i = 0;
+    if constexpr (Stream) {
+        while (i < n &&
+               (reinterpret_cast<uintptr_t>(result + i) & 31u) != 0) {
+            result[i] = lerp_scalar_value(self[i], end[i], weight[i]);
+            ++i;
+        }
+    }
     // Two vectors are answered per step, and no wider: the three loads, the
     // two selects and the interpolation of four answers ask for more vectors
     // than the walk has, so a step of thirty-two begins storing its own
@@ -3776,14 +3789,15 @@ void lerp_tensor_f32_avx2(const float* self, const float* end,
             _mm256_andnot_ps(abs_mask, w0), half, _CMP_LT_OQ);
         const __m256 small1 = _mm256_cmp_ps(
             _mm256_andnot_ps(abs_mask, w1), half, _CMP_LT_OQ);
-        const __m256 coeff0 = _mm256_blendv_ps(_mm256_sub_ps(w0, one), w0, small0);
-        const __m256 coeff1 = _mm256_blendv_ps(_mm256_sub_ps(w1, one), w1, small1);
+        const __m256 coeff0 =
+            _mm256_blendv_ps(_mm256_sub_ps(w0, one), w0, small0);
+        const __m256 coeff1 =
+            _mm256_blendv_ps(_mm256_sub_ps(w1, one), w1, small1);
         const __m256 base0 = _mm256_blendv_ps(e0, s0, small0);
         const __m256 base1 = _mm256_blendv_ps(e1, s1, small1);
-        _mm256_storeu_ps(
-            result + i,
-            _mm256_fmadd_ps(coeff0, _mm256_sub_ps(e0, s0), base0));
-        _mm256_storeu_ps(
+        lay_f32_block<Stream>(
+            result + i, _mm256_fmadd_ps(coeff0, _mm256_sub_ps(e0, s0), base0));
+        lay_f32_block<Stream>(
             result + i + 8,
             _mm256_fmadd_ps(coeff1, _mm256_sub_ps(e1, s1), base1));
     }
@@ -3795,12 +3809,16 @@ void lerp_tensor_f32_avx2(const float* self, const float* end,
             _mm256_andnot_ps(abs_mask, w), half, _CMP_LT_OQ);
         const __m256 coeff = _mm256_blendv_ps(_mm256_sub_ps(w, one), w, small);
         const __m256 base = _mm256_blendv_ps(e, s, small);
-        _mm256_storeu_ps(
-            result + i,
-            _mm256_fmadd_ps(coeff, _mm256_sub_ps(e, s), base));
+        lay_f32_block<Stream>(
+            result + i, _mm256_fmadd_ps(coeff, _mm256_sub_ps(e, s), base));
     }
     for (; i < n; ++i) {
         result[i] = lerp_scalar_value(self[i], end[i], weight[i]);
+    }
+    if constexpr (Stream) {
+        // The streamed blocks are complete once this returns; what reads the
+        // destination afterwards has to see them in order.
+        _mm_sfence();
     }
 }
 
@@ -4019,11 +4037,9 @@ void lerp_tensor_f64_avx512(const double* self, const double* end,
 // Every vectorized walk below takes the fixed split.  Each answers an element
 // in a fraction of a nanosecond, so a range of the size the drawn dispatch
 // cuts is answered in about the time the team spends queueing for the shared
-// counter, and that queue, not the memory, bounds the walk: the same four
-// float32 streams went from 0.120 to 0.069 ns per element at full width once
-// the split replaced the draw.  The scalar walks under them answer an element
-// with a widened expression, several times slower and by a different amount on
-// different kinds of core, so they keep the draw.
+// counter, and that queue, not the memory, bounds the walk.  The scalar walks
+// under them answer an element with a widened expression, several times slower
+// and by a different amount on different kinds of core, so they keep the draw.
 template <typename T>
 void lerp_tensor_contiguous(const T* self, const T* end, const T* weight,
                             T* result, int64_t n) {
@@ -4038,10 +4054,19 @@ void lerp_tensor_contiguous(const T* self, const T* end, const T* weight,
             return;
         }
         if (pointwise_cpu_has_avx2()) {
+            if (tensorplay::cpu::streamdst::ternary_works_past_cache(
+                    n, result, self, end, weight)) {
+                parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t finish) {
+                    lerp_tensor_f32_avx2<true>(self + begin, end + begin,
+                                               weight + begin, result + begin,
+                                               finish - begin);
+                });
+                return;
+            }
             parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t finish) {
-                lerp_tensor_f32_avx2(self + begin, end + begin,
-                                     weight + begin, result + begin,
-                                     finish - begin);
+                lerp_tensor_f32_avx2<false>(self + begin, end + begin,
+                                            weight + begin, result + begin,
+                                            finish - begin);
             });
             return;
         }
