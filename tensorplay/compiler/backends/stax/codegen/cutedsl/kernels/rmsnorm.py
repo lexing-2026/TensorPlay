@@ -253,7 +253,11 @@ def rmsnorm_fwd(x: tp.Tensor, weight: tp.Tensor, eps: float = 1e-6,
     cutlass_dtype = DTYPE_MAP[x.dtype]
     vec = vector_length(n, cutlass_dtype.width)
     if threads is None:
-        threads = threads_for_row(n, cutlass_dtype.width, budget=16)
+        # Two blocks of this width stay resident together, so the reduction of
+        # one row overlaps the memory traffic of the other.  A thousand-thread
+        # block leaves nothing beside it and measures slower on every shape
+        # tried here.
+        threads = min(512, threads_for_row(n, cutlass_dtype.width, budget=16))
     out = tp.empty_like(x)
     rstd = tp.empty(m, dtype=tp.float32, device=x.device)
 
