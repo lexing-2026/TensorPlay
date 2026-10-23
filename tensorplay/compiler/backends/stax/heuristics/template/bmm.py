@@ -37,6 +37,8 @@ class _BatchedProductConfigs(TemplateConfigHeuristics):
     group_m = 8
 
     def _get_template_configs_impl(self, kernel_inputs, op_name):
+        from ...codegen.triton_gemm import _matmul_allow_tf32
+
         rows, cols, inner = kernel_inputs.mnk_symbolic()
         device_type = kernel_inputs.device_type
         for config in CHOICES.get_mm_configs(device_type)(
@@ -45,6 +47,11 @@ class _BatchedProductConfigs(TemplateConfigHeuristics):
             yield {
                 "choice": "triton",
                 "GROUP_M": self.group_m,
+                # The sum is kept wider than the operands: a batch of many
+                # narrow terms loses the small ones if it is kept narrow, and
+                # the widening costs nothing that leaves the device.
+                "ACC_TYPE": "tl.float32",
+                "ALLOW_TF32": _matmul_allow_tf32(),
                 "EVEN_K": int(inner) % int(config.kwargs["BLOCK_K"]) == 0,
                 **config.as_kwargs(),
             }

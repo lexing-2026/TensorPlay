@@ -449,6 +449,8 @@ class TritonBenchmarkRequest(BenchmarkRequest):
         is current at the time.
         """
 
+        from .runtime.benchmarking import get_interface_for_device
+
         mod = PyCodeCache.load_by_key_path(
             self.module_cache_key,
             self.module_path,
@@ -537,7 +539,6 @@ class TritonBenchmarkRequest(BenchmarkRequest):
                 )
 
         return run_fn
-        from .runtime.benchmarking import get_interface_for_device
 
     def cleanup_run_fn(self) -> None:
         """Let go of what was loaded to be measured, however many times asked.

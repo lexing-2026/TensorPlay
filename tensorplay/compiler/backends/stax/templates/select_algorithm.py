@@ -4765,8 +4765,8 @@ class AlgorithmSelectorCache(PersistentCache):
         best = min(
             benchmark_results,
             key=lambda choice: (
-                not self._is_extern(choice),
                 benchmark_results[choice],
+                not self._is_extern(choice),
             ),
         )
         return best.output_node()
