@@ -8202,6 +8202,202 @@ class TestVulkanForeachGroup(unittest.TestCase):
                 group, self._group(powers, device)),
             "_foreach_pow_ by a payload of exponents")
 
+    def test_two_partners_fold_into_the_group_weighed_by_one_count(self):
+        tables = [self._table((4,)), self._table((3, 2)), self._table((5,))]
+        left = [self._table((4,), start=1.0), self._table((3, 2), start=2.0),
+                self._table((5,), start=3.0)]
+        right = [self._table((4,), start=4.0), self._table((3, 2), start=5.0),
+                 self._table((5,), start=6.0)]
+        count = 2.0
+        for op, sign in (
+                (tensorplay._foreach_addcmul,
+                 lambda held, one, other: held + count * (one * other)),
+                (tensorplay._foreach_addcdiv,
+                 lambda held, one, other: held + count * (one / other))):
+            want = [sign(np.ascontiguousarray(table), np.ascontiguousarray(one),
+                         np.ascontiguousarray(other))
+                    for table, one, other in zip(tables, left, right)]
+            self._read_matches(
+                tables, want,
+                lambda group, device, op=op: self._read(
+                    op(group, self._group(left, device), self._group(right, device),
+                       count)),
+                f"{op.__name__} weighed by one count")
+
+    def test_each_tensor_is_weighed_by_the_count_it_is_named(self):
+        tables = [self._table((4,)), self._table((3, 2)), self._table((5,))]
+        left = [self._table((4,), start=1.0), self._table((3, 2), start=2.0),
+                self._table((5,), start=3.0)]
+        right = [self._table((4,), start=4.0), self._table((3, 2), start=5.0),
+                 self._table((5,), start=6.0)]
+        counts = [0.5, -2.0, 3.0]
+        for op, sign in (
+                (tensorplay._foreach_addcmul,
+                 lambda held, one, other, weight: held + weight * (one * other)),
+                (tensorplay._foreach_addcdiv,
+                 lambda held, one, other, weight: held + weight * (one / other))):
+            for label, weights in (
+                    ("a list of counts", counts),
+                    ("a run the host holds",
+                     tensorplay.from_numpy(np.array(counts, dtype=np.float32)))):
+                want = [sign(np.ascontiguousarray(table), np.ascontiguousarray(one),
+                             np.ascontiguousarray(other), weight)
+                        for table, one, other, weight
+                        in zip(tables, left, right, counts)]
+                self._read_matches(
+                    tables, want,
+                    lambda group, device, op=op, weights=weights: self._read(
+                        op(group, self._group(left, device),
+                           self._group(right, device), weights)),
+                    f"{op.__name__} weighed by {label}")
+
+    def test_a_ternary_fold_writes_where_the_tensor_stands(self):
+        tables = [self._table((4,)), self._table((3, 2)), self._table((5,))]
+        left = [self._table((4,), start=1.0), self._table((3, 2), start=2.0),
+                self._table((5,), start=3.0)]
+        right = [self._table((4,), start=4.0), self._table((3, 2), start=5.0),
+                 self._table((5,), start=6.0)]
+        counts = [0.5, -2.0, 3.0]
+        folded = [
+            (tensorplay._foreach_addcmul_,
+             lambda held, one, other, weight: held + weight * (one * other)),
+            (tensorplay._foreach_addcdiv_,
+             lambda held, one, other, weight: held + weight * (one / other)),
+        ]
+        for write, sign in folded:
+            want = [sign(np.ascontiguousarray(table), np.ascontiguousarray(one),
+                         np.ascontiguousarray(other), 1.5)
+                    for table, one, other in zip(tables, left, right)]
+            self._write_matches(
+                tables, want,
+                lambda group, device, write=write: write(
+                    group, self._group(left, device), self._group(right, device),
+                    1.5),
+                f"{write.__name__} weighed by one count")
+            want = [sign(np.ascontiguousarray(table), np.ascontiguousarray(one),
+                         np.ascontiguousarray(other), weight)
+                    for table, one, other, weight
+                    in zip(tables, left, right, counts)]
+            self._write_matches(
+                tables, want,
+                lambda group, device, write=write: write(
+                    group, self._group(left, device), self._group(right, device),
+                    counts),
+                f"{write.__name__} weighed by a list of counts")
+            self._write_matches(
+                tables, want,
+                lambda group, device, write=write: write(
+                    group, self._group(left, device), self._group(right, device),
+                    tensorplay.from_numpy(np.array(counts, dtype=np.float32))),
+                f"{write.__name__} weighed by a run the host holds")
+
+    def test_a_group_slides_toward_a_partner(self):
+        tables = [self._table((4,)), self._table((3, 2)), self._table((5,))]
+        ends = [self._table((4,), start=2.0), self._table((3, 2), start=4.0),
+                self._table((5,), start=6.0)]
+        runs = [np.full((4,), 0.25, dtype=np.float32),
+                np.full((3, 2), 0.75, dtype=np.float32),
+                np.full((5,), -0.5, dtype=np.float32)]
+        counts = [0.25, 0.75, -0.5]
+
+        def slide(held, stop, weight):
+            return held + weight * (stop - held)
+
+        want = [slide(np.ascontiguousarray(table), np.ascontiguousarray(stop), 0.4)
+                for table, stop in zip(tables, ends)]
+        self._read_matches(
+            tables, want,
+            lambda group, device: self._read(
+                tensorplay._foreach_lerp(group, self._group(ends, device), 0.4)),
+            "_foreach_lerp slid by one count")
+        want = [slide(np.ascontiguousarray(table), np.ascontiguousarray(stop), weight)
+                for table, stop, weight in zip(tables, ends, counts)]
+        self._read_matches(
+            tables, want,
+            lambda group, device: self._read(
+                tensorplay._foreach_lerp(
+                    group, self._group(ends, device), counts)),
+            "_foreach_lerp slid by a count per tensor")
+        self._read_matches(
+            tables, want,
+            lambda group, device: self._read(
+                tensorplay._foreach_lerp(
+                    group, self._group(ends, device),
+                    self._group(runs, device))),
+            "_foreach_lerp slid by a payload of counts")
+
+    def test_a_slide_writes_where_the_tensor_stands(self):
+        tables = [self._table((4,)), self._table((3, 2)), self._table((5,))]
+        ends = [self._table((4,), start=2.0), self._table((3, 2), start=4.0),
+                self._table((5,), start=6.0)]
+        runs = [np.full((4,), 0.25, dtype=np.float32),
+                np.full((3, 2), 0.75, dtype=np.float32),
+                np.full((5,), -0.5, dtype=np.float32)]
+        counts = [0.25, 0.75, -0.5]
+
+        def slide(held, stop, weight):
+            return held + weight * (stop - held)
+
+        want = [slide(np.ascontiguousarray(table), np.ascontiguousarray(stop), 0.4)
+                for table, stop in zip(tables, ends)]
+        self._write_matches(
+            tables, want,
+            lambda group, device: tensorplay._foreach_lerp_(
+                group, self._group(ends, device), 0.4),
+            "_foreach_lerp_ slid by one count")
+        want = [slide(np.ascontiguousarray(table), np.ascontiguousarray(stop), weight)
+                for table, stop, weight in zip(tables, ends, counts)]
+        self._write_matches(
+            tables, want,
+            lambda group, device: tensorplay._foreach_lerp_(
+                group, self._group(ends, device), counts),
+            "_foreach_lerp_ slid by a count per tensor")
+        self._write_matches(
+            tables, want,
+            lambda group, device: tensorplay._foreach_lerp_(
+                group, self._group(ends, device), self._group(runs, device)),
+            "_foreach_lerp_ slid by a payload of counts")
+
+    def test_a_ternary_group_refuses_lists_that_do_not_pair(self):
+        tables = [self._table((4,)), self._table((3, 2)), self._table((5,))]
+        for device in ("vulkan", "cpu"):
+            group = self._group(tables, device)
+            short = self._group(tables[:2], device)
+            with self.assertRaisesRegex(
+                    ValueError, "ternary tensor lists must have the same length"):
+                tensorplay._foreach_addcmul(group, short, short, 1.0)
+            with self.assertRaisesRegex(
+                    ValueError,
+                    "ternary tensor/scalar lists must have the same length"):
+                tensorplay._foreach_addcmul(group, group, group, [1.0, 2.0])
+            with self.assertRaisesRegex(
+                    ValueError, "lerp lists must have the same length"):
+                tensorplay._foreach_lerp(group, short, short)
+            with self.assertRaisesRegex(
+                    ValueError, "tensor/scalar lists must have the same length"):
+                tensorplay._foreach_lerp(group, short, [1.0, 2.0, 3.0])
+            pair = group[:2]
+            with self.assertRaisesRegex(
+                    RuntimeError,
+                    "Expected packed scalar Tensor to be of dimension 1"):
+                tensorplay._foreach_addcdiv(
+                    pair, pair, pair, tensorplay.tensor(np.float32(2.0)))
+            with self.assertRaisesRegex(
+                    RuntimeError,
+                    "Expected length of scalars to match input of length 2 "
+                    "but got 3 instead"):
+                tensorplay._foreach_addcdiv(
+                    pair, pair, pair,
+                    tensorplay.from_numpy(np.array([1.0, 2.0, 3.0],
+                                                   dtype=np.float32)))
+        with self.assertRaisesRegex(
+                RuntimeError, "Expected scalars to be on CPU, got"):
+            group = self._group(tables, "vulkan")
+            tensorplay._foreach_addcmul(
+                group, group, group,
+                tensorplay.from_numpy(np.array([1.0, 2.0, 3.0],
+                                               dtype=np.float32)).to("vulkan"))
+
 
 class TestVulkanRowAccumulation(unittest.TestCase):
     # A list of row codes may name one row several times, and every row it names

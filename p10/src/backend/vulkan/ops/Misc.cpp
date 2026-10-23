@@ -158,6 +158,27 @@ Tensor& addcmul__kernel(
   return add_inplace_kernel(self, p, Scalar(1.0));
 }
 
+// A fresh answer is the same fold written somewhere else: the payload is cloned
+// and the in-place composition lands on the copy, so both entries keep one
+// arithmetic order and one set of shader operators.
+Tensor addcdiv_kernel(
+    const Tensor& self,
+    const Tensor& tensor1,
+    const Tensor& tensor2,
+    const Scalar& value) {
+  Tensor out = clone_kernel(self);
+  return addcdiv__kernel(out, tensor1, tensor2, value);
+}
+
+Tensor addcmul_kernel(
+    const Tensor& self,
+    const Tensor& tensor1,
+    const Tensor& tensor2,
+    const Scalar& value) {
+  Tensor out = clone_kernel(self);
+  return addcmul__kernel(out, tensor1, tensor2, value);
+}
+
 Tensor pow_scalar_kernel(const Tensor& self, const Scalar& exponent) {
   // A truth raised to a power stops being a truth and is not a count any lane
   // holds either, so it is read in single precision -- the width the scalar path
@@ -634,6 +655,8 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, MiscKernels) {
   m.impl("native_dropout", &tensorplay::vulkan::ops::native_dropout_kernel);
   m.impl("addcdiv_", &tensorplay::vulkan::ops::addcdiv__kernel);
   m.impl("addcmul_", &tensorplay::vulkan::ops::addcmul__kernel);
+  m.impl("addcdiv", &tensorplay::vulkan::ops::addcdiv_kernel);
+  m.impl("addcmul", &tensorplay::vulkan::ops::addcmul_kernel);
 }
 
 #endif /* USE_VULKAN */

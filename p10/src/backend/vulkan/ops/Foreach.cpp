@@ -4,6 +4,7 @@
 
 #include "tensorplay/ops/TPXOpsGenerated.h"
 
+#include <string>
 #include <vector>
 
 namespace tensorplay {
@@ -90,6 +91,108 @@ void walk_counts_inplace(
   }
 }
 
+// A ternary walk pairs two partners with every tensor, and a fold may carry one
+// more count per position beside them.  Each side names the same number of
+// tensors or the tail of the walk has no partner to fold.
+template <typename Fn>
+std::vector<Tensor> walk_triples(
+    const std::vector<Tensor>& self,
+    const std::vector<Tensor>& tensor1,
+    const std::vector<Tensor>& tensor2,
+    Fn&& each) {
+  TP_CHECK_VALUE(
+      self.size() == tensor1.size() && self.size() == tensor2.size(),
+      "foreach ternary tensor lists must have the same length");
+  std::vector<Tensor> result;
+  result.reserve(self.size());
+  for (size_t i = 0; i < self.size(); ++i) {
+    result.push_back(each(self[i], tensor1[i], tensor2[i]));
+  }
+  return result;
+}
+
+template <typename Fn>
+void walk_triples_inplace(
+    std::vector<Tensor>& self,
+    const std::vector<Tensor>& tensor1,
+    const std::vector<Tensor>& tensor2,
+    Fn&& each) {
+  TP_CHECK_VALUE(
+      self.size() == tensor1.size() && self.size() == tensor2.size(),
+      "foreach ternary tensor lists must have the same length");
+  for (size_t i = 0; i < self.size(); ++i) {
+    each(self[i], tensor1[i], tensor2[i]);
+  }
+}
+
+template <typename Fn>
+std::vector<Tensor> walk_triple_counts(
+    const std::vector<Tensor>& self,
+    const std::vector<Tensor>& tensor1,
+    const std::vector<Tensor>& tensor2,
+    const std::vector<Scalar>& scalars,
+    Fn&& each) {
+  TP_CHECK_VALUE(
+      self.size() == tensor1.size() && self.size() == tensor2.size()
+          && self.size() == scalars.size(),
+      "foreach ternary tensor/scalar lists must have the same length");
+  std::vector<Tensor> result;
+  result.reserve(self.size());
+  for (size_t i = 0; i < self.size(); ++i) {
+    result.push_back(each(self[i], tensor1[i], tensor2[i], scalars[i]));
+  }
+  return result;
+}
+
+template <typename Fn>
+void walk_triple_counts_inplace(
+    std::vector<Tensor>& self,
+    const std::vector<Tensor>& tensor1,
+    const std::vector<Tensor>& tensor2,
+    const std::vector<Scalar>& scalars,
+    Fn&& each) {
+  TP_CHECK_VALUE(
+      self.size() == tensor1.size() && self.size() == tensor2.size()
+          && self.size() == scalars.size(),
+      "foreach ternary tensor/scalar lists must have the same length");
+  for (size_t i = 0; i < self.size(); ++i) {
+    each(self[i], tensor1[i], tensor2[i], scalars[i]);
+  }
+}
+
+// A partner that arrives beside a count per position: the walk pairs the two
+// tensor lists and names one count for each pair.
+template <typename Fn>
+std::vector<Tensor> walk_pair_counts(
+    const std::vector<Tensor>& self,
+    const std::vector<Tensor>& other,
+    const std::vector<Scalar>& scalars,
+    Fn&& each) {
+  TP_CHECK_VALUE(
+      self.size() == other.size() && self.size() == scalars.size(),
+      "foreach tensor/scalar lists must have the same length");
+  std::vector<Tensor> result;
+  result.reserve(self.size());
+  for (size_t i = 0; i < self.size(); ++i) {
+    result.push_back(each(self[i], other[i], scalars[i]));
+  }
+  return result;
+}
+
+template <typename Fn>
+void walk_pair_counts_inplace(
+    std::vector<Tensor>& self,
+    const std::vector<Tensor>& other,
+    const std::vector<Scalar>& scalars,
+    Fn&& each) {
+  TP_CHECK_VALUE(
+      self.size() == other.size() && self.size() == scalars.size(),
+      "foreach tensor/scalar lists must have the same length");
+  for (size_t i = 0; i < self.size(); ++i) {
+    each(self[i], other[i], scalars[i]);
+  }
+}
+
 // The count one group shares reaches every tensor unchanged, so it has to
 // name a single lane.  Held by the host rather than by the walk, it crosses
 // as the one upload it is instead of turning the whole group into a read.
@@ -108,6 +211,43 @@ Tensor group_count(
       "scalar tensor expected to be 0 dim but it has ", scalar.dim(),
       " dimensions and ", scalar.numel(), " elements");
   return group_payload(scalar, self);
+}
+
+// A weight held as one payload for a whole group names a count per tensor
+// rather than one count shared, and the walk has to know each of them before
+// it starts pairing tensors.  The host keeps such a payload: it is read as a
+// contiguous rank-one run whose length is the length of the group.
+std::vector<Scalar> group_counts(
+    const Tensor& scalars,
+    size_t expected_length) {
+  if (scalars.device().type() != DeviceType::CPU) {
+    TP_THROW(
+        RuntimeError,
+        "Expected scalars to be on CPU, got " + scalars.device().toString() +
+            " instead.");
+  }
+  if (!scalars.is_contiguous()) {
+    TP_THROW(RuntimeError, "Expected scalars to be contiguous.");
+  }
+  if (scalars.dim() != 1) {
+    TP_THROW(
+        RuntimeError,
+        "Expected packed scalar Tensor to be of dimension 1. Got " +
+            std::to_string(scalars.dim()) + " instead.");
+  }
+  if (scalars.size(0) != static_cast<int64_t>(expected_length)) {
+    TP_THROW(
+        RuntimeError,
+        "Expected length of scalars to match input of length " +
+            std::to_string(expected_length) + " but got " +
+            std::to_string(scalars.size(0)) + " instead.");
+  }
+  std::vector<Scalar> result;
+  result.reserve(expected_length);
+  for (size_t i = 0; i < expected_length; ++i) {
+    result.push_back(scalars.select(0, static_cast<int64_t>(i)).item());
+  }
+  return result;
 }
 
 // The entries one weighted walk answers: a count is taken as it stands, a
@@ -285,6 +425,128 @@ Tensor group_count(
     });                                                                            \
   }
 
+// The entries one ternary walk answers: two partners fold into every tensor,
+// weighed by the count the walk carries, by a count per tensor, or by the run
+// of counts held as one payload.  Each entry rides the fold a lone tensor
+// reaches, so the arithmetic order stays the one that fold already keeps.
+#define TP_VK_FOREACH_TERNARY(NAME, OP)                                                \
+  std::vector<Tensor> foreach_##NAME##_scalar_kernel(                                  \
+      const std::vector<Tensor>& self, const std::vector<Tensor>& tensor1,             \
+      const std::vector<Tensor>& tensor2, const Scalar& value) {                       \
+    return walk_triples(                                                               \
+        self, tensor1, tensor2, [&](const Tensor& base, const Tensor& left,             \
+                                   const Tensor& right) {                              \
+          return tpx::ops::OP(base, left, right, value);                               \
+        });                                                                            \
+  }                                                                                    \
+  std::vector<Tensor> foreach_##NAME##_counts_kernel(                                  \
+      const std::vector<Tensor>& self, const std::vector<Tensor>& tensor1,             \
+      const std::vector<Tensor>& tensor2,                                              \
+      const std::vector<Scalar>& scalars) {                                            \
+    return walk_triple_counts(                                                         \
+        self, tensor1, tensor2, scalars,                                               \
+        [&](const Tensor& base, const Tensor& left, const Tensor& right,                \
+            Scalar weight) { return tpx::ops::OP(base, left, right, weight); });        \
+  }                                                                                    \
+  std::vector<Tensor> foreach_##NAME##_packed_kernel(                                  \
+      const std::vector<Tensor>& self, const std::vector<Tensor>& tensor1,             \
+      const std::vector<Tensor>& tensor2, const Tensor& scalars) {                     \
+    return foreach_##NAME##_counts_kernel(                                             \
+        self, tensor1, tensor2, group_counts(scalars, self.size()));                   \
+  }                                                                                    \
+  void foreach_##NAME##_scalar_inplace_kernel(                                         \
+      std::vector<Tensor> self, const std::vector<Tensor>& tensor1,                    \
+      const std::vector<Tensor>& tensor2, const Scalar& value) {                       \
+    walk_triples_inplace(                                                              \
+        self, tensor1, tensor2, [&](Tensor& base, const Tensor& left,                   \
+                                    const Tensor& right) {                             \
+          tpx::ops::OP##_(base, left, right, value);                                   \
+        });                                                                            \
+  }                                                                                    \
+  void foreach_##NAME##_counts_inplace_kernel(                                         \
+      std::vector<Tensor> self, const std::vector<Tensor>& tensor1,                    \
+      const std::vector<Tensor>& tensor2, const std::vector<Scalar>& scalars) {        \
+    walk_triple_counts_inplace(                                                        \
+        self, tensor1, tensor2, scalars,                                               \
+        [&](Tensor& base, const Tensor& left, const Tensor& right,                      \
+            Scalar weight) { tpx::ops::OP##_(base, left, right, weight); });            \
+  }                                                                                    \
+  void foreach_##NAME##_packed_inplace_kernel(                                         \
+      std::vector<Tensor> self, const std::vector<Tensor>& tensor1,                    \
+      const std::vector<Tensor>& tensor2, const Tensor& scalars) {                     \
+    foreach_##NAME##_counts_inplace_kernel(                                            \
+        self, tensor1, tensor2, group_counts(scalars, self.size()));                   \
+  }
+
+// A payload slid toward a partner by a weight: the weight is one count the
+// whole group shares, a count named per tensor, or a partner of its own.
+std::vector<Tensor> foreach_lerp_scalar_kernel(
+    const std::vector<Tensor>& self,
+    const std::vector<Tensor>& end,
+    const Scalar& weight) {
+  return walk_pairs(self, end, [&](const Tensor& base, const Tensor& stop) {
+    return tpx::ops::lerp(base, stop, weight);
+  });
+}
+
+std::vector<Tensor> foreach_lerp_counts_kernel(
+    const std::vector<Tensor>& self,
+    const std::vector<Tensor>& end,
+    const std::vector<Scalar>& weight) {
+  return walk_pair_counts(
+      self, end, weight,
+      [&](const Tensor& base, const Tensor& stop, Scalar count) {
+        return tpx::ops::lerp(base, stop, count);
+      });
+}
+
+std::vector<Tensor> foreach_lerp_list_kernel(
+    const std::vector<Tensor>& self,
+    const std::vector<Tensor>& end,
+    const std::vector<Tensor>& weight) {
+  TP_CHECK_VALUE(
+      self.size() == end.size() && self.size() == weight.size(),
+      "foreach lerp lists must have the same length");
+  std::vector<Tensor> result;
+  result.reserve(self.size());
+  for (size_t i = 0; i < self.size(); ++i) {
+    result.push_back(tpx::ops::lerp(self[i], end[i], weight[i]));
+  }
+  return result;
+}
+
+void foreach_lerp_scalar_inplace_kernel(
+    std::vector<Tensor> self,
+    const std::vector<Tensor>& end,
+    const Scalar& weight) {
+  walk_pairs_inplace(self, end, [&](Tensor& base, const Tensor& stop) {
+    tpx::ops::lerp_(base, stop, weight);
+  });
+}
+
+void foreach_lerp_counts_inplace_kernel(
+    std::vector<Tensor> self,
+    const std::vector<Tensor>& end,
+    const std::vector<Scalar>& weight) {
+  walk_pair_counts_inplace(
+      self, end, weight,
+      [&](Tensor& base, const Tensor& stop, Scalar count) {
+        tpx::ops::lerp_(base, stop, count);
+      });
+}
+
+void foreach_lerp_list_inplace_kernel(
+    std::vector<Tensor> self,
+    const std::vector<Tensor>& end,
+    const std::vector<Tensor>& weight) {
+  TP_CHECK_VALUE(
+      self.size() == end.size() && self.size() == weight.size(),
+      "foreach lerp lists must have the same length");
+  for (size_t i = 0; i < self.size(); ++i) {
+    tpx::ops::lerp_(self[i], end[i], weight[i]);
+  }
+}
+
 // A group raised to a count.  The exponent is either one count, one count per
 // tensor, or a payload of its own, and a shared base may be a count or a
 // payload held beside the walk.
@@ -390,11 +652,15 @@ TP_VK_FOREACH_BOUND(clamp_max, clamp_max, minimum)
 TP_VK_FOREACH_BOUND(maximum, clamp_min, maximum)
 TP_VK_FOREACH_BOUND(minimum, clamp_max, minimum)
 
+TP_VK_FOREACH_TERNARY(addcmul, addcmul)
+TP_VK_FOREACH_TERNARY(addcdiv, addcdiv)
+
 #undef TP_VK_FOREACH_WEIGHTED
 #undef TP_VK_FOREACH_PLAIN
 #undef TP_VK_FOREACH_UNARY
 #undef TP_VK_FOREACH_UNARY_HELD
 #undef TP_VK_FOREACH_BOUND
+#undef TP_VK_FOREACH_TERNARY
 
 } // namespace
 } // namespace ops
@@ -495,6 +761,49 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, ForeachKernels) {
   TP_VK_FOREACH_BOUND_LIBRARY(maximum)
   TP_VK_FOREACH_BOUND_LIBRARY(minimum)
 #undef TP_VK_FOREACH_BOUND_LIBRARY
+
+#define TP_VK_FOREACH_TERNARY_LIBRARY(NAME)                                            \
+  m.impl(                                                                                \
+      "_foreach_" #NAME ".Scalar",                                                        \
+      &tensorplay::vulkan::ops::foreach_##NAME##_scalar_kernel);                          \
+  m.impl(                                                                                \
+      "_foreach_" #NAME ".ScalarList",                                                    \
+      &tensorplay::vulkan::ops::foreach_##NAME##_counts_kernel);                           \
+  m.impl(                                                                                \
+      "_foreach_" #NAME ".Tensor",                                                        \
+      &tensorplay::vulkan::ops::foreach_##NAME##_packed_kernel);                           \
+  m.impl(                                                                                \
+      "_foreach_" #NAME "_.Scalar",                                                       \
+      &tensorplay::vulkan::ops::foreach_##NAME##_scalar_inplace_kernel);                   \
+  m.impl(                                                                                \
+      "_foreach_" #NAME "_.ScalarList",                                                   \
+      &tensorplay::vulkan::ops::foreach_##NAME##_counts_inplace_kernel);                   \
+  m.impl(                                                                                \
+      "_foreach_" #NAME "_.Tensor",                                                       \
+      &tensorplay::vulkan::ops::foreach_##NAME##_packed_inplace_kernel);
+
+  TP_VK_FOREACH_TERNARY_LIBRARY(addcmul)
+  TP_VK_FOREACH_TERNARY_LIBRARY(addcdiv)
+#undef TP_VK_FOREACH_TERNARY_LIBRARY
+
+  m.impl(
+      "_foreach_lerp.Scalar",
+      &tensorplay::vulkan::ops::foreach_lerp_scalar_kernel);
+  m.impl(
+      "_foreach_lerp.ScalarList",
+      &tensorplay::vulkan::ops::foreach_lerp_counts_kernel);
+  m.impl(
+      "_foreach_lerp.List",
+      &tensorplay::vulkan::ops::foreach_lerp_list_kernel);
+  m.impl(
+      "_foreach_lerp_.Scalar",
+      &tensorplay::vulkan::ops::foreach_lerp_scalar_inplace_kernel);
+  m.impl(
+      "_foreach_lerp_.ScalarList",
+      &tensorplay::vulkan::ops::foreach_lerp_counts_inplace_kernel);
+  m.impl(
+      "_foreach_lerp_.List",
+      &tensorplay::vulkan::ops::foreach_lerp_list_inplace_kernel);
 
   m.impl(
       "_foreach_pow.Scalar",
