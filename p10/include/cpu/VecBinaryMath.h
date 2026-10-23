@@ -421,12 +421,7 @@ static void f16_chunk_avx2(const uint16_t* a, const uint16_t* b,
             r0 = log_add_exp_f32(x0, y0);
             r1 = log_add_exp_f32(x1, y1);
         }
-        _mm_storeu_si128(
-            reinterpret_cast<__m128i*>(d + i),
-            tensorplay::cpu::vecreduced::narrow8(r0));
-        _mm_storeu_si128(
-            reinterpret_cast<__m128i*>(d + i + 8),
-            tensorplay::cpu::vecreduced::narrow8(r1));
+        tensorplay::cpu::vecreduced::store_f16_16(d + i, r0, r1);
     }
     for (; i + 8 <= end; i += 8) {
         const __m256 x = tensorplay::cpu::vecreduced::widen8(a + i);

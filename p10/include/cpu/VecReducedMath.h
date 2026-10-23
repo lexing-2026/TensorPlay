@@ -62,6 +62,21 @@ inline __m128i narrow8(__m256 v) {
     return _mm256_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
 }
 
+// Sixteen answers landed by one store.  Each half of the pair is narrowed on
+// its own and the two are put end to end, so a step that answers sixteen
+// elements writes the whole of them in one place instead of two; the walk
+// keeps the same answer either way, but the destination sees one block per
+// step, which is what a store that goes past the cache would need and what
+// the ordinary store can hand to the memory system in one piece.
+__attribute__((target("avx2,f16c"), always_inline))
+inline void store_f16_16(uint16_t* p, __m256 lo, __m256 hi) {
+    const __m128i low = narrow8(lo);
+    const __m128i high = narrow8(hi);
+    _mm256_storeu_si256(
+        reinterpret_cast<__m256i*>(p),
+        _mm256_insertf128_si256(_mm256_castsi128_si256(low), high, 1));
+}
+
 // The other reduced width, held in single precision: eight elements at a
 // time.  The layout is the upper half of the single-precision pattern.
 __attribute__((target("avx2"), always_inline))

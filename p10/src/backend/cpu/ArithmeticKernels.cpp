@@ -4357,12 +4357,9 @@ void addcmul_half_walk(const tensorplay::Half* self,
         const __m256 q0 = _mm256_mul_ps(p0, y0);
         const __m256 p1 = _mm256_mul_ps(scale, x1);
         const __m256 q1 = _mm256_mul_ps(p1, y1);
-        _mm_storeu_si128(
-            reinterpret_cast<__m128i*>(out_bits + i),
-            tensorplay::cpu::vecreduced::narrow8(_mm256_add_ps(s0, q0)));
-        _mm_storeu_si128(
-            reinterpret_cast<__m128i*>(out_bits + i + 8),
-            tensorplay::cpu::vecreduced::narrow8(_mm256_add_ps(s1, q1)));
+        tensorplay::cpu::vecreduced::store_f16_16(out_bits + i,
+                                                  _mm256_add_ps(s0, q0),
+                                                  _mm256_add_ps(s1, q1));
     }
     for (; i + 8 <= end; i += 8) {
         const __m256 s = tensorplay::cpu::vecreduced::widen8(self_bits + i);
@@ -4403,12 +4400,9 @@ void addcdiv_half_walk(const tensorplay::Half* self,
         const __m256 q0 = _mm256_div_ps(p0, y0);
         const __m256 p1 = _mm256_mul_ps(scale, x1);
         const __m256 q1 = _mm256_div_ps(p1, y1);
-        _mm_storeu_si128(
-            reinterpret_cast<__m128i*>(out_bits + i),
-            tensorplay::cpu::vecreduced::narrow8(_mm256_add_ps(s0, q0)));
-        _mm_storeu_si128(
-            reinterpret_cast<__m128i*>(out_bits + i + 8),
-            tensorplay::cpu::vecreduced::narrow8(_mm256_add_ps(s1, q1)));
+        tensorplay::cpu::vecreduced::store_f16_16(out_bits + i,
+                                                  _mm256_add_ps(s0, q0),
+                                                  _mm256_add_ps(s1, q1));
     }
     for (; i + 8 <= end; i += 8) {
         const __m256 s = tensorplay::cpu::vecreduced::widen8(self_bits + i);

@@ -3873,14 +3873,10 @@ void lerp_tensor_half_walk(const tensorplay::Half* self,
         const __m256 coeff1 = _mm256_blendv_ps(_mm256_sub_ps(w1, one), w1, small1);
         const __m256 base0 = _mm256_blendv_ps(e0, s0, small0);
         const __m256 base1 = _mm256_blendv_ps(e1, s1, small1);
-        _mm_storeu_si128(
-            reinterpret_cast<__m128i*>(out_bits + i),
-            tensorplay::cpu::vecreduced::narrow8(_mm256_fmadd_ps(
-                coeff0, _mm256_sub_ps(e0, s0), base0)));
-        _mm_storeu_si128(
-            reinterpret_cast<__m128i*>(out_bits + i + 8),
-            tensorplay::cpu::vecreduced::narrow8(_mm256_fmadd_ps(
-                coeff1, _mm256_sub_ps(e1, s1), base1)));
+        tensorplay::cpu::vecreduced::store_f16_16(
+            out_bits + i,
+            _mm256_fmadd_ps(coeff0, _mm256_sub_ps(e0, s0), base0),
+            _mm256_fmadd_ps(coeff1, _mm256_sub_ps(e1, s1), base1));
     }
     for (; i + 8 <= n; i += 8) {
         const __m256 s = tensorplay::cpu::vecreduced::widen8(self_bits + i);
