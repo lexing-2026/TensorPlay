@@ -11,6 +11,11 @@ message it raised instead of being dropped, so the table says what runs.
 The stax side reaches the kernels the way the framework does: tensors cross over
 through the DLPack bridge and the calls are the ones in
 ``tensorplay.compiler.backends.stax.codegen.cutedsl.kernels``.
+
+Both libraries keep their compiled objects on disk, so a repeat run times the
+loader in the first-call column.  To time the compiler instead, give each
+library a fresh object directory (``QUACK_CACHE_DIR`` and ``TP_STAX_CACHE_DIR``)
+or turn the stax one off with ``TP_STAX_CACHE=0``.
 """
 
 from __future__ import annotations
