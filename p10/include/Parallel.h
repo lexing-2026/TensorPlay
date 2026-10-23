@@ -150,7 +150,10 @@ f: user function applied to each handed-out range, signature:
 The same guards as parallel_for.  The ranges the team answers come from a
 counter the threads draw on as they free up, so a thread on a core that
 answers the walk quickly draws more ranges than a thread on one that answers
-it slowly.  Use it for a walk that only writes the range it is handed.
+it slowly.  Use it for a walk that only writes the range it is handed, and
+whose range takes longer to answer than the counter takes to reach the next
+thread: a walk that answers a range sooner spends its time queueing on that
+one line, and the fixed split has no such line.
 */
 template <class F>
 inline void parallel_for_balanced(int64_t begin, int64_t end,

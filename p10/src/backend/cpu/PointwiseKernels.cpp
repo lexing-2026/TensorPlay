@@ -2803,44 +2803,6 @@ Tensor clamp_write(const Tensor& self, const std::optional<Scalar>& min,
     const bool has_min = min.has_value();
     const bool has_max = max.has_value();
 
-    // A clamp is a floor followed by a ceiling, which is exactly the
-    // hardtanh map the vector layer already carries (same bounds, same NaN
-    // propagation), so the two float widths take that pass instead of the
-    // per-element loop below.
-    if (vecunary::vec_ready() &&
-        (self.dtype() == DType::Float32 || self.dtype() == DType::Float64)) {
-        const double lo = has_min
-            ? static_cast<double>(min->to<double>())
-            : -std::numeric_limits<double>::infinity();
-        const double hi = has_max
-            ? static_cast<double>(max->to<double>())
-            : std::numeric_limits<double>::infinity();
-        // Bounds the other way round have no vector answer; the per-element
-        // loop keeps whatever order the caller asked for.
-        if (lo <= hi) {
-            vecunary::VParams prm;
-            prm.p0 = lo;
-            prm.p1 = hi;
-            const int64_t n = self.numel();
-            if (self.dtype() == DType::Float32) {
-                const float* src = self_contig.data_ptr<float>();
-                float* dst = result.data_ptr<float>();
-                parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-                    vecunary::run_f32(vecunary::VOp::Hardtanh, prm, src, dst,
-                                      begin, end);
-                });
-            } else {
-                const double* src = self_contig.data_ptr<double>();
-                double* dst = result.data_ptr<double>();
-                parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-                    vecunary::run_f64(vecunary::VOp::Hardtanh, prm, src, dst,
-                                      begin, end);
-                });
-            }
-            return result;
-        }
-    }
-
     #define OP_CASE(ctype, name) \
     case DType::name: { \
         const ctype* src = self_contig.data_ptr<ctype>(); \
@@ -4054,13 +4016,21 @@ void lerp_tensor_f64_avx512(const double* self, const double* end,
     }
 }
 
+// Every vectorized walk below takes the fixed split.  Each answers an element
+// in a fraction of a nanosecond, so a range of the size the drawn dispatch
+// cuts is answered in about the time the team spends queueing for the shared
+// counter, and that queue, not the memory, bounds the walk: the same four
+// float32 streams went from 0.120 to 0.069 ns per element at full width once
+// the split replaced the draw.  The scalar walks under them answer an element
+// with a widened expression, several times slower and by a different amount on
+// different kinds of core, so they keep the draw.
 template <typename T>
 void lerp_tensor_contiguous(const T* self, const T* end, const T* weight,
                             T* result, int64_t n) {
 #if defined(__x86_64__)
     if constexpr (std::is_same_v<T, float>) {
         if (pointwise_cpu_has_avx512dq()) {
-            parallel_for_balanced(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t finish) {
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t finish) {
                 lerp_tensor_f32_avx512(self + begin, end + begin,
                                        weight + begin, result + begin,
                                        finish - begin);
@@ -4068,7 +4038,7 @@ void lerp_tensor_contiguous(const T* self, const T* end, const T* weight,
             return;
         }
         if (pointwise_cpu_has_avx2()) {
-            parallel_for_balanced(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t finish) {
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t finish) {
                 lerp_tensor_f32_avx2(self + begin, end + begin,
                                      weight + begin, result + begin,
                                      finish - begin);
@@ -4077,7 +4047,7 @@ void lerp_tensor_contiguous(const T* self, const T* end, const T* weight,
         }
     } else if constexpr (std::is_same_v<T, double>) {
         if (pointwise_cpu_has_avx512dq()) {
-            parallel_for_balanced(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t finish) {
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t finish) {
                 lerp_tensor_f64_avx512(self + begin, end + begin,
                                        weight + begin, result + begin,
                                        finish - begin);
@@ -4085,7 +4055,7 @@ void lerp_tensor_contiguous(const T* self, const T* end, const T* weight,
             return;
         }
         if (pointwise_cpu_has_avx2()) {
-            parallel_for_balanced(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t finish) {
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t finish) {
                 lerp_tensor_f64_avx2(self + begin, end + begin,
                                      weight + begin, result + begin,
                                      finish - begin);
@@ -4096,7 +4066,7 @@ void lerp_tensor_contiguous(const T* self, const T* end, const T* weight,
 #if defined(TP_VECREDUCED_X86)
         if (tensorplay::cpu::vecreduced::f16c_available() &&
             __builtin_cpu_supports("fma")) {
-            parallel_for_balanced(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t finish) {
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t finish) {
                 lerp_tensor_half_walk(self + begin, end + begin,
                                       weight + begin, result + begin,
                                       finish - begin);
@@ -4107,7 +4077,7 @@ void lerp_tensor_contiguous(const T* self, const T* end, const T* weight,
     } else if constexpr (std::is_same_v<T, tensorplay::BFloat16>) {
 #if defined(TP_VECREDUCED_X86)
         if (pointwise_cpu_has_avx2()) {
-            parallel_for_balanced(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t finish) {
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t finish) {
                 lerp_tensor_bf16_walk(self + begin, end + begin,
                                       weight + begin, result + begin,
                                       finish - begin);

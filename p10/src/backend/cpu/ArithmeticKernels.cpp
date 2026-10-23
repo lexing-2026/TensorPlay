@@ -4775,7 +4775,7 @@ void addcmul_dense_walk(const Tensor& self, const Tensor& tensor1,
     if constexpr (std::is_same_v<T, tensorplay::Half>) {
         if (tensorplay::cpu::vecreduced::f16c_available()) {
             const float scale = static_cast<float>(alpha);
-            parallel_for_balanced(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
                 addcmul_half_walk(self_ptr, tensor1_ptr, tensor2_ptr, scale,
                                   result_ptr, begin, end);
             });
@@ -4784,7 +4784,12 @@ void addcmul_dense_walk(const Tensor& self, const Tensor& tensor1,
     } else if constexpr (std::is_same_v<T, float>) {
         if (tensorplay::cpu::vecbinary::avx2_available()) {
             const float scale = static_cast<float>(alpha);
-            parallel_for_balanced(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+            // The fixed split, not the drawn ranges: a range of this walk is
+            // answered in about the time the team spends queueing for the
+            // shared counter, so the queue bounds the walk.  The four streams
+            // went from 0.126 to 0.069 ns per element at full width once the
+            // split replaced the draw.
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
                 addcmul_f32_avx2(self_ptr, tensor1_ptr, tensor2_ptr, scale,
                                  result_ptr, begin, end);
             });
@@ -4793,7 +4798,7 @@ void addcmul_dense_walk(const Tensor& self, const Tensor& tensor1,
     } else if constexpr (std::is_same_v<T, double>) {
         if (tensorplay::cpu::vecbinary::avx2_available()) {
             const double scale = static_cast<double>(alpha);
-            parallel_for_balanced(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
                 addcmul_f64_avx2(self_ptr, tensor1_ptr, tensor2_ptr, scale,
                                  result_ptr, begin, end);
             });
@@ -4802,7 +4807,7 @@ void addcmul_dense_walk(const Tensor& self, const Tensor& tensor1,
     } else if constexpr (std::is_same_v<T, tensorplay::BFloat16>) {
         if (tensorplay::cpu::vecbinary::avx2_available()) {
             const float scale = static_cast<float>(alpha);
-            parallel_for_balanced(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
                 addcmul_bf16_walk(self_ptr, tensor1_ptr, tensor2_ptr, scale,
                                   result_ptr, begin, end);
             });
@@ -5065,7 +5070,7 @@ void addcdiv_dense_walk(const Tensor& self, const Tensor& tensor1,
     if constexpr (std::is_same_v<T, tensorplay::Half>) {
         if (tensorplay::cpu::vecreduced::f16c_available()) {
             const float scale = static_cast<float>(alpha);
-            parallel_for_balanced(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
                 addcdiv_half_walk(self_ptr, tensor1_ptr, tensor2_ptr, scale,
                                   result_ptr, begin, end);
             });
@@ -5074,7 +5079,7 @@ void addcdiv_dense_walk(const Tensor& self, const Tensor& tensor1,
     } else if constexpr (std::is_same_v<T, float>) {
         if (tensorplay::cpu::vecbinary::avx2_available()) {
             const float scale = static_cast<float>(alpha);
-            parallel_for_balanced(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
                 addcdiv_f32_avx2(self_ptr, tensor1_ptr, tensor2_ptr, scale,
                                  result_ptr, begin, end);
             });
@@ -5083,7 +5088,7 @@ void addcdiv_dense_walk(const Tensor& self, const Tensor& tensor1,
     } else if constexpr (std::is_same_v<T, double>) {
         if (tensorplay::cpu::vecbinary::avx2_available()) {
             const double scale = static_cast<double>(alpha);
-            parallel_for_balanced(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
                 addcdiv_f64_avx2(self_ptr, tensor1_ptr, tensor2_ptr, scale,
                                  result_ptr, begin, end);
             });
@@ -5092,7 +5097,7 @@ void addcdiv_dense_walk(const Tensor& self, const Tensor& tensor1,
     } else if constexpr (std::is_same_v<T, tensorplay::BFloat16>) {
         if (tensorplay::cpu::vecbinary::avx2_available()) {
             const float scale = static_cast<float>(alpha);
-            parallel_for_balanced(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
                 addcdiv_bf16_walk(self_ptr, tensor1_ptr, tensor2_ptr, scale,
                                   result_ptr, begin, end);
             });
