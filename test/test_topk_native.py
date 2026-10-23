@@ -95,6 +95,81 @@ def test_topk_native_cuda_nan_order(largest):
 
 
 @pytest.mark.skipif(not tp.cuda.is_available(), reason="CUDA is unavailable")
+@pytest.mark.parametrize("largest", [True, False])
+def test_topk_native_cuda_single_keeps_first_position(largest):
+    array = np.array(
+        [[5, 9, 9, 1, 9], [4, 4, 4, 4, 4], [3, 1, 2, 7, 0]], dtype=np.int64)
+    _assert_sorted_result(array, 1, 1, largest, "cuda", 0)
+
+
+@pytest.mark.skipif(not tp.cuda.is_available(), reason="CUDA is unavailable")
+@pytest.mark.parametrize("largest", [True, False])
+def test_topk_native_cuda_single_nan_order(largest):
+    array = np.array(
+        [[np.nan, 2.0, np.nan, 5.0], [1.0, np.nan, np.nan, np.nan],
+         [np.nan, np.nan, np.nan, np.nan]],
+        dtype=np.float32)
+    _assert_sorted_result(array, 1, 1, largest, "cuda", 0)
+
+
+@pytest.mark.skipif(not tp.cuda.is_available(), reason="CUDA is unavailable")
+def test_topk_native_cuda_single_signed_zero():
+    array = np.array([[-0.0, 0.0], [0.0, -0.0]], dtype=np.float32)
+    for largest, expected_index, expected_sign in (
+            (True, [[1], [0]], [[False], [False]]),
+            (False, [[0], [1]], [[True], [True]])):
+        value, index = tp.topk(_as_tensor(array, "cuda"), 1, 1, largest, True, 0)
+        np.testing.assert_array_equal(_as_numpy(index), np.array(expected_index))
+        assert np.signbit(_as_numpy(value)).tolist() == expected_sign
+
+
+@pytest.mark.skipif(not tp.cuda.is_available(), reason="CUDA is unavailable")
+@pytest.mark.parametrize("largest", [True, False])
+def test_topk_native_cuda_single_wide_rows(largest):
+    rng = np.random.default_rng(7)
+    array = rng.standard_normal((64, 5003)).astype(np.float32)
+    array[:, ::1001] = 3.5
+    _assert_sorted_result(array, 1, 1, largest, "cuda", 0)
+
+
+@pytest.mark.skipif(not tp.cuda.is_available(), reason="CUDA is unavailable")
+@pytest.mark.parametrize("largest", [True, False])
+def test_topk_native_cuda_single_narrow_rows(largest):
+    rng = np.random.default_rng(11)
+    array = rng.integers(-50, 50, size=(32768, 128)).astype(np.int32)
+    _assert_sorted_result(array, 1, 1, largest, "cuda", 0)
+
+
+@pytest.mark.skipif(not tp.cuda.is_available(), reason="CUDA is unavailable")
+@pytest.mark.parametrize("largest", [True, False])
+def test_topk_native_cuda_single_strided_axis(largest):
+    rng = np.random.default_rng(13)
+    array = rng.integers(-8, 8, size=(3, 4, 5)).astype(np.int64)
+    _assert_sorted_result(array, 1, 1, largest, "cuda", 0)
+    wide = rng.integers(-6, 6, size=(16, 4099, 3)).astype(np.int64)
+    _assert_sorted_result(wide, 1, 1, largest, "cuda", 0)
+
+
+@pytest.mark.skipif(not tp.cuda.is_available(), reason="CUDA is unavailable")
+@pytest.mark.parametrize("largest", [True, False])
+def test_topk_native_cuda_single_vector(largest):
+    rng = np.random.default_rng(17)
+    array = rng.integers(-20, 20, size=10001).astype(np.int32)
+    _assert_sorted_result(array, 1, 0, largest, "cuda", 0)
+
+
+@pytest.mark.skipif(not tp.cuda.is_available(), reason="CUDA is unavailable")
+def test_topk_native_cuda_single_large_keys():
+    array = np.array(
+        [[np.iinfo(np.int64).min, 0, np.iinfo(np.int64).max, 5],
+         [7, np.iinfo(np.int64).max, np.iinfo(np.int64).min, 7]],
+        dtype=np.int64)
+    _assert_sorted_result(array, 1, 1, True, "cuda", 0)
+    _assert_sorted_result(array, 1, 1, False, "cuda", 0)
+    _assert_sorted_result(array, 1, 0, True, "cuda", 0)
+
+
+@pytest.mark.skipif(not tp.cuda.is_available(), reason="CUDA is unavailable")
 def test_topk_native_cuda_large_dimension_fallback():
     array = np.linspace(-1.0, 1.0, 4097, dtype=np.float32).reshape(1, -1)
     _assert_sorted_result(array, 3, 1, True, "cuda", 0)

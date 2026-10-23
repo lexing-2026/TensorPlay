@@ -812,11 +812,267 @@ void launch_sorted_topk(Tensor& values, Tensor& indices, int64_t rows,
 }
 
 template <typename T>
+__device__ inline void topk_single_take(
+    typename TopKRadixTraits<T>::key_type* best, int64_t* best_index,
+    typename TopKRadixTraits<T>::key_type key, int64_t index, bool largest) {
+  const bool win = largest
+      ? (key > *best || (key == *best && index < *best_index))
+      : (key < *best || (key == *best && index < *best_index));
+  if (win) {
+    *best = key;
+    *best_index = index;
+  }
+}
+
+template <typename T>
+__device__ inline typename TopKRadixTraits<T>::key_type topk_shfl_down(
+    typename TopKRadixTraits<T>::key_type value, int offset) {
+  if constexpr (sizeof(typename TopKRadixTraits<T>::key_type) == 8) {
+    const unsigned long long bits =
+        static_cast<unsigned long long>(value);
+    return static_cast<typename TopKRadixTraits<T>::key_type>(
+        __shfl_down_sync(0xffffffffu, bits, offset));
+  } else {
+    return static_cast<typename TopKRadixTraits<T>::key_type>(
+        __shfl_down_sync(0xffffffffu, static_cast<unsigned>(value), offset));
+  }
+}
+
+template <typename T>
+__device__ inline void topk_single_warp_reduce(
+    typename TopKRadixTraits<T>::key_type* best, int64_t* best_index,
+    bool largest) {
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    const auto other = topk_shfl_down<T>(*best, offset);
+    const int64_t other_index =
+        __shfl_down_sync(0xffffffffu, *best_index, offset);
+    topk_single_take<T>(best, best_index, other, other_index, largest);
+  }
+}
+
+// Folds one whole block onto a single (key, position) pair, keeping the
+// earliest position when keys tie so the answer matches a stable scan of
+// the row.
+template <typename T>
+__device__ inline void topk_single_block_reduce(
+    typename TopKRadixTraits<T>::key_type* best, int64_t* best_index,
+    typename TopKRadixTraits<T>::key_type* shared_keys,
+    int64_t* shared_indices, bool largest) {
+  using Key = typename TopKRadixTraits<T>::key_type;
+  topk_single_warp_reduce<T>(best, best_index, largest);
+  if (blockDim.x <= 32) return;
+  const int warps = (blockDim.x + 31) / 32;
+  if ((threadIdx.x & 31) == 0) {
+    shared_keys[threadIdx.x >> 5] = *best;
+    shared_indices[threadIdx.x >> 5] = *best_index;
+  }
+  __syncthreads();
+  if (threadIdx.x < 32) {
+    Key key = largest ? static_cast<Key>(0) : ~static_cast<Key>(0);
+    int64_t index = INT64_MAX;
+    if (threadIdx.x < warps) {
+      key = shared_keys[threadIdx.x];
+      index = shared_indices[threadIdx.x];
+    }
+    topk_single_warp_reduce<T>(&key, &index, largest);
+    if (threadIdx.x == 0) {
+      *best = key;
+      *best_index = index;
+    }
+  }
+}
+
+// One tile of one row: fold its elements to a candidate that the finalize
+// pass combines with the other tiles of that row.  A row that fits a single
+// tile writes its answer here directly.
+template <typename T>
+__global__ void topk_single_candidates_kernel(
+    const T* __restrict__ input,
+    typename TopKRadixTraits<T>::key_type* __restrict__ candidate_keys,
+    int32_t* __restrict__ candidate_positions, T* __restrict__ values,
+    int64_t* __restrict__ indices, int64_t rows, int64_t cols, int64_t inner,
+    int blocks_per_row, int items_per_thread, bool largest) {
+  using Key = typename TopKRadixTraits<T>::key_type;
+  __shared__ Key shared_keys[32];
+  __shared__ int64_t shared_indices[32];
+  const int64_t block = static_cast<int64_t>(topk_linear_block_id());
+  const int64_t row = block / blocks_per_row;
+  if (row >= rows) return;
+  const int64_t tile = block - row * blocks_per_row;
+  const int64_t outer = row / inner;
+  const T* row_input = input + outer * cols * inner + (row - outer * inner);
+  const int64_t base =
+      tile * static_cast<int64_t>(items_per_thread) * blockDim.x;
+
+  Key best = largest ? static_cast<Key>(0) : ~static_cast<Key>(0);
+  int64_t best_index = INT64_MAX;
+  for (int item = 0; item < items_per_thread; ++item) {
+    const int64_t column =
+        base + static_cast<int64_t>(item) * blockDim.x + threadIdx.x;
+    if (column < cols) {
+      const Key key = TopKRadixTraits<T>::encode(
+          topk_load(row_input + column * inner));
+      topk_single_take<T>(&best, &best_index, key, column, largest);
+    }
+  }
+  topk_single_block_reduce<T>(&best, &best_index, shared_keys, shared_indices,
+                              largest);
+  if (threadIdx.x != 0) return;
+  if (blocks_per_row == 1) {
+    values[row] = topk_load(row_input + best_index * inner);
+    indices[row] = best_index;
+  } else {
+    candidate_keys[block] = best;
+    candidate_positions[block] = static_cast<int32_t>(best_index);
+  }
+}
+
+// One warp per row folds that row's tile candidates.  The winning position
+// reloads the source element so NaN payloads and every other bit pattern
+// reach the output unchanged.
+template <typename T>
+__global__ void topk_single_finalize_kernel(
+    const T* __restrict__ input,
+    const typename TopKRadixTraits<T>::key_type* __restrict__ candidate_keys,
+    const int32_t* __restrict__ candidate_positions, T* __restrict__ values,
+    int64_t* __restrict__ indices, int64_t rows, int64_t cols, int64_t inner,
+    int blocks_per_row, bool largest) {
+  using Key = typename TopKRadixTraits<T>::key_type;
+  const int64_t row = static_cast<int64_t>(topk_linear_block_id());
+  if (row >= rows) return;
+  Key best = largest ? static_cast<Key>(0) : ~static_cast<Key>(0);
+  int64_t best_index = INT64_MAX;
+  const Key* keys = candidate_keys + row * blocks_per_row;
+  const int32_t* positions = candidate_positions + row * blocks_per_row;
+  for (int i = threadIdx.x; i < blocks_per_row; i += blockDim.x) {
+    topk_single_take<T>(&best, &best_index, keys[i],
+                        static_cast<int64_t>(positions[i]), largest);
+  }
+  topk_single_warp_reduce<T>(&best, &best_index, largest);
+  if (threadIdx.x != 0) return;
+  const int64_t outer = row / inner;
+  const T* row_input = input + outer * cols * inner + (row - outer * inner);
+  values[row] = topk_load(row_input + best_index * inner);
+  indices[row] = best_index;
+}
+
+// Narrow rows hand one warp to each row: a whole block per 128-element row
+// would spend more time in the block reduction than in the loads.
+template <typename T>
+__global__ void topk_single_row_warps_kernel(
+    const T* __restrict__ input, T* __restrict__ values,
+    int64_t* __restrict__ indices, int64_t rows, int64_t cols, int64_t inner,
+    int items_per_thread, bool largest) {
+  using Key = typename TopKRadixTraits<T>::key_type;
+  const int warps = blockDim.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int64_t row =
+      static_cast<int64_t>(topk_linear_block_id()) * warps + (threadIdx.x >> 5);
+  if (row >= rows) return;
+  const int64_t outer = row / inner;
+  const T* row_input = input + outer * cols * inner + (row - outer * inner);
+
+  Key best = largest ? static_cast<Key>(0) : ~static_cast<Key>(0);
+  int64_t best_index = INT64_MAX;
+  for (int item = 0; item < items_per_thread; ++item) {
+    const int64_t column = static_cast<int64_t>(item) * 32 + lane;
+    if (column < cols) {
+      const Key key = TopKRadixTraits<T>::encode(
+          topk_load(row_input + column * inner));
+      topk_single_take<T>(&best, &best_index, key, column, largest);
+    }
+  }
+  topk_single_warp_reduce<T>(&best, &best_index, largest);
+  if (lane == 0) {
+    values[row] = topk_load(row_input + best_index * inner);
+    indices[row] = best_index;
+  }
+}
+
+// A single element needs no digit-by-digit selection: one strided pass
+// keeps the running extreme and its earliest position.
+template <typename T>
+void launch_single_topk(const Tensor& input, Tensor& values, Tensor& indices,
+                        int64_t rows, int64_t cols, int64_t inner,
+                        bool largest) {
+  using Key = typename TopKRadixTraits<T>::key_type;
+  const auto& properties = topk_device_properties();
+  const auto stream = getCurrentCUDAStream().stream();
+  constexpr int64_t warp_row_limit = 512;
+  if (cols <= warp_row_limit) {
+    constexpr int warps = 8;
+    const int items_per_thread = static_cast<int>((cols + 31) / 32);
+    const uint64_t block_count =
+        static_cast<uint64_t>((rows + warps - 1) / warps);
+    topk_single_row_warps_kernel<T>
+        <<<topk_grid_for(block_count), warps * 32, 0, stream>>>(
+            input.data_ptr<T>(), values.data_ptr<T>(),
+            indices.data_ptr<int64_t>(), rows, cols, inner, items_per_thread,
+            largest);
+    TP_CUDA_CHECK(cudaGetLastError());
+    return;
+  }
+  int threads = 256;
+  if (cols < threads) {
+    threads = static_cast<int>(std::max<int64_t>(32, (cols + 31) / 32 * 32));
+  }
+  const uint64_t total =
+      static_cast<uint64_t>(rows) * static_cast<uint64_t>(cols);
+  const uint64_t target_blocks =
+      static_cast<uint64_t>(properties.multiProcessorCount) * 8;
+  const uint64_t needed = (total + target_blocks - 1) / target_blocks;
+  int items_per_thread = 1;
+  while (items_per_thread < 32 &&
+         static_cast<uint64_t>(threads) * items_per_thread < needed) {
+    items_per_thread *= 2;
+  }
+  const int64_t row_items = std::max<int64_t>(1, (cols + threads - 1) / threads);
+  items_per_thread = static_cast<int>(std::min<int64_t>(items_per_thread, row_items));
+  const int64_t tile = static_cast<int64_t>(threads) * items_per_thread;
+  const int blocks_per_row = static_cast<int>((cols + tile - 1) / tile);
+
+  const DType key_dtype =
+      sizeof(Key) == sizeof(uint32_t) ? DType::UInt32 : DType::UInt64;
+  Tensor candidate_keys;
+  Tensor candidate_positions;
+  if (blocks_per_row > 1) {
+    candidate_keys = Tensor::empty({rows * blocks_per_row}, key_dtype,
+                                   input.device());
+    candidate_positions = Tensor::empty({rows * blocks_per_row}, DType::Int32,
+                                        input.device());
+  }
+  const uint64_t block_count =
+      static_cast<uint64_t>(rows) * static_cast<uint64_t>(blocks_per_row);
+  const dim3 grid = topk_grid_for(block_count);
+  topk_single_candidates_kernel<T><<<grid, threads, 0, stream>>>(
+      input.data_ptr<T>(),
+      blocks_per_row > 1 ? candidate_keys.data_ptr<Key>() : nullptr,
+      blocks_per_row > 1 ? candidate_positions.data_ptr<int32_t>() : nullptr,
+      values.data_ptr<T>(), indices.data_ptr<int64_t>(), rows, cols, inner,
+      blocks_per_row, items_per_thread, largest);
+  TP_CUDA_CHECK(cudaGetLastError());
+  if (blocks_per_row > 1) {
+    const dim3 finalize_grid = topk_grid_for(static_cast<uint64_t>(rows));
+    topk_single_finalize_kernel<T><<<finalize_grid, 32, 0, stream>>>(
+        input.data_ptr<T>(), candidate_keys.data_ptr<Key>(),
+        candidate_positions.data_ptr<int32_t>(), values.data_ptr<T>(),
+        indices.data_ptr<int64_t>(), rows, cols, inner, blocks_per_row,
+        largest);
+    TP_CUDA_CHECK(cudaGetLastError());
+  }
+}
+
+template <typename T>
 void launch_topk_cuda(const Tensor& input, Tensor& values, Tensor& indices,
                       int64_t rows, int64_t cols, int64_t k, int64_t inner,
                       bool largest, bool sorted, int64_t impl) {
   if (impl != 0 && impl != 1) {
     TP_THROW(RuntimeError, "topk: unknown impl " + std::to_string(impl));
+  }
+
+  if (k == 1 && cols <= std::numeric_limits<int32_t>::max()) {
+    launch_single_topk<T>(input, values, indices, rows, cols, inner, largest);
+    return;
   }
 
   if (sorted && cols > 128 && cols <= 1024 && rows <= 2048) {
