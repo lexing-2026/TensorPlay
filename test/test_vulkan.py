@@ -16452,6 +16452,236 @@ class TestVulkanInstanceNorm(unittest.TestCase):
                     None, None, True, 1e-5)
 
 
+class TestVulkanRenorm(unittest.TestCase):
+    # Every span laid out along one named axis is measured as a vector, and a span
+    # longer than the bound is pulled back to it: one factor scales a whole span, so
+    # the answer keeps the shape the payload was read in and the axis that was named
+    # stays standing.  A length is taken in single precision even from a narrow
+    # payload, because a long span can leave the width of a lane, and the factor is
+    # rounded once -- when it returns to that width to multiply -- which is why a
+    # span exactly at the bound keeps its lanes and a length that is not a number,
+    # never being over the bound, keeps the lanes it holds.  A bound of nothing
+    # collapses a measuring span, a payload with one dimension has no span to
+    # measure, and counting lanes are not measured at all.
+
+    ORDERS = (1.0, 2.0, 3.0, math.inf)
+    BOUNDS = (0.0, 0.5, 1.0, 4.0, 1e9)
+
+    @staticmethod
+    def _device(values):
+        return tensorplay.from_numpy(np.ascontiguousarray(values)).to("vulkan")
+
+    @staticmethod
+    def _host(values):
+        return tensorplay.from_numpy(np.ascontiguousarray(values))
+
+    @staticmethod
+    def _wrap(values, axis):
+        rank = np.asarray(values).ndim
+        return axis + rank if axis < 0 else axis
+
+    @classmethod
+    def _lengths(cls, values, axis, order):
+        # The measure of every span, held along the axis it leaves standing.
+        wide = np.asarray(values, dtype=np.float64)
+        named = cls._wrap(wide, axis)
+        span = tuple(a for a in range(wide.ndim) if a != named)
+        if np.isinf(order):
+            return np.max(np.abs(wide), axis=span, keepdims=True)
+        return (np.abs(wide) ** order).sum(axis=span, keepdims=True) ** (1.0 / order)
+
+    @classmethod
+    def _truth(cls, values, order, axis, bound):
+        wide = np.asarray(values, dtype=np.float64)
+        lengths = cls._lengths(wide, axis, order)
+        factors = np.where(lengths > bound, bound / (lengths + 1e-7), 1.0)
+        return (wide * factors).astype(np.float32)
+
+    def test_a_span_longer_than_the_bound_is_pulled_back_to_it(self):
+        rng = np.random.default_rng(11)
+        matrix = (rng.standard_normal((4, 5)) * 3.0).astype(np.float32)
+        for order in self.ORDERS:
+            for bound in self.BOUNDS:
+                for axis in (0, 1, -1):
+                    truth = self._truth(matrix, order, axis, bound)
+                    device = tensorplay.renorm(
+                        self._device(matrix), order, axis, bound)
+                    host = tensorplay.renorm(
+                        self._host(matrix), order, axis, bound)
+                    with self.subTest(order=order, bound=bound, axis=axis):
+                        self.assertEqual(device.dtype, tensorplay.float32)
+                        self.assertEqual(tuple(device.shape), matrix.shape)
+                        # The length is summed in single precision, so a long span
+                        # answers a hair off the double-precision measure.
+                        np.testing.assert_allclose(
+                            device.detach().cpu().numpy(), truth,
+                            rtol=1e-5, atol=1e-5)
+                        np.testing.assert_allclose(
+                            host.detach().cpu().numpy(), truth,
+                            rtol=1e-5, atol=1e-5)
+
+    def test_a_span_already_under_the_bound_keeps_every_lane(self):
+        rng = np.random.default_rng(19)
+        for order in self.ORDERS:
+            matrix = (rng.standard_normal((3, 6)) * 2.0).astype(np.float32)
+            for axis in (0, 1):
+                with self.subTest(order=order, axis=axis):
+                    answer = tensorplay.renorm(
+                        self._device(matrix), order, axis, 1e9)
+                    np.testing.assert_array_equal(
+                        answer.detach().cpu().numpy(), matrix)
+
+    def test_a_bound_of_nothing_collapses_a_measuring_span(self):
+        rng = np.random.default_rng(23)
+        matrix = (rng.standard_normal((5, 4)) * 7.0).astype(np.float32)
+        for order in self.ORDERS:
+            for axis in (0, 1):
+                with self.subTest(order=order, axis=axis):
+                    answer = tensorplay.renorm(
+                        self._device(matrix), order, axis, 0.0)
+                    lanes = answer.detach().cpu().numpy()
+                    self.assertTrue(np.all(lanes == 0.0))
+
+    def test_a_narrow_span_is_measured_wider_than_its_lane(self):
+        # A span of nine thousand lanes squared leaves the width a half lane
+        # holds: measured there its length would be infinity, the factor zero, and
+        # every lane collapsed.  Measured wide, the span is only pulled back.
+        payload = np.full((9000, 8), 60000.0, dtype=np.float16)
+        truth = self._truth(payload, 2.0, 1, 1.0)
+        answer = tensorplay.renorm(self._device(payload), 2.0, 1, 1.0)
+        lanes = answer.detach().cpu().numpy()
+        self.assertEqual(answer.dtype, tensorplay.float16)
+        self.assertTrue(np.all(lanes != 0.0))
+        self.assertTrue(np.all(np.isfinite(lanes)))
+        np.testing.assert_allclose(
+            lanes.astype(np.float64), truth.astype(np.float64),
+            rtol=2e-3, atol=2e-3)
+
+    def test_a_rank_three_walk_scales_the_axis_it_names(self):
+        rng = np.random.default_rng(29)
+        cube = (rng.standard_normal((2, 3, 4)) * 2.0).astype(np.float32)
+        for axis in (0, 1, 2):
+            for order in (1.0, 2.0, math.inf):
+                with self.subTest(axis=axis, order=order):
+                    truth = self._truth(cube, order, axis, 1.5)
+                    answer = tensorplay.renorm(
+                        self._device(cube), order, axis, 1.5)
+                    np.testing.assert_allclose(
+                        answer.detach().cpu().numpy(), truth,
+                        rtol=1e-5, atol=1e-5)
+
+    def test_a_rank_four_walk_scales_the_axis_it_names(self):
+        rng = np.random.default_rng(31)
+        stack = (rng.standard_normal((2, 2, 3, 3)) * 2.0).astype(np.float32)
+        for axis in (0, 1, 2, 3):
+            with self.subTest(axis=axis):
+                truth = self._truth(stack, 2.0, axis, 1.0)
+                answer = tensorplay.renorm(self._device(stack), 2.0, axis, 1.0)
+                np.testing.assert_allclose(
+                    answer.detach().cpu().numpy(), truth, rtol=1e-5, atol=1e-5)
+
+    def test_a_span_with_no_lane_measures_as_nothing(self):
+        for shape in ((0, 3), (3, 0), (1, 1)):
+            payload = np.zeros(shape, dtype=np.float32)
+            with self.subTest(shape=shape):
+                answer = tensorplay.renorm(
+                    self._device(payload), 2.0, 1, 1.0)
+                self.assertEqual(tuple(answer.shape), shape)
+                self.assertEqual(answer.numel(), payload.size)
+                if payload.size:
+                    np.testing.assert_array_equal(
+                        answer.detach().cpu().numpy(), payload)
+
+    def test_the_write_back_lands_where_the_span_was_read(self):
+        rng = np.random.default_rng(37)
+        matrix = (rng.standard_normal((4, 5)) * 3.0).astype(np.float32)
+        truth = self._truth(matrix, 2.0, 1, 1.0)
+        payload = self._device(matrix)
+        answer = tensorplay.renorm_(payload, 2.0, 1, 1.0)
+        self.assertIs(answer, payload)
+        np.testing.assert_allclose(
+            payload.detach().cpu().numpy(), truth, rtol=1e-5, atol=1e-5)
+        host = self._host(matrix)
+        tensorplay.renorm_(host, 2.0, 1, 1.0)
+        np.testing.assert_allclose(
+            host.detach().cpu().numpy(), truth, rtol=1e-5, atol=1e-5)
+
+    def test_a_bound_carries_both_the_factor_and_the_measure_it_moves(self):
+        # A pulled-back span is not rescaled by a constant held off its gradient:
+        # the bound it is measured against moves with its lanes, so the gradient
+        # carries the rescaled gradient less the term the moved factor takes off
+        # the inner product the span holds with it.
+        rng = np.random.default_rng(41)
+        matrix = (rng.standard_normal((6, 4)) * 3.0).astype(np.float32)
+        bound = 1.0
+        # Axis one stays standing, so a span is a column: every measure is taken
+        # down the rows and one factor scales a whole column.
+        wide = matrix.astype(np.float64)
+        length = np.sqrt((wide * wide).sum(axis=0, keepdims=True))
+        ones = np.ones_like(wide)
+        inner = (wide * ones).sum(axis=0, keepdims=True)
+        pulled = length > bound
+        factor = np.where(pulled, bound / (length + 1e-7), 1.0)
+        correction = np.where(
+            pulled, bound * inner / (length * (length + 1e-7) ** 2), 0.0)
+        truth = factor * ones - wide * correction
+
+        leaf = self._device(matrix).requires_grad_(True)
+        answer = tensorplay.renorm(leaf, 2.0, 1, bound)
+        answer.backward(self._device(np.ones_like(matrix)))
+        self.assertEqual(tuple(leaf.grad.shape), matrix.shape)
+        np.testing.assert_allclose(
+            leaf.grad.detach().cpu().numpy(), truth, rtol=2e-3, atol=2e-4)
+
+    def test_a_walk_that_keeps_every_lane_keeps_every_gradient(self):
+        rng = np.random.default_rng(43)
+        matrix = (rng.standard_normal((5, 3)) * 2.0).astype(np.float32)
+        leaf = self._device(matrix).requires_grad_(True)
+        answer = tensorplay.renorm(leaf, 2.0, 1, 1e9)
+        answer.backward(tensorplay.ones_like(answer))
+        np.testing.assert_array_equal(
+            leaf.grad.detach().cpu().numpy(), np.ones_like(matrix))
+
+    def test_a_span_that_is_not_a_number_is_not_over_the_bound(self):
+        matrix = np.array(
+            [[3.0, 4.0], [1.0, np.nan], [0.5, 0.5]], dtype=np.float32)
+        # Axis zero stays standing, so a span is a row: the measure that is not a
+        # number is not over the bound, and it does not reach into the row next
+        # to it -- one is pulled back, one keeps its lanes, one stands short.
+        truth = self._truth(matrix, 2.0, 0, 1.0)
+        answer = tensorplay.renorm(self._device(matrix), 2.0, 0, 1.0)
+        lanes = answer.detach().cpu().numpy()
+        np.testing.assert_allclose(lanes[0], truth[0], rtol=1e-5, atol=1e-6)
+        self.assertEqual(lanes[1][0], 1.0)
+        self.assertTrue(math.isnan(float(lanes[1][1])))
+        np.testing.assert_array_equal(lanes[2], matrix[2])
+        host = tensorplay.renorm(self._host(matrix), 2.0, 0, 1.0)
+        np.testing.assert_array_equal(
+            host.detach().cpu().numpy(), lanes)
+
+    def test_a_walk_needs_a_measuring_payload_of_at_least_two_dimensions(self):
+        flat = np.zeros(4, dtype=np.float32)
+        with self.assertRaisesRegex(RuntimeError, "at least two dimensions"):
+            tensorplay.renorm(self._device(flat), 2.0, 0, 1.0)
+        counts = np.zeros((2, 2), dtype=np.int64)
+        with self.assertRaisesRegex(RuntimeError, "Float32 and Float16"):
+            tensorplay.renorm(self._device(counts), 2.0, 0, 1.0)
+        matrix = np.zeros((2, 2), dtype=np.float32)
+        with self.assertRaisesRegex(RuntimeError, "positive norm order"):
+            tensorplay.renorm(self._device(matrix), 0.0, 0, 1.0)
+        with self.assertRaisesRegex(RuntimeError, "positive norm order"):
+            tensorplay.renorm(self._device(matrix), -2.0, 0, 1.0)
+        with self.assertRaisesRegex(RuntimeError, "non-negative length"):
+            tensorplay.renorm(self._device(matrix), 2.0, 0, -1.0)
+        with self.assertRaisesRegex(RuntimeError, "out of range"):
+            tensorplay.renorm(self._device(matrix), 2.0, 2, 1.0)
+        # The fourth rank is the widest walk the storage carries.
+        with self.assertRaisesRegex(RuntimeError, "ndim <= 4"):
+            tensorplay.renorm(
+                self._device(np.zeros((2, 3, 4, 5, 6), np.float32)),
+                2.0, 1, 1.0)
+
+
 class TestVulkanBinaryCrossEntropy(unittest.TestCase):
     # A binary likelihood reads both planes as probabilities, so every lane has to
     # sit between the bounds a logarithm is taken of.  Each logarithm is clamped at
