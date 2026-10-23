@@ -36,6 +36,14 @@ layout(std430) buffer;
  * makes a long prefill window affordable: its score block alone would run to
  * gigabytes.
  *
+ * One staged block carries the keys while the tile's scores are formed and the
+ * values while those scores are applied.  The two are the same shape, and a
+ * value row is read only once every score of the chunk exists, so the slots the
+ * key walk leaves behind stage the value block instead of a second array.  Both
+ * halves of the chunk then read their operands from shared memory: a value row
+ * staged once serves every query row of the tile, where reading it from the
+ * payload would fetch the same elements again per row.
+ *
  * The shared rows are four wide, since a score is a dot product of two of them
  * and a value row enters the accumulator at the same width: one step of either
  * walk carries four dimensions, and a row padded by a whole quad keeps the
@@ -105,7 +113,8 @@ const float REJECT = -1.0e30f;
 const float NO_SCORE = -1.0e38f;
 
 shared vec4 sQ[ROWS][DQPAD];
-shared vec4 sK[KV][DQPAD];
+// Key block while the tile's scores are formed, value block once they are.
+shared vec4 sKV[KV][DQPAD];
 shared vec4 sO[ROWS][DQPAD];
 shared float sS[ROWS][KVPAD];
 shared float sM[ROWS];
@@ -121,7 +130,7 @@ layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
 float dot_qk(const int r, const int kk) {
   float acc = 0.0;
   for (int dq = 0; dq < uBlock.d_quads; ++dq) {
-    acc += dot(sQ[r][dq], sK[kk][dq]);
+    acc += dot(sQ[r][dq], sKV[kk][dq]);
   }
   return acc;
 }
@@ -262,7 +271,7 @@ void main() {
         kv = key_quad(
             kv_base + key * uBlock.kv_strides.z + d0, d0, d_last);
       }
-      sK[kk][dq] = kv;
+      sKV[kk][dq] = kv;
     }
     barrier();
 
@@ -313,22 +322,32 @@ void main() {
         sM[r] = m_new;
       }
     }
+
+    // The key rows of this chunk are spent once every score of the tile is in
+    // sS, so the same slots stage the value rows the accumulator reads.
+    for (int i = tid; i < KV * d_quads; i += THREADS) {
+      const int kk = i / d_quads;
+      const int dq = i - kk * d_quads;
+      const int d0 = dq * 4;
+      const int key = k0 + kk;
+      vec4 vv = vec4(0.0);
+      if (key < uBlock.seq_kv) {
+        vv = payload_quad(
+            kv_base + key * uBlock.kv_strides.z + d0, d0, d_last);
+      }
+      sKV[kk][dq] = vv;
+    }
     barrier();
 
-    // Rescale what the walk kept so far and add the chunk.  A weight of zero
-    // means the key is unattended or past the sequence, and no value element
-    // is read for it.
+    // Rescale what the walk kept so far and add the chunk.  A key a row may
+    // not attend, or one past the sequence, carries a weight of zero, so its
+    // staged quad multiplies to nothing and needs no guard of its own.
     for (int i = tid; i < ROWS * d_quads; i += THREADS) {
       const int r = i / d_quads;
       const int dq = i - r * d_quads;
-      const int d0 = dq * 4;
       vec4 acc = sO[r][dq] * sW[r];
       for (int kk = 0; kk < KV; ++kk) {
-        const float p = sS[r][kk];
-        if (p != 0.0) {
-          acc += p * payload_quad(
-              kv_base + (k0 + kk) * uBlock.kv_strides.z + d0, d0, d_last);
-        }
+        acc += sS[r][kk] * sKV[kk][dq];
       }
       sO[r][dq] = acc;
     }
