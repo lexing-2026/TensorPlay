@@ -23,7 +23,7 @@ from tensorplay.compiler.backends.stax.codegen.cutedsl.kernels import (
 cuda_only = pytest.mark.skipif(not tp.cuda.is_available(), reason="needs a CUDA device")
 
 DTYPES = [tp.bfloat16, tp.float16, tp.float32]
-SHAPES = [(8, 4096), (3, 8192)]
+SHAPES = [(8, 4096), (3, 8192), (4, 32000), (5, 1000), (2, 65536)]
 
 
 def _softmax_row(x):
