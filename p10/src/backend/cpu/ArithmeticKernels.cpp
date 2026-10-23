@@ -2239,17 +2239,29 @@ Tensor add_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha) 
     Tensor result = empty_binary_result(self, other, out_shape, result_dtype);
 
     bool optimized = false;
-    // Optimization for same-shape tensors (handles contiguous and non-contiguous via temporary copies)
+    // Flat iteration needs one consistent storage order: channels-last
+    // operands are consumed in their own physical order, everything else
+    // normalizes to row-major.
+    const bool flat_cl = binary_keep_channels_last(self, other) &&
+                         result.is_contiguous(MemoryFormat::ChannelsLast);
+    // A strided pair that is unit-stride along its last dimension is left to
+    // the vector branch of the iterator path: each contiguous run gets the
+    // same wide loop, while normalizing both operands here would pay two extra
+    // full sweeps over the data before the arithmetic pass.  Runs shorter than
+    // one vector are not worth a call each, so those keep the copy.
+    const bool unit_last_dim =
+        self.dim() > 0 && other.dim() > 0 &&
+        self.size(self.dim() - 1) >= 8 &&
+        self.stride(self.dim() - 1) == 1 && other.stride(other.dim() - 1) == 1;
+    const bool defer_strided_pair =
+        unit_last_dim && !flat_cl && !(self.is_contiguous() && other.is_contiguous());
+    // Optimization for same-shape tensors already laid out in one physical order
     if (result_dtype == DType::Float32 &&
         self.dtype() == DType::Float32 &&
         other.dtype() == DType::Float32 &&
-        self.shape() == other.shape()) {
+        self.shape() == other.shape() &&
+        !defer_strided_pair) {
 
-        // Flat iteration needs one consistent storage order: channels-last
-        // operands are consumed in their own physical order, everything else
-        // normalizes to row-major.
-        const bool flat_cl = binary_keep_channels_last(self, other) &&
-                             result.is_contiguous(MemoryFormat::ChannelsLast);
         // Create contiguous accessors (might trigger copy)
         Tensor self_contig = (flat_cl || self.is_contiguous()) ? self : self.contiguous();
         Tensor other_contig = (flat_cl || other.is_contiguous()) ? other : other.contiguous();
