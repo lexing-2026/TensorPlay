@@ -56,14 +56,28 @@ __global__ void median_select_kernel(int64_t n, const T* input, T* output) {
     if (threadIdx.x == 0) output[0] = median;
 }
 
+// A NaN ranks as the largest value, and the radix sort's sign-magnitude order
+// leaves a negatively signed NaN below every number, so a NaN shows up at one
+// of the two ends of the ordered sequence.  Picking on the device keeps the
+// answer off the host and saves the comparison and selection kernels a scalar
+// read would need.
+template <typename T>
+__global__ void median_pick_sorted_kernel(int64_t n, const T* sorted,
+                                          T* output) {
+    const T last = sorted[n - 1];
+    if (median_value_is_nan(last)) {
+        output[0] = last;
+        return;
+    }
+    const T first = sorted[0];
+    output[0] = median_value_is_nan(first) ? first : sorted[(n - 1) / 2];
+}
+
 }
 
 // Cross-file entries in this backend: the values-only radix sort (the
-// permutation costs a pass of int64 traffic per digit) and the two comparison
-// ops that settle the NaN rule without bringing an element back to the host.
+// permutation costs a pass of int64 traffic per digit).
 Tensor sort_values_only_cuda(const Tensor& self, int64_t dim);
-Tensor ne_kernel_cuda(const Tensor& self, const Tensor& other);
-Tensor where_cuda(const Tensor& condition, const Tensor& self, const Tensor& other);
 std::tuple<Tensor, Tensor> sort_cuda(const Tensor& self, int64_t dim,
                                      bool descending);
 
@@ -101,22 +115,36 @@ Tensor median_kernel(const Tensor& self) {
         flat.dtype() == DType::Float16 || flat.dtype() == DType::BFloat16 ||
         flat.dtype() == DType::Float32 || flat.dtype() == DType::Float64;
     // The single-block radix selector reads the whole input once per radix
-    // digit, which caps throughput at one SM.  For large flat medians a full
+    // digit, which caps throughput at one SM.  Past a few thousand elements a
     // multi-SM radix sort is faster and the median falls straight out of the
     // sorted order.
-    constexpr int64_t kMedianSortThreshold = int64_t{1} << 20;
+    constexpr int64_t kMedianSortThreshold = int64_t{1} << 14;
     if (selection_supported && n > kMedianSortThreshold) {
         // Only ordered values are read back, so no permutation is carried.
         Tensor sorted = sort_values_only_cuda(flat, 0);
-        Tensor middle = sorted.select(0, (n - 1) / 2);
-        if (!isFloatingType(flat.dtype())) return middle;
-        // A NaN orders as the largest value, so the last element says whether
-        // the array held any.  Two ordered comparisons against a NaN are both
-        // false, so `largest != largest` is the NaN test; keeping the choice on
-        // the device avoids the host round trip that a scalar read would put in
-        // the middle of every call.
-        Tensor largest = sorted.select(0, n - 1);
-        return where_cuda(ne_kernel_cuda(largest, largest), largest, middle);
+        if (!isFloatingType(flat.dtype())) return sorted.select(0, (n - 1) / 2);
+        Tensor result = Tensor::empty({}, flat.dtype(), flat.device());
+        auto stream = getCurrentCUDAStream().stream();
+        switch (flat.dtype()) {
+#define TP_MEDIAN_PICK_CASE(ctype, name_)                                    \
+    case DType::name_:                                                       \
+        median_pick_sorted_kernel<ctype><<<1, 1, 0, stream>>>(               \
+            n, static_cast<const ctype*>(sorted.data_ptr()),                 \
+            static_cast<ctype*>(result.data_ptr()));                         \
+        break;
+            TP_MEDIAN_PICK_CASE(Half, Float16)
+            TP_MEDIAN_PICK_CASE(BFloat16, BFloat16)
+            TP_MEDIAN_PICK_CASE(float, Float32)
+            TP_MEDIAN_PICK_CASE(double, Float64)
+#undef TP_MEDIAN_PICK_CASE
+            default:
+                TP_THROW(TypeError, "median: unsupported selection dtype");
+        }
+        cudaError_t error = cudaGetLastError();
+        if (error != cudaSuccess) {
+            TP_THROW(RuntimeError, std::string("CUDA Error: ") + cudaGetErrorString(error));
+        }
+        return result;
     }
     if (selection_supported) {
         Tensor result = Tensor::empty({}, flat.dtype(), flat.device());

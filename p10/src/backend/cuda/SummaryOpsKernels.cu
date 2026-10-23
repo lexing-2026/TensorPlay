@@ -5,6 +5,10 @@
 namespace tensorplay {
 namespace cuda {
 
+// Cross-file entry in this backend: the values-only radix sort never
+// materialises the permutation, so its passes move half the bytes.
+Tensor sort_values_only_cuda(const Tensor& self, int64_t dim);
+
 namespace {
 
 
@@ -53,16 +57,36 @@ __global__ void nanmedian_select_flat_kernel(
     if (threadIdx.x == 0) result[0] = median;
 }
 
+// A NaN ranks as the largest value, and the radix sort's sign-magnitude order
+// leaves a negatively signed NaN below every number, so NaNs occupy a prefix
+// and a suffix of the ordered sequence.  Two boundary searches size the two
+// runs, which is enough to aim at the middle of the values between them; no
+// counting pass and no host round trip are needed.
 template <typename T>
-__global__ void nanmedian_count_nan_kernel(int64_t n, const T* input,
-                                           unsigned long long* out) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    unsigned long long local = 0;
-    for (; i < n; i += stride) {
-        local += reduce_value_is_nan(input[i]) ? 1 : 0;
+__global__ void nanmedian_pick_sorted_kernel(int64_t n, const T* sorted,
+                                             T* result) {
+    int64_t head = 0;
+    int64_t hi = n;
+    while (head < hi) {
+        const int64_t mid = head + (hi - head) / 2;
+        if (reduce_value_is_nan(sorted[mid])) {
+            head = mid + 1;
+        } else {
+            hi = mid;
+        }
     }
-    if (local != 0) atomicAdd(out, local);
+    int64_t tail = head;
+    hi = n;
+    while (tail < hi) {
+        const int64_t mid = tail + (hi - tail) / 2;
+        if (reduce_value_is_nan(sorted[mid])) {
+            hi = mid;
+        } else {
+            tail = mid + 1;
+        }
+    }
+    const int64_t valid = tail - head;
+    result[0] = sorted[valid > 0 ? head + (valid - 1) / 2 : 0];
 }
 
 
@@ -404,43 +428,31 @@ Tensor nanmedian_cuda(const Tensor& self) {
     Tensor input = self.to(work_dt).contiguous().reshape({self.numel()});
     // The flat selection kernel is single-block; a full radix sort spreads
     // across the whole GPU and directly yields the median for large inputs.
-    constexpr int64_t kNanMedianSortThreshold = int64_t{1} << 20;
+    constexpr int64_t kNanMedianSortThreshold = int64_t{1} << 14;
     if (input.numel() > kNanMedianSortThreshold) {
-        auto sorted_pair = sort_cuda(input, 0, false);
-        Tensor sorted = std::get<0>(sorted_pair);
-        if (isFloatingType(work_dt)) {
-            Tensor nan_count_t =
-                Tensor::zeros({}, DType::UInt64, input.device());
-            const int blocks = static_cast<int>(
-                (input.numel() + kThreads - 1) / kThreads);
-            const auto stream = getCurrentCUDAStream().stream();
-#define TP_NANMEDIAN_COUNT_CASE(ctype, name_)                          \
-    case DType::name_:                                                 \
-        nanmedian_count_nan_kernel<ctype><<<blocks, kThreads, 0, stream>>>( \
-            input.numel(), input.data_ptr<ctype>(),                    \
-            nan_count_t.data_ptr<unsigned long long>());                \
-        break;
-            switch (work_dt) {
-                TP_NANMEDIAN_COUNT_CASE(float, Float32)
-                TP_NANMEDIAN_COUNT_CASE(double, Float64)
-                TP_NANMEDIAN_COUNT_CASE(Half, Float16)
-                TP_NANMEDIAN_COUNT_CASE(BFloat16, BFloat16)
-                default: break;
-            }
-#undef TP_NANMEDIAN_COUNT_CASE
-            CUDA_CHECK(cudaGetLastError());
-            const int64_t nan_count =
-                static_cast<int64_t>(nan_count_t.item().toDouble());
-            const int64_t valid = input.numel() - nan_count;
-            if (valid == 0) {
-                Tensor nan_result = Tensor::full(
-                    {}, Scalar(std::numeric_limits<double>::quiet_NaN()),
-                    work_dt, input.device());
-                return work_dt == out_dt ? nan_result : nan_result.to(out_dt);
-            }
-            return sorted.select(0, (valid - 1) / 2);
+        // Only ordered values are read back, so no permutation is carried.
+        Tensor sorted = sort_values_only_cuda(input, 0);
+        if (!isFloatingType(work_dt)) {
+            return sorted.select(0, (input.numel() - 1) / 2);
         }
-        return sorted.select(0, (input.numel() - 1) / 2);
+        Tensor result = Tensor::empty({}, work_dt, input.device());
+        const auto stream = getCurrentCUDAStream().stream();
+#define TP_NANMEDIAN_PICK_CASE(ctype, name_)                             \
+    case DType::name_:                                                   \
+        nanmedian_pick_sorted_kernel<ctype><<<1, 1, 0, stream>>>(        \
+            input.numel(), static_cast<const ctype*>(sorted.data_ptr()), \
+            static_cast<ctype*>(result.data_ptr()));                     \
+        break;
+        switch (work_dt) {
+            TP_NANMEDIAN_PICK_CASE(float, Float32)
+            TP_NANMEDIAN_PICK_CASE(double, Float64)
+            TP_NANMEDIAN_PICK_CASE(Half, Float16)
+            TP_NANMEDIAN_PICK_CASE(BFloat16, BFloat16)
+            default: break;
+        }
+#undef TP_NANMEDIAN_PICK_CASE
+        CUDA_CHECK(cudaGetLastError());
+        return work_dt == out_dt ? result : result.to(out_dt);
     }
     Tensor result = Tensor::empty({}, work_dt, self.device());
     auto stream = getCurrentCUDAStream().stream();
