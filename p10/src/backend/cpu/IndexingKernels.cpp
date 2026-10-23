@@ -1594,6 +1594,27 @@ struct SortSlotLess {
     }
 };
 
+// One float plus its position, folded into a single integer that orders the
+// way the slice should.  Sign-magnitude bits become an offset binary key:
+// positive values keep their bits above the halfway mark, negative values are
+// complemented below it.  All NaN patterns collapse onto the one key just
+// above +infinity, and -0.0 takes the +0.0 key, so values the comparator calls
+// equal share a key and the position in the low half decides, in ascending
+// order in either direction.
+inline uint64_t sort_f32_key(float value, uint32_t position, bool descending) {
+    uint32_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    // The high bit moves every positive value above every negative one, and a
+    // negative value also gets its remaining bits complemented, which is what
+    // turns the sign-magnitude ordering into an unsigned ordering.
+    const uint32_t sign = bits >> 31;
+    uint32_t key = bits ^ (0x80000000u | (0u - sign));
+    if ((bits & 0x7FFFFFFFu) > 0x7F800000u) key = 0xFF800001u;
+    if (bits == 0x80000000u) key = 0x80000000u;
+    if (descending) key = ~key;
+    return (static_cast<uint64_t>(key) << 32) | static_cast<uint64_t>(position);
+}
+
 template <typename ctype, typename index_t>
 void sort_dim_slices(const ctype* self, ctype* values, int64_t* indices,
                      int64_t outer, int64_t d_size, int64_t inner,
@@ -1603,6 +1624,37 @@ void sort_dim_slices(const ctype* self, ctype* values, int64_t* indices,
     const int64_t slice_grain = std::max<int64_t>(1, GRAIN_SIZE / std::max<int64_t>(d_size, 1));
     parallel_for(0, outer * inner, slice_grain, [&](int64_t b, int64_t e) {
         constexpr int64_t kMaxCachedElems = 1 << 12;
+        // A contiguous run of single-precision values is the case where the
+        // ordering can be settled by one integer compare per pair, so the
+        // slice is built as packed keys instead of slots.
+        if constexpr (std::is_same_v<ctype, float> && std::is_same_v<index_t, int32_t>) {
+            if (inner == 1) {
+                static thread_local std::vector<uint64_t> cached_keys;
+                std::vector<uint64_t> transient_keys;
+                uint64_t* kb = nullptr;
+                if (d_size <= kMaxCachedElems) {
+                    if (static_cast<int64_t>(cached_keys.size()) < d_size) cached_keys.resize(static_cast<size_t>(d_size));
+                    kb = cached_keys.data();
+                } else {
+                    transient_keys.resize(static_cast<size_t>(d_size));
+                    kb = transient_keys.data();
+                }
+                for (int64_t si = b; si < e; ++si) {
+                    const float* base = self + si * d_size;
+                    for (int64_t j = 0; j < d_size; ++j)
+                        kb[j] = sort_f32_key(base[j], static_cast<uint32_t>(j), descending);
+                    std::sort(kb, kb + d_size);
+                    float* vbase = values + si * d_size;
+                    int64_t* ibase = indices + si * d_size;
+                    for (int64_t j = 0; j < d_size; ++j) {
+                        const uint32_t pick = static_cast<uint32_t>(kb[j]);
+                        vbase[j] = base[pick];
+                        ibase[j] = pick;
+                    }
+                }
+                return;
+            }
+        }
         static thread_local std::vector<slot_t> cached_buf;
         std::vector<slot_t> transient_buf;
         slot_t* buf = nullptr;
