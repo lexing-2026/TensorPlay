@@ -655,6 +655,74 @@ __attribute__((target("avx2,fma"), always_inline))
 inline __m256 v_erfc_f32_fast(__m256 x) {
     return v_erfc_f32_impl<true>(x);
 }
+
+// asin and acos on float lanes.  One polynomial serves both the direct and
+// the half-angle branch: with y = x^2 for |x| <= 0.5 and y = (1-|x|)/2
+// beyond, asin(|x|) is either x + x*y*P(y) or pi/2 - 2*sqrt(y)*(1 + y*P(y)).
+// The square root's NaN on a negative argument is also what reports the
+// domain error for |x| > 1, so no separate range check is needed.
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256 v_asin_f32(__m256 x) {
+    const __m256 sign_bit = _mm256_set1_ps(-0.0f);
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 ax = _mm256_andnot_ps(sign_bit, x);
+    const __m256 small = _mm256_cmp_ps(ax, _mm256_set1_ps(0.5f), _CMP_LE_OQ);
+    const __m256 y = _mm256_blendv_ps(
+        _mm256_mul_ps(_mm256_sub_ps(one, ax), _mm256_set1_ps(0.5f)),
+        _mm256_mul_ps(ax, ax), small);
+    __m256 p = _mm256_set1_ps(3.4078566240e-2f);
+    p = _mm256_fmadd_ps(p, y, _mm256_set1_ps(7.0976971196e-4f));
+    p = _mm256_fmadd_ps(p, y, _mm256_set1_ps(2.1211881877e-2f));
+    p = _mm256_fmadd_ps(p, y, _mm256_set1_ps(2.1733134550e-2f));
+    p = _mm256_fmadd_ps(p, y, _mm256_set1_ps(3.0443983482e-2f));
+    p = _mm256_fmadd_ps(p, y, _mm256_set1_ps(4.4639437168e-2f));
+    p = _mm256_fmadd_ps(p, y, _mm256_set1_ps(7.5000096023e-2f));
+    p = _mm256_fmadd_ps(p, y, _mm256_set1_ps(1.6666666565e-1f));
+    const __m256 direct = _mm256_fmadd_ps(_mm256_mul_ps(ax, y), p, ax);
+    const __m256 t = _mm256_sqrt_ps(y);
+    const __m256 wide = _mm256_fnmadd_ps(
+        _mm256_add_ps(t, t),
+        _mm256_fmadd_ps(y, p, one),
+        _mm256_set1_ps(1.57079632679489661923f));
+    return _mm256_or_ps(_mm256_and_ps(sign_bit, x),
+                        _mm256_blendv_ps(wide, direct, small));
+}
+
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256 v_acos_f32(__m256 x) {
+    const __m256 sign_bit = _mm256_set1_ps(-0.0f);
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 half = _mm256_set1_ps(0.5f);
+    const __m256 ax = _mm256_andnot_ps(sign_bit, x);
+    // Inside |x| <= 0.5 the answer is the complement of the direct branch;
+    // outside it is 2*asin(sqrt((1-|x|)/2)), reflected for negative inputs.
+    const __m256 mid = _mm256_cmp_ps(ax, half, _CMP_LE_OQ);
+    const __m256 y = _mm256_blendv_ps(
+        _mm256_mul_ps(_mm256_sub_ps(one, ax), half),
+        _mm256_mul_ps(ax, ax), mid);
+    __m256 p = _mm256_set1_ps(3.4078566240e-2f);
+    p = _mm256_fmadd_ps(p, y, _mm256_set1_ps(7.0976971196e-4f));
+    p = _mm256_fmadd_ps(p, y, _mm256_set1_ps(2.1211881877e-2f));
+    p = _mm256_fmadd_ps(p, y, _mm256_set1_ps(2.1733134550e-2f));
+    p = _mm256_fmadd_ps(p, y, _mm256_set1_ps(3.0443983482e-2f));
+    p = _mm256_fmadd_ps(p, y, _mm256_set1_ps(4.4639437168e-2f));
+    p = _mm256_fmadd_ps(p, y, _mm256_set1_ps(7.5000096023e-2f));
+    p = _mm256_fmadd_ps(p, y, _mm256_set1_ps(1.6666666565e-1f));
+    const __m256 direct = _mm256_fmadd_ps(_mm256_mul_ps(ax, y), p, ax);
+    const __m256 t = _mm256_sqrt_ps(y);
+    const __m256 tail =
+        _mm256_mul_ps(_mm256_add_ps(t, t), _mm256_fmadd_ps(y, p, one));
+    // The polynomial was evaluated on |x|, so the complement branch needs the
+    // sign put back before it can be subtracted from pi/2.
+    const __m256 signed_direct =
+        _mm256_or_ps(_mm256_and_ps(sign_bit, x), direct);
+    __m256 r = _mm256_sub_ps(_mm256_set1_ps(1.57079632679489661923f), signed_direct);
+    r = _mm256_blendv_ps(r, tail, _mm256_cmp_ps(x, half, _CMP_GT_OQ));
+    r = _mm256_blendv_ps(
+        r, _mm256_sub_ps(_mm256_set1_ps(3.14159265358979323846f), tail),
+        _mm256_cmp_ps(x, _mm256_set1_ps(-0.5f), _CMP_LT_OQ));
+    return r;
+}
 // elu takes its three coefficients as arguments instead of reading prm itself.
 // The chunk loops below broadcast the parameters once per chunk; deriving them
 // inside the vector loop means a double load, a narrowing convert and a
@@ -768,8 +836,8 @@ inline __m256 apply_f32(VOp op, VParams prm, __m256 x) {
         case VOp::Sin: return tensorplay::tpsleef::sin(x);
         case VOp::Cos: return tensorplay::tpsleef::cos(x);
         case VOp::Tan: return tensorplay::tpsleef::tan(x);
-        case VOp::Asin: return tensorplay::tpsleef::asin(x);
-        case VOp::Acos: return tensorplay::tpsleef::acos(x);
+        case VOp::Asin: return v_asin_f32(x);
+        case VOp::Acos: return v_acos_f32(x);
         case VOp::Atan: return tensorplay::tpsleef::atan(x);
         case VOp::Sinh: return tensorplay::tpsleef::sinh(x);
         case VOp::Cosh: return tensorplay::tpsleef::cosh(x);
@@ -1124,10 +1192,10 @@ static void f32_chunk_avx2(VOp op, VParams prm, const float* src, float* dst, in
             TP_F32_SIMPLE_LOOP_8(tensorplay::tpsleef::tan(x));
             break;
         case VOp::Asin:
-            TP_F32_SIMPLE_LOOP_8(tensorplay::tpsleef::asin(x));
+            TP_F32_SIMPLE_LOOP_8(v_asin_f32(x));
             break;
         case VOp::Acos:
-            TP_F32_SIMPLE_LOOP_8(tensorplay::tpsleef::acos(x));
+            TP_F32_SIMPLE_LOOP_8(v_acos_f32(x));
             break;
         case VOp::Atan:
             TP_F32_SIMPLE_LOOP_8(tensorplay::tpsleef::atan(x));
