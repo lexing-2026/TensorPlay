@@ -8959,6 +8959,131 @@ class TestVulkanBatchSummedProduct(unittest.TestCase):
                                   self._device(lhs), self._device(rhs))
 
 
+class TestVulkanTrace(unittest.TestCase):
+    """The diagonal of a matrix folded into one lane: the width a count totals
+    into, the wider fold a narrow measured lane is read through before it is
+    rounded back, and the gradient that lands on the diagonal and nowhere
+    else."""
+
+    SHAPES = ((3, 3), (5, 7), (8, 5), (1, 6), (6, 1), (12, 12), (0, 4), (7, 0))
+
+    @staticmethod
+    def _device(values):
+        return tensorplay.from_numpy(np.asarray(values)).to("vulkan")
+
+    @staticmethod
+    def _host(values):
+        return tensorplay.from_numpy(np.asarray(values))
+
+    @staticmethod
+    def _matrix(shape, seed, dtype):
+        rng = np.random.default_rng(seed)
+        if np.issubdtype(dtype, np.integer):
+            return rng.integers(-30, 31, size=shape).astype(dtype)
+        return (rng.standard_normal(shape) * 12.0).astype(dtype)
+
+    @staticmethod
+    def _truth(values):
+        return values.diagonal().astype(np.float64).sum()
+
+    def test_the_diagonal_folds_into_one_lane(self):
+        for index, shape in enumerate(self.SHAPES):
+            for dtype in (np.float32, np.float16):
+                values = self._matrix(shape, 200 + index, dtype)
+                payload = self._device(values)
+                answer = tensorplay.trace(payload)
+                with self.subTest(dtype=np.dtype(dtype).name, shape=shape):
+                    self.assertEqual(tuple(answer.shape), ())
+                    self.assertEqual(answer.dtype, payload.dtype)
+                    got = float(answer.cpu().numpy())
+                    if dtype is np.float32:
+                        self.assertAlmostEqual(
+                            got, float(self._truth(values)), delta=1e-3)
+                    else:
+                        # The total is held in a width that can carry the whole
+                        # diagonal, so one rounding covers the entire walk.
+                        self.assertEqual(
+                            got, float(np.float16(self._truth(values))))
+                    # The host walk folds the same lanes in its own order, so
+                    # the two agree up to the last place the width can name.
+                    np.testing.assert_allclose(
+                        got, float(self._host(values).trace().cpu().numpy()),
+                        rtol=2e-3 if dtype is np.float16 else 1e-5,
+                        atol=2e-3 if dtype is np.float16 else 1e-4,
+                        err_msg="the host folded another way")
+
+    def test_a_count_totals_into_the_width_its_answer_names(self):
+        for dtype in (np.int32, np.int64):
+            for index, shape in enumerate(((4, 4), (6, 2), (3, 9), (0, 5))):
+                values = self._matrix(shape, 40 + index, dtype)
+                answer = tensorplay.trace(self._device(values))
+                with self.subTest(dtype=np.dtype(dtype).name, shape=shape):
+                    self.assertEqual(answer.dtype, tensorplay.int64)
+                    self.assertEqual(
+                        int(answer.cpu().numpy()),
+                        int(values.diagonal().astype(np.int64).sum()))
+
+    def test_a_walk_that_is_not_a_matrix_or_a_measured_width_refuses(self):
+        for shape in ((6,), (2, 3, 4), (2, 3, 4, 5)):
+            with self.subTest(kind=f"rank {len(shape)}"):
+                with self.assertRaisesRegex(
+                        RuntimeError, "expects a matrix"):
+                    tensorplay.trace(self._device(
+                        np.zeros(shape, np.float32)))
+        with self.subTest(kind="a payload that counts yes/no"):
+            with self.assertRaisesRegex(RuntimeError, "Float32, Float16"):
+                tensorplay.trace(self._device(
+                    np.eye(4, dtype=bool)))
+
+    def test_the_gradient_lands_on_the_diagonal_alone(self):
+        for shape in ((4, 4), (3, 6), (6, 3)):
+            for dtype in (np.float32, np.float16):
+                values = self._matrix(shape, 11, dtype)
+                payload = self._device(values).requires_grad_(True)
+                weight = np.asarray(3.5, dtype)
+                tensorplay.trace(payload).backward(self._device(weight))
+                want = np.eye(shape[0], shape[1], dtype=dtype) * weight
+                with self.subTest(shape=shape, dtype=np.dtype(dtype).name):
+                    np.testing.assert_allclose(
+                        payload.grad.cpu().numpy(), want, rtol=0, atol=0,
+                        err_msg="the gradient missed the diagonal")
+
+    def test_a_matrix_read_through_a_view_folds_its_own_diagonal(self):
+        base = (np.random.default_rng(9).standard_normal((6, 5)) * 12.0).astype(
+            np.float32)
+        payload = self._device(base)
+        for label, matrix in (
+                ("a transpose", payload.transpose(0, 1)),
+                ("a strided column", payload[:, 1:4]),
+                ("a narrow row", payload.narrow(0, 1, 4))):
+            answer = tensorplay.trace(matrix)
+            want = matrix.cpu().numpy().astype(np.float64)
+            with self.subTest(kind=label):
+                self.assertAlmostEqual(
+                    float(answer.cpu().numpy()),
+                    float(want.diagonal().sum()), delta=1e-4)
+
+    def test_the_device_answers_what_the_host_answers_over_every_width(self):
+        bounds = {
+            np.float32: (1e-5, 1e-4),
+            np.float16: (2e-3, 2e-3),
+            np.int32: (0.0, 0.0),
+            np.int64: (0.0, 0.0),
+        }
+        for index, shape in enumerate(self.SHAPES[:6]):
+            for dtype in (np.float32, np.float16, np.int32, np.int64):
+                values = self._matrix(shape, 700 + index, dtype)
+                rtol, atol = bounds[dtype]
+                with self.subTest(dtype=np.dtype(dtype).name, shape=shape):
+                    np.testing.assert_allclose(
+                        tensorplay.trace(self._device(values)).cpu().numpy(
+                        ).astype(np.float64),
+                        tensorplay.trace(self._host(values)).cpu().numpy(
+                        ).astype(np.float64),
+                        rtol=rtol, atol=atol,
+                        err_msg=f"{np.dtype(dtype).name} matrix {shape}")
+
+
 class TestVulkanRepeatExpansion(unittest.TestCase):
     """Repeating an axis in place: the count the key-value heads reach the
     query head count by, and the half-width rotary table doubles."""
