@@ -723,6 +723,99 @@ inline __m256 v_acos_f32(__m256 x) {
         _mm256_cmp_ps(x, _mm256_set1_ps(-0.5f), _CMP_LT_OQ));
     return r;
 }
+
+// atan on float lanes.  Two range steps put the argument inside
+// [-tan(pi/8), tan(pi/8)]: the reciprocal for |x| > 1, then the addition
+// formula (u - t8)/(1 + u*t8).  The two offsets are folded back in at the
+// end, and every corner falls out of the arithmetic: a NaN propagates
+// through both blends and a discarded infinity never reaches the result.
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256 v_atan_f32(__m256 x) {
+    const __m256 sign_bit = _mm256_set1_ps(-0.0f);
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 t8 = _mm256_set1_ps(0.41421356237309504880f);
+    const __m256 ax = _mm256_andnot_ps(sign_bit, x);
+    const __m256 big = _mm256_cmp_ps(ax, one, _CMP_GT_OQ);
+    // True divides here rather than reciprocals with Newton steps: the
+    // refinement multiplies its seed by (2 - d*seed), which turns an infinite
+    // input into 0 * inf and would report NaN for atan(+-inf).
+    const __m256 u = _mm256_blendv_ps(ax, _mm256_div_ps(one, ax), big);
+    const __m256 over = _mm256_cmp_ps(u, t8, _CMP_GT_OQ);
+    const __m256 v = _mm256_div_ps(_mm256_sub_ps(u, t8),
+                                   _mm256_fmadd_ps(u, t8, one));
+    const __m256 w = _mm256_blendv_ps(u, v, over);
+    const __m256 y = _mm256_mul_ps(w, w);
+    __m256 p = _mm256_set1_ps(-2.5157289730e-2f);
+    p = _mm256_fmadd_ps(p, y, _mm256_set1_ps(5.0106401570e-2f));
+    p = _mm256_fmadd_ps(p, y, _mm256_set1_ps(-6.5007834513e-2f));
+    p = _mm256_fmadd_ps(p, y, _mm256_set1_ps(7.6725048792e-2f));
+    p = _mm256_fmadd_ps(p, y, _mm256_set1_ps(-9.0894109278e-2f));
+    p = _mm256_fmadd_ps(p, y, _mm256_set1_ps(1.1111040776e-1f));
+    p = _mm256_fmadd_ps(p, y, _mm256_set1_ps(-1.4285712355e-1f));
+    p = _mm256_fmadd_ps(p, y, _mm256_set1_ps(1.9999999973e-1f));
+    p = _mm256_fmadd_ps(p, y, _mm256_set1_ps(-3.3333333333e-1f));
+    const __m256 a = _mm256_fmadd_ps(_mm256_mul_ps(w, y), p, w);
+    const __m256 lifted =
+        _mm256_blendv_ps(a, _mm256_add_ps(a, _mm256_set1_ps(0.39269908169872415481f)), over);
+    const __m256 r = _mm256_blendv_ps(
+        lifted, _mm256_sub_ps(_mm256_set1_ps(1.57079632679489661923f), lifted), big);
+    return _mm256_or_ps(_mm256_and_ps(sign_bit, x), r);
+}
+
+// Tangent's polynomial on an argument already reduced into [-pi/4, pi/4].
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256 v_tan_poly_f32(__m256 r) {
+    const __m256 y = _mm256_mul_ps(r, r);
+    __m256 p = _mm256_set1_ps(2.1161404219e-4f);
+    p = _mm256_fmadd_ps(p, y, _mm256_set1_ps(-2.7136352998e-4f));
+    p = _mm256_fmadd_ps(p, y, _mm256_set1_ps(6.3633578712e-4f));
+    p = _mm256_fmadd_ps(p, y, _mm256_set1_ps(3.3067524298e-4f));
+    p = _mm256_fmadd_ps(p, y, _mm256_set1_ps(1.5654777697e-3f));
+    p = _mm256_fmadd_ps(p, y, _mm256_set1_ps(3.5614434028e-3f));
+    p = _mm256_fmadd_ps(p, y, _mm256_set1_ps(8.8688866982e-3f));
+    p = _mm256_fmadd_ps(p, y, _mm256_set1_ps(2.1868825315e-2f));
+    p = _mm256_fmadd_ps(p, y, _mm256_set1_ps(5.3968300325e-2f));
+    p = _mm256_fmadd_ps(p, y, _mm256_set1_ps(1.3333333165e-1f));
+    p = _mm256_fmadd_ps(p, y, _mm256_set1_ps(3.3333333336e-1f));
+    return _mm256_fmadd_ps(_mm256_mul_ps(r, y), p, r);
+}
+
+// tan on float lanes.  The reduction runs in double, the polynomial in
+// float.
+//
+// A float reduction cannot hold this: x * 2/pi rounds to 24 bits, which at
+// |x| = 1e6 is already 0.03 -- enough to round to the wrong multiple of pi/2
+// for about one lane in thirty -- and even with that repaired, the reduced
+// argument carries an absolute error of k * (pi/2 - pio2_hi) * 2^-24, which
+// the tangent's derivative turns into a relative error near a pole that is
+// far above what the function should return.  Eight lanes become two double
+// vectors, the reduction lands exact to well under a float ulp, and the
+// result converts back before the polynomial.
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256 v_tan_f32(__m256 x) {
+    const __m256 sign_bit = _mm256_set1_ps(-0.0f);
+    const __m256d two_over_pi = _mm256_set1_pd(0.63661977236758134308);
+    const __m256d pio2_hi = _mm256_set1_pd(1.5707963267948966);
+    const __m256d pio2_lo = _mm256_set1_pd(6.123233995736766e-17);
+    const __m256d x0 = _mm256_cvtps_pd(_mm256_castps256_ps128(x));
+    const __m256d x1 = _mm256_cvtps_pd(_mm256_extractf128_ps(x, 1));
+    const __m256d k0 = _mm256_round_pd(
+        _mm256_mul_pd(x0, two_over_pi), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    const __m256d k1 = _mm256_round_pd(
+        _mm256_mul_pd(x1, two_over_pi), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    __m256d d0 = _mm256_fnmadd_pd(k0, pio2_hi, x0);
+    __m256d d1 = _mm256_fnmadd_pd(k1, pio2_hi, x1);
+    d0 = _mm256_fnmadd_pd(k0, pio2_lo, d0);
+    d1 = _mm256_fnmadd_pd(k1, pio2_lo, d1);
+    const __m256 r = _mm256_set_m128(_mm256_cvtpd_ps(d1), _mm256_cvtpd_ps(d0));
+    const __m256i ki = _mm256_set_m128i(_mm256_cvtpd_epi32(k1), _mm256_cvtpd_epi32(k0));
+    const __m256 t = v_tan_poly_f32(r);
+    // An odd multiple of pi/2 in the reduction means the answer is -1/t.
+    const __m256i odd = _mm256_cmpeq_epi32(
+        _mm256_and_si256(ki, _mm256_set1_epi32(1)), _mm256_set1_epi32(1));
+    return _mm256_blendv_ps(
+        t, _mm256_xor_ps(v_rcp_nr_ps(t), sign_bit), _mm256_castsi256_ps(odd));
+}
 // elu takes its three coefficients as arguments instead of reading prm itself.
 // The chunk loops below broadcast the parameters once per chunk; deriving them
 // inside the vector loop means a double load, a narrowing convert and a
@@ -838,7 +931,7 @@ inline __m256 apply_f32(VOp op, VParams prm, __m256 x) {
         case VOp::Tan: return tensorplay::tpsleef::tan(x);
         case VOp::Asin: return v_asin_f32(x);
         case VOp::Acos: return v_acos_f32(x);
-        case VOp::Atan: return tensorplay::tpsleef::atan(x);
+        case VOp::Atan: return v_atan_f32(x);
         case VOp::Sinh: return tensorplay::tpsleef::sinh(x);
         case VOp::Cosh: return tensorplay::tpsleef::cosh(x);
         case VOp::Tanh: return tensorplay::tpsleef::tanh(x);
@@ -1188,9 +1281,52 @@ static void f32_chunk_avx2(VOp op, VParams prm, const float* src, float* dst, in
         case VOp::Cos:
             TP_F32_SIMPLE_LOOP_8(tensorplay::tpsleef::cos(x));
             break;
-        case VOp::Tan:
-            TP_F32_SIMPLE_LOOP_8(tensorplay::tpsleef::tan(x));
+        case VOp::Tan: {
+            // The two-term pi/2 reduction holds while |x| * 2/pi still has
+            // enough low bits to round the multiple of pi/2 correctly; past
+            // 1e6 the library's multi-precision reduction takes the block.
+            const __m256 limit = _mm256_set1_ps(1.0e6f);
+            // Inside [-pi/4, pi/4] the reduction is the identity, so the
+            // polynomial alone answers the block and the double round trip
+            // disappears.
+            const __m256 quarter_pi = _mm256_set1_ps(0.78539816339744830962f);
+            for (; i + 32 <= n; i += 32) {
+                __m256 x0 = _mm256_loadu_ps(s + i);
+                __m256 x1 = _mm256_loadu_ps(s + i + 8);
+                __m256 x2 = _mm256_loadu_ps(s + i + 16);
+                __m256 x3 = _mm256_loadu_ps(s + i + 24);
+                // One magnitude for the whole block drives both range tests.
+                // max drops a NaN operand, which only ever routes a NaN lane
+                // to a path that returns NaN anyway.
+                const __m256 m = _mm256_max_ps(
+                    _mm256_max_ps(_mm256_andnot_ps(signbit, x0),
+                                  _mm256_andnot_ps(signbit, x1)),
+                    _mm256_max_ps(_mm256_andnot_ps(signbit, x2),
+                                  _mm256_andnot_ps(signbit, x3)));
+                if (_mm256_movemask_ps(_mm256_cmp_ps(m, quarter_pi, _CMP_LE_OQ)) == 0xff) {
+                    _mm256_storeu_ps(d + i, v_tan_poly_f32(x0));
+                    _mm256_storeu_ps(d + i + 8, v_tan_poly_f32(x1));
+                    _mm256_storeu_ps(d + i + 16, v_tan_poly_f32(x2));
+                    _mm256_storeu_ps(d + i + 24, v_tan_poly_f32(x3));
+                    continue;
+                }
+                if (_mm256_movemask_ps(_mm256_cmp_ps(m, limit, _CMP_NLE_UQ)) == 0) {
+                    _mm256_storeu_ps(d + i, v_tan_f32(x0));
+                    _mm256_storeu_ps(d + i + 8, v_tan_f32(x1));
+                    _mm256_storeu_ps(d + i + 16, v_tan_f32(x2));
+                    _mm256_storeu_ps(d + i + 24, v_tan_f32(x3));
+                } else {
+                    _mm256_storeu_ps(d + i, tensorplay::tpsleef::tan(x0));
+                    _mm256_storeu_ps(d + i + 8, tensorplay::tpsleef::tan(x1));
+                    _mm256_storeu_ps(d + i + 16, tensorplay::tpsleef::tan(x2));
+                    _mm256_storeu_ps(d + i + 24, tensorplay::tpsleef::tan(x3));
+                }
+            }
+            for (; i + 8 <= n; i += 8) {
+                _mm256_storeu_ps(d + i, tensorplay::tpsleef::tan(_mm256_loadu_ps(s + i)));
+            }
             break;
+        }
         case VOp::Asin:
             TP_F32_SIMPLE_LOOP_8(v_asin_f32(x));
             break;
@@ -1198,7 +1334,7 @@ static void f32_chunk_avx2(VOp op, VParams prm, const float* src, float* dst, in
             TP_F32_SIMPLE_LOOP_8(v_acos_f32(x));
             break;
         case VOp::Atan:
-            TP_F32_SIMPLE_LOOP_8(tensorplay::tpsleef::atan(x));
+            TP_F32_SIMPLE_LOOP_8(v_atan_f32(x));
             break;
         case VOp::Erf: {
             // |x| <= 9 keeps -x*x inside the range where the short exp chain
