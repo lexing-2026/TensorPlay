@@ -760,9 +760,10 @@ inline ReduceConfig make_reduce_config(const TensorIterator& iter) {
             const int blocks_per_sm = std::max(1, properties.max_threads_per_sm /
                                                     config.num_threads);
             const int target_grid = std::max(1, properties.multi_processor_count * blocks_per_sm);
-            // scheduled output block), ctas2/ctas3 bound the split so each
-            // thread keeps >= min_values_per_thread(16) elements but no more
-            // than max_values_per_thread(256).
+            // grid_x is the number of output blocks, so ctas_per_output1 fills
+            // the machine with blocks.  ctas_per_output2/ctas_per_output3 bound
+            // the split so each thread keeps at least 16 and at most 256
+            // elements.
             const int64_t output_step = config.step_output * config.output_vec_size;
             const int64_t grid_x = (config.num_outputs + output_step - 1) / output_step;
             const int64_t ctas_per_output1 = (target_grid + grid_x - 1) / grid_x;
@@ -771,6 +772,21 @@ inline ReduceConfig make_reduce_config(const TensorIterator& iter) {
             int64_t ctas = ctas_per_output1;
             if (ctas < ctas_per_output3) ctas = ctas_per_output3;
             if (ctas > ctas_per_output2) ctas = ctas_per_output2;
+            // A column walk already reads at the bus ceiling with three blocks
+            // per SM, but the partials it stages grow with the split: on
+            // 4096x4096 reduces over the slow dimension, a split of 8 measured
+            // 3-4.5us faster than the device-filling split of 31 for both 4 and
+            // 8 byte accumulators over rows 1024..16384, and a wider split only
+            // adds staging traffic.  Cap the block count there, keeping the
+            // per-thread floor that a genuinely long column needs.
+            if (!reduction_on_fastest_dimension) {
+                const int64_t resident = static_cast<int64_t>(
+                    properties.multi_processor_count) * std::min(blocks_per_sm, 3);
+                const int64_t column_cap =
+                    std::max<int64_t>(ctas_per_output3,
+                                      (resident + grid_x - 1) / grid_x);
+                if (ctas > column_cap) ctas = column_cap;
+            }
             ctas = std::min<int64_t>(ctas, 65535);  // gridDim.y hardware limit
             if (ctas > 1) {
                 config.ctas_per_output = static_cast<int>(ctas);
