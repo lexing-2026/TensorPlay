@@ -16,6 +16,12 @@ Both libraries keep their compiled objects on disk, so a repeat run times the
 loader in the first-call column.  To time the compiler instead, give each
 library a fresh object directory (``QUACK_CACHE_DIR`` and ``TP_STAX_CACHE_DIR``)
 or turn the stax one off with ``TP_STAX_CACHE=0``.
+
+The cases run one after another in a single process, and the memory each one
+frees is returned to the driver before the next one starts.  Without that, the
+last cases run against a pool holding every earlier case's cached blocks, and
+their first calls spend tens of milliseconds reclaiming memory rather than
+loading a kernel.
 """
 
 from __future__ import annotations
@@ -520,6 +526,8 @@ def main(argv: list[str]) -> int:
             case_id = run(case, records, args)
             print(f"{name:15s} {case_id['rows']}x{case_id['cols']} "
                   f"{case_id['dtype']:>9s} done", flush=True)
+            tp.cuda.empty_cache()
+            torch.cuda.empty_cache()
 
     print()
     print_table(records)
