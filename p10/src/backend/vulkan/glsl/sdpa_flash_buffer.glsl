@@ -5,9 +5,9 @@
 
 // A named constant (instead of a literal) lets the SPIR-V compiler fully
 // unroll every loop below.
-#define ROWS 8
+#define ROWS ${ROW_TILE}
 #define KV 16
-#define THREADS 128
+#define THREADS ${THREAD_COUNT}
 #define DMAX 128
 #define DQMAX (DMAX / 4)
 #define DQPAD (DQMAX + 1)
@@ -19,8 +19,8 @@ layout(std430) buffer;
 /*
  * Attention over linear storage, without a score matrix.
  *
- * A workgroup of four warps owns ROWS query rows of one (batch, head) pair and
- * walks the key sequence in chunks of KV.  Each chunk stages its key block
+ * A workgroup of THREADS lanes owns ROWS query rows of one (batch, head) pair
+ * and walks the key sequence in chunks of KV.  Each chunk stages its key block
  * into shared memory, forms the ROWS x KV scores out of shared memory alone,
  * and folds them into the row's running maximum, exponential sum and weighted
  * value accumulator:
@@ -60,8 +60,11 @@ layout(std430) buffer;
  * the mask rides the same rule with zero strides on the axes it broadcasts
  * over, and an absent mask leaves its binding unused.  Grouped query heads map
  * a query head onto key/value head h / group directly.  The shared footprint
- * is (2 * ROWS + KV) * DQPAD quads plus ROWS * KVPAD + 4 * ROWS floats, under
- * 18 KB, and the kernel needs no subgroup operation, no image operand and no
+ * is (2 * ROWS + KV) * DQPAD quads plus ROWS * KVPAD + 4 * ROWS floats: a
+ * wider row tile costs shared memory and saves operand traffic, because one
+ * staged key and value window then serves twice the query rows.  The lane
+ * count travels with the row count, so a lane owns one (row, key) score per
+ * chunk.  The kernel needs no subgroup operation, no image operand and no
  * 16-bit storage.
  */
 layout(set = 0, binding = 0) buffer PRECISION restrict writeonly OutBuffer {

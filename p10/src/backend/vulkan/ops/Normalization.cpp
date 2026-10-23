@@ -2013,24 +2013,24 @@ Tensor sdpa_composed(
 }
 
 //
-// Row tile, key chunk and widest head dimension of the single-walk attention
-// kernel; they have to match the constants of its shader.
+// Key chunk, widest head dimension and shared footprint of the single-walk
+// attention kernel; they have to match the constants of its shader builds.
 //
-constexpr int32_t kFlashRowTile = 8;
 constexpr int32_t kFlashKeyChunk = 16;
 constexpr int32_t kFlashMaxHeadDim = 128;
-constexpr int32_t kFlashThreads = 128;
 
 // Shared bytes the walk reserves whatever the head dimension: the query tile,
 // the key chunk and the accumulator all span the widest row in four-wide
 // steps, each row padded by a whole quad so the lanes of a workgroup miss each
 // other's bank columns, plus the score block and four running values per row.
 // A device whose shared pool is below this cannot back the pipeline at all, so
-// the walk stays off such hardware.
-constexpr int64_t kFlashSharedBytes =
-    (int64_t(2 * kFlashRowTile + kFlashKeyChunk) *
-         (kFlashMaxHeadDim / 4 + 1) * 16 +
-     (int64_t(kFlashRowTile) * (kFlashKeyChunk + 1) + 4 * kFlashRowTile) * 4);
+// the walk stays off such hardware.  The footprint grows with the rows one
+// workgroup owns.
+constexpr int64_t flash_shared_bytes(int64_t row_tile) {
+  return int64_t(2 * row_tile + kFlashKeyChunk) *
+          (kFlashMaxHeadDim / 4 + 1) * 16 +
+      (row_tile * (kFlashKeyChunk + 1) + 4 * row_tile) * 4;
+}
 
 // Element index range a 32-bit offset in a buffer kernel can reach.
 constexpr int64_t kLinearIndexLimit = 2147483647;
@@ -2050,11 +2050,58 @@ constexpr int64_t kLinearIndexLimit = 2147483647;
 // chain wins.
 constexpr int64_t kFlashWalkLaneFloor = 1LL << 16;
 
-// Row tiles the walk needs before the serial pass it takes over the keys, one
-// per tile, still leaves the device with enough workgroups to fill.
-constexpr int64_t kFlashMinWorkgroups = 1024;
+// Query rows the walk needs before its one-workgroup-per-row-tile form still
+// leaves the device filled.  Counted in rows rather than tiles because the tile
+// width sets how many tiles a window makes: the eight-row build measured this
+// floor at 1024 workgroups of eight rows, and the same row count at thirty-two
+// rows a quarter of the workgroups.
+constexpr int64_t kFlashMinQueryRows = 1024 * 8;
 
 namespace {
+
+// The rows one workgroup owns, and the build that walks with them.  A workgroup
+// spreads its chunk over one lane per (row, key) pair, so the lanes follow from
+// the rows and a lane forms exactly one score per chunk.
+struct FlashTile final {
+  const char* kernel;
+  int64_t rows;
+};
+
+constexpr int64_t flash_lanes(int64_t rows) {
+  return rows * kFlashKeyChunk;
+}
+
+// Widest tile first.  Every row tile streams the whole key and value window, so
+// a wider tile serves one staged window to more query rows and the reads that
+// set this kernel's pace fall with the tile count: against the eight-row build,
+// at a head dimension of one hundred twenty-eight and a window of a thousand
+// rows or more, thirty-two rows cost 0.83-0.88 of the same call and sixteen rows
+// 0.88-0.93, while a window of five hundred twelve rows lands within noise of
+// the eight-row tile either way.
+constexpr FlashTile kFlashTiles[] = {
+    {"sdpa_flash_buffer_w32", 32},
+    {"sdpa_flash_buffer_w16", 16},
+    {"sdpa_flash_buffer", 8},
+};
+
+// The widest tile the device can back and the window can fill: the device's
+// workgroups have to hold the lanes the rows need and its shared pool the
+// arrays they cost, and a tile wider than the query window spends its extra
+// rows on nothing.  No tile means nothing to walk, which leaves the window to
+// the two-product chain.
+FlashTile flash_tile_choice(api::Context* const context, int64_t seq_q) {
+  const auto& limits = context->adapter_ptr()->properties().limits;
+  for (const FlashTile& tile : kFlashTiles) {
+    if (tile.rows <= seq_q &&
+        flash_shared_bytes(tile.rows) <=
+            static_cast<int64_t>(limits.maxComputeSharedMemorySize) &&
+        flash_lanes(tile.rows) <=
+            static_cast<int64_t>(limits.maxComputeWorkGroupInvocations)) {
+      return tile;
+    }
+  }
+  return {"", 0};
+}
 
 // A payload the linear reads can walk: single precision, and dense in logical
 // order.  The cast and the stride fix are each one pass over one operand,
@@ -2188,10 +2235,12 @@ Tensor sdpa_flash(
   // One workgroup per row tile of one (batch, head) pair.  The launch counts
   // invocations, so the lane axis carries exactly a workgroup's worth and the
   // two axes above it number the tiles and the planes.
+  const FlashTile tile = flash_tile_choice(context, Sq);
+  const uint32_t lanes = static_cast<uint32_t>(flash_lanes(tile.rows));
   const uint32_t row_tiles = api::utils::safe_downcast_to_u32(
       api::utils::div_up(
           api::utils::safe_downcast_to_u32(Sq),
-          static_cast<uint32_t>(kFlashRowTile)));
+          static_cast<uint32_t>(tile.rows)));
   const uint32_t planes = api::utils::safe_downcast_to_u32(B * Hq);
   TP_CHECK(
       static_cast<int64_t>(row_tiles) <= kLinearDispatchAxisLimit &&
@@ -2244,10 +2293,10 @@ Tensor sdpa_flash(
   api::UniformParamsBuffer params(context, block);
   api::PipelineBarrier barrier{};
   context->submit_compute_job(
-      VK_KERNEL_FROM_STR("sdpa_flash_buffer"),
+      VK_KERNEL_FROM_STR(tile.kernel),
       barrier,
-      api::utils::uvec3{static_cast<uint32_t>(kFlashThreads), row_tiles, planes},
-      api::utils::uvec3{static_cast<uint32_t>(kFlashThreads), 1u, 1u},
+      api::utils::uvec3{lanes, row_tiles, planes},
+      api::utils::uvec3{lanes, 1u, 1u},
       VK_NULL_HANDLE,
       v_output.buffer(
           barrier,
@@ -2358,25 +2407,15 @@ Tensor scaled_dot_product_attention_kernel(
   // wide enough for that saving to outweigh its serial tail, and when the key
   // window is no longer than the query window: an inversion there leaves the
   // last row tile walking the whole key range while every other tile idles.
-  const int64_t row_tiles =
-      static_cast<int64_t>(
-          api::utils::div_up(
-              api::utils::safe_downcast_to_u32(Sq),
-              static_cast<uint32_t>(kFlashRowTile))) *
-      B * Hq;
+  const FlashTile flash_tile = flash_tile_choice(context, Sq);
   const bool no_image_form =
       v_query.storage_type() != api::StorageType::TEXTURE_3D ||
       v_key.storage_type() != api::StorageType::TEXTURE_3D ||
       v_value.storage_type() != api::StorageType::TEXTURE_3D ||
       !sdpa_images_fit(context, B, Hq, Sq, Skv);
   const bool walk_reachable =
-      D <= kFlashMaxHeadDim && Sq >= kFlashRowTile &&
-      row_tiles >= kFlashMinWorkgroups &&
-      kFlashSharedBytes <=
-          static_cast<int64_t>(
-              context->adapter_ptr()
-                  ->properties()
-                  .limits.maxComputeSharedMemorySize) &&
+      flash_tile.rows > 0 && D <= kFlashMaxHeadDim &&
+      static_cast<int64_t>(Sq) * B * Hq >= kFlashMinQueryRows &&
       B * Hq * Sq * D <= kLinearIndexLimit &&
       B * Hkv * Skv * D <= kLinearIndexLimit;
   const bool walk_pays_off =

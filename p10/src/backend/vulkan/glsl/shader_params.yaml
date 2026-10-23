@@ -2401,6 +2401,19 @@ rotary_embedding_buffer_half:
     TABLE_BUFFER: 1
   - NAME: rotary_embedding_buffer_half_tex_table
     TABLE_BUFFER: 0
+sdpa_flash_buffer:
+  parameter_names_with_default_values:
+    # Query rows one workgroup owns, and the lanes it spreads its chunk over.
+    ROW_TILE: 8
+    THREAD_COUNT: 128
+  shader_variants:
+  - NAME: sdpa_flash_buffer
+  - NAME: sdpa_flash_buffer_w16
+    ROW_TILE: 16
+    THREAD_COUNT: 256
+  - NAME: sdpa_flash_buffer_w32
+    ROW_TILE: 32
+    THREAD_COUNT: 512
 sdpa_qk:
   parameter_names_with_default_values: {}
   generate_variant_forall:
