@@ -165,6 +165,119 @@ def test_mm_out_writes_the_named_destination(device):
     np.testing.assert_allclose(_np(square), expected, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parametrize("device", DEVICES)
+def test_addmm_out_writes_the_named_destination(device):
+    if device == "cuda" and not tp.cuda.is_available():
+        pytest.skip("no cuda")
+    rng = np.random.RandomState(5)
+    a = rng.randn(9, 7).astype(np.float32)
+    b = rng.randn(7, 5).astype(np.float32)
+    ta, tb = _mk(a, device), _mk(b, device)
+
+    # The result keeps the destination's storage and its views.
+    bias = rng.randn(9, 5).astype(np.float32)
+    got = tp.empty(9, 5, dtype=tp.float32, device=tp.device(device))
+    ptr, view = got.data_ptr(), got[0]
+    tp.ops.tp.addmm.out(_mk(bias, device), ta, tb, beta=1.0, alpha=1.0, out=got)
+    assert got.data_ptr() == ptr
+    want = torch.addmm(_torch_mk(bias, device), _torch_mk(a, device),
+                       _torch_mk(b, device)).cpu().numpy()
+    np.testing.assert_allclose(_np(got), want, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(_np(view), want[0], rtol=1e-5, atol=1e-5)
+
+    # A row seed is folded in while the answer is written, at either width it
+    # may come in.
+    row = rng.randn(5).astype(np.float32)
+    for row_seed in (row, row.reshape(1, 5)):
+        got = tp.empty(9, 5, dtype=tp.float32, device=tp.device(device))
+        tp.ops.tp.addmm.out(_mk(row_seed, device), ta, tb, beta=2.0, alpha=3.0,
+                            out=got)
+        row_want = torch.addmm(_torch_mk(row_seed, device), _torch_mk(a, device),
+                               _torch_mk(b, device), beta=2.0,
+                               alpha=3.0).cpu().numpy()
+        np.testing.assert_allclose(_np(got), row_want, rtol=1e-5, atol=1e-5,
+                                   err_msg=str(row_seed.shape))
+
+    # The seed itself may be the destination: the accumulation happens in
+    # place rather than over a matrix being read.
+    seed = _mk(bias, device)
+    tp.ops.tp.addmm.out(seed, ta, tb, beta=1.0, alpha=1.0, out=seed)
+    np.testing.assert_allclose(_np(seed), want, rtol=1e-5, atol=1e-5)
+
+    # An operand as the destination still gets the answer.
+    right = rng.randn(7, 7).astype(np.float32)
+    seed = rng.randn(9, 7).astype(np.float32)
+    expected = torch.addmm(_torch_mk(seed, device), _torch_mk(a, device),
+                           _torch_mk(right, device)).cpu().numpy()
+    square = _mk(a, device)
+    tp.ops.tp.addmm.out(_mk(seed, device), square, _mk(right, device),
+                        beta=1.0, alpha=1.0, out=square)
+    np.testing.assert_allclose(_np(square), expected, rtol=1e-5, atol=1e-5)
+
+    # A window of the destination's buffer that starts elsewhere is not the
+    # seed, even at the same shape and strides: its values have to be read
+    # before the answer is written over them.
+    buf = tp.empty(18, 5, dtype=tp.float32, device=tp.device(device))
+    out, seed = buf[0:9], buf[9:18]
+    seed_np = rng.randn(9, 5).astype(np.float32)
+    seed.copy_(_mk(seed_np, device))
+    tp.ops.tp.addmm.out(seed, ta, tb, beta=2.0, alpha=1.0, out=out)
+    np.testing.assert_allclose(
+        _np(out),
+        torch.addmm(_torch_mk(seed_np, device), _torch_mk(a, device),
+                    _torch_mk(b, device), beta=2.0).cpu().numpy(),
+        rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_baddbmm_out_writes_the_named_destination(device):
+    if device == "cuda" and not tp.cuda.is_available():
+        pytest.skip("no cuda")
+    rng = np.random.RandomState(6)
+    A = rng.randn(3, 6, 4).astype(np.float32)
+    B = rng.randn(3, 4, 5).astype(np.float32)
+    bias = rng.randn(5).astype(np.float32)
+    tA, tB = _mk(A, device), _mk(B, device)
+
+    got = tp.empty(3, 6, 5, dtype=tp.float32, device=tp.device(device))
+    ptr, view = got.data_ptr(), got[1]
+    tp.baddbmm(_mk(bias, device), tA, tB, beta=0.5, alpha=2.0, out=got)
+    assert got.data_ptr() == ptr
+    want = torch.baddbmm(_torch_mk(bias, device), _torch_mk(A, device),
+                         _torch_mk(B, device), beta=0.5, alpha=2.0).cpu().numpy()
+    np.testing.assert_allclose(_np(got), want, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(_np(view), want[1], rtol=1e-5, atol=1e-5)
+
+    # The seed itself may be the destination.
+    seed = _mk(rng.randn(3, 6, 5).astype(np.float32), device)
+    keep = _np(seed).copy()
+    tp.baddbmm(seed, tA, tB, beta=1.0, alpha=1.0, out=seed)
+    np.testing.assert_allclose(
+        _np(seed),
+        torch.baddbmm(torch.tensor(keep, device=device), _torch_mk(A, device),
+                      _torch_mk(B, device)).cpu().numpy(), rtol=1e-5, atol=1e-5)
+
+    # An operand as the destination still gets the answer.
+    left = rng.randn(3, 6, 6).astype(np.float32)
+    right = rng.randn(3, 6, 6).astype(np.float32)
+    seed = rng.randn(6).astype(np.float32)
+    expected = torch.baddbmm(_torch_mk(seed, device), _torch_mk(left, device),
+                             _torch_mk(right, device)).cpu().numpy()
+    square = _mk(left, device)
+    tp.baddbmm(_mk(seed, device), square, _mk(right, device), out=square)
+    np.testing.assert_allclose(_np(square), expected, rtol=1e-5, atol=1e-5)
+
+    # An empty reduction leaves no product, so the seed survives scaled by
+    # beta rather than being zeroed with the product.
+    bias3 = rng.randn(3, 6, 5).astype(np.float32)
+    empty_a = np.zeros((3, 6, 0), np.float32)
+    empty_b = np.zeros((3, 0, 5), np.float32)
+    got = tp.empty(3, 6, 5, dtype=tp.float32, device=tp.device(device))
+    tp.baddbmm(_mk(bias3, device), _mk(empty_a, device),
+               _mk(empty_b, device), beta=2.0, out=got)
+    np.testing.assert_allclose(_np(got), 2.0 * bias3, rtol=1e-6, atol=1e-6)
+
+
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 

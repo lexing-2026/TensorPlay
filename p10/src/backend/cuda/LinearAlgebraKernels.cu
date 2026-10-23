@@ -112,6 +112,17 @@ bool shares_storage(const Tensor& first, const Tensor& second) {
            first_storage.data() == second_storage.data();
 }
 
+// Whether two tensors name every element at the same place.  An accumulator
+// read and written element for element needs this, not mere shared storage: a
+// window of the same buffer read at another width, or one that starts at
+// another offset, pairs different elements.
+bool same_layout(const Tensor& first, const Tensor& second) {
+    return first.data_ptr() == second.data_ptr() &&
+           static_cast<std::vector<int64_t>>(first.shape()) ==
+               static_cast<std::vector<int64_t>>(second.shape()) &&
+           first.strides() == second.strides();
+}
+
 } // anonymous namespace
 
 Tensor mm_kernel_cuda(const Tensor& self, const Tensor& other) {
@@ -401,6 +412,64 @@ Tensor addmm_kernel_cuda(const Tensor& input, const Tensor& mat1, const Tensor& 
     Tensor result = expand_gemm_input_cuda(input, {M, N}).clone().contiguous();
     gemm_impl(mat1, mat2, result, alpha_v, beta_v, nullptr);
     return result;
+}
+
+Tensor& addmm_out_kernel_cuda(const Tensor& input, const Tensor& mat1, const Tensor& mat2,
+                              const Scalar& beta, const Scalar& alpha, Tensor& out) {
+    if (mat1.dim() != 2 || mat2.dim() != 2) TP_THROW(RuntimeError, "mat1 and mat2 shapes cannot be multiplied (",
+        mat1.dim(), "D and ", mat2.dim(), "D)");
+    if (mat1.size(1) != mat2.size(0)) {
+        TP_THROW(RuntimeError, "mat1 and mat2 shapes cannot be multiplied (", mat1.size(0), "x", mat1.size(1),
+                 " and ", mat2.size(0), "x", mat2.size(1), ")");
+    }
+    if (input.dtype() != mat2.dtype()) {
+        TP_THROW(RuntimeError, "self and mat2 must have the same dtype, but got ",
+                 scalarTypeName(input.dtype()), " and ", scalarTypeName(mat2.dtype()));
+    }
+    if (mat1.dtype() != mat2.dtype()) {
+        TP_THROW(RuntimeError, "mat1 and mat2 must have the same dtype, but got ",
+                 scalarTypeName(mat1.dtype()), " and ", scalarTypeName(mat2.dtype()));
+    }
+    const int64_t M = mat1.size(0);
+    const int64_t N = mat2.size(1);
+    const double alpha_v = alpha.toDouble();
+    const double beta_v = beta.toDouble();
+
+    const bool takes = destination_takes(out, mat1.device(), mat1.dtype(), {M, N}) &&
+                       out.is_contiguous() &&
+                       !shares_storage(out, mat1) && !shares_storage(out, mat2);
+    // An empty reduction or an empty answer makes the product a scaling of
+    // the seed or nothing at all; which values those leave is already stated
+    // by the general path, so it is asked rather than restated here.
+    if (!takes || M == 0 || N == 0 || mat1.size(1) == 0) {
+        write_out(out, addmm_kernel_cuda(input, mat1, mat2, beta, alpha));
+        return out;
+    }
+    if (beta_v == 0.0) {
+        // The seed is multiplied by zero, so its values are never read and it
+        // may be the destination without being overwritten first.
+        gemm_impl(mat1, mat2, out, alpha_v, 0.0, nullptr);
+        return out;
+    }
+    if (beta_v == 1.0 && is_bias_vector(input, M, N) && !shares_storage(out, input)) {
+        // The seed is a row the epilogue adds while it writes, so the sum is
+        // formed on the way out instead of being seeded into the destination.
+        gemm_impl(mat1, mat2, out, alpha_v, 0.0, &input);
+        return out;
+    }
+    if (!shares_storage(out, input)) {
+        out.copy_(expand_gemm_input_cuda(input, {M, N}));
+    } else if (!same_layout(out, input)) {
+        // A seed windowed out of the destination cannot be seeded by copying
+        // it there; the product is formed elsewhere and written over it.
+        write_out(out, addmm_kernel_cuda(input, mat1, mat2, beta, alpha));
+        return out;
+    }
+    // The seed is already in place, either because the destination held it or
+    // because it was just copied in; the product then absorbs the beta factor
+    // on the way out instead of scaling the destination in a separate pass.
+    gemm_impl(mat1, mat2, out, alpha_v, beta_v, nullptr);
+    return out;
 }
 
 Tensor matmul_kernel_cuda(const Tensor& self, const Tensor& other) {
@@ -828,6 +897,7 @@ Tensor baddbmm_kernel_cuda(const Tensor& input, const Tensor& batch1, const Tens
     const int64_t B = batch1.size(0);
     const int64_t M = batch1.size(1);
     const int64_t N = batch2.size(2);
+    const int64_t K = batch1.size(2);
     const double beta_v = beta.toDouble();
     const double alpha_v = alpha.toDouble();
 
@@ -839,23 +909,95 @@ Tensor baddbmm_kernel_cuda(const Tensor& input, const Tensor& batch1, const Tens
         // clone() is required even when input is already contiguous: unlike
         // addmm's internal destination, baddbmm's out-of-place result may
         // alias batch1/batch2 (Muon passes the same tensor as input and
-        // batch2).  A contiguous() no-op would let the beta pre-scale mutate
-        // an operand before GEMM and corrupt every subsequent NS iteration.
-        // As with addmm above, preserve out-of-place aliasing while ensuring
-        // the destination has the dense layout expected by cuBLAS.
+        // batch2).  A contiguous() no-op would let GEMM write over an operand
+        // it is still reading.  As with addmm above, preserve out-of-place
+        // aliasing while ensuring the destination has the dense layout
+        // expected by cuBLAS.
         result = expand_gemm_input_cuda(input, target).clone().contiguous();
-        if (beta_v != 1.0) result.mul_(beta);
+    }
+    if (K == 0) {
+        // There is no product to form, so the answer is the seed scaled by
+        // beta; the library's empty-reduction exit would zero it instead.
+        if (beta_v == 0.0) {
+            result.zero_();
+        } else if (beta_v != 1.0) {
+            result.mul_(beta_v);
+        }
+        return result;
     }
 
     Tensor b1 = batch1.is_contiguous() ? batch1 : batch1.contiguous();
     Tensor b2 = batch2.is_contiguous() ? batch2 : batch2.contiguous();
     Tensor result_3d = std::move(result);
-    const long long stride_a = static_cast<long long>(M) * batch1.size(2);
-    const long long stride_b = static_cast<long long>(batch1.size(2)) * N;
-    gemm_strided_batched_3d(b1, b2, result_3d, B, M, N, batch1.size(2),
-                            stride_a, stride_b,
-                            alpha_v, beta_v == 0.0 ? 0.0 : 1.0);
+    const long long stride_a = static_cast<long long>(M) * K;
+    const long long stride_b = static_cast<long long>(K) * N;
+    gemm_strided_batched_3d(b1, b2, result_3d, B, M, N, K,
+                            stride_a, stride_b, alpha_v, beta_v);
     return result_3d;
+}
+
+Tensor& baddbmm_out_kernel_cuda(const Tensor& input, const Tensor& batch1, const Tensor& batch2,
+                                const Scalar& beta, const Scalar& alpha, Tensor& out) {
+    if (batch1.dim() != 3) TP_THROW(RuntimeError, "batch1 must be a 3D tensor");
+    if (batch2.dim() != 3) TP_THROW(RuntimeError, "batch2 must be a 3D tensor");
+    if (batch1.size(0) != batch2.size(0) || batch1.size(2) != batch2.size(1)) {
+        TP_THROW(RuntimeError, "Expected size for first two dimensions of batch2 tensor to be: [",
+                 batch1.size(0), ", ", batch1.size(2), "] but got: [", batch2.size(0), ", ",
+                 batch2.size(1), "].");
+    }
+    if (input.dtype() != batch1.dtype() || batch1.dtype() != batch2.dtype()) {
+        TP_THROW(RuntimeError, "Input dtypes must be the same, got: input ",
+                 elementTypeName(input.dtype()), ", batch1: ",
+                 elementTypeName(batch1.dtype()), ", batch2: ",
+                 elementTypeName(batch2.dtype()));
+    }
+
+    const int64_t B = batch1.size(0);
+    const int64_t M = batch1.size(1);
+    const int64_t N = batch2.size(2);
+    const int64_t K = batch1.size(2);
+    const double beta_v = beta.toDouble();
+    const double alpha_v = alpha.toDouble();
+    const std::vector<int64_t> target{B, M, N};
+
+    const bool takes = destination_takes(out, batch1.device(), batch1.dtype(), target) &&
+                       out.is_contiguous() &&
+                       !shares_storage(out, batch1) && !shares_storage(out, batch2);
+    if (!takes || B == 0 || M == 0 || N == 0) {
+        write_out(out, baddbmm_kernel_cuda(input, batch1, batch2, beta, alpha));
+        return out;
+    }
+
+    // The destination has to hold the seed before the product is accumulated
+    // onto it.  A seed it already holds at the same places needs no pass, one
+    // it does not hold is copied in, and a window of it that is not the whole
+    // destination is left to the general path.
+    if (beta_v != 0.0 && !shares_storage(out, input)) {
+        out.copy_(expand_gemm_input_cuda(input, target));
+    } else if (beta_v != 0.0 && !same_layout(out, input)) {
+        write_out(out, baddbmm_kernel_cuda(input, batch1, batch2, beta, alpha));
+        return out;
+    }
+    if (K == 0) {
+        // There is no product to form, so the answer is the seed scaled by
+        // beta; the library's empty-reduction exit would zero it instead.
+        if (beta_v == 0.0) {
+            out.zero_();
+        } else if (beta_v != 1.0) {
+            out.mul_(beta_v);
+        }
+        return out;
+    }
+
+    Tensor b1 = batch1.is_contiguous() ? batch1 : batch1.contiguous();
+    Tensor b2 = batch2.is_contiguous() ? batch2 : batch2.contiguous();
+    const long long stride_a = static_cast<long long>(M) * K;
+    const long long stride_b = static_cast<long long>(K) * N;
+    // The copied seed is scaled by the product's beta rather than by a
+    // separate pass over the destination.
+    gemm_strided_batched_3d(b1, b2, out, B, M, N, K, stride_a, stride_b,
+                            alpha_v, beta_v);
+    return out;
 }
 
 Tensor mv_kernel_cuda(const Tensor& self, const Tensor& vec) {
@@ -1081,10 +1223,12 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, LinearAlgebraKernels) {
     m.impl("matmul_backward_self", matmul_backward_self_kernel_cuda);
     m.impl("matmul_backward_other", matmul_backward_other_kernel_cuda);
     m.impl("addmm", addmm_kernel_cuda);
+    m.impl("addmm.out", addmm_out_kernel_cuda);
     m.impl("linear", linear_kernel_cuda);
     m.impl("bmm", bmm_kernel_cuda);
     m.impl("bmm.out", bmm_out_kernel_cuda);
     m.impl("baddbmm", baddbmm_kernel_cuda);
+    m.impl("baddbmm.out", baddbmm_out_kernel_cuda);
     m.impl("mv", mv_kernel_cuda);
     m.impl("dot", dot_kernel_cuda);
     m.impl("inner", inner_kernel_cuda);
