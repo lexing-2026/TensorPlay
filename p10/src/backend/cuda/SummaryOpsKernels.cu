@@ -486,7 +486,26 @@ __device__ __forceinline__ void mode_bitonic_swap(
 }
 
 
-template <typename T, unsigned int Power2Size>
+template <typename T>
+__device__ __forceinline__ void mode_bitonic_swap_exact(
+        T& lhs, T& rhs, bool direction) {
+    if (mode_value_less(lhs, rhs) == direction) {
+        const T value = lhs;
+        lhs = rhs;
+        rhs = value;
+    }
+}
+
+
+// A slice whose length is exactly the block's power-of-two size needs no
+// placeholders, so the network moves only the values.  That is most of the work
+// of the whole kernel: the flags live in their own shared array, and every stage
+// reads and writes it alongside the two values.  The loops carry no unroll
+// request on purpose.  Forcing one keeps a whole stage's live values of both
+// operands in registers, which a padded 2048-slot block cannot afford: it then
+// asks for more registers per thread than one resident block of 1024 threads is
+// allowed, and the launch simply fails.
+template <typename T, unsigned int Power2Size, bool Padded>
 __device__ inline void mode_bitonic_sort(T* values, bool* valid) {
     for (unsigned int size = 2; size < Power2Size; size <<= 1) {
         const bool direction = (threadIdx.x & (size / 2)) != 0;
@@ -494,24 +513,34 @@ __device__ inline void mode_bitonic_sort(T* values, bool* valid) {
             __syncthreads();
             const unsigned int position =
                 2 * threadIdx.x - (threadIdx.x & (stride - 1));
-            mode_bitonic_swap(
-                values[position], valid[position],
-                values[position + stride], valid[position + stride], direction);
+            if constexpr (Padded) {
+                mode_bitonic_swap(
+                    values[position], valid[position],
+                    values[position + stride], valid[position + stride], direction);
+            } else {
+                mode_bitonic_swap_exact(
+                    values[position], values[position + stride], direction);
+            }
         }
     }
     for (unsigned int stride = Power2Size / 2; stride > 0; stride >>= 1) {
         __syncthreads();
         const unsigned int position =
             2 * threadIdx.x - (threadIdx.x & (stride - 1));
-        mode_bitonic_swap(
-            values[position], valid[position],
-            values[position + stride], valid[position + stride], false);
+        if constexpr (Padded) {
+            mode_bitonic_swap(
+                values[position], valid[position],
+                values[position + stride], valid[position + stride], false);
+        } else {
+            mode_bitonic_swap_exact(
+                values[position], values[position + stride], false);
+        }
     }
     __syncthreads();
 }
 
 
-template <typename T, unsigned int Power2Size>
+template <typename T, unsigned int Power2Size, bool Padded>
 __global__ void mode_fused_kernel(
         int64_t n_slices, int64_t d_size, int64_t inner,
         const T* input, T* values, int64_t* indices) {
@@ -519,26 +548,36 @@ __global__ void mode_fused_kernel(
     if (si >= n_slices) return;
     extern __shared__ unsigned char storage[];
     T* sorted = reinterpret_cast<T*>(storage);
-    bool* valid = reinterpret_cast<bool*>(sorted + Power2Size);
+    bool* valid = Padded ? reinterpret_cast<bool*>(sorted + Power2Size) : nullptr;
     const int64_t outer_index = si / inner;
     const int64_t inner_index = si % inner;
     const T* slice_input = input + outer_index * d_size * inner + inner_index;
 
     const unsigned int second = blockDim.x + threadIdx.x;
+    // The two positions this thread loads are the two it may later report, so
+    // the register copies serve both the ordered copy and the search for the
+    // last occurrence.  Reading the slice a second time for the position costs
+    // as much as the first read, and the values are already in hand.
+    T own_first = static_cast<T>(0);
+    T own_second = static_cast<T>(0);
     if (threadIdx.x < Power2Size) {
-        valid[threadIdx.x] = threadIdx.x < static_cast<unsigned int>(d_size);
-        sorted[threadIdx.x] = valid[threadIdx.x]
+        const bool has = threadIdx.x < static_cast<unsigned int>(d_size);
+        if constexpr (Padded) valid[threadIdx.x] = has;
+        own_first = has
             ? slice_input[static_cast<int64_t>(threadIdx.x) * inner]
             : static_cast<T>(0);
+        sorted[threadIdx.x] = own_first;
     }
     if (second < Power2Size) {
-        valid[second] = second < static_cast<unsigned int>(d_size);
-        sorted[second] = valid[second]
+        const bool has = second < static_cast<unsigned int>(d_size);
+        if constexpr (Padded) valid[second] = has;
+        own_second = has
             ? slice_input[static_cast<int64_t>(second) * inner]
             : static_cast<T>(0);
+        sorted[second] = own_second;
     }
     __syncthreads();
-    mode_bitonic_sort<T, Power2Size>(sorted, valid);
+    mode_bitonic_sort<T, Power2Size, Padded>(sorted, valid);
 
     // Each thread owns the adjacent ordered pair 2t and 2t+1, and a run is only
     // measured where it closes: an interior position reports the same value at a
@@ -570,19 +609,15 @@ __global__ void mode_fused_kernel(
     __shared__ int32_t mode_index;
     if (threadIdx.x == 0) mode = sorted[best_position];
     __syncthreads();
-    // Uniform step count keeps the warp converged for the fold; an
-    // out-of-range step rereads the last element and reports no match.
-    const int32_t stride = static_cast<int32_t>(blockDim.x);
-    const int32_t length = static_cast<int32_t>(d_size);
-    const int32_t steps = (length + stride - 1) / stride;
+    const int32_t first_position = static_cast<int32_t>(threadIdx.x);
     int32_t best = -1;
-    for (int32_t step = 0; step < steps; ++step) {
-        const int32_t i = static_cast<int32_t>(threadIdx.x) + step * stride;
-        const int32_t clamped = i < length ? i : length - 1;
-        const bool match = i < length &&
-            same_ordered_value(slice_input[static_cast<int64_t>(clamped) * inner],
-                               mode);
-        best = match ? i : best;
+    if (static_cast<int64_t>(second) < d_size &&
+        same_ordered_value(own_second, mode)) {
+        best = static_cast<int32_t>(second);
+    }
+    if (first_position < d_size && same_ordered_value(own_first, mode) &&
+        first_position > best) {
+        best = first_position;
     }
     mode_block_span<int32_t>(best, true, &mode_index);
     if (threadIdx.x == 0) {
@@ -592,33 +627,55 @@ __global__ void mode_fused_kernel(
 }
 
 
-// Slices up to 128 values use the 128-wide block, larger ones the 1024- or
-// 2048-wide block.  Every block holds whole warps, which the reduction and its
-// tie handling rely on.
+// One tier per power-of-two slice length, so a slice is never ordered in a
+// network twice its size.  The tier's threads are half its slots, which the
+// adjacent-pair handling above assumes, and every tier holds whole warps, which
+// the reduction and its tie handling rely on.
+template <typename T, unsigned int Power2Size>
+void launch_mode_fused_power(
+        dim3 grid, cudaStream_t stream, int64_t n_slices, int64_t d_size,
+        int64_t inner, const Tensor& input, Tensor& values, Tensor& indices) {
+    const int threads = static_cast<int>(Power2Size) / 2;
+    const T* source = input.data_ptr<T>();
+    T* found_values = values.data_ptr<T>();
+    int64_t* found_indices = indices.data_ptr<int64_t>();
+    if (d_size == static_cast<int64_t>(Power2Size)) {
+        mode_fused_kernel<T, Power2Size, false><<<
+            grid, threads, sizeof(T) * Power2Size, stream>>>(
+            n_slices, d_size, inner, source, found_values, found_indices);
+    } else {
+        mode_fused_kernel<T, Power2Size, true><<<
+            grid, threads, sizeof(T) * Power2Size + sizeof(bool) * Power2Size,
+            stream>>>(
+            n_slices, d_size, inner, source, found_values, found_indices);
+    }
+}
+
 template <typename T>
 void launch_mode_fused(
         int64_t n_slices, int64_t d_size, int64_t inner,
         const Tensor& input, Tensor& values, Tensor& indices) {
-    const int64_t power = d_size <= 128 ? 128 : d_size <= 1024 ? 1024 : 2048;
+    const int64_t power =
+        d_size <= 128 ? 128
+        : d_size <= 256 ? 256
+        : d_size <= 512 ? 512
+        : d_size <= 1024 ? 1024
+        : 2048;
     const dim3 grid(static_cast<unsigned>(n_slices));
     auto stream = getCurrentCUDAStream().stream();
+#define TP_MODE_FUSED_TIER(Power)                                        \
+    case Power:                                                          \
+        launch_mode_fused_power<T, Power>(                               \
+            grid, stream, n_slices, d_size, inner, input, values, indices); \
+        break;
     switch (power) {
-        case 128:
-            mode_fused_kernel<T, 128><<<grid, 64, sizeof(T) * 128 + sizeof(bool) * 128, stream>>>(
-                n_slices, d_size, inner, input.data_ptr<T>(),
-                values.data_ptr<T>(), indices.data_ptr<int64_t>());
-            break;
-        case 1024:
-            mode_fused_kernel<T, 1024><<<grid, 512, sizeof(T) * 1024 + sizeof(bool) * 1024, stream>>>(
-                n_slices, d_size, inner, input.data_ptr<T>(),
-                values.data_ptr<T>(), indices.data_ptr<int64_t>());
-            break;
-        default:
-            mode_fused_kernel<T, 2048><<<grid, 1024, sizeof(T) * 2048 + sizeof(bool) * 2048, stream>>>(
-                n_slices, d_size, inner, input.data_ptr<T>(),
-                values.data_ptr<T>(), indices.data_ptr<int64_t>());
-            break;
+        TP_MODE_FUSED_TIER(128)
+        TP_MODE_FUSED_TIER(256)
+        TP_MODE_FUSED_TIER(512)
+        TP_MODE_FUSED_TIER(1024)
+        TP_MODE_FUSED_TIER(2048)
     }
+#undef TP_MODE_FUSED_TIER
 }
 
 
@@ -729,7 +786,9 @@ __device__ inline ModeBandSummary<T> mode_summarize_band(
 
 
 // The folded summary of a whole slice answers it: the longest run closed inside
-// it, or its trailing run, which is closed by the end of the slice itself.
+// it, or its trailing run, which is closed by the end of the slice itself.  A
+// stable order puts the smallest original index at a run's front, so this names
+// the earliest occurrence of the mode.
 template <typename T>
 __device__ inline void mode_report_folded(
         const ModeBandSummary<T>& fold, const T* source,
@@ -978,6 +1037,11 @@ std::tuple<Tensor, Tensor> mode_cuda(const Tensor& self, int64_t dim, bool keepd
         CUDA_CHECK(cudaGetLastError());
         return {values, indices};
     }
+    // One block per slice orders the slice in shared memory.  The largest tier
+    // that a block of at most 1024 threads can pair off is 2048 slots, and the
+    // network's cost per slice grows faster past it than a multi-block sort of
+    // the whole tensor plus one fold over the ordered sequence, so longer slices
+    // take that route.
     if (d_size >= 2 && d_size <= 2048) {
         switch (input.dtype()) {
 #define TP_MODE_FUSED_CASE(ctype, name_) \
