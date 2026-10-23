@@ -1,5 +1,6 @@
 #ifdef USE_VULKAN
 
+#include "AdvancedIndex.h"
 #include "Blocks.h"
 #include "Common.h"
 #include "Convert.h"
@@ -2239,11 +2240,13 @@ Tensor index_fill_tensor_kernel(
 // lands.  Both entry points carry the whole tuple, so the forms a row lookup
 // can drive are decided here.  A tuple with one list of row codes names one
 // axis: the read is that axis's row lookup with the codes' shape spliced in,
-// the write the row scatter the same axis already drives.  The other forms
-// stay refused rather than answered wrong: a mask compacts the axis it covers,
-// which needs a running total of the mask that no kernel here produces, and
-// several lists broadcast against each other and fold more than one axis at
-// once, which no single row lookup describes.
+// the write the row scatter the same axis already drives.  A read that names
+// more than one axis, or compacts an axis by a mask, is answered instead by a
+// walk that turns every coordinate into an address of the flattened payload
+// and hands those addresses to the flat lookup.  The write keeps to the row
+// scatter: the addresses a walk composes name single lanes inside the payload,
+// and no row scatter describes them, while a write through the payload
+// narrowed to a line reaches a copy of it rather than the payload itself.
 //
 namespace {
 
@@ -2295,27 +2298,166 @@ std::vector<int64_t> indexed_shape(
   return sizes;
 }
 
+// The axis a tuple holding exactly one list of integer codes names.  Nothing
+// is returned when the tuple carries a mask, several lists, or no list at all:
+// those forms reach past a single row of one axis, so only the walk below
+// describes them.
+std::optional<int64_t> lone_code_axis(
+    const std::vector<std::optional<Tensor>>& indices) {
+  std::optional<int64_t> axis;
+  for (size_t entry = 0; entry < indices.size(); ++entry) {
+    if (!indices[entry].has_value() || !indices[entry]->defined()) {
+      continue;
+    }
+    const DType codes_type = indices[entry]->dtype();
+    if (codes_type != DType::Int32 && codes_type != DType::Int64) {
+      return std::nullopt;
+    }
+    if (axis.has_value()) {
+      return std::nullopt;
+    }
+    axis = static_cast<int64_t>(entry);
+  }
+  return axis;
+}
+
+// The read a tuple of masks and code lists answers, by way of the addresses
+// its own coordinates trace through the payload.
+//
+// The tuple is first brought to one code list per axis it names: a mask is
+// compacted to the positions of the lanes it selects, lists broadcast against
+// each other, and lists that sit apart move the block they name in front of the
+// axes left whole, which is the order a walk over the whole payload leaves them
+// in.  Every axis then contributes one term to the addresses: a named axis its
+// own codes, an axis taken whole a count of its lanes.  Each term is measured
+// by the distance one step along that axis covers in the payload as it lies in
+// storage, so the sum names one element of the flattened payload per answer
+// lane, and the flat lookup reads them.
+//
+// No shader of its own is needed: the compaction, the counting and the lookup
+// are all answered elsewhere in this backend.  The addresses are counts wider
+// than a word because a payload's reach is, and the walk costs one term per
+// axis of the payload plus the answer itself.
+Tensor advanced_index_read(
+    const Tensor& self,
+    const std::vector<std::optional<Tensor>>& indices) {
+  std::pair<Tensor, std::vector<Tensor>> prepared =
+      indexing::native::prepare_indices(self, indices, true);
+  Tensor payload = std::move(prepared.first);
+  std::vector<Tensor>& lists = prepared.second;
+  const int64_t rank = payload.dim();
+
+  int64_t first = 0;
+  int64_t indexed = 0;
+  std::vector<int64_t> block;
+  for (int64_t axis = 0; axis < rank; ++axis) {
+    const Tensor& codes = lists[static_cast<size_t>(axis)];
+    if (!codes.defined()) {
+      continue;
+    }
+    if (indexed == 0) {
+      first = axis;
+    }
+    ++indexed;
+    block = static_cast<std::vector<int64_t>>(codes.shape());
+  }
+  if (indexed == 0) {
+    // Nothing is taken along an axis, so the answer is the payload itself.
+    return tpx::ops::clone(payload, std::nullopt);
+  }
+  if (!payload.is_contiguous()) {
+    payload = tpx::ops::contiguous(payload);
+  }
+  const int64_t entries = payload.numel();
+  // The walk addresses elements through signed words, so it cannot reach past
+  // the word it counts with.
+  TP_CHECK(
+      entries <= std::numeric_limits<int32_t>::max(),
+      "Vulkan index: the walk holds more than two billion elements");
+
+  // The terms of a named axis are laid out over the block the codes broadcast
+  // to; the axes left whole hold one lane per address and stand outside it.
+  // A block with no dimension of its own is what a tuple of single numbers
+  // leaves, and those axes drop out of the answer.
+  std::vector<int64_t> layout;
+  layout.reserve(static_cast<size_t>(rank));
+  for (int64_t axis = 0; axis < first; ++axis) {
+    layout.push_back(1);
+  }
+  layout.insert(layout.end(), block.begin(), block.end());
+  for (int64_t axis = first + indexed; axis < rank; ++axis) {
+    layout.push_back(1);
+  }
+  std::vector<int64_t> out_sizes =
+      static_cast<std::vector<int64_t>>(payload.shape());
+  out_sizes.erase(
+      out_sizes.begin() + first, out_sizes.begin() + first + indexed);
+  out_sizes.insert(
+      out_sizes.begin() + first, block.begin(), block.end());
+
+  Tensor addresses;
+  for (int64_t axis = 0; axis < rank; ++axis) {
+    const int64_t size = payload.size(axis);
+    const int64_t stride = payload.strides()[static_cast<size_t>(axis)];
+    Tensor term;
+    if (axis >= first && axis < first + indexed) {
+      term = lists[static_cast<size_t>(axis)].reshape(layout);
+      // A code below zero counts back from the end of the axis it names.
+      term = tpx::ops::where(
+          tpx::ops::lt(term, Scalar(0)),
+          tpx::ops::add(term, Scalar(size)),
+          term);
+    } else {
+      std::vector<int64_t> shape(static_cast<size_t>(rank), 1);
+      shape[static_cast<size_t>(axis)] = size;
+      term = tpx::ops::arange(
+                   Scalar(0),
+                   Scalar(size),
+                   Scalar(1),
+                   DType::Int64,
+                   payload.device())
+                   .reshape(shape);
+    }
+    if (stride != 1) {
+      term = tpx::ops::mul(term, Scalar(stride));
+    }
+    addresses =
+        addresses.defined() ? tpx::ops::add(addresses, term) : std::move(term);
+  }
+  // The addresses broadcast to one lane per answer element as they are summed;
+  // the lookup hands them back in the shape the tuple names.
+  return tpx::ops::take(payload, addresses).reshape(out_sizes);
+}
+
 } // namespace
 
 Tensor index_tensor_kernel(
     const Tensor& self,
     const std::vector<std::optional<Tensor>>& indices) {
-  const int64_t axis = checked_code_axis(self, indices, "index");
-  if (axis < 0) {
-    // Every axis is taken whole, so the answer is the payload itself; a copy
-    // keeps it independent of what the read is taken from.
-    return tpx::ops::clone(self, std::nullopt);
+  const std::optional<int64_t> axis = lone_code_axis(indices);
+  if (!axis.has_value()) {
+    // The tuple names more than a row of one axis: masks, several lists, or
+    // nothing at all.  The walk reads it.
+    return advanced_index_read(self, indices);
   }
-  const Tensor codes = *indices[static_cast<size_t>(axis)];
-  const std::vector<int64_t> out_sizes = indexed_shape(self, axis, codes);
+  const Tensor codes = *indices[static_cast<size_t>(*axis)];
+  const std::vector<int64_t> out_sizes = indexed_shape(self, *axis, codes);
   if (codes.numel() == 0) {
     // A list of no codes names no row, so the answer holds no element.
     return tpx::ops::empty(out_sizes, self.dtype(), self.device());
   }
+  // A code below zero counts back from the end of the axis it names, the way
+  // the host and the walk below read it; the count is settled on the device,
+  // so no step of it waits on the queue.  A code past the end still names no
+  // row, and the row lookup answers that with zeros.
+  const Tensor wrapped = tpx::ops::where(
+      tpx::ops::lt(codes, Scalar(0)),
+      tpx::ops::add(codes, Scalar(self.size(*axis))),
+      codes);
   // One code per row, in the order the codes list them; the codes' shape then
   // splices back onto the axis they walked.
   Tensor picked = tpx::ops::index_select(
-      self, axis, codes.reshape({codes.numel()}));
+      self, *axis, wrapped.reshape({wrapped.numel()}));
   return picked.reshape(out_sizes);
 }
 
