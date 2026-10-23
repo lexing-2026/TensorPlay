@@ -1666,6 +1666,40 @@ std::optional<Tensor> sum_leading_rows_split_impl(
     constexpr int64_t vs = Vec::size();
     const int64_t vec_cols = cols & ~(vs - 1);
 
+    // Fold n rows starting at row index r0 into one accumulator slice. Four
+    // rows land in each accumulator slot before it is read back, so the buffer
+    // is touched a quarter as often: that is the difference between a pass
+    // limited by L1 traffic and one limited by the input stream.
+    auto fold_rows = [&](Scalar* TP_RESTRICT acc, int64_t r0, int64_t n) {
+        int64_t s = 0;
+        for (; s + 4 <= n; s += 4) {
+            const Scalar* TP_RESTRICT p0 = in + (r0 + s) * cols;
+            const Scalar* TP_RESTRICT p1 = p0 + cols;
+            const Scalar* TP_RESTRICT p2 = p1 + cols;
+            const Scalar* TP_RESTRICT p3 = p2 + cols;
+            int64_t j = 0;
+            for (; j + vs <= cols; j += vs) {
+                (Vec::loadu(acc + j) +
+                 ((Vec::loadu(p0 + j) + Vec::loadu(p1 + j)) +
+                  (Vec::loadu(p2 + j) + Vec::loadu(p3 + j))))
+                    .store(acc + j);
+            }
+            for (; j < cols; ++j) {
+                acc[j] += ((p0[j] + p1[j]) + (p2[j] + p3[j]));
+            }
+        }
+        for (; s < n; ++s) {
+            const Scalar* TP_RESTRICT row = in + (r0 + s) * cols;
+            int64_t j = 0;
+            for (; j + vs <= cols; j += vs) {
+                (Vec::loadu(acc + j) + Vec::loadu(row + j)).store(acc + j);
+            }
+            for (; j < cols; ++j) {
+                acc[j] += row[j];
+            }
+        }
+    };
+
     tensorplay::parallel::parallel_for(
         0, nthreads, 1, [&](int64_t b, int64_t be) {
             (void)be;
@@ -1674,16 +1708,7 @@ std::optional<Tensor> sum_leading_rows_split_impl(
             const int64_t re = std::min(rows, rb + grain);
             if (!cascade) {
                 std::memset(a0, 0, cols * sizeof(Scalar));
-                for (int64_t r = rb; r < re; ++r) {
-                    const Scalar* TP_RESTRICT row = in + r * cols;
-                    int64_t j = 0;
-                    for (; j + vs <= cols; j += vs) {
-                        (Vec::loadu(a0 + j) + Vec::loadu(row + j)).store(a0 + j);
-                    }
-                    for (; j < cols; ++j) {
-                        a0[j] += row[j];
-                    }
-                }
+                fold_rows(a0, rb, re - rb);
                 return;
             }
             Scalar* TP_RESTRICT a1 = a0 + cols;
@@ -1698,16 +1723,7 @@ std::optional<Tensor> sum_leading_rows_split_impl(
             int64_t r = rb;
             int64_t groups = 0;
             for (; r + group <= re; r += group) {
-                for (int64_t s = 0; s < group; ++s) {
-                    const Scalar* TP_RESTRICT row = in + (r + s) * cols;
-                    int64_t j = 0;
-                    for (; j + vs <= cols; j += vs) {
-                        (Vec::loadu(a0 + j) + Vec::loadu(row + j)).store(a0 + j);
-                    }
-                    for (; j < cols; ++j) {
-                        a0[j] += row[j];
-                    }
-                }
+                fold_rows(a0, r, group);
                 ++groups;
                 for (int64_t j = 0; j + vs <= cols; j += vs) {
                     (Vec::loadu(a1 + j) + Vec::loadu(a0 + j)).store(a1 + j);
@@ -1739,16 +1755,7 @@ std::optional<Tensor> sum_leading_rows_split_impl(
                     }
                 }
             }
-            for (; r < re; ++r) {
-                const Scalar* TP_RESTRICT row = in + r * cols;
-                int64_t j = 0;
-                for (; j + vs <= cols; j += vs) {
-                    (Vec::loadu(a0 + j) + Vec::loadu(row + j)).store(a0 + j);
-                }
-                for (; j < cols; ++j) {
-                    a0[j] += row[j];
-                }
-            }
+            fold_rows(a0, r, re - r);
             for (int64_t j = 0; j + vs <= cols; j += vs) {
                 (Vec::loadu(a0 + j) + Vec::loadu(a1 + j) + Vec::loadu(a2 + j) +
                  Vec::loadu(a3 + j))
@@ -2551,9 +2558,21 @@ Tensor sum_dim_kernel_impl(const Tensor& self, const std::vector<int64_t>& dims,
                 const int64_t row_grain = std::max<int64_t>(1, GRAIN_SIZE / std::max<int64_t>(cols, 1));
                 tensorplay::parallel::parallel_for(0, rows, row_grain, [&](int64_t rb, int64_t re) {
                     float* TP_RESTRICT acc = partials[tensorplay::parallel::get_thread_num()].data();
-                    const float* TP_RESTRICT rp = in + rb * cols;
-                    for (int64_t r = rb; r < re; ++r, rp += cols) {
-                        const float* TP_RESTRICT rowp = rp;
+                    // Four rows land in each accumulator slot before it is read
+                    // back, so the column buffer is touched a quarter as often:
+                    // that is the difference between a pass limited by L1
+                    // traffic and one limited by memory.
+                    const int64_t re4 = rb + (re - rb) / 4 * 4;
+                    for (int64_t r = rb; r < re4; r += 4) {
+                        const float* TP_RESTRICT r0 = in + r * cols;
+                        const float* TP_RESTRICT r1 = r0 + cols;
+                        const float* TP_RESTRICT r2 = r1 + cols;
+                        const float* TP_RESTRICT r3 = r2 + cols;
+                        for (int64_t j = 0; j < cols; ++j)
+                            acc[j] += ((r0[j] + r1[j]) + (r2[j] + r3[j]));
+                    }
+                    for (int64_t r = re4; r < re; ++r) {
+                        const float* TP_RESTRICT rowp = in + r * cols;
                         for (int64_t j = 0; j < cols; ++j) acc[j] += rowp[j];
                     }
                 });
@@ -2569,9 +2588,17 @@ Tensor sum_dim_kernel_impl(const Tensor& self, const std::vector<int64_t>& dims,
                 const int64_t row_grain = std::max<int64_t>(1, GRAIN_SIZE / std::max<int64_t>(cols, 1));
                 tensorplay::parallel::parallel_for(0, rows, row_grain, [&](int64_t rb, int64_t re) {
                     double* TP_RESTRICT acc = partials[tensorplay::parallel::get_thread_num()].data();
-                    const double* TP_RESTRICT rp = in + rb * cols;
-                    for (int64_t r = rb; r < re; ++r, rp += cols) {
-                        const double* TP_RESTRICT rowp = rp;
+                    const int64_t re4 = rb + (re - rb) / 4 * 4;
+                    for (int64_t r = rb; r < re4; r += 4) {
+                        const double* TP_RESTRICT r0 = in + r * cols;
+                        const double* TP_RESTRICT r1 = r0 + cols;
+                        const double* TP_RESTRICT r2 = r1 + cols;
+                        const double* TP_RESTRICT r3 = r2 + cols;
+                        for (int64_t j = 0; j < cols; ++j)
+                            acc[j] += ((r0[j] + r1[j]) + (r2[j] + r3[j]));
+                    }
+                    for (int64_t r = re4; r < re; ++r) {
+                        const double* TP_RESTRICT rowp = in + r * cols;
                         for (int64_t j = 0; j < cols; ++j) acc[j] += rowp[j];
                     }
                 });
