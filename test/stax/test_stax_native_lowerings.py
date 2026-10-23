@@ -221,6 +221,38 @@ def test_windows_named_by_indexing(device, call_outs):
 
 
 @pytest.mark.parametrize("device", DEVICES)
+def test_writes_by_a_position_list_reach_their_call(device):
+    # A position list may name one place twice, so the write is run through
+    # rather than written out.  The region still has to be built, and the flag
+    # saying whether the new value adds to or replaces the old one has to reach
+    # the call: the two answers differ over a repeated position.
+    tp.manual_seed(0)
+    x = tp.randn(64, 32, 8, 8, device=device)
+    index = (tp.arange(64, device=device) % 32).to(tp.int64)
+
+    def add_fn(x, index):
+        y = F.group_norm(x, 32)
+        acc = tp.zeros(32, 32, device=device, dtype=x.dtype)
+        acc.index_add_(0, index, y.mean((2, 3)))
+        return acc
+
+    def copy_fn(x, index):
+        y = F.group_norm(x, 32)
+        acc = tp.zeros(32, 32, device=device, dtype=x.dtype)
+        acc.index_copy_(0, index, y.mean((2, 3)))
+        return acc
+
+    was_deterministic = tp.are_deterministic_algorithms_enabled()
+    tp.use_deterministic_algorithms(True)
+    try:
+        for fn in (add_fn, copy_fn):
+            out = tp.compile(fn, strict_native=True)(x, index)
+            assert tp.allclose(out, fn(x, index), atol=1e-5, rtol=1e-5)
+    finally:
+        tp.use_deterministic_algorithms(was_deterministic)
+
+
+@pytest.mark.parametrize("device", DEVICES)
 def test_var_mean_with_a_correction(device):
     tp.manual_seed(0)
     x = tp.randn(6, 10, device=device)

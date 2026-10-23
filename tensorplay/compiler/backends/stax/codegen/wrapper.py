@@ -1347,7 +1347,11 @@ class IndexPutFallbackLine(WrapperLine):
         ]
 
         self.wrapper._generate_index_put_fallback(
-            node.get_kernel_name(), x, indices, values, *node.codegen_const_args()
+            node.get_kernel_name(),
+            x,
+            indices,
+            values,
+            *(self.wrapper.val_to_arg_str(a) for a in node.constant_args),
         )
 
     def codegen_fx(self, converter: FxConverter) -> FxConversionFunc:
