@@ -3913,12 +3913,10 @@ void lerp_tensor_bf16_walk(const tensorplay::BFloat16* self,
     const __m256 abs_mask = _mm256_set1_ps(-0.0f);
     int64_t i = 0;
     for (; i + 16 <= n; i += 16) {
-        const __m256 s0 = tensorplay::cpu::vecreduced::widen_bf16_8(self_bits + i);
-        const __m256 e0 = tensorplay::cpu::vecreduced::widen_bf16_8(end_bits + i);
-        const __m256 w0 = tensorplay::cpu::vecreduced::widen_bf16_8(weight_bits + i);
-        const __m256 s1 = tensorplay::cpu::vecreduced::widen_bf16_8(self_bits + i + 8);
-        const __m256 e1 = tensorplay::cpu::vecreduced::widen_bf16_8(end_bits + i + 8);
-        const __m256 w1 = tensorplay::cpu::vecreduced::widen_bf16_8(weight_bits + i + 8);
+        __m256 s0, s1, e0, e1, w0, w1;
+        tensorplay::cpu::vecreduced::widen_bf16_16(self_bits + i, s0, s1);
+        tensorplay::cpu::vecreduced::widen_bf16_16(end_bits + i, e0, e1);
+        tensorplay::cpu::vecreduced::widen_bf16_16(weight_bits + i, w0, w1);
         const __m256 small0 = _mm256_cmp_ps(
             _mm256_andnot_ps(abs_mask, w0), half, _CMP_LT_OQ);
         const __m256 small1 = _mm256_cmp_ps(
@@ -3927,9 +3925,9 @@ void lerp_tensor_bf16_walk(const tensorplay::BFloat16* self,
         const __m256 coeff1 = _mm256_blendv_ps(_mm256_sub_ps(w1, one), w1, small1);
         const __m256 base0 = _mm256_blendv_ps(e0, s0, small0);
         const __m256 base1 = _mm256_blendv_ps(e1, s1, small1);
-        // One 16-wide store: packing the two halves before writing keeps the
+        // One 16-wide store: packing the two answers before writing keeps the
         // crossing the same and drops a store from the step.
-        tensorplay::cpu::vecreduced::store_bf16_16(
+        tensorplay::cpu::vecreduced::store_bf16_16_pair(
             out_bits + i,
             _mm256_fmadd_ps(coeff0, _mm256_sub_ps(e0, s0), base0),
             _mm256_fmadd_ps(coeff1, _mm256_sub_ps(e1, s1), base1));

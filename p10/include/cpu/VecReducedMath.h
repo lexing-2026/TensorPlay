@@ -88,6 +88,26 @@ inline __m256 widen_bf16_8(const uint16_t* p) {
             _mm_loadu_si128(reinterpret_cast<const __m128i*>(p))), 16));
 }
 
+// Sixteen of the other reduced width crossed into single precision at once.
+// The layout is the upper half of the single-precision pattern, so each
+// element's sixteen bits only have to be moved up into a box of their own: the
+// register that is read is interleaved with an empty one, which puts every
+// element in the low half of its box and leaves the box's upper half to carry
+// the sign and the exponent.  Two boxes come of one such move, and the sixteen
+// elements they hold are the leading four and the trailing four of each group
+// of eight -- the first answer carries the leading four of both halves of the
+// register, the second the trailing four.  A walk that keeps the two answers
+// together until the store therefore needs no moving of its own before it
+// writes, which is what the paired store below counts on.
+__attribute__((target("avx2"), always_inline))
+inline void widen_bf16_16(const uint16_t* p, __m256& lo, __m256& hi) {
+    const __m256i bits =
+        _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+    const __m256i empty = _mm256_setzero_si256();
+    lo = _mm256_castsi256_ps(_mm256_unpacklo_epi16(empty, bits));
+    hi = _mm256_castsi256_ps(_mm256_unpackhi_epi16(empty, bits));
+}
+
 // The eight answers held in `v`, gathered into the low half of the result.
 __attribute__((target("avx2"), always_inline))
 inline __m256i narrow_bf16_8(__m256 v) {
@@ -133,6 +153,19 @@ inline void store_bf16_16(uint16_t* p, __m256 lo, __m256 hi) {
     _mm256_storeu_si256(
         reinterpret_cast<__m256i*>(p),
         _mm256_permute4x64_epi64(packed, 0xD8));
+}
+
+// Sixteen answers landed by one store, given in the two-answer form that the
+// widening above hands back.  The packing takes four words from each register
+// per half, and the two registers hold the leading and the trailing four of
+// the same group of eight, so the words come out in the order the elements
+// went in: the moving that a sequential pair of answers would need is already
+// in the crossing, and costs nothing here.
+__attribute__((target("avx2"), always_inline))
+inline void store_bf16_16_pair(uint16_t* p, __m256 lo, __m256 hi) {
+    _mm256_storeu_si256(
+        reinterpret_cast<__m256i*>(p),
+        _mm256_packus_epi32(narrow_bf16_8(lo), narrow_bf16_8(hi)));
 }
 
 #else
