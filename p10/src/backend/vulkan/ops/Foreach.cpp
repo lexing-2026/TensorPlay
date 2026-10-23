@@ -640,6 +640,52 @@ std::vector<Tensor> foreach_mm_kernel(
   });
 }
 
+// A group of gradients that were scaled before the backward pass: every tensor
+// is scanned for a lane that is not a number, and the flag is raised on the
+// device so the scan costs no round trip.  Every tensor is then divided by the
+// scale, including the group that raised the flag, since the caller discards
+// the gradients once the flag is up.  The scan reads a lane before the division
+// touches it, so a scale that turns a finite lane into a non-finite one does
+// not raise the flag by itself.
+void amp_foreach_non_finite_check_and_unscale_kernel(
+    std::vector<Tensor> self, Tensor& found_inf, const Tensor& inv_scale) {
+  if (self.empty()) return;
+  if (found_inf.numel() != 1 || inv_scale.numel() != 1) {
+    TP_THROW(
+        RuntimeError,
+        "_amp_foreach_non_finite_check_and_unscale_: found_inf and inv_scale "
+        "must be 1-element tensors");
+  }
+  if (found_inf.dtype() != DType::Float32 ||
+      inv_scale.dtype() != DType::Float32) {
+    TP_THROW(
+        RuntimeError,
+        "_amp_foreach_non_finite_check_and_unscale_: found_inf and inv_scale "
+        "must be float32");
+  }
+  switch (self.front().dtype()) {
+    case DType::Float32:
+    case DType::Float16:
+      break;
+    default:
+      TP_THROW(
+          NotImplementedError,
+          "_amp_foreach_non_finite_check_and_unscale_: unsupported dtype");
+  }
+
+  Tensor failed = tpx::ops::any(
+      tpx::ops::logical_not(tpx::ops::isfinite(self.front())));
+  for (size_t i = 1; i < self.size(); ++i) {
+    failed = tpx::ops::logical_or(
+        failed,
+        tpx::ops::any(tpx::ops::logical_not(tpx::ops::isfinite(self[i]))));
+  }
+  tpx::ops::copy_(found_inf, tpx::ops::where(failed, 1.0, found_inf));
+  for (Tensor& value : self) {
+    tpx::ops::copy_(value, tpx::ops::mul(value, inv_scale));
+  }
+}
+
 // A group raised to a count.  The exponent is either one count, one count per
 // tensor, or a payload of its own, and a shared base may be a count or a
 // payload held beside the walk.
@@ -927,6 +973,10 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, ForeachKernels) {
   m.impl(
       "_foreach_mm",
       &tensorplay::vulkan::ops::foreach_mm_kernel);
+
+  m.impl(
+      "_amp_foreach_non_finite_check_and_unscale_",
+      &tensorplay::vulkan::ops::amp_foreach_non_finite_check_and_unscale_kernel);
 
   m.impl(
       "_foreach_pow.Scalar",

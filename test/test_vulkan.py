@@ -7789,6 +7789,17 @@ class TestVulkanForeachGroup(unittest.TestCase):
     def _read(group):
         return [held.cpu().numpy() for held in group]
 
+    def _unscale(self, group, device, inv_scale, found=None):
+        if found is None:
+            found = tensorplay.tensor(
+                0.0, dtype=tensorplay.float32, device=device)
+        scale = tensorplay.tensor(
+            inv_scale, dtype=tensorplay.float32, device=device)
+        self.assertIsNone(
+            tensorplay._amp_foreach_non_finite_check_and_unscale_(
+                group, found, scale))
+        return found
+
     def _answers(self, held, want, label, device, rtol=1e-5, atol=1e-6):
         self.assertEqual(len(held), len(want), msg=f"{label} on {device}")
         for index, (answer, truth) in enumerate(zip(held, want)):
@@ -8631,6 +8642,103 @@ class TestVulkanForeachGroup(unittest.TestCase):
                     ValueError, "tensor list arguments must have the same length"):
                 tensorplay._foreach_mm(
                     self._group(lefts, device), self._group(rights, device))
+
+    def test_a_clean_group_is_divided_by_the_scale_it_was_given(self):
+        # The scale is held as a single lane, and every lane of every tensor is
+        # divided by it; a scale of one leaves the group where it was.
+        tables = [self._table((3,)), self._table((2, 4), start=1.0)]
+        for inv_scale in (0.25, 1.0):
+            want = [np.ascontiguousarray(table * np.float32(inv_scale))
+                    for table in tables]
+            for device in ("vulkan", "cpu"):
+                group = self._group(tables, device)
+                found = self._unscale(group, device, inv_scale)
+                self.assertEqual(float(found.cpu().numpy()), 0.0, msg=device)
+                self._answers(
+                    self._read(group), want,
+                    f"amp unscale by {inv_scale}", device)
+
+    def test_a_group_with_a_lane_that_is_not_a_number_raises_the_flag(self):
+        tables = [np.array([2.0, np.inf], dtype=np.float32),
+                  np.array([4.0, -np.inf], dtype=np.float32),
+                  np.array([np.nan, 1.0], dtype=np.float32)]
+        divided = [np.ascontiguousarray(table * np.float32(0.5))
+                   for table in tables]
+        for device in ("vulkan", "cpu"):
+            group = self._group(tables, device)
+            found = self._unscale(group, device, 0.5)
+            self.assertEqual(float(found.cpu().numpy()), 1.0, msg=device)
+            if device == "vulkan":
+                # The device lane divides every group it is handed, whether or
+                # not the scan raised the flag; the host lane leaves a flagged
+                # group alone.
+                np.testing.assert_allclose(
+                    self._read(group), divided, rtol=1e-5, atol=1e-6,
+                    equal_nan=True)
+
+    def test_a_group_is_still_divided_after_the_flag_was_raised(self):
+        # A flag that is already up is not a reason to skip the division: the
+        # flag is only ever raised, never lowered, by this walk.  The host lane
+        # returns before touching the group in this case.
+        tables = [self._table((4,))]
+        want = [np.ascontiguousarray(table * np.float32(0.5))
+                for table in tables]
+        device = "vulkan"
+        group = self._group(tables, device)
+        found = tensorplay.tensor(1.0, dtype=tensorplay.float32, device=device)
+        found = self._unscale(group, device, 0.5, found)
+        self.assertEqual(float(found.cpu().numpy()), 1.0)
+        self._answers(self._read(group), want,
+                      "amp unscale after the flag was raised", device)
+
+    def test_a_group_that_names_no_tensor_leaves_the_flag_alone(self):
+        for device in ("vulkan", "cpu"):
+            found = self._unscale([], device, 0.5)
+            self.assertEqual(float(found.cpu().numpy()), 0.0, msg=device)
+
+    def test_a_half_group_is_divided_in_a_wider_width(self):
+        tables = [self._table((4,), dtype=np.float16),
+                  self._table((3,), dtype=np.float16, start=1.0)]
+        want = [np.ascontiguousarray(
+            (table.astype(np.float32) * np.float32(0.25)).astype(np.float16))
+            for table in tables]
+        for device in ("vulkan", "cpu"):
+            group = self._group(tables, device)
+            found = self._unscale(group, device, 0.25)
+            self.assertEqual(float(found.cpu().numpy()), 0.0, msg=device)
+            self._answers(self._read(group), want,
+                          "amp unscale of a half group", device)
+
+    def test_a_flag_or_scale_that_is_not_one_float_lane_is_refused(self):
+        # The flag is written as one float lane and the scale is read as one, so
+        # a wider flag or a counted one is refused on the device lane.  The host
+        # lane reads the first word of whatever it is handed.
+        device = "vulkan"
+        group = self._group([self._table((2,))], device)
+        scale = tensorplay.tensor(0.5, dtype=tensorplay.float32, device=device)
+        wide = tensorplay.tensor(
+            [0.0, 0.0], dtype=tensorplay.float32, device=device)
+        with self.assertRaisesRegex(RuntimeError, "1-element tensors"):
+            tensorplay._amp_foreach_non_finite_check_and_unscale_(
+                group, wide, scale)
+        counted = tensorplay.tensor([0], dtype=tensorplay.int32, device=device)
+        with self.assertRaisesRegex(RuntimeError, "must be float32"):
+            tensorplay._amp_foreach_non_finite_check_and_unscale_(
+                group, counted, scale)
+
+    def test_a_counted_group_is_refused(self):
+        tables = [np.array([1, 2], dtype=np.int32)]
+        for device in ("vulkan", "cpu"):
+            group = self._group(tables, device)
+            found = tensorplay.tensor(
+                0.0, dtype=tensorplay.float32, device=device)
+            scale = tensorplay.tensor(
+                0.5, dtype=tensorplay.float32, device=device)
+            with self.assertRaisesRegex(
+                    NotImplementedError, "unsupported dtype"):
+                tensorplay._amp_foreach_non_finite_check_and_unscale_(
+                    group, found, scale)
+            self.assertEqual(float(found.cpu().numpy()), 0.0, msg=device)
 
 
 class TestVulkanRowAccumulation(unittest.TestCase):
