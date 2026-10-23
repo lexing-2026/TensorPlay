@@ -691,6 +691,43 @@ std::tuple<Tensor, Tensor> nanmedian_dim_values_cpu(
     return {values, indices};
 }
 
+template <typename T>
+inline bool summary_value_is_nan(T value) {
+    if constexpr (std::is_same_v<T, float> || std::is_same_v<T, double>) {
+        return std::isnan(value);
+    } else if constexpr (std::is_same_v<T, Half> ||
+                         std::is_same_v<T, BFloat16>) {
+        return std::isnan(static_cast<float>(value));
+    } else {
+        return false;
+    }
+}
+
+// Two entries an ordered line may treat as one run.  A NaN is equal only to
+// another NaN, so it never lengthens the run of the number it lands beside once
+// ordered; reading this as "neither is less" would do exactly that, because
+// every comparison with a NaN is false.
+template <typename T>
+inline bool summary_same_value(T lhs, T rhs) {
+    const bool lhs_nan = summary_value_is_nan(lhs);
+    const bool rhs_nan = summary_value_is_nan(rhs);
+    if (lhs_nan || rhs_nan) return lhs_nan && rhs_nan;
+    return lhs == rhs;
+}
+
+// Order for a run count: numbers ascending, then NaNs after every number with
+// their input positions ascending, so a stretch of NaNs sits in one run.
+template <typename T>
+inline bool summary_value_less(
+        const std::pair<T, int64_t>& lhs, const std::pair<T, int64_t>& rhs) {
+    const bool lhs_nan = summary_value_is_nan(lhs.first);
+    const bool rhs_nan = summary_value_is_nan(rhs.first);
+    if (lhs_nan != rhs_nan) return !lhs_nan;
+    if (lhs_nan) return lhs.second < rhs.second;
+    if (!summary_same_value(lhs.first, rhs.first)) return lhs.first < rhs.first;
+    return lhs.second < rhs.second;
+}
+
 std::tuple<Tensor, Tensor> mode_cpu(const Tensor& self, int64_t dim,
                                     bool keepdim) {
     const int64_t nd = self.dim();
@@ -735,15 +772,12 @@ std::tuple<Tensor, Tensor> mode_cpu(const Tensor& self, int64_t dim,
                 const int64_t o = si / inner, in2 = si % inner; \
                 const ctype* src = sp + o * d_size * inner + in2; \
                 for (int64_t j = 0; j < d_size; ++j) buf[j] = {src[j * inner], j}; \
-                std::sort(buf.begin(), buf.begin() + d_size, [](const auto& a, const auto& b) { \
-                    if (!(a.first < b.first) && !(b.first < a.first)) return a.second < b.second; \
-                    return a.first < b.first; \
-                }); \
+                std::sort(buf.begin(), buf.begin() + d_size, summary_value_less<ctype>); \
                 ctype best_value = buf[0].first; \
                 int64_t best_count = 0, best_index = buf[0].second, run = 0; \
                 for (int64_t j = 0; j < d_size; ++j) { \
-                    const bool same = j > 0 && !(buf[j].first < buf[j - 1].first) && \
-                                      !(buf[j - 1].first < buf[j].first); \
+                    const bool same = j > 0 && \
+                        summary_same_value(buf[j].first, buf[j - 1].first); \
                     run = same ? run + 1 : 1; \
                     if (run > best_count) { \
                         best_count = run; best_value = buf[j].first; best_index = buf[j].second; \
@@ -763,23 +797,11 @@ std::tuple<Tensor, Tensor> mode_cpu(const Tensor& self, int64_t dim,
 }
 
 template <typename T>
-inline bool kthvalue_is_nan(T value) {
-    if constexpr (std::is_same_v<T, float> || std::is_same_v<T, double>) {
-        return std::isnan(value);
-    } else if constexpr (std::is_same_v<T, Half> ||
-                         std::is_same_v<T, BFloat16>) {
-        return std::isnan(static_cast<float>(value));
-    } else {
-        return false;
-    }
-}
-
-template <typename T>
 struct KthValueLess {
     bool operator()(const std::pair<T, int64_t>& lhs,
                     const std::pair<T, int64_t>& rhs) const {
-        const bool lhs_nan = kthvalue_is_nan(lhs.first);
-        const bool rhs_nan = kthvalue_is_nan(rhs.first);
+        const bool lhs_nan = summary_value_is_nan(lhs.first);
+        const bool rhs_nan = summary_value_is_nan(rhs.first);
         if (lhs_nan != rhs_nan) return !lhs_nan;
         if (lhs_nan) return lhs.second < rhs.second;
         if (lhs.first != rhs.first) return lhs.first < rhs.first;

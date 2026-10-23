@@ -90,6 +90,64 @@ __global__ void nanmedian_pick_sorted_kernel(int64_t n, const T* sorted,
 }
 
 
+// Whether two entries are the same value for the purposes of a run or a match.
+// A NaN counts as equal only to another NaN, so a stretch of NaNs is one run
+// and a NaN never joins the run of the number it sits beside once ordered --
+// reading this as "neither is less" would do exactly that, because every
+// comparison with a NaN is false.
+template <typename T>
+__device__ inline bool same_ordered_value(T lhs, T rhs) {
+    if constexpr (std::is_same<T, float>::value ||
+                  std::is_same<T, double>::value) {
+        return lhs == rhs || (::isnan(lhs) && ::isnan(rhs));
+    } else if constexpr (std::is_same<T, Half>::value ||
+                         std::is_same<T, BFloat16>::value) {
+        return lhs == rhs ||
+            (::isnan(static_cast<float>(lhs)) &&
+             ::isnan(static_cast<float>(rhs)));
+    } else {
+        return lhs == rhs;
+    }
+}
+
+
+// Smallest position holding the selected value.  A lane keeps its own earliest
+// hit and the block folds those with shuffles and one slot per warp: a shared
+// atomic per hit would serialise on the address the moment a slice repeats the
+// selected value, and its 64-bit form is a compare-and-swap loop.
+template <typename T>
+__device__ inline int64_t reduce_first_match(
+        const T* slice_input, int64_t d_size, int64_t inner, T selected,
+        uint32_t* warp_span) {
+    const int64_t stride = static_cast<int64_t>(blockDim.x);
+    const uint32_t none = static_cast<uint32_t>(d_size);
+    uint32_t own = none;
+    for (int64_t i = static_cast<int64_t>(threadIdx.x); i < d_size;
+         i += stride) {
+        if (same_ordered_value(slice_input[i * inner], selected)) {
+            own = static_cast<uint32_t>(i);
+            break;
+        }
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const uint32_t other = __shfl_down_sync(0xffffffffu, own, offset);
+        if (other < own) own = other;
+    }
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    if (lane == 0) warp_span[warp] = own;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const int warps = static_cast<int>(blockDim.x) >> 5;
+        for (int w = 1; w < warps; ++w) {
+            if (warp_span[w] < warp_span[0]) warp_span[0] = warp_span[w];
+        }
+    }
+    __syncthreads();
+    return static_cast<int64_t>(warp_span[0]);
+}
+
+
 template <typename T, typename index_t>
 __global__ void median_select_dim_kernel(
         index_t n_slices, index_t d_size, index_t inner, const T* input,
@@ -98,10 +156,9 @@ __global__ void median_select_dim_kernel(
     if (si >= n_slices) return;
     __shared__ index_t radix_smem[32];
     __shared__ unsigned long long nan_count;
-    __shared__ unsigned long long selected_index;
+    __shared__ uint32_t match_span[32];
     if (threadIdx.x == 0) {
         nan_count = 0;
-        selected_index = static_cast<unsigned long long>(d_size);
     }
     __syncthreads();
 
@@ -130,18 +187,11 @@ __global__ void median_select_dim_kernel(
     T median = static_cast<T>(0);
     topk_detail::topk_radix_select<T, index_t>(
         slice_input, k, false, d_size, inner, radix_smem, &median);
-    for (index_t i = static_cast<index_t>(threadIdx.x); i < d_size;
-         i += static_cast<index_t>(blockDim.x)) {
-        const T value = slice_input[i * inner];
-        if (value == median ||
-            (reduce_value_is_nan(value) && reduce_value_is_nan(median))) {
-            atomicMin(&selected_index, static_cast<unsigned long long>(i));
-        }
-    }
-    __syncthreads();
+    const int64_t first_match =
+        reduce_first_match(slice_input, d_size, inner, median, match_span);
     if (threadIdx.x == 0) {
         values[si] = median;
-        indices[si] = static_cast<int64_t>(selected_index);
+        indices[si] = first_match;
     }
 }
 
@@ -153,11 +203,7 @@ __global__ void kthvalue_select_kernel(
     const index_t si = static_cast<index_t>(blockIdx.x);
     if (si >= n_slices) return;
     __shared__ index_t radix_smem[32];
-    __shared__ unsigned long long selected_index;
-    if (threadIdx.x == 0) {
-        selected_index = static_cast<unsigned long long>(d_size);
-    }
-    __syncthreads();
+    __shared__ uint32_t match_span[32];
 
     const index_t outer_index = si / inner;
     const index_t inner_index = si % inner;
@@ -165,36 +211,14 @@ __global__ void kthvalue_select_kernel(
     T selected = static_cast<T>(0);
     topk_detail::topk_radix_select<T, index_t>(
         slice_input, k, false, d_size, inner, radix_smem, &selected);
-    for (index_t i = static_cast<index_t>(threadIdx.x); i < d_size;
-         i += static_cast<index_t>(blockDim.x)) {
-        const T value = slice_input[i * inner];
-        if (value == selected ||
-            (reduce_value_is_nan(value) && reduce_value_is_nan(selected))) {
-            atomicMin(&selected_index, static_cast<unsigned long long>(i));
-        }
-    }
-    __syncthreads();
+    const int64_t first_match =
+        reduce_first_match(slice_input, d_size, inner, selected, match_span);
     if (threadIdx.x == 0) {
         values[si] = selected;
-        indices[si] = static_cast<int64_t>(selected_index);
+        indices[si] = first_match;
     }
 }
 
-
-template <typename T>
-__device__ inline bool kthvalue_same_value(T lhs, T rhs) {
-    if constexpr (std::is_same<T, float>::value ||
-                  std::is_same<T, double>::value) {
-        return lhs == rhs || (::isnan(lhs) && ::isnan(rhs));
-    } else if constexpr (std::is_same<T, Half>::value ||
-                         std::is_same<T, BFloat16>::value) {
-        return lhs == rhs ||
-            (::isnan(static_cast<float>(lhs)) &&
-             ::isnan(static_cast<float>(rhs)));
-    } else {
-        return lhs == rhs;
-    }
-}
 
 // NaNs rank as the largest values, while the sign-magnitude order puts a
 // negatively signed NaN below every number and a positively signed one above.
@@ -274,7 +298,7 @@ __global__ void kthvalue_from_sorted_kernel(
     int64_t hi = target;
     while (lo < hi) {
         const int64_t mid = lo + (hi - lo) / 2;
-        if (kthvalue_same_value(source[mid * inner], value)) {
+        if (same_ordered_value(source[mid * inner], value)) {
             hi = mid;
         } else {
             lo = mid + 1;
@@ -282,12 +306,6 @@ __global__ void kthvalue_from_sorted_kernel(
     }
     values[si] = value;
     indices[si] = source_indices[lo * inner];
-}
-
-
-template <typename T>
-__device__ inline bool mode_value_equal(T lhs, T rhs) {
-    return !(lhs < rhs) && !(rhs < lhs);
 }
 
 
@@ -303,7 +321,7 @@ __device__ inline int64_t mode_run_start(
     int64_t hi = position;
     while (lo < hi) {
         const int64_t mid = lo + (hi - lo) / 2;
-        if (mode_value_equal(ordered[mid], value)) {
+        if (same_ordered_value(ordered[mid], value)) {
             hi = mid;
         } else {
             lo = mid + 1;
@@ -314,15 +332,20 @@ __device__ inline int64_t mode_run_start(
 
 
 // Longest run among the per-thread candidates of one block.  Equal lengths are
-// settled by the reduction tree itself: each step keeps the value already held
-// unless the partner reports strictly more, so the surviving position depends
-// only on where the tied runs sit.  The winner is broadcast through shared
-// memory so every thread can use it.
+// settled by position, not by the order the reduction happens to visit them: a
+// shuffle butterfly moves a later lane's report into an earlier one before the
+// two ever meet, so "keep unless the partner reports strictly more" would let a
+// later run outrank an earlier one of the same length.  The earlier run is the
+// run of the smaller value, which is what the ordered-route fold also reports.
+// Threads past the last pair report the first position at length one, which is
+// only ever chosen when every run is a single value.  The winner is broadcast
+// through shared memory so every thread can use it.
 __device__ inline int64_t mode_block_longest_run(int64_t length, int64_t position) {
     for (int offset = 16; offset > 0; offset >>= 1) {
         const int64_t other_length = __shfl_down_sync(0xffffffffu, length, offset);
         const int64_t other_position = __shfl_down_sync(0xffffffffu, position, offset);
-        if (other_length > length) {
+        if (other_length > length ||
+            (other_length == length && other_position < position)) {
             length = other_length;
             position = other_position;
         }
@@ -345,7 +368,8 @@ __device__ inline int64_t mode_block_longest_run(int64_t length, int64_t positio
                 __shfl_down_sync(0xffffffffu, length, offset);
             const int64_t other_position =
                 __shfl_down_sync(0xffffffffu, position, offset);
-            if (other_length > length) {
+            if (other_length > length ||
+                (other_length == length && other_position < position)) {
                 length = other_length;
                 position = other_position;
             }
@@ -519,23 +543,29 @@ __global__ void mode_fused_kernel(
     __syncthreads();
     mode_bitonic_sort<T, Power2Size>(sorted, valid);
 
-    // Each thread owns the adjacent ordered pair 2t and 2t+1 and reports how
-    // far into its run the later of the two sits; positions past the slice
-    // report zero, which never beats a real position.  The pair is selected
-    // without branching: a lane that dropped out of the warp here would make
-    // the fold below read past it, so the last pair position repeats when the
-    // slice ends on an odd length.
+    // Each thread owns the adjacent ordered pair 2t and 2t+1, and a run is only
+    // measured where it closes: an interior position reports the same value at a
+    // shorter length, so it can never win.  Where the pair holds one value the
+    // run it belongs to ends at the later slot, where they differ the earlier
+    // slot closes its own run and the later one only opens the next, so one
+    // search per pair covers both.  Every run end is a candidate, and equal
+    // lengths settle on the earliest, which is the run of the smaller value.
     const int64_t first = static_cast<int64_t>(threadIdx.x) * 2;
     const int64_t low = first < d_size ? first : 0;
     const int64_t high = first + 1 < d_size ? first + 1 : low;
-    int64_t into_run = low - mode_run_start(sorted, low);
-    int64_t best_position = low;
-    const int64_t high_into_run = high - mode_run_start(sorted, high);
-    if (high_into_run > into_run) {
-        into_run = high_into_run;
-        best_position = high;
-    }
-    best_position = mode_block_longest_run(into_run, best_position);
+    const int64_t probe = same_ordered_value(sorted[low], sorted[high])
+        ? high : low;
+    // The slot after the last one of the slice is padding, so a probe sitting
+    // there compares against itself and reads as an end.
+    const int64_t after = probe + 1 < d_size ? probe + 1 : probe;
+    const bool closed = probe == d_size - 1 ||
+        !same_ordered_value(sorted[probe], sorted[after]);
+    int64_t into_run = 0;
+    if (closed) into_run = probe - mode_run_start(sorted, probe);
+    // The search above is taken by some lanes and not others, so the warp is
+    // explicitly reconverged before the fold reads across lanes.
+    __syncwarp();
+    const int64_t best_position = mode_block_longest_run(into_run, probe);
 
     // The reported position is the last occurrence of the mode: each thread
     // keeps the last match it owns and the block folds the per-thread results.
@@ -553,7 +583,7 @@ __global__ void mode_fused_kernel(
         const uint64_t i = static_cast<uint64_t>(threadIdx.x) + step * stride;
         const uint64_t clamped = i < length ? i : length - 1;
         const bool match = i < length &&
-            mode_value_equal(slice_input[clamped * inner], mode);
+            same_ordered_value(slice_input[clamped * inner], mode);
         best = match ? static_cast<int64_t>(i) : best;
     }
     mode_block_span(best, true, &mode_index);
@@ -641,7 +671,7 @@ __device__ inline ModeBandSummary<T> mode_join(
     out.last_value = right.last_value;
     out.best_length = left.best_length;
     out.best_start = left.best_start;
-    const bool merge = mode_value_equal(left.last_value, right.first_value);
+    const bool merge = same_ordered_value(left.last_value, right.first_value);
     // Only a left band given over to one run can pass its leading run on.
     out.first_length = left.first_length == left.length && merge
         ? left.length + right.first_length : left.first_length;
@@ -682,7 +712,7 @@ __device__ inline ModeBandSummary<T> mode_summarize_band(
     int64_t first_length = -1;
     for (int64_t j = lo + 1; j < hi; ++j) {
         const T next = source[j * inner];
-        if (mode_value_equal(next, value)) {
+        if (same_ordered_value(next, value)) {
             ++run_length;
             continue;
         }

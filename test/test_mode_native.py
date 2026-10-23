@@ -18,8 +18,10 @@ def _expected_mode(array, dim):
 
     The reported position is the last occurrence of the mode when the line is
     at most 2048 long and the first one above that, so the expectation carries
-    both rules.  Count ties settle on the smallest value.  The host path may
-    report any occurrence, so its index is only checked for validity.
+    both rules.  Count ties settle on the smallest value.  A NaN is equal only
+    to another NaN, so a stretch of NaNs counts as one value that wins solely
+    on its length.  The host path may report any occurrence, so its index is
+    only checked for validity.
     """
     moved = np.moveaxis(np.asarray(array), dim, -1)
     rows = moved.reshape(-1, moved.shape[-1])
@@ -34,7 +36,10 @@ def _expected_mode(array, dim):
             distinct, counts = np.unique(row, return_counts=True)
             value = distinct[int(np.argmax(counts))]
         out_values[r] = value
-        positions = np.flatnonzero(row == value)
+        if row.dtype.kind == "f" and np.isnan(value):
+            positions = np.flatnonzero(np.isnan(row))
+        else:
+            positions = np.flatnonzero(row == value)
         out_indices[r] = positions[-1] if size <= 2048 else positions[0]
     return (
         out_values.reshape(moved.shape[:-1]),
@@ -213,6 +218,77 @@ def test_mode_cuda_run_spans_chunk_and_band_boundaries(size):
     got = tp.mode(_as_tensor(array, "cuda"), 1)
     np.testing.assert_array_equal(_value(got.values), expected_value)
     np.testing.assert_array_equal(_value(got.indices), expected_index)
+
+
+def _nan_lines(size):
+    """Lines where a stretch of NaNs competes with the runs of numbers.
+
+    Built so each row has one unambiguous answer: a lone NaN loses every count
+    tie, a NaN stretch wins on length alone, and a tie between NaNs and a number
+    goes to the number.
+    """
+    unique = np.arange(size, dtype=np.float32) + 1.0
+    unique[size // 2] = np.nan
+    longest = np.arange(size, dtype=np.float32) + 10.0
+    longest[: max(2, size // 2)] = np.nan
+    tie = np.arange(size, dtype=np.float32) + 100.0
+    repeat = max(2, size // 4)
+    tie[:repeat] = np.nan
+    tie[repeat : 2 * repeat] = 7.0
+    return np.stack([unique, longest, tie, np.full(size, np.nan, dtype=np.float32)])
+
+
+def _check_nan_mode(array, values, indices):
+    # Ordered beside a number, a NaN must not extend that number's run, and the
+    # reported position has to really hold the reported value.
+    assert values[0] == 1.0, "a single NaN cannot outrank the unique numbers"
+    assert np.isnan(values[1]), "a NaN stretch is one run of that length"
+    assert values[2] == 7.0, "a tie between NaNs and a number goes to the number"
+    for r in range(array.shape[0]):
+        line = array[r]
+        hit = np.isnan(line) if np.isnan(values[r]) else line == values[r]
+        assert int(indices[r]) in set(np.flatnonzero(hit))
+
+
+@pytest.mark.skipif(not tp.cuda.is_available(), reason="CUDA is unavailable")
+@pytest.mark.parametrize("size", [64, 2048, 2049, 4000])
+def test_mode_cuda_nan_counts_only_as_itself(size):
+    array = _nan_lines(size)
+    expected_value, expected_index = _expected_mode(array, 1)
+    got = tp.mode(_as_tensor(array, "cuda"), 1)
+    np.testing.assert_array_equal(_value(got.values), expected_value)
+    np.testing.assert_array_equal(_value(got.indices), expected_index)
+    _check_nan_mode(array, _value(got.values), _value(got.indices))
+
+
+@pytest.mark.parametrize("size", [64, 2048, 3000])
+def test_mode_cpu_nan_counts_only_as_itself(size):
+    # The count rule is the same on both backends; the host path names any
+    # occurrence, so only the value and the validity of the position are fixed.
+    array = _nan_lines(size)
+    expected_value, _ = _expected_mode(array, 1)
+    got = tp.mode(_as_tensor(array), 1)
+    values = _value(got.values)
+    np.testing.assert_array_equal(values, expected_value)
+    _check_nan_mode(array, values, _value(got.indices))
+
+
+@pytest.mark.parametrize("size", [16, 64, 3000])
+def test_mode_cpu_count_ties_keep_smallest_value(size):
+    # Four values appear equally often, and a permuted line puts the smallest of
+    # them anywhere, so the answer is fixed by the value and not by which run the
+    # ordered line happened to visit first.
+    rng = np.random.default_rng(size + 71)
+    array = np.tile(np.arange(size) % 4, (2, 1)).astype(np.int64)
+    array[1] = rng.permutation(array[1])
+    expected_value, _ = _expected_mode(array, 1)
+    assert np.all(expected_value == 0)
+    got = tp.mode(_as_tensor(array), 1)
+    values = _value(got.values)
+    np.testing.assert_array_equal(values, expected_value)
+    indices = _value(got.indices)
+    for r in range(array.shape[0]):
+        assert array[r, indices[r]] == values[r], "the position must hold the value"
 
 
 @pytest.mark.skipif(not tp.cuda.is_available(), reason="CUDA is unavailable")
