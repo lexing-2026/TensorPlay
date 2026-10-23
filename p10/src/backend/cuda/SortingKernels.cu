@@ -370,12 +370,25 @@ void sort_radix_impl(const Tensor& self_c, Tensor& values, Tensor& indices,
     const int64_t n = self_c.numel();
     const auto device = self_c.device();
     auto stream = getCurrentCUDAStream().stream();
-    // Integer keys in a single contiguous run need no conversion: the radix
-    // sort applies the signed-key transform itself, and positions are the
-    // permutation, so the run sorts straight from the input into the two
-    // outputs without a pack or unpack pass.
-    if constexpr (std::is_integral_v<T> && !std::is_same_v<T, bool>) {
-        if (d_size == n && inner == 1) {
+    // A single contiguous run of built-in numeric keys needs no conversion:
+    // the radix sort applies the signed-integer flip itself, and its floating
+    // point key is the bit order that puts -0.0, +0.0 and the two signed NaNs
+    // where the ordered values belong.  Carrying the position as the paired
+    // value makes that order the permutation, so the run sorts straight from
+    // the input into the two outputs without a pack or an unpack pass -- the
+    // two passes would otherwise move the keys and the positions three times
+    // over.
+    //
+    // A run of at most 128 elements keeps the converted keys, because a short
+    // run is ordered by comparison rather than by bit key: comparison asks
+    // whether one value is less than another, and a NaN answers no to both
+    // ends, so every NaN settles at the top whatever its sign.  The bit order
+    // instead reads the sign bit and puts a negative NaN below every real
+    // number, which is not what a comparison gives.
+    if constexpr ((std::is_integral_v<T> && !std::is_same_v<T, bool>) ||
+                  std::is_same_v<T, float> || std::is_same_v<T, double>) {
+        if (d_size == n && inner == 1 &&
+            (!std::is_floating_point_v<T> || d_size > 128)) {
             const int n_items = static_cast<int>(n);
             const int fill_blocks =
                 static_cast<int>((n + kThreads - 1) / kThreads);
@@ -760,7 +773,7 @@ Tensor argsort_cuda(const Tensor& self, int64_t dim, bool descending) {
 
 // Sorts along `dim` and returns only the values.  The permutation is never
 // materialised, so the radix passes move half the bytes.
-static Tensor sort_values_only_cuda(const Tensor& self, int64_t dim) {
+Tensor sort_values_only_cuda(const Tensor& self, int64_t dim) {
     const int64_t nd = self.dim();
     dim = wrap_dim(dim, nd);
     Tensor self_c = self.contiguous();

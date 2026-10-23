@@ -58,9 +58,16 @@ __global__ void median_select_kernel(int64_t n, const T* input, T* output) {
 
 }
 
+// Cross-file entries in this backend: the values-only radix sort (the
+// permutation costs a pass of int64 traffic per digit) and the two comparison
+// ops that settle the NaN rule without bringing an element back to the host.
+Tensor sort_values_only_cuda(const Tensor& self, int64_t dim);
+Tensor ne_kernel_cuda(const Tensor& self, const Tensor& other);
+Tensor where_cuda(const Tensor& condition, const Tensor& self, const Tensor& other);
+std::tuple<Tensor, Tensor> sort_cuda(const Tensor& self, int64_t dim,
+                                     bool descending);
+
 Tensor median_kernel(const Tensor& self) {
-    extern std::tuple<Tensor, Tensor> sort_cuda(const Tensor& self, int64_t dim,
-                                                bool descending);
     Tensor flat = self.contiguous().reshape({-1});
     const int64_t n = flat.numel();
     if (n == 0) {
@@ -99,17 +106,17 @@ Tensor median_kernel(const Tensor& self) {
     // sorted order.
     constexpr int64_t kMedianSortThreshold = int64_t{1} << 20;
     if (selection_supported && n > kMedianSortThreshold) {
-        auto sorted_pair = sort_cuda(flat, 0, false);
-        Tensor sorted = std::get<0>(sorted_pair);
-        if (isFloatingType(flat.dtype())) {
-            const Scalar last = sorted.select(0, n - 1).item();
-            if (std::isnan(last.toDouble())) {
-                return Tensor::full(
-                    {}, Scalar(std::numeric_limits<double>::quiet_NaN()),
-                    flat.dtype(), flat.device());
-            }
-        }
-        return sorted.select(0, (n - 1) / 2);
+        // Only ordered values are read back, so no permutation is carried.
+        Tensor sorted = sort_values_only_cuda(flat, 0);
+        Tensor middle = sorted.select(0, (n - 1) / 2);
+        if (!isFloatingType(flat.dtype())) return middle;
+        // A NaN orders as the largest value, so the last element says whether
+        // the array held any.  Two ordered comparisons against a NaN are both
+        // false, so `largest != largest` is the NaN test; keeping the choice on
+        // the device avoids the host round trip that a scalar read would put in
+        // the middle of every call.
+        Tensor largest = sorted.select(0, n - 1);
+        return where_cuda(ne_kernel_cuda(largest, largest), largest, middle);
     }
     if (selection_supported) {
         Tensor result = Tensor::empty({}, flat.dtype(), flat.device());
