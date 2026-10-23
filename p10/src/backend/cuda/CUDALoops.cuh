@@ -56,6 +56,25 @@ constexpr int loop_block_work_size() {
 
 #define TP_LOOP_LAUNCH_BOUNDS(n) __launch_bounds__(n)
 
+// An elementwise stream writes each output line once and never reads it back,
+// so the store is marked evict-first: cache left holding the operand lines a
+// later block still needs is worth more than the result on its way out.
+template <typename VecT>
+__device__ inline void store_vec_streaming(VecT* dst, const VecT& value) {
+    if constexpr (sizeof(VecT) == 16) {
+        __stcs(reinterpret_cast<uint4*>(dst),
+               *reinterpret_cast<const uint4*>(&value));
+    } else if constexpr (sizeof(VecT) == 8) {
+        __stcs(reinterpret_cast<uint2*>(dst),
+               *reinterpret_cast<const uint2*>(&value));
+    } else if constexpr (sizeof(VecT) == 4) {
+        __stcs(reinterpret_cast<unsigned*>(dst),
+               *reinterpret_cast<const unsigned*>(&value));
+    } else {
+        *dst = value;
+    }
+}
+
 // Lambdas passed to the loop dispatchers must carry both specifiers: a
 // host-side definition with only __device__ would be wrapped by nvcc into
 // an internal closure type whose call operator cannot be introspected.
@@ -400,7 +419,7 @@ struct vectorized {
             for (int j = 0; j < vec_size; j++) {
                 v.val[j] = from[vec_size * i + j];
             }
-            to_[index] = v;
+            store_vec_streaming(&to_[index], v);
         }
     }
 };

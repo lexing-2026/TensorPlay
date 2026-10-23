@@ -629,6 +629,20 @@ inline TensorIterator make_scalar_iter(const Tensor& out, const Tensor& input,
         .build();
 }
 
+// A same-shape elementwise stream writes each output line once and never reads
+// it back, so the store is marked evict-first: the space it would occupy in
+// cache is better spent holding the operands the next block still has to
+// fetch.  The pack is a 16-byte vector whenever the path took one.
+template <typename PackT>
+__device__ inline void store_pack_streaming(PackT* dst, const PackT& value) {
+    if constexpr (sizeof(PackT) == 16) {
+        __stcs(reinterpret_cast<uint4*>(dst),
+               *reinterpret_cast<const uint4*>(&value));
+    } else {
+        *dst = value;
+    }
+}
+
 template <typename T, int VecSize, typename Op>
 __global__ void binary_same_shape_vectorized_kernel(
     int64_t n, const T* __restrict__ a, const T* __restrict__ b,
@@ -644,7 +658,7 @@ __global__ void binary_same_shape_vectorized_kernel(
 #pragma unroll
         for (int v = 0; v < VecSize; ++v)
             po.v[v] = static_cast<T>(op(static_cast<M>(pa.v[v]), static_cast<M>(pb.v[v]), static_cast<M>(alpha)));
-        *reinterpret_cast<TPVecPack<T, VecSize>*>(y + i * VecSize) = po;
+        store_pack_streaming(reinterpret_cast<TPVecPack<T, VecSize>*>(y + i * VecSize), po);
     }
     // Tail elements past the last full vector, one per thread.
     for (int64_t j = vec_n * VecSize + tid; j < n; j += stride) {
