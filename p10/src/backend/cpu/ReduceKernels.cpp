@@ -574,30 +574,42 @@ std::tuple<Tensor, Tensor> var_mean_cpu(const Tensor& self,
 }
 
 Tensor nanmedian_cpu(const Tensor& self) {
-    Tensor flat = self.to(isFloatingType(self.dtype()) ? DType::Float64
-                                                        : DType::Int64)
+    const bool floating = isFloatingType(self.dtype());
+    Tensor flat = self.to(floating ? DType::Float64 : DType::Int64)
                       .reshape({self.numel()});
-    std::vector<double> values;
-    values.reserve(flat.numel());
-    const double* data = flat.data_ptr<double>();
-    for (int64_t i = 0; i < flat.numel(); ++i) {
-        if (!(data[i] != data[i])) values.push_back(data[i]);
+    const DType out_dtype = floating ? self.dtype() : DType::Int64;
+    Scalar picked;
+    if (floating) {
+        std::vector<double> values;
+        values.reserve(flat.numel());
+        const double* data = flat.data_ptr<double>();
+        for (int64_t i = 0; i < flat.numel(); ++i) {
+            if (!(data[i] != data[i])) values.push_back(data[i]);
+        }
+        if (values.empty()) {
+            return Tensor::zeros({}, out_dtype, self.device())
+                .fill_(Scalar(std::numeric_limits<double>::quiet_NaN()));
+        }
+        const auto middle =
+            values.begin() + static_cast<std::ptrdiff_t>((values.size() - 1) / 2);
+        std::nth_element(values.begin(), middle, values.end());
+        picked = Scalar(*middle);
+    } else {
+        std::vector<int64_t> values(flat.numel());
+        if (!values.empty()) {
+            const int64_t* data = flat.data_ptr<int64_t>();
+            std::copy(data, data + values.size(), values.begin());
+        }
+        if (values.empty()) {
+            return Tensor::zeros({}, out_dtype, self.device())
+                .fill_(Scalar(std::numeric_limits<int64_t>::min()));
+        }
+        const auto middle =
+            values.begin() + static_cast<std::ptrdiff_t>((values.size() - 1) / 2);
+        std::nth_element(values.begin(), middle, values.end());
+        picked = Scalar(*middle);
     }
-    const DType out_dtype = isFloatingType(self.dtype()) ? self.dtype()
-                                                          : DType::Int64;
-    if (values.empty()) {
-        Tensor out = Tensor::zeros({}, out_dtype, self.device());
-        if (isFloatingType(out_dtype))
-            out.fill_(Scalar(std::numeric_limits<double>::quiet_NaN()));
-        else
-            out.fill_(Scalar(std::numeric_limits<int64_t>::min()));
-        return out;
-    }
-    std::nth_element(values.begin(),
-                     values.begin() + static_cast<std::ptrdiff_t>((values.size() - 1) / 2),
-                     values.end());
-    return Tensor::zeros({}, out_dtype, self.device())
-        .fill_(Scalar(values[(values.size() - 1) / 2]));
+    return Tensor::zeros({}, out_dtype, self.device()).fill_(picked);
 }
 
 std::tuple<Tensor, Tensor> nanmedian_dim_cpu(const Tensor& self, int64_t dim,
