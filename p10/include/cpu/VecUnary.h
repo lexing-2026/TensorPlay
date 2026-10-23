@@ -1053,14 +1053,32 @@ static void f64_chunk_avx2(VOp op, VParams prm, const double* src, double* dst, 
 // One chunk-wide branch for the parameterised ops, as for float32: a double
 // load, a narrowing convert and a broadcast per vector sit on the same ports
 // as the convert pair, and there they cost more than the arithmetic they feed.
+//
+// Four vectors are in flight per iteration.  The widening convert, the
+// narrowing convert and most transcendental steps share one execution port,
+// and each element walks the whole widen-compute-narrow chain before the next
+// one starts, so a single stream leaves that port idle between steps.  Four
+// independent streams keep it busy, which is worth more here than the extra
+// registers.
+#define TP_HALF_STEP(EXPR, OFF)                                            \
+    {                                                                      \
+        __m256 x = _mm256_cvtph_ps(_mm_loadu_si128(                        \
+            reinterpret_cast<const __m128i*>(src + (OFF))));               \
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + (OFF)),          \
+                         _mm256_cvtps_ph((EXPR),                           \
+                                         _MM_FROUND_TO_NEAREST_INT));      \
+    }
+
 #define TP_HALF_CHUNK_8(EXPR)                                              \
     {                                                                      \
+        for (; i + 32 <= n; i += 32) {                                     \
+            TP_HALF_STEP(EXPR, i)                                          \
+            TP_HALF_STEP(EXPR, i + 8)                                      \
+            TP_HALF_STEP(EXPR, i + 16)                                     \
+            TP_HALF_STEP(EXPR, i + 24)                                     \
+        }                                                                  \
         for (; i + 8 <= n; i += 8) {                                       \
-            __m256 x = _mm256_cvtph_ps(_mm_loadu_si128(                    \
-                reinterpret_cast<const __m128i*>(src + i)));               \
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i),          \
-                             _mm256_cvtps_ph((EXPR),                       \
-                                             _MM_FROUND_TO_NEAREST_INT));  \
+            TP_HALF_STEP(EXPR, i)                                          \
         }                                                                  \
     }
 
@@ -1098,15 +1116,10 @@ static void half_chunk_avx2(VOp op, VParams prm, const uint16_t* src, uint16_t* 
             break;
         }
         default:
-            for (; i + 8 <= n; i += 8) {
-                __m256 x = _mm256_cvtph_ps(_mm_loadu_si128(
-                    reinterpret_cast<const __m128i*>(src + i)));
-                _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i),
-                                 _mm256_cvtps_ph(apply_f32(op, prm, x),
-                                                 _MM_FROUND_TO_NEAREST_INT));
-            }
+            TP_HALF_CHUNK_8(apply_f32(op, prm, x))
             break;
     }
+#undef TP_HALF_STEP
 #undef TP_HALF_CHUNK_8
     for (; i < n; ++i) {
         float xf = _cvtsh_ss(src[i]);
@@ -1690,24 +1703,38 @@ static void f64_chunk_avx512(VOp op, VParams prm, const double* src, double* dst
 
 // Same one-branch-per-chunk split as the Half loop: only the ops that read
 // runtime parameters need it, the rest keep the generic body.
+// Four vectors in flight, for the reason given at the half-precision walk:
+// the widen, the arithmetic and the narrow form one long chain per vector, so
+// a single stream idles the ports between steps.
+#define TP_BF16_STEP(EXPR, OFF)                                           \
+    {                                                                     \
+        __m256 x = _mm256_castsi256_ps(_mm256_slli_epi32(                 \
+            _mm256_cvtepu16_epi32(_mm_loadu_si128(                        \
+                reinterpret_cast<const __m128i*>(src + (OFF)))),          \
+            16));                                                         \
+        __m256 y = (EXPR);                                                \
+        __m256i u = _mm256_castps_si256(y);                               \
+        __m256i rounding = _mm256_add_epi32(                              \
+            _mm256_set1_epi32(0x7FFFu),                                   \
+            _mm256_srli_epi32(                                            \
+                _mm256_and_si256(u, _mm256_set1_epi32(0x10000u)), 16));   \
+        __m256i r = _mm256_srli_epi32(_mm256_add_epi32(u, rounding), 16); \
+        __m256i p = _mm256_shuffle_epi8(r, pack_pick);                    \
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + (OFF)),         \
+                         _mm_unpacklo_epi64(_mm256_castsi256_si128(p),    \
+                                            _mm256_extracti128_si256(p, 1))); \
+    }
+
 #define TP_BF16_CHUNK_8(EXPR)                                             \
     {                                                                     \
+        for (; i + 32 <= n; i += 32) {                                    \
+            TP_BF16_STEP(EXPR, i)                                         \
+            TP_BF16_STEP(EXPR, i + 8)                                     \
+            TP_BF16_STEP(EXPR, i + 16)                                    \
+            TP_BF16_STEP(EXPR, i + 24)                                    \
+        }                                                                 \
         for (; i + 8 <= n; i += 8) {                                      \
-            __m256 x = _mm256_castsi256_ps(_mm256_slli_epi32(             \
-                _mm256_cvtepu16_epi32(_mm_loadu_si128(                    \
-                    reinterpret_cast<const __m128i*>(src + i))),          \
-                16));                                                     \
-            __m256 y = (EXPR);                                            \
-            __m256i u = _mm256_castps_si256(y);                           \
-            __m256i rounding = _mm256_add_epi32(                          \
-                _mm256_set1_epi32(0x7FFFu),                               \
-                _mm256_srli_epi32(                                        \
-                    _mm256_and_si256(u, _mm256_set1_epi32(0x10000u)), 16));\
-            __m256i r = _mm256_srli_epi32(_mm256_add_epi32(u, rounding), 16); \
-            __m256i p = _mm256_shuffle_epi8(r, pack_pick);                \
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i),         \
-                             _mm_unpacklo_epi64(_mm256_castsi256_si128(p), \
-                                                _mm256_extracti128_si256(p, 1))); \
+            TP_BF16_STEP(EXPR, i)                                         \
         }                                                                 \
     }
 
@@ -1758,6 +1785,7 @@ static void bf16_chunk_avx2(VOp op, VParams prm, const uint16_t* src, uint16_t* 
             TP_BF16_CHUNK_8(apply_f32(op, prm, x))
             break;
     }
+#undef TP_BF16_STEP
 #undef TP_BF16_CHUNK_8
     for (; i < n; ++i) {
         uint32_t bits = static_cast<uint32_t>(src[i]) << 16;
