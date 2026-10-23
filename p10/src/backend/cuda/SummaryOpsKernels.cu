@@ -182,22 +182,227 @@ __global__ void kthvalue_select_kernel(
 
 
 template <typename T>
+__device__ inline bool kthvalue_same_value(T lhs, T rhs) {
+    if constexpr (std::is_same<T, float>::value ||
+                  std::is_same<T, double>::value) {
+        return lhs == rhs || (::isnan(lhs) && ::isnan(rhs));
+    } else if constexpr (std::is_same<T, Half>::value ||
+                         std::is_same<T, BFloat16>::value) {
+        return lhs == rhs ||
+            (::isnan(static_cast<float>(lhs)) &&
+             ::isnan(static_cast<float>(rhs)));
+    } else {
+        return lhs == rhs;
+    }
+}
+
+// NaNs rank as the largest values, while the sign-magnitude order puts a
+// negatively signed NaN below every number and a positively signed one above.
+// The NaNs therefore form a prefix and a suffix of the ordered sequence, and
+// the two boundaries say how far each end reaches.
+template <typename T>
+__device__ inline void kthvalue_nan_bounds(
+        const T* ordered, int64_t d_size, int64_t inner,
+        int64_t& lead, int64_t& trail) {
+    lead = 0;
+    trail = d_size;
+    if constexpr (std::is_same<T, float>::value ||
+                  std::is_same<T, double>::value ||
+                  std::is_same<T, Half>::value ||
+                  std::is_same<T, BFloat16>::value) {
+        int64_t lo = 0;
+        int64_t hi = d_size;
+        while (lo < hi) {
+            const int64_t mid = lo + (hi - lo) / 2;
+            if (reduce_value_is_nan(ordered[mid * inner])) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lead = lo;
+        hi = d_size;
+        while (lo < hi) {
+            const int64_t mid = lo + (hi - lo) / 2;
+            if (reduce_value_is_nan(ordered[mid * inner])) {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        trail = lo;
+    }
+}
+
+// A stable sort keeps equal values in input order, so the first position of
+// the k-th value's run carries the smallest original index; one binary search
+// finds where that run starts.  The leading NaN run is skipped over: those
+// NaNs count as the largest values, not the smallest.
+template <typename T>
+__global__ void kthvalue_from_sorted_kernel(
+        int64_t n_slices, int64_t d_size, int64_t inner, int64_t k,
+        const T* sorted, const int64_t* sorted_indices, T* values,
+        int64_t* indices) {
+    const int64_t si =
+        static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (si >= n_slices) return;
+    const int64_t outer_index = si / inner;
+    const int64_t base =
+        outer_index * d_size * inner + (si - outer_index * inner);
+    const T* source = sorted + base;
+    const int64_t* source_indices = sorted_indices + base;
+    int64_t lead = 0;
+    int64_t trail = d_size;
+    kthvalue_nan_bounds(source, d_size, inner, lead, trail);
+    const int64_t valid = trail - lead;
+    if (k > valid) {
+        // The k-th value is a NaN; the smallest original index over all NaNs
+        // is the first entry of whichever end run is non-empty.
+        const int64_t trailing = trail < d_size ? trail : 0;
+        int64_t position = trailing;
+        if (lead > 0 && (trail == d_size || source_indices[0] <
+                         source_indices[trailing * inner])) {
+            position = 0;
+        }
+        values[si] = source[position * inner];
+        indices[si] = source_indices[position * inner];
+        return;
+    }
+    const int64_t target = lead + k - 1;
+    const T value = source[target * inner];
+    int64_t lo = lead;
+    int64_t hi = target;
+    while (lo < hi) {
+        const int64_t mid = lo + (hi - lo) / 2;
+        if (kthvalue_same_value(source[mid * inner], value)) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    values[si] = value;
+    indices[si] = source_indices[lo * inner];
+}
+
+
+template <typename T>
 __device__ inline bool mode_value_equal(T lhs, T rhs) {
     return !(lhs < rhs) && !(rhs < lhs);
 }
 
 
+// The ordered slice is a chain of runs of equal values; the mode is the value
+// of the longest run.  A run's start is where that value first appears, so
+// bisecting the ordered values places every position inside its run without
+// walking the run.
+template <typename T>
+__device__ inline int64_t mode_run_start(
+        const T* ordered, int64_t position) {
+    const T value = ordered[position];
+    int64_t lo = 0;
+    int64_t hi = position;
+    while (lo < hi) {
+        const int64_t mid = lo + (hi - lo) / 2;
+        if (mode_value_equal(ordered[mid], value)) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    return lo;
+}
+
+
+// Longest run among the per-thread candidates of one block.  Equal lengths are
+// settled by the reduction tree itself: each step keeps the value already held
+// unless the partner reports strictly more, so the surviving position depends
+// only on where the tied runs sit.  The winner is broadcast through shared
+// memory so every thread can use it.
+__device__ inline int64_t mode_block_longest_run(int64_t length, int64_t position) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const int64_t other_length = __shfl_down_sync(0xffffffffu, length, offset);
+        const int64_t other_position = __shfl_down_sync(0xffffffffu, position, offset);
+        if (other_length > length) {
+            length = other_length;
+            position = other_position;
+        }
+    }
+    __shared__ int64_t warp_lengths[32];
+    __shared__ int64_t warp_positions[32];
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    if (lane == 0) {
+        warp_lengths[warp] = length;
+        warp_positions[warp] = position;
+    }
+    __syncthreads();
+    const int warps = static_cast<int>(blockDim.x) >> 5;
+    if (warp == 0) {
+        length = lane < warps ? warp_lengths[lane] : 0;
+        position = lane < warps ? warp_positions[lane] : 0;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            const int64_t other_length =
+                __shfl_down_sync(0xffffffffu, length, offset);
+            const int64_t other_position =
+                __shfl_down_sync(0xffffffffu, position, offset);
+            if (other_length > length) {
+                length = other_length;
+                position = other_position;
+            }
+        }
+        if (lane == 0) {
+            warp_lengths[0] = length;
+            warp_positions[0] = position;
+        }
+    }
+    __syncthreads();
+    return warp_positions[0];
+}
+
+
+// Folds the position each thread kept into one block-wide answer: `farthest`
+// takes the largest reported position, otherwise the smallest, and -1 means
+// the thread found none.  Warps reduce among themselves; thread 0 walks the
+// per-warp results in lane order and leaves the winner in `result`.  Only
+// thread 0 reads `result`, so no barrier follows the fold.
+__device__ inline void mode_block_span(int64_t own, bool farthest, int64_t* result) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const int64_t other = __shfl_down_sync(0xffffffffu, own, offset);
+        if (farthest) {
+            if (other > own) own = other;
+        } else if (other >= 0 && (own < 0 || other < own)) {
+            own = other;
+        }
+    }
+    __shared__ int64_t warp_span[32];
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    if (lane == 0) warp_span[warp] = own;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int64_t reported = warp_span[0];
+        const int warps = static_cast<int>(blockDim.x) >> 5;
+        for (int w = 1; w < warps; ++w) {
+            const int64_t candidate = warp_span[w];
+            if (farthest) {
+                if (candidate > reported) reported = candidate;
+            } else if (candidate >= 0 && (reported < 0 || candidate < reported)) {
+                reported = candidate;
+            }
+        }
+        *result = reported;
+    }
+}
+
+
 __global__ void mode_bool_kernel(
-        int64_t n_slices, int64_t d_size, int64_t inner,
+        int64_t n_slices, int64_t d_size, int64_t inner, bool keep_last,
         const bool* input, bool* values, int64_t* indices) {
     const int64_t si = static_cast<int64_t>(blockIdx.x);
     if (si >= n_slices) return;
-    __shared__ unsigned long long true_count;
-    __shared__ unsigned long long selected_index;
-    if (threadIdx.x == 0) {
-        true_count = 0;
-        selected_index = static_cast<unsigned long long>(d_size);
-    }
+    __shared__ unsigned int true_count;
+    __shared__ int64_t selected_index;
+    if (threadIdx.x == 0) true_count = 0;
     __syncthreads();
 
     const int64_t outer_index = si / inner;
@@ -206,23 +411,30 @@ __global__ void mode_bool_kernel(
     for (uint64_t i = static_cast<uint64_t>(threadIdx.x);
          i < static_cast<uint64_t>(d_size);
          i += static_cast<uint64_t>(blockDim.x)) {
-        if (slice_input[i * inner]) atomicAdd(&true_count, 1ull);
+        if (slice_input[i * inner]) atomicAdd(&true_count, 1u);
     }
     __syncthreads();
 
     const bool mode = true_count >
-        static_cast<unsigned long long>(d_size) - true_count;
-    for (uint64_t i = static_cast<uint64_t>(threadIdx.x);
-         i < static_cast<uint64_t>(d_size);
-         i += static_cast<uint64_t>(blockDim.x)) {
-        if (slice_input[i * inner] == mode) {
-            atomicMin(&selected_index, static_cast<unsigned long long>(i));
-        }
+        static_cast<unsigned int>(d_size) - true_count;
+    // Every thread walks the same number of steps so the fold after the loop
+    // sees a converged warp; an out-of-range step reads the last element and
+    // reports no match.
+    const uint64_t stride = static_cast<uint64_t>(blockDim.x);
+    const uint64_t length = static_cast<uint64_t>(d_size);
+    const uint64_t steps = (length + stride - 1) / stride;
+    int64_t best = -1;
+    for (uint64_t step = 0; step < steps; ++step) {
+        const uint64_t i = static_cast<uint64_t>(threadIdx.x) + step * stride;
+        const uint64_t clamped = i < length ? i : length - 1;
+        const bool match = i < length && slice_input[clamped * inner] == mode;
+        const bool take = match && (keep_last || best < 0);
+        best = take ? static_cast<int64_t>(i) : best;
     }
-    __syncthreads();
+    mode_block_span(best, keep_last, &selected_index);
     if (threadIdx.x == 0) {
         values[si] = mode;
-        indices[si] = static_cast<int64_t>(selected_index);
+        indices[si] = selected_index;
     }
 }
 
@@ -307,54 +519,62 @@ __global__ void mode_fused_kernel(
     __syncthreads();
     mode_bitonic_sort<T, Power2Size>(sorted, valid);
 
+    // Each thread owns the adjacent ordered pair 2t and 2t+1 and reports how
+    // far into its run the later of the two sits; positions past the slice
+    // report zero, which never beats a real position.  The pair is selected
+    // without branching: a lane that dropped out of the warp here would make
+    // the fold below read past it, so the last pair position repeats when the
+    // slice ends on an odd length.
+    const int64_t first = static_cast<int64_t>(threadIdx.x) * 2;
+    const int64_t low = first < d_size ? first : 0;
+    const int64_t high = first + 1 < d_size ? first + 1 : low;
+    int64_t into_run = low - mode_run_start(sorted, low);
+    int64_t best_position = low;
+    const int64_t high_into_run = high - mode_run_start(sorted, high);
+    if (high_into_run > into_run) {
+        into_run = high_into_run;
+        best_position = high;
+    }
+    best_position = mode_block_longest_run(into_run, best_position);
+
+    // The reported position is the last occurrence of the mode: each thread
+    // keeps the last match it owns and the block folds the per-thread results.
     __shared__ T mode;
-    __shared__ unsigned long long mode_index;
-    if (threadIdx.x == 0) {
-        int best_count = 0;
-        int run_count = 0;
-        unsigned int best_position = 0;
-        for (unsigned int i = 0; i < static_cast<unsigned int>(d_size); ++i) {
-            const bool same = i > 0 &&
-                mode_value_equal(sorted[i], sorted[i - 1]);
-            run_count = same ? run_count + 1 : 1;
-            if (run_count > best_count) {
-                best_count = run_count;
-                best_position = i;
-            }
-        }
-        mode = sorted[best_position];
-        mode_index = static_cast<unsigned long long>(d_size);
-    }
+    __shared__ int64_t mode_index;
+    if (threadIdx.x == 0) mode = sorted[best_position];
     __syncthreads();
-    for (uint64_t i = static_cast<uint64_t>(threadIdx.x);
-         i < static_cast<uint64_t>(d_size);
-         i += static_cast<uint64_t>(blockDim.x)) {
-        if (mode_value_equal(slice_input[i * inner], mode)) {
-            atomicMin(&mode_index, static_cast<unsigned long long>(i));
-        }
+    // Uniform step count keeps the warp converged for the fold; an
+    // out-of-range step rereads the last element and reports no match.
+    const uint64_t stride = static_cast<uint64_t>(blockDim.x);
+    const uint64_t length = static_cast<uint64_t>(d_size);
+    const uint64_t steps = (length + stride - 1) / stride;
+    int64_t best = -1;
+    for (uint64_t step = 0; step < steps; ++step) {
+        const uint64_t i = static_cast<uint64_t>(threadIdx.x) + step * stride;
+        const uint64_t clamped = i < length ? i : length - 1;
+        const bool match = i < length &&
+            mode_value_equal(slice_input[clamped * inner], mode);
+        best = match ? static_cast<int64_t>(i) : best;
     }
-    __syncthreads();
+    mode_block_span(best, true, &mode_index);
     if (threadIdx.x == 0) {
         values[si] = mode;
-        indices[si] = static_cast<int64_t>(mode_index);
+        indices[si] = mode_index;
     }
 }
 
 
+// Slices up to 128 values use the 128-wide block, larger ones the 1024- or
+// 2048-wide block.  Every block holds whole warps, which the reduction and its
+// tie handling rely on.
 template <typename T>
 void launch_mode_fused(
         int64_t n_slices, int64_t d_size, int64_t inner,
         const Tensor& input, Tensor& values, Tensor& indices) {
-    const int64_t power = d_size <= 32 ? 32 : d_size <= 128 ? 128
-                                      : d_size <= 1024 ? 1024 : 2048;
+    const int64_t power = d_size <= 128 ? 128 : d_size <= 1024 ? 1024 : 2048;
     const dim3 grid(static_cast<unsigned>(n_slices));
     auto stream = getCurrentCUDAStream().stream();
     switch (power) {
-        case 32:
-            mode_fused_kernel<T, 32><<<grid, 16, sizeof(T) * 32 + sizeof(bool) * 32, stream>>>(
-                n_slices, d_size, inner, input.data_ptr<T>(),
-                values.data_ptr<T>(), indices.data_ptr<int64_t>());
-            break;
         case 128:
             mode_fused_kernel<T, 128><<<grid, 64, sizeof(T) * 128 + sizeof(bool) * 128, stream>>>(
                 n_slices, d_size, inner, input.data_ptr<T>(),
@@ -374,43 +594,137 @@ void launch_mode_fused(
 }
 
 
+// What one thread reports about the band of the ordered slice it walked: the
+// longest run wholly inside the band and the runs that touch the band's two
+// ends, which the block stitches together afterwards.
 template <typename T>
-__global__ void mode_from_sorted_kernel(int64_t n_slices, int64_t d_size,
-                                         int64_t inner, const T* sorted,
-                                         const int64_t* sorted_indices,
-                                         T* values, int64_t* indices) {
-    int64_t si = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; si < n_slices; si += stride) {
-        int64_t outer_index = si / inner;
-        int64_t inner_index = si % inner;
-        const T* source = sorted + outer_index * d_size * inner + inner_index;
-        const int64_t* source_indices =
-            sorted_indices + outer_index * d_size * inner + inner_index;
-        T best_value = source[0];
-        int64_t best_count = 0;
-        int64_t best_index = source_indices[0];
-        int64_t run_count = 0;
-        int64_t run_index = source_indices[0];
-        for (int64_t j = 0; j < d_size; ++j) {
-            const T value = source[j * inner];
-            const int64_t original_index = source_indices[j * inner];
-            if (j > 0 && mode_value_equal(value, source[(j - 1) * inner])) {
-                ++run_count;
-                if (original_index < run_index) run_index = original_index;
-            } else {
-                run_count = 1;
-                run_index = original_index;
+struct ModeBandSummary {
+    T first_value;
+    T last_value;
+    int64_t first_length;
+    int64_t last_length;
+    int64_t last_start;
+    int64_t best_length;
+    int64_t best_start;
+};
+
+
+// One block per slice, one band per thread.  Stitching the bands in order lets
+// a run that crosses a band boundary keep growing, so a slice that is a handful
+// of long runs is measured in parallel instead of by a single lane walking the
+// whole slice.  The ordered sequence is stable, so a run's first position also
+// holds the smallest original index, which is the one reported.
+template <typename T>
+__global__ void mode_sorted_runs_kernel(
+        int64_t n_slices, int64_t d_size, int64_t inner, const T* sorted,
+        const int64_t* sorted_indices, T* values, int64_t* indices) {
+    const int64_t si = static_cast<int64_t>(blockIdx.x);
+    if (si >= n_slices) return;
+    const int64_t outer_index = si / inner;
+    const T* source = sorted + outer_index * d_size * inner +
+                      (si - outer_index * inner);
+    const int64_t* source_indices = sorted_indices +
+        outer_index * d_size * inner + (si - outer_index * inner);
+
+    const int64_t band =
+        (d_size + static_cast<int64_t>(blockDim.x) - 1) / blockDim.x;
+    const int64_t lo = static_cast<int64_t>(threadIdx.x) * band;
+    const int64_t hi = lo + band < d_size ? lo + band : d_size;
+
+    __shared__ ModeBandSummary<T> bands[kThreads];
+    if (lo < hi) {
+        const T first_value = source[lo * inner];
+        T value = first_value;
+        int64_t run_start = lo;
+        int64_t run_length = 1;
+        int64_t first_length = -1;
+        int64_t best_length = 0;
+        int64_t best_start = lo;
+        for (int64_t j = lo + 1; j < hi; ++j) {
+            const T next = source[j * inner];
+            if (mode_value_equal(next, value)) {
+                ++run_length;
+                continue;
             }
-            if (run_count > best_count) {
-                best_count = run_count;
-                best_value = value;
-                best_index = run_index;
+            if (first_length < 0) first_length = run_length;
+            if (run_length > best_length) {
+                best_length = run_length;
+                best_start = run_start;
+            }
+            value = next;
+            run_start = j;
+            run_length = 1;
+        }
+        if (first_length < 0) first_length = hi - lo;
+        if (run_length > best_length) {
+            best_length = run_length;
+            best_start = run_start;
+        }
+        bands[threadIdx.x].first_value = first_value;
+        bands[threadIdx.x].first_length = first_length;
+        bands[threadIdx.x].last_value = value;
+        bands[threadIdx.x].last_length = run_length;
+        bands[threadIdx.x].last_start = run_start;
+        bands[threadIdx.x].best_length = best_length;
+        bands[threadIdx.x].best_start = best_start;
+    }
+    __syncthreads();
+    if (threadIdx.x != 0) return;
+
+    int64_t best_length = 0;
+    int64_t best_start = d_size;
+    bool open = false;
+    T open_value = static_cast<T>(0);
+    int64_t open_length = 0;
+    int64_t open_start = 0;
+    for (int64_t t = 0; t < static_cast<int64_t>(blockDim.x); ++t) {
+        const int64_t start = t * band;
+        if (start >= d_size) break;
+        const ModeBandSummary<T>& summary = bands[t];
+        if (open) {
+            if (mode_value_equal(open_value, summary.first_value)) {
+                open_length += summary.first_length;
+            } else {
+                if (open_length > best_length ||
+                    (open_length == best_length && open_start < best_start)) {
+                    best_length = open_length;
+                    best_start = open_start;
+                }
+                open = false;
             }
         }
-        values[si] = best_value;
-        indices[si] = best_index;
+        if (!open) {
+            open = true;
+            open_value = summary.first_value;
+            open_length = summary.first_length;
+            open_start = start;
+        }
+        const int64_t span =
+            start + band < d_size ? start + band : d_size;
+        if (summary.first_length < span - start) {
+            if (open_length > best_length ||
+                (open_length == best_length && open_start < best_start)) {
+                best_length = open_length;
+                best_start = open_start;
+            }
+            open_value = summary.last_value;
+            open_length = summary.last_length;
+            open_start = summary.last_start;
+        }
+        if (summary.best_length > best_length ||
+            (summary.best_length == best_length &&
+             summary.best_start < best_start)) {
+            best_length = summary.best_length;
+            best_start = summary.best_start;
+        }
     }
+    if (open_length > best_length ||
+        (open_length == best_length && open_start < best_start)) {
+        best_length = open_length;
+        best_start = open_start;
+    }
+    values[si] = source[best_start * inner];
+    indices[si] = source_indices[best_start * inner];
 }
 
 
@@ -567,14 +881,17 @@ std::tuple<Tensor, Tensor> mode_cuda(const Tensor& self, int64_t dim, bool keepd
     if (slices == 0) return {values, indices};
     if (input.dtype() == DType::Bool) {
         auto stream = getCurrentCUDAStream().stream();
+        // Short slices report the last occurrence of the mode, longer ones the
+        // first; both name a position the value really occupies.
+        const bool keep_last = d_size <= 2048;
         mode_bool_kernel<<<
             dim3(static_cast<unsigned>(slices)), selection_threads(d_size), 0, stream>>>(
-            slices, d_size, inner, input.data_ptr<bool>(), values.data_ptr<bool>(),
-            indices.data_ptr<int64_t>());
+            slices, d_size, inner, keep_last, input.data_ptr<bool>(),
+            values.data_ptr<bool>(), indices.data_ptr<int64_t>());
         CUDA_CHECK(cudaGetLastError());
         return {values, indices};
     }
-    if (inner == 1 && d_size >= 2 && d_size <= 2048) {
+    if (d_size >= 2 && d_size <= 2048) {
         switch (input.dtype()) {
 #define TP_MODE_FUSED_CASE(ctype, name_) \
             case DType::name_: \
@@ -593,11 +910,10 @@ std::tuple<Tensor, Tensor> mode_cuda(const Tensor& self, int64_t dim, bool keepd
     Tensor sorted = std::get<0>(sorted_result);
     Tensor sorted_indices = std::get<1>(sorted_result);
     auto stream = getCurrentCUDAStream().stream();
-    const bool sel32 = input.numel() <=
-        static_cast<int64_t>(std::numeric_limits<int32_t>::max());
 #define TP_MODE_DEVICE_CASE(ctype, name_) \
     case DType::name_: \
-        mode_from_sorted_kernel<ctype><<<make_grid(slices), kThreads, 0, stream>>>( \
+        mode_sorted_runs_kernel<ctype><<<dim3(static_cast<unsigned>(slices)), \
+                                         kThreads, 0, stream>>>( \
             slices, d_size, inner, sorted.data_ptr<ctype>(), \
             sorted_indices.data_ptr<int64_t>(), values.data_ptr<ctype>(), \
             indices.data_ptr<int64_t>()); \
@@ -659,6 +975,44 @@ std::tuple<Tensor, Tensor> kthvalue_cuda(const Tensor& self, int64_t k, int64_t 
     outer_inner(shape_of(input), dim, outer, inner);
     const int64_t slices = outer * inner;
     auto stream = getCurrentCUDAStream().stream();
+    // The per-slice selector reads its slice once per radix digit from a single
+    // block.  Past a few thousand elements a multi-block sort is faster, and
+    // the k-th value falls straight out of the ordered sequence.
+    constexpr int64_t kKthValueSortThreshold = int64_t{1} << 14;
+    if (d_size > kKthValueSortThreshold) {
+        Tensor sorted;
+        Tensor sorted_indices;
+        std::tie(sorted, sorted_indices) = sort_cuda(input, dim, false);
+#define TP_KTHVALUE_SORTED_CASE(ctype, name_)                              \
+    case DType::name_:                                                     \
+        kthvalue_from_sorted_kernel<ctype><<<make_grid(slices), kThreads,   \
+                                             0, stream>>>(                 \
+            slices, d_size, inner, k,                                      \
+            static_cast<const ctype*>(sorted.data_ptr()),                   \
+            sorted_indices.data_ptr<int64_t>(),                            \
+            static_cast<ctype*>(values_out.data_ptr()),                    \
+            indices_out.data_ptr<int64_t>());                              \
+        break;
+        switch (input.dtype()) {
+            TP_KTHVALUE_SORTED_CASE(uint8_t, UInt8)
+            TP_KTHVALUE_SORTED_CASE(int8_t, Int8)
+            TP_KTHVALUE_SORTED_CASE(int16_t, Int16)
+            TP_KTHVALUE_SORTED_CASE(int32_t, Int32)
+            TP_KTHVALUE_SORTED_CASE(int64_t, Int64)
+            TP_KTHVALUE_SORTED_CASE(uint16_t, UInt16)
+            TP_KTHVALUE_SORTED_CASE(uint32_t, UInt32)
+            TP_KTHVALUE_SORTED_CASE(uint64_t, UInt64)
+            TP_KTHVALUE_SORTED_CASE(Half, Float16)
+            TP_KTHVALUE_SORTED_CASE(BFloat16, BFloat16)
+            TP_KTHVALUE_SORTED_CASE(float, Float32)
+            TP_KTHVALUE_SORTED_CASE(double, Float64)
+#undef TP_KTHVALUE_SORTED_CASE
+            default:
+                TP_THROW(NotImplementedError, "kthvalue: unsupported dtype");
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return {values_out, indices_out};
+    }
     const bool sel32 = input.numel() <=
         static_cast<int64_t>(std::numeric_limits<int32_t>::max());
 #define TP_KTHVALUE_SELECT_CASE(ctype, name_) \
