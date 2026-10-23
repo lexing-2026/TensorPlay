@@ -925,9 +925,10 @@ struct ReduceOp {
     OutputT* output;
     SecondOutputT* output2;
     AccT* partials;
-    unsigned long long* counters;
-    unsigned long long* flags;
-    unsigned long long tag;
+    // One arrival counter per output block, zeroed on the stream before the
+    // launch; each CTA adds one, so the CTA that sees gridDim.y-1 predecessors
+    // is the last to land for that output.
+    unsigned int* semaphores;
     AccT identity;
     Ops ops;
     // 32-bit split support: non-32-bit iterators recurse over sub-iterators
@@ -1213,18 +1214,6 @@ struct ReduceOp {
     __device__ __forceinline__ void run() {
         extern __shared__ unsigned char shared_raw[];
         AccT* shared = reinterpret_cast<AccT*>(shared_raw);
-        const bool block_leader = threadIdx.x == 0 && threadIdx.y == 0;
-        // Zero the per-output completion counter for THIS launch and publish
-        // the unique launch tag before any work: peers later check the tag
-        // (once, right before their single atomicAdd), so the counter is
-        // per-launch cudaMemsetAsync (a ~1us GPU stream op per reduction)
-        // with an in-kernel initialization.
-        if (config.global_reduce &&
-            blockIdx.y == 0 && block_leader) {
-            counters[blockIdx.x] = 0;
-            __threadfence();  // counter zeroed before the tag is published
-            *(volatile unsigned long long*)(flags + blockIdx.x) = tag;
-        }
         const int64_t output_index = config.output_idx();
         std::array<AccT, OutputVecSize> values;
         #pragma unroll
@@ -1252,7 +1241,7 @@ struct ReduceOp {
         }
 
         // NB: the fold/staging paths below require the global-reduce buffers
-        // (partials/counters/flags), which are only allocated when
+        // (partials/semaphores), which are only allocated when
         // config.global_reduce is set, so every branch touching them must be
         // gated on it. Without the gate, small reductions dereference null
         // staging pointers (illegal address on the first max/sum of a tiny
@@ -1319,23 +1308,14 @@ struct ReduceOp {
             }
             __threadfence();  // make the writes globally visible
             __syncthreads();  // ... and complete before the arrival count moves
-            if (block_leader) {
-                // Wait until this launch's counter is initialized (CTA y==0
-                // does it once, near kernel start; the unique per-launch tag
-                // makes stale flag content from previous launches
-                // indistinguishable-safe: it can never match). One short
-                // bounded spin per CTA — no polling storm.
-                volatile unsigned long long* flag = flags + blockIdx.x;
-                while (*flag != tag) {}
-                __threadfence();  // acquire the counter==0 establishment
-                const unsigned long long prev =
-                    atomicAdd(counters + blockIdx.x, 1ULL);
-                is_last_block = prev == static_cast<unsigned long long>(
-                                          config.ctas_per_output - 1);
+            if (threadIdx.x == 0 && threadIdx.y == 0) {
+                const unsigned int prev =
+                    atomicAdd(semaphores + blockIdx.x, 1u);
+                is_last_block = prev == gridDim.y - 1u;
             }
             __syncthreads();
             if (is_last_block) {
-                __threadfence();  // complete the acquire after the atomic
+                __threadfence();  // complete the acquire pattern after the atomic
                 // The fold may only walk the block extent that does not carry
                 // the output split: with the outputs on block.x, folding across
                 // x would merge different outputs into one.  So the lanes take
@@ -1496,8 +1476,6 @@ inline void launch_reduce(
         output2,
         nullptr,
         nullptr,
-        nullptr,
-        0,
         identity,
         ops,
         acc_buf,
@@ -1507,27 +1485,26 @@ inline void launch_reduce(
 
     DataPtr partial_buffer;
     if (config.global_reduce) {
-        // Scratch layout: one completion counter + one init flag per output
-        // block (u64 each), then the partials. The counter is zeroed
-        // in-kernel by the (x, y==0) CTA and its readiness is published via
-        // the flag holding this launch's unique tag — no cudaMemsetAsync, no
-        // reliance on allocator-held state, and stale content from prior
-        // launches can never match the tag.
+        // Scratch layout: one arrival counter per output block, then the
+        // partials.  The counters must read zero when the kernel starts, so
+        // they are cleared by a stream-ordered memset just before the launch;
+        // the kernel then only adds, which keeps the arrival path to a single
+        // atomic per CTA.
         size_t slots = static_cast<size_t>(grid.x) * grid.y * config.output_vec_size;
         if (!config.should_block_x_reduce()) {
             slots *= static_cast<size_t>(config.block_width);
         }
-        const size_t head = static_cast<size_t>(grid.x) * 2 *
-                            sizeof(unsigned long long);
+        const size_t counter_bytes = static_cast<size_t>(grid.x) * sizeof(unsigned int);
+        // Keep the partial run 16-byte aligned so the staging writes and the
+        // last-CTA reads stay vectorized.
+        const size_t head = (counter_bytes + 15) & ~static_cast<size_t>(15);
         partial_buffer = getAllocator(DeviceType::CUDA)->allocate(
             head + slots * sizeof(AccT), iter.device());
         char* base = static_cast<char*>(partial_buffer.get());
-        reduction.counters = reinterpret_cast<unsigned long long*>(base);
-        reduction.flags = reinterpret_cast<unsigned long long*>(
-            base + static_cast<size_t>(grid.x) * sizeof(unsigned long long));
+        reduction.semaphores = reinterpret_cast<unsigned int*>(base);
         reduction.partials = reinterpret_cast<AccT*>(base + head);
-        static std::atomic<unsigned long long> tag_counter{1};
-        reduction.tag = tag_counter.fetch_add(1, std::memory_order_relaxed);
+        checkCuda(cudaMemsetAsync(base, 0, counter_bytes, stream),
+                  "CUDA reduction arrival counters");
     }
 
     // Output-side vectorization groups adjacent outputs in one thread.  It
