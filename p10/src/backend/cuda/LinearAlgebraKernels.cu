@@ -273,6 +273,18 @@ Tensor matmul_batched_2d_cuda(
         self, self_batch_shape, batch_shape, M, K, batch_size);
     Tensor other_3d = materialize_batched_cuda(
         other, other_batch_shape, batch_shape, K, N, batch_size);
+    // A batch of one is a plain product wearing a unit dimension.  The
+    // batched entry point selects from a different kernel set than the
+    // single one, and for a lone pair of matrices the single call is the
+    // cheaper of the two, so the unit batch is dropped before launching.
+    if (batch_size == 1) {
+        Tensor self_2d = self_3d.reshape({M, K});
+        Tensor other_2d = other_3d.reshape({K, N});
+        Tensor result_2d = result.reshape({M, N});
+        gemm_impl(self_2d, other_2d, result_2d, 1.0, 0.0, nullptr);
+        return result;
+    }
+
     Tensor result_3d = result.reshape({batch_size, M, N});
 
     const long long stride_a = batched_matrix_stride_cuda(
