@@ -415,33 +415,27 @@ inline __m256 v_exp_f32(__m256 x) {
 
 __attribute__((target("avx2,fma"), always_inline))
 inline __m256 v_erf_f32(__m256 x) {
-    namespace poly = tensorplay::vecmath;
     const __m256 sign_bit = _mm256_set1_ps(-0.0f);
     const __m256 one = _mm256_set1_ps(1.0f);
     const __m256 abs_x = _mm256_andnot_ps(sign_bit, x);
-    const __m256 sq = _mm256_mul_ps(x, x);
-
-    __m256 near = _mm256_set1_ps(poly::kErfSeries[6]);
-    for (int i = 5; i >= 0; --i)
-        near = _mm256_fmadd_ps(near, sq, _mm256_set1_ps(poly::kErfSeries[i]));
-    near = _mm256_mul_ps(x, near);
-
+    // A single five-term form covers the whole range, so there is no series
+    // branch for small inputs and no blend afterwards.  The reciprocal
+    // argument maps [0, inf) onto (0, 1], which lets one polynomial in t carry
+    // both the linear region and the tail.
     const __m256 t = _mm256_div_ps(
-        one, _mm256_fmadd_ps(_mm256_set1_ps(poly::kErfTailScale), abs_x, one));
-    __m256 tail = _mm256_set1_ps(poly::kErfTail[4]);
-    for (int i = 3; i >= 0; --i)
-        tail = _mm256_fmadd_ps(tail, t, _mm256_set1_ps(poly::kErfTail[i]));
-    tail = _mm256_mul_ps(tail, t);
-    tail = _mm256_sub_ps(
-        one,
-        _mm256_mul_ps(tail, v_exp_f32(_mm256_xor_ps(sign_bit, sq))));
-    tail = _mm256_or_ps(_mm256_and_ps(sign_bit, x), tail);
-
-    return _mm256_blendv_ps(
-        tail, near,
-        _mm256_cmp_ps(abs_x, _mm256_set1_ps(poly::kErfSplit), _CMP_LT_OQ));
+        one, _mm256_fmadd_ps(_mm256_set1_ps(0.3275911f), abs_x, one));
+    __m256 p = _mm256_set1_ps(1.061405429f);
+    p = _mm256_fmadd_ps(p, t, _mm256_set1_ps(-1.453152027f));
+    p = _mm256_fmadd_ps(p, t, _mm256_set1_ps(1.421413741f));
+    p = _mm256_fmadd_ps(p, t, _mm256_set1_ps(-0.284496736f));
+    p = _mm256_fmadd_ps(p, t, _mm256_set1_ps(0.254829592f));
+    p = _mm256_mul_ps(p, t);
+    // exp(-x*x) decays to zero, so the tail saturates at one without any
+    // explicit clamp; the sign is restored at the end.
+    const __m256 decay = v_exp_f32(_mm256_xor_ps(sign_bit, _mm256_mul_ps(x, x)));
+    const __m256 r = _mm256_sub_ps(one, _mm256_mul_ps(p, decay));
+    return _mm256_or_ps(_mm256_and_ps(sign_bit, x), r);
 }
-
 // elu takes its three coefficients as arguments instead of reading prm itself.
 // The chunk loops below broadcast the parameters once per chunk; deriving them
 // inside the vector loop means a double load, a narrowing convert and a
