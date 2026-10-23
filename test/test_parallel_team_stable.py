@@ -50,6 +50,28 @@ def test_chunks_cover_the_range_exactly_once():
         assert float((x + 1.0).sum()) == n * (n + 1) / 2
 
 
+def test_drawn_ranges_cover_the_walk_exactly_once():
+    # A walk whose ranges come from a shared counter has no fixed partition to
+    # check: the ranges are handed out in whatever order the threads free up.
+    # The answer is added to itself here, so a range that skipped an element or
+    # answered it twice moves the total.
+    if tp.get_num_threads() < 3:
+        pytest.skip("needs a team of at least three threads")
+    # The range is a whole number of sixty-four elements and there are sixteen
+    # of them per thread, so these lengths put a range boundary in the middle of
+    # the walk, leave one short tail, and stay just above the grain that decides
+    # whether the walk is spread at all.
+    grain = 32768
+    for n in (grain + 1, 65536, 100000, 196608, 262145, 1000003):
+        index = tp.arange(n, dtype=tp.float64)
+        zero = tp.zeros(n, dtype=tp.float64)
+        one = tp.ones(n, dtype=tp.float64)
+        answer = tp.empty(n, dtype=tp.float64)
+        # zero + one * index == index
+        tp.addcmul(zero, one, index, out=answer)
+        assert float(answer.sum()) == n * (n - 1) / 2
+
+
 def _cpu_list_count(path):
     try:
         text = open(path).read().strip()

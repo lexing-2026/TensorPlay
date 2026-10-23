@@ -80,8 +80,27 @@ class ThreadIdGuard {
 template <class F>
 void invoke_parallel(int64_t begin, int64_t end, int64_t grain_size, const F& f);
 
+template <class F>
+void invoke_parallel_balanced(int64_t begin, int64_t end, int64_t grain_size,
+                              const F& f);
+
 // Non-template core dispatched by invoke_parallel; implemented in Parallel.cpp.
 P10_API void invoke_parallel_impl(
+    int64_t begin,
+    int64_t end,
+    int64_t grain_size,
+    const std::function<void(int64_t, int64_t)>& f);
+
+// Non-template core dispatched by invoke_parallel_balanced; implemented in
+// Parallel.cpp.  The work is handed out range by range from a shared counter
+// rather than split once among the team, so a thread that answers quickly
+// takes more of the walk than one that answers slowly.  The size of a range
+// is decided here from the team and the iteration count; grain_size only
+// decides, as in parallel_for, whether the walk is worth spreading.  A body
+// is safe here only when it writes the range it is given and keeps nothing of
+// its own per thread: a body that folds into a per-thread slot must stay with
+// the split, because a slot would then hold several ranges.
+P10_API void invoke_parallel_balanced_impl(
     int64_t begin,
     int64_t end,
     int64_t grain_size,
@@ -119,11 +138,50 @@ inline void parallel_for(int64_t begin, int64_t end, int64_t grain_size, const F
   internal::invoke_parallel(begin, end, grain_size, f);
 }
 
+/*
+parallel_for_balanced
+
+begin: index at which to start applying user function
+end:   index at which to stop applying user function
+grain_size: iteration count below which the walk is not spread.
+f: user function applied to each handed-out range, signature:
+   void f(int64_t begin, int64_t end)
+
+The same guards as parallel_for.  The ranges the team answers come from a
+counter the threads draw on as they free up, so a thread on a core that
+answers the walk quickly draws more ranges than a thread on one that answers
+it slowly.  Use it for a walk that only writes the range it is handed.
+*/
+template <class F>
+inline void parallel_for_balanced(int64_t begin, int64_t end,
+                                  int64_t grain_size, const F& f) {
+  if (begin >= end) {
+    return;
+  }
+  internal::lazy_init_num_threads();
+  const int64_t numiter = end - begin;
+  const bool use_parallel =
+      (numiter > grain_size && numiter > 1 && !in_parallel_region() && get_num_threads() > 1);
+  if (!use_parallel) {
+    internal::ThreadIdGuard tid_guard(0);
+    f(begin, end);
+    return;
+  }
+  internal::invoke_parallel_balanced(begin, end, grain_size, f);
+}
+
 namespace internal {
 
 template <class F>
 void invoke_parallel(int64_t begin, int64_t end, int64_t grain_size, const F& f) {
   invoke_parallel_impl(begin, end, grain_size, [&f](int64_t b, int64_t e) { f(b, e); });
+}
+
+template <class F>
+void invoke_parallel_balanced(int64_t begin, int64_t end, int64_t grain_size,
+                              const F& f) {
+  invoke_parallel_balanced_impl(
+      begin, end, grain_size, [&f](int64_t b, int64_t e) { f(b, e); });
 }
 
 } // namespace internal

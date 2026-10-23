@@ -262,6 +262,18 @@ struct ParallelRegionGuard {
   }
 };
 
+// TP_PARALLEL_BACKEND=native forces the in-house pool even in OpenMP builds.
+// Back-to-back small regions (RNN cell loops) measured ~600us cheaper per
+// region transition on Zen4 with the native pool: libgomp's post-barrier
+// spin taxes the serial op that follows each region.
+bool native_pool_forced() {
+  static const bool forced = [] {
+      const char* e = std::getenv("TP_PARALLEL_BACKEND");
+      return e && std::strcmp(e, "native") == 0;
+  }();
+  return forced;
+}
+
 } // namespace
 
 void init_num_threads() {
@@ -518,16 +530,7 @@ void invoke_parallel_impl(
   // Kernels run inside an OpenMP region so libgomp keeps the team warm
   // between dispatches.  The native pool below stays as the fallback for
   // non-OpenMP builds.
-  //
-  // TP_PARALLEL_BACKEND=native forces the in-house pool even in OpenMP builds.
-  // Back-to-back small regions (RNN cell loops) measured ~600us cheaper per
-  // region transition on Zen4 with the native pool: libgomp's post-barrier
-  // spin taxes the serial op that follows each region.
-  static const bool force_native_pool = [] {
-      const char* e = std::getenv("TP_PARALLEL_BACKEND");
-      return e && std::strcmp(e, "native") == 0;
-  }();
-  if (!force_native_pool && omp_get_max_threads() > 1 && !omp_in_parallel()) {
+  if (!native_pool_forced() && omp_get_max_threads() > 1 && !omp_in_parallel()) {
     std::atomic_flag err_flag = ATOMIC_FLAG_INIT;
     std::exception_ptr eptr;
     // The region always opens with the full team and the chunking is decided
@@ -619,6 +622,71 @@ void invoke_parallel_impl(
   if (state.eptr) {
     std::rethrow_exception(state.eptr);
   }
+}
+
+void invoke_parallel_balanced_impl(
+    int64_t begin,
+    int64_t end,
+    int64_t grain_size,
+    const std::function<void(int64_t, int64_t)>& f) {
+  const int64_t numiter = end - begin;
+  const int64_t num_threads = get_num_threads();
+
+#ifdef _OPENMP
+  if (!native_pool_forced() && omp_get_max_threads() > 1 && !omp_in_parallel()) {
+    // The walk is cut into sixteen ranges per thread.  The draw is what
+    // spreads the work, so a thread on a core that answers the walk quickly
+    // takes more ranges than a thread on a core that answers it slowly, and
+    // what the last round cannot hand out stays under a sixteenth of the
+    // walk.  A range is a whole number of sixty-four elements, a multiple of
+    // every step a walk takes, so a range never splits a step that a
+    // neighbouring range began.
+    const int64_t draws = num_threads * 16;
+    const int64_t chunk =
+        std::max<int64_t>(64, ((numiter + draws - 1) / draws + 63) & ~int64_t(63));
+    std::atomic<int64_t> drawn{0};
+    std::atomic<bool> failed{false};
+    std::atomic_flag err_flag = ATOMIC_FLAG_INIT;
+    std::exception_ptr eptr;
+    #pragma omp parallel
+    {
+      const int64_t team =
+          std::min<int64_t>(omp_get_num_threads(), num_threads);
+      const int64_t tid = omp_get_thread_num();
+      if (tid < team) {
+        ParallelRegionGuard guard(static_cast<int>(tid));
+        for (;;) {
+          if (failed.load(std::memory_order_relaxed)) {
+            break;
+          }
+          const int64_t index = drawn.fetch_add(1, std::memory_order_relaxed);
+          const int64_t local_begin = begin + index * chunk;
+          if (local_begin >= end) {
+            break;
+          }
+          const int64_t local_end = std::min(end, local_begin + chunk);
+          try {
+            f(local_begin, local_end);
+          } catch (...) {
+            if (!err_flag.test_and_set()) {
+              eptr = std::current_exception();
+            }
+            failed.store(true, std::memory_order_relaxed);
+            break;
+          }
+        }
+      }
+    }
+    if (eptr) {
+      std::rethrow_exception(eptr);
+    }
+    return;
+  }
+#endif
+
+  // Without the team there is nothing to balance across, and the split below
+  // hands the walk to the threads it has.
+  invoke_parallel_impl(begin, end, grain_size, f);
 }
 
 } // namespace internal
