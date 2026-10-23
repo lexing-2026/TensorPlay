@@ -417,6 +417,26 @@ Tensor& trunc_inplace_kernel(Tensor& self) {
   return unary_op_typed_inplace(self, "truncinplace", "buffer_truncinplace", "unary trunc");
 }
 
+// The fraction a lane keeps after the whole toward zero is taken away.  A
+// count holds none of itself to take, so a counting payload is turned away
+// rather than read wide and answered with a zero.
+Tensor frac_kernel(const Tensor& self) {
+  TP_CHECK(
+      self.dtype() == DType::Float32 || self.dtype() == DType::Float16,
+      "Vulkan frac takes the fraction off a measured payload; a count has "
+      "none");
+  return unary_op_typed(self, "frac", "buffer_frac", false, "unary frac");
+}
+
+Tensor& frac_inplace_kernel(Tensor& self) {
+  TP_CHECK(
+      self.dtype() == DType::Float32 || self.dtype() == DType::Float16,
+      "Vulkan frac_ takes the fraction off a measured payload; a count has "
+      "none");
+  return unary_op_typed_inplace(
+      self, "fracinplace", "buffer_fracinplace", "unary frac");
+}
+
 Tensor tan_kernel(const Tensor& self) {
   return unary_op_typed(self, "tan", "buffer_tan", false, "unary tan");
 }
@@ -580,6 +600,8 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, UnaryOpKernels) {
   m.impl("round_", &tensorplay::vulkan::ops::round_inplace_kernel);
   m.impl("trunc", &tensorplay::vulkan::ops::trunc_kernel);
   m.impl("trunc_", &tensorplay::vulkan::ops::trunc_inplace_kernel);
+  m.impl("frac", &tensorplay::vulkan::ops::frac_kernel);
+  m.impl("frac_", &tensorplay::vulkan::ops::frac_inplace_kernel);
   m.impl("tan", &tensorplay::vulkan::ops::tan_kernel);
   m.impl("tan_", &tensorplay::vulkan::ops::tan_inplace_kernel);
   m.impl("sinh", &tensorplay::vulkan::ops::sinh_kernel);

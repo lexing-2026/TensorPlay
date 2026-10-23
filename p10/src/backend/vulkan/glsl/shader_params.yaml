@@ -75,6 +75,10 @@ unary_op:
     OPERATOR: roundEven(X)
   - NAME: trunc
     OPERATOR: trunc(X)
+  # What a measured lane keeps once the whole toward zero is taken away, so the
+  # answer carries the sign of the payload and never leaves (-1, 1).
+  - NAME: frac
+    OPERATOR: X - trunc(X)
   - NAME: tan
     OPERATOR: tan(X)
   - NAME: sinh
@@ -395,6 +399,10 @@ buffer_unary_op:
   - NAME: buffer_trunc_i32
     DTYPE: int
     OPERATOR: X
+  # The fraction of a count is the count itself, so only the measured widths
+  # get a kernel; a counting payload is refused before the dispatch.
+  - NAME: buffer_frac
+    OPERATOR: X - trunc(X)
   - NAME: buffer_tan
     OPERATOR: tan(X)
   - NAME: buffer_sinh
@@ -2487,6 +2495,12 @@ buffer_half_unary_op:
     INPLACE: false
   - NAME: buffer_floor_halfinplace
     OPERATOR: 'floor(X)'
+    INPLACE: true
+  - NAME: buffer_frac_half
+    OPERATOR: 'X - trunc(X)'
+    INPLACE: false
+  - NAME: buffer_frac_halfinplace
+    OPERATOR: 'X - trunc(X)'
     INPLACE: true
   - NAME: buffer_gelu_half
     OPERATOR: '0.5f * X * (1.0f + erf_approx(X * 0.70710678118654752f))'
