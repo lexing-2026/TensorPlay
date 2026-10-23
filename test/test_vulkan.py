@@ -8741,6 +8741,116 @@ class TestVulkanForeachGroup(unittest.TestCase):
             self.assertEqual(float(found.cpu().numpy()), 0.0, msg=device)
 
 
+class TestVulkanAmpScale(unittest.TestCase):
+    # A step ends by turning the flag the gradient scan raised into a new loss
+    # scale.  The update watches two one-lane tensors - the scale and the count
+    # of clean steps since it last changed - and a raised flag, a clean count
+    # and the step that reaches the growth interval each take a different
+    # branch.  The device lane keeps the count and the flag resident; the host
+    # lane is the cross-check for the branches the two lanes share.
+
+    @staticmethod
+    def _scale(device, value):
+        return tensorplay.tensor(
+            value, dtype=tensorplay.float32, device=device)
+
+    @staticmethod
+    def _tracker(device, value):
+        return tensorplay.tensor(
+            value, dtype=tensorplay.int32, device=device)
+
+    @staticmethod
+    def _flag(device, value):
+        return tensorplay.tensor(
+            value, dtype=tensorplay.float32, device=device)
+
+    @staticmethod
+    def _read(held):
+        return held.cpu().numpy().item()
+
+    def test_a_step_that_found_a_bad_lane_backs_the_scale_off(self):
+        for device in ("vulkan", "cpu"):
+            scale = self._scale(device, 128.0)
+            tracker = self._tracker(device, 7)
+            found = self._flag(device, 1.0)
+            tensorplay._amp_update_scale_(
+                scale, tracker, found, 2.0, 0.5, 100)
+            self.assertEqual(self._read(scale), 64.0, msg=device)
+            self.assertEqual(self._read(tracker), 0, msg=device)
+            # The flag is read, never written, by the update.
+            self.assertEqual(self._read(found), 1.0, msg=device)
+
+    def test_a_clean_step_counts_toward_the_growth_interval(self):
+        for device in ("vulkan", "cpu"):
+            scale = self._scale(device, 128.0)
+            tracker = self._tracker(device, 0)
+            found = self._flag(device, 0.0)
+            for counted in (1, 2):
+                tensorplay._amp_update_scale_(
+                    scale, tracker, found, 2.0, 0.5, 3)
+                self.assertEqual(self._read(tracker), counted, msg=device)
+                self.assertEqual(self._read(scale), 128.0, msg=device)
+            tensorplay._amp_update_scale_(
+                scale, tracker, found, 2.0, 0.5, 3)
+            self.assertEqual(self._read(tracker), 0, msg=device)
+            self.assertEqual(self._read(scale), 256.0, msg=device)
+
+    def test_a_growth_that_would_overflow_keeps_the_previous_scale(self):
+        # A growth past the largest finite single-precision value keeps the
+        # previous scale and still clears the count.  The host lane has no bound
+        # check and stores an infinite scale instead.
+        device = "vulkan"
+        kept = float(np.float32(3.0e38))
+        scale = tensorplay.tensor(
+            [3.0e38], dtype=tensorplay.float32, device=device)
+        tracker = tensorplay.tensor([0], dtype=tensorplay.int32, device=device)
+        found = tensorplay.tensor(
+            [0.0], dtype=tensorplay.float32, device=device)
+        tensorplay._amp_update_scale_(scale, tracker, found, 2.0, 0.5, 1)
+        self.assertEqual(self._read(scale), kept)
+        self.assertTrue(np.isfinite(self._read(scale)))
+        self.assertEqual(self._read(tracker), 0)
+
+    def test_a_flag_lane_names_a_raised_flag_by_not_being_zero(self):
+        # The flag is a truth: any lane that is not zero, including a negative
+        # one or a not-a-number, backs the scale off.  The host lane asks
+        # whether the flag is positive.
+        device = "vulkan"
+        for flag in (-2.0, np.nan):
+            scale = self._scale(device, 128.0)
+            tracker = self._tracker(device, 5)
+            found = self._flag(device, flag)
+            tensorplay._amp_update_scale_(
+                scale, tracker, found, 2.0, 0.5, 100)
+            self.assertEqual(self._read(scale), 64.0, msg=flag)
+            self.assertEqual(self._read(tracker), 0, msg=flag)
+
+    def test_a_scale_or_count_that_is_not_one_lane_is_refused(self):
+        device = "vulkan"
+        scale = self._scale(device, 128.0)
+        tracker = self._tracker(device, 0)
+        found = self._flag(device, 0.0)
+        wide = tensorplay.tensor(
+            [128.0, 128.0], dtype=tensorplay.float32, device=device)
+        with self.assertRaisesRegex(RuntimeError, "1-element tensors"):
+            tensorplay._amp_update_scale_(wide, tracker, found, 2.0, 0.5, 3)
+        counted = tensorplay.tensor(
+            128, dtype=tensorplay.int32, device=device)
+        with self.assertRaisesRegex(RuntimeError, "must be float32"):
+            tensorplay._amp_update_scale_(
+                counted, tracker, found, 2.0, 0.5, 3)
+        wide_tracker = tensorplay.tensor(
+            [0, 0], dtype=tensorplay.int32, device=device)
+        with self.assertRaisesRegex(RuntimeError, "1-element tensors"):
+            tensorplay._amp_update_scale_(
+                scale, wide_tracker, found, 2.0, 0.5, 3)
+        half_tracker = tensorplay.tensor(
+            0, dtype=tensorplay.float16, device=device)
+        with self.assertRaisesRegex(RuntimeError, "must be int32"):
+            tensorplay._amp_update_scale_(
+                scale, half_tracker, found, 2.0, 0.5, 3)
+
+
 class TestVulkanRowAccumulation(unittest.TestCase):
     # A list of row codes may name one row several times, and every row it names
     # has to reach the destination.  Nothing on this device locks a row while it

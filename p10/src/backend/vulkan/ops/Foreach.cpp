@@ -686,6 +686,60 @@ void amp_foreach_non_finite_check_and_unscale_kernel(
   }
 }
 
+// A step ends by turning the flag the gradient scan raised into a new loss
+// scale.  The update is a state machine over two one-lane tensors - the scale
+// and the count of clean steps since it last changed - and both stay on the
+// device so no branch needs the flag or the count on the host.  A raised flag
+// backs the scale off and clears the count; a clean step counts up, and the
+// step that reaches the interval grows the scale once and clears the count.
+// A growth that would leave the largest finite single-precision value keeps
+// the previous scale instead.  The flag is read as a truth, so any lane that
+// is not zero, including a not-a-number, counts as raised.
+Tensor& amp_update_scale_kernel(
+    Tensor& self,
+    Tensor& growth_tracker,
+    const Tensor& found_inf,
+    double growth_factor,
+    double backoff_factor,
+    int64_t growth_interval) {
+  if (!self.device().is_vulkan() || !growth_tracker.device().is_vulkan() ||
+      !found_inf.device().is_vulkan()) {
+    TP_THROW(
+        RuntimeError,
+        "_amp_update_scale_: every tensor must be a Vulkan tensor");
+  }
+  if (self.numel() != 1 || growth_tracker.numel() != 1 ||
+      found_inf.numel() != 1) {
+    TP_THROW(
+        RuntimeError,
+        "_amp_update_scale_: self, growth_tracker and found_inf must be "
+        "1-element tensors");
+  }
+  if (self.dtype() != DType::Float32 || found_inf.dtype() != DType::Float32) {
+    TP_THROW(
+        RuntimeError, "_amp_update_scale_: self and found_inf must be float32");
+  }
+  if (growth_tracker.dtype() != DType::Int32) {
+    TP_THROW(
+        RuntimeError, "_amp_update_scale_: growth_tracker must be int32");
+  }
+
+  const Tensor failed = tpx::ops::ne(found_inf, 0.0);
+  const Tensor incremented = tpx::ops::add(growth_tracker, 1);
+  const Tensor reached = tpx::ops::eq(incremented, growth_interval);
+  const Tensor scaled_up = tpx::ops::mul(self, growth_factor);
+  const Tensor grown =
+      tpx::ops::where(tpx::ops::isfinite(scaled_up), scaled_up, self);
+  const Tensor backed = tpx::ops::mul(self, backoff_factor);
+  const Tensor scale = tpx::ops::where(
+      failed, backed, tpx::ops::where(reached, grown, self));
+  const Tensor tracker = tpx::ops::where(
+      tpx::ops::logical_or(failed, reached), 0, incremented);
+  tpx::ops::copy_(growth_tracker, tracker);
+  tpx::ops::copy_(self, scale);
+  return self;
+}
+
 // A group raised to a count.  The exponent is either one count, one count per
 // tensor, or a payload of its own, and a shared base may be a count or a
 // payload held beside the walk.
@@ -977,6 +1031,8 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, ForeachKernels) {
   m.impl(
       "_amp_foreach_non_finite_check_and_unscale_",
       &tensorplay::vulkan::ops::amp_foreach_non_finite_check_and_unscale_kernel);
+  m.impl(
+      "_amp_update_scale_", &tensorplay::vulkan::ops::amp_update_scale_kernel);
 
   m.impl(
       "_foreach_pow.Scalar",
