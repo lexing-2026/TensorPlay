@@ -16,6 +16,7 @@ import os
 import pickle
 import sys
 from functools import lru_cache
+from importlib.metadata import PackageNotFoundError, version as _package_version
 from pathlib import Path
 from typing import Any, Callable
 
@@ -233,15 +234,31 @@ def _cache_root() -> Path | None:
 
 
 @lru_cache(maxsize=1)
+def _ffi_version() -> str:
+    """The FFI bridge's version, read from metadata instead of by importing it.
+
+    Importing the bridge costs most of a second, and the fingerprint that names
+    an object file needs its version even when the object is already on disk.
+    """
+
+    for name in ("apache-tvm-ffi", "tvm-ffi"):
+        try:
+            return _package_version(name)
+        except PackageNotFoundError:
+            pass
+    import tvm_ffi
+
+    return tvm_ffi.__version__
+
+
+@lru_cache(maxsize=1)
 def _source_fingerprint() -> str:
     """Identify this build of the kernel sources and of the toolchain."""
-
-    import tvm_ffi
 
     digest = hashlib.sha256()
     digest.update(f"py{sys.version_info.major}.{sys.version_info.minor}".encode())
     digest.update(f"cutlass={cutlass.__version__}".encode())
-    digest.update(f"tvm_ffi={tvm_ffi.__version__}".encode())
+    digest.update(f"tvm_ffi={_ffi_version()}".encode())
     root = Path(__file__).resolve().parent
     for source in sorted(root.rglob("*.py")):
         content = source.read_bytes()
