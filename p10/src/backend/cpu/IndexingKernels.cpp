@@ -1558,23 +1558,83 @@ inline bool sort_is_nan(T value) {
     }
 }
 
-template <typename ctype>
-struct SortPairLess {
+// A sort element is value + originating position.  Keeping the position as
+// narrow as the slice allows halves the bytes std::sort moves per swap: a
+// 32-bit-index slot is one general-purpose register, so every rotation is a
+// single load/store pair instead of two.
+template <typename ctype, typename index_t>
+struct SortSlot {
+    ctype value;
+    index_t index;
+};
+
+template <typename ctype, typename index_t>
+struct SortSlotLess {
     bool descending;
-    explicit SortPairLess(bool desc) : descending(desc) {}
-    // returns true when pair a must come before pair b
-    bool operator()(const std::pair<ctype, int64_t>& a, const std::pair<ctype, int64_t>& b) const {
+    explicit SortSlotLess(bool desc) : descending(desc) {}
+    // returns true when slot a must come before slot b
+    bool operator()(const SortSlot<ctype, index_t>& a, const SortSlot<ctype, index_t>& b) const {
+        // Two ordered comparisons settle every pair of comparable values and
+        // leave only equal values (or NaN) in the residual case, so the NaN
+        // tests run on the rare path instead of on every comparison.
+        if (descending) {
+            if (b.value < a.value) return true;
+            if (a.value < b.value) return false;
+        } else {
+            if (a.value < b.value) return true;
+            if (b.value < a.value) return false;
+        }
         if constexpr (std::is_floating_point_v<ctype> ||
                       std::is_same_v<ctype, Half> ||
                       std::is_same_v<ctype, BFloat16>) {
-            const bool na = sort_is_nan(a.first), nb = sort_is_nan(b.first);
+            const bool na = sort_is_nan(a.value), nb = sort_is_nan(b.value);
             if (na != nb) return descending ? na : nb;  // NaN sinks in ascending
-            if (na) return a.second < b.second;         // stable among NaNs
         }
-        if (a.first != b.first) return descending ? (b.first < a.first) : (a.first < b.first);
-        return a.second < b.second;  // stable among equal values
+        return a.index < b.index;  // stable among equal values
     }
 };
+
+template <typename ctype, typename index_t>
+void sort_dim_slices(const ctype* self, ctype* values, int64_t* indices,
+                     int64_t outer, int64_t d_size, int64_t inner,
+                     bool descending) {
+    using slot_t = SortSlot<ctype, index_t>;
+    const SortSlotLess<ctype, index_t> less(descending);
+    const int64_t slice_grain = std::max<int64_t>(1, GRAIN_SIZE / std::max<int64_t>(d_size, 1));
+    parallel_for(0, outer * inner, slice_grain, [&](int64_t b, int64_t e) {
+        constexpr int64_t kMaxCachedElems = 1 << 12;
+        static thread_local std::vector<slot_t> cached_buf;
+        std::vector<slot_t> transient_buf;
+        slot_t* buf = nullptr;
+        if (d_size <= kMaxCachedElems) {
+            if (static_cast<int64_t>(cached_buf.size()) < d_size) cached_buf.resize(static_cast<size_t>(d_size));
+            buf = cached_buf.data();
+        } else {
+            transient_buf.resize(static_cast<size_t>(d_size));
+            buf = transient_buf.data();
+        }
+        if (inner == 1) {
+            for (int64_t si = b; si < e; ++si) {
+                const ctype* base = self + si * d_size;
+                for (int64_t j = 0; j < d_size; ++j) buf[j] = slot_t{base[j], static_cast<index_t>(j)};
+                std::sort(buf, buf + d_size, less);
+                ctype* vbase = values + si * d_size;
+                int64_t* ibase = indices + si * d_size;
+                for (int64_t j = 0; j < d_size; ++j) { vbase[j] = buf[j].value; ibase[j] = buf[j].index; }
+            }
+            return;
+        }
+        for (int64_t si = b; si < e; ++si) {
+            int64_t o = si / inner, in2 = si % inner;
+            const ctype* base = self + o * d_size * inner + in2;
+            for (int64_t j = 0; j < d_size; ++j) buf[j] = slot_t{base[j * inner], static_cast<index_t>(j)};
+            std::sort(buf, buf + d_size, less);
+            ctype* vbase = values + o * d_size * inner + in2;
+            int64_t* ibase = indices + o * d_size * inner + in2;
+            for (int64_t j = 0; j < d_size; ++j) { vbase[j * inner] = buf[j].value; ibase[j * inner] = buf[j].index; }
+        }
+    });
+}
 
 }  // namespace
 
@@ -1594,31 +1654,11 @@ std::tuple<Tensor, Tensor> sort_cpu(const Tensor& self, int64_t dim, bool descen
         const ctype* s = self_c.data_ptr<ctype>(); \
         ctype* vp = values.data_ptr<ctype>(); \
         int64_t* ip = indices.data_ptr<int64_t>(); \
-        const SortPairLess<ctype> less(descending); \
-        const int64_t slice_grain = std::max<int64_t>(1, GRAIN_SIZE / std::max<int64_t>(d_size, 1)); \
-        parallel_for(0, outer * inner, slice_grain, [&](int64_t b, int64_t e) { \
-            using pair_t = std::pair<ctype, int64_t>; \
-            constexpr int64_t kMaxCachedElems = 1 << 12; \
-            static thread_local std::vector<pair_t> cached_buf; \
-            std::vector<pair_t> transient_buf; \
-            pair_t* buf = nullptr; \
-            if (d_size <= kMaxCachedElems) { \
-                if (static_cast<int64_t>(cached_buf.size()) < d_size) cached_buf.resize(static_cast<size_t>(d_size)); \
-                buf = cached_buf.data(); \
-            } else { \
-                transient_buf.resize(static_cast<size_t>(d_size)); \
-                buf = transient_buf.data(); \
-            } \
-            for (int64_t si = b; si < e; ++si) { \
-                int64_t o = si / inner, in2 = si % inner; \
-                const ctype* base = s + o * d_size * inner + in2; \
-                for (int64_t j = 0; j < d_size; ++j) buf[j] = {base[j * inner], j}; \
-                std::sort(buf, buf + d_size, less); \
-                ctype* vbase = vp + o * d_size * inner + in2; \
-                int64_t* ibase = ip + o * d_size * inner + in2; \
-                for (int64_t j = 0; j < d_size; ++j) { vbase[j * inner] = buf[j].first; ibase[j * inner] = buf[j].second; } \
-            } \
-        }); \
+        if (d_size <= std::numeric_limits<int32_t>::max()) { \
+            sort_dim_slices<ctype, int32_t>(s, vp, ip, outer, d_size, inner, descending); \
+        } else { \
+            sort_dim_slices<ctype, int64_t>(s, vp, ip, outer, d_size, inner, descending); \
+        } \
         break; \
     }
     switch (self_c.dtype()) {
