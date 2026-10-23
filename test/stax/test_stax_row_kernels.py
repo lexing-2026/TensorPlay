@@ -22,7 +22,7 @@ from tensorplay.compiler.backends.stax.codegen.cutedsl.kernels import (
 
 cuda_only = pytest.mark.skipif(not tp.cuda.is_available(), reason="needs a CUDA device")
 
-DTYPES = [tp.bfloat16, tp.float32]
+DTYPES = [tp.bfloat16, tp.float16, tp.float32]
 SHAPES = [(8, 4096), (3, 8192)]
 
 

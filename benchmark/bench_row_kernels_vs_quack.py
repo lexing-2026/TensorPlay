@@ -41,6 +41,7 @@ EPS = 1e-6
 RMS_CASES = [
     (1024, 4096, torch.bfloat16),
     (4096, 4096, torch.bfloat16),
+    (4096, 8192, torch.float16),
     (4096, 8192, torch.float32),
     (16384, 8192, torch.bfloat16),
     (4096, 16384, torch.bfloat16),
@@ -51,13 +52,17 @@ SOFTMAX_CASES = [
     (1024, 4096, torch.bfloat16),
     (4096, 4096, torch.float32),
     (16384, 4096, torch.bfloat16),
+    (4096, 8192, torch.float16),
     (4096, 8192, torch.bfloat16),
+    (4096, 32000, torch.float16),
     (4096, 32000, torch.bfloat16),
     (4096, 32000, torch.float32),
 ]
 CE_CASES = [
+    (4096, 8192, torch.float16),
     (4096, 8192, torch.bfloat16),
     (4096, 8192, torch.float32),
+    (4096, 32000, torch.float16),
     (4096, 32000, torch.bfloat16),
     (16384, 32000, torch.bfloat16),
     (4096, 32000, torch.float32),
