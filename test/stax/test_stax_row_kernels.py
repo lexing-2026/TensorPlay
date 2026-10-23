@@ -10,6 +10,7 @@ import pytest
 import tensorplay as tp
 import tensorplay.nn.functional as F
 import tensorplay.compiler.backends.stax.op_lowerings as lowerings
+import tensorplay.compiler.backends.stax.codegen.cutedsl.kernels.softmax as softmax_module
 from tensorplay.compiler.backends.stax.codegen.cutedsl.kernels import (
     ce_bwd,
     ce_fwd,
@@ -107,6 +108,24 @@ def test_cross_entropy_rows_match_a_float32_reference(dtype, shape):
     want = (tp.softmax(x.float(), -1) - onehot) * dloss.reshape(rows, 1)
     assert dx.dtype == dtype
     assert tp.allclose(dx.float(), want, atol=3e-2, rtol=2e-2)
+
+
+@cuda_only
+def test_a_compiled_kernel_is_reloaded_from_its_object(tmp_path, monkeypatch):
+    monkeypatch.setenv("TP_STAX_CACHE_DIR", str(tmp_path))
+    # Earlier tests share the table, so start from an empty one and take the
+    # single entry this call adds.
+    softmax_module._fwd_cache.clear()
+    x = tp.randn(4, 2048, device="cuda", dtype=tp.float32)
+    first = softmax_fwd(x)
+    (key, built), = softmax_module._fwd_cache.items()
+    assert list(tmp_path.rglob("*.o"))
+    # A later process starts with an empty table and finds the object instead
+    # of building the kernel again.
+    softmax_module._fwd_cache.clear()
+    again = softmax_fwd(x)
+    assert softmax_module._fwd_cache[key] is not built
+    assert tp.allclose(again.float(), first.float(), atol=0, rtol=0)
 
 
 @cuda_only

@@ -9,8 +9,14 @@ a multiple of the tile, and the compile cache.
 
 from __future__ import annotations
 
+import hashlib
 import math
 import operator
+import os
+import pickle
+import sys
+from functools import lru_cache
+from pathlib import Path
 from typing import Any, Callable
 
 import cutlass
@@ -181,17 +187,93 @@ def fake_tensor(dtype, shape, divisibility: int = 1, leading_dim: int = -1):
 
 
 def compile_cached(cache: dict, key: Any, build: Callable[[], Any]):
-    """Compile once per key.
+    """Compile once per key, reusing the object file across processes.
 
     A kernel is specialised on its row length and dtype, so the key is those
-    facts: two shapes that agree on them run the same binary.
+    facts: two shapes that agree on them run the same binary.  The object is
+    also kept on disk, because generating and assembling a kernel costs a
+    tenth of a second where loading the object costs a millisecond.
     """
 
     compiled = cache.get(key)
-    if compiled is None:
-        compiled = build()
-        cache[key] = compiled
+    if compiled is not None:
+        return compiled
+    path = _object_path(build, key)
+    if path is not None and path.exists():
+        try:
+            compiled = _load_object(path)
+        except Exception:
+            # An object written by another build of the toolchain, or one
+            # whose symbols no longer match, is simply rebuilt below.
+            compiled = None
+        if compiled is not None:
+            cache[key] = compiled
+            return compiled
+    compiled = build()
+    cache[key] = compiled
+    if path is not None:
+        _store_object(compiled, path)
     return compiled
+
+
+#: Name the object file exports its entry point under.
+_EXPORT_NAME = "func"
+
+
+def _cache_root() -> Path | None:
+    """Directory holding compiled objects, or ``None`` when caching is off."""
+
+    if os.environ.get("TP_STAX_CACHE", "1") == "0":
+        return None
+    override = os.environ.get("TP_STAX_CACHE_DIR")
+    if override:
+        return Path(override)
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    return Path(base) / "tensorplay" / "stax"
+
+
+@lru_cache(maxsize=1)
+def _source_fingerprint() -> str:
+    """Identify this build of the kernel sources and of the toolchain."""
+
+    import tvm_ffi
+
+    digest = hashlib.sha256()
+    digest.update(f"py{sys.version_info.major}.{sys.version_info.minor}".encode())
+    digest.update(f"cutlass={cutlass.__version__}".encode())
+    digest.update(f"tvm_ffi={tvm_ffi.__version__}".encode())
+    root = Path(__file__).resolve().parent
+    for source in sorted(root.rglob("*.py")):
+        content = source.read_bytes()
+        digest.update(source.name.encode())
+        digest.update(len(content).to_bytes(8, "little"))
+        digest.update(content)
+    return digest.hexdigest()[:16]
+
+
+def _object_path(build: Callable[[], Any], key: Any) -> Path | None:
+    root = _cache_root()
+    if root is None:
+        return None
+    fingerprint = _source_fingerprint()
+    digest = hashlib.sha256(pickle.dumps((fingerprint, build.__module__, build.__qualname__, key)))
+    return root / fingerprint / f"{digest.hexdigest()[:32]}.o"
+
+
+def _load_object(path: Path):
+    return cute.runtime.load_module(str(path), enable_tvm_ffi=True)[_EXPORT_NAME]
+
+
+def _store_object(compiled, path: Path) -> None:
+    """Publish an object file atomically, so a reader never sees it half written."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    staged = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        compiled.export_to_c(object_file_path=str(staged), function_name=_EXPORT_NAME)
+        os.replace(staged, path)
+    except Exception:
+        staged.unlink(missing_ok=True)
 
 
 def tiled_copy_for(dtype, threads: int, vec: int):
