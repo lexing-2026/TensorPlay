@@ -1025,6 +1025,184 @@ class TestVulkanLlmKernels(unittest.TestCase):
                 tensorplay.from_numpy(np.zeros((20000, 16), np.float32)
                                       ).to("vulkan"))
 
+    def test_fused_rope_rotates_a_query_key_pair(self):
+        import tensorplay as tp
+        # One table answers both operands: position t of the query has to read
+        # the same cosine/sine row as position t of the key, and a query head
+        # and the key head it attends to have to land on the same angle.  The
+        # head and batch counts stay free to differ, which is exactly what a
+        # grouped-query layout asks for.
+        tensorplay.manual_seed(31337)
+        for q_shape, k_shape, table_len, off in (
+                ((1, 4, 8, 16), (1, 2, 8, 16), 12, 0),
+                ((1, 2, 9, 32), (1, 2, 9, 32), 18, 5),
+                ((2, 3, 1, 128), (2, 1, 1, 128), 705, 700),
+                ((3, 2, 64, 64), (3, 1, 64, 64), 64, 0),
+                ((2, 8, 17, 32), (2, 2, 17, 32), 40, 9)):
+            head_dim = q_shape[-1]
+            q_cpu = (tensorplay.randn(q_shape, device="cpu") * 0.4).numpy()
+            k_cpu = (tensorplay.randn(k_shape, device="cpu") * 0.4).numpy()
+            cos_cpu, sin_cpu = _rope_tables(head_dim, table_len)
+            rotated_q, rotated_k = tp.fused_rope(
+                tensorplay.from_numpy(q_cpu.copy()).to("vulkan"),
+                tensorplay.from_numpy(k_cpu.copy()).to("vulkan"),
+                tensorplay.from_numpy(cos_cpu.copy()).to("vulkan"),
+                tensorplay.from_numpy(sin_cpu.copy()).to("vulkan"),
+                off)
+            self.assertTrue(rotated_q.device.is_vulkan())
+            self.assertEqual(tuple(rotated_q.shape), q_shape)
+            self.assertEqual(tuple(rotated_k.shape), k_shape)
+            for got, want in (
+                    (rotated_q.cpu().numpy(),
+                     _rope_reference(q_cpu, cos_cpu, sin_cpu, off)),
+                    (rotated_k.cpu().numpy(),
+                     _rope_reference(k_cpu, cos_cpu, sin_cpu, off))):
+                np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-5)
+
+        # The pair and the single-tensor form answer the same rotation, so a
+        # caller that already holds one of the two operands gets the lanes it
+        # would have got by rotating each tensor on its own.
+        q = tensorplay.randn((2, 3, 16, 64), device="cpu") * 0.4
+        k = tensorplay.randn((2, 1, 16, 64), device="cpu") * 0.4
+        cos_cpu, sin_cpu = _rope_tables(64, 24)
+        cos = tensorplay.from_numpy(cos_cpu.copy())
+        sin = tensorplay.from_numpy(sin_cpu.copy())
+        pair_q, pair_k = tp.fused_rope(q.to("vulkan"), k.to("vulkan"),
+                                       cos.to("vulkan"), sin.to("vulkan"), 3)
+        solo_q = tp.functional.rotary_embedding(q.to("vulkan"), cos.to("vulkan"),
+                                                sin.to("vulkan"),
+                                                position_offset=3)
+        solo_k = tp.functional.rotary_embedding(k.to("vulkan"), cos.to("vulkan"),
+                                                sin.to("vulkan"),
+                                                position_offset=3)
+        np.testing.assert_array_equal(pair_q.cpu().numpy(),
+                                      solo_q.cpu().numpy())
+        np.testing.assert_array_equal(pair_k.cpu().numpy(),
+                                      solo_k.cpu().numpy())
+
+    def test_fused_rope_over_linear_storage(self):
+        import tensorplay as tp
+        # A prefill or a long cached decode step pushes either the token axis or
+        # the table past the image axis limit, so both operands are consumed as
+        # row-major payloads while sharing one table walk.  Half precision is the
+        # decode-time default, and a one-row table is the broadcast case a
+        # position-free rotation needs.
+        tensorplay.manual_seed(90210)
+        for q_shape, k_shape, table_len, off, dtype, flat in (
+                ((2, 20000, 64), (2, 20000, 64), 20000, 0,
+                 tensorplay.float32, False),
+                ((1, 16400, 32), (1, 16400, 32), 1, 0, tensorplay.float32, True),
+                ((3, 1, 20003, 32), (3, 2, 20003, 32), 20010, 5,
+                 tensorplay.float16, False),
+                ((2, 8, 16400), (3, 8, 16400), 32, 0,
+                 tensorplay.float16, False),
+                ((1, 4, 129, 128), (1, 1, 129, 128), 20000, 700,
+                 tensorplay.float32, False)):
+            head_dim = q_shape[-1]
+            q_cpu = (tensorplay.randn(q_shape, device="cpu")
+                     * 0.4).to(dtype).numpy()
+            k_cpu = (tensorplay.randn(k_shape, device="cpu")
+                     * 0.4).to(dtype).numpy()
+            cos_cpu, sin_cpu = _rope_tables(head_dim, table_len)
+            if flat:
+                cos_cpu, sin_cpu = cos_cpu[0], sin_cpu[0]
+            width = np.float16 if dtype == tensorplay.float16 else np.float32
+            cos_cpu = cos_cpu.astype(width)
+            sin_cpu = sin_cpu.astype(width)
+            rotated_q, rotated_k = tp.fused_rope(
+                tensorplay.from_numpy(q_cpu.copy()).to("vulkan"),
+                tensorplay.from_numpy(k_cpu.copy()).to("vulkan"),
+                tensorplay.from_numpy(np.ascontiguousarray(cos_cpu)).to("vulkan"),
+                tensorplay.from_numpy(np.ascontiguousarray(sin_cpu)).to("vulkan"),
+                off)
+            self.assertEqual(rotated_q.dtype, dtype)
+            self.assertEqual(rotated_k.dtype, dtype)
+            for got, want in (
+                    (rotated_q.cpu().numpy(),
+                     _rope_reference(q_cpu.astype(np.float32),
+                                     cos_cpu.astype(np.float32),
+                                     sin_cpu.astype(np.float32), off).astype(
+                                         width)),
+                    (rotated_k.cpu().numpy(),
+                     _rope_reference(k_cpu.astype(np.float32),
+                                     cos_cpu.astype(np.float32),
+                                     sin_cpu.astype(np.float32), off).astype(
+                                         width))):
+                if width is np.float16:
+                    # A half payload rotates inside one 32-bit word, so the pair
+                    # is rounded exactly once and the lanes agree bit for bit.
+                    np.testing.assert_array_equal(got.view(np.uint16),
+                                                  want.view(np.uint16))
+                else:
+                    np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-5)
+
+    def test_fused_rope_rejects_a_mismatched_pair(self):
+        import tensorplay as tp
+        cos_cpu, sin_cpu = _rope_tables(32, 16)
+
+        def device_pairs(query, key):
+            return tp.fused_rope(query.to("vulkan"), key.to("vulkan"),
+                                 tensorplay.from_numpy(cos_cpu.copy()).to("vulkan"),
+                                 tensorplay.from_numpy(sin_cpu.copy()).to("vulkan"),
+                                 0)
+
+        # A shared angle only means something when both operands rotate the same
+        # lanes, at the same positions, in the same width.
+        with self.assertRaisesRegex(RuntimeError, "same rank and token length"):
+            device_pairs(tensorplay.randn((1, 4, 8, 32), device="cpu"),
+                         tensorplay.randn((1, 4, 7, 32), device="cpu"))
+        with self.assertRaisesRegex(RuntimeError, "same rank and token length"):
+            device_pairs(tensorplay.randn((1, 4, 8, 32), device="cpu"),
+                         tensorplay.randn((8, 32), device="cpu"))
+        with self.assertRaisesRegex(
+                RuntimeError, "even head dimension shared by query and key"):
+            device_pairs(tensorplay.randn((1, 2, 8, 32), device="cpu"),
+                         tensorplay.randn((1, 2, 8, 16), device="cpu"))
+        with self.assertRaisesRegex(
+                RuntimeError, "even head dimension shared by query and key"):
+            device_pairs(tensorplay.randn((1, 2, 8, 31), device="cpu"),
+                         tensorplay.randn((1, 2, 8, 31), device="cpu"))
+        with self.assertRaisesRegex(RuntimeError, "same dtype"):
+            device_pairs(tensorplay.randn((1, 2, 8, 32), device="cpu"),
+                         tensorplay.randn((1, 2, 8, 32), device="cpu")
+                         .to(tensorplay.float16))
+        with self.assertRaisesRegex(RuntimeError, "ndim >= 2"):
+            device_pairs(tensorplay.randn((1, 2, 8, 32), device="cpu"),
+                         tensorplay.randn((256,), device="cpu"))
+        with self.assertRaisesRegex(RuntimeError, "non-negative position offset"):
+            tp.fused_rope(
+                tensorplay.randn((1, 2, 8, 32), device="cpu").to("vulkan"),
+                tensorplay.randn((1, 2, 8, 32), device="cpu").to("vulkan"),
+                tensorplay.from_numpy(cos_cpu.copy()).to("vulkan"),
+                tensorplay.from_numpy(sin_cpu.copy()).to("vulkan"),
+                -1)
+        # A table cannot answer a position on a different device than the lanes
+        # it rotates.
+        with self.assertRaisesRegex(RuntimeError, "same device"):
+            tp.fused_rope(
+                tensorplay.randn((1, 2, 8, 32), device="cpu").to("vulkan"),
+                tensorplay.randn((1, 2, 8, 32), device="cpu"),
+                tensorplay.from_numpy(cos_cpu.copy()).to("vulkan"),
+                tensorplay.from_numpy(sin_cpu.copy()).to("vulkan"),
+                0)
+        # The table contract still belongs to the rotation itself: one walk
+        # indexes both tables, so a sine of another width or of another length
+        # would be read past its own entries.
+        with self.assertRaisesRegex(RuntimeError, "head_dim/2"):
+            tp.fused_rope(
+                tensorplay.randn((1, 2, 8, 32), device="cpu").to("vulkan"),
+                tensorplay.randn((1, 2, 8, 32), device="cpu").to("vulkan"),
+                tensorplay.from_numpy(cos_cpu.copy()).to("vulkan"),
+                tensorplay.from_numpy(sin_cpu[:, :8].copy()).to("vulkan"),
+                0)
+        with self.assertRaisesRegex(RuntimeError, "same number of"):
+            tp.fused_rope(
+                tensorplay.randn((1, 2, 8, 32), device="cpu").to("vulkan"),
+                tensorplay.randn((1, 2, 8, 32), device="cpu").to("vulkan"),
+                tensorplay.from_numpy(cos_cpu.copy()).to("vulkan"),
+                tensorplay.from_numpy(sin_cpu[:8].copy()).to("vulkan"),
+                0)
+
     def test_glu_splits_and_dtypes(self):
         # Gated linear unit over texture storage: first_half *
         # sigmoid(second_half), along whichever axis is halved.  Half

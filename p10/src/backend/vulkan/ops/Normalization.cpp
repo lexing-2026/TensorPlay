@@ -1649,9 +1649,17 @@ Tensor rotary_embedding_kernel(
       "Vulkan rotary_embedding needs the cosine and sine tables in the same "
       "storage");
   TP_CHECK(
-      cos.size(-1) == half_dim,
+      cos.size(-1) == half_dim && sin.size(-1) == half_dim,
       "Vulkan rotary_embedding needs cosine/sine tables of head_dim/2 entries "
       "per position");
+  // One walk indexes both tables, so a sine narrower or shorter than its cosine
+  // would be read past its own entries.  A rank-one table broadcasts over the
+  // tokens and therefore has to meet the other one in the same form.
+  TP_CHECK(
+      (cos.dim() >= 2 ? cos.size(-2) : 1) ==
+          (sin.dim() >= 2 ? sin.size(-2) : 1),
+      "Vulkan rotary_embedding needs cosine/sine tables with the same number of "
+      "positions");
   const bool table_linear = v_cos.storage_type() == api::StorageType::BUFFER;
   // A linear table is read as raw words, so its element width has to match the
   // way the consumer indexes it: a texture-stored activation reads one float
@@ -1744,6 +1752,45 @@ Tensor rotary_embedding_kernel(
   }
 
   return convert(v_output);
+}
+
+// A rotary pair shares one table: position t of the query and of the key has to
+// read the same cosine/sine row, and a query head and its grouped key head must
+// land on the same angle.  Nothing about the rotation couples the two tensors,
+// so the pair is answered by walking each one with the single-tensor rotation;
+// the pair only adds the agreements a shared table imposes -- same head
+// dimension, same token length, same element type.  The head and batch counts
+// may still differ, which is what a grouped-query layout needs.
+std::tuple<Tensor, Tensor> fused_rope_kernel(
+    const Tensor& query,
+    const Tensor& key,
+    const Tensor& cos,
+    const Tensor& sin,
+    int64_t position_offset) {
+  TP_CHECK(
+      position_offset >= 0,
+      "Vulkan fused_rope needs a non-negative position offset");
+  TP_CHECK(
+      query.dim() >= 2 && key.dim() >= 2,
+      "Vulkan fused_rope needs ndim >= 2 on both operands");
+  TP_CHECK(
+      query.size(-1) % 2 == 0 && query.size(-1) == key.size(-1),
+      "Vulkan fused_rope needs an even head dimension shared by query and key");
+  if (query.device() != key.device()) {
+    TP_THROW(
+        DeviceMismatchError,
+        "Vulkan fused_rope: query and key must be on the same device");
+  }
+  TP_CHECK(
+      query.dtype() == key.dtype(),
+      "Vulkan fused_rope: query and key must have the same dtype");
+  TP_CHECK(
+      query.dim() == key.dim() && query.size(-2) == key.size(-2),
+      "Vulkan fused_rope: query and key must have the same rank and token "
+      "length");
+  return {
+      rotary_embedding_kernel(query, cos, sin, position_offset),
+      rotary_embedding_kernel(key, cos, sin, position_offset)};
 }
 
 //
@@ -2907,6 +2954,7 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, LlmKernels) {
   m.impl("silu_mul", &tensorplay::vulkan::ops::silu_mul_kernel);
   m.impl("silu_and_mul", &tensorplay::vulkan::ops::silu_and_mul_kernel);
   m.impl("rotary_embedding", &tensorplay::vulkan::ops::rotary_embedding_kernel);
+  m.impl("fused_rope", &tensorplay::vulkan::ops::fused_rope_kernel);
   m.impl(
       "scaled_dot_product_attention",
       &tensorplay::vulkan::ops::scaled_dot_product_attention_kernel);
