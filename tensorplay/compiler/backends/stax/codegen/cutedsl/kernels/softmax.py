@@ -15,10 +15,11 @@ import cutlass.cute as cute
 from cutlass import Float32, const_expr
 
 from ._prims import (
-    block_max,
-    block_sum,
+    block_stats,
+    block_sum_once,
     compile_cached,
     fake_tensor,
+    stream_atoms,
     tail_predicate,
     threads_for_row,
     tiled_copy_for,
@@ -50,17 +51,19 @@ class SoftmaxFwd:
     @cute.jit
     def __call__(self, x, out, stream):
         atom, tiled_copy = tiled_copy_for(x.element_type, self.threads, self.vec)
-        self.kernel(x, out, atom, tiled_copy, self.tiler_n).launch(
+        load, store = stream_atoms(x.element_type, self.vec)
+        self.kernel(x, out, atom, load, store, tiled_copy, self.tiler_n).launch(
             grid=[x.shape[0], 1, 1], block=[self.threads, 1, 1], stream=stream
         )
 
     @cute.kernel
-    def kernel(self, x, out, atom, tiled_copy, tiler_n: cutlass.Constexpr):
+    def kernel(self, x, out, atom, load, store, tiled_copy, tiler_n: cutlass.Constexpr):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         n = self.n
         smem = cutlass.utils.SmemAllocator()
-        buf = smem.allocate_tensor(Float32, cute.make_layout(self.num_warps), byte_alignment=4)
+        buf_m = smem.allocate_tensor(Float32, cute.make_layout(self.num_warps), byte_alignment=4)
+        buf_s = smem.allocate_tensor(Float32, cute.make_layout(self.num_warps), byte_alignment=4)
         thr = tiled_copy.get_slice(tidx)
         gX = thr.partition_S(cute.local_tile(x, (1, tiler_n), (bidx, 0)))
         gO = thr.partition_D(cute.local_tile(out, (1, tiler_n), (bidx, 0)))
@@ -68,30 +71,47 @@ class SoftmaxFwd:
 
         if const_expr(self.in_rmem):
             rX = cute.make_rmem_tensor_like(gX)
-            rO = cute.make_rmem_tensor_like(gO)
             # Positions past the row are never stored.  The sentinel is
             # neutral for both of the reductions below: it loses the maximum
-            # and its exponential is zero.
-            rX.fill(-3.0e38)
-            cute.copy(atom, gX, rX, pred=pred)
+            # and its exponential is zero.  Only the last chunk can reach past
+            # the row, so only it is seeded.
+            if const_expr(pred is not None):
+                rX[None, None, self.chunks - 1].fill(-3.0e38)
+            for k in cutlass.range_constexpr(self.chunks):
+                # Every chunk but the last lies wholly inside the row.
+                p = None if k < self.chunks - 1 or pred is None else pred[None, None, k]
+                cute.copy(load, gX[None, None, k], rX[None, None, k], pred=p)
             xf = rX.load().to(Float32)
             flat = xf.reshape((cute.size(rX),))
-            top = block_max(
-                flat.reduce(cute.ReductionOp.MAX, init_val=-3.0e38, reduction_profile=0),
-                buf,
-                self.num_warps,
-            )
-            e = cute.math.exp2((xf - top) * LOG2E, fastmath=True)
-            total = block_sum(
+            # The row is exponentiated against this thread's own maximum, so
+            # the exponentials start before any cross-thread exchange; only
+            # the scalar sums meet in the (maximum, sum) reduction below.
+            m_t = flat.reduce(cute.ReductionOp.MAX, init_val=-3.0e38, reduction_profile=0)
+            e = cute.math.exp2((xf - m_t) * LOG2E, fastmath=True)
+            wmax = cute.arch.warp_reduction(m_t, cute.arch.fmax)
+            top, total = block_stats(
+                wmax,
                 e.reshape((cute.size(rX),)).reduce(
                     cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0
-                ),
-                buf,
+                ) * cute.math.exp2((m_t - wmax) * LOG2E, fastmath=True),
+                buf_m,
+                buf_s,
                 self.num_warps,
             )
-            y = (e * (Float32(1.0) / total)).reshape(xf.shape)
-            rO.store(y.to(rO.element_type))
-            cute.copy(atom, rO, gO, pred=pred)
+            # One scalar moves the row from this thread's maximum onto the
+            # block maximum and normalises it in the same step.  Every thread
+            # divides by the same sum, so an approximate reciprocal is both
+            # exact enough for a weight and one instruction.
+            y = e * (
+                cute.math.exp2((m_t - top) * LOG2E, fastmath=True)
+                * cute.arch.rcp_approx(total)
+            )
+            # The row of inputs is dead once it has been exponentiated, so the
+            # output goes back over it and the block holds one row, not two.
+            rX.store(y.to(rX.element_type))
+            for k in cutlass.range_constexpr(self.chunks):
+                p = None if k < self.chunks - 1 or pred is None else pred[None, None, k]
+                cute.copy(store, rX[None, None, k], gO[None, None, k], pred=p)
         else:
             # A row that does not fit in registers is read twice: the first
             # walk folds it into the maximum and the exponential sum, the
@@ -102,7 +122,7 @@ class SoftmaxFwd:
             for k in cutlass.range_constexpr(self.chunks):
                 col = tidx * self.vec + k * self.threads * self.vec
                 p = None if pred is None else pred[None, None, k]
-                cute.copy(atom, gX[None, None, k], rK, pred=p)
+                cute.copy(load, gX[None, None, k], rK, pred=p)
                 if col < n:
                     v = rK.load().to(Float32).reshape((cute.size(rK),))
                     cm = v.reduce(cute.ReductionOp.MAX, init_val=-3.0e38,
@@ -113,18 +133,24 @@ class SoftmaxFwd:
                             cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0
                         )
                     mx = mn
-            top = block_max(mx, buf, self.num_warps)
-            sm = sm * cute.math.exp2((mx - top) * LOG2E, fastmath=True)
-            inv = Float32(1.0) / block_sum(sm, buf, self.num_warps)
+            wmax = cute.arch.warp_reduction(mx, cute.arch.fmax)
+            top, total = block_stats(
+                wmax,
+                sm * cute.math.exp2((mx - wmax) * LOG2E, fastmath=True),
+                buf_m,
+                buf_s,
+                self.num_warps,
+            )
+            inv = cute.arch.rcp_approx(total)
             for k in cutlass.range_constexpr(self.chunks):
                 col = tidx * self.vec + k * self.threads * self.vec
                 p = None if pred is None else pred[None, None, k]
-                cute.copy(atom, gX[None, None, k], rK, pred=p)
+                cute.copy(load, gX[None, None, k], rK, pred=p)
                 if col < n:
                     v = rK.load().to(Float32).reshape((cute.size(rK),))
                     e = cute.math.exp2((v - top) * LOG2E, fastmath=True) * inv
                     rK.store(e.to(rK.element_type))
-                    cute.copy(atom, rK, gO[None, None, k], pred=p)
+                    cute.copy(store, rK, gO[None, None, k], pred=p)
 
 
 class SoftmaxBwd:
@@ -169,7 +195,7 @@ class SoftmaxBwd:
             cute.copy(atom, gO, rO, pred=pred)
             yv = rY.load().to(Float32)
             dv = rO.load().to(Float32)
-            total = block_sum(
+            total = block_sum_once(
                 (yv * dv).reshape((cute.size(rY),)).reduce(
                     cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0
                 ),
@@ -197,7 +223,7 @@ class SoftmaxBwd:
                     sm += (yv * dv).reduce(
                         cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0
                     )
-            total = block_sum(sm, buf, self.num_warps)
+            total = block_sum_once(sm, buf, self.num_warps)
             for k in cutlass.range_constexpr(self.chunks):
                 col = tidx * self.vec + k * self.threads * self.vec
                 p = None if pred is None else pred[None, None, k]
@@ -258,7 +284,7 @@ class SoftmaxBwdUniform:
             rY.fill(0.0)
             cute.copy(atom, gY, rY, pred=pred)
             yv = rY.load().to(Float32)
-            total = block_sum(
+            total = block_sum_once(
                 yv.reshape((cute.size(rY),)).reduce(
                     cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0
                 ),
@@ -281,7 +307,7 @@ class SoftmaxBwdUniform:
                     sm += v.reduce(
                         cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0
                     )
-            g_eff = scale - scale * block_sum(sm, buf, self.num_warps)
+            g_eff = scale - scale * block_sum_once(sm, buf, self.num_warps)
             for k in cutlass.range_constexpr(self.chunks):
                 col = tidx * self.vec + k * self.threads * self.vec
                 p = None if pred is None else pred[None, None, k]
@@ -304,7 +330,11 @@ def softmax_fwd(x: tp.Tensor, threads: int | None = None):
     cutlass_dtype = DTYPE_MAP[x.dtype]
     vec = vector_length(n, cutlass_dtype.width)
     if threads is None:
-        threads = threads_for_row(n, cutlass_dtype.width)
+        # Rows of a few thousand elements are fastest on a quarter-thousand
+        # block, which keeps a second block resident beside it so one row's
+        # reduction overlaps the other's memory traffic; longer rows take the
+        # width that keeps about 32 elements per thread.
+        threads = threads_for_row(n, cutlass_dtype.width, floor=256)
     out = tp.empty_like(x)
 
     def build():

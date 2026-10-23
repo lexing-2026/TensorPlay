@@ -16,8 +16,7 @@ import cutlass.cute as cute
 from cutlass import Float32, const_expr
 
 from ._prims import (
-    block_max,
-    block_sum,
+    block_stats,
     compile_cached,
     fake_tensor,
     tail_predicate,
@@ -62,7 +61,8 @@ class CrossEntropyFwd:
         bidx, _, _ = cute.arch.block_idx()
         n = self.n
         smem = cutlass.utils.SmemAllocator()
-        buf = smem.allocate_tensor(Float32, cute.make_layout(self.num_warps), byte_alignment=4)
+        buf_m = smem.allocate_tensor(Float32, cute.make_layout(self.num_warps), byte_alignment=4)
+        buf_s = smem.allocate_tensor(Float32, cute.make_layout(self.num_warps), byte_alignment=4)
         thr = tiled_copy.get_slice(tidx)
         gX = thr.partition_S(cute.local_tile(x, (1, tiler_n), (bidx, 0)))
         pred = tail_predicate(thr, tiler_n, n) if const_expr(tiler_n != n) else None
@@ -84,9 +84,16 @@ class CrossEntropyFwd:
                     (v - mn) * LOG2E, fastmath=True
                 ).reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0)
                 mx = mn
-        top = block_max(mx, buf, self.num_warps)
-        sm = sm * cute.math.exp2((mx - top) * LOG2E, fastmath=True)
-        total = block_sum(sm, buf, self.num_warps)
+        # Each warp folds its own maximum, so the block exchanges one
+        # (maximum, sum) pair per warp instead of reducing twice.
+        wmax = cute.arch.warp_reduction(mx, cute.arch.fmax)
+        top, total = block_stats(
+            wmax,
+            sm * cute.math.exp2((mx - wmax) * LOG2E, fastmath=True),
+            buf_m,
+            buf_s,
+            self.num_warps,
+        )
         log_denom = top + cute.math.log2(total, fastmath=True) * (1.0 / LOG2E)
         if tidx == 0:
             t = target[bidx]
@@ -131,11 +138,14 @@ class CrossEntropyBwd:
             e = cute.math.exp2((v - log_denom) * LOG2E, fastmath=True) * scale
             rK.store(e.to(rK.element_type))
             cute.copy(atom, rK, gD[None, None, k], pred=p)
-        cute.arch.barrier()
-        if tidx == 0:
-            t = target[bidx]
-            v0 = grad[bidx, t].to(Float32)
-            grad[bidx, t] = (v0 - scale).to(grad.element_type)
+        # The thread that wrote the target column corrects its own element once
+        # more, so the subtraction needs no second read and no block barrier:
+        # both stores come from one thread and reach the address in order.
+        t = target[bidx]
+        if tidx == (t // self.vec) % self.threads:
+            v0 = x[bidx, t].to(Float32)
+            grad[bidx, t] = ((cute.math.exp2((v0 - log_denom) * LOG2E, fastmath=True)
+                              - 1.0) * scale).to(grad.element_type)
 
 
 _fwd_cache: dict = {}
@@ -145,13 +155,13 @@ _bwd_cache: dict = {}
 def _streaming_threads(n: int, element_bits: int, vec: int) -> int:
     """A block width leaving about eight vector loads per thread in flight.
 
-    The row is walked a chunk at a time rather than held, so a narrower block
-    with a longer per-thread stream keeps more requests outstanding than a
-    wide one with a chunk or two each; blocks of a thousand threads measure
-    slower on every shape tried.
+    The row is walked a chunk at a time rather than held, so the block width
+    barely changes the per-thread work; a block of half a thousand threads
+    measured fastest in both directions on every shape tried, and a block of a
+    thousand leaves nothing beside it on the device.
     """
 
-    return threads_for_row(n, element_bits, budget=8 * vec, cap=512, floor=128)
+    return threads_for_row(n, element_bits, budget=8 * vec, cap=512, floor=512)
 
 
 def ce_fwd(x: tp.Tensor, target: tp.Tensor, threads: int | None = None):

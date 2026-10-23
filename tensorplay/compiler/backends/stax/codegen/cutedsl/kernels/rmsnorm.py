@@ -20,6 +20,7 @@ from ._prims import (
     column_sum,
     compile_cached,
     fake_tensor,
+    stream_atoms,
     tail_predicate,
     threads_for_row,
     tiled_copy_for,
@@ -46,12 +47,15 @@ class RmsNormFwd:
     @cute.jit
     def __call__(self, x, w, out, rstd, eps, stream):
         atom, tiled_copy = tiled_copy_for(x.element_type, self.threads, self.vec)
-        self.kernel(x, w, out, rstd, eps, atom, tiled_copy, self.tiler_n).launch(
+        load, store = stream_atoms(x.element_type, self.vec)
+        self.kernel(x, w, out, rstd, eps, atom, load, store, tiled_copy,
+                    self.tiler_n).launch(
             grid=[x.shape[0], 1, 1], block=[self.threads, 1, 1], stream=stream
         )
 
     @cute.kernel
-    def kernel(self, x, w, out, rstd, eps, atom, tiled_copy, tiler_n: cutlass.Constexpr):
+    def kernel(self, x, w, out, rstd, eps, atom, load, store, tiled_copy,
+               tiler_n: cutlass.Constexpr):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         n = self.n
@@ -68,12 +72,13 @@ class RmsNormFwd:
         pred = tail_predicate(thr, tiler_n, n) if const_expr(tiler_n != n) else None
         rX = cute.make_rmem_tensor_like(gX)
         rW = cute.make_rmem_tensor_like(gW)
-        rO = cute.make_rmem_tensor_like(gO)
         # Positions past the row are neutral for the sum of squares and are
-        # never stored, so zero is the right starting value.
-        rX.fill(0.0)
-        rW.fill(0.0)
-        cute.copy(atom, gX, rX, pred=pred)
+        # never stored, so zero is the right starting value.  Only the last
+        # chunk can reach past the row, so only it is seeded.
+        if const_expr(pred is not None):
+            rX[None, None, self.chunks - 1].fill(0.0)
+            rW[None, None, self.chunks - 1].fill(0.0)
+        cute.copy(load, gX, rX, pred=pred)
         cute.copy(atom, gW, rW, pred=pred)
 
         v = rX.load().to(Float32)
@@ -85,8 +90,10 @@ class RmsNormFwd:
         )
         scale = cute.math.rsqrt(total / n + eps)
         y = v * scale * rW.load().to(Float32)
-        rO.store(y.to(rO.element_type))
-        cute.copy(atom, rO, gO, pred=pred)
+        # The row is dead once it has been scaled, so the output goes back over
+        # it and the block keeps one row of registers rather than two.
+        rX.store(y.to(rX.element_type))
+        cute.copy(store, rX, gO, pred=pred)
         if tidx == 0:
             gR[0] = scale
 
@@ -141,7 +148,6 @@ class RmsNormBwd:
         if const_expr(self.resident):
             rX = cute.make_rmem_tensor_like(proto)
             rO = cute.make_rmem_tensor_like(proto)
-            rD = cute.make_rmem_tensor_like(proto)
             rW = cute.make_rmem_tensor_like(gW)
             rP = cute.make_rmem_tensor_like(gP)
             rW.fill(0.0)
@@ -177,8 +183,10 @@ class RmsNormBwd:
                     self.num_warps,
                 ) / n
                 out = (wdy - xh * c1) * inv
-                rD.store(out.to(rD.element_type))
-                cute.copy(atom, rD, gD, pred=pred)
+                # The row of inputs is dead once the gradient is formed, so the
+                # gradient is written back over it.
+                rX.store(out.to(rX.element_type))
+                cute.copy(atom, rX, gD, pred=pred)
                 rP.store(rP.load() + dv * xh)
             cute.copy(atom32, rP, gP, pred=pred)
         else:
@@ -258,6 +266,11 @@ def rmsnorm_fwd(x: tp.Tensor, weight: tp.Tensor, eps: float = 1e-6,
         # block leaves nothing beside it and measures slower on every shape
         # tried here.
         threads = min(512, threads_for_row(n, cutlass_dtype.width, budget=16))
+        if n > 48 * threads:
+            # A row this wide puts the block against the register file, so
+            # half the width buys a second resident block instead of more
+            # threads per row; the overlap is worth more than the width.
+            threads //= 2
     out = tp.empty_like(x)
     rstd = tp.empty(m, dtype=tp.float32, device=x.device)
 
@@ -314,5 +327,5 @@ def rmsnorm_bwd(
     compile_cached(_bwd_cache, (n, x.dtype, threads, vec, blocks), build)(
         x, weight, dout, rstd, dx, dw_partial
     )
-    column_sum(dw_partial, dw, blocks, n, DTYPE_MAP[weight.dtype], weight.dtype, x.device)
+    column_sum(dw_partial, dw, blocks, n, DTYPE_MAP[weight.dtype], weight.dtype)
     return dx, dw

@@ -15,8 +15,9 @@ from typing import Any, Callable
 
 import cutlass
 import cutlass.cute as cute
-import tensorplay as tp
 from cutlass import Boolean, Float32, const_expr
+
+LOG2E = 1.4426950408889634
 
 
 #: Widths the kernels are written for.  A row is read as 128-bit vectors, so the
@@ -89,6 +90,56 @@ def block_max(val, buf, num_warps: cutlass.Constexpr):
 
 
 @cute.jit
+def block_sum_once(val, buf, num_warps: cutlass.Constexpr):
+    """Sum a per-thread value across the block for a block's only reduction.
+
+    The slots are never read again, so the barrier that would protect them for
+    a later reduction is left out.  A kernel that reduces twice must use
+    :func:`block_sum` for the first one or give each reduction its own slots.
+    """
+
+    lane = cute.arch.lane_idx()
+    warp = cute.arch.warp_idx()
+    v = cute.arch.warp_reduction(val, operator.add)
+    if lane == 0:
+        buf[warp] = v
+    cute.arch.barrier()
+    w = Float32(0.0)
+    if lane < num_warps:
+        w = buf[lane]
+    return cute.arch.warp_reduction(w, operator.add)
+
+
+@cute.jit
+def block_stats(wmax, s, buf_m, buf_s, num_warps: cutlass.Constexpr):
+    """Block maximum and the exponential sum taken relative to it.
+
+    ``wmax`` is the calling warp's own maximum and ``s`` is that warp's sum of
+    values taken relative to ``wmax``.  Both levels meet in a single
+    shared-memory round, so a maximum and a sum cost one barrier between them
+    instead of two reductions; the slots are left dirty.
+    """
+
+    lane = cute.arch.lane_idx()
+    warp = cute.arch.warp_idx()
+    wsum = cute.arch.warp_reduction(s, operator.add)
+    if lane == 0:
+        buf_m[warp] = wmax
+        buf_s[warp] = wsum
+    cute.arch.barrier()
+    mw = Float32(-3.0e38)
+    sw = Float32(0.0)
+    if lane < num_warps:
+        mw = buf_m[lane]
+        sw = buf_s[lane]
+    top = cute.arch.warp_reduction(mw, cute.arch.fmax)
+    total = cute.arch.warp_reduction(
+        sw * cute.math.exp2((mw - top) * LOG2E, fastmath=True), operator.add
+    )
+    return top, total
+
+
+@cute.jit
 def tail_predicate(thr: cute.ThrCopy, tiler_n: cutlass.Constexpr, n: cutlass.Constexpr):
     """Per-vector in-range predicate for a row tile wider than the row.
 
@@ -153,32 +204,52 @@ def tiled_copy_for(dtype, threads: int, vec: int):
     return atom, cute.make_tiled_copy_tv(atom, thr_layout, cute.make_layout((1, vec)))
 
 
-class ColumnSum:
-    """Sum a ``(rows, n)`` buffer down its rows into an ``(out_rows, n)`` vector.
+def stream_atoms(dtype, vec: int):
+    """Load and store atoms for a row that is read once and written once.
 
-    Block ``(c, g)`` folds rows ``g, g + groups, ...`` over the column tile
-    ``c``, so the work spreads over the device by both rows and columns and the
-    buffer is read exactly once.
+    The row is never read again, so its lines are marked to leave the cache
+    first and the output is streamed past it: the cache keeps whatever the
+    block reuses (weights, row scales) instead of two whole rows.
     """
 
-    def __init__(self, out_dtype, n: int, rows: int, groups: int = 1,
-                 out_rows: int = 1, threads: int = 256):
+    bits = vec * dtype.width
+    load = cute.make_copy_atom(
+        cute.nvgpu.CopyG2ROp(),
+        dtype,
+        num_bits_per_copy=bits,
+        l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.EVICT_FIRST,
+    )
+    store = cute.make_copy_atom(
+        cute.nvgpu.CopyR2GOp(),
+        dtype,
+        num_bits_per_copy=bits,
+        store_cache_mode=cute.nvgpu.StoreCacheMode.STREAMING,
+    )
+    return load, store
+
+
+class ColumnSum:
+    """Sum a ``(rows, n)`` buffer down its rows into an ``(n,)`` vector.
+
+    A warp owns a 128-element column tile and walks every row, so the buffer
+    is read once and the sum finishes in a single launch: the parallelism is
+    spread over the columns, and each row's tile is a single coalesced load.
+    """
+
+    def __init__(self, out_dtype, n: int, rows: int, threads: int = 32):
         self.out_dtype = out_dtype
         self.n = n
         self.rows = rows
-        self.groups = groups
-        self.out_rows = out_rows
         self.threads = threads
         self.vec = vector_length(n, 32)
-        self.chunks = (n // self.vec + threads - 1) // threads
-        self.tiler_n = self.vec * self.chunks * threads
+        self.tiler_n = self.vec * threads
 
     @cute.jit
     def __call__(self, src, dst, stream):
         atom, tiled_copy = tiled_copy_for(Float32, self.threads, self.vec)
         atom_out, tiled_out = tiled_copy_for(self.out_dtype, self.threads, self.vec)
         self.kernel(src, dst, atom, tiled_copy, atom_out, tiled_out, self.tiler_n).launch(
-            grid=[cute.ceil_div(self.n, self.tiler_n), self.groups, 1],
+            grid=[cute.ceil_div(self.n, self.tiler_n), 1, 1],
             block=[self.threads, 1, 1],
             stream=stream,
         )
@@ -188,29 +259,24 @@ class ColumnSum:
                tiler_n: cutlass.Constexpr):
         tidx = cute.arch.thread_idx()[0]
         bidx = cute.arch.block_idx()[0]
-        gidx = cute.arch.block_idx()[1]
         n = self.n
         thr = tiled_copy.get_slice(tidx)
         thr_out = tiled_out.get_slice(tidx)
         src2 = cute.make_tensor(
             src.iterator, cute.make_layout((self.rows, n), stride=(n, 1))
         )
-        dst2 = cute.make_tensor(
-            dst.iterator, cute.make_layout((self.out_rows, n), stride=(n, 1))
-        )
+        dst2 = cute.make_tensor(dst.iterator, cute.make_layout((1, n), stride=(n, 1)))
         proto = thr.partition_S(cute.local_tile(src2, (1, tiler_n), (0, bidx)))
-        gD = thr_out.partition_D(cute.local_tile(dst2, (1, tiler_n), (gidx, bidx)))
+        gD = thr_out.partition_D(cute.local_tile(dst2, (1, tiler_n), (0, bidx)))
         pred = tail_predicate(thr, tiler_n, n) if const_expr(tiler_n != n) else None
 
         acc = cute.make_rmem_tensor_like(proto)
         part = cute.make_rmem_tensor_like(proto)
         rD = cute.make_rmem_tensor_like(gD)
         acc.fill(0.0)
-        iters = cute.ceil_div(self.rows - gidx, self.groups)
-        for i in cutlass.range(iters):
-            row = thr.partition_S(cute.local_tile(src2, (1, tiler_n),
-                                                 (gidx + i * self.groups, bidx)))
-            cute.copy(atom, row, part, pred=pred)
+        for row in cutlass.range(self.rows):
+            src_row = thr.partition_S(cute.local_tile(src2, (1, tiler_n), (row, bidx)))
+            cute.copy(atom, src_row, part, pred=pred)
             acc.store(acc.load() + part.load())
         rD.store(acc.load().to(rD.element_type))
         cute.copy(atom_out, rD, gD, pred=pred)
@@ -219,12 +285,12 @@ class ColumnSum:
 _colsum_cache: dict = {}
 
 
-def _colsum_run(key, src, dst, rows: int, n: int, out_dtype, groups: int, out_rows: int):
+def _colsum_run(key, src, dst, rows: int, n: int, out_dtype):
     def build():
         return cute.compile(
-            ColumnSum(out_dtype, n, rows, groups, out_rows),
+            ColumnSum(out_dtype, n, rows),
             fake_tensor(Float32, (rows * n,), vector_length(n, 32)),
-            fake_tensor(out_dtype, (out_rows * n,), vector_length(n, 32)),
+            fake_tensor(out_dtype, (n,), vector_length(n, 32)),
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             options="--enable-tvm-ffi",
         )
@@ -232,20 +298,8 @@ def _colsum_run(key, src, dst, rows: int, n: int, out_dtype, groups: int, out_ro
     compile_cached(_colsum_cache, key, build)(src, dst)
 
 
-def column_sum(src, dst, rows: int, n: int, out_dtype, out_key, device):
-    """Write the row sum of ``src`` into ``dst``; ``out_key`` identifies the dtype.
+def column_sum(src, dst, rows: int, n: int, out_dtype, out_key):
+    """Write the row sum of ``src`` into ``dst``; ``out_key`` identifies the dtype."""
 
-    A buffer with many rows is folded in two passes so that the first pass has
-    enough blocks to keep the device busy.
-    """
-
-    src = src.view(-1)
-    groups = 8 if rows > 8 else 1
-    if groups == 1:
-        _colsum_run((n, rows, 1, 1, out_key), src, dst, rows, n, out_dtype, 1, 1)
-        return dst
-    mid = tp.empty(groups * n, dtype=tp.float32, device=device)
-    _colsum_run((n, rows, groups, groups), src, mid, rows, n, cutlass.Float32,
-                groups, groups)
-    _colsum_run((n, groups, 1, 1, out_key), mid, dst, groups, n, out_dtype, 1, 1)
+    _colsum_run((n, rows, out_key), src.view(-1), dst, rows, n, out_dtype)
     return dst
