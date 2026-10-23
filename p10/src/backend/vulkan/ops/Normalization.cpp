@@ -2790,6 +2790,90 @@ std::tuple<Tensor, Tensor, Tensor> scaled_dot_product_attention_backward_kernel(
   };
 }
 
+// Every span laid out along the named axis is measured, and a span longer
+// than the bound is pulled back to it: one factor scales a whole span, so the
+// answer keeps the shape the payload was read in.  A length is taken in single
+// precision even from a narrow payload, because a long span can leave the width
+// of a lane; the factor is rounded once, when it returns to that width to
+// multiply.  A length that is not a number is not over the bound, so such a
+// span keeps its lanes.
+Tensor renorm_kernel(
+    const Tensor& self,
+    const Scalar& p,
+    int64_t dim,
+    const Scalar& maxnorm) {
+  TP_CHECK(!p.isComplex(), "Vulkan renorm takes a real norm order");
+  const double order = p.toDouble();
+  TP_CHECK(
+      order > 0.0, "Vulkan renorm needs a positive norm order, got ", order);
+  TP_CHECK(!maxnorm.isComplex(), "Vulkan renorm takes a real length bound");
+  const double bound = maxnorm.toDouble();
+  TP_CHECK(
+      bound >= 0.0,
+      "Vulkan renorm needs a non-negative length bound, got ", bound);
+  TP_CHECK(
+      self.dtype() == DType::Float32 || self.dtype() == DType::Float16,
+      "Vulkan renorm supports Float32 and Float16 tensors only");
+  const int64_t rank = self.dim();
+  TP_CHECK(
+      rank > 1, "Vulkan renorm needs at least two dimensions, got ", rank);
+  const int64_t axis = dim < 0 ? dim + rank : dim;
+  TP_CHECK(
+      axis >= 0 && axis < rank,
+      "Vulkan renorm: the axis ", dim, " is out of range for a tensor with ",
+      rank, " dimensions");
+
+  std::vector<int64_t> span;
+  span.reserve(static_cast<size_t>(rank - 1));
+  for (int64_t walk = 0; walk < rank; ++walk) {
+    if (walk != axis) {
+      span.push_back(walk);
+    }
+  }
+
+  const Tensor lengths = dispatch_vk<Tensor>(
+      "linalg_vector_norm",
+      self,
+      Scalar(order),
+      std::optional<std::vector<int64_t>>(span),
+      true,
+      std::optional<DType>(DType::Float32));
+  const Tensor over =
+      dispatch_vk<Tensor>("gt.Scalar", lengths, Scalar(bound));
+  const Tensor reached = dispatch_vk<Tensor>(
+      "div.Tensor",
+      dispatch_vk<Tensor>(
+          "full_like",
+          lengths,
+          Scalar(bound),
+          DType::Float32,
+          std::optional<Device>(std::nullopt)),
+      dispatch_vk<Tensor>(
+          "add.Scalar", lengths, Scalar(1e-7), Scalar(1.0)));
+  const Tensor unchanged = dispatch_vk<Tensor>(
+      "full_like",
+      lengths,
+      Scalar(1.0),
+      DType::Float32,
+      std::optional<Device>(std::nullopt));
+  Tensor factors = dispatch_vk<Tensor>("where.self", over, reached, unchanged);
+  if (factors.dtype() != self.dtype()) {
+    factors = factors.to(self.dtype());
+  }
+  return dispatch_vk<Tensor>("mul.Tensor", self, factors);
+}
+
+// The bound is measured against the lanes a span holds now, so the scaled
+// answer is written back where it was read.
+Tensor& renorm_inplace_kernel(
+    Tensor& self,
+    const Scalar& p,
+    int64_t dim,
+    const Scalar& maxnorm) {
+  self.copy_(renorm_kernel(self, p, dim, maxnorm));
+  return self;
+}
+
 } // namespace ops
 } // namespace vulkan
 } // namespace tensorplay
@@ -2800,6 +2884,8 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, NormalizationKernels) {
   m.impl("batch_norm", &tensorplay::vulkan::ops::batch_norm_kernel);
   m.impl("rms_norm", &tensorplay::vulkan::ops::rms_norm_kernel);
   m.impl("group_norm", &tensorplay::vulkan::ops::group_norm_kernel);
+  m.impl("renorm", &tensorplay::vulkan::ops::renorm_kernel);
+  m.impl("renorm_", &tensorplay::vulkan::ops::renorm_inplace_kernel);
   m.impl(
       "native_group_norm",
       &tensorplay::vulkan::ops::native_group_norm_kernel);
