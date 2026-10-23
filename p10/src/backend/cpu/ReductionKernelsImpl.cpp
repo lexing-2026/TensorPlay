@@ -3766,6 +3766,53 @@ Tensor prod_dim_kernel_impl(const Tensor& self, const std::vector<int64_t>& dims
         }
 #endif
 
+        // Leading-dim product of a real matrix: walk whole rows into per-thread
+        // column buffers, so reads stay contiguous, then fold the buffers. Four
+        // rows are in flight before an accumulator slot is read back, which is
+        // what separates a memory-bound pass from an L1-traffic-bound one. Only
+        // the single-block case (outer == 1) is covered; wider reductions keep
+        // the iterator path.
+        if (dim == 0 && outer == 1 &&
+            (out_dtype == DType::Float32 || out_dtype == DType::Float64)) {
+            const int64_t rows = d_size;
+            const int64_t cols = inner;
+            auto column_product = [&](auto identity) {
+                using CT = decltype(identity);
+                const CT* in = input.data_ptr<CT>();
+                CT* outp = out.data_ptr<CT>();
+                const int64_t nthreads =
+                    std::max<int64_t>(1, tensorplay::parallel::get_num_threads());
+                std::vector<std::vector<CT>> partials(
+                    nthreads, std::vector<CT>(cols, identity));
+                const int64_t row_grain = std::max<int64_t>(
+                    1, GRAIN_SIZE / std::max<int64_t>(cols, 1));
+                tensorplay::parallel::parallel_for(0, rows, row_grain, [&](int64_t rb, int64_t re) {
+                    CT* TP_RESTRICT acc =
+                        partials[tensorplay::parallel::get_thread_num()].data();
+                    const int64_t re4 = rb + (re - rb) / 4 * 4;
+                    for (int64_t r = rb; r < re4; r += 4) {
+                        const CT* TP_RESTRICT r0 = in + r * cols;
+                        const CT* TP_RESTRICT r1 = r0 + cols;
+                        const CT* TP_RESTRICT r2 = r1 + cols;
+                        const CT* TP_RESTRICT r3 = r2 + cols;
+                        for (int64_t j = 0; j < cols; ++j)
+                            acc[j] *= ((r0[j] * r1[j]) * (r2[j] * r3[j]));
+                    }
+                    for (int64_t r = re4; r < re; ++r) {
+                        const CT* TP_RESTRICT rowp = in + r * cols;
+                        for (int64_t j = 0; j < cols; ++j) acc[j] *= rowp[j];
+                    }
+                });
+                std::vector<CT> total(cols, identity);
+                for (int64_t t = 0; t < nthreads; ++t)
+                    for (int64_t j = 0; j < cols; ++j) total[j] *= partials[t][j];
+                for (int64_t j = 0; j < cols; ++j) outp[j] = total[j];
+            };
+            if (out_dtype == DType::Float32) column_product(1.0f);
+            else column_product(1.0);
+            return out;
+        }
+
         if (d_size >= 16) {
             std::vector<bool> mask(input.dim(), false);
             mask[dim] = true;
