@@ -6,6 +6,8 @@
 #include "CUDARuntime.h"
 #include "Allocator.h"
 #include <cuda_runtime.h>
+#include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <vector>
 #include <algorithm>
@@ -67,6 +69,67 @@ __global__ void pad_gather_kernel(const T* __restrict__ src, T* __restrict__ dst
         src_off += s * p.src_strides[d];
     }
     dst[idx] = src[src_off];
+}
+
+// Constant pad with a zero fill, written in one pass: every output element is
+// either the fill or a source element, so the buffer is touched twice (read the
+// interior, write everything) instead of the three traversals a fill-then-copy
+// pays (write all, read the interior, overwrite the interior).  The interior
+// starts `left` elements into each output row, so with an odd pad neither side
+// of that copy is 16-byte aligned and the vectorised form of the copy is
+// unavailable anyway - dropping the extra traversal is the whole gain.  Zero is
+// the all-bits-zero pattern at every storage width, which is what lets this stay
+// width-dispatched like the gather kernels above.
+//
+// RowForm is set when both sides are contiguous and only the innermost dimension
+// is padded: every output row is then the source row of the same number shifted
+// by `left`, and rows past the end of the source are pure fill.  That costs one
+// quotient instead of one per dimension, and the 32-bit form of it stays off the
+// emulated 64-bit divide path, whose few hundred instructions per element push
+// the walk well under the bus ceiling.
+template <typename T, bool RowForm>
+__global__ void pad_constant_zero_kernel(const T* __restrict__ src,
+                                         T* __restrict__ dst, const PadPlan p,
+                                         const unsigned dst_last,
+                                         const unsigned src_last,
+                                         const unsigned src_rows,
+                                         const unsigned left) {
+    const T fill = {};
+    const long long total = p.ndim > 0
+        ? static_cast<long long>(p.dst_strides[0]) * p.dst_sizes[0]
+        : 1;
+    const long long idx =
+        static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    if (RowForm) {
+        const unsigned i = static_cast<unsigned>(idx);
+        const unsigned row = i / dst_last;
+        // Unsigned wrap does the lower-bound test for free: a column left of the
+        // interior becomes huge and fails the width comparison.
+        const unsigned col = i - row * dst_last - left;
+        dst[i] = (row < src_rows && col < src_last)
+            ? src[row * src_last + col] : fill;
+        return;
+    }
+    long long rem = idx;
+    long long src_off = 0;
+    bool interior = true;
+    for (int d = 0; d < p.ndim; ++d) {
+        const long long q = rem / p.dst_strides[d];
+        rem -= q * p.dst_strides[d];
+        if (d >= p.ndim - p.k_padded) {
+            const int pair = p.ndim - 1 - d;
+            const long long s = q - p.pad_pairs[2 * pair];
+            if (s < 0 || s >= p.src_sizes[d]) {
+                interior = false;
+                break;
+            }
+            src_off += s * p.src_strides[d];
+        } else {
+            src_off += q * p.src_strides[d];
+        }
+    }
+    dst[idx] = interior ? src[src_off] : fill;
 }
 
 // Backward: scatter-add each padded position into grad_input.  float and
@@ -198,6 +261,70 @@ Tensor pad_mode_backward(const Tensor& grad_output, const Tensor& self,
     return lowp ? gi.to(go.dtype()) : gi;
 }
 
+// Launch the one-pass zero fill over the whole output.  Returns false when the
+// width has no instantiation or the plan disagrees with the caller's shape, so
+// the caller keeps the general fill-and-copy body.
+bool constant_pad_zero_forward(const Tensor& self,
+                               const std::vector<int64_t>& pad, Tensor& output) {
+    if (output.numel() == 0) return true;
+    // The walk addresses both sides by flat element index, so it needs the
+    // contiguous layout the caller's `empty` is expected to have produced; a
+    // permuted output (or a quantized one, whose padded byte is the zero point
+    // rather than the all-zero pattern) keeps the general body.
+    if (!output.is_contiguous() || isQuantizedType(self.dtype())) return false;
+    Tensor src = self.is_contiguous() ? self : self.contiguous();
+    const PadPlan p = make_plan(src, pad);
+    const long long total = p.ndim > 0
+        ? static_cast<long long>(p.dst_strides[0]) * p.dst_sizes[0]
+        : 1;
+    if (static_cast<long long>(output.numel()) != total) return false;
+    // The row form needs a 32-bit index space and an untouched outer shape: a
+    // pad on any dimension but the innermost one shifts whole rows, which the
+    // single quotient cannot express.
+    bool innermost_only = p.ndim >= 1;
+    for (int i = 1; i < p.k_padded && innermost_only; ++i) {
+        innermost_only = p.pad_pairs[2 * i] == 0 && p.pad_pairs[2 * i + 1] == 0;
+    }
+    const bool row_form = innermost_only && total <= INT32_MAX;
+    const unsigned src_last =
+        row_form ? static_cast<unsigned>(p.src_sizes[p.ndim - 1]) : 0u;
+    const unsigned dst_last =
+        row_form ? static_cast<unsigned>(p.dst_sizes[p.ndim - 1]) : 0u;
+    const unsigned src_rows =
+        row_form ? static_cast<unsigned>(src.numel() / std::max<int64_t>(src_last, 1)) : 0u;
+    const unsigned left =
+        row_form ? static_cast<unsigned>(p.pad_pairs[0]) : 0u;
+    const int threads = 256;
+    const unsigned blocks = static_cast<unsigned>((total + threads - 1) / threads);
+    const auto stream = getCurrentCUDAStream().stream();
+    const void* src_ptr = src.data_ptr();
+    void* dst_ptr = output.data_ptr();
+    auto launch = [&](auto tag) {
+        using T = decltype(tag);
+        if (row_form) {
+            pad_constant_zero_kernel<T, true><<<blocks, threads, 0, stream>>>(
+                static_cast<const T*>(src_ptr), static_cast<T*>(dst_ptr), p,
+                dst_last, src_last, src_rows, left);
+        } else {
+            pad_constant_zero_kernel<T, false><<<blocks, threads, 0, stream>>>(
+                static_cast<const T*>(src_ptr), static_cast<T*>(dst_ptr), p,
+                dst_last, src_last, src_rows, left);
+        }
+    };
+    switch (elementSize(src.dtype())) {
+        case 1: launch(uint8_t{}); break;
+        case 2: launch(uint16_t{}); break;
+        case 4: launch(uint32_t{}); break;
+        case 8: launch(uint64_t{}); break;
+        case 16: launch(ulonglong2{}); break;
+        default: return false;
+    }
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess)
+        TP_THROW(RuntimeError, std::string("pad CUDA: ") + cudaGetErrorString(err));
+    return true;
+}
+
 }  // namespace
 
 Tensor reflection_pad_nd_cuda(const Tensor& self, const std::vector<int64_t>& pad) {
@@ -290,6 +417,22 @@ static Tensor constant_pad_nd_cuda(const Tensor& self, const std::vector<int64_t
     }
 
     Tensor output = Tensor::empty(new_shape, self.dtype(), self.device());
+
+    // One pass over the output whenever the fill is the all-zero bit pattern
+    // (a negative zero is not: its sign bit would be lost), every pad is
+    // non-negative (a negative one slices the input, so a plan built from self
+    // would not describe the region to copy) and the padded rank and input rank
+    // fit the plan.  Otherwise fill and copy the interior over the fill.
+    const double fill_value =
+        (!value.isComplex() && value.dtype() != DType::Undefined)
+            ? value.toDouble() : 1.0;
+    const bool zero_fill = fill_value == 0.0 && !std::signbit(fill_value);
+    const bool plain_pads = l_pad <= 4 && l_inp <= 8 &&
+        std::all_of(pad.begin(), pad.end(), [](int64_t p) { return p >= 0; });
+    if (zero_fill && plain_pads && constant_pad_zero_forward(self, pad, output)) {
+        return output;
+    }
+
     output.fill_(value);
 
     Tensor c_output = output;
