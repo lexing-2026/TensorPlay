@@ -7258,6 +7258,25 @@ class TestVulkanIndexWalk(unittest.TestCase):
             payload[self._device(mask)].cpu().numpy(), table[mask],
             err_msg="a subscript under a mask")
 
+    def test_a_block_wider_than_the_axes_it_names_keeps_its_place(self):
+        # A list of more than one dimension names one axis but leaves a block of
+        # several, so the addresses carry the rank of the answer rather than
+        # that of the payload.  An axis held whole then has to stand after the
+        # whole block, not where its own axis sat.
+        table = self._table((3, 4, 5))
+        self._read_matches(table, [None, np.array([[0], [1]])],
+                           "a two dimensional list over a middle axis")
+        self._read_matches(table, [np.array([[0], [1]]), None],
+                           "a two dimensional list with the axes after it whole")
+        self._read_matches(table, [None, None, np.array([[0, 1], [2, 3]])],
+                           "a two dimensional list at the end of a tuple")
+        self._read_matches(table, [np.array([[0], [1]]), None, np.array([0, 1])],
+                           "a wide block moved in front of an axis left whole")
+        wide = self._table((2, 3, 4, 5))
+        self._read_matches(wide, [np.array([[0], [1]]), None, None,
+                                  np.array([0, 1])],
+                           "a wide block at both ends of a rank four payload")
+
     def test_a_tuple_the_walk_cannot_follow_is_answered_off_it(self):
         payload = self._device(self._table((3, 4, 5)))
         with self.assertRaisesRegex((RuntimeError, IndexError), "long, int, byte or bool"):
@@ -7271,6 +7290,117 @@ class TestVulkanIndexWalk(unittest.TestCase):
             tensorplay.index(payload, [self._codes([0]), self._codes([0]),
                                        self._codes([0]), self._codes([0])])
 
+    def _mask_write_matches(self, table, keys, value, accumulate, label,
+                            host_number=False):
+        # The lanes a mask opens are numbered by the order the payload holds
+        # them, so the answer is the payload read back with those lanes written
+        # over - which is the arithmetic the host does here.  A lone number is
+        # laid in every lane the mask opens; a payload arrives lane by lane.
+        if not isinstance(keys, list):
+            keys = [keys]
+        selected = tuple(slice(None) if key is None else key for key in keys)
+        want = table.copy()
+        picked = want[selected]
+        number = np.asarray(value)
+        spread = np.full(picked.shape, number, want.dtype) \
+            if number.ndim == 0 else np.asarray(value, want.dtype)
+        want[selected] = (picked + spread) if accumulate else spread
+        for device in ("vulkan", "cpu"):
+            # The transfer holds the array it is given rather than a copy of it,
+            # so a write starts from a payload with memory of its own.
+            payload = tensorplay.from_numpy(
+                np.ascontiguousarray(table).copy()).to(device)
+            indices = [None if key is None else
+                       tensorplay.from_numpy(np.asarray(key)).to(device)
+                       for key in keys]
+            source = tensorplay.from_numpy(np.ascontiguousarray(number))
+            if not (host_number and number.ndim == 0):
+                source = source.to(device)
+            tensorplay.index_put_(payload, indices, source, accumulate)
+            np.testing.assert_array_equal(
+                payload.cpu().numpy(), want, err_msg=f"{label} on {device}")
+
+    def test_a_lone_number_lands_on_every_lane_a_mask_opens(self):
+        table = self._table((3, 4, 5))
+        self._mask_write_matches(table, table % 3 == 0, np.float32(9.0), False,
+                                 "a number over a whole mask")
+        self._mask_write_matches(table, table % 3 == 0, np.float32(9.0), False,
+                                 "a number that stayed on the host",
+                                 host_number=True)
+        self._mask_write_matches(table, np.array([True, False, True]),
+                                 np.float32(-2.0), False,
+                                 "a number over a mask of one axis")
+        self._mask_write_matches(table, [None, np.array([True, False, True, False])],
+                                 np.float32(3.0), False,
+                                 "a number over a mask of a middle axis")
+        self._mask_write_matches(table, table[:, :, 0] % 2 == 0,
+                                 np.float32(4.0), True,
+                                 "a number added under a mask of two axes")
+        self._mask_write_matches(table, table % 5 == 0, np.float32(0.5), True,
+                                 "a number added over a whole mask")
+
+    def test_a_lone_number_writes_a_payload_of_any_width(self):
+        for dtype, held in ((np.float32, np.float32(7.0)),
+                            (np.float16, np.float16(7.0)),
+                            (np.int64, np.int64(7))):
+            table = self._table((3, 4, 5), dtype)
+            mask = table % (7 if np.issubdtype(dtype, np.integer) else 3) == 0
+            self._mask_write_matches(table, mask, held, False,
+                                     f"a number over a {np.dtype(dtype).name} payload")
+
+    def test_several_numbers_spread_in_the_order_the_mask_walks(self):
+        table = self._table((3, 4, 5))
+        whole = table % 3 == 0
+        count = int(np.count_nonzero(whole))
+        self._mask_write_matches(
+            table, whole, (np.arange(count, dtype=np.float32) + 100.0), False,
+            "a payload spread over the lanes a whole mask opens")
+        self._mask_write_matches(
+            table, whole, (np.arange(count, dtype=np.float32) + 100.0), True,
+            "a payload added over the lanes a whole mask opens")
+        # A mask that covers two axes opens a whole line of the payload per lane
+        # it selects, so the numbers arrive one line at a time.
+        lines = table[:, :, 0] % 2 == 0
+        rows = int(np.count_nonzero(lines))
+        self._mask_write_matches(
+            table, lines,
+            np.arange(rows * 5, dtype=np.float32).reshape(rows, 5), False,
+            "a payload spread over the lines a mask of two axes opens")
+        # A mask of one axis opens a plane, so the numbers arrive plane by plane.
+        planes = np.array([True, False, True])
+        self._mask_write_matches(
+            table, planes,
+            np.arange(2 * 4 * 5, dtype=np.float32).reshape(2, 4, 5), False,
+            "a payload spread over the planes a mask of one axis opens")
+
+    def test_a_mask_that_opens_no_lane_writes_nothing(self):
+        table = self._table((4, 3))
+        closed = np.zeros((4, 3), bool)
+        for device in ("vulkan", "cpu"):
+            payload = tensorplay.from_numpy(table.copy()).to(device)
+            tensorplay.index_put_(
+                payload, [tensorplay.from_numpy(closed).to(device)],
+                tensorplay.from_numpy(np.zeros(0, np.float32)).to(device), False)
+            np.testing.assert_array_equal(
+                payload.cpu().numpy(), table,
+                err_msg=f"a mask that opens no lane on {device}")
+            tensorplay.index_put_(
+                payload, [tensorplay.from_numpy(closed).to(device)],
+                tensorplay.from_numpy(np.float32(5.0)).to(device), True)
+            np.testing.assert_array_equal(
+                payload.cpu().numpy(), table,
+                err_msg=f"a number over no lane on {device}")
+
+    def test_a_subscript_writes_through_a_mask(self):
+        table = self._table((4, 3))
+        payload = self._device(table)
+        mask = self._device(table[:, 0] > 1)
+        payload[mask] = self._device(np.float32(-1.0))
+        want = table.copy()
+        want[table[:, 0] > 1] = -1.0
+        np.testing.assert_array_equal(
+            payload.cpu().numpy(), want, err_msg="a subscript write under a mask")
+
     def test_a_write_of_points_the_walk_names_stays_refused(self):
         # The addresses a walk composes name single lanes, and the payload is
         # held in a form a write through it narrowed to a line does not reach,
@@ -7281,10 +7411,22 @@ class TestVulkanIndexWalk(unittest.TestCase):
             tensorplay.index_put_(
                 payload, [self._codes([0, 1]), self._codes([0, 1])],
                 self._device(np.zeros((2, 5), np.float32)), False)
-        with self.assertRaisesRegex(RuntimeError, "list of row codes"):
+        with self.assertRaisesRegex(RuntimeError, "several lists"):
+            tensorplay.index_put_(
+                payload, [self._device(np.zeros((3, 4, 5), bool)),
+                          self._codes([0, 1])],
+                self._device(np.zeros((2, 5), np.float32)), False)
+
+    def test_a_mask_that_does_not_line_up_is_answered_off_the_write(self):
+        payload = self._device(np.zeros((3, 4, 5), np.float32))
+        with self.assertRaisesRegex(RuntimeError, "shape of the mask"):
+            tensorplay.index_put_(
+                payload, [self._device(np.zeros(4, bool))],
+                self._device(np.float32(1.0)), False)
+        with self.assertRaisesRegex(RuntimeError, "dtypes match"):
             tensorplay.index_put_(
                 payload, [self._device(np.zeros((3, 4, 5), bool))],
-                self._device(np.zeros(4, np.float32)), False)
+                self._device(np.zeros(4, np.int64)), False)
 
 
 class TestVulkanMaskCompaction(unittest.TestCase):
