@@ -649,14 +649,17 @@ std::vector<Tensor> foreach_mm_cpu(const std::vector<Tensor>& self,
         [](const Tensor& lhs, const Tensor& rhs) { return lhs.mm(rhs); });
 }
 
+// Taking the reciprocal is the one place a counting payload answers in a wider
+// width than it came in: a count has no negative power to fold into itself, so
+// the walk keeps the measured shape the formula needs rather than refusing.
 std::vector<Tensor> foreach_reciprocal_cpu(const std::vector<Tensor>& self) {
     return map_tensors(self, [&](const Tensor& value) {
-        return value.pow(Scalar(-1));
+        return value.reciprocal();
     });
 }
 void foreach_reciprocal_inplace_cpu(std::vector<Tensor> self) {
     map_tensors_inplace(std::move(self), [&](Tensor& value) {
-        value.copy_(value.pow(Scalar(-1)));
+        value.reciprocal_();
     });
 }
 
