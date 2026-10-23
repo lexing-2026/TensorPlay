@@ -599,6 +599,36 @@ void foreach_zero_inplace_kernel(std::vector<Tensor> self) {
   walk_each_inplace(self, [](Tensor& value) { tpx::ops::zero_(value); });
 }
 
+// The group folded down to one lane per tensor: the largest lane a tensor holds,
+// the length of a tensor, and the sum a length is built from.  A group may be
+// told to hold its payloads in another width before the fold starts, which is how
+// a run of counts is totalled without the walk overflowing the word it counts in.
+std::vector<Tensor> foreach_max_kernel(const std::vector<Tensor>& self) {
+  return walk_each(self, [](const Tensor& value) {
+    return tpx::ops::amax(value);
+  });
+}
+
+std::vector<Tensor> foreach_norm_kernel(
+    const std::vector<Tensor>& self,
+    const Scalar& ord,
+    std::optional<DType> dtype) {
+  return walk_each(self, [&](const Tensor& value) {
+    Tensor held = dtype.has_value() ? tpx::ops::to(value, *dtype) : value;
+    return tpx::ops::norm(held, ord.to<double>());
+  });
+}
+
+std::vector<Tensor> foreach_powsum_kernel(
+    const std::vector<Tensor>& self,
+    const Scalar& ord,
+    std::optional<DType> dtype) {
+  return walk_each(self, [&](const Tensor& value) {
+    Tensor held = dtype.has_value() ? tpx::ops::to(value, *dtype) : value;
+    return tpx::ops::sum(tpx::ops::pow(tpx::ops::abs(held), ord));
+  });
+}
+
 // A group raised to a count.  The exponent is either one count, one count per
 // tensor, or a payload of its own, and a shared base may be a count or a
 // payload held beside the walk.
@@ -872,6 +902,16 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, ForeachKernels) {
   m.impl(
       "_foreach_zero_",
       &tensorplay::vulkan::ops::foreach_zero_inplace_kernel);
+
+  m.impl(
+      "_foreach_max",
+      &tensorplay::vulkan::ops::foreach_max_kernel);
+  m.impl(
+      "_foreach_norm.Scalar",
+      &tensorplay::vulkan::ops::foreach_norm_kernel);
+  m.impl(
+      "_foreach_powsum.Scalar",
+      &tensorplay::vulkan::ops::foreach_powsum_kernel);
 
   m.impl(
       "_foreach_pow.Scalar",

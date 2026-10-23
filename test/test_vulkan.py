@@ -8494,6 +8494,120 @@ class TestVulkanForeachGroup(unittest.TestCase):
                     ValueError, "tensor list arguments must have the same length"):
                 tensorplay._foreach_copy_(group, short)
 
+    def test_a_group_folded_down_answers_the_largest_lane_it_holds(self):
+        # One lane answers each tensor of the group, in the width the tensor itself
+        # is held in: a measurement folds to a measurement and a count to a count.
+        # A fold answers a single lane, so the answer holds no axis at all.
+        tables = [self._table((4,)), self._table((3, 2), start=1.0),
+                  self._table((5,), dtype=np.int32, start=2.0),
+                  self._table((6,), dtype=np.int64, start=3.0)]
+        want = [np.array(table.max()) for table in tables]
+        self._read_matches(
+            tables, want,
+            lambda group, device: self._read(tensorplay._foreach_max(group)),
+            "_foreach_max of a group")
+
+    def test_a_fold_down_names_a_lane_that_is_not_a_number(self):
+        # A lane that is not a number wins the fold, on either lane, so the answer
+        # is a fold that holds one rather than the largest lane it can compare.
+        tables = [self._table((4,)), self._table((3, 2), start=1.0)]
+        tables[0][1] = np.float32(np.nan)
+        for device in ("vulkan", "cpu"):
+            group = self._group(tables, device)
+            held = self._read(tensorplay._foreach_max(group))
+            self.assertTrue(bool(np.isnan(held[0])),
+                            msg=f"_foreach_max on {device}")
+            self.assertEqual(float(held[1]), float(tables[1].max()),
+                             msg=f"_foreach_max on {device}")
+
+    def test_a_fold_down_refuses_a_tensor_holding_no_lane(self):
+        # A fold over nothing has no starting value, so a group handed to it
+        # refuses before an answer of no lane can be read back.
+        for device in ("vulkan", "cpu"):
+            empty = [tensorplay.tensor([], dtype=tensorplay.float32).to(device)]
+            with self.assertRaisesRegex(
+                    RuntimeError, "Expected reduction dim to be specified"):
+                tensorplay._foreach_max(empty)
+
+    def test_a_group_folded_down_answers_the_length_of_a_tensor(self):
+        # A length is totalled in the width a measurement folds in, and the power
+        # names how the total is taken: a sum of magnitudes, a root of a sum of
+        # powers, the largest magnitude, or the count of lanes holding a number.
+        tables = [self._table((4,)), self._table((3, 2), start=1.0),
+                  self._table((5,), start=2.0)]
+        for power in (1, 2, 3):
+            want = [np.array(float(np.sum(np.abs(table) ** power))
+                             ** (1.0 / power)).astype(np.float32)
+                    for table in tables]
+            self._read_matches(
+                tables, want,
+                lambda group, device, power=power: self._read(
+                    tensorplay._foreach_norm(group, power)),
+                f"_foreach_norm of a group at power {power}")
+
+        want = [np.array(np.abs(table).max()) for table in tables]
+        self._read_matches(
+            tables, want,
+            lambda group, device: self._read(
+                tensorplay._foreach_norm(group, float("inf"))),
+            "_foreach_norm of a group at the infinity power")
+
+        want = [np.array(float(np.count_nonzero(table))).astype(np.float32)
+                for table in tables]
+        self._read_matches(
+            tables, want,
+            lambda group, device: self._read(
+                tensorplay._foreach_norm(group, 0)),
+            "_foreach_norm of a group at the zero power")
+
+    def test_a_fold_down_refuses_a_count_group_handed_no_width(self):
+        # The walk rides the fold a lone tensor reaches, and that fold answers only
+        # a payload that measures, so a group of counts is refused until it is told
+        # to hold in a measuring width.  The host lane folds a count without asking
+        # for a width, which is why this refusal is pinned here alone.
+        counted = [self._table((4,), dtype=np.int32),
+                   self._table((3, 2), dtype=np.int32, start=1.0)]
+        group = self._group(counted, "vulkan")
+        with self.assertRaisesRegex(
+                TypeError, "expects a floating or complex input"):
+            tensorplay._foreach_norm(group, 2.0)
+
+    def test_a_fold_down_holds_a_group_in_a_width_it_was_told_to_answer_in(self):
+        # A group of counts asked to fold in a measuring width is widened before the
+        # walk starts, so the length is totalled in the wider word rather than the
+        # narrow one it counts in.
+        tables = [self._table((4,)), self._table((3, 2), start=1.0)]
+        counted = [table.astype(np.int32) for table in tables]
+        want = [np.array(
+                    float(np.sum(np.abs(count.astype(np.float32)) ** 2)) ** 0.5)
+                .astype(np.float32) for count in counted]
+        self._read_matches(
+            counted, want,
+            lambda group, device: self._read(
+                tensorplay._foreach_norm(group, 2.0, dtype=tensorplay.float32)),
+            "_foreach_norm of a counted group held in a measuring width")
+
+    def test_a_group_folded_down_answers_the_sum_a_length_is_built_from(self):
+        tables = [self._table((4,)), self._table((3, 2), start=1.0),
+                  self._table((5,), start=2.0)]
+        for power in (1, 2, 3):
+            want = [np.array(float(np.sum(np.abs(table) ** power)))
+                    .astype(np.float32) for table in tables]
+            self._read_matches(
+                tables, want,
+                lambda group, device, power=power: self._read(
+                    tensorplay._foreach_powsum(group, power)),
+                f"_foreach_powsum of a group at power {power}")
+
+        counted = [table.astype(np.int32) for table in tables]
+        want = [np.array(float(np.sum(np.abs(count.astype(np.float32)) ** 2)))
+                .astype(np.float32) for count in counted]
+        self._read_matches(
+            counted, want,
+            lambda group, device: self._read(
+                tensorplay._foreach_powsum(group, 2, dtype=tensorplay.float32)),
+            "_foreach_powsum of a counted group held in a measuring width")
+
 
 class TestVulkanRowAccumulation(unittest.TestCase):
     # A list of row codes may name one row several times, and every row it names
