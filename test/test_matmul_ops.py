@@ -166,6 +166,95 @@ def test_mm_out_writes_the_named_destination(device):
 
 
 @pytest.mark.parametrize("device", DEVICES)
+def test_matmul_out_writes_the_named_destination(device):
+    if device == "cuda" and not tp.cuda.is_available():
+        pytest.skip("no cuda")
+    rng = np.random.RandomState(6)
+    a = rng.randn(11, 7).astype(np.float32)
+    b = rng.randn(7, 5).astype(np.float32)
+    ta, tb = _mk(a, device), _mk(b, device)
+    ha, hb = _torch_mk(a, device), _torch_mk(b, device)
+    want = (ha @ hb).cpu().numpy()
+
+    # A destination of the answer's shape keeps its storage and its views.
+    got = tp.empty(11, 5, dtype=tp.float32, device=tp.device(device))
+    ptr, view = got.data_ptr(), got[0]
+    tp.matmul(ta, tb, out=got)
+    assert got.data_ptr() == ptr
+    np.testing.assert_allclose(_np(got), want, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(_np(view), want[0], rtol=1e-5, atol=1e-5)
+
+    # A destination of another shape is resized rather than refused.
+    got = tp.empty(1, 1, dtype=tp.float32, device=tp.device(device))
+    tp.matmul(ta, tb, out=got)
+    assert tuple(got.shape) == (11, 5)
+    np.testing.assert_allclose(_np(got), want, rtol=1e-5, atol=1e-5)
+
+    # A window of a larger buffer receives the answer and leaves the rest of
+    # the buffer alone.
+    buf = tp.empty(2, 11, 5, dtype=tp.float32, device=tp.device(device))
+    buf.copy_(_mk(np.full((2, 11, 5), 3.0, np.float32), device))
+    tp.matmul(ta, tb, out=buf[1])
+    np.testing.assert_allclose(_np(buf[1]), want, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(_np(buf[0]), np.full((11, 5), 3.0, np.float32),
+                               rtol=1e-6, atol=1e-6)
+
+    # A destination in another layout is written in that layout.
+    base = tp.empty(5, 11, dtype=tp.float32, device=tp.device(device))
+    tp.matmul(ta, tb, out=base.transpose(0, 1))
+    np.testing.assert_allclose(_np(base.transpose(0, 1)), want, rtol=1e-5,
+                               atol=1e-5)
+
+    # An operand as the destination still gets the product: the answer may not
+    # be written over a matrix while that matrix is being read.
+    right = rng.randn(7, 7).astype(np.float32)
+    hr = _torch_mk(right, device)
+    expected = (ha @ hr).cpu().numpy()
+    square = _mk(np.array(a, copy=True), device)
+    tp.matmul(square, _mk(right, device), out=square)
+    np.testing.assert_allclose(_np(square), expected, rtol=1e-5, atol=1e-5)
+
+    # Vectors and dots are matrix products with a unit extent.
+    v = rng.randn(7).astype(np.float32)
+    hv = _torch_mk(v, device)
+    tv = _mk(v, device)
+    got = tp.empty(5, dtype=tp.float32, device=tp.device(device))
+    tp.matmul(tv, tb, out=got)
+    np.testing.assert_allclose(_np(got), (hv @ hb).cpu().numpy(), rtol=1e-5,
+                               atol=1e-5)
+    got = tp.empty(11, dtype=tp.float32, device=tp.device(device))
+    tp.matmul(ta, tv, out=got)
+    np.testing.assert_allclose(_np(got), (ha @ hv).cpu().numpy(), rtol=1e-5,
+                               atol=1e-5)
+    scalar = tp.empty(1, dtype=tp.float32, device=tp.device(device))
+    tp.matmul(tv, tv, out=scalar)
+    assert tuple(scalar.shape) == ()
+    np.testing.assert_allclose(_np(scalar), (hv @ hv).cpu().numpy(), rtol=1e-5,
+                               atol=1e-5)
+
+    # A batched product with one shared operand folds the batch into the row
+    # count and still writes the caller's buffer.
+    A = rng.randn(4, 3, 5).astype(np.float32)
+    B = rng.randn(5, 6).astype(np.float32)
+    got = tp.empty(4, 3, 6, dtype=tp.float32, device=tp.device(device))
+    ptr = got.data_ptr()
+    tp.matmul(_mk(A, device), _mk(B, device), out=got)
+    assert got.data_ptr() == ptr
+    np.testing.assert_allclose(
+        _np(got),
+        torch.matmul(_torch_mk(A, device), _torch_mk(B, device)).cpu().numpy(),
+        rtol=1e-5, atol=1e-5)
+
+    # An empty contraction answers zeros in the destination.
+    got = tp.empty(1, 1, dtype=tp.float32, device=tp.device(device))
+    tp.matmul(_mk(np.zeros((11, 0), np.float32), device),
+              _mk(np.zeros((0, 5), np.float32), device), out=got)
+    assert tuple(got.shape) == (11, 5)
+    np.testing.assert_allclose(_np(got), np.zeros((11, 5), np.float32),
+                               rtol=1e-6, atol=1e-6)
+
+
+@pytest.mark.parametrize("device", DEVICES)
 def test_addmm_out_writes_the_named_destination(device):
     if device == "cuda" and not tp.cuda.is_available():
         pytest.skip("no cuda")

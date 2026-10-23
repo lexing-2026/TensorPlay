@@ -322,12 +322,11 @@ Tensor matmul_batched_2d_cuda(
     }
 
     if (batch_shape.empty()) {
-        Tensor product = mm_kernel_cuda(self, other);
-        if (destination == nullptr) {
-            return product;
+        if (destination != nullptr) {
+            gemm_impl(self, other, *destination, 1.0, 0.0, nullptr);
+            return *destination;
         }
-        destination->copy_(product);
-        return *destination;
+        return mm_kernel_cuda(self, other);
     }
 
     // folding the batch into M.  Besides matching that execution contract,
@@ -472,14 +471,18 @@ Tensor& addmm_out_kernel_cuda(const Tensor& input, const Tensor& mat1, const Ten
     return out;
 }
 
-Tensor matmul_kernel_cuda(const Tensor& self, const Tensor& other) {
+namespace {
+
+// The checks a matrix product's operands must pass, and the shape its answer
+// comes in.  Both entry points ask this one question, so an out= destination
+// is measured against exactly the shape the allocating entry point produces.
+std::vector<int64_t> matmul_result_shape_cuda(const Tensor& self, const Tensor& other) {
     const int64_t dim1 = self.dim();
     const int64_t dim2 = other.dim();
     if (dim1 < 1 || dim2 < 1) {
         TP_THROW(RuntimeError, "matmul(): input operands must be at least 1D");
     }
 
-    // kernel; see the comment there for the folding rules).
     const auto self_shape = static_cast<std::vector<int64_t>>(self.shape());
     const auto other_shape = static_cast<std::vector<int64_t>>(other.shape());
 
@@ -530,6 +533,40 @@ Tensor matmul_kernel_cuda(const Tensor& self, const Tensor& other) {
         TP_THROW(RuntimeError, "expected mat1 and mat2 to have the same dtype, but got: ",
                  elementTypeName(self.dtype()), " != ", elementTypeName(other.dtype()));
     }
+
+    if (dim1 == 1 && dim2 == 1) {
+        return {};
+    }
+    if (dim1 == 1) {
+        // The contraction axis is dropped wherever it sits, and the vector
+        // self has none of its own, so the answer keeps every dimension of
+        // the right operand but the second to last.
+        std::vector<int64_t> shape(other_shape.begin(), other_shape.end() - 2);
+        shape.push_back(other_shape.back());
+        return shape;
+    }
+    if (dim2 == 1) {
+        return std::vector<int64_t>(self_shape.begin(), self_shape.end() - 1);
+    }
+    std::vector<int64_t> shape = broadcast_shapes(
+        std::vector<int64_t>(self_shape.begin(), self_shape.end() - 2),
+        std::vector<int64_t>(other_shape.begin(), other_shape.end() - 2));
+    shape.push_back(self_shape[self_shape.size() - 2]);
+    shape.push_back(other_shape.back());
+    return shape;
+}
+
+} // namespace
+
+Tensor matmul_kernel_cuda(const Tensor& self, const Tensor& other) {
+    const int64_t dim1 = self.dim();
+    const int64_t dim2 = other.dim();
+    // The answer's shape belongs to the walk below; the checks that reject
+    // incompatible operands are shared with the out= entry point.
+    (void)matmul_result_shape_cuda(self, other);
+
+    const auto self_shape = static_cast<std::vector<int64_t>>(self.shape());
+    const auto other_shape = static_cast<std::vector<int64_t>>(other.shape());
     const Tensor& self_p = self;
     const Tensor& other_p = other;
 
@@ -579,12 +616,53 @@ Tensor& matmul_out_kernel_cuda(const Tensor& self, const Tensor& other, Tensor& 
                  "but one of the arguments requires grad.");
     }
 
-    Tensor result = matmul_kernel_cuda(self, other);
-    if (out.shape() == result.shape()) {
-        out.copy_(result);
-    } else {
-        out.unsafeGetTensorImpl()->copy_metadata_from(*result.unsafeGetTensorImpl());
+    const std::vector<int64_t> target = matmul_result_shape_cuda(self, other);
+    // The dense products below bypass the batched entry point's own gate, so
+    // the types without a library GEMM are rejected here for every path.
+    check_cublas_gemm_dtype(self.dtype());
+    if (out.defined() && static_cast<std::vector<int64_t>>(out.shape()) != target) {
+        out.resize_(target);
     }
+    // A destination that is already the dense buffer this product would have
+    // allocated receives the product itself; one that needs another layout,
+    // or that overlaps an operand, is filled from a computed result so that
+    // its identity and its views survive.
+    const bool direct = out.defined() && out.is_contiguous() &&
+                        self.numel() != 0 && other.numel() != 0 &&
+                        !shares_storage(out, self) && !shares_storage(out, other);
+    if (direct) {
+        const int64_t dim1 = self.dim();
+        const int64_t dim2 = other.dim();
+        if (dim1 <= 2 && dim2 <= 2) {
+            // An unbatched product is one dense GEMM over views of the
+            // destination: a vector or a dot is a matrix with a unit extent.
+            const int64_t rows = dim1 == 1 ? 1 : self.size(0);
+            const int64_t cols = dim2 == 1 ? 1 : other.size(1);
+            Tensor answer = out.view({rows, cols});
+            gemm_impl(dim1 == 1 ? self.unsqueeze(0) : self,
+                      dim2 == 1 ? other.unsqueeze(-1) : other,
+                      answer, 1.0, 0.0, nullptr);
+            return out;
+        }
+        // A batched product hands the destination to the same walk that
+        // would allocate one; its batch stride and its folded batch are
+        // views of the caller's buffer rather than copies.
+        std::vector<int64_t> self_batch;
+        std::vector<int64_t> other_batch;
+        if (dim1 > 2) {
+            const auto self_shape = static_cast<std::vector<int64_t>>(self.shape());
+            self_batch.assign(self_shape.begin(), self_shape.end() - 2);
+        }
+        if (dim2 > 2) {
+            const auto other_shape = static_cast<std::vector<int64_t>>(other.shape());
+            other_batch.assign(other_shape.begin(), other_shape.end() - 2);
+        }
+        matmul_batched_2d_cuda(dim1 == 1 ? self.unsqueeze(0) : self,
+                               dim2 == 1 ? other.unsqueeze(-1) : other,
+                               self_batch, other_batch, &out);
+        return out;
+    }
+    write_out(out, matmul_kernel_cuda(self, other));
     return out;
 }
 
