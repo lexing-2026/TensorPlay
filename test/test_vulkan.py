@@ -7774,11 +7774,15 @@ class TestVulkanForeachGroup(unittest.TestCase):
     @staticmethod
     def _table(shape, dtype=np.float32, start=0.0):
         return (((np.arange(int(np.prod(shape)), dtype=np.float32) % 13) / 4.0
-                 + start)).astype(dtype)
+                 + start)).astype(dtype).reshape(shape)
 
     @staticmethod
     def _group(tables, device):
-        return [tensorplay.from_numpy(np.ascontiguousarray(table)).to(device)
+        # The walk is handed a copy of each lane: a host tensor shares the
+        # buffer it was read from, so an in-place answer would otherwise rewrite
+        # the table the next device is about to be built from.
+        return [tensorplay.from_numpy(np.array(table, copy=True))
+                .to(device)
                 for table in tables]
 
     @staticmethod
@@ -7983,6 +7987,220 @@ class TestVulkanForeachGroup(unittest.TestCase):
             lambda group, device: self._read(
                 tensorplay._foreach_sub(group, 0.75)),
             "a group of one tensor")
+
+    FORMULAS = {
+        "sqrt": np.sqrt,
+        "rsqrt": lambda held: 1.0 / np.sqrt(held),
+        "neg": lambda held: -held,
+        "abs": np.abs,
+        "reciprocal": lambda held: 1.0 / held,
+        "sign": np.sign,
+        "ceil": np.ceil,
+        "floor": np.floor,
+        "trunc": np.trunc,
+        "frac": lambda held: held - np.trunc(held),
+        "exp": np.exp,
+        "expm1": np.expm1,
+        "log": np.log,
+        "log2": np.log2,
+        "log10": np.log10,
+        "log1p": np.log1p,
+        "sin": np.sin,
+        "cos": np.cos,
+        "tan": np.tan,
+        "sinh": np.sinh,
+        "cosh": np.cosh,
+        "tanh": np.tanh,
+        "sigmoid": lambda held: 1.0 / (1.0 + np.exp(-held)),
+    }
+
+    def _formula_tables(self, name):
+        # An angle walk only answers where an angle is defined, so those two
+        # formulas are handed a group narrow enough to stay inside it.
+        if name in ("asin", "acos"):
+            return [self._table((5,)) * 0.2, self._table((2, 3)) * 0.2]
+        return [self._table((5,), start=1.0), self._table((2, 3), start=1.0)]
+
+    def test_a_formula_spreads_over_the_group(self):
+        for name in list(self.FORMULAS) + ["asin", "acos", "atan"]:
+            tables = self._formula_tables(name)
+            sign = (self.FORMULAS[name] if name in self.FORMULAS
+                    else {"asin": np.arcsin, "acos": np.arccos,
+                          "atan": np.arctan}[name])
+            want = [sign(np.ascontiguousarray(table)) for table in tables]
+            self._read_matches(
+                tables, want,
+                lambda group, device, name=name: self._read(
+                    getattr(tensorplay, "_foreach_" + name)(group)),
+                f"_foreach_{name}")
+
+    def test_a_formula_writes_where_the_tensor_stands(self):
+        # The in-place walk answers with the same formula, and the tensor it
+        # writes keeps its own shape rather than the shape of a fresh read.
+        for name in ("sqrt", "rsqrt", "neg", "abs", "reciprocal", "sign",
+                     "floor", "trunc", "exp", "tanh", "sigmoid"):
+            tables = self._formula_tables(name)
+            sign = self.FORMULAS[name]
+            want = [sign(np.ascontiguousarray(table)) for table in tables]
+            self._write_matches(
+                tables, want,
+                lambda group, device, name=name: getattr(
+                    tensorplay, "_foreach_" + name + "_")(group),
+                f"_foreach_{name}_")
+
+    def test_a_tie_in_a_rounding_formula_lands_the_same_way_on_both_lanes(self):
+        # A lane exactly between two counts is where a rounding rule shows up,
+        # and both walks have to keep the same count for it.
+        tables = [self._table((13,)) + 0.5, self._table((2, 6)) + 0.5]
+        want = [np.round(np.ascontiguousarray(table)) for table in tables]
+        self._read_matches(
+            tables, want,
+            lambda group, device: self._read(tensorplay._foreach_round(group)),
+            "_foreach_round of a tied group", rtol=0.0, atol=0.0)
+        self._write_matches(
+            tables, want,
+            lambda group, device: tensorplay._foreach_round_(group),
+            "_foreach_round_ of a tied group", rtol=0.0, atol=0.0)
+
+    def test_a_count_group_finds_the_reciprocal_in_a_wider_width(self):
+        # A count has no negative power to fold into itself, so the reciprocal
+        # of a counting group is kept in the width that can hold it.
+        tables = [np.array([2, 4, 8], dtype=np.int32),
+                  np.array([1, 5], dtype=np.int64)]
+        want = [(1.0 / table.astype(np.float32)).astype(np.float32)
+                for table in tables]
+        self._read_matches(
+            tables, want,
+            lambda group, device: self._read(
+                tensorplay._foreach_reciprocal(group)),
+            "_foreach_reciprocal of a counting group")
+
+    def test_a_formula_keeps_the_half_width_it_holds(self):
+        tables = [self._table((6,), dtype=np.float16, start=1.0),
+                  self._table((2, 2), dtype=np.float16, start=2.0)]
+        for name in ("neg", "abs", "floor", "sign", "sqrt", "exp"):
+            want = [self.FORMULAS[name](
+                        np.ascontiguousarray(table).astype(np.float32)
+                    ).astype(np.float16)
+                    for table in tables]
+            self._read_matches(
+                tables, want,
+                lambda group, device, name=name: self._read(
+                    getattr(tensorplay, "_foreach_" + name)(group)),
+                f"_foreach_{name} of a half group", rtol=1e-3, atol=1e-3)
+
+    BOUNDS = (("clamp_min", np.maximum), ("clamp_max", np.minimum),
+              ("maximum", np.maximum), ("minimum", np.minimum))
+
+    def test_a_bound_holds_the_group_up(self):
+        # A bound that keeps a lane off the floor and one that keeps it off the
+        # ceiling are the same walk seen from either end, and a partner bound
+        # wins whichever of the two lanes is wider.
+        tables = [self._table((5,)), self._table((2, 3)), self._table((4,))]
+        partners = [self._table((5,), start=0.5), self._table((2, 3), start=1.0),
+                    self._table((4,), start=1.5)]
+        counts = [0.5, 2.0, 1.25]
+        for name, fold in self.BOUNDS:
+            call = getattr(tensorplay, "_foreach_" + name)
+            self._read_matches(
+                tables,
+                [fold(np.ascontiguousarray(table), 1.0) for table in tables],
+                lambda group, device, call=call: self._read(call(group, 1.0)),
+                f"_foreach_{name} of one bound")
+            self._read_matches(
+                tables,
+                [fold(np.ascontiguousarray(table), np.ascontiguousarray(partner))
+                 for table, partner in zip(tables, partners)],
+                lambda group, device, call=call: self._read(
+                    call(group, self._group(partners, device))),
+                f"_foreach_{name} of a partner bound")
+            self._read_matches(
+                tables,
+                [fold(np.ascontiguousarray(table), count)
+                 for table, count in zip(tables, counts)],
+                lambda group, device, call=call: self._read(call(group, counts)),
+                f"_foreach_{name} of a bound per tensor")
+
+    def test_a_bound_writes_where_the_tensor_stands(self):
+        tables = [self._table((5,)), self._table((2, 3)), self._table((4,))]
+        partners = [self._table((5,), start=0.5), self._table((2, 3), start=1.0),
+                    self._table((4,), start=1.5)]
+        counts = [0.5, 2.0, 1.25]
+        for name, fold in self.BOUNDS:
+            write = getattr(tensorplay, "_foreach_" + name + "_")
+            self._write_matches(
+                tables,
+                [fold(np.ascontiguousarray(table), 1.0) for table in tables],
+                lambda group, device, write=write: write(group, 1.0),
+                f"_foreach_{name}_ of one bound")
+            self._write_matches(
+                tables,
+                [fold(np.ascontiguousarray(table), np.ascontiguousarray(partner))
+                 for table, partner in zip(tables, partners)],
+                lambda group, device, write=write: write(
+                    group, self._group(partners, device)),
+                f"_foreach_{name}_ of a partner bound")
+            self._write_matches(
+                tables,
+                [fold(np.ascontiguousarray(table), count)
+                 for table, count in zip(tables, counts)],
+                lambda group, device, write=write: write(group, counts),
+                f"_foreach_{name}_ of a bound per tensor")
+
+    def test_a_group_raised_to_a_count_keeps_its_shape(self):
+        tables = [self._table((5,), start=1.0), self._table((2, 3), start=1.0),
+                  self._table((4,), start=2.0)]
+        powers = [np.full((5,), 2.0, dtype=np.float32),
+                  np.full((2, 3), 3.0, dtype=np.float32),
+                  np.full((4,), 1.5, dtype=np.float32)]
+        counts = [2.0, 3.0, 1.5]
+        self._read_matches(
+            tables, [np.power(np.ascontiguousarray(table), 2.0)
+                     for table in tables],
+            lambda group, device: self._read(tensorplay._foreach_pow(group, 2.0)),
+            "_foreach_pow by one count")
+        self._read_matches(
+            tables, [np.power(np.ascontiguousarray(table), count)
+                     for table, count in zip(tables, counts)],
+            lambda group, device: self._read(
+                tensorplay._foreach_pow(group, counts)),
+            "_foreach_pow by a count per tensor")
+        self._read_matches(
+            tables, [np.power(np.ascontiguousarray(table), np.ascontiguousarray(power))
+                     for table, power in zip(tables, powers)],
+            lambda group, device: self._read(
+                tensorplay._foreach_pow(group, self._group(powers, device))),
+            "_foreach_pow by a payload of exponents")
+        self._read_matches(
+            tables, [np.power(np.float32(2.0), np.ascontiguousarray(table))
+                     for table in tables],
+            lambda group, device: self._read(
+                tensorplay._foreach_pow(2.0, group)),
+            "_foreach_pow of a shared base")
+
+    def test_a_power_writes_where_the_tensor_stands(self):
+        tables = [self._table((5,), start=1.0), self._table((2, 3), start=1.0),
+                  self._table((4,), start=2.0)]
+        powers = [np.full((5,), 2.0, dtype=np.float32),
+                  np.full((2, 3), 3.0, dtype=np.float32),
+                  np.full((4,), 1.5, dtype=np.float32)]
+        counts = [2.0, 3.0, 1.5]
+        self._write_matches(
+            tables, [np.power(np.ascontiguousarray(table), 3.0)
+                     for table in tables],
+            lambda group, device: tensorplay._foreach_pow_(group, 3.0),
+            "_foreach_pow_ by one count")
+        self._write_matches(
+            tables, [np.power(np.ascontiguousarray(table), count)
+                     for table, count in zip(tables, counts)],
+            lambda group, device: tensorplay._foreach_pow_(group, counts),
+            "_foreach_pow_ by a count per tensor")
+        self._write_matches(
+            tables, [np.power(np.ascontiguousarray(table), np.ascontiguousarray(power))
+                     for table, power in zip(tables, powers)],
+            lambda group, device: tensorplay._foreach_pow_(
+                group, self._group(powers, device)),
+            "_foreach_pow_ by a payload of exponents")
 
 
 class TestVulkanRowAccumulation(unittest.TestCase):
