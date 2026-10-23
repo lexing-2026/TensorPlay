@@ -8850,6 +8850,30 @@ class TestVulkanAmpScale(unittest.TestCase):
             tensorplay._amp_update_scale_(
                 scale, half_tracker, found, 2.0, 0.5, 3)
 
+    def test_a_scaler_unscales_and_updates_on_the_device(self):
+        # The whole step the two amp entries exist for: a scaled backward pass
+        # leaves a multiple of the scale in the gradient, the unscale divides it
+        # back and flags nothing, and the update counts the clean step.  The
+        # gradient is a power of two multiple of the truth, so the division is
+        # exact.
+        from tensorplay.amp import GradScaler
+        from tensorplay.optim import SGD
+
+        device = "vulkan"
+        param = tensorplay.tensor(
+            [1.0, -2.0], dtype=tensorplay.float32, device=device,
+            requires_grad=True)
+        optimizer = SGD([param], lr=0.25)
+        scaler = GradScaler(device, init_scale=8.0, growth_interval=2)
+        scaler.scale((param * param).sum()).backward()
+        np.testing.assert_allclose(
+            param.grad.cpu().numpy(), [16.0, -32.0], rtol=1e-6, atol=1e-6)
+        scaler.unscale_(optimizer)
+        np.testing.assert_allclose(
+            param.grad.cpu().numpy(), [2.0, -4.0], rtol=1e-6, atol=1e-6)
+        scaler.update()
+        self.assertEqual(scaler.get_scale(), 8.0)
+
 
 class TestVulkanRowAccumulation(unittest.TestCase):
     # A list of row codes may name one row several times, and every row it names

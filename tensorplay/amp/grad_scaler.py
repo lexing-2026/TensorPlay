@@ -355,11 +355,16 @@ class GradScaler:
         # FP32 division can be imprecise for certain compile options, so we carry out the reciprocal in FP64.
         if self._scale is None:
             raise AssertionError("_scale is None in unscale_")
-        inv_scale = (
-            tensorplay.full((), 1.0, dtype=tensorplay.float64, device=self._scale.device)
-            .div(self._scale.to(tensorplay.float64))
-            .to(tensorplay.float32)
-        )
+        if self._scale.device.type == "vulkan":
+            # This device has no double, so the reciprocal keeps the scale's own
+            # single-precision width.
+            inv_scale = tensorplay.reciprocal(self._scale)
+        else:
+            inv_scale = (
+                tensorplay.full((), 1.0, dtype=tensorplay.float64, device=self._scale.device)
+                .div(self._scale.to(tensorplay.float64))
+                .to(tensorplay.float32)
+            )
         found_inf = tensorplay.full(
             (), 0.0, dtype=tensorplay.float32, device=self._scale.device
         )
