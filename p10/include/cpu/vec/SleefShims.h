@@ -13,8 +13,8 @@
 // No ISA macros are required to declare or call them.
 //
 // Precision tiers: u10 for most functions, u35 for the single-precision paths
-// where a few extra ulp of error buy a shorter dependency chain (sin/cos/log/
-// tanh), u15 for erfc and u05 for hypot.
+// where a few extra ulp of error buy a shorter dependency chain (sin/cos/tanh),
+// u15 for erfc and u05 for hypot.
 // Gate for consumers: the SIMD call sites themselves must be compiled only
 // where the surrounding code already guarantees AVX2/AVX-512 support
 // (capability TUs or target-attributed functions).
@@ -36,7 +36,6 @@ __m256 TP_SLEEF_CC Sleef_expf8_u10(__m256);
 __m256 TP_SLEEF_CC Sleef_exp2f8_u10(__m256);
 __m256 TP_SLEEF_CC Sleef_expm1f8_u10(__m256);
 __m256 TP_SLEEF_CC Sleef_logf8_u10(__m256);
-__m256 TP_SLEEF_CC Sleef_logf8_u35(__m256);
 __m256 TP_SLEEF_CC Sleef_log2f8_u10(__m256);
 __m256 TP_SLEEF_CC Sleef_log10f8_u10(__m256);
 __m256 TP_SLEEF_CC Sleef_log1pf8_u10(__m256);
@@ -158,7 +157,7 @@ inline __m256d expm1(__m256d a) { return Sleef_expm1d4_u10(a); }
 inline __m512 expm1(__m512 a) { return Sleef_expm1f16_u10(a); }
 inline __m512d expm1(__m512d a) { return Sleef_expm1d8_u10(a); }
 
-inline __m256 log(__m256 a) { return Sleef_logf8_u35(a); }
+inline __m256 log(__m256 a) { return Sleef_logf8_u10(a); }
 inline __m256d log(__m256d a) { return Sleef_logd4_u10(a); }
 inline __m512 log(__m512 a) { return Sleef_logf16_u10(a); }
 inline __m512d log(__m512d a) { return Sleef_logd8_u10(a); }

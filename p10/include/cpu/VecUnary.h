@@ -238,6 +238,63 @@ constexpr double kLanczos[9] = {
     -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7};
 constexpr double kHalfLogTwoPi = 0.91893853320467274178032973640562;
 
+// Natural logarithm of a float vector.
+//
+// The input is split as 2^e * m with e = round(log2 x), so m lands in
+// [0.75, 1.5).  Rounding the exponent instead of truncating it is what keeps
+// inputs near 1 accurate: they reduce to e = 0 and m close to 1, and the
+// result is then formed from a leading term that already is the answer rather
+// than from the difference of two numbers near 0.7.
+//
+// Under that reduction log(m) = log(1 + u) = u * P(u) with u = m - 1 in
+// [-0.25, 0.5).  The fitted P keeps its constant term at 1, so the relative
+// error stays bounded as u approaches zero; the worst relative error over the
+// interval is 1.2e-8, about 0.1 ulp.
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256 v_log_f32(__m256 x) {
+    // A subnormal leaves the exponent field at zero and its leading bit in the
+    // mantissa, so it is scaled into the normal range first and the factor is
+    // paid back out of the exponent.
+    const __m256 tiny = _mm256_cmp_ps(x, _mm256_set1_ps(1.1754944e-38f), _CMP_LT_OQ);
+    const __m256i ix = _mm256_castps_si256(
+        _mm256_blendv_ps(x, _mm256_mul_ps(x, _mm256_set1_ps(1.8446744e19f)), tiny));
+    // Adding half a mantissa range before shifting rounds the exponent to
+    // nearest.  Subtracting the exponent field from the original bit pattern
+    // then leaves 0.75 <= m < 1.5.
+    const __m256i biased =
+        _mm256_srli_epi32(_mm256_add_epi32(ix, _mm256_set1_epi32(0x00400000)), 23);
+    const __m256 m = _mm256_castsi256_ps(_mm256_add_epi32(
+        _mm256_sub_epi32(ix, _mm256_slli_epi32(biased, 23)),
+        _mm256_set1_epi32(0x3F800000)));
+    __m256 e = _mm256_cvtepi32_ps(_mm256_sub_epi32(biased, _mm256_set1_epi32(127)));
+    e = _mm256_sub_ps(e, _mm256_and_ps(tiny, _mm256_set1_ps(64.0f)));
+
+    const __m256 u = _mm256_sub_ps(m, _mm256_set1_ps(1.0f));
+    __m256 p = _mm256_set1_ps(-4.413553457e-2f);
+    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(1.032194468e-1f));
+    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(-1.310681637e-1f));
+    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(1.448485294e-1f));
+    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(-1.665304757e-1f));
+    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(1.999078531e-1f));
+    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(-2.499990939e-1f));
+    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(3.333346255e-1f));
+    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(-5.000000213e-1f));
+    p = _mm256_fmadd_ps(p, u, _mm256_set1_ps(9.999999972e-1f));
+    // Two-part ln2 keeps the exponent contribution accurate for large |e|;
+    // the mantissa term is the whole answer when e is zero.
+    __m256 r = _mm256_fmadd_ps(e, _mm256_set1_ps(0.693145751953125f), _mm256_mul_ps(u, p));
+    r = _mm256_fmadd_ps(e, _mm256_set1_ps(1.428606765330187e-6f), r);
+
+    // log(0) is -inf, log(+inf) is +inf, and negative or NaN inputs give NaN.
+    // max(x, 0) returns 0 for a NaN first operand, so one compare covers both
+    // the negative and the unordered cases.
+    const __m256 zero = _mm256_setzero_ps();
+    const __m256 bad = _mm256_cmp_ps(_mm256_max_ps(x, zero), x, _CMP_NEQ_UQ);
+    r = _mm256_blendv_ps(r, _mm256_set1_ps(-INFINITY), _mm256_cmp_ps(x, zero, _CMP_EQ_OQ));
+    r = _mm256_blendv_ps(r, x, _mm256_cmp_ps(x, _mm256_set1_ps(3.4028235e38f), _CMP_GT_OQ));
+    return _mm256_blendv_ps(r, _mm256_set1_ps(NAN), bad);
+}
+
 __attribute__((target("avx2,fma"), always_inline))
 inline __m256 v_lgamma_pos_f32(__m256 x) {
     // Valid only where every lane > 0.  Reflection for x < 1:
@@ -257,10 +314,10 @@ inline __m256 v_lgamma_pos_f32(__m256 x) {
     __m256 t = _mm256_add_ps(z, _mm256_set1_ps(7.5f));
     __m256 res = _mm256_sub_ps(
         _mm256_fmadd_ps(_mm256_add_ps(z, _mm256_set1_ps(0.5f)),
-                        tensorplay::tpsleef::log(t), _mm256_set1_ps(static_cast<float>(kHalfLogTwoPi))),
+                        v_log_f32(t), _mm256_set1_ps(static_cast<float>(kHalfLogTwoPi))),
         t);
-    res = _mm256_add_ps(res, tensorplay::tpsleef::log(series));
-    return _mm256_sub_ps(res, _mm256_and_ps(small, tensorplay::tpsleef::log(x)));
+    res = _mm256_add_ps(res, v_log_f32(series));
+    return _mm256_sub_ps(res, _mm256_and_ps(small, v_log_f32(x)));
 }
 
 __attribute__((target("avx2,fma"), always_inline))
@@ -469,7 +526,7 @@ inline __m256 apply_f32(VOp op, VParams prm, __m256 x) {
         case VOp::Relu: return _mm256_max_ps(zero, x); // NaN propagates (second operand wins)
         case VOp::Exp: return v_exp_f32(x);
         case VOp::Expm1: return tensorplay::tpsleef::expm1(x);
-        case VOp::Log: return tensorplay::tpsleef::log(x);
+        case VOp::Log: return v_log_f32(x);
         case VOp::Log2: return tensorplay::tpsleef::log2(x);
         case VOp::Log10: return tensorplay::tpsleef::log10(x);
         case VOp::Log1p: return tensorplay::tpsleef::log1p(x);
@@ -507,7 +564,7 @@ inline __m256 apply_f32(VOp op, VParams prm, __m256 x) {
         case VOp::Mish: {
             // Uses the scalar expression: log((1 + exp(x))) * tanh(...) — plain
             // log, not log1p, and overflow-to-inf semantics are preserved.
-            __m256 sp = tensorplay::tpsleef::log(_mm256_add_ps(one, v_exp_f32(x)));
+            __m256 sp = v_log_f32(_mm256_add_ps(one, v_exp_f32(x)));
             return _mm256_mul_ps(x, tensorplay::tpsleef::tanh(sp));
         }
         case VOp::Selu: {
@@ -660,7 +717,7 @@ static void f32_chunk_avx2(VOp op, VParams prm, const float* src, float* dst, in
             TP_F32_SIMPLE_LOOP_8(tensorplay::tpsleef::expm1(x));
             break;
         case VOp::Log:
-            TP_F32_SIMPLE_LOOP_8(tensorplay::tpsleef::log(x));
+            TP_F32_SIMPLE_LOOP_8(v_log_f32(x));
             break;
         case VOp::Log1p:
             TP_F32_SIMPLE_LOOP_8(tensorplay::tpsleef::log1p(x));
@@ -756,7 +813,7 @@ static void f32_chunk_avx2(VOp op, VParams prm, const float* src, float* dst, in
         }
         case VOp::Mish:
             TP_F32_SIMPLE_LOOP_8(_mm256_mul_ps(
-                x, tensorplay::tpsleef::tanh(tensorplay::tpsleef::log(
+                x, tensorplay::tpsleef::tanh(v_log_f32(
                        _mm256_add_ps(one, v_exp_f32(x))))));
             break;
         default:
