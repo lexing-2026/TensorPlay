@@ -211,8 +211,90 @@ class SoftmaxBwd:
                     cute.copy(atom, rK, gD[None, None, k], pred=p)
 
 
+class SoftmaxBwdUniform:
+    """Softmax backward when the incoming gradient is the same everywhere.
+
+    A graph that ends in a reduction hands back one value, and every position
+    of the gradient arriving here is that value.  The per-row product sum then
+    needs nothing from the incoming gradient but the value itself, so the row
+    is read once to fold its sum and once more to be written, and the incoming
+    gradient is read as the single element it is.
+    """
+
+    def __init__(self, dtype, n: int, threads: int, vec: int):
+        self.dtype = dtype
+        self.n = n
+        self.threads = threads
+        self.vec = vec
+        self.chunks = (n // vec + threads - 1) // threads
+        self.tiler_n = vec * self.chunks * threads
+        self.num_warps = threads // 32
+        self.in_rmem = self.chunks * vec <= RMEM_BUDGET
+
+    @cute.jit
+    def __call__(self, y, g, dx, stream):
+        atom, tiled_copy = tiled_copy_for(y.element_type, self.threads, self.vec)
+        self.kernel(y, g, dx, atom, tiled_copy, self.tiler_n).launch(
+            grid=[y.shape[0], 1, 1], block=[self.threads, 1, 1], stream=stream
+        )
+
+    @cute.kernel
+    def kernel(self, y, g, dx, atom, tiled_copy, tiler_n: cutlass.Constexpr):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        n = self.n
+        smem = cutlass.utils.SmemAllocator()
+        buf = smem.allocate_tensor(Float32, cute.make_layout(self.num_warps), byte_alignment=4)
+        thr = tiled_copy.get_slice(tidx)
+        gY = thr.partition_S(cute.local_tile(y, (1, tiler_n), (bidx, 0)))
+        gD = thr.partition_D(cute.local_tile(dx, (1, tiler_n), (bidx, 0)))
+        pred = tail_predicate(thr, tiler_n, n) if const_expr(tiler_n != n) else None
+        scale = Float32(g[0])
+
+        if const_expr(self.in_rmem):
+            rY = cute.make_rmem_tensor_like(gY)
+            # Positions past the row are neutral for the sum and are never
+            # stored, so zero is the right starting value.
+            rY.fill(0.0)
+            cute.copy(atom, gY, rY, pred=pred)
+            yv = rY.load().to(Float32)
+            total = block_sum(
+                yv.reshape((cute.size(rY),)).reduce(
+                    cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0
+                ),
+                buf,
+                self.num_warps,
+            )
+            rY.store((yv * (scale - scale * total)).to(rY.element_type))
+            cute.copy(atom, rY, gD, pred=pred)
+        else:
+            # A row that does not fit in registers is read twice: the first
+            # walk folds its sum, the second scales it and writes it.
+            rK = cute.make_rmem_tensor_like(gY[None, None, 0])
+            sm = Float32(0.0)
+            for k in cutlass.range_constexpr(self.chunks):
+                col = tidx * self.vec + k * self.threads * self.vec
+                p = None if pred is None else pred[None, None, k]
+                cute.copy(atom, gY[None, None, k], rK, pred=p)
+                if col < n:
+                    v = rK.load().to(Float32).reshape((cute.size(rK),))
+                    sm += v.reduce(
+                        cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0
+                    )
+            g_eff = scale - scale * block_sum(sm, buf, self.num_warps)
+            for k in cutlass.range_constexpr(self.chunks):
+                col = tidx * self.vec + k * self.threads * self.vec
+                p = None if pred is None else pred[None, None, k]
+                cute.copy(atom, gY[None, None, k], rK, pred=p)
+                if col < n:
+                    v = rK.load().to(Float32)
+                    rK.store((v * g_eff).to(rK.element_type))
+                    cute.copy(atom, rK, gD[None, None, k], pred=p)
+
+
 _fwd_cache: dict = {}
 _bwd_cache: dict = {}
+_bwd_uniform_cache: dict = {}
 
 
 def softmax_fwd(x: tp.Tensor, threads: int | None = None):
@@ -259,4 +341,31 @@ def softmax_bwd(y: tp.Tensor, dout: tp.Tensor, threads: int | None = None):
         )
 
     compile_cached(_bwd_cache, (n, y.dtype, threads, vec), build)(y, dout, dx)
+    return dx
+
+
+def softmax_bwd_uniform(y: tp.Tensor, g: tp.Tensor, threads: int | None = None):
+    """Gradient of :func:`softmax_fwd` for a one-element incoming gradient.
+
+    ``g`` holds the single value every position of the incoming gradient has.
+    """
+
+    n = y.shape[1]
+    cutlass_dtype = DTYPE_MAP[y.dtype]
+    vec = vector_length(n, cutlass_dtype.width)
+    if threads is None:
+        threads = threads_for_row(n, cutlass_dtype.width)
+    dx = tp.empty_like(y)
+
+    def build():
+        return cute.compile(
+            SoftmaxBwdUniform(cutlass_dtype, n, threads, vec),
+            fake_tensor(cutlass_dtype, (cute.sym_int(), n), vec),
+            fake_tensor(cutlass_dtype, (1,), 1),
+            fake_tensor(cutlass_dtype, (cute.sym_int(), n), vec),
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
+        )
+
+    compile_cached(_bwd_uniform_cache, (n, y.dtype, threads, vec), build)(y, g, dx)
     return dx

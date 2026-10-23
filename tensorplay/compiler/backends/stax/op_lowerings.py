@@ -3369,6 +3369,8 @@ def _accumulation_dtype(dtype):
 
 
 def _static_ints(values) -> list[int] | None:
+    if values is None:
+        return None
     out = []
     for v in values:
         try:
@@ -3660,6 +3662,81 @@ def _softmax_out_dtype(x, dtype=None, half_to_float=False):
     return x.get_dtype()
 
 
+#: The element types the purpose-written row kernels are instantiated for.
+_ROW_KERNEL_DTYPES = frozenset({tp.float16, tp.bfloat16, tp.float32})
+
+#: Handlers that hand a whole call to a row kernel, made once and kept.
+_ROW_KERNEL_HANDLERS: dict = {}
+
+
+def _row_kernel(name: str, *args):
+    """Hand this call, whole, to the named row kernel.
+
+    The kernel is loaded on first use rather than when this module is, because
+    the kernels are written against a device language that only a machine with
+    one needs to load.
+    """
+
+    handler = _ROW_KERNEL_HANDLERS.get(name)
+    if handler is None:
+        from .codegen.cutedsl.kernels import _extern
+
+        handler = fallback_handler(
+            getattr(_extern, name), add_to_fallback_set=False
+        )
+        _ROW_KERNEL_HANDLERS[name] = handler
+    return handler(*args)
+
+
+def _row_call(x, dim, dtypes=_ROW_KERNEL_DTYPES):
+    """The (rows, extent) shape a row kernel can answer this call with, if any.
+
+    Such a kernel reads each row as a contiguous run and reduces it in one
+    pass, so the call has to reduce the last axis of a contiguous arrangement,
+    in a type the kernel is instantiated for, on a device it runs on.  Anything
+    else keeps the loop this lowering would otherwise write.
+    """
+
+    device = x.get_device()
+    if device is None or device.type != "cuda" or not tp.cuda.is_available():
+        return None
+    if x.get_dtype() not in dtypes:
+        return None
+    size = _static_ints(x.get_size())
+    if not size or size[-1] == 0:
+        return None
+    if normalize_dim(int(dim), len(size)) != len(size) - 1:
+        return None
+    # A value whose layout has not been settled yet has no strides to read,
+    # and a kernel written in terms of a contiguous run cannot take it.
+    strides = _static_ints(x.maybe_get_stride())
+    if strides is None or tuple(strides) != tuple(contiguous_strides(size)):
+        return None
+    return prod(size[:-1]), size[-1]
+
+
+def _uniform_value(x):
+    """The one element this value repeats everywhere, if it repeats one.
+
+    A value that came back from a reduction is a single number spread over the
+    shape it is a gradient of.  Every stride being zero says so; what it
+    repeats is then the only element of whatever the view looks at.  Handing
+    that element over costs one read where reading the spread-out value would
+    cost a walk of the whole shape.
+    """
+
+    if not isinstance(x, BaseView):
+        return None
+    strides = _static_ints(x.maybe_get_stride())
+    if strides is None or any(s != 0 for s in strides):
+        return None
+    base = x.unwrap_view()
+    size = _static_ints(base.get_size())
+    if size is None or prod(size) != 1:
+        return None
+    return base
+
+
 def _softmax_lowering(op, log):
     fallback = fallback_handler(op, add_to_fallback_set=False)
 
@@ -3672,6 +3749,8 @@ def _softmax_lowering(op, log):
             out_dtype = _softmax_out_dtype(x, dtype=kwargs.get("dtype", third))
         if out_dtype != x.get_dtype() and not log:
             x = to_dtype(x, out_dtype)
+        if not log and _row_call(x, dim) is not None:
+            return _row_kernel("softmax_forward", x)
         result = _softmax_like(x, dim, out_dtype, log)
         if result is None:
             return fallback(x, dim, third) if third is not None else fallback(x, dim)
@@ -3698,6 +3777,20 @@ def _softmax_backward_lowering(op, log):
         rank = len(grad.get_size())
         if size is None or rank == 0:
             return fallback(grad, output, dim, input_dtype)
+        if not log and _row_call(output, dim) is not None:
+            if (
+                input_dtype in (None, grad.get_dtype())
+                and output.get_dtype() == grad.get_dtype()
+            ):
+                if _row_call(grad, dim) is not None:
+                    return _row_kernel("softmax_backward", grad, output)
+                # A gradient that arrived from a reduction is one value over
+                # the whole shape, which the row kernel can take as one value.
+                scalar = _uniform_value(grad)
+                if scalar is not None:
+                    return _row_kernel(
+                        "softmax_backward_uniform", output, scalar
+                    )
         d = normalize_dim(int(dim), rank)
         device = grad.get_device()
         acc = _accumulation_dtype(grad.get_dtype())
@@ -8955,7 +9048,6 @@ for _name, _warn in (
     ("normal", False),
     ("_pdist_forward", False),
     ("soft_margin_loss_backward", False),
-    ("_fused_rms_norm", False),
     ("_cdist_forward", False),
     ("_cdist_backward", False),
     ("_trilinear", False),
@@ -8977,6 +9069,63 @@ for _name, _warn in (
     _op = getattr(tp_ops, _name, None)
     if _op is not None:
         make_fallback(_op, warn=_warn)
+
+
+def _rms_norm_row(x, normalized_shape, weight, eps):
+    """What a normalisation over the trailing axes can be answered with.
+
+    The trailing axes of a contiguous value are one contiguous run per row,
+    which is the shape the row kernel takes: it reduces each run in one pass
+    and reports the scale it reduced it by.  A normalisation over any other
+    axes, a missing or differently typed weight, and a scale that is not a
+    number all keep the call where it is.
+    """
+
+    if weight is None or not isinstance(eps, (int, float)):
+        return None
+    shape = (
+        normalized_shape
+        if isinstance(normalized_shape, (list, tuple))
+        else [normalized_shape]
+    )
+    dims = _static_ints(shape)
+    size = _static_ints(x.get_size())
+    if dims is None or size is None or not dims or len(dims) > len(size):
+        return None
+    if tuple(size[len(size) - len(dims):]) != tuple(dims):
+        return None
+    if weight.get_dtype() != x.get_dtype():
+        return None
+    weight_size = _static_ints(weight.get_size())
+    weight_stride = _static_ints(weight.maybe_get_stride())
+    if weight_size is None or weight_stride is None:
+        return None
+    if prod(weight_size) != prod(dims):
+        return None
+    if tuple(weight_stride) != tuple(contiguous_strides(weight_size)):
+        return None
+    row = _row_call(x, -1)
+    if row is None or row[1] != prod(dims):
+        return None
+    return row
+
+
+def _rms_norm_lowering(op):
+    """A normalisation over the trailing axes, answered a row at a time."""
+
+    fallback = fallback_handler(op, add_to_fallback_set=False)
+
+    def lower(x, normalized_shape, weight, eps):
+        if _rms_norm_row(x, normalized_shape, weight, eps) is not None:
+            return _row_kernel("rms_norm", x, weight, eps)
+        return fallback(x, normalized_shape, weight, eps)
+
+    return lower
+
+
+LOWERINGS["_fused_rms_norm.default"] = _rms_norm_lowering(
+    tp_ops._fused_rms_norm.default
+)
 
 #: A histogram whose edges are given rather than counted is a different
 #: operation from one that counts them: where the edges are is a fact about the
