@@ -663,6 +663,59 @@ Tensor logcumsumexp_cpu(const Tensor& self, int64_t dim, std::optional<DType> dt
 // into the indexed locations.
 // ---------------------------------------------------------------------------
 
+// One answer per index element, with nothing after the gathered axis on either
+// side.  The index and the destination are then walked in order and only the
+// source jumps by whole rows, so the row a pick lands in is a demand miss no
+// stride pattern predicts; the line behind a pick a few steps ahead is asked
+// for while the current element is answered.
+template <typename ctype>
+void gather_named_rows(const ctype* self, const int64_t* index, ctype* result,
+                       int64_t idx_outer, int64_t idx_dim_size,
+                       int64_t self_dim_size, int64_t self_inner) {
+    // A row whose picks fit the first-level cache is asked for as a whole
+    // before any of them is read, which lets the memory system overlap the
+    // misses of the entire row.  A wider row would drop the early lines again
+    // before they are used, so those keep a rolling lookahead.
+    constexpr int64_t kPrefetchWholeRow = 128;
+    constexpr int64_t kLookahead = 16;
+    const int64_t row_grain =
+        std::max<int64_t>(1, GRAIN_SIZE / std::max<int64_t>(idx_dim_size, 1));
+    parallel_for(0, idx_outer, row_grain, [&](int64_t gb, int64_t ge) {
+        for (int64_t g = gb; g < ge; ++g) {
+            const ctype* s_g = self + g * self_dim_size * self_inner;
+            const int64_t* ip_row = index + g * idx_dim_size;
+            ctype* d_row = result + g * idx_dim_size;
+            if (idx_dim_size <= kPrefetchWholeRow) {
+                for (int64_t c = 0; c < idx_dim_size; ++c)
+                    __builtin_prefetch(
+                        reinterpret_cast<const char*>(
+                            s_g + ip_row[c] * self_inner), 0, 3);
+                for (int64_t c = 0; c < idx_dim_size; ++c) {
+                    const int64_t pick = ip_row[c];
+                    if (pick < 0 || pick >= self_dim_size) {
+                        TP_THROW(IndexError, "gather", ": index out of range");
+                    }
+                    d_row[c] = s_g[pick * self_inner];
+                }
+                continue;
+            }
+            int64_t c = 0;
+            for (; c < idx_dim_size; ++c) {
+                if (c + kLookahead < idx_dim_size) {
+                    __builtin_prefetch(
+                        reinterpret_cast<const char*>(
+                            s_g + ip_row[c + kLookahead] * self_inner), 0, 3);
+                }
+                const int64_t pick = ip_row[c];
+                if (pick < 0 || pick >= self_dim_size) {
+                    TP_THROW(IndexError, "gather", ": index out of range");
+                }
+                d_row[c] = s_g[pick * self_inner];
+            }
+        }
+    });
+}
+
 Tensor gather_cpu(const Tensor& self, int64_t dim, const Tensor& index) {
     int64_t nd = self.dim();
     dim = wrap_dim(dim, nd);
@@ -700,6 +753,10 @@ Tensor gather_cpu(const Tensor& self, int64_t dim, const Tensor& index) {
         const int64_t* ip = idx_c.data_ptr<int64_t>(); \
         ctype* d = result.data_ptr<ctype>(); \
         const int64_t row_elems = idx_dim_size * idx_inner; \
+        if (idx_inner == 1) { \
+            gather_named_rows<ctype>(s, ip, d, idx_outer, idx_dim_size, self_dim_size, self_inner); \
+            break; \
+        } \
         parallel_for(0, idx_outer * row_elems, GRAIN_SIZE, [&](int64_t begin, int64_t end) { \
             int64_t g = begin / row_elems; \
             int64_t within = begin - g * row_elems; \
