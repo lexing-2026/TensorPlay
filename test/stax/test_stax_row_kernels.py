@@ -42,6 +42,24 @@ def _rms_row(x, w):
     return F.rms_norm(x, (w.shape[0],), w, 1e-6)
 
 
+def test_a_row_of_no_even_width_gets_a_block_that_covers_it_exactly():
+    # 32000 half-precision columns are 4000 vectors; 800 threads cover them in
+    # five chunks, so no thread is idle and the last chunk needs no predicate.
+    assert softmax_module.row_block(32000, 16, floor=256) == (800, 40)
+    # The same width in single precision has twice as many shorter vectors.
+    assert softmax_module.row_block(32000, 32, floor=256) == (800, 40)
+    # A row the default width already covers keeps that width and budget.
+    assert softmax_module.row_block(8192, 16, floor=256) == (256, 32)
+    # A row with no exact fit at all keeps the tailed block.
+    assert softmax_module.row_block(1000, 16, floor=256) == (128, 32)
+
+
+def test_two_rows_in_flight_keep_the_unraised_budget():
+    # The softmax gradient holds both its input rows, so the extra elements an
+    # exact fit would need are held twice and the tailed block stands.
+    assert softmax_module.row_block(32000, 16, floor=64, exact_budget=32) == (1024, 32)
+
+
 @cuda_only
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("shape", SHAPES)

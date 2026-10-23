@@ -35,10 +35,37 @@ DTYPE_MAP = {
 #: Elements per thread a row may hold in registers; above this the row is
 #: staged through shared memory instead.
 RMEM_BUDGET = 32
+#: An exact fit leaves the last chunk without a predicate, which buys room for
+#: this many elements per thread.
+EXACT_RMEM_BUDGET = 40
+
+
+def row_block(
+    n: int, element_bits: int, floor: int, exact_budget: int = EXACT_RMEM_BUDGET
+) -> tuple[int, int]:
+    """A block width and register budget for one row of ``n`` elements.
+
+    The width that keeps about :data:`RMEM_BUDGET` elements per thread is
+    preferred.  When that width leaves a partial last chunk, narrower widths
+    that cover the row exactly are tried in turn: every lane then has work in
+    every chunk and the last chunk needs no predicate, which pays for a few
+    more elements per thread.  A kernel that keeps two rows in flight passes
+    the unraised budget, since the extra elements would be held twice.
+    """
+
+    vec = vector_length(n, element_bits)
+    vectors = n // vec
+    threads = threads_for_row(n, element_bits, floor=floor)
+    if vectors % threads == 0:
+        return threads, RMEM_BUDGET
+    for candidate in range(threads - 32, floor - 1, -32):
+        if vectors % candidate == 0 and (vectors // candidate) * vec <= exact_budget:
+            return candidate, exact_budget
+    return threads, RMEM_BUDGET
 
 
 class SoftmaxFwd:
-    def __init__(self, dtype, n: int, threads: int, vec: int):
+    def __init__(self, dtype, n: int, threads: int, vec: int, rmem_budget: int = RMEM_BUDGET):
         self.dtype = dtype
         self.n = n
         self.threads = threads
@@ -46,7 +73,7 @@ class SoftmaxFwd:
         self.chunks = (n // vec + threads - 1) // threads
         self.tiler_n = vec * self.chunks * threads
         self.num_warps = threads // 32
-        self.in_rmem = self.chunks * vec <= RMEM_BUDGET
+        self.in_rmem = self.chunks * vec <= rmem_budget
 
     @cute.jit
     def __call__(self, x, out, stream):
@@ -77,23 +104,31 @@ class SoftmaxFwd:
             # the row, so only it is seeded.
             if const_expr(pred is not None):
                 rX[None, None, self.chunks - 1].fill(-3.0e38)
+            cute.copy(load, gX, rX, pred=pred)
+            # The row is folded a chunk at a time, so only one chunk of
+            # float32 values is live and a wide row does not spill.  The row
+            # stays in registers; the exponentials are rebuilt from it once
+            # the block normaliser is known.
+            m_t = Float32(-3.0e38)
             for k in cutlass.range_constexpr(self.chunks):
-                # Every chunk but the last lies wholly inside the row.
-                p = None if k < self.chunks - 1 or pred is None else pred[None, None, k]
-                cute.copy(load, gX[None, None, k], rX[None, None, k], pred=p)
-            xf = rX.load().to(Float32)
-            flat = xf.reshape((cute.size(rX),))
-            # The row is exponentiated against this thread's own maximum, so
-            # the exponentials start before any cross-thread exchange; only
-            # the scalar sums meet in the (maximum, sum) reduction below.
-            m_t = flat.reduce(cute.ReductionOp.MAX, init_val=-3.0e38, reduction_profile=0)
-            e = cute.math.exp2((xf - m_t) * LOG2E, fastmath=True)
+                v = rX[None, None, k].load().to(Float32)
+                m_t = cute.arch.fmax(
+                    m_t,
+                    v.reshape((cute.size(rX[None, None, k]),)).reduce(
+                        cute.ReductionOp.MAX, init_val=-3.0e38, reduction_profile=0
+                    ),
+                )
+            sm = Float32(0.0)
+            for k in cutlass.range_constexpr(self.chunks):
+                v = rX[None, None, k].load().to(Float32)
+                e = cute.math.exp2((v - m_t) * LOG2E, fastmath=True)
+                sm += e.reshape((cute.size(rX[None, None, k]),)).reduce(
+                    cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0
+                )
             wmax = cute.arch.warp_reduction(m_t, cute.arch.fmax)
             top, total = block_stats(
                 wmax,
-                e.reshape((cute.size(rX),)).reduce(
-                    cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0
-                ) * cute.math.exp2((m_t - wmax) * LOG2E, fastmath=True),
+                sm * cute.math.exp2((m_t - wmax) * LOG2E, fastmath=True),
                 buf_m,
                 buf_s,
                 self.num_warps,
@@ -102,16 +137,17 @@ class SoftmaxFwd:
             # block maximum and normalises it in the same step.  Every thread
             # divides by the same sum, so an approximate reciprocal is both
             # exact enough for a weight and one instruction.
-            y = e * (
+            scale = (
                 cute.math.exp2((m_t - top) * LOG2E, fastmath=True)
                 * cute.arch.rcp_approx(total)
             )
-            # The row of inputs is dead once it has been exponentiated, so the
-            # output goes back over it and the block holds one row, not two.
-            rX.store(y.to(rX.element_type))
+            # The row of inputs is dead once its exponentials are scaled, so
+            # the output goes back over it and the block holds one row.
             for k in cutlass.range_constexpr(self.chunks):
-                p = None if k < self.chunks - 1 or pred is None else pred[None, None, k]
-                cute.copy(store, rX[None, None, k], gO[None, None, k], pred=p)
+                v = rX[None, None, k].load().to(Float32)
+                e = cute.math.exp2((v - m_t) * LOG2E, fastmath=True) * scale
+                rX[None, None, k].store(e.to(rX.element_type))
+            cute.copy(store, rX, gO, pred=pred)
         else:
             # A row that does not fit in registers is read twice: the first
             # walk folds it into the maximum and the exponential sum, the
@@ -154,7 +190,7 @@ class SoftmaxFwd:
 
 
 class SoftmaxBwd:
-    def __init__(self, dtype, n: int, threads: int, vec: int):
+    def __init__(self, dtype, n: int, threads: int, vec: int, rmem_budget: int = RMEM_BUDGET):
         self.dtype = dtype
         self.n = n
         self.threads = threads
@@ -162,7 +198,7 @@ class SoftmaxBwd:
         self.chunks = (n // vec + threads - 1) // threads
         self.tiler_n = vec * self.chunks * threads
         self.num_warps = threads // 32
-        self.in_rmem = self.chunks * vec <= RMEM_BUDGET
+        self.in_rmem = self.chunks * vec <= rmem_budget
 
     @cute.jit
     def __call__(self, y, dout, dx, stream):
@@ -193,17 +229,21 @@ class SoftmaxBwd:
             rO.fill(0.0)
             cute.copy(atom, gY, rY, pred=pred)
             cute.copy(atom, gO, rO, pred=pred)
-            yv = rY.load().to(Float32)
-            dv = rO.load().to(Float32)
-            total = block_sum_once(
-                (yv * dv).reshape((cute.size(rY),)).reduce(
+            # Both rows are read a chunk at a time so only one chunk of each
+            # is in flight in float32; holding both rows whole would double
+            # the registers the block needs and spill wide rows.
+            sm = Float32(0.0)
+            for k in cutlass.range_constexpr(self.chunks):
+                yv = rY[None, None, k].load().to(Float32)
+                dv = rO[None, None, k].load().to(Float32)
+                sm += (yv * dv).reshape((cute.size(rY[None, None, k]),)).reduce(
                     cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0
-                ),
-                buf,
-                self.num_warps,
-            )
-            grad = yv * (dv - total)
-            rY.store(grad.to(rY.element_type))
+                )
+            total = block_sum_once(sm, buf, self.num_warps)
+            for k in cutlass.range_constexpr(self.chunks):
+                yv = rY[None, None, k].load().to(Float32)
+                dv = rO[None, None, k].load().to(Float32)
+                rY[None, None, k].store((yv * (dv - total)).to(rY.element_type))
             cute.copy(atom, rY, gD, pred=pred)
         else:
             # A row that does not fit in registers is read twice: the first
@@ -247,7 +287,7 @@ class SoftmaxBwdUniform:
     gradient is read as the single element it is.
     """
 
-    def __init__(self, dtype, n: int, threads: int, vec: int):
+    def __init__(self, dtype, n: int, threads: int, vec: int, rmem_budget: int = RMEM_BUDGET):
         self.dtype = dtype
         self.n = n
         self.threads = threads
@@ -255,7 +295,7 @@ class SoftmaxBwdUniform:
         self.chunks = (n // vec + threads - 1) // threads
         self.tiler_n = vec * self.chunks * threads
         self.num_warps = threads // 32
-        self.in_rmem = self.chunks * vec <= RMEM_BUDGET
+        self.in_rmem = self.chunks * vec <= rmem_budget
 
     @cute.jit
     def __call__(self, y, g, dx, stream):
@@ -334,19 +374,21 @@ def softmax_fwd(x: tp.Tensor, threads: int | None = None):
         # block, which keeps a second block resident beside it so one row's
         # reduction overlaps the other's memory traffic; longer rows take the
         # width that keeps about 32 elements per thread.
-        threads = threads_for_row(n, cutlass_dtype.width, floor=256)
+        threads, rmem_budget = row_block(n, cutlass_dtype.width, floor=256)
+    else:
+        rmem_budget = RMEM_BUDGET
     out = tp.empty_like(x)
 
     def build():
         return cute.compile(
-            SoftmaxFwd(cutlass_dtype, n, threads, vec),
+            SoftmaxFwd(cutlass_dtype, n, threads, vec, rmem_budget),
             fake_tensor(cutlass_dtype, (cute.sym_int(), n), vec),
             fake_tensor(cutlass_dtype, (cute.sym_int(), n), vec),
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             options="--enable-tvm-ffi",
         )
 
-    compile_cached(_fwd_cache, (n, x.dtype, threads, vec), build)(x, out)
+    compile_cached(_fwd_cache, (n, x.dtype, threads, vec, rmem_budget), build)(x, out)
     return out
 
 
@@ -357,12 +399,16 @@ def softmax_bwd(y: tp.Tensor, dout: tp.Tensor, threads: int | None = None):
     cutlass_dtype = DTYPE_MAP[y.dtype]
     vec = vector_length(n, cutlass_dtype.width)
     if threads is None:
-        threads = threads_for_row(n, cutlass_dtype.width)
+        threads, rmem_budget = row_block(
+            n, cutlass_dtype.width, floor=64, exact_budget=RMEM_BUDGET
+        )
+    else:
+        rmem_budget = RMEM_BUDGET
     dx = tp.empty_like(y)
 
     def build():
         return cute.compile(
-            SoftmaxBwd(cutlass_dtype, n, threads, vec),
+            SoftmaxBwd(cutlass_dtype, n, threads, vec, rmem_budget),
             fake_tensor(cutlass_dtype, (cute.sym_int(), n), vec),
             fake_tensor(cutlass_dtype, (cute.sym_int(), n), vec),
             fake_tensor(cutlass_dtype, (cute.sym_int(), n), vec),
@@ -370,7 +416,7 @@ def softmax_bwd(y: tp.Tensor, dout: tp.Tensor, threads: int | None = None):
             options="--enable-tvm-ffi",
         )
 
-    compile_cached(_bwd_cache, (n, y.dtype, threads, vec), build)(y, dout, dx)
+    compile_cached(_bwd_cache, (n, y.dtype, threads, vec, rmem_budget), build)(y, dout, dx)
     return dx
 
 
@@ -384,12 +430,14 @@ def softmax_bwd_uniform(y: tp.Tensor, g: tp.Tensor, threads: int | None = None):
     cutlass_dtype = DTYPE_MAP[y.dtype]
     vec = vector_length(n, cutlass_dtype.width)
     if threads is None:
-        threads = threads_for_row(n, cutlass_dtype.width)
+        threads, rmem_budget = row_block(n, cutlass_dtype.width, floor=64)
+    else:
+        rmem_budget = RMEM_BUDGET
     dx = tp.empty_like(y)
 
     def build():
         return cute.compile(
-            SoftmaxBwdUniform(cutlass_dtype, n, threads, vec),
+            SoftmaxBwdUniform(cutlass_dtype, n, threads, vec, rmem_budget),
             fake_tensor(cutlass_dtype, (cute.sym_int(), n), vec),
             fake_tensor(cutlass_dtype, (1,), 1),
             fake_tensor(cutlass_dtype, (cute.sym_int(), n), vec),
@@ -397,5 +445,5 @@ def softmax_bwd_uniform(y: tp.Tensor, g: tp.Tensor, threads: int | None = None):
             options="--enable-tvm-ffi",
         )
 
-    compile_cached(_bwd_uniform_cache, (n, y.dtype, threads, vec), build)(y, g, dx)
+    compile_cached(_bwd_uniform_cache, (n, y.dtype, threads, vec, rmem_budget), build)(y, g, dx)
     return dx
