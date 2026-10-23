@@ -556,6 +556,25 @@ Tensor& erf_inplace_kernel(Tensor& self) {
       self, "erfinplace", "buffer_erfinplace", "unary erf");
 }
 
+Tensor erfc_kernel(const Tensor& self) {
+  return unary_op_typed(self, "erfc", "buffer_erfc", false, "unary erfc");
+}
+
+Tensor& erfc_inplace_kernel(Tensor& self) {
+  return unary_op_typed_inplace(
+      self, "erfcinplace", "buffer_erfcinplace", "unary erfc");
+}
+
+Tensor lgamma_kernel(const Tensor& self) {
+  return unary_op_typed(
+      self, "lgamma", "buffer_lgamma", false, "unary lgamma");
+}
+
+Tensor& lgamma_inplace_kernel(Tensor& self) {
+  return unary_op_typed_inplace(
+      self, "lgammainplace", "buffer_lgammainplace", "unary lgamma");
+}
+
 // Conjugation is the identity for the real and integer dtypes this backend
 // supports; complex tensors are rejected at allocation time.
 Tensor conj_kernel(const Tensor& self) {
@@ -630,6 +649,10 @@ TENSORPLAY_LIBRARY_IMPL(Vulkan, UnaryOpKernels) {
   m.impl("reciprocal_", &tensorplay::vulkan::ops::reciprocal_inplace_kernel);
   m.impl("erf", &tensorplay::vulkan::ops::erf_kernel);
   m.impl("erf_", &tensorplay::vulkan::ops::erf_inplace_kernel);
+  m.impl("erfc", &tensorplay::vulkan::ops::erfc_kernel);
+  m.impl("erfc_", &tensorplay::vulkan::ops::erfc_inplace_kernel);
+  m.impl("lgamma", &tensorplay::vulkan::ops::lgamma_kernel);
+  m.impl("lgamma_", &tensorplay::vulkan::ops::lgamma_inplace_kernel);
   m.impl("conj", &tensorplay::vulkan::ops::conj_kernel);
 }
 

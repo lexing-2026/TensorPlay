@@ -107,6 +107,10 @@ unary_op:
     OPERATOR: 1.0f / X
   - NAME: erf
     OPERATOR: sign(X) * (1.0f - ((((1.061405429f * (1.0f / (1.0f + 0.3275911f * abs(X))) - 1.453152027f) * (1.0f / (1.0f + 0.3275911f * abs(X))) + 1.421413741f) * (1.0f / (1.0f + 0.3275911f * abs(X))) - 0.284496736f) * (1.0f / (1.0f + 0.3275911f * abs(X))) + 0.254829592f) * (1.0f / (1.0f + 0.3275911f * abs(X))) * exp(-X * X))
+  - NAME: erfc
+    OPERATOR: erfc_approx(X)
+  - NAME: lgamma
+    OPERATOR: lgamma_approx(X)
   - NAME: ceil_i32
     DTYPE: int
     OPERATOR: X
@@ -434,6 +438,10 @@ buffer_unary_op:
     OPERATOR: 1.0f / X
   - NAME: buffer_erf
     OPERATOR: sign(X) * (1.0f - ((((1.061405429f * (1.0f / (1.0f + 0.3275911f * abs(X))) - 1.453152027f) * (1.0f / (1.0f + 0.3275911f * abs(X))) + 1.421413741f) * (1.0f / (1.0f + 0.3275911f * abs(X))) - 0.284496736f) * (1.0f / (1.0f + 0.3275911f * abs(X))) + 0.254829592f) * (1.0f / (1.0f + 0.3275911f * abs(X))) * exp(-X * X))
+  - NAME: buffer_erfc
+    OPERATOR: erfc_approx(X)
+  - NAME: buffer_lgamma
+    OPERATOR: lgamma_approx(X)
 upload_buffer:
   parameter_names_with_default_values: {}
   shader_variants:
@@ -2471,6 +2479,18 @@ buffer_half_unary_op:
     INPLACE: false
   - NAME: buffer_erf_halfinplace
     OPERATOR: 'sign(X) * (1.0f - ((((1.061405429f * (1.0f / (1.0f + 0.3275911f * abs(X))) - 1.453152027f) * (1.0f / (1.0f + 0.3275911f * abs(X))) + 1.421413741f) * (1.0f / (1.0f + 0.3275911f * abs(X))) - 0.284496736f) * (1.0f / (1.0f + 0.3275911f * abs(X))) + 0.254829592f) * (1.0f / (1.0f + 0.3275911f * abs(X))) * exp(-X * X))'
+    INPLACE: true
+  - NAME: buffer_erfc_half
+    OPERATOR: erfc_approx(X)
+    INPLACE: false
+  - NAME: buffer_erfc_halfinplace
+    OPERATOR: erfc_approx(X)
+    INPLACE: true
+  - NAME: buffer_lgamma_half
+    OPERATOR: lgamma_approx(X)
+    INPLACE: false
+  - NAME: buffer_lgamma_halfinplace
+    OPERATOR: lgamma_approx(X)
     INPLACE: true
   - NAME: buffer_exp_half
     OPERATOR: 'exp(X)'

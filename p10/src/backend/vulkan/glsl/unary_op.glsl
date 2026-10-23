@@ -9,6 +9,8 @@
 
 layout(std430) buffer;
 
+#include "math_ext.h"
+
 $if DTYPE == "int":
   // Integer planes bind as signed-word storage images: samplers cannot read
   // integer formats, so both directions go through iimage loads.

@@ -5663,6 +5663,106 @@ class TestVulkanScalarVocabulary(unittest.TestCase):
             self._device(np.array([1, 2], dtype=np.int8)) + 2
 
 
+class TestVulkanSpecialFunctions(unittest.TestCase):
+    # The complementary error function and the log-gamma magnitude are answered
+    # by the device's own polynomial forms rather than by any hardware
+    # instruction, so every case is held against the host lane on the same
+    # payload.  The tolerance is the approximation tier: about 1e-7 absolute for
+    # the central band, worse only where the answer itself is nearly zero.
+
+    VALUES = np.array(
+        [-8.0, -5.5, -3.0, -2.5, -1.5, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5,
+         0.75, 1.0, 1.5, 2.0, 2.5, 3.0, 5.5, 8.0, 1e-8, -1e-8],
+        dtype=np.float32)
+
+    TOLERANCE = {"erfc": (1e-5, 1e-6), "lgamma": (1e-5, 1e-5)}
+
+    @staticmethod
+    def _device(values):
+        return tensorplay.from_numpy(np.array(values, dtype=np.float32)) \
+            .to("vulkan")
+
+    def _answers(self, got, want, label, rtol, atol):
+        self.assertEqual(got.dtype, want.dtype, msg=label)
+        self.assertEqual(tuple(got.shape), tuple(want.shape), msg=label)
+        np.testing.assert_allclose(
+            got.cpu().numpy(), want.cpu().numpy(), rtol=rtol, atol=atol,
+            equal_nan=True, err_msg=label)
+
+    def test_the_special_functions_match_the_host_lane(self):
+        host_values = tensorplay.from_numpy(self.VALUES.copy())
+        for name, (rtol, atol) in self.TOLERANCE.items():
+            want = getattr(host_values, name)()
+            got = getattr(self._device(self.VALUES), name)()
+            self._answers(got, want, f"device {name}", rtol, atol)
+
+    def test_a_long_row_rides_the_linear_writer(self):
+        # Past the image edge the same formula is read from a storage buffer,
+        # where the element type is named by the words of the buffer.
+        rng = np.random.default_rng(11)
+        row = (rng.random(200003, dtype=np.float32) * 16.0 - 6.0)
+        host_row = tensorplay.from_numpy(np.array(row))
+        device_row = tensorplay.from_numpy(np.array(row)).to("vulkan")
+        for name, (rtol, atol) in self.TOLERANCE.items():
+            want = getattr(host_row, name)()
+            got = getattr(device_row, name)()
+            self._answers(got, want, f"linear {name}", rtol, atol)
+
+    def test_a_half_payload_answers_in_its_own_width(self):
+        values = np.array([-3.5, -2.5, -1.5, -0.5, 0.5, 1.5, 3.5],
+                          dtype=np.float16)
+        host = tensorplay.from_numpy(values.copy())
+        device = tensorplay.from_numpy(values.copy()).to("vulkan")
+        for name in ("erfc", "lgamma"):
+            want = getattr(host, name)()
+            got = getattr(device, name)()
+            self.assertEqual(got.dtype, tensorplay.float16, msg=name)
+            np.testing.assert_allclose(
+                got.cpu().numpy(), want.cpu().numpy(), rtol=2e-2, atol=2e-2,
+                equal_nan=True, err_msg=f"half {name}")
+
+    def test_a_count_is_read_in_single_precision(self):
+        counts = np.array([-3, -2, -1, 0, 1, 2, 5], dtype=np.int32)
+        host = tensorplay.from_numpy(counts.copy())
+        device = tensorplay.from_numpy(counts.copy()).to("vulkan")
+        for name in ("erfc", "lgamma"):
+            want = getattr(host, name)()
+            got = getattr(device, name)()
+            self.assertEqual(got.dtype, tensorplay.float32, msg=name)
+            np.testing.assert_allclose(
+                got.cpu().numpy(), want.cpu().numpy(), rtol=1e-5, atol=1e-5,
+                equal_nan=True, err_msg=f"count {name}")
+
+    def test_the_special_lanes_and_poles(self):
+        values = np.array(
+            [np.inf, -np.inf, np.nan, 0.0, -0.0, -1.0, -2.0, -7.0],
+            dtype=np.float32)
+        host = tensorplay.from_numpy(values.copy())
+        device = tensorplay.from_numpy(values.copy()).to("vulkan")
+        for name in ("erfc", "lgamma"):
+            want = getattr(host, name)()
+            got = getattr(device, name)()
+            np.testing.assert_allclose(
+                got.cpu().numpy(), want.cpu().numpy(), rtol=1e-6, atol=1e-6,
+                equal_nan=True, err_msg=f"special {name}")
+
+    def test_each_special_function_writes_its_own_tensor(self):
+        values = np.array([-1.5, -0.5, 0.5, 1.5, 2.5], dtype=np.float32)
+        host_values = tensorplay.from_numpy(values.copy())
+        for name in ("erfc", "lgamma"):
+            want = getattr(host_values, name)().cpu().numpy()
+            written = self._device(values)
+            getattr(written, name + "_")()
+            np.testing.assert_allclose(
+                written.cpu().numpy(), want,
+                rtol=1e-5, atol=1e-5, err_msg=f"in-place {name}")
+            # A count has no fractional place to write the answer into.
+            counts = tensorplay.from_numpy(
+                np.array([1, 2, 3], dtype=np.int32)).to("vulkan")
+            with self.assertRaisesRegex(RuntimeError, "kernel|float"):
+                getattr(counts, name + "_")()
+
+
 class TestVulkanUnaryWidth(unittest.TestCase):
     # The width a unary answer lands in belongs to the formula, not to the
     # payload: a series or a ratio has fractions in it, so a count is read in
@@ -8739,6 +8839,31 @@ class TestVulkanForeachGroup(unittest.TestCase):
                 tensorplay._amp_foreach_non_finite_check_and_unscale_(
                     group, found, scale)
             self.assertEqual(float(found.cpu().numpy()), 0.0, msg=device)
+
+    def test_a_special_function_group_matches_the_host_lane(self):
+        # Two formulas this device answers with its own polynomial forms, over
+        # a group whose entries differ in shape and in sign.
+        tables = [
+            np.array([[-2.5, -1.5, -0.5, 0.5], [1.5, 2.5, 3.5, 10.0]],
+                     dtype=np.float32),
+            np.array([-8.0, -3.5, 0.25, 1.0, 1e-3], dtype=np.float32),
+        ]
+        for name in ("erfc", "lgamma"):
+            want = self._read([
+                getattr(tensorplay.from_numpy(np.array(table, copy=True)),
+                        name)()
+                for table in tables])
+            rtol, atol = ((1e-5, 1e-6) if name == "erfc"
+                          else (1e-5, 1e-5))
+            for device in ("vulkan", "cpu"):
+                group = self._group(tables, device)
+                answer = getattr(tensorplay, f"_foreach_{name}")(group)
+                self._answers(self._read(answer), want,
+                              f"foreach {name}", device, rtol, atol)
+                written = self._group(tables, device)
+                getattr(tensorplay, f"_foreach_{name}_")(written)
+                self._answers(self._read(written), want,
+                              f"foreach {name}_", device, rtol, atol)
 
 
 class TestVulkanAmpScale(unittest.TestCase):

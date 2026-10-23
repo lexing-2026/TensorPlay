@@ -9,6 +9,8 @@
 
 layout(std430) buffer;
 
+#include "math_ext.h"
+
 $if DTYPE == "int":
   // Signed-word storage buffers for the integer variants.  Data is laid out
   // as 16-byte vectors so the bulk of the work uses aligned 128-bit loads.
