@@ -10,6 +10,7 @@
 #include "DTypeNames.h"
 #include "CudaGemm.h"
 #include "Complex.h"
+#include "OutWrite.h"
 #include <cublas_v2.h>
 #include <cublasLt.h>
 #include <cuda_runtime.h>
@@ -94,6 +95,23 @@ Tensor expand_gemm_input_cuda(const Tensor& input, const std::vector<int64_t>& t
     return input.as_strided(target, out_strides);
 }
 
+// Whether two tensors sit in one allocation.  A product read while its answer
+// is written has to be judged as a whole, not one element at a time: a
+// destination overlaying an operand would be overwritten before the library
+// finished reading it, even where element i is read before element i is
+// stored.
+bool shares_storage(const Tensor& first, const Tensor& second) {
+    const auto first_impl = first.unsafeGetTensorImpl();
+    const auto second_impl = second.unsafeGetTensorImpl();
+    if (!first_impl || !second_impl) {
+        return false;
+    }
+    const auto& first_storage = first_impl->storage();
+    const auto& second_storage = second_impl->storage();
+    return first_storage.defined() && second_storage.defined() &&
+           first_storage.data() == second_storage.data();
+}
+
 } // anonymous namespace
 
 Tensor mm_kernel_cuda(const Tensor& self, const Tensor& other) {
@@ -124,6 +142,40 @@ Tensor mm_kernel_cuda(const Tensor& self, const Tensor& other) {
     }
     gemm_impl(self_p, other_p, result, 1.0, 0.0, nullptr);
     return result;
+}
+
+Tensor& mm_out_kernel_cuda(const Tensor& self, const Tensor& other, Tensor& out) {
+    if (self.dim() != 2) TP_THROW(RuntimeError, "self must be a matrix");
+    if (other.dim() != 2) TP_THROW(RuntimeError, "mat2 must be a matrix");
+    if (self.size(1) != other.size(0)) {
+        TP_THROW(RuntimeError, "mat1 and mat2 shapes cannot be multiplied (", self.size(0),
+                 "x", self.size(1), " and ", other.size(0), "x", other.size(1), ")");
+    }
+    if (self.dtype() != other.dtype()) {
+        TP_THROW(RuntimeError, "expected mat1 and mat2 to have the same dtype, but got: ",
+                 elementTypeName(self.dtype()), " != ", elementTypeName(other.dtype()));
+    }
+    check_cublas_gemm_dtype(self.dtype());
+
+    const int64_t M = self.size(0);
+    const int64_t N = other.size(1);
+    // A destination that is already the buffer this product would have
+    // allocated is written by the GEMM itself; anything else is filled from a
+    // computed result so that it keeps its identity and its views.
+    if (destination_takes(out, self.device(), self.dtype(), {M, N}) &&
+        out.is_contiguous() && !shares_storage(out, self) &&
+        !shares_storage(out, other)) {
+        if (M != 0 && N != 0) {
+            if (self.size(1) == 0) {
+                zero_matmul_output_cuda(out);
+            } else {
+                gemm_impl(self, other, out, 1.0, 0.0, nullptr);
+            }
+        }
+        return out;
+    }
+    write_out(out, mm_kernel_cuda(self, other));
+    return out;
 }
 
 std::vector<int64_t> decode_batch_index_cuda(
@@ -213,12 +265,15 @@ long long batched_matrix_stride_cuda(
 }
 
 // Launch one strided-batched GEMM over contiguous (B, M, K) x (B, K, N)
-// operand stacks into a contiguous (B, M, N) result.
+// operand stacks into a contiguous (B, M, N) result.  `destination`, when
+// given, is a buffer of exactly that shape and layout owned by the caller,
+// and the product is written into it rather than into a fresh allocation.
 
 Tensor matmul_batched_2d_cuda(
     const Tensor& self, const Tensor& other,
     const std::vector<int64_t>& self_batch_shape,
-    const std::vector<int64_t>& other_batch_shape) {
+    const std::vector<int64_t>& other_batch_shape,
+    Tensor* destination = nullptr) {
     if (self.dim() < 2 || other.dim() < 2) {
         TP_THROW(RuntimeError, "matmul: internal operands must be at least 2D");
     }
@@ -234,7 +289,9 @@ Tensor matmul_batched_2d_cuda(
     std::vector<int64_t> result_shape = batch_shape;
     result_shape.push_back(M);
     result_shape.push_back(N);
-    Tensor result = Tensor::empty(result_shape, self.dtype(), self.device());
+    Tensor result = destination != nullptr
+                        ? *destination
+                        : Tensor::empty(result_shape, self.dtype(), self.device());
 
     int64_t batch_size = 1;
     for (const int64_t size : batch_shape) {
@@ -254,7 +311,12 @@ Tensor matmul_batched_2d_cuda(
     }
 
     if (batch_shape.empty()) {
-        return mm_kernel_cuda(self, other);
+        Tensor product = mm_kernel_cuda(self, other);
+        if (destination == nullptr) {
+            return product;
+        }
+        destination->copy_(product);
+        return *destination;
     }
 
     // folding the batch into M.  Besides matching that execution contract,
@@ -717,6 +779,36 @@ Tensor bmm_kernel_cuda(const Tensor& self, const Tensor& batch2) {
     return matmul_batched_2d_cuda(self, batch2, {self.size(0)}, {batch2.size(0)});
 }
 
+Tensor& bmm_out_kernel_cuda(const Tensor& self, const Tensor& batch2, Tensor& out) {
+    if (self.dim() != 3) TP_THROW(RuntimeError, "batch1 must be a 3D tensor");
+    if (batch2.dim() != 3) TP_THROW(RuntimeError, "batch2 must be a 3D tensor");
+    if (self.size(0) != batch2.size(0) || self.size(2) != batch2.size(1)) {
+        TP_THROW(RuntimeError, "Expected size for first two dimensions of batch2 tensor to be: [",
+                 self.size(0), ", ", self.size(2), "] but got: [", batch2.size(0), ", ",
+                 batch2.size(1), "].");
+    }
+    if (self.dtype() != batch2.dtype()) {
+        TP_THROW(RuntimeError, "expected scalar type ", scalarTypeName(self.dtype()),
+                 " but found ", scalarTypeName(batch2.dtype()));
+    }
+    check_cublas_gemm_dtype(self.dtype());
+
+    const std::vector<int64_t> target{self.size(0), self.size(1), batch2.size(2)};
+    // A destination that is already the buffer this product would have
+    // allocated is written by the GEMM itself: computing into a fresh tensor
+    // and copying afterwards would read and write the whole result twice.  Any
+    // other destination keeps its identity through write_out.
+    if (destination_takes(out, self.device(), self.dtype(), target) &&
+        out.is_contiguous() && !shares_storage(out, self) &&
+        !shares_storage(out, batch2)) {
+        matmul_batched_2d_cuda(
+            self, batch2, {self.size(0)}, {batch2.size(0)}, &out);
+        return out;
+    }
+    write_out(out, bmm_kernel_cuda(self, batch2));
+    return out;
+}
+
 Tensor baddbmm_kernel_cuda(const Tensor& input, const Tensor& batch1, const Tensor& batch2,
                            const Scalar& beta, const Scalar& alpha) {
     if (batch1.dim() != 3) TP_THROW(RuntimeError, "batch1 must be a 3D tensor");
@@ -983,6 +1075,7 @@ Tensor linear_kernel_cuda(const Tensor& input, const Tensor& weight,
 
 TENSORPLAY_LIBRARY_IMPL(CUDA, LinearAlgebraKernels) {
     m.impl("mm", mm_kernel_cuda);
+    m.impl("mm.out", mm_out_kernel_cuda);
     m.impl("matmul", matmul_kernel_cuda);
     m.impl("matmul.out", matmul_out_kernel_cuda);
     m.impl("matmul_backward_self", matmul_backward_self_kernel_cuda);
@@ -990,6 +1083,7 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, LinearAlgebraKernels) {
     m.impl("addmm", addmm_kernel_cuda);
     m.impl("linear", linear_kernel_cuda);
     m.impl("bmm", bmm_kernel_cuda);
+    m.impl("bmm.out", bmm_out_kernel_cuda);
     m.impl("baddbmm", baddbmm_kernel_cuda);
     m.impl("mv", mv_kernel_cuda);
     m.impl("dot", dot_kernel_cuda);

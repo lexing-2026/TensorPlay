@@ -100,6 +100,71 @@ def test_baddbmm_broadcast_inputs(device):
         np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-5, err_msg=str(shape))
 
 
+@pytest.mark.parametrize("device", DEVICES)
+def test_bmm_out_writes_the_named_destination(device):
+    if device == "cuda" and not tp.cuda.is_available():
+        pytest.skip("no cuda")
+    rng = np.random.RandomState(3)
+    A = rng.randn(4, 7, 5).astype(np.float32)
+    B = rng.randn(4, 5, 6).astype(np.float32)
+    tA, tB = _mk(A, device), _mk(B, device)
+    want = torch.bmm(_torch_mk(A, device), _torch_mk(B, device)).cpu().numpy()
+
+    # A destination of the answer's shape keeps its storage and its views:
+    # the answer is written where it was asked for, not swapped in.
+    got = tp.empty(4, 7, 6, dtype=tp.float32, device=tp.device(device))
+    ptr = got.data_ptr()
+    view = got[0]
+    tp.bmm(tA, tB, out=got)
+    assert got.data_ptr() == ptr
+    np.testing.assert_allclose(_np(got), want, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(_np(view), want[0], rtol=1e-5, atol=1e-5)
+
+    # A destination of another shape is resized rather than refused, and one
+    # that is a window of a larger buffer still receives the whole answer.
+    got = tp.empty(1, 1, 1, dtype=tp.float32, device=tp.device(device))
+    tp.bmm(tA, tB, out=got)
+    assert tuple(got.shape) == (4, 7, 6)
+    np.testing.assert_allclose(_np(got), want, rtol=1e-5, atol=1e-5)
+
+    window = tp.empty(4, 7, 12, dtype=tp.float32, device=tp.device(device))[:, :, :6]
+    tp.bmm(tA, tB, out=window)
+    np.testing.assert_allclose(_np(window), want, rtol=1e-5, atol=1e-5)
+
+    # A destination that is an operand still gets the product: the answer may
+    # not be written over a matrix while that matrix is being read.
+    C = rng.randn(4, 5, 5).astype(np.float32)
+    expected = torch.bmm(_torch_mk(A, device), _torch_mk(C, device)).cpu().numpy()
+    square = _mk(A, device)
+    tp.bmm(square, _mk(C, device), out=square)
+    np.testing.assert_allclose(_np(square), expected, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_mm_out_writes_the_named_destination(device):
+    if device == "cuda" and not tp.cuda.is_available():
+        pytest.skip("no cuda")
+    rng = np.random.RandomState(4)
+    a = rng.randn(17, 9).astype(np.float32)
+    b = rng.randn(9, 5).astype(np.float32)
+    ta, tb = _mk(a, device), _mk(b, device)
+    want = (_torch_mk(a, device) @ _torch_mk(b, device)).cpu().numpy()
+
+    got = tp.empty(17, 5, dtype=tp.float32, device=tp.device(device))
+    ptr = got.data_ptr()
+    tp.ops.tp.mm.out(ta, tb, out=got)
+    assert got.data_ptr() == ptr
+    np.testing.assert_allclose(_np(got), want, rtol=1e-5, atol=1e-5)
+
+    # An operand as the destination still gets the product: the answer may not
+    # be written over a matrix while that matrix is being read.
+    right = rng.randn(9, 9).astype(np.float32)
+    expected = torch.mm(_torch_mk(a, device), _torch_mk(right, device)).cpu().numpy()
+    square = _mk(a, device)
+    tp.ops.tp.mm.out(square, _mk(right, device), out=square)
+    np.testing.assert_allclose(_np(square), expected, rtol=1e-5, atol=1e-5)
+
+
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 
