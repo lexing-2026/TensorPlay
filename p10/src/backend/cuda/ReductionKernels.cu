@@ -242,26 +242,18 @@ template <typename InputT, typename AccT, typename OutputT, typename Ops,
 Tensor run_reduction_typed(
         const Tensor& input, const ReductionSpec& spec, bool keepdim,
         DType output_dtype, Ops ops, AccT identity, Tensor* second_output = nullptr) {
-    static_assert(reduction::kReductionEngineRevision == 14);
+    static_assert(reduction::kReductionEngineRevision == 15);
     Tensor result = Tensor::empty(
         reduction_output_shape(input, spec, keepdim), output_dtype, input.device());
     if (input.numel() == 0 || result.numel() == 0) return result;
 
     Tensor viewed = reduction_view(result, input, spec, keepdim);
     TensorIterator iter = TensorIterator::reduce_op(viewed, input);
-    const auto config = reduction::make_reduce_config<InputT, AccT, OutputT>(iter);
     SecondOutputT* second_ptr =
         second_output == nullptr ? nullptr : second_output->data_ptr<SecondOutputT>();
-    if (config.input_vec_size == 8) {
-        reduction::launch_reduce<InputT, AccT, OutputT, Ops, ValuesPerThread, 8, SecondOutputT>(
-            iter, ops, identity, second_ptr);
-    } else if (config.input_vec_size == 4) {
-        reduction::launch_reduce<InputT, AccT, OutputT, Ops, ValuesPerThread, 4, SecondOutputT>(
-            iter, ops, identity, second_ptr);
-    } else {
-        reduction::launch_reduce<InputT, AccT, OutputT, Ops, ValuesPerThread, 1, SecondOutputT>(
-            iter, ops, identity, second_ptr);
-    }
+    reduction::launch_reduce<InputT, AccT, OutputT, Ops, ValuesPerThread,
+                             reduction::input_vec_width_v<InputT>, SecondOutputT>(
+        iter, ops, identity, second_ptr);
     return result;
 }
 

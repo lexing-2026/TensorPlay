@@ -146,23 +146,11 @@ struct XorHashOps {
 
 template <typename InputT>
 void launch_hash_tensor_reduce(TensorIterator& iter) {
-    const auto config = reduction::make_reduce_config<InputT,
-                                                       unsigned long long,
-                                                       uint64_t>(iter);
     XorHashOps<InputT> ops;
-    if (config.input_vec_size == 8) {
-        reduction::launch_reduce<InputT, unsigned long long, uint64_t,
-                                 XorHashOps<InputT>, 4, 8>(
-            iter, ops, 0ull);
-    } else if (config.input_vec_size == 4) {
-        reduction::launch_reduce<InputT, unsigned long long, uint64_t,
-                                 XorHashOps<InputT>, 4, 4>(
-            iter, ops, 0ull);
-    } else {
-        reduction::launch_reduce<InputT, unsigned long long, uint64_t,
-                                 XorHashOps<InputT>, 4, 1>(
-            iter, ops, 0ull);
-    }
+    reduction::launch_reduce<InputT, unsigned long long, uint64_t,
+                             XorHashOps<InputT>, 4,
+                             reduction::input_vec_width_v<InputT>>(
+        iter, ops, 0ull);
 }
 
 std::vector<int64_t> hash_output_shape(const Tensor& input,

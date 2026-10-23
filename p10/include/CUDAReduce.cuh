@@ -35,7 +35,15 @@ constexpr int kDefaultValuesPerThread = 4;
 constexpr int kMaxCachedReduceDevices = 64;
 // Bump when the header-only launch path changes; this also keeps generated
 // CUDA objects from silently reusing an older reduction implementation.
-constexpr int kReductionEngineRevision = 14;
+constexpr int kReductionEngineRevision = 15;
+
+// Load width of one reduction unit: 16-bit elements take eight per
+// instruction (one 16B vector), wider elements four.  The width is a property
+// of the element type, so a single instantiation per type serves both the
+// aligned vector path and the scalar fallback (which is a runtime property of
+// the launch).
+template <typename T>
+inline constexpr int input_vec_width_v = (sizeof(T) == 2) ? 8 : 4;
 
 // Per-device launch geometry, queried once via cudaDeviceGetAttribute and
 // cached: cudaGetDeviceProperties costs ~1ms per call on the target GPU and
@@ -1036,47 +1044,30 @@ struct ReduceOp {
                 }
                 unit += step;
             }
-        } else {
+        } else if (can_vec) {
+            // Vector units with a ragged final chunk (num_inputs not
+            // divisible by InputVecSize): bound the main loop by the
+            // full-unit count so no vec load can overrun the row; the
+            // checked tail below consumes the remainder. The host only
+            // enables vectorization when the fastest row is contiguous, so
+            // unit*InputVecSize is the exact element base of each unit.
             int64_t unit = start;
-            if constexpr (InputVecSize == 1) {
-                // Scalar main loop: the while condition bounds every unit of
-                // the group (unit + (ValuesPerThread-1)*step < end), so
-                // per-element guards would be redundant — and measurably
-                // double the runtime on small chunks by blocking load
-                // hoisting.
-                while (unit + static_cast<int64_t>(ValuesPerThread - 1) * step < end) {
+            const int64_t full_units =
+                (config.num_inputs - config.input_head) / InputVecSize;
+            while (unit + static_cast<int64_t>(ValuesPerThread - 1) * step < full_units) {
+                #pragma unroll
+                for (int i = 0; i < ValuesPerThread; ++i) {
+                    const int64_t logical_base =
+                        config.input_head +
+                        (unit + static_cast<int64_t>(i) * step) * InputVecSize;
+                    const Vec loaded = *reinterpret_cast<const Vec*>(
+                        row + config.template input_offset_nt<NRED>(logical_base));
                     #pragma unroll
-                    for (int i = 0; i < ValuesPerThread; ++i) {
-                        const int64_t logical = unit + static_cast<int64_t>(i) * step;
-                        values[i] = ops.reduce(values[i], row[config.template input_offset_nt<NRED>(logical)], logical);
+                    for (int j = 0; j < InputVecSize; ++j) {
+                        values[i] = ops.reduce(values[i], loaded.val[j], logical_base + j);
                     }
-                    unit += step * ValuesPerThread;
                 }
-            } else {
-                // Vector units with a ragged final chunk (num_inputs not
-                // divisible by InputVecSize): bound the main loop by the
-                // full-unit count so no vec load can overrun the row; the
-                // checked tail below consumes the remainder. For
-                // InputVecSize > 1 the host only enables vectorization when
-                // the fastest row is contiguous, so unit*InputVecSize is the
-                // exact element base of each unit.
-                const int64_t full_units =
-                    (config.num_inputs - config.input_head) / InputVecSize;
-                while (unit + static_cast<int64_t>(ValuesPerThread - 1) * step < full_units) {
-                    #pragma unroll
-                    for (int i = 0; i < ValuesPerThread; ++i) {
-                        const int64_t logical_base =
-                            config.input_head +
-                            (unit + static_cast<int64_t>(i) * step) * InputVecSize;
-                        const Vec loaded = *reinterpret_cast<const Vec*>(
-                            row + config.template input_offset_nt<NRED>(logical_base));
-                        #pragma unroll
-                        for (int j = 0; j < InputVecSize; ++j) {
-                            values[i] = ops.reduce(values[i], loaded.val[j], logical_base + j);
-                        }
-                    }
-                    unit += step * ValuesPerThread;
-                }
+                unit += step * ValuesPerThread;
             }
             while (unit < end) {
                 values[0] = reduce_unit<NRED>(
@@ -1085,6 +1076,31 @@ struct ReduceOp {
                 // Threads stride by step_input; a plain ++unit makes every lane
                 // walk into its neighbours' units (each element counted
                 // (num_inputs - lane) times -> triangular sums).
+                unit += step;
+            }
+        } else {
+            // Scalar path, selected at run time when the config declined
+            // vectorization (unaligned row start, holes between chunks, or a
+            // short row).  Keeping it in the same kernel as the vector path
+            // avoids a second instantiation whose only difference is the
+            // load width.  The while condition bounds every unit of the group
+            // (unit + (ValuesPerThread-1)*step < end), so per-element guards
+            // would be redundant — and measurably double the runtime on small
+            // chunks by blocking load hoisting.
+            int64_t unit = start;
+            while (unit + static_cast<int64_t>(ValuesPerThread - 1) * step < end) {
+                #pragma unroll
+                for (int i = 0; i < ValuesPerThread; ++i) {
+                    const int64_t logical = unit + static_cast<int64_t>(i) * step;
+                    values[i] = ops.reduce(values[i], row[config.template input_offset_nt<NRED>(logical)], logical);
+                }
+                unit += step * ValuesPerThread;
+            }
+            while (unit < end) {
+                // Units here are single elements: the config reports the
+                // scalar width, so no vector group applies.
+                values[0] = ops.reduce(
+                    values[0], row[config.template input_offset_nt<NRED>(unit)], unit);
                 unit += step;
             }
         }
@@ -1425,20 +1441,11 @@ inline void launch_reduce(
                 static_cast<OutputT*>(iter.data_ptr(0));
             AccT* sub_acc = acc_buf == nullptr ? nullptr : acc_buf + output_offset;
             SecondOutputT* sub_output2 = output2 == nullptr ? nullptr : output2 + output_offset;
-            // A split can shrink the reduced extent below the vectorization
-            // floor, so re-derive the vector width for this sub-iterator
-            // instead of assuming the parent's.
-            const auto sub_config = make_reduce_config<InputT, AccT, OutputT>(sub_iter);
-            if (sub_config.input_vec_size == 8) {
-                launch_reduce<InputT, AccT, OutputT, Ops, ValuesPerThread, 8, SecondOutputT>(
-                    sub_iter, ops, identity, sub_output2, sub_acc, sub_base);
-            } else if (sub_config.input_vec_size == 4) {
-                launch_reduce<InputT, AccT, OutputT, Ops, ValuesPerThread, 4, SecondOutputT>(
-                    sub_iter, ops, identity, sub_output2, sub_acc, sub_base);
-            } else {
-                launch_reduce<InputT, AccT, OutputT, Ops, ValuesPerThread, 1, SecondOutputT>(
-                    sub_iter, ops, identity, sub_output2, sub_acc, sub_base);
-            }
+            // The load width is fixed by the element type; a sub-iterator
+            // whose rows cannot vectorize takes the kernel's runtime scalar
+            // path, so one instantiation covers both.
+            launch_reduce<InputT, AccT, OutputT, Ops, ValuesPerThread, InputVecSize, SecondOutputT>(
+                sub_iter, ops, identity, sub_output2, sub_acc, sub_base);
         }
         return;
     }
@@ -1520,15 +1527,14 @@ inline void launch_reduce(
         reduction.tag = tag_counter.fetch_add(1, std::memory_order_relaxed);
     }
 
-    if constexpr (InputVecSize == 1) {
-        if (config.output_vec_size == 4) {
-            reduce_output_kernel<4><<<grid, block, shared_bytes, stream>>>(reduction);
-        } else if (config.output_vec_size == 2) {
-            reduce_output_kernel<2><<<grid, block, shared_bytes, stream>>>(reduction);
-        } else {
-            reduce_kernel<InputT, AccT, OutputT, Ops, ValuesPerThread, InputVecSize, SecondOutputT>
-                <<<grid, block, shared_bytes, stream>>>(reduction);
-        }
+    // Output-side vectorization groups adjacent outputs in one thread.  It
+    // applies when the reduction runs along a non-fastest dimension, which is
+    // also when the config keeps the input width scalar; the kernel body for
+    // the grouped form does not depend on the compile-time input width.
+    if (config.output_vec_size == 4) {
+        reduce_output_kernel<4><<<grid, block, shared_bytes, stream>>>(reduction);
+    } else if (config.output_vec_size == 2) {
+        reduce_output_kernel<2><<<grid, block, shared_bytes, stream>>>(reduction);
     } else {
         reduce_kernel<InputT, AccT, OutputT, Ops, ValuesPerThread, InputVecSize, SecondOutputT>
             <<<grid, block, shared_bytes, stream>>>(reduction);
