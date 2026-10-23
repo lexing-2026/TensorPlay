@@ -682,7 +682,6 @@ buffer_wide_unary_op:
   - NAME: buffer_trunc_wide
     OPERATOR: X
 mm:
-  parameter_names_with_default_values: {}
   generate_variant_forall:
     FORMAT:
     - VALUE: rgba32f
@@ -692,7 +691,11 @@ mm:
   shader_variants:
   - NAME: mm
 addmm:
-  parameter_names_with_default_values: {}
+  parameter_names_with_default_values:
+    # Output entries one thread owns along each axis.  The wide build answers a
+    # 64x64 block of the product and is dispatched only for an answer large
+    # enough to keep the device busy at that block size.
+    THREAD_TILE: 4
   generate_variant_forall:
     FORMAT:
     - VALUE: rgba32f
@@ -701,6 +704,8 @@ addmm:
       SUFFIX: _f16
   shader_variants:
   - NAME: addmm
+  - NAME: addmm_wide
+    THREAD_TILE: 8
 gemv_combine:
   parameter_names_with_default_values: {}
   generate_variant_forall:

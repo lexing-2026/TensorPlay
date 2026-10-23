@@ -432,6 +432,19 @@ constexpr int64_t kGemvSplitMax = 64;
 constexpr int64_t kGemvMinReduction = 512;
 constexpr int64_t kGemvThreadBudget = 8192;
 
+/*
+ * Output entries one thread owns along each axis in the staged product.  A
+ * thread's block decides how many words it reads from shared memory, how many
+ * operand texels the workgroup stages and how much of the answer a tile
+ * barrier covers, all per unit of arithmetic.  The wider block halves the
+ * shared-memory traffic per product, but it spreads the answer over a quarter
+ * as many workgroups, so it only pays off once the answer is large enough for
+ * those workgroups to still fill the device.
+ */
+constexpr int64_t kTileNarrow = 4;
+constexpr int64_t kTileWide = 8;
+constexpr int64_t kWideTileMinEntries = 1LL << 20;
+
 Tensor gemv_decode(
     const api::vTensor& v_lhs,
     const api::vTensor& v_rhs,
@@ -1380,6 +1393,20 @@ Tensor product_dispatch(
   const float alpha_f = alpha.to<float>();
   const float beta_f = beta.to<float>();
 
+  // One invocation owns a tile x tile block of the answer, and the workgroup
+  // of 8x8 invocations therefore covers 8*tile of each axis.  Only the product
+  // that folds an addend takes the wide tile, and only once the answer holds
+  // enough entries for the wider block to still spread itself over the
+  // device: measured against the 4x4 tile in both element types it answers
+  // products of a million entries or more 1.1x-1.8x faster, while smaller
+  // answers, which end up with too few workgroups to fill the machine, cost
+  // up to 1.8x more.  The product with nothing to fold in never benefited.
+  const bool wide_tile = bias.has_value() && M * N >= kWideTileMinEntries;
+  const int64_t tile = wide_tile ? kTileWide : kTileNarrow;
+  const char* const kernel =
+      bias.has_value() ? (wide_tile ? "addmm_wide" : "addmm") : "mm";
+  const auto tile_u32 = api::utils::safe_downcast_to_u32(tile);
+
   if (bias.has_value()) {
     TP_CHECK(
         bias->device().is_vulkan(),
@@ -1407,15 +1434,15 @@ Tensor product_dispatch(
     api::UniformParamsBuffer params(context, block);
     api::PipelineBarrier pipeline_barrier{};
 
-    // Each invocation produces a 4x4 output tile.
+    // Each invocation produces a tile of the answer.
     const api::utils::uvec3 global_size{
-        api::utils::div_up(api::utils::safe_downcast_to_u32(N), 4u),
-        api::utils::div_up(api::utils::safe_downcast_to_u32(M), 4u),
+        api::utils::div_up(api::utils::safe_downcast_to_u32(N), tile_u32),
+        api::utils::div_up(api::utils::safe_downcast_to_u32(M), tile_u32),
         1u,
     };
 
     context->submit_compute_job(
-        kernel_for("addmm", dtype),
+        kernel_for(kernel, dtype),
         pipeline_barrier,
         global_size,
         {8u, 8u, 1u},
@@ -1441,13 +1468,13 @@ Tensor product_dispatch(
     api::PipelineBarrier pipeline_barrier{};
 
     const api::utils::uvec3 global_size{
-        api::utils::div_up(api::utils::safe_downcast_to_u32(N), 4u),
-        api::utils::div_up(api::utils::safe_downcast_to_u32(M), 4u),
+        api::utils::div_up(api::utils::safe_downcast_to_u32(N), tile_u32),
+        api::utils::div_up(api::utils::safe_downcast_to_u32(M), tile_u32),
         1u,
     };
 
     context->submit_compute_job(
-        kernel_for("mm", dtype),
+        kernel_for(kernel, dtype),
         pipeline_barrier,
         global_size,
         {8u, 8u, 1u},

@@ -5,8 +5,21 @@
 // clang-format on
 
 // A named constant (instead of a literal) lets the SPIR-V compiler fully
-// unroll every loop below.
-#define FOUR 4
+// unroll every loop below.  TT is the number of output entries a thread owns
+// along each axis: a workgroup of 8x8 threads covers 8*TT of each output axis,
+// and the reduction tile is sized so that both staged operands stay inside the
+// shared memory a baseline device has to offer.
+#define TT ${THREAD_TILE}
+#if TT > 4
+#define TILE_K 16
+#else
+#define TILE_K 32
+#endif
+
+#define BLOCK (8 * TT)
+#define K_TEXELS (TILE_K / 4)
+#define TILE_PAD 1
+#define THREADS 64
 
 layout(std430) buffer;
 
@@ -29,15 +42,14 @@ layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
  * Tiled matrix product with a fused affine epilogue:
  *   out = beta * bias + alpha * (M1 x M2)
  *
- * A workgroup of 8x8 threads, each producing a 4x4 output tile, covers a 32x32
- * output block.  Per K tile of 32 elements it cooperatively stages the 32x32
- * A and B sub-blocks into shared memory, one fetch per texel reused by every
- * thread of the workgroup, and then accumulates from shared memory.  Walking
- * the operands from their images at every K step instead costs the workgroup
- * eight texel fetches per four lanes of the reduction, so an operand element
- * is read once per output row that needs it rather than once per tile, and the
- * reduction stalls on each of those fetches.  The K tile stride is 33 floats
- * to avoid shared-memory bank conflicts.
+ * The product is staged exactly as the product with no addend stages it: one
+ * workgroup of 8x8 threads covers a BLOCK x BLOCK output block, loads the two
+ * BLOCK x TILE_K sub-blocks of the operands into shared memory per tile of
+ * TILE_K reduction elements, and accumulates from there, so an operand texel
+ * is read once per workgroup rather than once per tile.  The K tile stride is
+ * one word longer than the tile to rotate rows across the shared memory banks,
+ * and a thread's own rows and columns sit 8 elements apart so that the lanes of
+ * a warp read distinct banks.
  *
  * Operand layout (produced by the packing pass in the op):
  *  - uMat1 (M x K) is width-packed: texel (j, m) carries M1[m][4j .. 4j + 3]
@@ -54,14 +66,8 @@ layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
  * after the reduction rather than inside it, is broadcast over singleton
  * width/height dimensions, and is folded out entirely when beta is zero.
  */
-#define TILE_M 32
-#define TILE_N 32
-#define TILE_K 32
-#define K_TEXELS (TILE_K / 4)
-#define TILE_PAD 1
-
-shared float sA[TILE_M][TILE_K + TILE_PAD];
-shared float sB[TILE_N][TILE_K + TILE_PAD];
+shared float sA[BLOCK][TILE_K + TILE_PAD];
+shared float sB[BLOCK][TILE_K + TILE_PAD];
 
 void main() {
   const ivec3 pos = ivec3(gl_GlobalInvocationID);
@@ -73,19 +79,21 @@ void main() {
 
   // This shader is dispatched with an 8x8 workgroup.
   const int tid = int(gl_LocalInvocationIndex);
-  const int wg_base_m = (pos.y / 8) * 8 * FOUR;
-  const int wg_base_n = (pos.x / 8) * 8 * FOUR;
+  const int wg_base_m = (pos.y / 8) * BLOCK;
+  const int wg_base_n = (pos.x / 8) * BLOCK;
+  const int lane_m = pos.y % 8;
+  const int lane_n = pos.x % 8;
 
-  float results[FOUR][FOUR];
-  for (int i = 0; i < FOUR; ++i) {
-    for (int j = 0; j < FOUR; ++j) {
+  float results[TT][TT];
+  for (int i = 0; i < TT; ++i) {
+    for (int j = 0; j < TT; ++j) {
       results[i][j] = 0.0f;
     }
   }
 
   for (int k_block = 0; k_block < uBlock.step_size; k_block += K_TEXELS) {
-    // Stage the A sub-block (TILE_M rows x TILE_K cols) into shared memory.
-    for (int i = tid; i < TILE_M * K_TEXELS; i += 64) {
+    // Stage the A sub-block (BLOCK rows x TILE_K cols) into shared memory.
+    for (int i = tid; i < BLOCK * K_TEXELS; i += THREADS) {
       const int row = i / K_TEXELS;
       const int jtex = k_block + (i % K_TEXELS);
       const vec4 v = texelFetch(uMat1, ivec3(jtex, wg_base_m + row, pos.z), 0);
@@ -96,8 +104,8 @@ void main() {
       sA[row][kk + 3] = v.w;
     }
 
-    // Stage the B sub-block (TILE_N rows x TILE_K cols) into shared memory.
-    for (int i = tid; i < TILE_N * K_TEXELS; i += 64) {
+    // Stage the B sub-block (BLOCK rows x TILE_K cols) into shared memory.
+    for (int i = tid; i < BLOCK * K_TEXELS; i += THREADS) {
       const int row = i / K_TEXELS;
       const int jtex = k_block + (i % K_TEXELS);
       const vec4 v = texelFetch(uMat2, ivec3(wg_base_n + row, jtex, pos.z), 0);
@@ -110,13 +118,18 @@ void main() {
 
     barrier();
 
-    const int local_m = (pos.y % 8) * 4;
-    const int local_n = (pos.x % 8) * 4;
     for (int k = 0; k < TILE_K; ++k) {
-      for (int r = 0; r < FOUR; ++r) {
-        const float arow = sA[local_m + r][k];
-        for (int c = 0; c < FOUR; ++c) {
-          results[r][c] += arow * sB[local_n + c][k];
+      float arow[TT];
+      float bcol[TT];
+      for (int r = 0; r < TT; ++r) {
+        arow[r] = sA[lane_m + 8 * r][k];
+      }
+      for (int c = 0; c < TT; ++c) {
+        bcol[c] = sB[lane_n + 8 * c][k];
+      }
+      for (int r = 0; r < TT; ++r) {
+        for (int c = 0; c < TT; ++c) {
+          results[r][c] += arow[r] * bcol[c];
         }
       }
     }
@@ -124,22 +137,21 @@ void main() {
     barrier();
   }
 
-  // Store the 4x4 output tile; out-of-range stores are discarded.
-  const int out_m = (pos.y % 8) * 4;
-  const int out_n = (pos.x % 8) * 4;
-  for (int r = 0; r < FOUR; ++r) {
-    const int m = wg_base_m + out_m + r;
+  // Store this thread's block; out-of-range stores are discarded.
+  const bool fold_addend = uBlock.beta != 0.0f;
+  for (int r = 0; r < TT; ++r) {
+    const int m = wg_base_m + lane_m + 8 * r;
     if (m >= uBlock.out_sizes.y) {
       continue;
     }
     const int row_eff = (uBlock.bias_sizes.y == 1) ? 0 : m;
-    for (int c = 0; c < FOUR; ++c) {
-      const int n = wg_base_n + out_n + c;
+    for (int c = 0; c < TT; ++c) {
+      const int n = wg_base_n + lane_n + 8 * c;
       if (n >= uBlock.out_sizes.x) {
         continue;
       }
       float addend = 0.0f;
-      if (uBlock.beta != 0.0f) {
+      if (fold_addend) {
         const int col_eff = (uBlock.bias_sizes.x == 1) ? 0 : n;
         addend = texelFetch(uBias, ivec3(col_eff, row_eff, 0), 0).x;
       }
