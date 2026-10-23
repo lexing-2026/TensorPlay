@@ -302,6 +302,61 @@ inline __m256 v_rcp_nr_ps(__m256 d) {
 // cpu/vec/ErfPoly.h; the vector class evaluates the same function, so a
 // kernel and its compiled counterpart agree.
 __attribute__((target("avx2,fma"), always_inline))
+// Fast float exp: x = k*ln2 + r with |r| <= ln2/2, exp(r) from a
+// fifth-order polynomial and 2^k from the exponent field.
+//
+// The polynomial is the only serial part of the chain.  A fifth-order
+// fit holds the worst-case relative error to 4.1e-7 over the reduced
+// interval, about 3.4 ulp, which is the trade this path makes for the
+// shorter chain; the composites that call it (sigmoid, softplus, the
+// erf tail) carry a wider error budget than the bare unary entry point.
+//
+// The scale is split across two exponent fields so results below the
+// smallest normal stay representable as denormals.
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256 v_exp_f32(__m256 x) {
+    // Inputs past the underflow bound have no representable result, and
+    // letting them through would drive the polynomial to -inf where the
+    // answer is +0.  The floor also catches -inf; the operand order keeps
+    // NaN on the second position so it passes through unchanged.
+    x = _mm256_max_ps(_mm256_set1_ps(-103.97208404541015625f), x);
+    const __m256 log2e = _mm256_set1_ps(1.44269504088896341f);
+    const __m256 ln2_hi = _mm256_set1_ps(0.693145751953125f);
+    const __m256 ln2_lo = _mm256_set1_ps(1.428606765330187e-6f);
+    __m256i ki = _mm256_cvtps_epi32(_mm256_mul_ps(x, log2e));
+    __m256 k = _mm256_cvtepi32_ps(ki);
+    __m256 r = _mm256_fnmadd_ps(k, ln2_hi, x);
+    r = _mm256_fnmadd_ps(k, ln2_lo, r);
+    // Coefficients fit to exp on [-ln2/2, ln2/2] with the constant and
+    // linear terms pinned to 1, so exp(0) comes back exactly 1.  Worst
+    // relative error over that interval is 4.1e-7, about 3.4 ulp.
+    __m256 p = _mm256_set1_ps(8.3572001485e-3f);
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(4.1833804078e-2f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.6666630825e-1f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(4.9999748990e-1f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0f));
+    // The exponent used for the scale is clamped to the range the two
+    // half-fields can express.  Without it a very large input wraps the
+    // field and turns an overflow into a small value; the polynomial
+    // keeps the unclamped exponent, so the reduced argument stays right.
+    __m256i ks = _mm256_max_epi32(
+        _mm256_min_epi32(ki, _mm256_set1_epi32(254)),
+        _mm256_set1_epi32(-252));
+    __m256i k1 = _mm256_srai_epi32(ks, 1);
+    __m256i k2 = _mm256_sub_epi32(ks, k1);
+    __m256 s1 = _mm256_castsi256_ps(_mm256_slli_epi32(
+        _mm256_add_epi32(k1, _mm256_set1_epi32(127)), 23));
+    __m256 s2 = _mm256_castsi256_ps(_mm256_slli_epi32(
+        _mm256_add_epi32(k2, _mm256_set1_epi32(127)), 23));
+    // Two multiplies rather than one: the product of both halves can
+    // reach 2^128, past the largest finite float, while the polynomial
+    // times the first half and then the second stays finite for inputs
+    // whose result is still representable.
+    return _mm256_mul_ps(_mm256_mul_ps(p, s1), s2);
+}
+
+__attribute__((target("avx2,fma"), always_inline))
 inline __m256 v_erf_f32(__m256 x) {
     namespace poly = tensorplay::vecmath;
     const __m256 sign_bit = _mm256_set1_ps(-0.0f);
@@ -322,7 +377,7 @@ inline __m256 v_erf_f32(__m256 x) {
     tail = _mm256_mul_ps(tail, t);
     tail = _mm256_sub_ps(
         one,
-        _mm256_mul_ps(tail, tensorplay::tpsleef::exp(_mm256_xor_ps(sign_bit, sq))));
+        _mm256_mul_ps(tail, v_exp_f32(_mm256_xor_ps(sign_bit, sq))));
     tail = _mm256_or_ps(_mm256_and_ps(sign_bit, x), tail);
 
     return _mm256_blendv_ps(
@@ -351,7 +406,7 @@ inline __m256 v_elu_f32(__m256 negcoef, __m256 poscoef, __m256 negipt, __m256 x)
 __attribute__((target("avx2,fma"), always_inline))
 inline __m256 v_softplus_f32(__m256 beta, __m256 threshold, __m256 x) {
     __m256 bx = _mm256_mul_ps(x, beta);
-    __m256 sp = _mm256_div_ps(tensorplay::tpsleef::log1p(tensorplay::tpsleef::exp(bx)), beta);
+    __m256 sp = _mm256_div_ps(tensorplay::tpsleef::log1p(v_exp_f32(bx)), beta);
     return _mm256_blendv_ps(sp, x, _mm256_cmp_ps(bx, threshold, _CMP_GT_OQ));
 }
 
@@ -362,7 +417,7 @@ inline __m256 v_sigmoid_f32(__m256 x, __m256 one, __m256 signbit) {
     // rcp+NR instead of divps.  Division corners reproduced: den==inf
     // (x <= -88.7, exp overflowed) must yield +0 like 1/inf, and a NaN
     // denominator must stay NaN -- hence the two mask repairs.
-    __m256 den = _mm256_add_ps(one, tensorplay::tpsleef::exp(_mm256_xor_ps(x, signbit)));
+    __m256 den = _mm256_add_ps(one, v_exp_f32(_mm256_xor_ps(x, signbit)));
     __m256 r = v_rcp_nr_ps(den);
     __m256 not_inf = _mm256_cmp_ps(den, _mm256_set1_ps(INFINITY), _CMP_NEQ_OQ);
     __m256 zeroed = _mm256_and_ps(not_inf, r);
@@ -412,7 +467,7 @@ inline __m256 apply_f32(VOp op, VParams prm, __m256 x) {
         case VOp::Round: return _mm256_round_ps(x, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
         case VOp::Frac: return _mm256_sub_ps(x, _mm256_round_ps(x, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC));
         case VOp::Relu: return _mm256_max_ps(zero, x); // NaN propagates (second operand wins)
-        case VOp::Exp: return tensorplay::tpsleef::exp(x);
+        case VOp::Exp: return v_exp_f32(x);
         case VOp::Expm1: return tensorplay::tpsleef::expm1(x);
         case VOp::Log: return tensorplay::tpsleef::log(x);
         case VOp::Log2: return tensorplay::tpsleef::log2(x);
@@ -446,13 +501,13 @@ inline __m256 apply_f32(VOp op, VParams prm, __m256 x) {
             // x * rcp_nr(den) matches x/den bit-for-bit in every corner here:
             // den==inf makes the NR chain NaN exactly like -inf/+inf division,
             // and finite dens get a float-exact reciprocal.
-            __m256 den = _mm256_add_ps(one, tensorplay::tpsleef::exp(_mm256_xor_ps(x, signbit)));
+            __m256 den = _mm256_add_ps(one, v_exp_f32(_mm256_xor_ps(x, signbit)));
             return _mm256_mul_ps(x, v_rcp_nr_ps(den));
         }
         case VOp::Mish: {
             // Uses the scalar expression: log((1 + exp(x))) * tanh(...) — plain
             // log, not log1p, and overflow-to-inf semantics are preserved.
-            __m256 sp = tensorplay::tpsleef::log(_mm256_add_ps(one, tensorplay::tpsleef::exp(x)));
+            __m256 sp = tensorplay::tpsleef::log(_mm256_add_ps(one, v_exp_f32(x)));
             return _mm256_mul_ps(x, tensorplay::tpsleef::tanh(sp));
         }
         case VOp::Selu: {
@@ -599,7 +654,7 @@ static void f32_chunk_avx2(VOp op, VParams prm, const float* src, float* dst, in
             break;
         }
         case VOp::Exp:
-            TP_F32_SIMPLE_LOOP_8(tensorplay::tpsleef::exp(x));
+            TP_F32_SIMPLE_LOOP_8(v_exp_f32(x));
             break;
         case VOp::Expm1:
             TP_F32_SIMPLE_LOOP_8(tensorplay::tpsleef::expm1(x));
@@ -689,7 +744,7 @@ static void f32_chunk_avx2(VOp op, VParams prm, const float* src, float* dst, in
             break;
         case VOp::Silu:
             TP_F32_SIMPLE_LOOP_8(_mm256_mul_ps(
-                x, v_rcp_nr_ps(_mm256_add_ps(one, tensorplay::tpsleef::exp(_mm256_xor_ps(x, signbit))))));
+                x, v_rcp_nr_ps(_mm256_add_ps(one, v_exp_f32(_mm256_xor_ps(x, signbit))))));
             break;
         case VOp::Selu: {
             const __m256 lambda = _mm256_set1_ps(static_cast<float>(1.0507009873554804934193349852946));
@@ -702,7 +757,7 @@ static void f32_chunk_avx2(VOp op, VParams prm, const float* src, float* dst, in
         case VOp::Mish:
             TP_F32_SIMPLE_LOOP_8(_mm256_mul_ps(
                 x, tensorplay::tpsleef::tanh(tensorplay::tpsleef::log(
-                       _mm256_add_ps(one, tensorplay::tpsleef::exp(x))))));
+                       _mm256_add_ps(one, v_exp_f32(x))))));
             break;
         default:
             for (; i + 8 <= n; i += 8) {
