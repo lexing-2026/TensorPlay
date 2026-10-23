@@ -3798,54 +3798,11 @@ void lerp_tensor_f32_avx2(const float* self, const float* end,
     const __m256 one = _mm256_set1_ps(1.0f);
     const __m256 abs_mask = _mm256_set1_ps(-0.0f);
     int64_t i = 0;
-    // Four answers are selected and interpolated per step: the three loads
-    // and the blend of one answer do not wait on the next, so a wider step
-    // keeps more of the walk in flight.
-    for (; i + 32 <= n; i += 32) {
-        const __m256 s0 = _mm256_loadu_ps(self + i);
-        const __m256 e0 = _mm256_loadu_ps(end + i);
-        const __m256 w0 = _mm256_loadu_ps(weight + i);
-        const __m256 s1 = _mm256_loadu_ps(self + i + 8);
-        const __m256 e1 = _mm256_loadu_ps(end + i + 8);
-        const __m256 w1 = _mm256_loadu_ps(weight + i + 8);
-        const __m256 s2 = _mm256_loadu_ps(self + i + 16);
-        const __m256 e2 = _mm256_loadu_ps(end + i + 16);
-        const __m256 w2 = _mm256_loadu_ps(weight + i + 16);
-        const __m256 s3 = _mm256_loadu_ps(self + i + 24);
-        const __m256 e3 = _mm256_loadu_ps(end + i + 24);
-        const __m256 w3 = _mm256_loadu_ps(weight + i + 24);
-        const __m256 small0 = _mm256_cmp_ps(
-            _mm256_andnot_ps(abs_mask, w0), half, _CMP_LT_OQ);
-        const __m256 small1 = _mm256_cmp_ps(
-            _mm256_andnot_ps(abs_mask, w1), half, _CMP_LT_OQ);
-        const __m256 small2 = _mm256_cmp_ps(
-            _mm256_andnot_ps(abs_mask, w2), half, _CMP_LT_OQ);
-        const __m256 small3 = _mm256_cmp_ps(
-            _mm256_andnot_ps(abs_mask, w3), half, _CMP_LT_OQ);
-        const __m256 coeff0 = _mm256_blendv_ps(_mm256_sub_ps(w0, one), w0, small0);
-        const __m256 coeff1 = _mm256_blendv_ps(_mm256_sub_ps(w1, one), w1, small1);
-        const __m256 coeff2 = _mm256_blendv_ps(_mm256_sub_ps(w2, one), w2, small2);
-        const __m256 coeff3 = _mm256_blendv_ps(_mm256_sub_ps(w3, one), w3, small3);
-        const __m256 base0 = _mm256_blendv_ps(e0, s0, small0);
-        const __m256 base1 = _mm256_blendv_ps(e1, s1, small1);
-        const __m256 base2 = _mm256_blendv_ps(e2, s2, small2);
-        const __m256 base3 = _mm256_blendv_ps(e3, s3, small3);
-        _mm256_storeu_ps(
-            result + i,
-            _mm256_fmadd_ps(coeff0, _mm256_sub_ps(e0, s0), base0));
-        _mm256_storeu_ps(
-            result + i + 8,
-            _mm256_fmadd_ps(coeff1, _mm256_sub_ps(e1, s1), base1));
-        _mm256_storeu_ps(
-            result + i + 16,
-            _mm256_fmadd_ps(coeff2, _mm256_sub_ps(e2, s2), base2));
-        _mm256_storeu_ps(
-            result + i + 24,
-            _mm256_fmadd_ps(coeff3, _mm256_sub_ps(e3, s3), base3));
-    }
-    // Two vectors are answered per step: the two answers do not depend on
-    // each other, so the machine overlaps them instead of waiting for one
-    // to finish before it starts the next.
+    // Two vectors are answered per step, and no wider: the three loads, the
+    // two selects and the interpolation of four answers ask for more vectors
+    // than the walk has, so a step of thirty-two begins storing its own
+    // working set on the stack.  Of two answers the second does not wait on
+    // the first, so the machine overlaps them.
     for (; i + 16 <= n; i += 16) {
         const __m256 s0 = _mm256_loadu_ps(self + i);
         const __m256 e0 = _mm256_loadu_ps(end + i);
