@@ -104,6 +104,19 @@ def time_call(fn, iters: int, warmup: int, rounds: int = 3):
     return statistics.median(averages), last
 
 
+def timed_round(fn, iters: int) -> float:
+    """Seconds per call over one round of back-to-back calls."""
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        fn()
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end) * 1e-3 / iters
+
+
 def first_call(fn) -> tuple[float, object]:
     """Seconds the first call takes, along with whatever it returned."""
 
@@ -134,36 +147,67 @@ def brief(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}".splitlines()[0][:180]
 
 
-def measure_pair(case_id, records, library, fwd, check_fwd, backward, check_bwd,
-                 gb, gb_bwd, args):
-    """Time both directions of one library on one case.
+def measure_pair(case_id, records, entries, gb, gb_bwd, args):
+    """Time both directions of every library on one case, round by round.
 
-    A callable returns the tensors it produced and nothing else, so the timing
-    sees the operation rather than a full-tensor comparison; the answers are
-    checked once, on the last call, outside the timed region.  ``backward``
+    The libraries take turns inside each round and swap places between rounds,
+    so a drift in the card's clock across the run cannot favour whichever one
+    was measured first.  A callable returns the tensors it produced and nothing
+    else, so the timing sees the operation rather than a full-tensor comparison;
+    the answers are checked once, outside the timed region.  ``backward``
     builds the backward callable; whatever setup it needs (such as a forward
     pass to record a graph) is not timed either, so the two directions stay
     comparable.  A direction the library refuses leaves the other in the table.
     """
 
     fields: dict = {}
-    try:
-        first, _ = first_call(fwd)
-        steady, out = time_call(fwd, args.iters, args.warmup)
-        fields.update(first_fwd=first, fwd_s=steady, fwd_gbs=gb / steady,
-                      fwd_err=list(check_fwd(out)))
-    except Exception as exc:
-        fields["fwd_error"] = brief(exc)
-    try:
-        bwd = backward()
-        first, _ = first_call(bwd)
-        steady, out = time_call(bwd, args.iters, args.warmup)
-        fields.update(first_bwd=first, bwd_s=steady, bwd_gbs=gb_bwd / steady,
-                      bwd_err=list(check_bwd(out)))
-    except Exception as exc:
-        fields["bwd_error"] = brief(exc)
-    ok = "fwd_s" in fields or "bwd_s" in fields
-    records.append(dict(case_id, library=library, ok=ok, **fields))
+    fwd_fns: dict = {}
+    bwd_fns: dict = {}
+    for name, fwd, check_fwd, backward, check_bwd in entries:
+        try:
+            first, out = first_call(fwd)
+            fields[name] = dict(first_fwd=first, fwd_err=list(check_fwd(out)))
+            fwd_fns[name] = fwd
+        except Exception as exc:
+            fields[name] = dict(fwd_error=brief(exc))
+    for name, fwd, check_fwd, backward, check_bwd in entries:
+        if name not in fwd_fns:
+            continue
+        try:
+            bwd = backward()
+            first, out = first_call(bwd)
+            fields[name].update(first_bwd=first, bwd_err=list(check_bwd(out)))
+            bwd_fns[name] = bwd
+        except Exception as exc:
+            fields[name]["bwd_error"] = brief(exc)
+
+    for fn in fwd_fns.values():
+        for _ in range(args.warmup):
+            fn()
+    for fn in bwd_fns.values():
+        for _ in range(args.warmup):
+            fn()
+    torch.cuda.synchronize()
+
+    fwd_samples = {name: [] for name in fwd_fns}
+    bwd_samples = {name: [] for name in bwd_fns}
+    for round_index in range(args.rounds):
+        for fns, samples in ((fwd_fns, fwd_samples), (bwd_fns, bwd_samples)):
+            names = list(fns)
+            if round_index % 2:
+                names.reverse()
+            for name in names:
+                samples[name].append(timed_round(fns[name], args.iters))
+
+    for name, entry in fields.items():
+        if name in fwd_samples:
+            steady = statistics.median(fwd_samples[name])
+            entry.update(fwd_s=steady, fwd_gbs=gb / steady)
+        if name in bwd_samples:
+            steady = statistics.median(bwd_samples[name])
+            entry.update(bwd_s=steady, bwd_gbs=gb_bwd / steady)
+        records.append(dict(case_id, library=name,
+                            ok="fwd_s" in entry or "bwd_s" in entry, **entry))
 
 
 def run_rms(case, records, args):
@@ -185,6 +229,7 @@ def run_rms(case, records, args):
     gb = TRAFFIC["fwd"] * m * n * xt.element_size() / 1e9
     gb_bwd = TRAFFIC["bwd"] * m * n * xt.element_size() / 1e9
 
+    entries = []
     if not args.no_quack:
         import quack
 
@@ -208,8 +253,7 @@ def run_rms(case, records, args):
             dx, dw = grads
             return [max_error(dx, ref_dx), max_error(dw, ref_dw)]
 
-        measure_pair(case_id, records, "quack", q_fwd, q_check, q_backward,
-                     q_check_bwd, gb, gb_bwd, args)
+        entries.append(("quack", q_fwd, q_check, q_backward, q_check_bwd))
 
     x, w, dy = from_torch(xt), from_torch(wt), from_torch(dyt)
     held: dict = {}
@@ -236,8 +280,8 @@ def run_rms(case, records, args):
         dx, dw = grads
         return [max_error(to_torch(dx), ref_dx), max_error(to_torch(dw), ref_dw)]
 
-    measure_pair(case_id, records, "stax", s_fwd, s_check, s_backward,
-                 s_check_bwd, gb, gb_bwd, args)
+    entries.append(("stax", s_fwd, s_check, s_backward, s_check_bwd))
+    measure_pair(case_id, records, entries, gb, gb_bwd, args)
     records.append(dict(case_id, library="copy", ok=True,
                         fwd_gbs=wall_gbs(m * n, xt.element_size(), wall)))
     return case_id
@@ -257,6 +301,7 @@ def run_softmax(case, records, args):
     gb = TRAFFIC["fwd"] * m * n * xt.element_size() / 1e9
     gb_bwd = TRAFFIC["bwd"] * m * n * xt.element_size() / 1e9
 
+    entries = []
     if not args.no_quack:
         import quack
 
@@ -279,8 +324,7 @@ def run_softmax(case, records, args):
             (dx,) = grads
             return [max_error(dx, ref_dx)]
 
-        measure_pair(case_id, records, "quack", q_fwd, q_check, q_backward,
-                     q_check_bwd, gb, gb_bwd, args)
+        entries.append(("quack", q_fwd, q_check, q_backward, q_check_bwd))
 
     x, dy = from_torch(xt), from_torch(dyt)
     held: dict = {}
@@ -307,8 +351,8 @@ def run_softmax(case, records, args):
         (dx,) = grads
         return [max_error(to_torch(dx), ref_dx)]
 
-    measure_pair(case_id, records, "stax", s_fwd, s_check, s_backward,
-                 s_check_bwd, gb, gb_bwd, args)
+    entries.append(("stax", s_fwd, s_check, s_backward, s_check_bwd))
+    measure_pair(case_id, records, entries, gb, gb_bwd, args)
     records.append(dict(case_id, library="copy", ok=True,
                         fwd_gbs=wall_gbs(m * n, xt.element_size(), wall)))
     return case_id
@@ -332,6 +376,7 @@ def run_ce(case, records, args):
     gb = CE_TRAFFIC["fwd"] * m * n * xt.element_size() / 1e9
     gb_bwd = CE_TRAFFIC["bwd"] * m * n * xt.element_size() / 1e9
 
+    entries = []
     if not args.no_quack:
         import quack
 
@@ -354,8 +399,7 @@ def run_ce(case, records, args):
             (dx,) = grads
             return [max_error(dx, dx_ref)]
 
-        measure_pair(case_id, records, "quack", q_fwd, q_check, q_backward,
-                     q_check_bwd, gb, gb_bwd, args)
+        entries.append(("quack", q_fwd, q_check, q_backward, q_check_bwd))
 
     x, target, dloss = from_torch(xt), from_torch(tt), from_torch(dl)
     held: dict = {}
@@ -382,8 +426,8 @@ def run_ce(case, records, args):
         (dx,) = grads
         return [max_error(to_torch(dx), dx_ref)]
 
-    measure_pair(case_id, records, "stax", s_fwd, s_check, s_backward,
-                 s_check_bwd, gb, gb_bwd, args)
+    entries.append(("stax", s_fwd, s_check, s_backward, s_check_bwd))
+    measure_pair(case_id, records, entries, gb, gb_bwd, args)
     records.append(dict(case_id, library="copy", ok=True,
                         fwd_gbs=wall_gbs(m * n, xt.element_size(), wall)))
     return case_id
@@ -434,6 +478,7 @@ def main(argv: list[str]) -> int:
                         default="all")
     parser.add_argument("--iters", type=int, default=30)
     parser.add_argument("--warmup", type=int, default=8)
+    parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--no-quack", action="store_true")
     parser.add_argument("--quack-path", type=str, default=None,
                         help="directory holding the reference library, put on the path first")
