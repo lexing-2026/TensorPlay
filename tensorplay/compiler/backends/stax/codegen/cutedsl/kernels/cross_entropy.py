@@ -142,6 +142,18 @@ _fwd_cache: dict = {}
 _bwd_cache: dict = {}
 
 
+def _streaming_threads(n: int, element_bits: int, vec: int) -> int:
+    """A block width leaving about eight vector loads per thread in flight.
+
+    The row is walked a chunk at a time rather than held, so a narrower block
+    with a longer per-thread stream keeps more requests outstanding than a
+    wide one with a chunk or two each; blocks of a thousand threads measure
+    slower on every shape tried.
+    """
+
+    return threads_for_row(n, element_bits, budget=8 * vec, cap=512, floor=128)
+
+
 def ce_fwd(x: tp.Tensor, target: tp.Tensor, threads: int | None = None):
     """Per-row cross entropy of ``x`` against ``target``, with log-sum-exp."""
 
@@ -150,7 +162,7 @@ def ce_fwd(x: tp.Tensor, target: tp.Tensor, threads: int | None = None):
     index_dtype = INDEX_MAP[target.dtype]
     vec = vector_length(n, cutlass_dtype.width)
     if threads is None:
-        threads = threads_for_row(n, cutlass_dtype.width)
+        threads = _streaming_threads(n, cutlass_dtype.width, vec)
     loss = tp.empty(m, dtype=tp.float32, device=x.device)
     lse = tp.empty(m, dtype=tp.float32, device=x.device)
 
@@ -180,7 +192,7 @@ def ce_bwd(x: tp.Tensor, target: tp.Tensor, lse: tp.Tensor,
     index_dtype = INDEX_MAP[target.dtype]
     vec = vector_length(n, cutlass_dtype.width)
     if threads is None:
-        threads = threads_for_row(n, cutlass_dtype.width)
+        threads = _streaming_threads(n, cutlass_dtype.width, vec)
     grad = tp.empty_like(x)
 
     def build():
