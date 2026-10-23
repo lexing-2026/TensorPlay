@@ -167,3 +167,66 @@ def test_mode_cuda_single_element_lines():
     got = tp.mode(_as_tensor(array, "cuda"), 0)
     np.testing.assert_array_equal(_value(got.values), np.arange(6))
     np.testing.assert_array_equal(_value(got.indices), np.zeros(6, dtype=np.int64))
+
+
+def _short_runs(total):
+    while total > 0:
+        yield min(2, total)
+        total -= 2
+
+
+def _line_with_one_long_run(size, start, length):
+    """Ascending line where one value holds ``length`` positions and others two.
+
+    The long run is the only candidate, so the answer follows from the shape.
+    """
+    runs = []
+    value = 1
+    for count in _short_runs(start):
+        runs.append((value, count))
+        value += 1
+    runs.append((1_000_000, length))
+    for count in _short_runs(size - start - length):
+        runs.append((value, count))
+        value += 1
+    return np.concatenate(
+        [np.full(count, float(one), dtype=np.float32) for one, count in runs]
+    )
+
+
+@pytest.mark.skipif(not tp.cuda.is_available(), reason="CUDA is unavailable")
+@pytest.mark.parametrize("size", [2049, 16385, 100003, 1 << 20])
+def test_mode_cuda_run_spans_chunk_and_band_boundaries(size):
+    # The ordered slice is folded from per-chunk summaries, so a run that crosses
+    # a chunk boundary, the narrower per-thread band inside a chunk, or the end
+    # of the slice has to keep growing through the fold.
+    chunks = min(max(1, -(-size // 16384)), 256)
+    chunk = -(-size // chunks)
+    band = -(-chunk // 256)
+    length = 7
+    starts = [chunk - 3, chunk * max(1, chunks // 2) - 4, band * 2 - 2, size - length]
+    array = np.stack(
+        [_line_with_one_long_run(size, start, length) for start in starts
+         if 0 < start and start + length <= size]
+    )
+    expected_value, expected_index = _expected_mode(array, 1)
+    got = tp.mode(_as_tensor(array, "cuda"), 1)
+    np.testing.assert_array_equal(_value(got.values), expected_value)
+    np.testing.assert_array_equal(_value(got.indices), expected_index)
+
+
+@pytest.mark.skipif(not tp.cuda.is_available(), reason="CUDA is unavailable")
+@pytest.mark.parametrize("size", [16385, 100003])
+def test_mode_cuda_equal_runs_split_by_chunks(size):
+    # Two values own a whole chunk each: the counts tie, so the smaller value and
+    # its first position are what the fold has to report.
+    chunks = min(max(1, -(-size // 16384)), 256)
+    chunk = -(-size // chunks)
+    head = np.full(chunk, 9.0, dtype=np.float32)
+    tail = np.arange(size - chunk, dtype=np.float32) + 10.0
+    array = np.concatenate([head, tail])[None, :]
+    expected_value, expected_index = _expected_mode(array, 1)
+    assert float(expected_value[0]) == 9.0
+    got = tp.mode(_as_tensor(array, "cuda"), 1)
+    np.testing.assert_array_equal(_value(got.values), expected_value)
+    np.testing.assert_array_equal(_value(got.indices), expected_index)

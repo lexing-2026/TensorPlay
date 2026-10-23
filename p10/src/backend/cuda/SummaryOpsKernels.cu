@@ -594,13 +594,15 @@ void launch_mode_fused(
 }
 
 
-// What one thread reports about the band of the ordered slice it walked: the
-// longest run wholly inside the band and the runs that touch the band's two
-// ends, which the block stitches together afterwards.
+// What one band of the ordered slice reports: the longest run closed inside the
+// band and the runs touching its two ends, which may still join a neighbour.
+// Positions name a place in the slice, so bands of a chunk and chunks of a slice
+// fold with the same rule.
 template <typename T>
 struct ModeBandSummary {
     T first_value;
     T last_value;
+    int64_t length;
     int64_t first_length;
     int64_t last_length;
     int64_t last_start;
@@ -609,122 +611,179 @@ struct ModeBandSummary {
 };
 
 
-// One block per slice, one band per thread.  Stitching the bands in order lets
-// a run that crosses a band boundary keep growing, so a slice that is a handful
-// of long runs is measured in parallel instead of by a single lane walking the
-// whole slice.  The ordered sequence is stable, so a run's first position also
-// holds the smallest original index, which is the one reported.
+// Equal lengths keep the earlier start: over an ordered slice that is the run of
+// the smaller value, and a stable order puts the smallest original index at that
+// run's front.
+__device__ inline void mode_take_run(
+        int64_t length, int64_t start, int64_t& best_length,
+        int64_t& best_start) {
+    if (length > 0 && (length > best_length ||
+                       (length == best_length && start < best_start))) {
+        best_length = length;
+        best_start = start;
+    }
+}
+
+
+// Combines two adjacent ordered bands into their union.  A run that reaches the
+// left band's end keeps growing into the right band while the values match, and
+// it only becomes a candidate for the longest run once it is closed on both
+// sides — which is why the left band's trailing run is weighed here instead of
+// being left to the caller.
 template <typename T>
-__global__ void mode_sorted_runs_kernel(
-        int64_t n_slices, int64_t d_size, int64_t inner, const T* sorted,
-        const int64_t* sorted_indices, T* values, int64_t* indices) {
+__device__ inline ModeBandSummary<T> mode_join(
+        const ModeBandSummary<T>& left, const ModeBandSummary<T>& right) {
+    if (left.length == 0) return right;
+    if (right.length == 0) return left;
+    ModeBandSummary<T> out{};
+    out.length = left.length + right.length;
+    out.first_value = left.first_value;
+    out.last_value = right.last_value;
+    out.best_length = left.best_length;
+    out.best_start = left.best_start;
+    const bool merge = mode_value_equal(left.last_value, right.first_value);
+    // Only a left band given over to one run can pass its leading run on.
+    out.first_length = left.first_length == left.length && merge
+        ? left.length + right.first_length : left.first_length;
+    // The union's trailing run is the right band's unless that band is spent on
+    // its own leading run, in which case it is the growing join of both.
+    const bool right_spent = right.first_length == right.length;
+    out.last_length = merge && right_spent
+        ? right.length + left.last_length : right.last_length;
+    out.last_start = merge && right_spent ? left.last_start : right.last_start;
+    mode_take_run(right.best_length, right.best_start, out.best_length,
+                  out.best_start);
+    // A joined run that reaches the right band's end is still open, so it
+    // travels on as the union's trailing run rather than being weighed here.
+    if (merge && !right_spent) {
+        mode_take_run(left.last_length + right.first_length,
+                      left.last_start, out.best_length, out.best_start);
+    } else if (!merge) {
+        mode_take_run(left.last_length, left.last_start, out.best_length,
+                      out.best_start);
+    }
+    return out;
+}
+
+
+// One thread's contiguous band of an ordered slice.  Runs are weighed as they
+// close inside the band; whatever reaches either end stays open for the fold.
+template <typename T>
+__device__ inline ModeBandSummary<T> mode_summarize_band(
+        const T* source, int64_t inner, int64_t lo, int64_t hi) {
+    ModeBandSummary<T> own{};
+    own.length = hi - lo;
+    if (own.length <= 0) return own;
+    own.first_value = source[lo * inner];
+    own.best_start = lo;
+    T value = own.first_value;
+    int64_t run_start = lo;
+    int64_t run_length = 1;
+    int64_t first_length = -1;
+    for (int64_t j = lo + 1; j < hi; ++j) {
+        const T next = source[j * inner];
+        if (mode_value_equal(next, value)) {
+            ++run_length;
+            continue;
+        }
+        if (first_length < 0) first_length = run_length;
+        mode_take_run(run_length, run_start, own.best_length, own.best_start);
+        value = next;
+        run_start = j;
+        run_length = 1;
+    }
+    own.first_length = first_length < 0 ? own.length : first_length;
+    own.last_value = value;
+    own.last_length = run_length;
+    own.last_start = run_start;
+    return own;
+}
+
+
+// The folded summary of a whole slice answers it: the longest run closed inside
+// it, or its trailing run, which is closed by the end of the slice itself.
+template <typename T>
+__device__ inline void mode_report_folded(
+        const ModeBandSummary<T>& fold, const T* source,
+        const int64_t* source_indices, int64_t inner, int64_t si, T* values,
+        int64_t* indices) {
+    int64_t best_length = fold.best_length;
+    int64_t best_start = fold.best_start;
+    mode_take_run(fold.last_length, fold.last_start, best_length, best_start);
+    values[si] = source[best_start * inner];
+    indices[si] = source_indices[best_start * inner];
+}
+
+
+// One block per slice and chunk, one band per thread.  Folding a chunk's bands
+// in order lets a run that crosses a band boundary keep growing, and handing the
+// chunk summaries to a second pass lets a long slice be measured by many blocks
+// instead of by the one lane that owns it.  With a single chunk per slice there
+// is nothing to hand on, so the block reports the answer itself.  The ordered
+// sequence is stable, so a run's first position also holds the smallest original
+// index, which is the one reported.
+template <typename T>
+__global__ void mode_chunk_kernel(
+        int64_t n_slices, int64_t d_size, int64_t inner, int64_t chunk,
+        int64_t chunks_per_slice, const T* sorted,
+        const int64_t* sorted_indices, T* values, int64_t* indices,
+        ModeBandSummary<T>* summaries) {
     const int64_t si = static_cast<int64_t>(blockIdx.x);
     if (si >= n_slices) return;
     const int64_t outer_index = si / inner;
-    const T* source = sorted + outer_index * d_size * inner +
-                      (si - outer_index * inner);
-    const int64_t* source_indices = sorted_indices +
+    const int64_t base =
         outer_index * d_size * inner + (si - outer_index * inner);
-
+    const T* source = sorted + base;
+    const int64_t ci = static_cast<int64_t>(blockIdx.y);
+    const int64_t lo = ci * chunk;
+    const int64_t hi = lo + chunk < d_size ? lo + chunk : d_size;
     const int64_t band =
-        (d_size + static_cast<int64_t>(blockDim.x) - 1) / blockDim.x;
-    const int64_t lo = static_cast<int64_t>(threadIdx.x) * band;
-    const int64_t hi = lo + band < d_size ? lo + band : d_size;
+        (hi - lo + static_cast<int64_t>(blockDim.x) - 1) /
+        static_cast<int64_t>(blockDim.x);
+    const int64_t own_lo =
+        lo + static_cast<int64_t>(threadIdx.x) * band < hi
+        ? lo + static_cast<int64_t>(threadIdx.x) * band : hi;
+    const int64_t own_hi = own_lo + band < hi ? own_lo + band : hi;
 
     __shared__ ModeBandSummary<T> bands[kThreads];
-    if (lo < hi) {
-        const T first_value = source[lo * inner];
-        T value = first_value;
-        int64_t run_start = lo;
-        int64_t run_length = 1;
-        int64_t first_length = -1;
-        int64_t best_length = 0;
-        int64_t best_start = lo;
-        for (int64_t j = lo + 1; j < hi; ++j) {
-            const T next = source[j * inner];
-            if (mode_value_equal(next, value)) {
-                ++run_length;
-                continue;
-            }
-            if (first_length < 0) first_length = run_length;
-            if (run_length > best_length) {
-                best_length = run_length;
-                best_start = run_start;
-            }
-            value = next;
-            run_start = j;
-            run_length = 1;
-        }
-        if (first_length < 0) first_length = hi - lo;
-        if (run_length > best_length) {
-            best_length = run_length;
-            best_start = run_start;
-        }
-        bands[threadIdx.x].first_value = first_value;
-        bands[threadIdx.x].first_length = first_length;
-        bands[threadIdx.x].last_value = value;
-        bands[threadIdx.x].last_length = run_length;
-        bands[threadIdx.x].last_start = run_start;
-        bands[threadIdx.x].best_length = best_length;
-        bands[threadIdx.x].best_start = best_start;
-    }
+    bands[threadIdx.x] = mode_summarize_band(source, inner, own_lo, own_hi);
     __syncthreads();
     if (threadIdx.x != 0) return;
 
-    int64_t best_length = 0;
-    int64_t best_start = d_size;
-    bool open = false;
-    T open_value = static_cast<T>(0);
-    int64_t open_length = 0;
-    int64_t open_start = 0;
+    ModeBandSummary<T> fold{};
     for (int64_t t = 0; t < static_cast<int64_t>(blockDim.x); ++t) {
-        const int64_t start = t * band;
-        if (start >= d_size) break;
-        const ModeBandSummary<T>& summary = bands[t];
-        if (open) {
-            if (mode_value_equal(open_value, summary.first_value)) {
-                open_length += summary.first_length;
-            } else {
-                if (open_length > best_length ||
-                    (open_length == best_length && open_start < best_start)) {
-                    best_length = open_length;
-                    best_start = open_start;
-                }
-                open = false;
-            }
-        }
-        if (!open) {
-            open = true;
-            open_value = summary.first_value;
-            open_length = summary.first_length;
-            open_start = start;
-        }
-        const int64_t span =
-            start + band < d_size ? start + band : d_size;
-        if (summary.first_length < span - start) {
-            if (open_length > best_length ||
-                (open_length == best_length && open_start < best_start)) {
-                best_length = open_length;
-                best_start = open_start;
-            }
-            open_value = summary.last_value;
-            open_length = summary.last_length;
-            open_start = summary.last_start;
-        }
-        if (summary.best_length > best_length ||
-            (summary.best_length == best_length &&
-             summary.best_start < best_start)) {
-            best_length = summary.best_length;
-            best_start = summary.best_start;
-        }
+        fold = mode_join(fold, bands[t]);
     }
-    if (open_length > best_length ||
-        (open_length == best_length && open_start < best_start)) {
-        best_length = open_length;
-        best_start = open_start;
+    if (summaries != nullptr) {
+        summaries[si * chunks_per_slice + ci] = fold;
+        return;
     }
-    values[si] = source[best_start * inner];
-    indices[si] = source_indices[best_start * inner];
+    mode_report_folded(fold, source, sorted_indices + base, inner, si, values,
+                       indices);
+}
+
+
+// Joins the chunk summaries of one slice back into the slice answer.
+template <typename T>
+__global__ void mode_chunk_combine_kernel(
+        int64_t n_slices, int64_t d_size, int64_t inner,
+        int64_t chunks_per_slice, const T* sorted,
+        const int64_t* sorted_indices, const ModeBandSummary<T>* summaries,
+        T* values, int64_t* indices) {
+    const int64_t si = static_cast<int64_t>(blockIdx.x);
+    if (si >= n_slices) return;
+    if (threadIdx.x != 0) return;
+    const int64_t outer_index = si / inner;
+    const int64_t base =
+        outer_index * d_size * inner + (si - outer_index * inner);
+    ModeBandSummary<T> fold{};
+    const ModeBandSummary<T>* slice_summaries =
+        summaries + si * chunks_per_slice;
+    for (int64_t c = 0; c < chunks_per_slice; ++c) {
+        fold = mode_join(fold, slice_summaries[c]);
+    }
+    mode_report_folded(fold, sorted + base, sorted_indices + base, inner, si,
+                       values, indices);
 }
 
 
@@ -910,14 +969,39 @@ std::tuple<Tensor, Tensor> mode_cuda(const Tensor& self, int64_t dim, bool keepd
     Tensor sorted = std::get<0>(sorted_result);
     Tensor sorted_indices = std::get<1>(sorted_result);
     auto stream = getCurrentCUDAStream().stream();
+    // A chunk holds enough elements for a whole band per thread, up to one
+    // chunk per lane; past that a slice is measured by more blocks and the
+    // chunk summaries are joined by a second pass.
+    constexpr int64_t kModeChunkElements = int64_t{kThreads} * 64;
+    int64_t chunks = (d_size + kModeChunkElements - 1) / kModeChunkElements;
+    if (chunks > kThreads) chunks = kThreads;
+    const int64_t chunk = (d_size + chunks - 1) / chunks;
 #define TP_MODE_DEVICE_CASE(ctype, name_) \
-    case DType::name_: \
-        mode_sorted_runs_kernel<ctype><<<dim3(static_cast<unsigned>(slices)), \
-                                         kThreads, 0, stream>>>( \
-            slices, d_size, inner, sorted.data_ptr<ctype>(), \
+    case DType::name_: { \
+        Tensor band_notes; \
+        ModeBandSummary<ctype>* summaries = nullptr; \
+        if (chunks > 1) { \
+            band_notes = Tensor::empty( \
+                {slices * chunks * static_cast<int64_t>( \
+                    sizeof(ModeBandSummary<ctype>))}, \
+                DType::UInt8, input.device()); \
+            summaries = reinterpret_cast<ModeBandSummary<ctype>*>( \
+                band_notes.data_ptr<uint8_t>()); \
+        } \
+        mode_chunk_kernel<ctype><<< \
+            dim3(static_cast<unsigned>(slices), static_cast<unsigned>(chunks)), \
+            kThreads, 0, stream>>>( \
+            slices, d_size, inner, chunk, chunks, sorted.data_ptr<ctype>(), \
             sorted_indices.data_ptr<int64_t>(), values.data_ptr<ctype>(), \
-            indices.data_ptr<int64_t>()); \
-        break;
+            indices.data_ptr<int64_t>(), summaries); \
+        if (chunks > 1) { \
+            mode_chunk_combine_kernel<ctype><<< \
+                dim3(static_cast<unsigned>(slices)), 1, 0, stream>>>( \
+                slices, d_size, inner, chunks, sorted.data_ptr<ctype>(), \
+                sorted_indices.data_ptr<int64_t>(), summaries, \
+                values.data_ptr<ctype>(), indices.data_ptr<int64_t>()); \
+        } \
+    } break;
     switch (input.dtype()) {
         TENSORPLAY_FORALL_SCALAR_TYPES(TP_MODE_DEVICE_CASE)
         default: TP_THROW(TypeError, "mode: unsupported dtype");
@@ -925,6 +1009,28 @@ std::tuple<Tensor, Tensor> mode_cuda(const Tensor& self, int64_t dim, bool keepd
 #undef TP_MODE_DEVICE_CASE
     CUDA_CHECK(cudaGetLastError());
     return {values, indices};
+}
+
+
+// The selector walks a slice once per radix digit from the single block that
+// owns it, so a long slice leaves the rest of the GPU idle while its last digits
+// are being read; a multi-block sort instead costs a fixed multiple of the whole
+// tensor and answers the k-th value straight from the ordered run.  Both
+// estimates are microseconds measured on this device for a four-byte element:
+// the selector reads ~42us of one slice's 16k elements while up to ~128 slices
+// are in flight, settles at ~0.035us per thousand elements once the blocks fill
+// the GPU, and the sort plus its lookup starts at ~60us of launches and moves
+// ~0.29us per thousand elements.  The element width shifts the two routes about
+// equally, so the comparison is left in element units.
+inline bool kthvalue_prefer_sort(int64_t slices, int64_t d_size) {
+    const double elements =
+        static_cast<double>(slices) * static_cast<double>(d_size);
+    const double waves = static_cast<double>((slices + 127) / 128);
+    double select = 42.0 * (static_cast<double>(d_size) / 16384.0) * waves;
+    const double throughput = 0.035 * elements / 1000.0;
+    if (throughput > select) select = throughput;
+    const double sort = 60.0 + 0.29 * elements / 1000.0;
+    return sort < select;
 }
 
 
@@ -976,10 +1082,8 @@ std::tuple<Tensor, Tensor> kthvalue_cuda(const Tensor& self, int64_t k, int64_t 
     const int64_t slices = outer * inner;
     auto stream = getCurrentCUDAStream().stream();
     // The per-slice selector reads its slice once per radix digit from a single
-    // block.  Past a few thousand elements a multi-block sort is faster, and
-    // the k-th value falls straight out of the ordered sequence.
-    constexpr int64_t kKthValueSortThreshold = int64_t{1} << 14;
-    if (d_size > kKthValueSortThreshold) {
+    // block; the sort route is picked only where that latency outweighs it.
+    if (kthvalue_prefer_sort(slices, d_size)) {
         Tensor sorted;
         Tensor sorted_indices;
         std::tie(sorted, sorted_indices) = sort_cuda(input, dim, false);
