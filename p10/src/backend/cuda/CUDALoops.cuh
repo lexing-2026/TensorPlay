@@ -54,6 +54,42 @@ constexpr int loop_block_work_size() {
     return loop_thread_work_size() * loop_num_threads();
 }
 
+// Widest vector, counted in scalars, that the vectorized path instantiates.
+constexpr int kLoopMaxVecSize = 4;
+
+// Bytes the vectorized path moves per element slot: every operand the functor
+// reads plus the one it writes.
+template <typename args_t, size_t... Is>
+constexpr size_t sum_of_sizes(args_t, std::index_sequence<Is...>) {
+    if constexpr (sizeof...(Is) == 0) {
+        return 0;
+    } else {
+        return (sizeof(std::tuple_element_t<Is, args_t>) + ...);
+    }
+}
+
+template <typename func_t>
+constexpr size_t calc_io_size() {
+    using traits = tensorplay::function_traits<func_t>;
+    using args_t = typename traits::ArgsTuple;
+    return sum_of_sizes(args_t{},
+                        std::make_index_sequence<std::tuple_size_v<args_t>>{}) +
+           sizeof(typename traits::result_type);
+}
+
+// Slots each thread holds in the vectorized path. Two whole transactions per
+// operand are in flight at once, which is what keeps a streaming launch bound
+// to the memory pipes rather than to issue rate; a functor that reads nothing
+// at all can afford four transactions.
+template <size_t io_size>
+constexpr int vectorized_thread_work_size() {
+    if constexpr (io_size == 1) {
+        return 16;
+    } else {
+        return 8;
+    }
+}
+
 #define TP_LOOP_LAUNCH_BOUNDS(n) __launch_bounds__(n)
 
 // An elementwise stream writes each output line once and never reads it back,
@@ -266,8 +302,8 @@ struct unroll_load_helper {
     }
 };
 
-// Loads argument slot arg_index as one aligned vector in the vectorized
-// policy: a thread's slot is one vector apart from the next lane's.
+// Loads argument slot arg_index as aligned vectors in the vectorized policy:
+// a thread's slot is one vector apart from the next lane's.
 template <int arg_index>
 struct vectorized_load_helper {
     template <typename args_t, typename policy_t>
@@ -390,10 +426,16 @@ struct vectorized {
     __device__ inline void load_single_arg(accessor_t to, const arg_t* ptr) {
         using vec_t = aligned_vector<arg_t, vec_size>;
         const auto* from = reinterpret_cast<const vec_t*>(ptr);
-        vec_t v = from[threadIdx.x];
+        const int thread_idx = threadIdx.x;
 #pragma unroll
-        for (int j = 0; j < vec_size; ++j) {
-            to(vec_size * 0 + j) = v.val[j];
+        for (int i = 0; i < loop_size; i++) {
+            // One vector per round, a whole block-of-vectors apart: the lanes
+            // of a warp stay adjacent inside every transaction.
+            vec_t v = from[thread_idx + i * loop_num_threads()];
+#pragma unroll
+            for (int j = 0; j < vec_size; ++j) {
+                to(vec_size * i + j) = v.val[j];
+            }
         }
     }
 
@@ -647,9 +689,15 @@ inline bool check_binary_rt_types_for_specialization(
 template <int vec_size, int tws, typename func_t, typename array_t>
 __device__ inline void vectorized_elementwise_kernel_impl(int N, func_t f,
                                                           array_t data) {
-    int remaining = N - kLoopBlockWorkSize * blockIdx.x;
+    constexpr int bws = tws * loop_num_threads();
+    int remaining = N - bws * blockIdx.x;
 
-    if (remaining < kLoopBlockWorkSize) {
+    // The compiler keeps the first branch's instructions closest in the
+    // instruction stream, so the full-block path is written first.
+    if (remaining >= bws) {
+        elementwise_kernel_helper<tws>(
+            f, memory::policies::vectorized<vec_size, array_t, tws>(data));
+    } else {
         // Tail block: unroll machinery with a per-element inbounds check.
         constexpr int kArity =
             tensorplay::function_traits<func_t>::arity;
@@ -664,18 +712,15 @@ __device__ inline void vectorized_elementwise_kernel_impl(int N, func_t f,
                                      memory::LoadWithoutCast,
                                      memory::StoreWithoutCast, tws>(
                 data, remaining, input_calc, output_calc, loader, storer));
-    } else {
-        elementwise_kernel_helper<tws>(
-            f,
-            memory::policies::vectorized<vec_size, array_t, tws>(data));
     }
 }
 
 template <int vec_size, typename func_t, typename array_t>
 TP_LOOP_LAUNCH_BOUNDS(kLoopNumThreads)
 __global__ void vectorized_elementwise_kernel(int N, func_t f, array_t data) {
-    vectorized_elementwise_kernel_impl<vec_size, kLoopThreadWorkSize>(
-        N, f, data);
+    constexpr int tws =
+        vectorized_thread_work_size<calc_io_size<func_t>()>();
+    vectorized_elementwise_kernel_impl<vec_size, tws>(N, f, data);
 }
 
 template <int elems_per_thread, typename func_t, typename array_t,
@@ -701,16 +746,16 @@ inline void launch_vectorized_kernel(int64_t N, const func_t& f,
                                      array_t data) {
     TP_CHECK(N > 0 && N <= std::numeric_limits<int32_t>::max(),
              "vectorized kernel range must fit 32-bit indexing");
-    constexpr int tws = loop_thread_work_size();
+    constexpr int tws = vectorized_thread_work_size<calc_io_size<func_t>()>();
     constexpr int threads = loop_num_threads();
     int64_t grid = (N + tws * static_cast<int64_t>(threads) - 1) /
                    (tws * static_cast<int64_t>(threads));
     auto stream = getCurrentCUDAStream().stream();
-    // vec_size must divide the per-thread workload exactly (the vectorized
-    // policy slices each thread's slots into whole vectors), so cap the
-    // alignment-derived width at the fixed thread work size.
+    // The vectorized policy slices each thread's slots into whole vectors, so
+    // the width has to divide the thread work size; widths above the cap are
+    // left to devices that feed wider transactions.
     int vec_size =
-        std::min(memory::can_vectorize_up_to<func_t>(data), tws);
+        std::min(memory::can_vectorize_up_to<func_t>(data), kLoopMaxVecSize);
     switch (vec_size) {
         case 4:
             vectorized_elementwise_kernel<4, func_t, array_t>
