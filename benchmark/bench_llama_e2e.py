@@ -95,6 +95,15 @@ class TorchLlama(torch.nn.Module):
 classTPLlama_ready = None
 
 
+def attention_backend(attn_impl):
+    """Map the schedule selector onto the attention routing keyword.
+
+    2 leaves the choice to the router, which lands on the GEMM-backed fused
+    entry for this workload; 5 asks for the standalone flash schedule.
+    """
+    return None if attn_impl == 2 else "flash"
+
+
 def tp_forward(model, ids, attn_impl=2):
     import math
     c = CFG
@@ -122,10 +131,10 @@ def tp_forward(model, ids, attn_impl=2):
         # Native fused Q/K RoPE: one dispatch/launch replaces the composite
         # even/odd slice, multiply, add, stack, and reshape sequence.
         _q, _k = tp.fused_rope(q, k, model["cos"], model["sin"])
-        # impl=2 is the native GEMM-backed path.  impl=5 selects the original
-        # aligned standalone CUTE/CUTLASS flash schedule on CUDA FP16.
-        att = tp.scaled_dot_product_attention(
-            _q, _k, v, is_causal=True, impl=attn_impl
+        # impl=2 leaves the schedule to the router, which lands on the fused
+        # GEMM-backed entry; impl=5 asks for the standalone flash schedule.
+        att = tp.nn.functional.scaled_dot_product_attention(
+            _q, _k, v, is_causal=True, backend=attention_backend(attn_impl)
         )
         att = att.permute([0, 2, 1, 3]).reshape([B, T, H * D])
         x = res + lin(att, L["o"])
@@ -196,11 +205,27 @@ def best(fn, dev="cuda", R=5):
     return round(m, 2)
 
 
+def drain(value, dev):
+    """Ends a timed region on a device whose launches only queue their work.
+
+    A read-back waits for everything submitted before it, so one element
+    pulled to the host is the drain; CUDA keeps its explicit synchronize and
+    the CPU answers when asked.
+    """
+    if dev == "vulkan":
+        value.cpu()
+    return value
+
+
 def run(fw, dev="cuda", prefill_len=128, decode_steps=24,
         dtype_name="float32", timing_runs=5, attn_impl=2):
     c = CFG
     torch_dtype, _np_dtype = _dtype_pair(dtype_name)
     if fw == "t":
+        if dev == "vulkan":
+            raise ValueError(
+                "the reference leg has no Vulkan kernels; only the "
+                "tensorplay side runs on that device")
         model = TorchLlama(c).to(dev, dtype=torch_dtype).eval()
         ids = torch.randint(0, c["vocab"], (1, prefill_len), device=dev)
         with torch.no_grad():
@@ -215,7 +240,9 @@ def run(fw, dev="cuda", prefill_len=128, decode_steps=24,
         ids = tp.from_numpy(torch.randint(0, c["vocab"], (1, prefill_len)).cpu().numpy())
         ids = ids.to(dev)
         with tp.no_grad():
-            pf = best(lambda: tp_forward(model, ids, attn_impl), dev, timing_runs)
+            def prefill():
+                drain(tp_forward(model, ids, attn_impl)[:, -1:, :], dev)
+            pf = best(prefill, dev, timing_runs)
             def dec():
                 cur = ids
                 for _ in range(decode_steps):
@@ -223,6 +250,7 @@ def run(fw, dev="cuda", prefill_len=128, decode_steps=24,
                         cur,
                         tp.argmax(tp_forward(model, cur, attn_impl)[:, -1:, :], dim=-1),
                     ], 1)
+                drain(cur, dev)
         with tp.no_grad():
             dc = best(dec, dev, timing_runs)
     ms_per_tok = dc / decode_steps
@@ -244,6 +272,7 @@ def profile_once(dev, prompt_len=128, steps=10, dtype_name="float32",
                 cur,
                 tp.argmax(tp_forward(model, cur, attn_impl)[:, -1:, :], dim=-1),
             ], 1)
+        drain(cur, dev)
 
     # Warm every context length that will be captured outside the region so
     # one-time GEMM plan selection is not mistaken for steady-state profile
@@ -283,7 +312,8 @@ def profile_once(dev, prompt_len=128, steps=10, dtype_name="float32",
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--device", choices=("cpu", "cuda", "all"), default="cuda")
+    parser.add_argument(
+        "--device", choices=("cpu", "cuda", "vulkan", "all"), default="cuda")
     parser.add_argument(
         "--dtype", choices=("float32", "float16", "bfloat16"),
         default="float32", help="model/activation dtype (default: float32)",
@@ -350,14 +380,18 @@ def main():
                 f"decode={decode_steps} steps (interleaved x{args.rounds})"
             )
             res = {"t": [], "p": []}
+            # The reference leg only runs on a device its build carries
+            # kernels for, so a Vulkan report stands on the tensorplay side
+            # alone and skips the paired speedup.
+            legs = ("p",) if dev == "vulkan" else ("t", "p")
             for _ in range(args.rounds):
-                for fw in ("t", "p"):
+                for fw in legs:
                     pf, mt = run(
                         fw, dev, prefill_len, decode_steps, args.dtype,
                         args.timing_runs, args.attn_impl
                     )
                     res[fw].append((pf, mt))
-            for fw in ("t", "p"):
+            for fw in legs:
                 name = "ref  " if fw == "t" else "tp   "
                 ds = sorted(m for _, m in res[fw])
                 ps = sorted(p for p, _ in res[fw])
@@ -366,6 +400,8 @@ def main():
                     f"min={ds[0]:7.2f} ms/tok | prefill med={ps[len(ps)//2]:6.2f} "
                     f"ms ({1000/ds[0]:7.1f} tok/s best)"
                 )
+            if "t" not in legs:
+                continue
             torch_decode_med = sorted(m for _, m in res["t"])[len(res["t"]) // 2]
             tp_decode_med = sorted(m for _, m in res["p"])[len(res["p"]) // 2]
             torch_decode_best = min(m for _, m in res["t"])
