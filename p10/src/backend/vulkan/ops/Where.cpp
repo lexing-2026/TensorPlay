@@ -298,20 +298,21 @@ Tensor where_kernel(
   return convert(v_output);
 }
 
-// A scalar branch is a plane of one element that the selection repeats, so
-// folding it does not have to fill the output's shape; the folded plane takes
-// the other branch's dtype, which is the type that holds the pair.
+// A scalar branch is a lane that the selection repeats, so folding it does not
+// have to fill the output's shape; the folded lane takes the other branch's
+// dtype, which is the type that holds the pair.  It is released without an axis
+// of its own: a fold that names a length would add one to the broadcast, and a
+// walk whose operands are all lanes would answer with a plane where its caller
+// expects a lane.
 Tensor where_scalar_self_kernel(
     const Tensor& condition, const Scalar& self, const Tensor& other) {
-  Tensor folded =
-      full_kernel({1}, self, other.dtype(), other.device(), false);
+  Tensor folded = full_kernel({}, self, other.dtype(), other.device(), false);
   return where_kernel(condition, folded, other);
 }
 
 Tensor where_scalar_other_kernel(
     const Tensor& condition, const Tensor& self, const Scalar& other) {
-  Tensor folded =
-      full_kernel({1}, other, self.dtype(), self.device(), false);
+  Tensor folded = full_kernel({}, other, self.dtype(), self.device(), false);
   return where_kernel(condition, self, folded);
 }
 
@@ -333,10 +334,8 @@ Tensor where_scalar_scalar_kernel(
       ? DType::Float32
       : (fits_a_signed_word(self) && fits_a_signed_word(other) ? DType::Int32
                                                               : DType::Int64);
-  Tensor held =
-      full_kernel({1}, self, vocabulary, condition.device(), false);
-  Tensor taken =
-      full_kernel({1}, other, vocabulary, condition.device(), false);
+  Tensor held = full_kernel({}, self, vocabulary, condition.device(), false);
+  Tensor taken = full_kernel({}, other, vocabulary, condition.device(), false);
   return where_kernel(condition, held, taken);
 }
 

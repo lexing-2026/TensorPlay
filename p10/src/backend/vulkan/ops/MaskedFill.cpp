@@ -29,10 +29,10 @@ void validate_payload(const Tensor& t, const char* name) {
  * 0-dimensional value here, so it contributes its single element and joins the
  * scalar form.
  *
- * The fill rides a plane of one in the payload's own width, which the walk
- * repeats, so a mask narrower than the input broadcasts without either the
- * mask or the fill being materialized at the output shape, and one selection
- * implementation covers every element type instead of a per-width copy.
+ * The fill rides one lane in the payload's own width, which the walk repeats,
+ * so a mask narrower than the input broadcasts without either the mask or the
+ * fill being materialized at the output shape, and one selection implementation
+ * covers every element type instead of a per-width copy.
  */
 Tensor masked_fill_impl(
     const Tensor& self,
@@ -50,9 +50,10 @@ Tensor masked_fill_impl(
   const Tensor mask_on_device =
       mask.device().is_vulkan() ? mask : mask.to(self.device());
   // A number stored into a payload of a given width is read into that width
-  // first, so the plane holds what the masked lanes take.
+  // first, so the lane the masked lanes take holds it.  It carries no axis of
+  // its own: the mask and the payload already name every axis the answer has.
   const Tensor held =
-      full_kernel({1}, value, self.dtype(), self.device(), false);
+      full_kernel({}, value, self.dtype(), self.device(), false);
   return where_kernel(mask_on_device, held, self);
 }
 
