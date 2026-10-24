@@ -644,6 +644,25 @@ __device__ inline void store_pack_streaming(PackT* dst, const PackT& value) {
     }
 }
 
+// The same mark on a single element, for the paths that walk columns one at a
+// time.  A line the row engine writes is never read back, so it is the part of
+// the cache a later launch can least afford to have held.
+template <typename T>
+__device__ inline void store_val_streaming(T* dst, const T& value) {
+    if constexpr (sizeof(T) == 16) {
+        __stcs(reinterpret_cast<uint4*>(dst),
+               *reinterpret_cast<const uint4*>(&value));
+    } else if constexpr (sizeof(T) == 8) {
+        __stcs(reinterpret_cast<uint2*>(dst),
+               *reinterpret_cast<const uint2*>(&value));
+    } else if constexpr (sizeof(T) == 4) {
+        __stcs(reinterpret_cast<unsigned*>(dst),
+               *reinterpret_cast<const unsigned*>(&value));
+    } else {
+        *dst = value;
+    }
+}
+
 template <typename T, int VecSize, typename Op, bool Streaming>
 __global__ void binary_same_shape_vectorized_kernel(
     int n, const T* __restrict__ a, const T* __restrict__ b,
@@ -999,7 +1018,7 @@ __global__ void binary_row_flat_vec_kernel(
 // row comes from blockIdx.y and each thread owns a run of columns, leaving one
 // add, two loads and a store per element.  The second load usually hits
 // cache, since the operands of a shifted pair overlap almost entirely.
-template <typename T, bool ASplat, bool BSplat, typename Op>
+template <typename T, bool ASplat, bool BSplat, bool Streaming, typename Op>
 __global__ void binary_row_flat_scalar_kernel(
     int inner,
     const T* __restrict__ a, int64_t a_row_stride,
@@ -1021,10 +1040,18 @@ __global__ void binary_row_flat_scalar_kernel(
         for (int k = 0; k < kColsPerThread; ++k) {
             const int c = col + k;
             if (c < inner) {
-                y_row[c] = static_cast<T>(op(
-                    static_cast<M>(ASplat ? a_row[0] : a_row[c]),
-                    static_cast<M>(BSplat ? b_row[0] : b_row[c]),
-                    static_cast<M>(alpha)));
+                const M av = static_cast<M>(
+                    ASplat ? a_row[0]
+                           : (Streaming ? load_vec_streaming(a_row + c) : a_row[c]));
+                const M bv = static_cast<M>(
+                    BSplat ? b_row[0]
+                           : (Streaming ? load_vec_streaming(b_row + c) : b_row[c]));
+                const T out = static_cast<T>(op(av, bv, alpha));
+                if (Streaming) {
+                    store_val_streaming(y_row + c, out);
+                } else {
+                    y_row[c] = out;
+                }
             }
         }
     }
@@ -1082,32 +1109,50 @@ inline bool try_row_flat(
     if (blocks_x > 2147483647) return false;
     if (blocks_x == 0) return false;
     dim3 grid(static_cast<unsigned>(blocks_x), static_cast<unsigned>(rows));
+
+    // A column of the walk reads at most one element of each full operand and
+    // writes one result, so the run's traffic is known before the launch.  Past
+    // several cache widths a line is never needed again once the thread has
+    // moved on, which is when the evict-first marks pay.
+    const CUDAStream launch_stream = getCurrentCUDAStream();
+    const int64_t l2_bytes = loop_l2_cache_bytes(launch_stream.device_index());
+    const int64_t per_column =
+        static_cast<int64_t>(sizeof(T)) * (1 + (a_full ? 1 : 0) + (b_full ? 1 : 0));
+    const bool streaming = l2_bytes > 0 &&
+        inner * rows * per_column >= kStreamL2Factor * l2_bytes;
+
+#define TP_ROW_SCALAR(A_SPLAT, B_SPLAT)                                      \
+    do {                                                                     \
+        if (streaming) {                                                     \
+            binary_row_flat_scalar_kernel<T, A_SPLAT, B_SPLAT, true, Op>     \
+                <<<grid, threads, 0, stream>>>(                              \
+                    static_cast<int>(inner), a.data_ptr<T>(), a_row_stride,  \
+                    b.data_ptr<T>(), b_row_stride, y.data_ptr<T>(), alpha,   \
+                    op);                                                     \
+        } else {                                                             \
+            binary_row_flat_scalar_kernel<T, A_SPLAT, B_SPLAT, false, Op>    \
+                <<<grid, threads, 0, stream>>>(                              \
+                    static_cast<int>(inner), a.data_ptr<T>(), a_row_stride,  \
+                    b.data_ptr<T>(), b_row_stride, y.data_ptr<T>(), alpha,   \
+                    op);                                                     \
+        }                                                                    \
+    } while (0)
+
     if (!packed) {
         if (a_full) {
             if (b_full) {
-                binary_row_flat_scalar_kernel<T, false, false, Op>
-                    <<<grid, threads, 0, stream>>>(
-                        static_cast<int>(inner), a.data_ptr<T>(), a_row_stride,
-                        b.data_ptr<T>(), b_row_stride, y.data_ptr<T>(), alpha, op);
+                TP_ROW_SCALAR(false, false);
             } else {
-                binary_row_flat_scalar_kernel<T, false, true, Op>
-                    <<<grid, threads, 0, stream>>>(
-                        static_cast<int>(inner), a.data_ptr<T>(), a_row_stride,
-                        b.data_ptr<T>(), b_row_stride, y.data_ptr<T>(), alpha, op);
+                TP_ROW_SCALAR(false, true);
             }
         } else if (b_full) {
-            binary_row_flat_scalar_kernel<T, true, false, Op>
-                <<<grid, threads, 0, stream>>>(
-                    static_cast<int>(inner), a.data_ptr<T>(), a_row_stride,
-                    b.data_ptr<T>(), b_row_stride, y.data_ptr<T>(), alpha, op);
+            TP_ROW_SCALAR(true, false);
         } else {
-            binary_row_flat_scalar_kernel<T, true, true, Op>
-                <<<grid, threads, 0, stream>>>(
-                    static_cast<int>(inner), a.data_ptr<T>(), a_row_stride,
-                    b.data_ptr<T>(), b_row_stride, y.data_ptr<T>(), alpha, op);
+            TP_ROW_SCALAR(true, true);
         }
         return true;
     }
+#undef TP_ROW_SCALAR
 
     const int64_t vec_inner = inner / kVec;
     // The splat pattern is fixed for the whole launch, so select it at compile
