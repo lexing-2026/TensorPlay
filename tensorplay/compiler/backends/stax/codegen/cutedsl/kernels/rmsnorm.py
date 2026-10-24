@@ -19,6 +19,7 @@ import cutlass.cute as cute
 from cutlass import Float32, const_expr
 
 from ._prims import (
+    REGISTERS_PER_SM,
     block_sum,
     column_sum,
     compile_cached,
@@ -106,11 +107,6 @@ class RmsNormFwd:
 #: needs more is walked twice instead, which costs two extra row reads but
 #: keeps the working set small enough to stay in registers.
 RESIDENT_BUDGET = 16
-
-#: 32-bit registers one SM offers its resident blocks, so a block of ``threads``
-#: threads may spend ``REGISTERS_PER_SM * 4 / threads`` bytes of them each before
-#: the compiler starts parking values in local memory.
-REGISTERS_PER_SM = 65536
 
 
 class RmsNormBwd:

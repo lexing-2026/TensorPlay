@@ -64,6 +64,22 @@ def test_two_rows_in_flight_keep_the_unraised_budget():
 
 
 @cuda_only
+def test_a_row_pair_too_wide_for_the_registers_goes_to_shared_memory():
+    # 32000 columns are 32 elements per thread at this width, and both rows
+    # together exceed a thousand-thread block's share of the register file, so
+    # the probability row is staged and only the gradient row is held.
+    bwd = softmax_module.SoftmaxBwd(softmax_module.cutlass.BFloat16, 32000, 1024, 8)
+    assert not bwd.in_rmem and bwd.hold and 0 < bwd.stage <= bwd.chunks
+    # Half the width doubles what each thread may keep, and the walk is single.
+    narrow = softmax_module.SoftmaxBwd(softmax_module.cutlass.BFloat16, 16384, 512, 8)
+    assert narrow.in_rmem and narrow.stage == 0 and not narrow.hold
+    # Single precision doubles the same rows again, and a 65536-wide row of it
+    # exceeds what a block can hold at all, so the gradient is read twice.
+    wide = softmax_module.SoftmaxBwd(softmax_module.cutlass.Float32, 65536, 1024, 4)
+    assert not wide.in_rmem and not wide.hold and wide.stage < wide.chunks
+
+
+@cuda_only
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("shape", SHAPES)
 def test_softmax_rows_match_a_float32_reference(dtype, shape):

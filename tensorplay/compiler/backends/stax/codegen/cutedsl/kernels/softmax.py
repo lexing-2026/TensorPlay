@@ -3,9 +3,11 @@
 One block owns one row.  While the row fits in registers the block reads it
 once, reduces the maximum and the exponential sum in place, and writes the
 normalised row back.  A row wider than that is walked twice, the first walk
-folding the row and the second rebuilding it: the register budget a block of
-full width can hold is already close to the shared memory one block may, so a
-row that escapes the former rarely fits in the latter.
+folding the row and the second rebuilding it.  The gradient needs both the
+probability row and the incoming gradient row, so what shared memory can hold
+of the first is parked there between the walks and the second stays in
+registers; a block that would rather own the pair keeps them in local memory
+instead and measures slower than both.
 """
 
 from __future__ import annotations
@@ -17,10 +19,12 @@ import cutlass.cute as cute
 from cutlass import Float32, const_expr
 
 from ._prims import (
+    REGISTERS_PER_SM,
     block_stats,
     block_sum_once,
     compile_cached,
     fake_tensor,
+    staging_plan,
     stream_atoms,
     tail_predicate,
     threads_for_row,
@@ -200,7 +204,32 @@ class SoftmaxBwd:
         self.chunks = (n // vec + threads - 1) // threads
         self.tiler_n = vec * self.chunks * threads
         self.num_warps = threads // 32
-        self.in_rmem = self.chunks * vec <= rmem_budget
+        element_bytes = dtype.width // 8
+        #: Lanes of the SM register file one thread may fill before the compiler
+        #: starts parking its values in local memory.  A row kept between the
+        #: walks costs one lane per element, since each chunk read has to be
+        #: addressable on its own, and a chunk taken through float32 costs two
+        #: more lanes per element plus the loop's own share.
+        lanes = REGISTERS_PER_SM / threads
+        held = self.chunks * vec
+        # Walking the row once keeps both rows whole, so it pays for the pair.  A
+        # thousand-thread block fills its share with two rows of thirty-two and
+        # spills, which measures worse than either of the walks below.
+        self.in_rmem = self.chunks * vec <= rmem_budget and (
+            2 * held + 2 * vec + 8 <= lanes
+        )
+        # Otherwise the probability row is left in shared memory between the two
+        # walks as far as shared memory reaches, one chunk at a time, and the
+        # gradient row stays in registers alone.
+        self.stage = (
+            0
+            if self.in_rmem
+            else staging_plan(
+                vec * threads * element_bytes, self.num_warps * 4, self.chunks
+            )
+        )
+        self.stage_n = self.stage * vec * threads
+        self.hold = not self.in_rmem and (held + 2 * vec + 8 <= lanes)
 
     @cute.jit
     def __call__(self, y, dout, dx, stream):
@@ -231,9 +260,9 @@ class SoftmaxBwd:
             rO.fill(0.0)
             cute.copy(atom, gY, rY, pred=pred)
             cute.copy(atom, gO, rO, pred=pred)
-            # Both rows are read a chunk at a time so only one chunk of each
-            # is in flight in float32; holding both rows whole would double
-            # the registers the block needs and spill wide rows.
+            # The pair is held whole but read a chunk at a time, so only one
+            # chunk of each is in flight as float32 values; the two rows already
+            # spend most of what the block may keep in registers.
             sm = Float32(0.0)
             for k in cutlass.range_constexpr(self.chunks):
                 yv = rY[None, None, k].load().to(Float32)
@@ -248,35 +277,63 @@ class SoftmaxBwd:
                 rY[None, None, k].store((yv * (dv - total)).to(rY.element_type))
             cute.copy(atom, rY, gD, pred=pred)
         else:
-            # A row that does not fit in registers is read twice: the first
-            # walk folds the product sum, the second rebuilds each element
-            # and writes it.
-            rK = cute.make_rmem_tensor_like(gY[None, None, 0])
+            # The first walk folds the product sum and leaves what it read of the
+            # probability row in shared memory; the second takes the row from
+            # there, or from global memory again past the reach of the stage, and
+            # writes the gradient.
+            stage_y = None
+            if const_expr(self.stage > 0):
+                stage_y = smem.allocate_tensor(
+                    self.dtype,
+                    cute.make_layout((1, self.stage_n), stride=(0, 1)),
+                    byte_alignment=16,
+                )
+            sY = (
+                thr.partition_S(cute.local_tile(stage_y, (1, self.stage_n), (0, 0)))
+                if const_expr(self.stage > 0)
+                else None
+            )
+            rY = cute.make_rmem_tensor_like(gY[None, None, 0])
             rO = cute.make_rmem_tensor_like(gO[None, None, 0])
+            rH = cute.make_rmem_tensor_like(gO) if const_expr(self.hold) else None
             sm = Float32(0.0)
             for k in cutlass.range_constexpr(self.chunks):
                 col = tidx * self.vec + k * self.threads * self.vec
                 p = None if pred is None else pred[None, None, k]
-                cute.copy(atom, gY[None, None, k], rK, pred=p)
-                cute.copy(atom, gO[None, None, k], rO, pred=p)
+                cute.copy(atom, gY[None, None, k], rY, pred=p)
+                if const_expr(self.hold):
+                    cute.copy(atom, gO[None, None, k], rH[None, None, k], pred=p)
+                    dv = rH[None, None, k].load().to(Float32).reshape((self.vec,))
+                else:
+                    cute.copy(atom, gO[None, None, k], rO, pred=p)
+                    dv = rO.load().to(Float32).reshape((self.vec,))
+                if const_expr(k < self.stage):
+                    cute.copy(atom, rY, sY[None, None, k], pred=p)
                 if col < n:
-                    yv = rK.load().to(Float32).reshape((cute.size(rK),))
-                    dv = rO.load().to(Float32).reshape((cute.size(rO),))
+                    yv = rY.load().to(Float32).reshape((self.vec,))
                     sm += (yv * dv).reduce(
                         cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0
                     )
             total = block_sum_once(sm, buf, self.num_warps)
+            # No thread may take a staged chunk back before every thread has
+            # written it.
+            cute.arch.barrier()
             for k in cutlass.range_constexpr(self.chunks):
                 col = tidx * self.vec + k * self.threads * self.vec
                 p = None if pred is None else pred[None, None, k]
-                cute.copy(atom, gY[None, None, k], rK, pred=p)
-                cute.copy(atom, gO[None, None, k], rO, pred=p)
+                if const_expr(k < self.stage):
+                    cute.copy(atom, sY[None, None, k], rY, pred=p)
+                else:
+                    cute.copy(atom, gY[None, None, k], rY, pred=p)
+                if const_expr(self.hold):
+                    dv = rH[None, None, k].load().to(Float32).reshape((self.vec,))
+                else:
+                    cute.copy(atom, gO[None, None, k], rO, pred=p)
+                    dv = rO.load().to(Float32).reshape((self.vec,))
                 if col < n:
-                    yv = rK.load().to(Float32)
-                    dv = rO.load().to(Float32)
-                    grad = yv * (dv - total)
-                    rK.store(grad.to(rK.element_type))
-                    cute.copy(atom, rK, gD[None, None, k], pred=p)
+                    yv = rY.load().to(Float32).reshape((self.vec,))
+                    rY.store((yv * (dv - total)).to(rY.element_type))
+                    cute.copy(atom, rY, gD[None, None, k], pred=p)
 
 
 class SoftmaxBwdUniform:
@@ -407,10 +464,11 @@ def softmax_bwd(y: tp.Tensor, dout: tp.Tensor, threads: int | None = None):
     else:
         rmem_budget = RMEM_BUDGET
     dx = tp.empty_like(y)
+    plan = SoftmaxBwd(cutlass_dtype, n, threads, vec, rmem_budget)
 
     def build():
         return cute.compile(
-            SoftmaxBwd(cutlass_dtype, n, threads, vec, rmem_budget),
+            plan,
             fake_tensor(cutlass_dtype, (cute.sym_int(), n), vec),
             fake_tensor(cutlass_dtype, (cute.sym_int(), n), vec),
             fake_tensor(cutlass_dtype, (cute.sym_int(), n), vec),
@@ -418,7 +476,13 @@ def softmax_bwd(y: tp.Tensor, dout: tp.Tensor, threads: int | None = None):
             options="--enable-tvm-ffi",
         )
 
-    compile_cached(_bwd_cache, (n, y.dtype, threads, vec, rmem_budget), build)(y, dout, dx)
+    # How much of the row the block stages, and whether it can keep the
+    # gradient row at all, depends on the shared memory and the register file the
+    # device in play offers, so a device that would plan a different pass needs
+    # its own object file rather than one asking for more than it has.
+    compile_cached(
+        _bwd_cache, (n, y.dtype, threads, vec, rmem_budget, plan.stage, plan.hold), build
+    )(y, dout, dx)
     return dx
 
 
