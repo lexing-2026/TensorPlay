@@ -560,7 +560,11 @@ Tensor flip_kernel(const Tensor& self, const std::vector<int64_t>& dims) {
     return convert(v_output);
   }
 
-  api::vTensor v_output{context, v_input.sizes(), v_input.dtype()};
+  // The walk below reads and writes texels, so the result is reserved as an
+  // image even for a shape an unasked allocation would keep in words.
+  api::vTensor v_output = allocate_output(
+      context, api::StorageType::TEXTURE_3D, v_input.sizes(),
+      v_input.dtype());
 
   const struct FlipBlock final {
     ivec4 in_sizes;

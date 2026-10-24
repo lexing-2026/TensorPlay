@@ -362,7 +362,10 @@ Tensor cumsum_kernel(
 
   api::Context* const context = api::context();
   api::vTensor v_input = convert(payload);
-  api::vTensor v_output{context, v_input.sizes(), out_dtype};
+  // The scan below reads a texel plane and writes one, so the result is
+  // reserved as an image even where an unasked allocation would choose words.
+  api::vTensor v_output = allocate_output(
+      context, api::StorageType::TEXTURE_3D, v_input.sizes(), out_dtype);
 
   const struct ScanBlock block{
       make_whcn_ivec4(v_input.sizes()),

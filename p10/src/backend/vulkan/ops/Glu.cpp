@@ -82,7 +82,10 @@ Tensor glu_kernel(const Tensor& self, int64_t dim) {
 
   // The gate is elementwise, so the result keeps the input element type and
   // the bound views match the format baked into the selected variant.
-  api::vTensor v_output{context, out_sizes, self.dtype()};
+  // The gate below reads and writes texels, so the result is reserved as an
+  // image even for a shape an unasked allocation would keep in words.
+  api::vTensor v_output = allocate_output(
+      context, api::StorageType::TEXTURE_3D, out_sizes, self.dtype());
 
   const struct GluBlock block{
       make_whcn_ivec4(v_input.sizes()),

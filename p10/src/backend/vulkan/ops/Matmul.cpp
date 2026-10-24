@@ -23,7 +23,8 @@ Tensor materialize_view(
     const Tensor& self,
     const std::vector<int64_t>& out_sizes,
     const std::vector<int64_t>& out_strides,
-    int64_t storage_offset);
+    int64_t storage_offset,
+    std::optional<api::StorageType> destination = std::nullopt);
 
 // Defined in BinaryOp.cpp; copies a texture payload into a fresh linear one so
 // a kernel that binds every operand as words can read it.

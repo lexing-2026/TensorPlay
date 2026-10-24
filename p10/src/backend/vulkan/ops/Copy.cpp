@@ -21,7 +21,8 @@ Tensor materialize_view(
     const Tensor& self,
     const std::vector<int64_t>& out_sizes,
     const std::vector<int64_t>& out_strides,
-    int64_t storage_offset);
+    int64_t storage_offset,
+    std::optional<api::StorageType> destination = std::nullopt);
 
 // Defined in BinaryOp.cpp; copies a texture payload into a dense buffer.
 api::vTensor to_buffer_storage_dispatch(
@@ -510,11 +511,15 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
         } else {
           const std::vector<int64_t> sizes(
               v_src.sizes().begin(), v_src.sizes().end());
+          // The crossing ends in the destination's class, which here is the
+          // image one; an unasked allocation of the same shape would keep the
+          // payload in words and leave the transfer below sampling nothing.
           gathered = materialize_view(
               src_payload,
               sizes,
               SizesAndStrides::compute_contiguous_strides(sizes),
-              0);
+              0,
+              api::StorageType::TEXTURE_3D);
           v_src = convert(gathered);
         }
       }

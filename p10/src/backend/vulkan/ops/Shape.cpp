@@ -22,7 +22,8 @@ Tensor materialize_view(
     const Tensor& self,
     const std::vector<int64_t>& out_sizes,
     const std::vector<int64_t>& out_strides,
-    int64_t storage_offset);
+    int64_t storage_offset,
+    std::optional<api::StorageType> destination = std::nullopt);
 
 // Defined in Factory.cpp; materializes a host-filled 1-D payload.  The
 // triangular masks below use Int32 index tensors, the widest integer dtype

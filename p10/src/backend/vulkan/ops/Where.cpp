@@ -265,7 +265,10 @@ Tensor where_kernel(
       vocabulary != DType::Int64,
       "Vulkan where has no image form for a count wider than a word");
 
-  api::vTensor v_output{context, out_sizes, vocabulary};
+  // The selection below reads and writes texels, so the result is reserved as
+  // an image even for a shape an unasked allocation would keep in words.
+  api::vTensor v_output = allocate_output(
+      context, api::StorageType::TEXTURE_3D, out_sizes, vocabulary);
 
   const WhereBlock block{
       make_whcn_ivec4(out_sizes),

@@ -22,6 +22,7 @@ namespace vulkan {
 namespace ops {
 
 Tensor sub_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha);
+Tensor mul_kernel(const Tensor& self, const Tensor& other);
 
 // Defined in Copy.cpp; the element type conversion entry point.
 Tensor to_dtype_kernel(
@@ -37,7 +38,8 @@ Tensor materialize_view(
     const Tensor& self,
     const std::vector<int64_t>& out_sizes,
     const std::vector<int64_t>& out_strides,
-    int64_t storage_offset);
+    int64_t storage_offset,
+    std::optional<api::StorageType> destination = std::nullopt);
 
 namespace {
 
@@ -510,7 +512,7 @@ Tensor extremum_one_axis(
     int64_t axis_from_left,
     ExtremumKind kind) {
   api::Context* const context = api::context();
-  const Tensor dense_input = dense_payload_of_view(input);
+  Tensor dense_input = dense_payload_of_view(input);
   api::vTensor v_input = convert(dense_input);
 
   const int axis_innermost =
@@ -579,6 +581,13 @@ Tensor extremum_one_axis(
     linear_reduce_pass(
         context, v_output, v_input, axis_size, inner, rows, buffer_shader);
     return release_reduced_output(context, v_output);
+  }
+
+  // A fold that has no linear walk to answer it in place reads the row through
+  // texels, so a payload the shape keeps in words crosses into an image first.
+  if (v_input.storage_type() == api::StorageType::BUFFER) {
+    dense_input = to_image_storage(context, dense_input);
+    v_input = convert(dense_input);
   }
 
   // Both operands and the result of the fold below are read and written as
@@ -1309,18 +1318,23 @@ Tensor integral_total(
   }
 
   const Tensor dense_self = dense_payload_of_view(self);
-  if (convert(dense_self).storage_type() == api::StorageType::TEXTURE_3D) {
-    return dense_self.dtype() == DType::Int32
-        ? reduce_int64(dense_self, dims, keepdim, "sum_int64")
-        : reduce_int64(
-              dense_self.to(DType::Float32), dims, keepdim, "sum_int64_float");
+  // The class that decides the route is the one the fold actually reads, which
+  // is the narrowed width rather than the code it came from: a byte payload
+  // sits in texels, but its single-precision stand-in keeps the words the shape
+  // asks for and folds on the linear walk.
+  const bool counts_in_words = dense_self.dtype() != DType::Int32;
+  const Tensor narrowed = counts_in_words ? dense_self.to(DType::Float32)
+                                          : dense_self;
+  if (convert(narrowed).storage_type() == api::StorageType::TEXTURE_3D) {
+    return reduce_int64(
+        narrowed, dims, keepdim,
+        counts_in_words ? "sum_int64_float" : "sum_int64");
   }
   // A signed word crosses to the wide word as itself; every narrower code is
   // exact in single precision, so it steps through that width on the way.
   return wide_total_impl(
-      dense_self.dtype() == DType::Int32
-          ? dense_self.to(DType::Int64)
-          : dense_self.to(DType::Float32).to(DType::Int64),
+      counts_in_words ? dense_self.to(DType::Float32).to(DType::Int64)
+                      : dense_self.to(DType::Int64),
       dims,
       keepdim,
       TotalKind::kSum);
@@ -1642,9 +1656,14 @@ Tensor cumprod_kernel(
   int64_t axis = dim < 0 ? dim + self.dim() : dim;
   TP_CHECK(axis >= 0 && axis < self.dim(), "Vulkan cumprod: dim out of range");
   api::Context* const context = api::context();
-  const Tensor dense_self = dense_payload_of_view(self);
+  // The running product walks the axis through texels, and it has no linear
+  // twin, so a payload the shape keeps in words crosses into an image first and
+  // the answer is reserved in the class the walk writes.
+  const Tensor dense_self =
+      to_image_storage(context, dense_payload_of_view(self));
   api::vTensor v_input = convert(dense_self);
-  api::vTensor v_output{context, v_input.sizes(), DType::Float32};
+  api::vTensor v_output = allocate_output(
+      context, api::StorageType::TEXTURE_3D, v_input.sizes(), DType::Float32);
 
   const struct CumprodBlock final {
     ivec4 in_sizes;
@@ -1759,9 +1778,9 @@ Tensor norm_dim_kernel(
 namespace {
 
 //
-// Broadcast elementwise helpers used by the variance composition.  The
-// patterns mirror the binary op shader conventions: out = a - b with b
-// broadcast, and out = a * a elementwise.
+// Broadcast elementwise helpers used by the variance composition.  Both answer
+// through the binary walk, which broadcasts the second operand and reads either
+// storage class.
 //
 Tensor broadcast_sub(const Tensor& a, const Tensor& b) {
   // Delegate to the binary op path: it infers the broadcasted output shape
@@ -1771,41 +1790,11 @@ Tensor broadcast_sub(const Tensor& a, const Tensor& b) {
   return sub_kernel(a, b, Scalar(1.0));
 }
 
-
 Tensor square(const Tensor& a) {
-  api::Context* const context = api::context();
-
+  // The product of a payload with itself: the binary walk answers in whichever
+  // storage the payload sits in, so nothing crosses classes here.
   const Tensor dense_a = dense_payload_of_view(a);
-  api::vTensor v_a = convert(dense_a);
-  api::vTensor v_out{context, v_a.sizes(), a.dtype()};
-
-  const struct Block final {
-    ivec4 output_sizes;
-    ivec4 input_sizes;
-    ivec4 other_sizes;
-    float alpha;
-  } block{
-      make_whcn_ivec4(v_out.sizes()),
-      make_whcn_ivec4(v_a.sizes()),
-      make_whcn_ivec4(v_a.sizes()),
-      1.0f,
-  };
-
-  api::UniformParamsBuffer params(context, block);
-  api::PipelineBarrier pipeline_barrier{};
-
-  context->submit_compute_job(
-      VK_KERNEL(mul), pipeline_barrier, v_out.extents(),
-      adaptive_work_group_size(v_out.extents()), VK_NULL_HANDLE,
-      v_out.image(
-          pipeline_barrier,
-          api::PipelineStage::COMPUTE,
-          api::MemoryAccessType::WRITE),
-      v_a.image(pipeline_barrier, api::PipelineStage::COMPUTE),
-      v_a.image(pipeline_barrier, api::PipelineStage::COMPUTE),
-      params.buffer());
-
-  return convert(v_out);
+  return mul_kernel(dense_a, dense_a);
 }
 
 //

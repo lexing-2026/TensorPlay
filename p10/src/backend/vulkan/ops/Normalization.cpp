@@ -40,7 +40,8 @@ Tensor materialize_view(
     const Tensor& self,
     const std::vector<int64_t>& out_sizes,
     const std::vector<int64_t>& out_strides,
-    int64_t storage_offset);
+    int64_t storage_offset,
+    std::optional<api::StorageType> destination = std::nullopt);
 
 namespace {
 
@@ -127,11 +128,11 @@ Tensor layer_norm_impl(
     return out;
   }
 
-  api::vTensor v_output{
-      context,
-      v_input.sizes(),
-      v_input.dtype(),
-  };
+  // The walk below reads and writes texels, so the result is reserved as an
+  // image even for a shape an unasked allocation would keep in words.
+  api::vTensor v_output = allocate_output(
+      context, api::StorageType::TEXTURE_3D, v_input.sizes(),
+      v_input.dtype());
 
   if (v_output.storage_type() == api::StorageType::BUFFER) {
     TP_THROW(
@@ -362,7 +363,11 @@ Tensor batch_norm_kernel(
     return out;
   }
 
-  api::vTensor v_output{context, v_input.sizes(), v_input.dtype()};
+  // The walk below reads and writes texels, so the result is reserved as an
+  // image even for a shape an unasked allocation would keep in words.
+  api::vTensor v_output = allocate_output(
+      context, api::StorageType::TEXTURE_3D, v_input.sizes(),
+      v_input.dtype());
 
   const bool has_weight = weight_opt.has_value();
   const bool has_bias = bias_opt.has_value();
@@ -1186,11 +1191,11 @@ Tensor rms_norm_fused(
   api::Context* const context = api::context();
 
   api::vTensor v_input = convert(input_arg);
-  api::vTensor v_output{
-      context,
-      v_input.sizes(),
-      v_input.dtype(),
-  };
+  // The walk below reads and writes texels, so the result is reserved as an
+  // image even for a shape an unasked allocation would keep in words.
+  api::vTensor v_output = allocate_output(
+      context, api::StorageType::TEXTURE_3D, v_input.sizes(),
+      v_input.dtype());
 
   const bool has_weight = weight_opt.has_value();
   const std::string name = std::string("rms_norm") +
@@ -1690,7 +1695,11 @@ Tensor rotary_embedding_kernel(
   // input's element type; widening a Float16 activation here would both change
   // the contract and double the bytes written per token.  The matching image
   // format comes from the dtype-selected shader variant.
-  api::vTensor v_output{context, input.sizes(), input.dtype()};
+  // The walk below reads and writes texels, so the result is reserved as an
+  // image even for a shape an unasked allocation would keep in words.
+  api::vTensor v_output = allocate_output(
+      context, api::StorageType::TEXTURE_3D, input.sizes(),
+      input.dtype());
 
   const struct RotaryBlock final {
     ivec4 extents;

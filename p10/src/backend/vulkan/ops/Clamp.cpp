@@ -165,11 +165,11 @@ Tensor clamp(
       self_arg.dtype() != DType::Int64,
       "Vulkan clamp has no image form for a count wider than a word");
 
-  api::vTensor v_output{
-      context,
-      v_self.sizes(),
-      v_self.dtype(),
-  };
+  // The clip below reads and writes texels, so the result is reserved as an
+  // image even for a shape an unasked allocation would keep in words.
+  api::vTensor v_output = allocate_output(
+      context, api::StorageType::TEXTURE_3D, v_self.sizes(),
+      v_self.dtype());
 
   const struct Block final {
     ivec4 extents;

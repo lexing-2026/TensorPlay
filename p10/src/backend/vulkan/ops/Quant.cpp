@@ -205,22 +205,19 @@ Tensor quantize_per_tensor_qint8_kernel(
 
   api::Context* const context = api::context();
 
-  api::vTensor v_input = convert(self);
-  if (v_input.storage_type() != api::StorageType::TEXTURE_3D) {
-    TP_THROW(
-        NotImplementedError, "Vulkan quantize requires texture storage");
-  }
-
   // Downcast double inputs once on the host so the shader reads floats.
   const Tensor input_f32 =
       self.dtype() == DType::Float64 ? self.to(DType::Float32) : self;
-  api::vTensor v_src =
-      self.dtype() == DType::Float64 ? convert(input_f32) : v_input;
+  // The walk below samples and writes texels, and a code payload has no linear
+  // twin, so a payload the shape keeps in words crosses into an image first.
+  const Tensor input = to_image_storage(context, input_f32);
+  api::vTensor v_src = convert(input);
 
   // The output texture is allocated over the underlying integer code type;
   // the quantized dtype view with its quantizer is wrapped on below.
-  api::vTensor v_output{
-      context, v_src.sizes(), DType::Int8};
+  api::vTensor v_output =
+      allocate_output(context, api::StorageType::TEXTURE_3D,
+                      v_src.sizes(), DType::Int8);
 
   const struct QuantizeBlock block{
       ivec4(
@@ -324,8 +321,11 @@ Tensor dequantize_per_tensor_kernel(
         NotImplementedError, "Vulkan dequantize requires texture storage");
   }
 
-  api::vTensor v_output{
-      context, v_input.sizes(), DType::Float32};
+  // The walk samples texels and writes them back, so the float answer is
+  // reserved as an image whatever the shape alone would have picked.
+  api::vTensor v_output = allocate_output(
+      context, api::StorageType::TEXTURE_3D, v_input.sizes(),
+      DType::Float32);
 
   const struct DequantizeBlock block{
       ivec4(
@@ -563,7 +563,10 @@ Tensor dequantize_affine_kernel(
         "Vulkan dequantize_affine(): requires texture or buffer storage");
   }
 
-  api::vTensor v_output{context, v_codes.sizes(), DType::Float32};
+  // The undo walks texels of the code image, so the float answer is reserved in
+  // that class: its extents are what the sweep below dispatches over.
+  api::vTensor v_output = allocate_output(
+      context, api::StorageType::TEXTURE_3D, v_codes.sizes(), DType::Float32);
   // A texel's four lanes are four channels, so the depth of the channel groups
   // splits the image's z axis back into a batch and a group within it.
   const uint32_t channels = api::utils::safe_downcast_to_u32(
@@ -1306,11 +1309,14 @@ Tensor quantize_per_tensor_quint8_kernel(
 
   api::Context* const context = api::context();
 
-  api::vTensor v_src = convert(self);
+  // The walk samples the float payload a texel at a time, so a payload the
+  // shape keeps in words crosses into an image first.
+  const Tensor input = to_image_storage(context, self);
+  api::vTensor v_src = convert(input);
 
   // Codes land in a UInt8 texture; the QUInt8 view wraps on below.
-  api::vTensor v_output{
-      context, v_src.sizes(), DType::UInt8};
+  api::vTensor v_output = allocate_output(
+      context, api::StorageType::TEXTURE_3D, v_src.sizes(), DType::UInt8);
 
   const struct QuantizeBlock block{
       ivec4(
@@ -1359,8 +1365,9 @@ Tensor dequantize_per_tensor_quint8_kernel(
 
   api::vTensor v_input = convert(self);
 
-  api::vTensor v_output{
-      context, v_input.sizes(), DType::Float32};
+  // The undo writes the code image back as float texels.
+  api::vTensor v_output = allocate_output(
+      context, api::StorageType::TEXTURE_3D, v_input.sizes(), DType::Float32);
 
   const struct DequantizeBlock block{
       ivec4(
@@ -1400,11 +1407,12 @@ Tensor quantize_per_tensor_qint32_kernel(
 
   api::Context* const context = api::context();
 
-  api::vTensor v_src = convert(self);
+  const Tensor input = to_image_storage(context, self);
+  api::vTensor v_src = convert(input);
 
   // Codes land in an Int32 texture; the QInt32 view wraps on below.
-  api::vTensor v_output{
-      context, v_src.sizes(), DType::Int32};
+  api::vTensor v_output = allocate_output(
+      context, api::StorageType::TEXTURE_3D, v_src.sizes(), DType::Int32);
 
   const struct QuantizeBlock block{
       ivec4(
@@ -1453,8 +1461,9 @@ Tensor dequantize_per_tensor_qint32_kernel(
 
   api::vTensor v_input = convert(self);
 
-  api::vTensor v_output{
-      context, v_input.sizes(), DType::Float32};
+  // The undo writes the code image back as float texels.
+  api::vTensor v_output = allocate_output(
+      context, api::StorageType::TEXTURE_3D, v_input.sizes(), DType::Float32);
 
   const struct DequantizeBlock block{
       ivec4(
@@ -2240,7 +2249,10 @@ Tensor w4a16_linear_kernel(
       v_input.image(pipeline_barrier, api::PipelineStage::COMPUTE),
       pack_in_params.buffer());
 
-  api::vTensor v_output{context, {M, N}, DType::Float16};
+  // Both walks of this route read and write texels, so the product is reserved
+  // as an image even though the shape alone would now keep it in words.
+  api::vTensor v_output = allocate_output(
+      context, api::StorageType::TEXTURE_3D, {M, N}, DType::Float16);
 
   if (M == 1) {
     // Decode shape: one thread per output channel, no shared-memory

@@ -397,10 +397,15 @@ Tensor eye_kernel(
       dtype == DType::Float32 || dtype == DType::Float16 ||
           dtype == DType::Int32,
       "Vulkan eye supports Float32, Float16 and Int32 only");
-  Tensor t = empty_kernel({n, m}, dtype, resolve_device(device), false);
+  api::Context* context = api::context();
+  // The only writer of this payload stores one texel per lane, so the result is
+  // reserved in the class that walk writes rather than the one the shape alone
+  // would pick.
+  api::vTensor made = allocate_output(
+      context, api::StorageType::TEXTURE_3D, {n, m}, convert_dtype(dtype));
+  Tensor t = convert(made);
   if (t.numel() == 0) return t;
   api::vTensor v = convert(t);
-  api::Context* context = api::context();
   const char* shader = dtype == DType::Int32 ? "eye_i32" :
       dtype == DType::Float16 ? "eye_f16" : "eye";
   api::PipelineBarrier barrier{};

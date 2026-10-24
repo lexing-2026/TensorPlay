@@ -41,8 +41,15 @@ std::tuple<Tensor, Tensor> sort_impl(
   out_sizes[dim] = count;
   api::Context* context = api::context();
   api::vTensor input = convert(self);
-  api::vTensor values{context, out_sizes, self.dtype()};
-  api::vTensor indices{context, out_sizes, DType::Int32};
+  // The final gather writes both results in one walk, so they must live in the
+  // same class: a walk that binds a linear destination onto a payload reserved
+  // as an image finds no buffer behind it.  The order the two follow is the one
+  // the payload they are read from already sits in.
+  const api::StorageType result_storage = input.storage_type();
+  api::vTensor values =
+      allocate_output(context, result_storage, out_sizes, self.dtype());
+  api::vTensor indices =
+      allocate_output(context, result_storage, out_sizes, DType::Int32);
   if (values.numel() == 0) return {convert(values), convert(indices)};
 
   // Sort 2048-element tiles in shared memory (one workgroup per tile, all
