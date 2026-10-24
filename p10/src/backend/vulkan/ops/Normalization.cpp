@@ -2507,6 +2507,10 @@ Tensor scaled_dot_product_attention_kernel(
     if (!mask_f.device().is_vulkan()) {
       mask_f = mask_f.to(query.device());
     }
+    // The score walk samples the rejection lane by lane, so a plane the shape
+    // keeps in words crosses into an image before it is bound: the gather is
+    // one pass over (Sq, Skv) while the scores it feeds are read per head.
+    mask_f = to_image_storage(context, mask_f);
     mask_mode = sdpa_mask_mode(
         static_cast<std::vector<int64_t>>(mask_f.shape()), B, Hq);
   }
