@@ -8,9 +8,9 @@
 // the four packed streams of a ternary map it is a fifth of everything the
 // walk moves.  A streamed store writes whole blocks out of a write-combining
 // buffer and leaves the fetch out, which is worth having only while the
-// destination would not have been wanted in cache again anyway -- so the
-// choice is made on whether the walk's working set is larger than the cache
-// that would have had to hold it.
+// destination would not have been wanted in cache again anyway -- the test
+// ternary_works_past_cache asks is whether the team could have held the
+// destination at all.
 
 #include "Parallel.h"
 
@@ -111,11 +111,19 @@ inline bool ranges_apart(const void* one, const void* other, int64_t bytes) {
 }
 
 // A ternary walk of three packed operands and one packed destination of the
-// same width moves four times n bytes, and the team holds those only while
-// they fit in the share of the last-level cache its threads add up to.  Past
-// that the lines are chosen against everything else running, and the
-// destination is asked for again only by the walk that wrote it -- which
-// never reads it.
+// same width answers whether to stream by asking one question of the
+// destination alone: can the team hold it?  A destination it can hold keeps
+// its lines in the last level cache between the calls that write it -- an
+// optimizer step, a repeated fill -- and each of those calls rewrites lines
+// that are already there, so little of the destination reaches memory.  A
+// line streamed away is gone before the next such call arrives, and that
+// call pays for the whole destination again at the memory controller, which
+// takes a write stream at a lower rate than it takes a read of the same
+// bytes.
+//
+// Once the destination by itself outgrows what the team can hold, nothing
+// stays to be asked for again and the fetch a streamed store avoids is all
+// that is left, so the walk takes it.
 //
 // A destination that is another window over an operand is a different matter:
 // there the walk does read its own stores back, and a line streamed away has
@@ -128,7 +136,7 @@ inline bool ternary_works_past_cache(int64_t n, const T* result, const T* self,
         return false;
     }
     const int64_t team = parallel::get_num_threads();
-    if (bytes * 4 <= last_level_bytes_per_core() * team) {
+    if (bytes <= last_level_bytes_per_core() * team) {
         return false;
     }
     return ranges_apart(result, self, bytes) &&
