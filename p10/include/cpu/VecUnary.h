@@ -1481,14 +1481,16 @@ inline __m256d v_exp_f64(__m256d x) {
     p = _mm256_fmadd_pd(p, r, _mm256_set1_pd(0.5));
     p = _mm256_fmadd_pd(p, r, _mm256_set1_pd(1.0));
     p = _mm256_fmadd_pd(p, r, _mm256_set1_pd(1.0));
-    const __m256d half = _mm256_round_pd(_mm256_mul_pd(k, _mm256_set1_pd(0.5)),
-                                         _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    // The two halves are split in integer form rather than by rounding k/2 in
+    // floating point: ceil(k/2) and the remainder still add back to k, and the
+    // vector only has to be converted out once.
+    const __m128i k32 = _mm256_cvtpd_epi32(k);
+    const __m128i hi = _mm_srai_epi32(_mm_add_epi32(k32, _mm_set1_epi32(1)), 1);
     const __m256i bias = _mm256_set1_epi64x(1023);
     const __m256d s1 = _mm256_castsi256_pd(_mm256_slli_epi64(
-        _mm256_add_epi64(_mm256_cvtepi32_epi64(_mm256_cvtpd_epi32(half)), bias), 52));
+        _mm256_add_epi64(_mm256_cvtepi32_epi64(hi), bias), 52));
     const __m256d s2 = _mm256_castsi256_pd(_mm256_slli_epi64(
-        _mm256_add_epi64(_mm256_cvtepi32_epi64(_mm256_cvtpd_epi32(
-                             _mm256_sub_pd(k, half))), bias), 52));
+        _mm256_add_epi64(_mm256_cvtepi32_epi64(_mm_sub_epi32(k32, hi)), bias), 52));
     return _mm256_mul_pd(_mm256_mul_pd(p, s1), s2);
 }
 
@@ -1686,31 +1688,73 @@ inline __m256d v_erfc_f64(__m256d x) {
     return _mm256_add_pd(r, _mm256_setzero_pd());
 }
 
+// erf on double lanes.  Up to 2 the quotient erf(x)/x is a degree-17 fit in
+// t = x^2/2 - 1, a form with no subtraction in it, so the relative accuracy of
+// the series survives to the result.  Past 2 the same quotient is reached
+// through the complement, taken as the reciprocal of a degree-19 fit of
+// erfc(x)^(-1/16) raised to the sixteenth power: four squarings stand in for
+// the exponential and its argument reduction, and the fitted factor only spans
+// 1.4 to 11 over the range.  The input is clamped at 6, where the complement is
+// already below half an ulp of one, so every lane past it answers exactly 1.
+// A NaN passes the clamp untouched because it is the second operand, which is
+// the one the minimum instruction returns when either side is unordered.
 __attribute__((target("avx2,fma"), always_inline))
 inline __m256d v_erf_f64(__m256d x) {
     const __m256d one = _mm256_set1_pd(1.0);
     const __m256d signbit = _mm256_set1_pd(-0.0);
     const __m256d ax = _mm256_andnot_pd(signbit, x);
-    // The series is fitted in t = 2x^2 - 1 over [-1, 1].
-    const __m256d t = _mm256_fmadd_pd(
-        _mm256_mul_pd(x, x), _mm256_set1_pd(2.0), _mm256_set1_pd(-1.0));
-    __m256d p = _mm256_set1_pd(1.4543887079465116e-14);
-    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(-3.8078824063194953e-13));
-    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(9.167619596865806e-12));
-    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(-2.0352284058157691e-10));
-    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(4.1158005832081488e-09));
-    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(-7.5115692865917272e-08));
-    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(1.223382738359897e-06));
-    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(-1.7537169441124866e-05));
-    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(0.00021751715604159932));
-    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(-0.0022854855611441132));
-    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(0.019852496688983708));
-    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(-0.14053608902271711));
-    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(0.96546873866986727));
+    const __m256d t = _mm256_fmadd_pd(_mm256_mul_pd(ax, ax),
+                                      _mm256_set1_pd(0.5), _mm256_set1_pd(-1.0));
+    __m256d p = _mm256_set1_pd(-1.88741637439674822e-12);
+    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(1.72188581554841830e-11));
+    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(-1.40155406333159304e-10));
+    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(1.13316117879612726e-09));
+    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(-8.61766514420579149e-09));
+    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(6.11973590542225037e-08));
+    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(-4.04509494736763476e-07));
+    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(2.47580105876321681e-06));
+    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(-1.39462737275972513e-05));
+    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(7.18010087814341700e-05));
+    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(-3.35143533529314627e-04));
+    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(1.40509142358536342e-03));
+    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(-5.23487583615802731e-03));
+    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(1.71283445718231446e-02));
+    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(-4.86627774491550924e-02));
+    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(1.19479138609851626e-01));
+    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(-2.61111860931245388e-01));
+    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(6.74933236039655049e-01));
     const __m256d near = _mm256_mul_pd(x, p);
-    const __m256d far = _mm256_sub_pd(one, v_erfc_tail_f64(ax));
+    const __m256d ac = _mm256_min_pd(_mm256_set1_pd(6.0), ax);
+    const __m256d tf = _mm256_mul_pd(_mm256_sub_pd(ac, _mm256_set1_pd(4.0)),
+                                     _mm256_set1_pd(0.5));
+    __m256d q = _mm256_set1_pd(1.03838257208176768e-09);
+    q = _mm256_fmadd_pd(q, tf, _mm256_set1_pd(5.71343613323906640e-09));
+    q = _mm256_fmadd_pd(q, tf, _mm256_set1_pd(2.39829938878930770e-08));
+    q = _mm256_fmadd_pd(q, tf, _mm256_set1_pd(1.20093813619575749e-07));
+    q = _mm256_fmadd_pd(q, tf, _mm256_set1_pd(5.85482141133101655e-07));
+    q = _mm256_fmadd_pd(q, tf, _mm256_set1_pd(2.71759705131416074e-06));
+    q = _mm256_fmadd_pd(q, tf, _mm256_set1_pd(1.20931192017991857e-05));
+    q = _mm256_fmadd_pd(q, tf, _mm256_set1_pd(5.15683245066669922e-05));
+    q = _mm256_fmadd_pd(q, tf, _mm256_set1_pd(2.10250621946793831e-04));
+    q = _mm256_fmadd_pd(q, tf, _mm256_set1_pd(8.13158231721587362e-04));
+    q = _mm256_fmadd_pd(q, tf, _mm256_set1_pd(2.98004904880838986e-03));
+    q = _mm256_fmadd_pd(q, tf, _mm256_set1_pd(1.02438853513442570e-02));
+    q = _mm256_fmadd_pd(q, tf, _mm256_set1_pd(3.28915725965540015e-02));
+    q = _mm256_fmadd_pd(q, tf, _mm256_set1_pd(9.74006074349214185e-02));
+    q = _mm256_fmadd_pd(q, tf, _mm256_set1_pd(2.62969278706932041e-01));
+    q = _mm256_fmadd_pd(q, tf, _mm256_set1_pd(6.36422385744002450e-01));
+    q = _mm256_fmadd_pd(q, tf, _mm256_set1_pd(1.33680714216341312e+00));
+    q = _mm256_fmadd_pd(q, tf, _mm256_set1_pd(2.38025074259940705e+00));
+    q = _mm256_fmadd_pd(q, tf, _mm256_set1_pd(3.16880692459380864e+00));
+    q = _mm256_fmadd_pd(q, tf, _mm256_set1_pd(3.07786490674295621e+00));
+    __m256d rr = _mm256_div_pd(one, q);
+    rr = _mm256_mul_pd(rr, rr);
+    rr = _mm256_mul_pd(rr, rr);
+    rr = _mm256_mul_pd(rr, rr);
+    rr = _mm256_mul_pd(rr, rr);
+    const __m256d far = _mm256_sub_pd(one, rr);
     const __m256d r = _mm256_blendv_pd(
-        far, near, _mm256_cmp_pd(ax, one, _CMP_LE_OQ));
+        far, near, _mm256_cmp_pd(ax, _mm256_set1_pd(2.0), _CMP_LE_OQ));
     return _mm256_or_pd(r, _mm256_and_pd(x, signbit));
 }
 
