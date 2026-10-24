@@ -84,10 +84,6 @@ template <class F>
 void invoke_parallel_balanced(int64_t begin, int64_t end, int64_t grain_size,
                               const F& f);
 
-template <class F>
-void invoke_parallel_weighted(int64_t begin, int64_t end, int64_t grain_size,
-                              const F& f);
-
 // Non-template core dispatched by invoke_parallel; implemented in Parallel.cpp.
 P10_API void invoke_parallel_impl(
     int64_t begin,
@@ -105,21 +101,6 @@ P10_API void invoke_parallel_impl(
 // its own per thread: a body that folds into a per-thread slot must stay with
 // the split, because a slot would then hold several ranges.
 P10_API void invoke_parallel_balanced_impl(
-    int64_t begin,
-    int64_t end,
-    int64_t grain_size,
-    const std::function<void(int64_t, int64_t)>& f);
-
-// Non-template core dispatched by invoke_parallel_weighted; implemented in
-// Parallel.cpp.  The walk is split once among the team, as in the plain
-// split, but the shares follow the capacity each core publishes rather than
-// the thread count alone.  A team that spans two kinds of core answers a
-// range at two rates, and an even split leaves the slower kind holding the
-// closing stretch while the faster kind has nothing left: the walk then ends
-// when the slower cores are done, not when the team is.  A body here keeps
-// the same contract as the plain split -- it may fold into a per-thread slot
-// indexed by get_thread_num(), because it sees one range.
-P10_API void invoke_parallel_weighted_impl(
     int64_t begin,
     int64_t end,
     int64_t grain_size,
@@ -192,39 +173,6 @@ inline void parallel_for_balanced(int64_t begin, int64_t end,
   internal::invoke_parallel_balanced(begin, end, grain_size, f);
 }
 
-/*
-parallel_for_weighted
-
-begin: index at which to start applying user function
-end:   index at which to stop applying user function
-grain_size: iteration count below which the walk is not spread.
-f: user function applied to each share, signature:
-   void f(int64_t begin, int64_t end)
-
-The same guards as parallel_for.  The walk is cut once, but the cut follows
-the capacity the firmware publishes for the core each thread is running on,
-so a team that spans two kinds of core finishes together instead of waiting
-for the slower kind.  Use it where the per-thread contract of the plain split
-is enough and the walk costs enough per element for the capacity gap to show.
-*/
-template <class F>
-inline void parallel_for_weighted(int64_t begin, int64_t end,
-                                  int64_t grain_size, const F& f) {
-  if (begin >= end) {
-    return;
-  }
-  internal::lazy_init_num_threads();
-  const int64_t numiter = end - begin;
-  const bool use_parallel =
-      (numiter > grain_size && numiter > 1 && !in_parallel_region() && get_num_threads() > 1);
-  if (!use_parallel) {
-    internal::ThreadIdGuard tid_guard(0);
-    f(begin, end);
-    return;
-  }
-  internal::invoke_parallel_weighted(begin, end, grain_size, f);
-}
-
 namespace internal {
 
 template <class F>
@@ -236,13 +184,6 @@ template <class F>
 void invoke_parallel_balanced(int64_t begin, int64_t end, int64_t grain_size,
                               const F& f) {
   invoke_parallel_balanced_impl(
-      begin, end, grain_size, [&f](int64_t b, int64_t e) { f(b, e); });
-}
-
-template <class F>
-void invoke_parallel_weighted(int64_t begin, int64_t end, int64_t grain_size,
-                              const F& f) {
-  invoke_parallel_weighted_impl(
       begin, end, grain_size, [&f](int64_t b, int64_t e) { f(b, e); });
 }
 
