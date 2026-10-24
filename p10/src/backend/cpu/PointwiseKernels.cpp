@@ -3842,6 +3842,7 @@ void lerp_tensor_f32_avx2(const float* self, const float* end,
 // same way the scalar walk computes it: the weight picks the nearer end
 // when it is below a half, and the answer is narrowed where it is stored.
 #if defined(TP_VECREDUCED_X86)
+template <bool Stream>
 __attribute__((target("avx2,f16c,fma"), noinline))
 void lerp_tensor_half_walk(const tensorplay::Half* self,
                            const tensorplay::Half* end,
@@ -3855,7 +3856,35 @@ void lerp_tensor_half_walk(const tensorplay::Half* self,
     const __m256 one = _mm256_set1_ps(1.0f);
     const __m256 abs_mask = _mm256_set1_ps(-0.0f);
     int64_t i = 0;
+    if constexpr (Stream) {
+        // A streamed store writes a whole 32-byte block, and the span the
+        // thread was handed begins wherever the split left it, so the
+        // elements before the first block are answered one at a time.
+        while (i < n &&
+               (reinterpret_cast<uintptr_t>(out_bits + i) & 31u) != 0) {
+            result[i] = lerp_scalar_value(self[i], end[i], weight[i]);
+            ++i;
+        }
+    }
     for (; i + 16 <= n; i += 16) {
+        if constexpr (Stream) {
+            // Two lines of each operand, asked for the distance the next two
+            // steps cover: the answer waits on the memory rather than on the
+            // selects, and the destination is left out because it goes past
+            // the cache anyway.
+            _mm_prefetch(reinterpret_cast<const char*>(self_bits + i + 32),
+                         _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(self_bits + i + 64),
+                         _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(end_bits + i + 32),
+                         _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(end_bits + i + 64),
+                         _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(weight_bits + i + 32),
+                         _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(weight_bits + i + 64),
+                         _MM_HINT_T0);
+        }
         const __m256 s0 = tensorplay::cpu::vecreduced::widen8(self_bits + i);
         const __m256 e0 = tensorplay::cpu::vecreduced::widen8(end_bits + i);
         const __m256 w0 = tensorplay::cpu::vecreduced::widen8(weight_bits + i);
@@ -3873,7 +3902,7 @@ void lerp_tensor_half_walk(const tensorplay::Half* self,
         const __m256 coeff1 = _mm256_blendv_ps(_mm256_sub_ps(w1, one), w1, small1);
         const __m256 base0 = _mm256_blendv_ps(e0, s0, small0);
         const __m256 base1 = _mm256_blendv_ps(e1, s1, small1);
-        tensorplay::cpu::vecreduced::store_f16_16(
+        tensorplay::cpu::vecreduced::lay_f16_block<Stream>(
             out_bits + i,
             _mm256_fmadd_ps(coeff0, _mm256_sub_ps(e0, s0), base0),
             _mm256_fmadd_ps(coeff1, _mm256_sub_ps(e1, s1), base1));
@@ -3886,13 +3915,17 @@ void lerp_tensor_half_walk(const tensorplay::Half* self,
             _mm256_cmp_ps(_mm256_andnot_ps(abs_mask, w), half, _CMP_LT_OQ);
         const __m256 coeff = _mm256_blendv_ps(_mm256_sub_ps(w, one), w, small);
         const __m256 base = _mm256_blendv_ps(e, s, small);
-        _mm_storeu_si128(
-            reinterpret_cast<__m128i*>(out_bits + i),
-            tensorplay::cpu::vecreduced::narrow8(
-                _mm256_fmadd_ps(coeff, _mm256_sub_ps(e, s), base)));
+        tensorplay::cpu::vecreduced::lay_f16_8<Stream>(
+            out_bits + i,
+            _mm256_fmadd_ps(coeff, _mm256_sub_ps(e, s), base));
     }
     for (; i < n; ++i) {
         result[i] = lerp_scalar_value(self[i], end[i], weight[i]);
+    }
+    if constexpr (Stream) {
+        // The streamed blocks are complete once this returns; what reads the
+        // destination afterwards has to see them in order.
+        _mm_sfence();
     }
 }
 #endif  // TP_VECREDUCED_X86
@@ -4097,10 +4130,21 @@ void lerp_tensor_contiguous(const T* self, const T* end, const T* weight,
 #if defined(TP_VECREDUCED_X86)
         if (tensorplay::cpu::vecreduced::f16c_available() &&
             __builtin_cpu_supports("fma")) {
-            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t finish) {
-                lerp_tensor_half_walk(self + begin, end + begin,
-                                      weight + begin, result + begin,
-                                      finish - begin);
+            if (tensorplay::cpu::streamdst::ternary_works_past_cache(
+                    n, result, self, end, weight)) {
+                parallel_for_weighted(0, n, GRAIN_SIZE,
+                                      [&](int64_t begin, int64_t finish) {
+                    lerp_tensor_half_walk<true>(self + begin, end + begin,
+                                                weight + begin, result + begin,
+                                                finish - begin);
+                });
+                return;
+            }
+            parallel_for_weighted(0, n, GRAIN_SIZE,
+                                  [&](int64_t begin, int64_t finish) {
+                lerp_tensor_half_walk<false>(self + begin, end + begin,
+                                             weight + begin, result + begin,
+                                             finish - begin);
             });
             return;
         }

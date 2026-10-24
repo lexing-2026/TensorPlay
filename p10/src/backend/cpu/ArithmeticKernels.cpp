@@ -4335,6 +4335,7 @@ Tensor& div_scalar_inplace_kernel(Tensor& self, const Scalar& other) {
 //
 // The elements that do not fill a step are answered by the software walk,
 // one element at a time.
+template <bool Stream>
 __attribute__((target("avx2,f16c"), noinline))
 void addcmul_half_walk(const tensorplay::Half* self,
                        const tensorplay::Half* tensor1,
@@ -4346,10 +4347,41 @@ void addcmul_half_walk(const tensorplay::Half* self,
     auto* out_bits = reinterpret_cast<uint16_t*>(result);
     const __m256 scale = _mm256_set1_ps(alpha);
     int64_t i = begin;
+    if constexpr (Stream) {
+        // A streamed store writes a whole 32-byte block, and the span the
+        // thread was handed begins wherever the split left it, so the
+        // elements before the first block are answered one at a time.
+        while (i < end &&
+               (reinterpret_cast<uintptr_t>(out_bits + i) & 31u) != 0) {
+            const float product = alpha * static_cast<float>(tensor1[i]);
+            result[i] = tensorplay::Half(
+                static_cast<float>(self[i]) +
+                product * static_cast<float>(tensor2[i]));
+            ++i;
+        }
+    }
     // Four answers are built before any of them is stored: the crossings and
     // the products are independent per answer, so a wider step keeps more of
     // them in flight.  The arithmetic order per answer is unchanged.
     for (; i + 32 <= end; i += 32) {
+        if constexpr (Stream) {
+            // Two lines of each operand, asked for the distance the next two
+            // steps cover: the answer waits on the memory rather than on the
+            // products, and the destination is left out because it goes past
+            // the cache anyway.
+            _mm_prefetch(reinterpret_cast<const char*>(self_bits + i + 32),
+                         _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(self_bits + i + 64),
+                         _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(t1_bits + i + 32),
+                         _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(t1_bits + i + 64),
+                         _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(t2_bits + i + 32),
+                         _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(t2_bits + i + 64),
+                         _MM_HINT_T0);
+        }
         __m256 s0, s1, s2, s3, x0, x1, x2, x3, y0, y1, y2, y3;
         tensorplay::cpu::vecreduced::widen_f16_16(self_bits + i, s0, s1);
         tensorplay::cpu::vecreduced::widen_f16_16(t1_bits + i, x0, x1);
@@ -4361,9 +4393,9 @@ void addcmul_half_walk(const tensorplay::Half* self,
         const __m256 q1 = _mm256_mul_ps(_mm256_mul_ps(scale, x1), y1);
         const __m256 q2 = _mm256_mul_ps(_mm256_mul_ps(scale, x2), y2);
         const __m256 q3 = _mm256_mul_ps(_mm256_mul_ps(scale, x3), y3);
-        tensorplay::cpu::vecreduced::store_f16_16(
+        tensorplay::cpu::vecreduced::lay_f16_block<Stream>(
             out_bits + i, _mm256_add_ps(s0, q0), _mm256_add_ps(s1, q1));
-        tensorplay::cpu::vecreduced::store_f16_16(
+        tensorplay::cpu::vecreduced::lay_f16_block<Stream>(
             out_bits + i + 16, _mm256_add_ps(s2, q2), _mm256_add_ps(s3, q3));
     }
     for (; i + 16 <= end; i += 16) {
@@ -4375,9 +4407,8 @@ void addcmul_half_walk(const tensorplay::Half* self,
         const __m256 q0 = _mm256_mul_ps(p0, y0);
         const __m256 p1 = _mm256_mul_ps(scale, x1);
         const __m256 q1 = _mm256_mul_ps(p1, y1);
-        tensorplay::cpu::vecreduced::store_f16_16(out_bits + i,
-                                                  _mm256_add_ps(s0, q0),
-                                                  _mm256_add_ps(s1, q1));
+        tensorplay::cpu::vecreduced::lay_f16_block<Stream>(
+            out_bits + i, _mm256_add_ps(s0, q0), _mm256_add_ps(s1, q1));
     }
     for (; i + 8 <= end; i += 8) {
         const __m256 s = tensorplay::cpu::vecreduced::widen8(self_bits + i);
@@ -4385,17 +4416,22 @@ void addcmul_half_walk(const tensorplay::Half* self,
         const __m256 y = tensorplay::cpu::vecreduced::widen8(t2_bits + i);
         const __m256 product = _mm256_mul_ps(scale, x);
         const __m256 scaled = _mm256_mul_ps(product, y);
-        _mm_storeu_si128(
-            reinterpret_cast<__m128i*>(out_bits + i),
-            tensorplay::cpu::vecreduced::narrow8(_mm256_add_ps(s, scaled)));
+        tensorplay::cpu::vecreduced::lay_f16_8<Stream>(
+            out_bits + i, _mm256_add_ps(s, scaled));
     }
     for (; i < end; ++i) {
         const float product = alpha * static_cast<float>(tensor1[i]);
         result[i] = tensorplay::Half(static_cast<float>(self[i]) +
                                       product * static_cast<float>(tensor2[i]));
     }
+    if constexpr (Stream) {
+        // The streamed blocks are complete once this returns; what reads the
+        // destination afterwards has to see them in order.
+        _mm_sfence();
+    }
 }
 
+template <bool Stream>
 __attribute__((target("avx2,f16c"), noinline))
 void addcdiv_half_walk(const tensorplay::Half* self,
                        const tensorplay::Half* tensor1,
@@ -4407,9 +4443,40 @@ void addcdiv_half_walk(const tensorplay::Half* self,
     auto* out_bits = reinterpret_cast<uint16_t*>(result);
     const __m256 scale = _mm256_set1_ps(alpha);
     int64_t i = begin;
+    if constexpr (Stream) {
+        // A streamed store writes a whole 32-byte block, and the span the
+        // thread was handed begins wherever the split left it, so the
+        // elements before the first block are answered one at a time.
+        while (i < end &&
+               (reinterpret_cast<uintptr_t>(out_bits + i) & 31u) != 0) {
+            const float product = alpha * static_cast<float>(tensor1[i]);
+            result[i] = tensorplay::Half(
+                static_cast<float>(self[i]) +
+                product / static_cast<float>(tensor2[i]));
+            ++i;
+        }
+    }
     // The quotient has the longer dependency, so four of them are kept in
     // flight per step; the arithmetic order per answer is unchanged.
     for (; i + 32 <= end; i += 32) {
+        if constexpr (Stream) {
+            // Two lines of each operand, asked for the distance the next two
+            // steps cover: the answer waits on the memory rather than on the
+            // quotients, and the destination is left out because it goes past
+            // the cache anyway.
+            _mm_prefetch(reinterpret_cast<const char*>(self_bits + i + 32),
+                         _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(self_bits + i + 64),
+                         _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(t1_bits + i + 32),
+                         _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(t1_bits + i + 64),
+                         _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(t2_bits + i + 32),
+                         _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(t2_bits + i + 64),
+                         _MM_HINT_T0);
+        }
         __m256 s0, s1, s2, s3, x0, x1, x2, x3, y0, y1, y2, y3;
         tensorplay::cpu::vecreduced::widen_f16_16(self_bits + i, s0, s1);
         tensorplay::cpu::vecreduced::widen_f16_16(t1_bits + i, x0, x1);
@@ -4421,9 +4488,9 @@ void addcdiv_half_walk(const tensorplay::Half* self,
         const __m256 q1 = _mm256_div_ps(_mm256_mul_ps(scale, x1), y1);
         const __m256 q2 = _mm256_div_ps(_mm256_mul_ps(scale, x2), y2);
         const __m256 q3 = _mm256_div_ps(_mm256_mul_ps(scale, x3), y3);
-        tensorplay::cpu::vecreduced::store_f16_16(
+        tensorplay::cpu::vecreduced::lay_f16_block<Stream>(
             out_bits + i, _mm256_add_ps(s0, q0), _mm256_add_ps(s1, q1));
-        tensorplay::cpu::vecreduced::store_f16_16(
+        tensorplay::cpu::vecreduced::lay_f16_block<Stream>(
             out_bits + i + 16, _mm256_add_ps(s2, q2), _mm256_add_ps(s3, q3));
     }
     for (; i + 16 <= end; i += 16) {
@@ -4435,9 +4502,8 @@ void addcdiv_half_walk(const tensorplay::Half* self,
         const __m256 q0 = _mm256_div_ps(p0, y0);
         const __m256 p1 = _mm256_mul_ps(scale, x1);
         const __m256 q1 = _mm256_div_ps(p1, y1);
-        tensorplay::cpu::vecreduced::store_f16_16(out_bits + i,
-                                                  _mm256_add_ps(s0, q0),
-                                                  _mm256_add_ps(s1, q1));
+        tensorplay::cpu::vecreduced::lay_f16_block<Stream>(
+            out_bits + i, _mm256_add_ps(s0, q0), _mm256_add_ps(s1, q1));
     }
     for (; i + 8 <= end; i += 8) {
         const __m256 s = tensorplay::cpu::vecreduced::widen8(self_bits + i);
@@ -4445,14 +4511,18 @@ void addcdiv_half_walk(const tensorplay::Half* self,
         const __m256 y = tensorplay::cpu::vecreduced::widen8(t2_bits + i);
         const __m256 product = _mm256_mul_ps(scale, x);
         const __m256 scaled = _mm256_div_ps(product, y);
-        _mm_storeu_si128(
-            reinterpret_cast<__m128i*>(out_bits + i),
-            tensorplay::cpu::vecreduced::narrow8(_mm256_add_ps(s, scaled)));
+        tensorplay::cpu::vecreduced::lay_f16_8<Stream>(
+            out_bits + i, _mm256_add_ps(s, scaled));
     }
     for (; i < end; ++i) {
         const float product = alpha * static_cast<float>(tensor1[i]);
         result[i] = tensorplay::Half(static_cast<float>(self[i]) +
                                       product / static_cast<float>(tensor2[i]));
+    }
+    if constexpr (Stream) {
+        // The streamed blocks are complete once this returns; what reads the
+        // destination afterwards has to see them in order.
+        _mm_sfence();
     }
 }
 // The other reduced width crosses by a shift of the single-precision
@@ -4856,9 +4926,19 @@ void addcmul_dense_walk(const Tensor& self, const Tensor& tensor1,
     if constexpr (std::is_same_v<T, tensorplay::Half>) {
         if (tensorplay::cpu::vecreduced::f16c_available()) {
             const float scale = static_cast<float>(alpha);
-            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-                addcmul_half_walk(self_ptr, tensor1_ptr, tensor2_ptr, scale,
-                                  result_ptr, begin, end);
+            if (tensorplay::cpu::streamdst::ternary_works_past_cache(
+                    n, result_ptr, self_ptr, tensor1_ptr, tensor2_ptr)) {
+                parallel_for_weighted(0, n, GRAIN_SIZE,
+                                      [&](int64_t begin, int64_t end) {
+                    addcmul_half_walk<true>(self_ptr, tensor1_ptr, tensor2_ptr,
+                                            scale, result_ptr, begin, end);
+                });
+                return;
+            }
+            parallel_for_weighted(0, n, GRAIN_SIZE,
+                                  [&](int64_t begin, int64_t end) {
+                addcmul_half_walk<false>(self_ptr, tensor1_ptr, tensor2_ptr,
+                                         scale, result_ptr, begin, end);
             });
             return;
         }
@@ -5157,15 +5237,27 @@ void addcdiv_dense_walk(const Tensor& self, const Tensor& tensor1,
     if constexpr (std::is_same_v<T, tensorplay::Half>) {
         if (tensorplay::cpu::vecreduced::f16c_available()) {
             const float scale = static_cast<float>(alpha);
-            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-                addcdiv_half_walk(self_ptr, tensor1_ptr, tensor2_ptr, scale,
-                                  result_ptr, begin, end);
+            if (tensorplay::cpu::streamdst::ternary_works_past_cache(
+                    n, result_ptr, self_ptr, tensor1_ptr, tensor2_ptr)) {
+                parallel_for_weighted(0, n, GRAIN_SIZE,
+                                      [&](int64_t begin, int64_t end) {
+                    addcdiv_half_walk<true>(self_ptr, tensor1_ptr, tensor2_ptr,
+                                            scale, result_ptr, begin, end);
+                });
+                return;
+            }
+            parallel_for_weighted(0, n, GRAIN_SIZE,
+                                  [&](int64_t begin, int64_t end) {
+                addcdiv_half_walk<false>(self_ptr, tensor1_ptr, tensor2_ptr,
+                                         scale, result_ptr, begin, end);
             });
             return;
         }
     } else if constexpr (std::is_same_v<T, float>) {
         if (tensorplay::cpu::vecbinary::avx2_available()) {
             const float scale = static_cast<float>(alpha);
+            // The fixed split, as in addcmul: the walk answers a range in
+            // about the time the team spends queueing for the shared counter.
             if (tensorplay::cpu::streamdst::ternary_works_past_cache(
                     n, result_ptr, self_ptr, tensor1_ptr, tensor2_ptr)) {
                 parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
