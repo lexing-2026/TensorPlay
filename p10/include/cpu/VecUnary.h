@@ -2867,7 +2867,87 @@ inline void run_f32(VOp op, VParams prm, const float* src, float* dst, int64_t b
     for (int64_t i = b; i < e; ++i) dst[i] = scalar_apply(op, prm, src[i]);
 }
 
+#ifdef USE_MKL
+// The MKL vector math library exposes batch entry points that take a whole
+// contiguous array per call.  The mode word is taken from mkl_vml_defines.h:
+// VML_HA (0x2) selects the high-accuracy kernel, VML_ERRMODE_IGNORE (0x100)
+// lets an out-of-domain input produce NaN directly instead of entering the
+// error callback (without it, log over negative lanes runs two orders of
+// magnitude slower), and VML_FTZDAZ_OFF (0x140000) keeps subnormals.
+//
+// tanh is deliberately absent: the piecewise form in this file is about
+// fifteen percent faster than the library kernel, so it keeps its own path.
+extern "C" {
+void vmdExp(const int, const double[], double[], const long long) noexcept;
+void vmdLn(const int, const double[], double[], const long long) noexcept;
+void vmdLog2(const int, const double[], double[], const long long) noexcept;
+void vmdLog10(const int, const double[], double[], const long long) noexcept;
+void vmdLog1p(const int, const double[], double[], const long long) noexcept;
+void vmdExpm1(const int, const double[], double[], const long long) noexcept;
+void vmdErf(const int, const double[], double[], const long long) noexcept;
+void vmdErfc(const int, const double[], double[], const long long) noexcept;
+void vmdSin(const int, const double[], double[], const long long) noexcept;
+void vmdCos(const int, const double[], double[], const long long) noexcept;
+void vmdTan(const int, const double[], double[], const long long) noexcept;
+void vmdAsin(const int, const double[], double[], const long long) noexcept;
+void vmdAcos(const int, const double[], double[], const long long) noexcept;
+void vmdAtan(const int, const double[], double[], const long long) noexcept;
+void vmdSinh(const int, const double[], double[], const long long) noexcept;
+void vmdCosh(const int, const double[], double[], const long long) noexcept;
+void vmdAsinh(const int, const double[], double[], const long long) noexcept;
+void vmdAcosh(const int, const double[], double[], const long long) noexcept;
+void vmdAtanh(const int, const double[], double[], const long long) noexcept;
+int MKL_Set_Num_Threads_Local(int) noexcept;
+}
+
+constexpr long long kVml64Mode =
+    0x2LL /* VML_HA */ | 0x100LL /* VML_ERRMODE_IGNORE */ |
+    0x140000LL /* VML_FTZDAZ_OFF */;
+
+using Vml64Entry = void (*)(const int, const double[], double[], const long long);
+
+inline Vml64Entry vml64_entry(VOp op) {
+    switch (op) {
+        case VOp::Exp:   return vmdExp;
+        case VOp::Expm1: return vmdExpm1;
+        case VOp::Log:   return vmdLn;
+        case VOp::Log2:  return vmdLog2;
+        case VOp::Log10: return vmdLog10;
+        case VOp::Log1p: return vmdLog1p;
+        case VOp::Sin:   return vmdSin;
+        case VOp::Cos:   return vmdCos;
+        case VOp::Tan:   return vmdTan;
+        case VOp::Asin:  return vmdAsin;
+        case VOp::Acos:  return vmdAcos;
+        case VOp::Atan:  return vmdAtan;
+        case VOp::Sinh:  return vmdSinh;
+        case VOp::Cosh:  return vmdCosh;
+        case VOp::Asinh: return vmdAsinh;
+        case VOp::Acosh: return vmdAcosh;
+        case VOp::Atanh: return vmdAtanh;
+        case VOp::Erf:   return vmdErf;
+        case VOp::Erfc:  return vmdErfc;
+        default:         return nullptr;
+    }
+}
+#endif
+
 inline void run_f64(VOp op, VParams prm, const double* src, double* dst, int64_t b, int64_t e) {
+#ifdef USE_MKL
+    if (Vml64Entry fn = vml64_entry(op)) {
+        // Every worker owns a slice of the walk, so the library must not spread
+        // that slice over threads of its own.
+        MKL_Set_Num_Threads_Local(1);
+        // The entry points index with a 32-bit count; the cap keeps a slice
+        // from ever wrapping one.
+        constexpr int64_t kSpan = int64_t(1) << 24;
+        for (int64_t i = b; i < e; i += kSpan) {
+            const int64_t m = (e - i) < kSpan ? (e - i) : kSpan;
+            fn(static_cast<int>(m), src + i, dst + i, kVml64Mode);
+        }
+        return;
+    }
+#endif
 #ifdef TP_VECUNARY_SLEEF
 #if defined(CPU_CAPABILITY_AVX512)
     // Tier-compiled copy (see run_f32).  The f64_avx2_only ops have no
