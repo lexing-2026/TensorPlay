@@ -14,6 +14,7 @@
 #include "CUDABroadcast.cuh"
 #include "CUDAComplex.cuh"
 #include "CUDALoops.cuh"
+#include "IntegerDivider.cuh"
 
 #include <cuda_runtime.h>
 #include <limits>
@@ -1057,6 +1058,54 @@ __global__ void binary_row_flat_scalar_kernel(
     }
 }
 
+// Flat-index twin of the scalar kernel, for shapes the vector width does not
+// divide.  Walking the output as one contiguous run instead of row by row is
+// what puts the store back on a line boundary: a row length the vector width
+// does not divide makes every row base of the result start mid-line, so each
+// 32-lane store straddles two lines, and a thread that owns a fixed pair of
+// columns doubles the span one instruction covers.  Here a block owns a
+// contiguous run and the two items of a thread sit blockDim.x apart, so one
+// instruction moves 32 consecutive elements starting where the block started.
+// The row then has to come back out of the index, which is a multiply-shift.
+template <typename T, bool ASplat, bool BSplat, bool Streaming, typename Op>
+__global__ void binary_flat_scalar_kernel(
+    int n, int inner, detail::IntDividerU32 inner_div,
+    const T* __restrict__ a, int64_t a_row_stride, int64_t a_delta,
+    const T* __restrict__ b, int64_t b_row_stride, int64_t b_delta,
+    T* __restrict__ y, typename BinaryOpMath<T>::type alpha, Op op) {
+    using M = typename BinaryOpMath<T>::type;
+    constexpr int kItemsPerThread = 2;
+    const int nt = blockDim.x;
+    const int run = nt * kItemsPerThread;
+    for (int base = blockIdx.x * run; base < n; base += gridDim.x * run) {
+        int idx = base + threadIdx.x;
+#pragma unroll
+        for (int k = 0; k < kItemsPerThread; ++k, idx += nt) {
+            if (idx < n) {
+                const int64_t row = inner_div.div(static_cast<uint32_t>(idx));
+                const int64_t a_off = ASplat
+                    ? row * a_row_stride
+                    : static_cast<int64_t>(idx) + row * a_delta;
+                const int64_t b_off = BSplat
+                    ? row * b_row_stride
+                    : static_cast<int64_t>(idx) + row * b_delta;
+                const M av = static_cast<M>(
+                    ASplat ? a[a_off]
+                           : (Streaming ? load_vec_streaming(a + a_off) : a[a_off]));
+                const M bv = static_cast<M>(
+                    BSplat ? b[b_off]
+                           : (Streaming ? load_vec_streaming(b + b_off) : b[b_off]));
+                const T out = static_cast<T>(op(av, bv, alpha));
+                if (Streaming) {
+                    store_val_streaming(y + idx, out);
+                } else {
+                    y[idx] = out;
+                }
+            }
+        }
+    }
+}
+
 // Launches a flat specialization when the output is a contiguous 2-D tensor
 // and both operands right-align to it with at most one row stride each.  A
 // trailing size-1 dim makes an operand a per-row splat; a trailing dim equal
@@ -1137,6 +1186,64 @@ inline bool try_row_flat(
                     op);                                                     \
         }                                                                    \
     } while (0)
+
+    // A row length the vector width does not divide leaves no aligned form for
+    // the row-by-row walk, so hand the shape to the flat sweep.  It recovers
+    // the row with a multiply-shift, which is only valid while the element
+    // count stays inside the divider's 32-bit range; past that the row grid
+    // carries the shape instead.
+    const int64_t total = inner * rows;
+    if (!packed && total <= static_cast<int64_t>(0x7fffffffLL)) {
+        unsigned flat_threads = 256;
+        if (total < static_cast<int64_t>(flat_threads) * 2) {
+            const unsigned half =
+                static_cast<unsigned>(total / 2 + 1);
+            flat_threads = ((half + 31) / 32) * 32;
+            if (flat_threads == 0) flat_threads = 32;
+        }
+        const int64_t flat_blocks =
+            (total + static_cast<int64_t>(flat_threads) * 2 - 1) /
+            (static_cast<int64_t>(flat_threads) * 2);
+        if (flat_blocks <= 2147483647) {
+            const dim3 flat_grid(static_cast<unsigned>(flat_blocks));
+            const detail::IntDividerU32 inner_div(static_cast<uint32_t>(inner));
+            const int64_t a_delta = a_row_stride - inner;
+            const int64_t b_delta = b_row_stride - inner;
+
+#define TP_ROW_FLAT(A_SPLAT, B_SPLAT)                                        \
+            do {                                                             \
+                if (streaming) {                                             \
+                    binary_flat_scalar_kernel<T, A_SPLAT, B_SPLAT, true, Op> \
+                        <<<flat_grid, flat_threads, 0, stream>>>(            \
+                            static_cast<int>(total), static_cast<int>(inner),\
+                            inner_div, a.data_ptr<T>(), a_row_stride,        \
+                            a_delta, b.data_ptr<T>(), b_row_stride, b_delta, \
+                            y.data_ptr<T>(), alpha, op);                     \
+                } else {                                                     \
+                    binary_flat_scalar_kernel<T, A_SPLAT, B_SPLAT, false, Op>\
+                        <<<flat_grid, flat_threads, 0, stream>>>(            \
+                            static_cast<int>(total), static_cast<int>(inner),\
+                            inner_div, a.data_ptr<T>(), a_row_stride,        \
+                            a_delta, b.data_ptr<T>(), b_row_stride, b_delta, \
+                            y.data_ptr<T>(), alpha, op);                     \
+                }                                                            \
+            } while (0)
+
+            if (a_full) {
+                if (b_full) {
+                    TP_ROW_FLAT(false, false);
+                } else {
+                    TP_ROW_FLAT(false, true);
+                }
+            } else if (b_full) {
+                TP_ROW_FLAT(true, false);
+            } else {
+                TP_ROW_FLAT(true, true);
+            }
+#undef TP_ROW_FLAT
+            return true;
+        }
+    }
 
     if (!packed) {
         if (a_full) {
