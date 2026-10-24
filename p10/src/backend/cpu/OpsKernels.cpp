@@ -14,6 +14,7 @@
 #include "Complex.h"
 #include "cpu/ComplexUnary.h"
 #include "cpu/FloatMathLoops.h"
+#include "cpu/VecUnary.h"
 #include "cpu/VecBinaryMath.h"
 
 #include <vector>
@@ -833,7 +834,30 @@ Tensor& sgn_out_cpu(const Tensor& self, Tensor& out) {
     return dtype_unary_out_kernel(self, out, sgn_cpu, SgnScalar{}, "sgn");
 }
 Tensor exp2_cpu(const Tensor& self) {
-    return float_math_kernel(self, Exp2Scalar{}, "exp2");
+    // The generic float loop widens every element to double before calling
+    // std::exp2, so the single-precision case runs the double routine at half
+    // the rate.  Both floating widths take the vector walk instead; every
+    // other dtype keeps the generic loop and its promotion rules.
+    if (self.dtype() != DType::Float32 && self.dtype() != DType::Float64)
+        return float_math_kernel(self, Exp2Scalar{}, "exp2");
+    Tensor w = self.contiguous();
+    Tensor t = Tensor::empty(static_cast<std::vector<int64_t>>(w.shape()),
+                             self.dtype(), w.device());
+    const int64_t n = w.numel();
+    if (self.dtype() == DType::Float64) {
+        const double* sp = w.data_ptr<double>();
+        double* dp = t.data_ptr<double>();
+        parallel_for(0, n, GRAIN_SIZE, [&](int64_t b, int64_t e) {
+            vecunary::run_f64(vecunary::VOp::Exp2, {}, sp, dp, b, e);
+        });
+    } else {
+        const float* sp = w.data_ptr<float>();
+        float* dp = t.data_ptr<float>();
+        parallel_for(0, n, GRAIN_SIZE, [&](int64_t b, int64_t e) {
+            vecunary::run_f32(vecunary::VOp::Exp2, {}, sp, dp, b, e);
+        });
+    }
+    return t;
 }
 Tensor& exp2_out_cpu(const Tensor& self, Tensor& out) {
     return float_math_out_kernel(self, out, exp2_cpu, Exp2Scalar{}, "exp2");

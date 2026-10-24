@@ -53,7 +53,7 @@ enum class VOp : int {
     Abs, Neg, Sign, Square, Reciprocal, Sqrt, Rsqrt,
     Floor, Ceil, Trunc, Round, Frac, Relu,
     // transcendental (libmvec)
-    Exp, Expm1, Log, Log2, Log10, Log1p,
+    Exp, Exp2, Expm1, Log, Log2, Log10, Log1p,
     Sin, Cos, Tan, Asin, Acos, Atan,
     Sinh, Cosh, Tanh, Asinh, Acosh, Atanh,
     Erf, Erfc, Lgamma,
@@ -137,6 +137,7 @@ inline T scalar_apply(VOp op, VParams prm, T x) {
         case VOp::Frac: return x - std::trunc(x);
         case VOp::Relu: return x < T(0) ? T(0) : x;
         case VOp::Exp: return std::exp(x);
+        case VOp::Exp2: return std::exp2(x);
         case VOp::Expm1: return std::expm1(x);
         case VOp::Log: return std::log(x);
         case VOp::Log2: return std::log2(x);
@@ -921,6 +922,7 @@ inline __m256 apply_f32(VOp op, VParams prm, __m256 x) {
         case VOp::Frac: return _mm256_sub_ps(x, _mm256_round_ps(x, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC));
         case VOp::Relu: return _mm256_max_ps(zero, x); // NaN propagates (second operand wins)
         case VOp::Exp: return v_exp_f32(x);
+        case VOp::Exp2: return tensorplay::tpsleef::exp2(x);
         case VOp::Expm1: return tensorplay::tpsleef::expm1(x);
         case VOp::Log: return v_log_f32(x);
         case VOp::Log2: return tensorplay::tpsleef::log2(x);
@@ -1814,6 +1816,7 @@ inline __m256d apply_f64(VOp op, VParams prm, __m256d x) {
         case VOp::Frac: return _mm256_sub_pd(x, _mm256_round_pd(x, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC));
         case VOp::Relu: return _mm256_max_pd(zero, x);
         case VOp::Exp: return v_exp_f64(x);
+        case VOp::Exp2: return tensorplay::tpsleef::exp2(x);
         case VOp::Expm1: return tensorplay::tpsleef::expm1(x);
         case VOp::Log: return v_log_f64<LogBase64::E>(x);
         case VOp::Log2: return v_log_f64<LogBase64::Two>(x);
@@ -2328,6 +2331,7 @@ inline __m512 apply16_f32(VOp op, VParams prm, __m512 x) {
         case VOp::Frac: return _mm512_sub_ps(x, _mm512_roundscale_ps(x, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC));
         case VOp::Relu: return _mm512_max_ps(zero, x);
         case VOp::Exp: return tensorplay::tpsleef::exp(x);
+        case VOp::Exp2: return tensorplay::tpsleef::exp2(x);
         case VOp::Expm1: return tensorplay::tpsleef::expm1(x);
         case VOp::Log: return tensorplay::tpsleef::log(x);
         case VOp::Log2: return tensorplay::tpsleef::log2(x);
@@ -2577,6 +2581,7 @@ inline __m512d apply16_f64(VOp op, VParams prm, __m512d x) {
         case VOp::Frac: return _mm512_sub_pd(x, _mm512_roundscale_pd(x, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC));
         case VOp::Relu: return _mm512_max_pd(zero, x);
         case VOp::Exp: return tensorplay::tpsleef::exp(x);
+        case VOp::Exp2: return tensorplay::tpsleef::exp2(x);
         case VOp::Expm1: return tensorplay::tpsleef::expm1(x);
         case VOp::Log: return tensorplay::tpsleef::log(x);
         case VOp::Log2: return tensorplay::tpsleef::log2(x);
@@ -2864,6 +2869,7 @@ static void bf16_chunk_avx2(VOp op, VParams prm, const uint16_t* src, uint16_t* 
 // faster than the library kernel.
 extern "C" {
 void vmsExp(const int, const float[], float[], const long long) noexcept;
+void vmsExp2(const int, const float[], float[], const long long) noexcept;
 void vmsExpm1(const int, const float[], float[], const long long) noexcept;
 void vmsLog1p(const int, const float[], float[], const long long) noexcept;
 void vmsSin(const int, const float[], float[], const long long) noexcept;
@@ -2878,6 +2884,7 @@ void vmsAtanh(const int, const float[], float[], const long long) noexcept;
 void vmsErf(const int, const float[], float[], const long long) noexcept;
 void vmsErfc(const int, const float[], float[], const long long) noexcept;
 void vmdExp(const int, const double[], double[], const long long) noexcept;
+void vmdExp2(const int, const double[], double[], const long long) noexcept;
 void vmdLn(const int, const double[], double[], const long long) noexcept;
 void vmdLog2(const int, const double[], double[], const long long) noexcept;
 void vmdLog10(const int, const double[], double[], const long long) noexcept;
@@ -2912,6 +2919,7 @@ using Vml64Entry = void (*)(const int, const double[], double[], const long long
 inline Vml32Entry vml32_entry(VOp op) {
     switch (op) {
         case VOp::Exp:   return vmsExp;
+        case VOp::Exp2:  return vmsExp2;
         case VOp::Expm1: return vmsExpm1;
         case VOp::Log1p: return vmsLog1p;
         case VOp::Sin:   return vmsSin;
@@ -2932,6 +2940,7 @@ inline Vml32Entry vml32_entry(VOp op) {
 inline Vml64Entry vml64_entry(VOp op) {
     switch (op) {
         case VOp::Exp:   return vmdExp;
+        case VOp::Exp2:  return vmdExp2;
         case VOp::Expm1: return vmdExpm1;
         case VOp::Log:   return vmdLn;
         case VOp::Log2:  return vmdLog2;
