@@ -3223,6 +3223,142 @@ bool fold_whole_extrema(Tensor& result, const Tensor& self, int64_t ndim,
     return true;
 }
 
+// One block of rows folded into a column slice held by the task that owns it.
+// The slice is read once and written once per group of four rows rather than per
+// row, which is what keeps the pass behind the input stream instead of behind
+// its own accumulator traffic.  The combine answers a tie with its second
+// operand, so a group reports its own latest row and a later group replaces what
+// an earlier one held; that is the rule the lane-wise walk in the general
+// reduction already follows.  Only the sign of a zero is affected, since -0.0
+// and 0.0 compare equal.
+template <typename ctype, bool WantMax>
+void fold_leading_block(const ctype* in, ctype* acc, int64_t cols,
+                        int64_t row_begin, int64_t n) {
+    using Vec = Vectorized<ctype>;
+    constexpr int64_t lanes = Vec::size();
+    auto pair_of = [](const Vec& a, const Vec& b) {
+        if constexpr (WantMax) {
+            return maximum(a, b);
+        } else {
+            return minimum(a, b);
+        }
+    };
+    // Seeding from the block's first row keeps an identity value out of the
+    // fold, so a block holding a NaN cannot report anything but a NaN.
+    const ctype* seed = in + row_begin * cols;
+    int64_t j = 0;
+    for (; j + lanes <= cols; j += lanes) Vec::loadu(seed + j).store(acc + j);
+    for (; j < cols; ++j) acc[j] = seed[j];
+
+    int64_t s = 1;
+    for (; s + 4 <= n; s += 4) {
+        const ctype* p0 = in + (row_begin + s) * cols;
+        const ctype* p1 = p0 + cols;
+        const ctype* p2 = p1 + cols;
+        const ctype* p3 = p2 + cols;
+        int64_t k = 0;
+        for (; k + lanes <= cols; k += lanes) {
+            const Vec low = pair_of(Vec::loadu(p0 + k), Vec::loadu(p1 + k));
+            const Vec high = pair_of(Vec::loadu(p2 + k), Vec::loadu(p3 + k));
+            pair_of(Vec::loadu(acc + k), pair_of(low, high)).store(acc + k);
+        }
+        for (; k < cols; ++k) {
+            ctype best = acc[k];
+            best = WantMax ? nan_max(best, p0[k]) : nan_min(best, p0[k]);
+            best = WantMax ? nan_max(best, p1[k]) : nan_min(best, p1[k]);
+            best = WantMax ? nan_max(best, p2[k]) : nan_min(best, p2[k]);
+            best = WantMax ? nan_max(best, p3[k]) : nan_min(best, p3[k]);
+            acc[k] = best;
+        }
+    }
+    for (; s < n; ++s) {
+        const ctype* row = in + (row_begin + s) * cols;
+        int64_t k = 0;
+        for (; k + lanes <= cols; k += lanes) {
+            pair_of(Vec::loadu(acc + k), Vec::loadu(row + k)).store(acc + k);
+        }
+        for (; k < cols; ++k) {
+            acc[k] = WantMax ? nan_max(acc[k], row[k]) : nan_min(acc[k], row[k]);
+        }
+    }
+}
+
+// A leading dimension of a dense tensor is the one case where the rows can be
+// handed out whole: each task sweeps a contiguous block and carries its partial
+// answer as a private slice, so the walk never leaves the row it is reading.  The
+// alternative folds a band of columns at a time, which walks every row of the
+// plane once per band with a stride of the full row width; past a few cache lines
+// that stride outruns the prefetchers, and the same bytes then take about twice
+// as long.  The slices are folded together afterwards, and an extremum of slice
+// extrema is the extremum, so no identity value enters anywhere.
+template <typename ctype>
+bool fold_leading_extrema(Tensor& result, const Tensor& self, int64_t ndim,
+                          const std::vector<int64_t>& resolved,
+                          bool maximum_value) {
+    if (ndim < 2 || resolved.size() != 1 || resolved[0] != 0) return false;
+    if (!self.is_contiguous()) return false;
+    const int64_t rows = self.size(0);
+    if (rows <= 0) return false;
+    const int64_t cols = self.numel() / rows;
+    if (cols <= 0 || rows * cols != self.numel() || result.numel() != cols) {
+        return false;
+    }
+    // A slice wider than the level-one cache would be evicted between the rows
+    // that fold into it, and a block shorter than a few dozen rows per task is
+    // better served by the banded walk, which then wins the prefetcher back.
+    if (cols * static_cast<int64_t>(sizeof(ctype)) > 16384) return false;
+    const bool serial = self.numel() < GRAIN_SIZE || get_num_threads() == 1 ||
+                        in_parallel_region();
+    const int64_t tasks = serial ? 1 : get_num_threads();
+    if (rows < 32 * tasks) return false;
+
+    const int64_t per = (rows + tasks - 1) / tasks;
+    Tensor buffer = Tensor::empty({tasks * cols}, self.dtype(), self.device());
+    const ctype* data = self.data_ptr<ctype>();
+    ctype* slices = buffer.data_ptr<ctype>();
+    auto fold_task = [&](int64_t t) {
+        const int64_t begin = t * per;
+        const int64_t end = std::min(rows, begin + per);
+        ctype* acc = slices + t * cols;
+        if (maximum_value) {
+            fold_leading_block<ctype, true>(data, acc, cols, begin, end - begin);
+        } else {
+            fold_leading_block<ctype, false>(data, acc, cols, begin, end - begin);
+        }
+    };
+    if (serial) {
+        for (int64_t t = 0; t < tasks; ++t) fold_task(t);
+    } else {
+        parallel_for(0, tasks, 1, [&](int64_t begin, int64_t end) {
+            for (int64_t t = begin; t < end; ++t) fold_task(t);
+        });
+    }
+
+    ctype* out = result.data_ptr<ctype>();
+    parallel_for(0, cols, 256, [&](int64_t begin, int64_t end) {
+        constexpr int64_t lanes = Vectorized<ctype>::size();
+        int64_t j = begin;
+        for (; j + lanes <= end; j += lanes) {
+            Vectorized<ctype> acc = Vectorized<ctype>::loadu(slices + j);
+            for (int64_t t = 1; t < tasks; ++t) {
+                const Vectorized<ctype> part =
+                    Vectorized<ctype>::loadu(slices + t * cols + j);
+                acc = maximum_value ? maximum(acc, part) : minimum(acc, part);
+            }
+            acc.store(out + j);
+        }
+        for (; j < end; ++j) {
+            ctype best = slices[j];
+            for (int64_t t = 1; t < tasks; ++t) {
+                best = maximum_value ? nan_max(best, slices[t * cols + j])
+                                     : nan_min(best, slices[t * cols + j]);
+            }
+            out[j] = best;
+        }
+    });
+    return true;
+}
+
 // ---- Fused dual-input reductions -------------------------------------------
 // A single pass over both inputs accumulates sum((a-b)^2) or sum(|a-b|), so
 // regression metrics never materialise the difference/power tensors and their
@@ -3396,6 +3532,10 @@ Tensor extrema_dim_kernel_impl(const Tensor& self, const std::vector<int64_t>& d
             } \
             if (fold_whole_extrema<ctype>(result, self, ndim, resolved, \
                                           maximum_value)) { \
+                return result; \
+            } \
+            if (fold_leading_extrema<ctype>(result, self, ndim, resolved, \
+                                            maximum_value)) { \
                 return result; \
             } \
         } \
