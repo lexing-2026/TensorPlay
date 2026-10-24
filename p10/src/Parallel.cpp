@@ -19,6 +19,10 @@
 #include <omp.h>
 #endif
 
+#if defined(__linux__)
+#include <sched.h>
+#endif
+
 #ifdef USE_MKL
 #include <mkl.h>
 #endif
@@ -686,6 +690,133 @@ void invoke_parallel_balanced_impl(
 
   // Without the team there is nothing to balance across, and the split below
   // hands the walk to the threads it has.
+  invoke_parallel_impl(begin, end, grain_size, f);
+}
+
+namespace {
+
+#if defined(__linux__)
+// The capacity each core publishes for itself, read once.  A core that
+// publishes nothing keeps a zero and is treated as the mean of the team, so
+// an unknown part neither starves nor takes more than its share.
+int core_capacity(int cpu) {
+  static const std::vector<int> table = []() {
+    std::vector<int> values(256, 0);
+    for (int id = 0; id < 256; ++id) {
+      std::string path = "/sys/devices/system/cpu/cpu" + std::to_string(id) +
+                         "/cpu_capacity";
+      std::FILE* file = std::fopen(path.c_str(), "re");
+      if (!file) {
+        break;
+      }
+      int value = 0;
+      if (std::fscanf(file, "%d", &value) == 1 && value > 0) {
+        values[id] = value;
+      }
+      std::fclose(file);
+    }
+    return values;
+  }();
+  if (cpu < 0 || cpu >= static_cast<int>(table.size())) {
+    return 0;
+  }
+  return table[cpu];
+}
+#else
+int core_capacity(int) {
+  return 0;
+}
+#endif
+
+// The core the calling thread sits on, or -1 where the platform does not say.
+int running_core() {
+#if defined(__linux__)
+  return sched_getcpu();
+#else
+  return -1;
+#endif
+}
+
+} // namespace
+
+void invoke_parallel_weighted_impl(
+    int64_t begin,
+    int64_t end,
+    int64_t grain_size,
+    const std::function<void(int64_t, int64_t)>& f) {
+  const int64_t numiter = end - begin;
+
+#ifdef _OPENMP
+  if (!native_pool_forced() && omp_get_max_threads() > 1 && !omp_in_parallel()) {
+    const int64_t num_threads = get_num_threads();
+    std::atomic_flag err_flag = ATOMIC_FLAG_INIT;
+    std::exception_ptr eptr;
+    // One slot per worker, filled by the worker itself: the capacity of the
+    // core it runs on is the only weight that describes this call.
+    int weights[256] = {};
+    #pragma omp parallel
+    {
+      int64_t team = std::min<int64_t>(omp_get_num_threads(), num_threads);
+      if (grain_size > 0) {
+        team = std::min(team, (numiter + grain_size - 1) / grain_size);
+      }
+      team = std::max<int64_t>(team, 1);
+      team = std::min<int64_t>(team, 256);
+      const int64_t tid = omp_get_thread_num();
+      if (tid < team && tid < 256) {
+        weights[tid] = core_capacity(running_core());
+      }
+      #pragma omp barrier
+      if (tid < team && tid < 256) {
+        // A core that publishes nothing is taken as the mean of the ones
+        // that do; when none does, the split is the even one.
+        int64_t total = 0;
+        int64_t known = 0;
+        for (int64_t t = 0; t < team; ++t) {
+          if (weights[t] > 0) {
+            total += weights[t];
+            ++known;
+          }
+        }
+        int64_t before = 0;
+        int64_t own = 1;
+        if (total > 0) {
+          const int64_t mean = total / known;
+          total = 0;
+          for (int64_t t = 0; t < team; ++t) {
+            const int64_t weight = weights[t] > 0 ? weights[t] : mean;
+            if (t < tid) {
+              before += weight;
+            } else if (t == tid) {
+              own = weight;
+            }
+            total += weight;
+          }
+        } else {
+          before = tid;
+          total = team;
+        }
+        const int64_t local_begin = begin + numiter * before / total;
+        const int64_t local_end = begin + numiter * (before + own) / total;
+        if (local_begin < local_end) {
+          try {
+            ParallelRegionGuard guard(static_cast<int>(tid));
+            f(local_begin, local_end);
+          } catch (...) {
+            if (!err_flag.test_and_set()) {
+              eptr = std::current_exception();
+            }
+          }
+        }
+      }
+    }
+    if (eptr) {
+      std::rethrow_exception(eptr);
+    }
+    return;
+  }
+#endif
+
   invoke_parallel_impl(begin, end, grain_size, f);
 }
 
