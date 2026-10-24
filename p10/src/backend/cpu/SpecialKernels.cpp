@@ -93,9 +93,9 @@ Tensor bessel_y1_cpu(const Tensor& self) {
     return float_math_kernel(self, [](double x) { return bessel_y1_forward(x); }, "bessel_y1");
 }
 Tensor spherical_bessel_j0_cpu(const Tensor& self) {
-    return float_math_kernel(self,
-                             [](double x) { return spherical_bessel_j0_forward(x); },
-                             "spherical_bessel_j0");
+    return float_math_vec_kernel(
+        self, [](double x) { return spherical_bessel_j0_forward(x); },
+        "spherical_bessel_j0", cpu::vecunary::VOp::SphBesselJ0);
 }
 Tensor modified_bessel_i0_cpu(const Tensor& self) {
     return float_math_kernel(self,

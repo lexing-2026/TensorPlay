@@ -62,7 +62,7 @@ enum class VOp : int {
     Erf, Erfc, ErfInv, Lgamma,
     // composed: a vector walk over one of the ops above plus an elementwise
     // fix-up, so they need no kernel of their own
-    Sinc, Entr, Logit,
+    Sinc, Entr, Logit, SphBesselJ0,
     // library-only: no vector form below, so these run the scalar tail unless
     // the library is linked in
     Ndtr, NdtrI, Erfcx,
@@ -128,6 +128,24 @@ inline bool f64_avx2_only(VOp op) {
 // PointwiseKernels.cpp one-for-one; they serve as both the non-AVX2 fallback
 // and the vector-loop tail.
 // ---------------------------------------------------------------------------
+// sin(x)/x.  The series form is used below 0.5, where the quotient loses the
+// leading digits; the caller supplies sin(x) so a vector walk can hand in the
+// value it already has.
+template <typename T>
+inline T spherical_j0_from_sin(T x, T sinx) {
+    if (std::isinf(x)) return T(0);
+    if (std::fabs(x) < T(0.5)) {
+        const T x2 = x * x;
+        return T(1) + x2 * (T(-1.0) / T(6.0) +
+               x2 * (T(1.0) / T(120.0) +
+               x2 * (T(-1.0) / T(5040.0) +
+               x2 * (T(1.0) / T(362880.0) +
+               x2 * (T(-1.0) / T(39916800.0) +
+               x2 * (T(1.0) / T(6227020800.0)))))));
+    }
+    return sinx / x;
+}
+
 template <typename T>
 inline T scalar_apply(VOp op, VParams prm, T x) {
     constexpr T kHalf = static_cast<T>(0.5);
@@ -190,6 +208,7 @@ inline T scalar_apply(VOp op, VParams prm, T x) {
                              T(1) - static_cast<T>(prm.p0));
             return std::log(p / (T(1) - p));
         }
+        case VOp::SphBesselJ0: return spherical_j0_from_sin(x, std::sin(x));
         case VOp::Lgamma: return std::lgamma(x);
         case VOp::Sigmoid: return T(1) / (T(1) + std::exp(-x));
         case VOp::GeluNone: {
@@ -3071,6 +3090,11 @@ inline bool composed_f32(VOp op, VParams prm, const float* src, float* dst, int6
             run_f32(VOp::Log, {}, dst, dst, b, e);
             return true;
         }
+        case VOp::SphBesselJ0:
+            run_f32(VOp::Sin, {}, src, dst, b, e);
+            for (int64_t i = b; i < e; ++i)
+                dst[i] = spherical_j0_from_sin(src[i], dst[i]);
+            return true;
         default:
             return false;
     }
@@ -3112,6 +3136,11 @@ inline bool composed_f64(VOp op, VParams prm, const double* src, double* dst, in
             run_f64(VOp::Log, {}, dst, dst, b, e);
             return true;
         }
+        case VOp::SphBesselJ0:
+            run_f64(VOp::Sin, {}, src, dst, b, e);
+            for (int64_t i = b; i < e; ++i)
+                dst[i] = spherical_j0_from_sin(src[i], dst[i]);
+            return true;
         default:
             return false;
     }
