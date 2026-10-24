@@ -56,15 +56,21 @@ inline __m256 widen8(const uint16_t* p) {
         _mm_loadu_si128(reinterpret_cast<const __m128i*>(p)));
 }
 
-// Sixteen halfs crossed into single precision.  The two answers keep the
-// block's own order: the first carries the leading eight elements, the
-// second the trailing eight.  Each half is fetched by the crossing itself,
-// so a block costs one step per eight elements, and the block is never taken
-// in whole only to be split afterwards.
+// A block of sixteen halfs taken whole.  One move takes what two crossings
+// would otherwise fetch, and a walk that takes a pair of blocks at the head
+// of its step has the operands of both in hand before either is crossed.
 __attribute__((target("avx2,f16c"), always_inline))
-inline void widen_f16_16(const uint16_t* p, __m256& lo, __m256& hi) {
-    lo = widen8(p);
-    hi = widen8(p + 8);
+inline __m256i load_f16_16(const uint16_t* p) {
+    return _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+}
+
+// A block of sixteen halfs crossed into single precision.  The leading eight
+// are the low half of the block and are crossed where they lie; the trailing
+// eight are moved into the low half of a register first.
+__attribute__((target("avx2,f16c"), always_inline))
+inline void widen_f16_16_block(__m256i bits, __m256& lo, __m256& hi) {
+    lo = _mm256_cvtph_ps(_mm256_castsi256_si128(bits));
+    hi = _mm256_cvtph_ps(_mm256_extractf128_si256(bits, 1));
 }
 
 // The single-precision answer, held in the half layout.
@@ -85,16 +91,27 @@ inline __m128i narrow8(__m256 v) {
 // walk's leading step of one element at a time is for.
 template <bool Stream>
 __attribute__((target("avx2,f16c"), always_inline))
-inline void lay_f16_block(uint16_t* p, __m256 lo, __m256 hi) {
-    const __m128i low = narrow8(lo);
-    const __m128i high = narrow8(hi);
-    const __m256i bits =
-        _mm256_insertf128_si256(_mm256_castsi128_si256(low), high, 1);
+inline void store_f16_block(uint16_t* p, __m256i bits) {
     if constexpr (Stream) {
         _mm256_stream_si256(reinterpret_cast<__m256i*>(p), bits);
     } else {
         _mm256_storeu_si256(reinterpret_cast<__m256i*>(p), bits);
     }
+}
+
+// Sixteen answers narrowed and left in one register, for a step that answers
+// two blocks before it stores either of them.
+__attribute__((target("avx2,f16c"), always_inline))
+inline __m256i narrow_f16_block(__m256 lo, __m256 hi) {
+    const __m128i low = narrow8(lo);
+    const __m128i high = narrow8(hi);
+    return _mm256_insertf128_si256(_mm256_castsi128_si256(low), high, 1);
+}
+
+template <bool Stream>
+__attribute__((target("avx2,f16c"), always_inline))
+inline void lay_f16_block(uint16_t* p, __m256 lo, __m256 hi) {
+    store_f16_block<Stream>(p, narrow_f16_block(lo, hi));
 }
 
 __attribute__((target("avx2,f16c"), always_inline))

@@ -3867,30 +3867,19 @@ void lerp_tensor_half_walk(const tensorplay::Half* self,
         }
     }
     for (; i + 16 <= n; i += 16) {
-        if constexpr (Stream) {
-            // Two lines of each operand, asked for the distance the next two
-            // steps cover: the answer waits on the memory rather than on the
-            // selects, and the destination is left out because it goes past
-            // the cache anyway.
-            _mm_prefetch(reinterpret_cast<const char*>(self_bits + i + 32),
-                         _MM_HINT_T0);
-            _mm_prefetch(reinterpret_cast<const char*>(self_bits + i + 64),
-                         _MM_HINT_T0);
-            _mm_prefetch(reinterpret_cast<const char*>(end_bits + i + 32),
-                         _MM_HINT_T0);
-            _mm_prefetch(reinterpret_cast<const char*>(end_bits + i + 64),
-                         _MM_HINT_T0);
-            _mm_prefetch(reinterpret_cast<const char*>(weight_bits + i + 32),
-                         _MM_HINT_T0);
-            _mm_prefetch(reinterpret_cast<const char*>(weight_bits + i + 64),
-                         _MM_HINT_T0);
-        }
-        const __m256 s0 = tensorplay::cpu::vecreduced::widen8(self_bits + i);
-        const __m256 e0 = tensorplay::cpu::vecreduced::widen8(end_bits + i);
-        const __m256 w0 = tensorplay::cpu::vecreduced::widen8(weight_bits + i);
-        const __m256 s1 = tensorplay::cpu::vecreduced::widen8(self_bits + i + 8);
-        const __m256 e1 = tensorplay::cpu::vecreduced::widen8(end_bits + i + 8);
-        const __m256 w1 = tensorplay::cpu::vecreduced::widen8(weight_bits + i + 8);
+        // Each operand is taken as one block and crossed from it, so the
+        // walk asks the memory for three blocks per step rather than six
+        // halves of blocks.
+        const __m256i self_raw =
+            tensorplay::cpu::vecreduced::load_f16_16(self_bits + i);
+        const __m256i end_raw =
+            tensorplay::cpu::vecreduced::load_f16_16(end_bits + i);
+        const __m256i weight_raw =
+            tensorplay::cpu::vecreduced::load_f16_16(weight_bits + i);
+        __m256 s0, s1, e0, e1, w0, w1;
+        tensorplay::cpu::vecreduced::widen_f16_16_block(self_raw, s0, s1);
+        tensorplay::cpu::vecreduced::widen_f16_16_block(end_raw, e0, e1);
+        tensorplay::cpu::vecreduced::widen_f16_16_block(weight_raw, w0, w1);
         const __m256 small0 =
             _mm256_cmp_ps(_mm256_andnot_ps(abs_mask, w0), half, _CMP_LT_OQ);
         const __m256 small1 =
