@@ -1329,15 +1329,16 @@ class TestVulkanIndexCopy(unittest.TestCase):
                 err_msg=f"out-of-place rows of a {shape} cache")
 
     def test_a_cache_without_an_image_form_scatters_any_axis(self):
-        # Past the image axis limit a payload is plain row-major memory, so the
-        # row an invocation moves is a run of consecutive elements and any axis can
-        # name it - including the innermost one, whose rows an image packs into the
-        # lanes of a texel and cannot scatter whole.
+        # A payload the shape or the count leaves in words is plain row-major
+        # memory, so the row an invocation moves is a run of consecutive elements
+        # and any axis can name it - including the innermost one, whose rows an
+        # image packs into the lanes of a texel and cannot scatter whole.
         tensorplay.manual_seed(99)
         cases = (
             ((20000,), 0, [0, 19999, 7]),
             ((40000, 8), 0, [0, 39999, 7]),
             ((40000, 8), 1, [0, 2, 7]),
+            ((9, 64), 1, [0, 2, 63]),
             ((6, 40000, 4), 1, [0, 39999, 7, 100]),
             ((6, 40000, 4), 0, [5, 0, 1]),
         )
@@ -1366,13 +1367,16 @@ class TestVulkanIndexCopy(unittest.TestCase):
         # A texel holds four lanes of the axis a payload packs, so writing one of
         # its rows means rewriting lanes the scatter did not name.  Neither the
         # innermost axis nor a rank-1 payload's only axis is the texture's height.
-        buf = tensorplay.randn((9, 64), device="cpu").to("vulkan")
-        src = tensorplay.randn((9, 2), device="cpu").to("vulkan")
+        buf = tensorplay.randn((3, 9, 64), device="cpu").to("vulkan")
+        self.assertEqual(
+            buf.data_ptr(), 0,
+            "a rank-three plane was expected to keep its image")
+        src = tensorplay.randn((3, 9, 2), device="cpu").to("vulkan")
         codes = tensorplay.tensor([0, 2], dtype=tensorplay.int64,
                                   device="vulkan")
         with self.assertRaisesRegex(
                 RuntimeError, "an image payload scatters the axis above"):
-            tensorplay.index_copy_(buf, 1, codes, src)
+            tensorplay.index_copy_(buf, 2, codes, src)
         flat = tensorplay.randn((12,), device="cpu").to("vulkan")
         with self.assertRaisesRegex(
                 RuntimeError, "an image payload scatters the axis above"):
@@ -3687,7 +3691,12 @@ class TestVulkanHalfLerp(unittest.TestCase):
             out.cpu().numpy().astype(np.float32), want,
             rtol=1e-2, atol=1e-2, err_msg="half lerp_ left the payload wrong")
 
-    def test_lerp_refuses_a_linear_payload(self):
+    def test_lerp_answers_a_linear_payload(self):
+        # A walk that samples texels cannot read a payload the shape leaves in
+        # words, so the spread is composed from the walks that do index words:
+        # out = self + weight * (end - self).  The count is one past an image
+        # axis on purpose, and the odd element count leaves a tail no four-lane
+        # group covers.
         import tensorplay.functional as F
         for dtype in (np.float32, np.float16):
             base = tensorplay.from_numpy(
@@ -3696,9 +3705,30 @@ class TestVulkanHalfLerp(unittest.TestCase):
                 np.linspace(1.0, -1.0, 70001).astype(dtype)).to("vulkan")
             weight = tensorplay.from_numpy(
                 np.zeros(70001, dtype=dtype)).to("vulkan")
-            with self.assertRaisesRegex(
-                    RuntimeError, "requires texture storage"):
-                F.lerp(base, end, weight)
+            self.assertNotEqual(
+                base.data_ptr(), 0,
+                f"a {np.dtype(dtype).name} count this long was expected to "
+                "keep its elements in words")
+            for w in (0.0, 0.25, -0.5):
+                answer = F.lerp(base, end, w)
+                self.assertTrue(
+                    answer.device.is_vulkan(),
+                    f"a word-resident {np.dtype(dtype).name} lerp at "
+                    f"weight={w} left the device")
+                want = (base.cpu().numpy().astype(np.float64)
+                        + w * (end.cpu().numpy().astype(np.float64)
+                               - base.cpu().numpy().astype(np.float64)))
+                np.testing.assert_allclose(
+                    answer.cpu().numpy().astype(np.float64), want,
+                    rtol=1e-3, atol=1e-3,
+                    err_msg=f"a word-resident lerp missed the spread "
+                            f"({np.dtype(dtype).name}, weight={w})")
+            weighted = F.lerp(base, end, weight)
+            np.testing.assert_allclose(
+                weighted.cpu().numpy().astype(np.float64),
+                base.cpu().numpy().astype(np.float64),
+                rtol=0, atol=1e-3,
+                err_msg="a zero tensor weight moved the start it should hold")
 
 
 class TestVulkanCumsumStorages(unittest.TestCase):
@@ -4302,15 +4332,11 @@ class TestVulkanDeviceBuiltPayload(unittest.TestCase):
 
     @staticmethod
     def _uses_dense_storage(payload):
-        # Only single precision has both a texture and a linear form of this
-        # kernel, so a lerp that reports the missing image marks a payload that
-        # keeps the elements in words.
-        import tensorplay.functional as F
-        try:
-            F.lerp(payload, payload, 0.5)
-            return False
-        except RuntimeError:
-            return True
+        # A payload kept in words owns the buffer a binding names, while an
+        # image carries its lanes through a texture view and has no such
+        # pointer: the class a payload was reserved in is therefore readable
+        # without asking some op which walk it took.
+        return payload.data_ptr() != 0
 
     def test_clone_keeps_the_storage_of_its_model(self):
         host = self._grid((2, 3, 4, 5))
@@ -4512,26 +4538,23 @@ class TestVulkanWidePayload(unittest.TestCase):
 
     @staticmethod
     def _released_as_texels(payload):
-        # Whether a payload has an image or a buffer to bind decides which kernels
-        # can take it: a texel kernel refuses a dense operand outright.
-        import tensorplay.functional as F
-        try:
-            F.lerp(payload, payload, 0.5)
-        except RuntimeError:
-            return False
-        return True
+        # A payload kept in words owns the buffer a binding names, while an
+        # image carries its lanes through a texture view and has no such
+        # pointer, so which of the two a lookup handed back is readable without
+        # asking some op which walk it took.
+        return payload.data_ptr() == 0
 
     def test_a_device_index_list_stays_on_the_device(self):
-        # The index list is built in whichever class the lookup already uses, so
-        # a table with an image form keeps its texel route and a table without one
-        # keeps its flat route: neither drags the other's payload across the
-        # boundary because the codes arrived 64-bit wide.
+        # A lookup reads its table through the class the shape names, so the
+        # codes never drag a payload across the boundary whatever width they
+        # arrived in: the short table and the one past an image axis answer from
+        # the same words, and a host list is the only one that has to be uploaded.
         rows, feats = 40000, 64
         host_table = (
             (np.arange(rows, dtype=np.float32) % 9).reshape(rows, 1)
             * np.ones((1, feats), np.float32)).astype(np.float32)
         # Every code is a row of the short table too, so one reference serves
-        # both classes.
+        # both fixtures.
         ids = np.array([0, 17, 255, 3, 128], dtype=np.int64)
         lists = (
             ("64-bit", tensorplay.from_numpy(ids.copy()).to("vulkan")),
@@ -4539,12 +4562,13 @@ class TestVulkanWidePayload(unittest.TestCase):
              tensorplay.from_numpy(ids.astype(np.int32)).to("vulkan")),
             ("host", tensorplay.from_numpy(ids.copy())),
         )
-        for name, used in (("texel", 256), ("dense", rows)):
+        for name, used in (("short", 256), ("long", rows)):
             table = tensorplay.from_numpy(
                 host_table[:used].copy()).to("vulkan")
             self.assertIs(
-                self._released_as_texels(table), name == "texel",
-                f"the {name} fixture is not the class it names")
+                self._released_as_texels(table), False,
+                f"the {name} fixture was not reserved in the class its shape "
+                "names")
             want = host_table[:used][ids]
             classes = []
             for lname, index in lists:
@@ -4556,13 +4580,11 @@ class TestVulkanWidePayload(unittest.TestCase):
             self.assertEqual(
                 classes, [classes[0]] * 3,
                 f"an index list routed the {name} lookup differently")
-            # Whichever route read the table, the rows come back in an image: a
-            # consumer picks its route from what it was handed, and a lookup
-            # result is usually narrow enough that a texture-only kernel is the
-            # only one that can read it at all.
+            # The rows a lookup hands back are a plane of two measured axes, so
+            # a consumer reads them in the same class the table was kept in.
             self.assertEqual(
-                classes, [True] * 3,
-                f"a {name} table released its rows outside an image")
+                classes, [False] * 3,
+                f"a {name} table released its rows outside words")
 
     def test_wide_payloads_stop_at_the_walk_that_folds_a_lane_into_a_word(self):
         values = np.array([0, 5, 2, 7, 1], dtype=np.int64)
@@ -11589,25 +11611,22 @@ class TestVulkanHalfSelection(unittest.TestCase):
 
     @staticmethod
     def _uploaded(array):
-        # A payload that arrives from the host keeps the image form.
+        # An arrival from the host is reserved by shape and width: two measured
+        # axes are words, anything else an image.
         return tensorplay.from_numpy(np.asarray(array, np.float16)).to("vulkan")
 
     @staticmethod
     def _built(array):
-        # A payload the device lays out itself keeps its elements in words.
+        # A payload the device lays out itself is written a word at a time.
         return tensorplay.tensor(np.asarray(array, np.float16), device="vulkan")
 
     @staticmethod
     def _uses_dense_storage(payload):
-        # Only single precision has both a texture and a linear form of lerp, so
-        # a lerp that reports the missing image marks a payload that keeps its
-        # elements in words.
-        import tensorplay.functional as F
-        try:
-            F.lerp(payload, payload, 0.5)
-            return False
-        except RuntimeError:
-            return True
+        # A payload kept in words owns the buffer a binding names, while an
+        # image carries its lanes through a texture view and has no such
+        # pointer: the class a payload was reserved in is therefore readable
+        # without asking some op which walk it took.
+        return payload.data_ptr() != 0
 
     @staticmethod
     def _lanes(rows, cols):
@@ -11718,13 +11737,13 @@ class TestVulkanCountingRowLookup(unittest.TestCase):
 
     @staticmethod
     def _uploaded(values):
-        # A payload that arrives from the host keeps the image form its shape
-        # allows.
+        # An arrival from the host is reserved by shape and width: two measured
+        # axes are words, anything else an image.
         return tensorplay.from_numpy(np.asarray(values)).to("vulkan")
 
     @staticmethod
     def _built(values):
-        # A payload the device lays out itself keeps its elements in words.
+        # A payload the device lays out itself is written a word at a time.
         return tensorplay.tensor(np.asarray(values), device="vulkan")
 
     @staticmethod
@@ -13540,30 +13559,28 @@ class TestVulkanProductStorageClasses(unittest.TestCase):
 
     @staticmethod
     def _uploaded(array, dtype=np.float32):
-        # A payload that arrives from the host keeps the image form.
+        # An arrival from the host is reserved by shape and width: two measured
+        # axes are words, anything else an image.
         return tensorplay.from_numpy(np.asarray(array, dtype)).to("vulkan")
 
     @staticmethod
     def _built(array, dtype=np.float32):
-        # A payload the device lays out itself keeps its elements in words.
+        # A payload the device lays out itself is written a word at a time.
         return tensorplay.tensor(np.asarray(array, dtype), device="vulkan")
 
     @staticmethod
     def _uses_dense_storage(payload):
-        # Only single precision has both a texture and a linear form of lerp, so
-        # a lerp that reports the missing image marks a payload that keeps its
-        # elements in words.
-        import tensorplay.functional as F
-        try:
-            F.lerp(payload, payload, 0.5)
-            return False
-        except RuntimeError:
-            return True
+        # A payload kept in words owns the buffer a binding names, while an
+        # image carries its lanes through a texture view and has no such
+        # pointer: the class a payload was reserved in is therefore readable
+        # without asking some op which walk it took.
+        return payload.data_ptr() != 0
 
     @classmethod
     def _rows_without_an_image_form(cls, width):
-        # The smallest row count whose plane the device cannot hold in an image,
-        # which is where a product over such rows has to write words.
+        # The smallest row count the device answers a plane of in words: the
+        # walk's own class is what a caller has to read back, so the probe asks
+        # the allocator rather than assuming it.
         rows = 4096
         while rows <= 262144:
             probe = tensorplay.from_numpy(
@@ -13599,15 +13616,18 @@ class TestVulkanProductStorageClasses(unittest.TestCase):
             # one actually carries, so the width only costs rounding.
             want_linear = x.astype(np.float32) @ w.astype(np.float32).T
             want_mm = x.astype(np.float32) @ wt.astype(np.float32)
-            for act_name, make_act in (("word", self._built),
-                                       ("image", self._uploaded)):
+            for act_name, make_act in (("device-built", self._built),
+                                       ("host-arrived", self._uploaded)):
+                # The class is named by the shape, not by how the payload got
+                # here: two axes of a measured width are reserved in words
+                # whether the device laid them out or the host handed them over.
                 probe = make_act(x, np.float32)
-                self.assertIs(
-                    self._uses_dense_storage(probe), make_act == self._built,
-                    f"a {act_name} activation was not the storage its builder "
-                    "answers")
-                for wt_name, make_wt in (("word", self._built),
-                                         ("image", self._uploaded)):
+                self.assertTrue(
+                    self._uses_dense_storage(probe),
+                    f"a {act_name} activation was not reserved in the class "
+                    "its shape names")
+                for wt_name, make_wt in (("device-built", self._built),
+                                         ("host-arrived", self._uploaded)):
                     activation = make_act(x, dtype)
                     answers = (
                         linear(activation, make_wt(w, dtype)),
@@ -13620,6 +13640,32 @@ class TestVulkanProductStorageClasses(unittest.TestCase):
                             self._relerr(self._back(answer), want), tol,
                             f"a {act_name} activation against a {wt_name} "
                             f"weight missed the product ({dtype.__name__})")
+
+    def test_an_odd_width_narrow_answer_feeds_the_next_product(self):
+        # A thread of the tiled walk owns four consecutive columns, so a narrow
+        # result whose width is odd cannot pair its last lanes into a word shared
+        # with the next row.  Whatever destination that walk picks, the answer
+        # carries the lanes the following product has to read.
+        from tensorplay.nn.functional import linear
+
+        rng = np.random.default_rng(21)
+        M, K, odd_n, P = 4, 6, 7, 5
+        host_x = rng.standard_normal((M, K)).astype(np.float32)
+        host_w = rng.standard_normal((odd_n, K)).astype(np.float32)
+        host_next = rng.standard_normal((P, odd_n)).astype(np.float32)
+        first = linear(self._built(host_x, np.float16),
+                       self._built(host_w, np.float16))
+        self.assertEqual(
+            list(first.shape), [M, odd_n],
+            "an odd-width narrow answer lost its shape")
+        want = host_x @ host_w.T @ host_next.T
+        answer = linear(first, self._built(host_next, np.float16))
+        self.assertTrue(
+            answer.device.is_vulkan(),
+            "a product reading an odd-width narrow answer left the device")
+        self.assertLessEqual(
+            self._relerr(self._back(answer), want), 6e-3,
+            "a product reading an odd-width narrow answer missed the walk")
 
     def test_an_addend_of_either_storage_feeds_the_product(self):
         from tensorplay.nn.functional import linear
@@ -13635,12 +13681,12 @@ class TestVulkanProductStorageClasses(unittest.TestCase):
             b = host_b.astype(dtype)
             want = (x.astype(np.float32) @ w.astype(np.float32).T
                     + b.astype(np.float32))
-            for act_name, make_act in (("word", self._built),
-                                       ("image", self._uploaded)):
-                for wt_name, make_wt in (("word", self._built),
-                                         ("image", self._uploaded)):
-                    for bias_name, make_bias in (("word", self._built),
-                                                 ("image", self._uploaded)):
+            for act_name, make_act in (("device", self._built),
+                                       ("host", self._uploaded)):
+                for wt_name, make_wt in (("device", self._built),
+                                         ("host", self._uploaded)):
+                    for bias_name, make_bias in (("device", self._built),
+                                                 ("host", self._uploaded)):
                         answer = linear(
                             make_act(x, dtype), make_wt(w, dtype),
                             make_bias(b, dtype))
@@ -13651,9 +13697,9 @@ class TestVulkanProductStorageClasses(unittest.TestCase):
                             f"product ({dtype.__name__})")
 
     def test_a_product_wide_enough_for_words_reads_an_image_addend(self):
-        # Rows past the device's image axes leave a product no image to write,
-        # so its result lies in words while the addend broadcast over those rows
-        # still has a texture of its own.
+        # A product of two axes writes words while the addend broadcast over its
+        # rows is a single axis the walk still samples as an image, so the two
+        # classes meet inside one dispatch.
         from tensorplay.nn.functional import linear
 
         rows = self._rows_without_an_image_form(8)
@@ -13686,9 +13732,11 @@ class TestVulkanProductStorageClasses(unittest.TestCase):
         host_w = model.weight.detach().cpu().numpy().astype(np.float32)
         host_b = model.bias.detach().cpu().numpy().astype(np.float32)
         model.to("vulkan")
-        self.assertFalse(
+        # A layer's weight is a plane of two measured axes, so uploading it
+        # reserves words just like the batch the device lays out itself.
+        self.assertTrue(
             self._uses_dense_storage(model.weight.detach()),
-            "an uploaded layer was expected to keep its image")
+            "an uploaded layer was not reserved in the class its shape names")
 
         feed = self._built(host_x).detach().requires_grad_(True)
         answer = model(feed)
@@ -13718,26 +13766,22 @@ class TestVulkanSquaredErrorLoss(unittest.TestCase):
 
     @staticmethod
     def _uploaded(array, dtype=np.float32):
-        # A payload that arrives from the host keeps the image form.
+        # An arrival from the host is reserved by shape and width: two measured
+        # axes are words, anything else an image.
         return tensorplay.from_numpy(np.asarray(array, dtype)).to("vulkan")
 
     @staticmethod
     def _built(array, dtype=np.float32):
-        # A payload the device lays out itself keeps its elements in words.
+        # A payload the device lays out itself is written a word at a time.
         return tensorplay.tensor(np.asarray(array, dtype), device="vulkan")
 
     @staticmethod
     def _uses_dense_storage(payload):
-        # Only single precision has both a texture and a linear form of lerp, so
-        # a lerp that reports the missing image marks a payload that keeps its
-        # elements in words.  Both squared-error walks are asked for below, and
-        # this is what says they were.
-        import tensorplay.functional as F
-        try:
-            F.lerp(payload, payload, 0.5)
-            return False
-        except RuntimeError:
-            return True
+        # A payload kept in words owns the buffer a binding names, while an
+        # image carries its lanes through a texture view and has no such
+        # pointer: the class a payload was reserved in is therefore readable
+        # without asking some op which walk it took.
+        return payload.data_ptr() != 0
 
     @staticmethod
     def _half(array):
@@ -13755,13 +13799,19 @@ class TestVulkanSquaredErrorLoss(unittest.TestCase):
             values = rng.standard_normal(shape).astype(np.float32)
             compared = rng.standard_normal(shape).astype(np.float32)
             squares = (values - compared) ** 2
-            for name, make in (("image", self._uploaded),
-                               ("word", self._built)):
+            for name, make in (("device", self._built),
+                               ("host", self._uploaded)):
                 first = make(values)
                 second = make(compared)
+                # A plane the device lays out itself is reserved in words, and
+                # so is a host arrival of two measured axes; the single axis and
+                # the three-axis block that arrived from the host keep the texel
+                # walk.
                 self.assertIs(
-                    self._uses_dense_storage(first), make == self._built,
-                    f"a {name} plane was not the storage its builder answers")
+                    self._uses_dense_storage(first),
+                    make is self._built or len(shape) == 2,
+                    f"a {name} plane was not reserved in the class its builder "
+                    "and shape name")
                 for reduction, want in (
                         ("none", squares),
                         ("mean", float(squares.mean())),
