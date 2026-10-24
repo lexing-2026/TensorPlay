@@ -4132,16 +4132,14 @@ void lerp_tensor_contiguous(const T* self, const T* end, const T* weight,
             __builtin_cpu_supports("fma")) {
             if (tensorplay::cpu::streamdst::ternary_works_past_cache(
                     n, result, self, end, weight)) {
-                parallel_for_weighted(0, n, GRAIN_SIZE,
-                                      [&](int64_t begin, int64_t finish) {
+                parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t finish) {
                     lerp_tensor_half_walk<true>(self + begin, end + begin,
                                                 weight + begin, result + begin,
                                                 finish - begin);
                 });
                 return;
             }
-            parallel_for_weighted(0, n, GRAIN_SIZE,
-                                  [&](int64_t begin, int64_t finish) {
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t finish) {
                 lerp_tensor_half_walk<false>(self + begin, end + begin,
                                              weight + begin, result + begin,
                                              finish - begin);

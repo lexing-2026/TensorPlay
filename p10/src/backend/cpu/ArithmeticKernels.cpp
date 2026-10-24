@@ -4928,15 +4928,13 @@ void addcmul_dense_walk(const Tensor& self, const Tensor& tensor1,
             const float scale = static_cast<float>(alpha);
             if (tensorplay::cpu::streamdst::ternary_works_past_cache(
                     n, result_ptr, self_ptr, tensor1_ptr, tensor2_ptr)) {
-                parallel_for_weighted(0, n, GRAIN_SIZE,
-                                      [&](int64_t begin, int64_t end) {
+                parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
                     addcmul_half_walk<true>(self_ptr, tensor1_ptr, tensor2_ptr,
                                             scale, result_ptr, begin, end);
                 });
                 return;
             }
-            parallel_for_weighted(0, n, GRAIN_SIZE,
-                                  [&](int64_t begin, int64_t end) {
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
                 addcmul_half_walk<false>(self_ptr, tensor1_ptr, tensor2_ptr,
                                          scale, result_ptr, begin, end);
             });
@@ -5239,15 +5237,13 @@ void addcdiv_dense_walk(const Tensor& self, const Tensor& tensor1,
             const float scale = static_cast<float>(alpha);
             if (tensorplay::cpu::streamdst::ternary_works_past_cache(
                     n, result_ptr, self_ptr, tensor1_ptr, tensor2_ptr)) {
-                parallel_for_weighted(0, n, GRAIN_SIZE,
-                                      [&](int64_t begin, int64_t end) {
+                parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
                     addcdiv_half_walk<true>(self_ptr, tensor1_ptr, tensor2_ptr,
                                             scale, result_ptr, begin, end);
                 });
                 return;
             }
-            parallel_for_weighted(0, n, GRAIN_SIZE,
-                                  [&](int64_t begin, int64_t end) {
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
                 addcdiv_half_walk<false>(self_ptr, tensor1_ptr, tensor2_ptr,
                                          scale, result_ptr, begin, end);
             });
