@@ -63,6 +63,8 @@ enum class VOp : int {
     // composed: a vector walk over one of the ops above plus an elementwise
     // fix-up, so they need no kernel of their own
     Sinc, Entr, Logit, SphBesselJ0,
+    // Chebyshev series evaluated across the lanes (see the Bessel block below)
+    I1e,
     // library-only: no vector form below, so these run the scalar tail unless
     // the library is linked in
     Ndtr, NdtrI, Erfcx,
@@ -91,6 +93,15 @@ inline bool avx2_available() {
 inline bool f16c_available() {
 #if defined(TP_VECUNARY_X86)
     static const bool ok = __builtin_cpu_supports("f16c") != 0;
+    return ok;
+#else
+    return false;
+#endif
+}
+
+inline bool fma_available() {
+#if defined(TP_VECUNARY_X86)
+    static const bool ok = __builtin_cpu_supports("fma") != 0;
     return ok;
 #else
     return false;
@@ -209,6 +220,7 @@ inline T scalar_apply(VOp op, VParams prm, T x) {
             return std::log(p / (T(1) - p));
         }
         case VOp::SphBesselJ0: return spherical_j0_from_sin(x, std::sin(x));
+        case VOp::I1e: return special_math::calc_i1e(x);
         case VOp::Lgamma: return std::lgamma(x);
         case VOp::Sigmoid: return T(1) / (T(1) + std::exp(-x));
         case VOp::GeluNone: {
@@ -3146,8 +3158,108 @@ inline bool composed_f64(VOp op, VParams prm, const double* src, double* dst, in
     }
 }
 
+// ---------------------------------------------------------------------------
+// Bessel family.
+//
+// These are Chebyshev series whose recurrence is serial in the coefficient
+// index: one value can only advance one step at a time, so a single value is a
+// pure latency chain.  The parallelism has to come from the values instead --
+// eight of them (four for double) walk the coefficient list together, which
+// turns latency into throughput.  A group that holds a value outside the
+// series interval, or a non-finite one, takes the scalar routine; the check is
+// per group, so ordinary input never pays for it.
+// ---------------------------------------------------------------------------
+#if defined(TP_VECUNARY_X86) && defined(__x86_64__) \
+    && (defined(__GNUC__) || defined(__clang__))
+#define TP_VECUNARY_SIMD_MATH 1
+#endif
+
+#ifdef TP_VECUNARY_SIMD_MATH
+// The multiply, subtract and add are kept apart rather than fused: the scalar
+// routine rounds three times per step, and doing the same here keeps the lanes
+// bit-identical to it instead of trading a rounding step for a wider error.
+__attribute__((target("avx2,fma")))
+static inline __m256 chbevl_f32x8(__m256 x, const float* a, int len) {
+    const __m256 zero = _mm256_setzero_ps();
+    __m256 b0 = _mm256_set1_ps(a[0]), b1 = zero, b2 = zero;
+    for (int i = 1; i < len; ++i) {
+        b2 = b1;
+        b1 = b0;
+        b0 = _mm256_add_ps(_mm256_sub_ps(_mm256_mul_ps(x, b1), b2), _mm256_set1_ps(a[i]));
+    }
+    return _mm256_mul_ps(_mm256_set1_ps(0.5f), _mm256_sub_ps(b0, b2));
+}
+
+// The series changes at |x| = 8: below it the argument is x/2 - 2 and the
+// result scales by x, above it the argument is 32/x - 2 and the result scales
+// by 1/sqrt(x).  A group that straddles the split evaluates both and blends,
+// which is cheaper than dropping the whole group to the scalar routine.
+__attribute__((target("avx2,fma")))
+static inline __m256 i1e_small_f32x8(__m256 x, const float* a, int len) {
+    const __m256 y = _mm256_sub_ps(_mm256_mul_ps(x, _mm256_set1_ps(0.5f)),
+                                   _mm256_set1_ps(2.0f));
+    return _mm256_mul_ps(chbevl_f32x8(y, a, len), x);
+}
+
+__attribute__((target("avx2,fma")))
+static inline __m256 i1e_large_f32x8(__m256 x, const float* b, int len) {
+    const __m256 y = _mm256_sub_ps(_mm256_div_ps(_mm256_set1_ps(32.0f), x),
+                                   _mm256_set1_ps(2.0f));
+    return _mm256_div_ps(chbevl_f32x8(y, b, len), _mm256_sqrt_ps(x));
+}
+
+__attribute__((target("avx2,fma")))
+static void i1e_block_f32_avx2(const float* src, float* dst, int64_t b, int64_t e) {
+    const auto [small, small_len] = special_math::chebyshev_coefficients_i1e_A<float>();
+    const auto [large, large_len] = special_math::chebyshev_coefficients_i1e_B<float>();
+    const __m256 sgn = _mm256_set1_ps(-0.0f);
+    const __m256 eight = _mm256_set1_ps(8.0f);
+    const __m256 zero = _mm256_setzero_ps();
+    int64_t i = b;
+    for (; i + 8 <= e; i += 8) {
+        const __m256 v = _mm256_loadu_ps(src + i);
+        const __m256 x = _mm256_andnot_ps(sgn, v);
+        const __m256 below = _mm256_cmp_ps(x, eight, _CMP_LE_OQ);
+        const int lanes = _mm256_movemask_ps(below);
+        __m256 r;
+        if (lanes == 0xFF) {
+            r = i1e_small_f32x8(x, small, static_cast<int>(small_len));
+        } else if (lanes == 0) {
+            r = i1e_large_f32x8(x, large, static_cast<int>(large_len));
+        } else {
+            r = _mm256_blendv_ps(i1e_large_f32x8(x, large, static_cast<int>(large_len)),
+                                 i1e_small_f32x8(x, small, static_cast<int>(small_len)),
+                                 below);
+        }
+        r = _mm256_blendv_ps(r, _mm256_sub_ps(zero, r), _mm256_cmp_ps(v, zero, _CMP_LT_OQ));
+        _mm256_storeu_ps(dst + i, r);
+    }
+    for (; i < e; ++i) dst[i] = scalar_apply(VOp::I1e, {}, src[i]);
+}
+#endif
+
+inline void i1e_block_f32(const float* src, float* dst, int64_t b, int64_t e) {
+#ifdef TP_VECUNARY_SIMD_MATH
+    if (avx2_available() && fma_available()) {
+        i1e_block_f32_avx2(src, dst, b, e);
+        return;
+    }
+#endif
+    for (int64_t i = b; i < e; ++i) dst[i] = scalar_apply(VOp::I1e, {}, src[i]);
+}
+
+// The double series carries 29 coefficients, so a four-wide walk only buys a
+// few times over the scalar routine; that path keeps the routine it had.
+inline void i1e_block_f64(const double* src, double* dst, int64_t b, int64_t e) {
+    for (int64_t i = b; i < e; ++i) dst[i] = scalar_apply(VOp::I1e, {}, src[i]);
+}
+
 inline void run_f32(VOp op, VParams prm, const float* src, float* dst, int64_t b, int64_t e) {
     if (composed_f32(op, prm, src, dst, b, e)) return;
+    if (op == VOp::I1e) {
+        i1e_block_f32(src, dst, b, e);
+        return;
+    }
 #ifdef USE_MKL
     if (Vml32Entry fn = vml32_entry(op)) {
         MKL_Set_Num_Threads_Local(1);
@@ -3185,6 +3297,10 @@ inline void run_f32(VOp op, VParams prm, const float* src, float* dst, int64_t b
 
 inline void run_f64(VOp op, VParams prm, const double* src, double* dst, int64_t b, int64_t e) {
     if (composed_f64(op, prm, src, dst, b, e)) return;
+    if (op == VOp::I1e) {
+        i1e_block_f64(src, dst, b, e);
+        return;
+    }
 #ifdef USE_MKL
     if (Vml64Entry fn = vml64_entry(op)) {
         // Every worker owns a slice of the walk, so the library must not spread
