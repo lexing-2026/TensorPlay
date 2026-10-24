@@ -4,7 +4,10 @@ The forward pass reads a row once into registers, reduces the mean square
 across the block, and writes the scaled row back.  The backward pass keeps a
 per-thread weight gradient in registers while it walks a strided set of rows,
 so the whole pass costs three row reads, one row write, and one partial buffer
-per block that a caller sums afterwards.
+per block that a caller sums afterwards.  A row too wide for the registers is
+walked twice, and what shared memory can hold of it between the walks is not
+read again; where only one of the two rows read fits there, the other is kept
+in registers instead.
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ from ._prims import (
     column_sum,
     compile_cached,
     fake_tensor,
+    staging_plan,
     stream_atoms,
     tail_predicate,
     threads_for_row,
@@ -103,6 +107,11 @@ class RmsNormFwd:
 #: keeps the working set small enough to stay in registers.
 RESIDENT_BUDGET = 16
 
+#: 32-bit registers one SM offers its resident blocks, so a block of ``threads``
+#: threads may spend ``REGISTERS_PER_SM * 4 / threads`` bytes of them each before
+#: the compiler starts parking values in local memory.
+REGISTERS_PER_SM = 65536
+
 
 class RmsNormBwd:
     def __init__(self, dtype, n: int, threads: int, vec: int, blocks: int):
@@ -115,6 +124,28 @@ class RmsNormBwd:
         self.tiler_n = vec * self.chunks * threads
         self.num_warps = threads // 32
         self.resident = self.chunks * vec <= RESIDENT_BUDGET
+        # The second walk needs the row and its incoming gradient, so staging
+        # both is what turns the walk into a shared-memory read.  One array
+        # still saves one pass over global memory; the block runs alone on its
+        # SM either way, because the grid is the SM count.
+        self.stage = (
+            0
+            if self.resident
+            else staging_plan(self.tiler_n * (dtype.width // 8), self.num_warps * 4)
+        )
+        # Where only one of the two rows fits in shared memory, the other can be
+        # kept in registers instead of read again.  The weight-gradient
+        # accumulator, the held row, one chunk of each vector read and their
+        # float32 products are then live across both walks at once, and a block
+        # may spend only its share of the SM register file on them.  Past that
+        # the compiler parks the held row in local memory, which measures worse
+        # than reading it from global memory a second time.
+        self.hold = self.stage == 1 and (
+            self.chunks * self.vec * (4 + dtype.width // 8)
+            + self.vec * (3 * (dtype.width // 8) + 16)
+            + 64
+            <= 4 * REGISTERS_PER_SM / self.threads
+        )
 
     @cute.jit
     def __call__(self, x, w, dout, rstd, dx, dw_partial, stream):
@@ -192,10 +223,24 @@ class RmsNormBwd:
         else:
             # Wide rows are walked twice instead of held: the first walk folds
             # the row into the reduction and the weight gradient, the second
-            # rebuilds each element and writes the input gradient.
+            # rebuilds each element and writes the input gradient.  Whatever of
+            # the row shared memory can hold is read from there the second
+            # time, so only what cannot escape costs another pass.
+            stage_layout = cute.make_layout((1, tiler_n), stride=(0, 1))
+            stage_x = stage_d = None
+            if const_expr(self.stage >= 1):
+                stage_x = smem.allocate_tensor(self.dtype, stage_layout, byte_alignment=16)
+            if const_expr(self.stage >= 2):
+                stage_d = smem.allocate_tensor(self.dtype, stage_layout, byte_alignment=16)
+            sX = (thr.partition_S(cute.local_tile(stage_x, (1, tiler_n), (0, 0)))
+                  if const_expr(self.stage >= 1) else None)
+            sD = (thr.partition_S(cute.local_tile(stage_d, (1, tiler_n), (0, 0)))
+                  if const_expr(self.stage >= 2) else None)
+
             rX = cute.make_rmem_tensor_like(proto[None, None, 0])
             rO = cute.make_rmem_tensor_like(proto[None, None, 0])
             rW = cute.make_rmem_tensor_like(gW[None, None, 0])
+            rH = cute.make_rmem_tensor_like(proto) if const_expr(self.hold) else None
             rP = [cute.make_rmem_tensor_like(gP[None, None, k]) for k in range(self.chunks)]
             for k in cutlass.range_constexpr(self.chunks):
                 rP[k].fill(0.0)
@@ -210,32 +255,56 @@ class RmsNormBwd:
                 for k in cutlass.range_constexpr(self.chunks):
                     p = None if pred is None else pred[None, None, k]
                     cute.copy(atom, gX[None, None, k], rX, pred=p)
-                    cute.copy(atom, gO[None, None, k], rO, pred=p)
+                    if const_expr(self.hold):
+                        cute.copy(atom, gO[None, None, k], rH[None, None, k], pred=p)
+                        dv = rH[None, None, k].load().to(Float32).reshape((self.vec,))
+                    else:
+                        cute.copy(atom, gO[None, None, k], rO, pred=p)
+                        dv = rO.load().to(Float32).reshape((self.vec,))
                     cute.copy(atom, gW[None, None, k], rW, pred=p)
+                    if const_expr(self.stage >= 1):
+                        cute.copy(atom, rX, sX[None, None, k], pred=p)
+                    if const_expr(self.stage >= 2):
+                        cute.copy(atom, rO, sD[None, None, k], pred=p)
                     col = tidx * self.vec + k * self.threads * self.vec
                     if col < n:
                         v = rX.load().to(Float32).reshape((self.vec,))
-                        d = rO.load().to(Float32).reshape((self.vec,))
                         wv = rW.load().to(Float32).reshape((self.vec,))
-                        dot += (v * d * wv).reduce(
+                        dot += (v * dv * wv).reduce(
                             cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0
                         )
                         pk = rP[k].load()
-                        rP[k].store(pk + (d * v * inv).reshape(pk.shape))
+                        rP[k].store(pk + (dv * v * inv).reshape(pk.shape))
                 c1 = block_sum(dot, buf, self.num_warps) * inv / n
+                # No warp may read a staged row back before every warp has
+                # written it.
+                cute.arch.barrier()
                 for k in cutlass.range_constexpr(self.chunks):
                     p = None if pred is None else pred[None, None, k]
-                    cute.copy(atom, gX[None, None, k], rX, pred=p)
-                    cute.copy(atom, gO[None, None, k], rO, pred=p)
-                    cute.copy(atom, gW[None, None, k], rW, pred=p)
                     col = tidx * self.vec + k * self.threads * self.vec
+                    if const_expr(self.stage >= 1):
+                        cute.copy(atom, sX[None, None, k], rX, pred=p)
+                    else:
+                        cute.copy(atom, gX[None, None, k], rX, pred=p)
+                    if const_expr(self.stage >= 2):
+                        cute.copy(atom, sD[None, None, k], rO, pred=p)
+                    elif not const_expr(self.hold):
+                        cute.copy(atom, gO[None, None, k], rO, pred=p)
+                    cute.copy(atom, gW[None, None, k], rW, pred=p)
                     if col < n:
                         v = rX.load().to(Float32).reshape((self.vec,))
-                        d = rO.load().to(Float32).reshape((self.vec,))
+                        if const_expr(self.hold):
+                            dv = rH[None, None, k].load().to(Float32).reshape((self.vec,))
+                        else:
+                            dv = rO.load().to(Float32).reshape((self.vec,))
                         wv = rW.load().to(Float32).reshape((self.vec,))
-                        out = (d * wv - v * inv * c1) * inv
+                        out = (dv * wv - v * inv * c1) * inv
                         rO.store(out.to(rO.element_type))
                         cute.copy(atom, rO, gD[None, None, k], pred=p)
+                # The next row overwrites the stage, so no thread may still be
+                # reading this one.
+                if const_expr(self.stage >= 1):
+                    cute.arch.barrier()
             for k in cutlass.range_constexpr(self.chunks):
                 p = None if pred is None else pred[None, None, k]
                 cute.copy(atom32, rP[k], gP[None, None, k], pred=p)
@@ -310,10 +379,11 @@ def rmsnorm_bwd(
     dx = tp.empty_like(x)
     dw_partial = tp.empty(blocks, n, dtype=tp.float32, device=x.device)
     dw = tp.empty(n, dtype=weight.dtype, device=x.device)
+    plan = RmsNormBwd(cutlass_dtype, n, threads, vec, blocks)
 
     def build():
         return cute.compile(
-            RmsNormBwd(cutlass_dtype, n, threads, vec, blocks),
+            plan,
             fake_tensor(cutlass_dtype, (cute.sym_int(), n), vec),
             fake_tensor(cutlass_dtype, (n,), vec),
             fake_tensor(cutlass_dtype, (cute.sym_int(), n), vec),
@@ -324,8 +394,11 @@ def rmsnorm_bwd(
             options="--enable-tvm-ffi",
         )
 
-    compile_cached(_bwd_cache, (n, x.dtype, threads, vec, blocks), build)(
-        x, weight, dout, rstd, dx, dw_partial
-    )
+    # What the block stages and holds depends on how much shared memory the
+    # device in play allows, so a device that would plan a different pass has to
+    # get its own object file rather than reuse one asking for more than it has.
+    compile_cached(
+        _bwd_cache, (n, x.dtype, threads, vec, blocks, plan.stage, plan.hold), build
+    )(x, weight, dout, rstd, dx, dw_partial)
     column_sum(dw_partial, dw, blocks, n, DTYPE_MAP[weight.dtype], weight.dtype)
     return dx, dw

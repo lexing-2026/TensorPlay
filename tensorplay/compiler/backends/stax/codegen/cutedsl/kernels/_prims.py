@@ -52,6 +52,35 @@ def threads_for_row(
     return max(threads, 32)
 
 
+#: Bytes of dynamic shared memory one block may hold on the device in play.  A
+#: row wider than the register budget is parked here rather than read twice, so
+#: this decides how much of the row escapes another pass over global memory.
+#: The architecture is only known once the kernel dialect is initialised, hence
+#: the accessor instead of a module constant.
+@lru_cache(maxsize=1)
+def smem_block_cap() -> int:
+    return cutlass.utils.SmemAllocator.capacity_in_bytes()
+
+
+#: Slack kept back from the shared-memory budget for the alignment each staged
+#: buffer may round up to.
+STAGE_RESERVE = 256
+
+
+def staging_plan(row_bytes: int, scratch_bytes: int, arrays: int = 2) -> int:
+    """How many whole rows of ``row_bytes`` the block can park in shared memory.
+
+    A row too wide for registers is otherwise walked twice, and the second walk
+    is a fresh pass over global memory.  Staging costs one shared-memory read
+    per element instead.  ``scratch_bytes`` is what the block already needs for
+    its reductions, and the answer never exceeds the number of rows the caller
+    would like to keep.
+    """
+
+    room = smem_block_cap() - scratch_bytes - STAGE_RESERVE
+    return max(0, min(arrays, room // row_bytes))
+
+
 @cute.jit
 def block_sum(val, buf, num_warps: cutlass.Constexpr):
     """Sum a per-thread value across the block.

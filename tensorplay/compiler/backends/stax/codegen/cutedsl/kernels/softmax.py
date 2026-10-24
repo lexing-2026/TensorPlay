@@ -2,8 +2,10 @@
 
 One block owns one row.  While the row fits in registers the block reads it
 once, reduces the maximum and the exponential sum in place, and writes the
-normalised row back; wider rows are staged through shared memory so the row is
-still read from global memory only once.
+normalised row back.  A row wider than that is walked twice, the first walk
+folding the row and the second rebuilding it: the register budget a block of
+full width can hold is already close to the shared memory one block may, so a
+row that escapes the former rarely fits in the latter.
 """
 
 from __future__ import annotations

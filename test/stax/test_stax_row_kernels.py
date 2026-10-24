@@ -23,7 +23,10 @@ from tensorplay.compiler.backends.stax.codegen.cutedsl.kernels import (
 cuda_only = pytest.mark.skipif(not tp.cuda.is_available(), reason="needs a CUDA device")
 
 DTYPES = [tp.bfloat16, tp.float16, tp.float32]
-SHAPES = [(8, 4096), (3, 8192), (4, 32000), (5, 1000), (2, 65536)]
+# 16384 columns are wide enough that the normalisation gradient cannot hold a
+# row of them, so the shape also covers the walks that stage through shared
+# memory; 65536 is wide enough that not even one row of them fits there.
+SHAPES = [(8, 4096), (3, 8192), (4, 32000), (5, 1000), (2, 65536), (2, 16384)]
 
 
 def _softmax_row(x):
