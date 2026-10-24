@@ -2303,10 +2303,6 @@ reduce_argminmax_buffer_half:
     GREATER: 1
   - NAME: reduce_argmin_buffer_half
     GREATER: 0
-hardshrink_mask:
-  parameter_names_with_default_values: {}
-  shader_variants:
-  - NAME: hardshrink_mask
 softmax_buffer:
   parameter_names_with_default_values:
     LOG_MODE: 0
@@ -2323,12 +2319,6 @@ softmax_buffer_half:
     LOG_MODE: 0
   - NAME: log_softmax_buffer_half
     LOG_MODE: 1
-one_minus:
-  parameter_names_with_default_values:
-    OPERATOR: 1.0f - X
-  shader_variants:
-  - NAME: one_minus
-    OPERATOR: 1.0f - X
 reduce_int64:
   parameter_names_with_default_values:
     DTYPE: int
