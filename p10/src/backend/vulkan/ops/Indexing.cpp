@@ -570,8 +570,18 @@ Tensor& index_copy_rows_inplace(Tensor& self, int64_t dim, const Tensor& index, 
     // small; bring it to a dense buffer so every linear-path argument has
     // memory attached (an empty buffer binding would silently skip the job).
     v_source = to_buffer_storage_dispatch(context, v_source);
+    // Two lanes of a half payload share one word, so that walk cannot be driven
+    // from the rows it fills: an odd feature count puts the last lane of one row
+    // in the same word as the first of the next, and a walk that owns elements
+    // rather than words would rewrite the lane the scatter never named.  It runs
+    // from the destination one word per invocation instead.  A single-precision
+    // payload answers each lane through a word of its own, so it stays driven
+    // from the source rows it touches and never reads the destination.
+    const bool paired_lanes = self.dtype() == DType::Float16;
     const uint32_t nf4 = static_cast<uint32_t>((width + 3) / 4);
-    const int64_t invocations = nf4 * planes * n_idx;
+    const int64_t invocations = paired_lanes
+        ? (self.numel() + 1) / 2
+        : static_cast<int64_t>(nf4) * planes * n_idx;
     TP_CHECK(
         invocations <= std::numeric_limits<int32_t>::max(),
         "Vulkan index_copy_: the row walk needs more than two billion "
@@ -591,12 +601,17 @@ Tensor& index_copy_rows_inplace(Tensor& self, int64_t dim, const Tensor& index, 
     api::UniformParamsBuffer params(context, block);
     api::PipelineBarrier pipeline_barrier{};
     context->submit_compute_job(
-        VK_KERNEL_FROM_STR("index_copy_buffer"), pipeline_barrier,
+        VK_KERNEL_FROM_STR(paired_lanes ? "index_copy_buffer_half"
+                                        : "index_copy_buffer"),
+        pipeline_barrier,
         {n, 1u, 1u}, {256u, 1u, 1u}, VK_NULL_HANDLE,
         v_self.buffer(
             pipeline_barrier,
             api::PipelineStage::COMPUTE,
-            api::MemoryAccessType::WRITE),
+            paired_lanes
+                ? (api::MemoryAccessType::READ |
+                   api::MemoryAccessType::WRITE)
+                : api::MemoryAccessType::WRITE),
         v_source.buffer(
             pipeline_barrier,
             api::PipelineStage::COMPUTE,

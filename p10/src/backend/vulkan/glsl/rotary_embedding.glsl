@@ -11,8 +11,9 @@ layout(std430) buffer;
 // the texture stores one head dimension per x position and packs four heads
 // per texel along z, so texel (x, row, batch) holds dimension x of four
 // heads.  cos/sin tables are [table_rows, half_dim], one value per texel, in
-// texture or linear storage.  Each invocation rotates one pair of dimensions
-// (2i, 2i+1) for the four head lanes:
+// texture or linear storage; a linear table of the narrower element type
+// carries its two entries in the one 32-bit word that holds them.  Each
+// invocation rotates one pair of dimensions (2i, 2i+1) for the four head lanes:
 //   out[2i]   = in[2i]   * cos[t][i] - in[2i+1] * sin[t][i]
 //   out[2i+1] = in[2i]   * sin[t][i] + in[2i+1] * cos[t][i]
 // where t = row % seq_len (+ position_offset for KV cache increments).
@@ -28,6 +29,18 @@ $if TABLE_BUFFER == 1:
   uCos;
   layout(set = 0, binding = 3) buffer PRECISION restrict readonly SinBuffer {
     float data[];
+  }
+  uSin;
+$elif TABLE_BUFFER == 2:
+  // A table whose shape has an image form is still read from words when the
+  // allocator kept it there; the narrower element type pairs two entries in
+  // every word, so the walk names the word and the half of it it wants.
+  layout(set = 0, binding = 2) buffer PRECISION restrict readonly CosBuffer {
+    uint data[];
+  }
+  uCos;
+  layout(set = 0, binding = 3) buffer PRECISION restrict readonly SinBuffer {
+    uint data[];
   }
   uSin;
 $else:
@@ -61,11 +74,18 @@ void main() {
 
   // cos/sin for this rotation pair.  A texture table holds one value per texel
   // x position in its .x lane; a linear table is the flat [rows, half_dim]
-  // array.
+  // array, one entry per word for the wider type and two entries per word for
+  // the narrower one.
   // clang-format off
   $if TABLE_BUFFER == 1:
     const float c = uCos.data[table_row * uBlock.table_stride + pair];
     const float s = uSin.data[table_row * uBlock.table_stride + pair];
+  $elif TABLE_BUFFER == 2:
+    const int entry = table_row * uBlock.table_stride + pair;
+    const float c =
+        unpackHalf2x16(uCos.data[uint(entry) >> 1u])[uint(entry) & 1u];
+    const float s =
+        unpackHalf2x16(uSin.data[uint(entry) >> 1u])[uint(entry) & 1u];
   $else:
     const float c = texelFetch(uCos, ivec3(pair, table_row, 0), 0).x;
     const float s = texelFetch(uSin, ivec3(pair, table_row, 0), 0).x;

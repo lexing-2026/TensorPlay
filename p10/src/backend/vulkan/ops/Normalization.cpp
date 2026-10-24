@@ -1666,21 +1666,21 @@ Tensor rotary_embedding_kernel(
       "Vulkan rotary_embedding needs cosine/sine tables with the same number of "
       "positions");
   const bool table_linear = v_cos.storage_type() == api::StorageType::BUFFER;
-  // A linear table is read as raw words, so its element width has to match the
-  // way the consumer indexes it: a texture-stored activation reads one float
-  // texel-sized lane per entry, while a half linear payload unpacks two lanes
-  // out of every word.
+  // A linear table is read as raw words, so the walk has to index it the way
+  // its own element width packs the entries: single precision holds one entry
+  // per word, the narrower type pairs two, and a texture-stored activation
+  // reads one entry per rotation pair.  One walk indexes both tables, so a pair
+  // of different widths would read one of them past its own entries.
   if (table_linear) {
+    TP_CHECK(
+        cos.dtype() == sin.dtype(),
+        "Vulkan rotary_embedding needs cosine/sine tables of one element type "
+        "over linear storage");
     if (v_input.storage_type() != api::StorageType::TEXTURE_3D) {
       TP_CHECK(
           cos.dtype() == input.dtype(),
           "Vulkan rotary_embedding needs cosine/sine tables of the payload "
           "dtype over linear storage");
-    } else {
-      TP_CHECK(
-          cos.dtype() == DType::Float32,
-          "Vulkan rotary_embedding needs Float32 cosine/sine tables over "
-          "linear storage for a texture-stored payload");
     }
   }
 
@@ -1729,8 +1729,15 @@ Tensor rotary_embedding_kernel(
       v_output.extents()[2u]};
 
   if (table_linear) {
+    // The table's width, not the activation's, picks how the entries are read
+    // out of the words; the activation's own type still picks the image format
+    // the walk writes through.
     context->submit_compute_job(
-        kernel_for("rotary_embedding_lin_table", input.dtype()),
+        kernel_for(
+            cos.dtype() == DType::Float16
+                ? "rotary_embedding_paired_lin_table"
+                : "rotary_embedding_lin_table",
+            input.dtype()),
         pipeline_barrier,
         grid,
         adaptive_work_group_size(grid),

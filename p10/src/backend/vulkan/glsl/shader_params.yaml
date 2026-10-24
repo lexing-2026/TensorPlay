@@ -1450,6 +1450,10 @@ index_copy_buffer:
   parameter_names_with_default_values: {}
   shader_variants:
   - NAME: index_copy_buffer
+index_copy_buffer_half:
+  parameter_names_with_default_values: {}
+  shader_variants:
+  - NAME: index_copy_buffer_half
 index_add:
   parameter_names_with_default_values: {}
   generate_variant_forall:
@@ -2383,6 +2387,12 @@ rotary_embedding:
     FORMAT: rgba32f
   - NAME: rotary_embedding_lin_table_f16
     TABLE_BUFFER: 1
+    FORMAT: rgba16f
+  - NAME: rotary_embedding_paired_lin_table
+    TABLE_BUFFER: 2
+    FORMAT: rgba32f
+  - NAME: rotary_embedding_paired_lin_table_f16
+    TABLE_BUFFER: 2
     FORMAT: rgba16f
 rotary_embedding_buffer:
   parameter_names_with_default_values:
