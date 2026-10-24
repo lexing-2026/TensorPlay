@@ -2844,40 +2844,39 @@ static void bf16_chunk_avx2(VOp op, VParams prm, const uint16_t* src, uint16_t* 
 
 #endif // TP_VECUNARY_SLEEF
 
-// ---------------------------------------------------------------------------
-// Public entry points: process [b, e) of contiguous src -> dst.
-// ---------------------------------------------------------------------------
-inline void run_f32(VOp op, VParams prm, const float* src, float* dst, int64_t b, int64_t e) {
-#ifdef TP_VECUNARY_SLEEF
-#if defined(CPU_CAPABILITY_AVX512)
-    // Tier-compiled copy: the ISA is guaranteed by the tier's -m flags, so
-    // the runtime CPUID branch disappears entirely.
-    f32_chunk_avx512(op, prm, src, dst, b, e);
-    return;
-#endif
-    if (avx512_available()) {
-        f32_chunk_avx512(op, prm, src, dst, b, e);
-        return;
-    }
-    if (avx2_available()) {
-        f32_chunk_avx2(op, prm, src, dst, b, e);
-        return;
-    }
-#endif
-    for (int64_t i = b; i < e; ++i) dst[i] = scalar_apply(op, prm, src[i]);
-}
-
 #ifdef USE_MKL
-// The MKL vector math library exposes batch entry points that take a whole
+// The vector math library exposes batch entry points that take a whole
 // contiguous array per call.  The mode word is taken from mkl_vml_defines.h:
 // VML_HA (0x2) selects the high-accuracy kernel, VML_ERRMODE_IGNORE (0x100)
-// lets an out-of-domain input produce NaN directly instead of entering the
-// error callback (without it, log over negative lanes runs two orders of
-// magnitude slower), and VML_FTZDAZ_OFF (0x140000) keeps subnormals.
+// lets an out-of-domain lane produce NaN without entering the error callback,
+// and VML_FTZDAZ_OFF (0x140000) keeps subnormals.
 //
-// tanh is deliberately absent: the piecewise form in this file is about
-// fifteen percent faster than the library kernel, so it keeps its own path.
+// A lane that is subnormal, infinite, NaN or outside the function's domain
+// takes a per-element repair path inside the kernel: a logarithm over one
+// negative lane runs four to five times slower, over one subnormal lane fifty
+// times.  Screening each block for those lanes would cost a second pass over
+// the input, and the kernel is compute-bound while the screen is bound by
+// memory, so the two cannot overlap: the screen measured fifteen to twenty
+// percent on the fast path.  Paying that on every call to shorten a path only
+// unclean data takes is the wrong trade, so blocks are forwarded as they are.
+//
+// tanh is never forwarded: the piecewise form here is about fifteen percent
+// faster than the library kernel.
 extern "C" {
+void vmsExp(const int, const float[], float[], const long long) noexcept;
+void vmsExpm1(const int, const float[], float[], const long long) noexcept;
+void vmsLog1p(const int, const float[], float[], const long long) noexcept;
+void vmsSin(const int, const float[], float[], const long long) noexcept;
+void vmsCos(const int, const float[], float[], const long long) noexcept;
+void vmsAsin(const int, const float[], float[], const long long) noexcept;
+void vmsAcos(const int, const float[], float[], const long long) noexcept;
+void vmsSinh(const int, const float[], float[], const long long) noexcept;
+void vmsCosh(const int, const float[], float[], const long long) noexcept;
+void vmsAsinh(const int, const float[], float[], const long long) noexcept;
+void vmsAcosh(const int, const float[], float[], const long long) noexcept;
+void vmsAtanh(const int, const float[], float[], const long long) noexcept;
+void vmsErf(const int, const float[], float[], const long long) noexcept;
+void vmsErfc(const int, const float[], float[], const long long) noexcept;
 void vmdExp(const int, const double[], double[], const long long) noexcept;
 void vmdLn(const int, const double[], double[], const long long) noexcept;
 void vmdLog2(const int, const double[], double[], const long long) noexcept;
@@ -2900,11 +2899,35 @@ void vmdAtanh(const int, const double[], double[], const long long) noexcept;
 int MKL_Set_Num_Threads_Local(int) noexcept;
 }
 
-constexpr long long kVml64Mode =
+constexpr long long kVmlMode =
     0x2LL /* VML_HA */ | 0x100LL /* VML_ERRMODE_IGNORE */ |
     0x140000LL /* VML_FTZDAZ_OFF */;
 
+using Vml32Entry = void (*)(const int, const float[], float[], const long long);
 using Vml64Entry = void (*)(const int, const double[], double[], const long long);
+
+// Single-precision functions the library evaluates faster than the kernels
+// here.  log, log2, log10, sqrt, tan, atan and tanh are absent because the
+// local form is at least as fast.
+inline Vml32Entry vml32_entry(VOp op) {
+    switch (op) {
+        case VOp::Exp:   return vmsExp;
+        case VOp::Expm1: return vmsExpm1;
+        case VOp::Log1p: return vmsLog1p;
+        case VOp::Sin:   return vmsSin;
+        case VOp::Cos:   return vmsCos;
+        case VOp::Asin:  return vmsAsin;
+        case VOp::Acos:  return vmsAcos;
+        case VOp::Sinh:  return vmsSinh;
+        case VOp::Cosh:  return vmsCosh;
+        case VOp::Asinh: return vmsAsinh;
+        case VOp::Acosh: return vmsAcosh;
+        case VOp::Atanh: return vmsAtanh;
+        case VOp::Erf:   return vmsErf;
+        case VOp::Erfc:  return vmsErfc;
+        default:         return nullptr;
+    }
+}
 
 inline Vml64Entry vml64_entry(VOp op) {
     switch (op) {
@@ -2930,7 +2953,43 @@ inline Vml64Entry vml64_entry(VOp op) {
         default:         return nullptr;
     }
 }
+
 #endif
+
+// ---------------------------------------------------------------------------
+// Public entry points: process [b, e) of contiguous src -> dst.
+// ---------------------------------------------------------------------------
+inline void run_f32(VOp op, VParams prm, const float* src, float* dst, int64_t b, int64_t e) {
+#ifdef USE_MKL
+    if (Vml32Entry fn = vml32_entry(op)) {
+        MKL_Set_Num_Threads_Local(1);
+        constexpr int64_t kSpan = int64_t(1) << 24;
+        for (int64_t i = b; i < e; i += kSpan) {
+            const int64_t m = (e - i) < kSpan ? (e - i) : kSpan;
+            fn(static_cast<int>(m), src + i, dst + i, kVmlMode);
+        }
+        return;
+    }
+#endif
+#ifdef TP_VECUNARY_SLEEF
+#if defined(CPU_CAPABILITY_AVX512)
+    // Tier-compiled copy: the ISA is guaranteed by the tier's -m flags, so
+    // the runtime CPUID branch disappears entirely.
+    f32_chunk_avx512(op, prm, src, dst, b, e);
+    return;
+#endif
+    if (avx512_available()) {
+        f32_chunk_avx512(op, prm, src, dst, b, e);
+        return;
+    }
+    if (avx2_available()) {
+        f32_chunk_avx2(op, prm, src, dst, b, e);
+        return;
+    }
+#endif
+    for (int64_t i = b; i < e; ++i) dst[i] = scalar_apply(op, prm, src[i]);
+}
+
 
 inline void run_f64(VOp op, VParams prm, const double* src, double* dst, int64_t b, int64_t e) {
 #ifdef USE_MKL
@@ -2943,7 +3002,7 @@ inline void run_f64(VOp op, VParams prm, const double* src, double* dst, int64_t
         constexpr int64_t kSpan = int64_t(1) << 24;
         for (int64_t i = b; i < e; i += kSpan) {
             const int64_t m = (e - i) < kSpan ? (e - i) : kSpan;
-            fn(static_cast<int>(m), src + i, dst + i, kVml64Mode);
+            fn(static_cast<int>(m), src + i, dst + i, kVmlMode);
         }
         return;
     }
