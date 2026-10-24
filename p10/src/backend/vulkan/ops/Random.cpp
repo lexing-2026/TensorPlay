@@ -18,18 +18,15 @@ namespace ops {
 
 using namespace api::utils;
 
-// Sibling Vulkan selection kernels used by the token sampler.
-std::tuple<Tensor, Tensor> sort_kernel(
-    const Tensor& self, int64_t dim, bool descending);
-std::tuple<Tensor, Tensor> topk_kernel(
-    const Tensor& self, int64_t k, int64_t dim, bool largest, bool sorted,
-    int64_t impl);
+// Sibling Vulkan selection kernels used by the token sampler.  The sampler
+// binds the ranks the walk keeps a word at a time, so it takes the positions in
+// the width the walk writes them in rather than the wide answer the op table
+// hands out.
+std::tuple<Tensor, Tensor> sorted_positions(
+    const Tensor& self, int64_t dim, bool descending, int64_t count);
 Tensor argmax_kernel(
     const Tensor& self, std::optional<int64_t> dim, bool keepdim);
 Tensor div_kernel(const Tensor& self, const Tensor& other);
-Tensor to_dtype_kernel(
-    const Tensor& self, DType dtype, bool non_blocking, bool copy,
-    std::optional<int64_t> memory_format);
 
 namespace {
 
@@ -512,14 +509,14 @@ Tensor multinomial_kernel(
         prob.device(), false);
     exponential_kernel(waits, 1.0, generator);
     const Tensor scores = div_kernel(prob, waits);
+    // A draw names a category, so it travels on the wide count: the arg fold
+    // already answers there, while the ordered walk keeps its ranks in the
+    // signed word and moves them up here.
     const Tensor picks = num_samples == 1
-        ? reshape_kernel(
-              argmax_kernel(scores, scores.dim() - 1, true), out_shape)
-        : std::get<1>(
-              topk_kernel(scores, num_samples, -1, true, true, 0));
-    // The rank is a position in a row, which the ranking kernels keep in the
-    // signed word; the answer counts categories, so it travels in the wide code.
-    return to_dtype_kernel(picks, DType::Int64, false, true, std::nullopt);
+        ? argmax_kernel(scores, scores.dim() - 1, true)
+        : std::get<1>(sorted_positions(
+              scores, -1, true, num_samples)).to(DType::Int64);
+    return reshape_kernel(picks, out_shape);
   }
 
   api::Context* const context = api::context();
@@ -616,10 +613,10 @@ Tensor sample_kernel(
   int64_t sorted_len = cols;
   std::tuple<Tensor, Tensor> sorted;
   if (top_k > 0 && top_k < cols) {
-    sorted = topk_kernel(input, top_k, -1, true, true, 0);
+    sorted = sorted_positions(input, -1, true, top_k);
     sorted_len = top_k;
   } else {
-    sorted = sort_kernel(input, -1, true);
+    sorted = sorted_positions(input, -1, true, -1);
   }
   const Tensor& values = std::get<0>(sorted);
   const Tensor& indices = std::get<1>(sorted);

@@ -172,6 +172,15 @@ std::tuple<Tensor, Tensor> sort_impl(
 
 } // namespace
 
+// The ranks a walk keeps live in the signed word the walk writes them in.  A
+// consumer that binds those positions a word at a time — the sampler, which
+// reads an ordered row straight out of the walk — takes this pair, while every
+// answer handed to a caller names its lane on the wide count.
+std::tuple<Tensor, Tensor> sorted_positions(
+    const Tensor& self, int64_t dim, bool descending, int64_t count) {
+  return sort_impl(self, dim, descending, count);
+}
+
 Tensor median_kernel(const Tensor& self) {
   TP_CHECK(self.numel() > 0, "Vulkan median requires a non-empty tensor");
   const Tensor flat = reshape_kernel(self, {self.numel()});
@@ -181,14 +190,15 @@ Tensor median_kernel(const Tensor& self) {
 
 std::tuple<Tensor, Tensor> sort_kernel(
     const Tensor& self, int64_t dim, bool descending) {
-  return sort_impl(self, dim, descending, -1);
+  const auto ordered = sort_impl(self, dim, descending, -1);
+  return {std::get<0>(ordered), std::get<1>(ordered).to(DType::Int64)};
 }
 
 // The permutation alone: the same selection, with the ordered values dropped
 // rather than written out a second time.
 Tensor argsort_kernel(
     const Tensor& self, int64_t dim, bool descending) {
-  return std::get<1>(sort_impl(self, dim, descending, -1));
+  return std::get<1>(sort_impl(self, dim, descending, -1)).to(DType::Int64);
 }
 
 // The k-th smallest entry of a span and the lane that holds it.  The ordered
@@ -254,7 +264,8 @@ std::tuple<Tensor, Tensor> topk_kernel(
   (void)sorted; // Sorted output also satisfies the unordered top-k contract.
   (void)impl;   // Algorithm selection hint; one implementation here.
   TP_CHECK(k >= 0, "Vulkan topk: k must be non-negative");
-  return sort_impl(self, dim, largest, k);
+  const auto ordered = sort_impl(self, dim, largest, k);
+  return {std::get<0>(ordered), std::get<1>(ordered).to(DType::Int64)};
 }
 
 } // namespace ops

@@ -1041,6 +1041,18 @@ Tensor arg_impl(
   return repack_with_sizes(reduced, std::move(final_sizes));
 }
 
+// The walk keeps the lane it names in a signed word, while a named lane counts
+// lanes and therefore travels on the wide count.  Every entry that hands one
+// out goes through here, so the width a caller can join, gather or compare is
+// the same one the host answers with.
+Tensor arg_named(
+    const Tensor& self,
+    std::optional<int64_t> dim,
+    bool keepdim,
+    bool greater) {
+  return arg_impl(self, dim, keepdim, greater).to(DType::Int64);
+}
+
 enum class BoolReduceKind { kAll, kAny };
 
 const char* bool_reduce_shader_name(BoolReduceKind kind) {
@@ -1437,7 +1449,7 @@ std::tuple<Tensor, Tensor> max_dim_kernel(
     bool keepdim) {
   return {
       extremum_impl(self, {dim}, keepdim, ExtremumKind::kMax),
-      arg_impl(self, dim, keepdim, true),
+      arg_named(self, dim, keepdim, true),
   };
 }
 
@@ -1451,7 +1463,7 @@ std::tuple<Tensor, Tensor> min_dim_kernel(
     bool keepdim) {
   return {
       extremum_impl(self, {dim}, keepdim, ExtremumKind::kMin),
-      arg_impl(self, dim, keepdim, false),
+      arg_named(self, dim, keepdim, false),
   };
 }
 
@@ -1593,14 +1605,14 @@ Tensor argmax_kernel(
     const Tensor& self,
     std::optional<int64_t> dim,
     bool keepdim) {
-  return arg_impl(self, dim, keepdim, true);
+  return arg_named(self, dim, keepdim, true);
 }
 
 Tensor argmin_kernel(
     const Tensor& self,
     std::optional<int64_t> dim,
     bool keepdim) {
-  return arg_impl(self, dim, keepdim, false);
+  return arg_named(self, dim, keepdim, false);
 }
 
 Tensor count_nonzero_kernel(

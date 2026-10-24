@@ -422,9 +422,10 @@ Tensor logcumsumexp_kernel(
 
 // The running extremum keeps the payload's own width.  A byte-packed lane
 // widens into single precision, which holds every value it can carry exactly,
-// and the winning lane narrows back; the indices answer in the backend's index
-// width, one word.  A scalar has no axis to walk: its value is itself and the
-// sole position is zero.
+// and the winning lane narrows back.  The walk keeps the lane it names in a
+// signed word, while a named lane counts lanes and therefore travels on the wide
+// count the host answers with.  A scalar has no axis to walk: its value is
+// itself and the sole position is zero.
 std::tuple<Tensor, Tensor> cum_extremum_kernel(
     const Tensor& self, int64_t dim, bool is_max) {
   const std::string name = is_max ? "cummax" : "cummin";
@@ -442,7 +443,7 @@ std::tuple<Tensor, Tensor> cum_extremum_kernel(
         dim == 0 || dim == -1, "Vulkan ", name, ": dimension out of range");
     return {
         to_dtype_kernel(self, self.dtype(), false, true, std::nullopt),
-        zeros_kernel({}, DType::Int32, self.device(), false)};
+        zeros_kernel({}, DType::Int64, self.device(), false)};
   }
   TP_CHECK(
       self.dim() >= 1 && self.dim() <= 4,
@@ -466,6 +467,7 @@ std::tuple<Tensor, Tensor> cum_extremum_kernel(
   if (byte_packed) {
     std::get<0>(walked) = as_type(std::get<0>(walked), self.dtype());
   }
+  std::get<1>(walked) = std::get<1>(walked).to(DType::Int64);
   return walked;
 }
 

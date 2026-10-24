@@ -2515,7 +2515,7 @@ class TestVulkanLinearPayload(unittest.TestCase):
         np.testing.assert_array_equal(
             F.argmin(rows, dim=0).cpu().numpy(), rows_cpu.argmin(axis=0),
             err_msg="column argmin over an odd half output row count")
-        self.assertEqual(F.argmax(rows, dim=1).dtype, tensorplay.int32,
+        self.assertEqual(F.argmax(rows, dim=1).dtype, tensorplay.int64,
                          "half argmax changed its index dtype")
         np.testing.assert_allclose(
             rows.sum(dim=[1]).cpu().numpy().astype(np.float32),
@@ -11519,7 +11519,7 @@ class TestVulkanArgsort(unittest.TestCase):
         rng = np.random.default_rng(40)
         data = (rng.standard_normal((6, 11)) * 10).astype(np.float32)
         order = self._device(data).argsort(dim=1, descending=True)
-        self.assertEqual(order.dtype, tensorplay.int32)
+        self.assertEqual(order.dtype, tensorplay.int64)
         values, indices = tensorplay.sort(self._device(data), dim=1, descending=True)
         np.testing.assert_array_equal(order.cpu().numpy(), indices.cpu().numpy())
         # Reading the row back in that order gives the sorted values.
@@ -11533,6 +11533,51 @@ class TestVulkanArgsort(unittest.TestCase):
             data.argsort(dim=4)
         with self.assertRaisesRegex(RuntimeError, "Float32 and Float16"):
             self._device(np.zeros((3, 4), np.int32)).argsort(dim=1)
+
+
+class TestVulkanNamedLane(unittest.TestCase):
+    """A lane an op names is a count, so it travels on the width a count gets."""
+
+    @staticmethod
+    def _device(values):
+        return tensorplay.from_numpy(np.asarray(values)).to("vulkan")
+
+    def test_every_entry_that_names_a_lane_answers_the_wide_count(self):
+        import tensorplay.functional as F
+
+        rng = np.random.default_rng(41)
+        rows = self._device(
+            (rng.standard_normal((4, 9)) * 10).astype(np.float32))
+        named = {
+            "argmax": F.argmax(rows, dim=1),
+            "argmin": F.argmin(rows, dim=1),
+            "max.dim": F.max(rows, dim=1)[1],
+            "min.dim": F.min(rows, dim=1)[1],
+            "sort": tensorplay.sort(rows, dim=1)[1],
+            "argsort": rows.argsort(dim=1),
+            "topk": tensorplay.topk(rows, 3, dim=-1)[1],
+            "kthvalue": rows.kthvalue(3, 1)[1],
+            "cummax": tensorplay.cummax(rows, 1).indices,
+            "cummin": tensorplay.cummin(rows, 1).indices,
+        }
+        for name, lane in named.items():
+            self.assertEqual(
+                lane.dtype, tensorplay.int64,
+                f"{name} handed out a lane on the narrow count")
+
+    def test_a_named_lane_joins_a_counting_sequence(self):
+        # A generation loop grows the history of codes with the lane a fold
+        # names, so the two have to be carried in the same width to join.
+        import tensorplay.functional as F
+
+        codes = self._device(np.arange(6, dtype=np.int64))
+        logits = self._device(np.zeros((1, 5), np.float32))
+        drawn = F.argmax(logits, dim=1).reshape(-1)
+        joined = tensorplay.cat([codes, drawn], 0)
+        self.assertEqual(joined.dtype, tensorplay.int64)
+        np.testing.assert_array_equal(
+            joined.cpu().numpy(), np.array([0, 1, 2, 3, 4, 5, 0], np.int64),
+            err_msg="a drawn lane joined the code history")
 
 
 class TestVulkanHalfSelection(unittest.TestCase):
@@ -11579,7 +11624,7 @@ class TestVulkanHalfSelection(unittest.TestCase):
             axis=axis, kind="stable")
         want_values = np.take_along_axis(data, want_order, axis=axis)
         self.assertEqual(values.dtype, tensorplay.float16)
-        self.assertEqual(indices.dtype, tensorplay.int32)
+        self.assertEqual(indices.dtype, tensorplay.int64)
         np.testing.assert_array_equal(
             values.cpu().numpy(), want_values,
             err_msg=f"half values axis {axis} descending {descending}")
@@ -16401,7 +16446,7 @@ class TestVulkanCumExtremum(unittest.TestCase):
         device = case._device(values)
         got = op(device, dim)
         case.assertEqual(got.values.dtype, device.dtype)
-        case.assertEqual(got.indices.dtype, tensorplay.int32)
+        case.assertEqual(got.indices.dtype, tensorplay.int64)
         if np.issubdtype(values.dtype, np.floating):
             np.testing.assert_allclose(
                 got.values.cpu().numpy().astype(np.float64),
