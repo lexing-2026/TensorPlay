@@ -5,9 +5,12 @@
 #define LHS_BUFFER ${LHS_BUFFER}
 #define RHS_NK ${RHS_NK}
 #define RHS_VEC4 ${RHS_VEC4}
+#define RHS_VEC8 ${RHS_VEC8}
 // clang-format on
 
+#define TWO 2
 #define FOUR 4
+#define EIGHT 8
 
 layout(std430) buffer;
 
@@ -23,7 +26,11 @@ layout(std430) buffer;
  * as floats, so a long reduction never narrows between terms.  The two weight
  * orientations differ only in which step a fetch takes; a row-major (N x K)
  * payload whose length divides by four moves eight bytes per fetch, because one
- * aligned pair of words already carries the four elements a step consumes.
+ * aligned pair of words already carries the four elements a step consumes, and
+ * one that also divides by eight doubles that to sixteen bytes per fetch.  The
+ * wide step keeps two partial sums so a second load leaves before the first one
+ * is folded in, which is what a column-at-a-time walk over a long row needs to
+ * hold enough reads in flight.
  *
  * The activation operand arrives either as its own linear payload or as a
  * width-packed image, and a half image hands its four lanes back as floats, so
@@ -35,7 +42,7 @@ layout(set = 0, binding = 0) buffer PRECISION restrict writeonly Partials {
 uPartials;
 // clang-format off
 $if LHS_BUFFER == 1:
-  $if RHS_VEC4 == 1:
+  $if RHS_VEC4 == 1 or RHS_VEC8 == 1:
     layout(set = 0, binding = 1) buffer PRECISION restrict readonly Mat1 {
       uvec2 data[];
     }
@@ -49,7 +56,12 @@ $else:
   layout(set = 0, binding = 1) uniform PRECISION sampler3D uMat1;
 // clang-format on
 // clang-format off
-$if RHS_VEC4 == 1:
+$if RHS_VEC8 == 1:
+  layout(set = 0, binding = 2) buffer PRECISION restrict readonly Mat2 {
+    uvec4 data[];
+  }
+  uMat2;
+$elif RHS_VEC4 == 1:
   layout(set = 0, binding = 2) buffer PRECISION restrict readonly Mat2 {
     uvec2 data[];
   }
@@ -74,7 +86,17 @@ uBlock;
 layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
 
 // clang-format off
-$if RHS_VEC4 == 1:
+$if RHS_VEC8 == 1:
+  // Eight reduction elements land in one aligned quadruple of words, in order,
+  // so a step reads sixteen bytes and hands back two unpackable pairs.
+  uvec4 weight_words(const int col, const int g) {
+    const int groups = uBlock.k_elements / EIGHT;
+    return uMat2.data[col * groups + g];
+  }
+  vec4 half_pair(const in uint first, const in uint second) {
+    return vec4(unpackHalf2x16(first), unpackHalf2x16(second));
+  }
+$elif RHS_VEC4 == 1:
   // Four reduction elements land in one aligned pair of words, in order, so a
   // step reads eight bytes and unpacks them into one accumulator vector.
   vec4 weight_vec(const int col, const int j) {
@@ -94,7 +116,7 @@ $else:
 
 // clang-format off
 $if LHS_BUFFER == 1:
-  $if RHS_VEC4 == 1:
+  $if RHS_VEC4 == 1 or RHS_VEC8 == 1:
     // A row opens on a group boundary, because the reduction length that
     // reaches this build divides by four.
     vec4 lhs_vec(const int row, const int j) {
@@ -142,7 +164,18 @@ void main() {
   float acc = 0.0;
 
   // clang-format off
-  $if RHS_NK == 1 and RHS_VEC4 == 1:
+  $if RHS_NK == 1 and RHS_VEC8 == 1:
+    // Chunks open on an eight-element boundary, since the host sizes them in
+    // multiples of eight, so both ends of the span sit inside one weight row.
+    float even = 0.0;
+    float odd = 0.0;
+    for (int g = k_begin / EIGHT; g < k_end / EIGHT; ++g) {
+      const uvec4 packed = weight_words(col, g);
+      even += dot(lhs_vec(row, TWO * g), half_pair(packed.x, packed.y));
+      odd += dot(lhs_vec(row, TWO * g + 1), half_pair(packed.z, packed.w));
+    }
+    acc = even + odd;
+  $elif RHS_NK == 1 and RHS_VEC4 == 1:
     // Chunks open on a group boundary, since the host sizes them in multiples
     // of four, so both ends of the span sit inside one weight row.
     for (int j = k_begin / FOUR; j < k_end / FOUR; ++j) {

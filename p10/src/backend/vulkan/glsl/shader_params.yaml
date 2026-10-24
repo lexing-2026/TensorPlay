@@ -774,6 +774,7 @@ gemv_linear_split_half:
     LHS_BUFFER: 0
     RHS_NK: 0
     RHS_VEC4: 0
+    RHS_VEC8: 0
   shader_variants:
   - NAME: gemv_linear_split_half
     LHS_BUFFER: 0
@@ -795,6 +796,14 @@ gemv_linear_split_half:
     LHS_BUFFER: 1
     RHS_NK: 1
     RHS_VEC4: 1
+  - NAME: gemv_linear_split_nk_vec8_half
+    LHS_BUFFER: 0
+    RHS_NK: 1
+    RHS_VEC8: 1
+  - NAME: gemv_linear_split_buffer_nk_vec8_half
+    LHS_BUFFER: 1
+    RHS_NK: 1
+    RHS_VEC8: 1
 gemv_linear_combine_half:
   parameter_names_with_default_values:
     OUTPUT_BUFFER: 1

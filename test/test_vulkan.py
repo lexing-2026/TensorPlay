@@ -2654,6 +2654,28 @@ class TestVulkanLinearPayload(unittest.TestCase):
                 narrowed(x_cpu @ w_cpu.T), rtol=2e-3, atol=2e-3,
                 err_msg=f"half product over a ragged reduction of {K}")
 
+        # A whole count is a stricter check on the walk than a tolerance is:
+        # every chunk has to open on a step boundary and the last chunk has to
+        # reach the last lane, so a misplaced boundary returns a wrong count
+        # rather than a rounding.  The count is only compared after the one
+        # rounding a half result lane applies to it.
+        for K in (20000, 20004, 20008):
+            x_cpu = np.ones((2, K), dtype=np.float16)
+            lanes = np.arange(K)
+            for row, count in (
+                    (np.ones(K, dtype=np.float16), K),
+                    ((lanes == K - 1).astype(np.float16), 1),
+                    ((lanes % 8 == 7).astype(np.float16), (K + 7) // 8),
+                    ((lanes % 4 == 3).astype(np.float16), (K + 3) // 4)):
+                w_cpu = np.tile(row, (17, 1))
+                want = np.full((2, 17), float(np.float16(count)),
+                               dtype=np.float32)
+                got = F.linear(upload(x_cpu), upload(w_cpu)).cpu().numpy()
+                np.testing.assert_array_equal(
+                    got.astype(np.float32), want,
+                    err_msg=f"half decode walk miscounts a count of {count} "
+                            f"lanes at K={K}")
+
         # Weights that keep an image form are restaged by the packing kernels,
         # which now pick the format of the payload they are handed.
         for M, N, K in ((1, 256, 64), (4, 128, 96)):

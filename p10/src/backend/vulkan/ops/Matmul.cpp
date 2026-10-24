@@ -813,6 +813,11 @@ Tensor gemv_decode_linear(
   // boundary; a reduction length that is not a multiple of four leaves the
   // tail ragged and stays on the element-at-a-time path.
   const bool rhs_vec4 = rhs_nk && (K % 4 == 0) && (stride_n == K);
+  // A half payload packs two elements per word, so four words carry a whole
+  // eight-element step.  Only the half family has this form: a float row would
+  // need sixteen bytes per word pair to reach the same width.
+  const bool rhs_vec8 =
+      rhs_nk && dtype == DType::Float16 && (K % 8 == 0) && (stride_n == K);
 
   const uint32_t k_texels =
       api::utils::div_up(api::utils::safe_downcast_to_u32(K), 4u);
@@ -831,8 +836,11 @@ Tensor gemv_decode_linear(
   splits = std::min(splits, k_texels);
   // Split boundaries open on texel edges so the packed operand never starts a
   // chunk in the middle of a group; a chunk therefore covers at least four
-  // elements.
-  const uint32_t chunk = 4u * api::utils::div_up(k_texels, splits);
+  // elements, or eight wherever the wide half step runs.
+  const uint32_t chunk = rhs_vec8
+      ? 8u * api::utils::div_up(
+            api::utils::safe_downcast_to_u32(K) / 8u, splits)
+      : 4u * api::utils::div_up(k_texels, splits);
 
   api::vTensor v_output{context, {M, N}, dtype};
   const bool out_buffer =
@@ -868,7 +876,10 @@ Tensor gemv_decode_linear(
   api::PipelineBarrier split_barrier{};
 
   std::string split_shader;
-  if (rhs_vec4) {
+  if (rhs_vec8) {
+    split_shader = lhs_buffer ? "gemv_linear_split_buffer_nk_vec8"
+                              : "gemv_linear_split_nk_vec8";
+  } else if (rhs_vec4) {
     split_shader = lhs_buffer ? "gemv_linear_split_buffer_nk_vec4"
                               : "gemv_linear_split_nk_vec4";
   } else if (rhs_nk) {
