@@ -1858,6 +1858,15 @@ void searchsorted_cpu_sortered(Tensor& result, const Tensor& input,
 // The same walk without a sorter: the boundary is read directly, so the
 // search does not carry a choice per step.  A sorter is rare, so it keeps
 // its own copy of the walk.
+//
+// Four queries are answered side by side, and each search is written so that
+// the machine never has to guess.  A probe's outcome picks between two next
+// values, and either pick can be recorded without a branch; the window left to
+// search then halves every round, so the round count is the table's bit depth
+// and is the same for every query.  A search still waits for its own previous
+// probe, so four of them run side by side: while one is waiting on a line,
+// three others have theirs in flight.  The answers are the ones the branched
+// walk gives because the probe sequence is the same.
 template <typename input_t, typename output_t>
 void searchsorted_cpu_plain(Tensor& result, const Tensor& input,
                             const Tensor& boundaries, bool right,
@@ -1869,23 +1878,65 @@ void searchsorted_cpu_plain(Tensor& result, const Tensor& input,
     const input_t* data_in = input.data_ptr<input_t>();
     const input_t* data_bd = boundaries.data_ptr<input_t>();
     output_t* data_out = result.data_ptr<output_t>();
+
+    // A probe is below the answer when it fails to reach the value.  The test
+    // stays a negated compare: a NaN boundary then counts as below, which is
+    // what the lone walk did, and the search moves past it.
+    auto below = [&](const input_t& probe, const input_t& val) {
+        return right ? !(probe > val) : !(probe >= val);
+    };
+    int64_t depth = 0;
+    for (int64_t w = idim_bd; w > 0; w >>= 1) ++depth;
+    constexpr int64_t kLaneCount = 4;
     parallel_for(0, numel_in, kSearchSortedGrainSize, [&](int64_t b, int64_t e) {
-        for (int64_t i = b; i < e; ++i) {
+        int64_t i = b;
+        for (; i + kLaneCount <= e; i += kLaneCount) {
+            const input_t* tbl[kLaneCount];
+            input_t val[kLaneCount];
+            int64_t first[kLaneCount], len[kLaneCount];
+            for (int j = 0; j < kLaneCount; ++j) {
+                // A 1-D boundary table is shared by every query; a row-wise
+                // table starts at (query row / input innermost) * table size.
+                const int64_t row_offset =
+                    is_1d_boundaries ? 0 : (i + j) / idim_in * idim_bd;
+                tbl[j] = data_bd + row_offset;
+                val[j] = data_in[i + j];
+                first[j] = 0;
+                len[j] = idim_bd;
+            }
+            // The last entry is the highest index a probe may read.  A closed
+            // window leaves the probe where it is, which can sit one past the
+            // end when every entry was below the value, so it is pulled back;
+            // the round then reports no move and the answer stands.
+            const int64_t last = idim_bd - 1;
+            for (int64_t round = 0; round < depth; ++round) {
+                for (int j = 0; j < kLaneCount; ++j) {
+                    const int64_t half = len[j] >> 1;
+                    const int64_t at = first[j] + half;
+                    const int64_t safe = at > last ? last : at;
+                    // The load and the window test are separate so neither one
+                    // decides whether the other runs: a closed window still
+                    // reads a valid entry and still reports "no move" through
+                    // the same arithmetic.
+                    const input_t probe = tbl[j][safe];
+                    const bool move = (len[j] > 0) & below(probe, val[j]);
+                    first[j] += move ? half + 1 : 0;
+                    len[j] = move ? len[j] - half - 1 : half;
+                }
+            }
+            for (int j = 0; j < kLaneCount; ++j) {
+                data_out[i + j] = static_cast<output_t>(first[j]);
+            }
+        }
+        for (; i < e; ++i) {
             const int64_t row_offset =
                 is_1d_boundaries ? 0 : i / idim_in * idim_bd;
             int64_t start_bd = row_offset;
             int64_t end_bd = start_bd + idim_bd;
             const input_t val = data_in[i];
-            if (!right) {
-                while (start_bd < end_bd) {
-                    const int64_t mid = start_bd + ((end_bd - start_bd) >> 1);
-                    if (!(data_bd[mid] >= val)) start_bd = mid + 1; else end_bd = mid;
-                }
-            } else {
-                while (start_bd < end_bd) {
-                    const int64_t mid = start_bd + ((end_bd - start_bd) >> 1);
-                    if (!(data_bd[mid] > val)) start_bd = mid + 1; else end_bd = mid;
-                }
+            while (start_bd < end_bd) {
+                const int64_t mid = start_bd + ((end_bd - start_bd) >> 1);
+                if (below(data_bd[mid], val)) start_bd = mid + 1; else end_bd = mid;
             }
             data_out[i] = static_cast<output_t>(start_bd - row_offset);
         }
