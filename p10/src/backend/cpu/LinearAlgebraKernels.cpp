@@ -1680,23 +1680,39 @@ Tensor bmm_kernel(const Tensor& self, const Tensor& batch2) {
                  " but found ", scalarTypeName(batch2.dtype()));
     }
     check_cpu_matmul_dtype(self.dtype());
-    // Small/thin slices keep the parallel batched-2d path; fat contiguous
-    // stacks go through the fused batched GEMM without view-select round
-    // trips.
+    const int64_t B = self.size(0), M = self.size(1), K = self.size(2);
+    const int64_t N = batch2.size(2);
+    // One batch item is the matrix product with the leading dimension folded
+    // out.  The fold reaches the route that was timed for that matrix shape and
+    // skips the batched primitive's setup, which costs more than it saves when
+    // there is nothing to batch; the three views share the destination, so the
+    // product is written straight into the result.
+    if (B == 1) {
+        Tensor result = Tensor::empty({B, M, N}, self.dtype(), self.device());
+        Tensor lhs =
+            self.as_strided({M, K}, {self.stride(1), self.stride(2)});
+        Tensor rhs =
+            batch2.as_strided({K, N}, {batch2.stride(1), batch2.stride(2)});
+        Tensor lane =
+            result.as_strided({M, N}, {result.stride(1), result.stride(2)});
+        mm_into_impl(lhs, rhs, lane);
+        return result;
+    }
+    // Thin slices -- a single row, a single column or a single contraction step
+    // -- keep the array library's batched call.  A fat stack is one primitive
+    // for the blocked engine, which spreads the whole batch across the thread
+    // pool instead of paying call setup slice by slice in sequence.
     if ((self.dtype() == DType::Float32 || self.dtype() == DType::Float64) &&
+        (M == 1 || N == 1 || K == 1) &&
         batch_items_contiguous_or_transposed(self) &&
         batch_items_contiguous_or_transposed(batch2)) {
-        const int64_t B = self.size(0), M = self.size(1), N = batch2.size(2);
-        const int64_t macs = B * self.size(1) * self.size(2) * N;
-        if (macs >= 4096 || (M == 1 || N == 1 || self.size(2) == 1)) {
-            Tensor result = Tensor::empty({B, M, N}, self.dtype(), self.device());
-            if (self.dtype() == DType::Float32) {
-                bgemm_batch<float>(self, batch2, result, 1.0, 0.0);
-            } else {
-                bgemm_batch<double>(self, batch2, result, 1.0, 0.0);
-            }
-            return result;
+        Tensor result = Tensor::empty({B, M, N}, self.dtype(), self.device());
+        if (self.dtype() == DType::Float32) {
+            bgemm_batch<float>(self, batch2, result, 1.0, 0.0);
+        } else {
+            bgemm_batch<double>(self, batch2, result, 1.0, 0.0);
         }
+        return result;
     }
     return matmul_batched_2d(self, batch2, {self.size(0)}, {batch2.size(0)});
 }
