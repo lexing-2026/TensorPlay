@@ -207,6 +207,23 @@ api::vTensor pack_lhs_width_transposed(const Tensor& src) {
   std::vector<int64_t> dst_sizes{src_sizes.back(), src_sizes[src_sizes.size() - 2]};
   api::vTensor v_src = convert(src);
 
+  // A payload the shape keeps in words has no texels to sample, so its swap is
+  // gathered word to word: the read walks the storage through the strides of
+  // the other orientation and the write lands dense, which is the layout a
+  // linear product reads its left operand in.
+  if (v_src.storage_type() == api::StorageType::BUFFER) {
+    TP_CHECK(
+        src_sizes.size() == 2u,
+        "Vulkan products over linear operands transpose a two-axis payload");
+    Tensor swapped = materialize_view(
+        src,
+        dst_sizes,
+        std::vector<int64_t>{1, src_sizes[1]},
+        0,
+        api::StorageType::BUFFER);
+    return convert(swapped);
+  }
+
   api::vTensor v_dst{
       context,
       dst_sizes,
@@ -1075,11 +1092,17 @@ Tensor mm_buffer_tiled(
 
   const bool a_buffer = v_lhs.storage_type() == api::StorageType::BUFFER;
 
-  api::vTensor v_output{context, {M, N}, dtype};
+  // A thread of the tiled kernel owns four consecutive columns, so a half
+  // result pairs them into words only when a row starts on an even element.  An
+  // odd result width therefore asks for the image destination, where every
+  // entry rides a channel of its own texel and the pairing never crosses a row;
+  // only a shape too wide to become an image is beyond this kernel.
+  api::vTensor v_output = (dtype == DType::Float16 && N % 2 != 0)
+      ? allocate_output(
+            context, api::StorageType::TEXTURE_3D, {M, N}, dtype)
+      : api::vTensor{context, {M, N}, dtype};
   const bool out_buffer =
       v_output.storage_type() == api::StorageType::BUFFER;
-  // A thread of the tiled kernel owns four consecutive columns, so a half
-  // result pairs them into words only when a row starts on an even element.
   TP_CHECK(
       !(out_buffer && dtype == DType::Float16 && N % 2 != 0),
       "Vulkan products over buffer-stored operands need an even result width "
