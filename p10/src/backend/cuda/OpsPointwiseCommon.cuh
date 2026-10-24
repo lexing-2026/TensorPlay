@@ -897,6 +897,29 @@ Tensor float_math_cuda(const Tensor& self, F f, const char* name) {
     DType in = self.dtype();
     DType out_dt = isFloatingType(in) ? in : DType::Float32;
     DType compute_dt = (in == DType::Float64) ? DType::Float64 : DType::Float32;
+    // Half and bfloat16 keep their own buffers.  Widening inside the kernel
+    // leaves one launch and one pass over memory; staging through a float
+    // tensor costs two extra launches and twice the traffic.
+    if (out_dt != compute_dt) {
+        Tensor out = Tensor::empty(shape_of(self), out_dt, self.device());
+        if (self.numel() == 0) return out;
+        TensorIterator iter = TensorIteratorConfig()
+            .check_all_same_dtype(true)
+            .add_output(out)
+            .add_const_input(self)
+            .build();
+        if (out_dt == DType::Float16) {
+            gpu_kernel(iter, [f] __host__ __device__(Half x) -> Half {
+                return static_cast<Half>(f(static_cast<float>(x)));
+            });
+        } else {
+            gpu_kernel(iter, [f] __host__ __device__(BFloat16 x) -> BFloat16 {
+                return static_cast<BFloat16>(f(static_cast<float>(x)));
+            });
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return out;
+    }
     Tensor w = (in == compute_dt) ? self : self.to(compute_dt);
     Tensor t = Tensor::empty(shape_of(w), compute_dt, w.device());
     if (w.numel() > 0) {
@@ -928,6 +951,31 @@ Tensor binary_float_cuda(const Tensor& a_in, const Tensor& b_in, F f, const char
     DType compute_dt = (dt == DType::Float64) ? DType::Float64 : DType::Float32;
     const std::vector<int64_t> out_shape = broadcast_shapes(
         shape_of(a_in), shape_of(b_in));
+    // Half and bfloat16 operands stay in their own width: the widening and
+    // the narrowing happen inside the single elementwise launch.
+    if (dt != compute_dt) {
+        Tensor ac = a_in.expand(out_shape);
+        Tensor bc = b_in.expand(out_shape);
+        Tensor out = Tensor::empty(out_shape, dt, a_in.device());
+        if (out.numel() == 0) return out;
+        TensorIterator iter = TensorIteratorConfig()
+            .check_all_same_dtype(true)
+            .add_output(out)
+            .add_const_input(ac)
+            .add_const_input(bc)
+            .build();
+        if (dt == DType::Float16) {
+            gpu_kernel(iter, [f] __host__ __device__(Half x, Half y) -> Half {
+                return static_cast<Half>(f(static_cast<float>(x), static_cast<float>(y)));
+            });
+        } else {
+            gpu_kernel(iter, [f] __host__ __device__(BFloat16 x, BFloat16 y) -> BFloat16 {
+                return static_cast<BFloat16>(f(static_cast<float>(x), static_cast<float>(y)));
+            });
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return out;
+    }
     Tensor ac = a_in.to(compute_dt).expand(out_shape);
     Tensor bc = b_in.to(compute_dt).expand(out_shape);
     Tensor out = Tensor::empty(out_shape, compute_dt, a_in.device());
