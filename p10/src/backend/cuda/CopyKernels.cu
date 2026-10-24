@@ -451,6 +451,42 @@ bool transpose_layout_is_strided_outer_4d(const Tensor& self, const Tensor& src)
     return outer_count <= 65535 && self.numel() > 0;
 }
 
+// A broadcast source whose leading dimensions are all stride zero repeats
+// one contiguous block.  Returns that block length in elements, or -1 when
+// the layout is anything else.
+int64_t broadcast_block_repeat(const Tensor& self, const Tensor& src,
+                               const Tensor& src_in) {
+    if (!src_in.is_contiguous() || src_in.numel() == 0 ||
+        src_in.numel() == self.numel()) {
+        return -1;
+    }
+    int64_t block = 1;
+    int64_t dim = src.dim() - 1;
+    for (; dim >= 0; --dim) {
+        if (src.stride(dim) == 0) break;
+        if (src.stride(dim) != block) return -1;
+        block *= src.size(dim);
+    }
+    if (block != src_in.numel()) return -1;
+    for (int64_t q = 0; q <= dim; ++q) {
+        if (src.stride(q) != 0) return -1;
+    }
+    return self.numel() % block == 0 ? block : -1;
+}
+
+// Writes one contiguous block over and over.  Sixteen bytes per thread per
+// step: the same repetition through the generic strided walker issues one
+// scalar store per element and reaches half the store bandwidth.
+__global__ void repeat_block_vec16_kernel(uint4* __restrict__ dst,
+                                          const uint4* __restrict__ src,
+                                          int64_t nvec, int64_t block_vec) {
+    const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
+    for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < nvec; i += step) {
+        dst[i] = src[i % block_vec];
+    }
+}
+
 }  // namespace
 
 Tensor& copy_kernel(Tensor& self, const Tensor& src_in, bool non_blocking) {
@@ -520,6 +556,29 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src_in, bool non_blocking) {
             }
         }
         return self;
+    }
+
+    // A broadcast source that repeats one contiguous block: the destination
+    // is that block written over and over, so it goes out in sixteen-byte
+    // stores instead of the strided walker's scalar ones.
+    if (src_cuda && self.dtype() == src.dtype() && self.is_contiguous()) {
+        const int64_t block = broadcast_block_repeat(self, src, src_in);
+        const int64_t block_bytes = block * self.itemsize();
+        if (block > 0 && self.numel() > 0 && block_bytes % 16 == 0 &&
+            ((reinterpret_cast<uintptr_t>(self.data_ptr()) |
+              reinterpret_cast<uintptr_t>(src.data_ptr())) & 15u) == 0) {
+            const int64_t nvec = self.numel() * self.itemsize() / 16;
+            const int64_t block_vec = block_bytes / 16;
+            constexpr int kThreads = 256;
+            int64_t grid = (nvec + kThreads - 1) / kThreads;
+            if (grid > 65535) grid = 65535;
+            repeat_block_vec16_kernel<<<static_cast<unsigned>(grid), kThreads,
+                                        0, stream.stream()>>>(
+                static_cast<uint4*>(self.data_ptr()),
+                static_cast<const uint4*>(src.data_ptr()), nvec, block_vec);
+            checkCuda(cudaGetLastError(), "CUDA repeat-block broadcast copy");
+            return self;
+        }
     }
 
     // Transposed 2-D views: a column-major destination over a row-major
