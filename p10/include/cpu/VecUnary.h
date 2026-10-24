@@ -1570,6 +1570,150 @@ inline __m256d v_log_f64(__m256d x) {
     return r;
 }
 
+
+// The complementary error function on double lanes.  Below |x| = 1 the
+// complement comes straight from the odd series in x^2 -- a degree-12 fit over
+// y in [0, 1] with a relative error of 1.4e-19 -- and above it the tail is
+// exp(-x^2) times a smooth factor in u = 1/x.  One polynomial cannot hold that
+// factor over the whole tail: it is fitted per octave of x, three degree-14
+// pieces over u in [1/2, 1], [1/4, 1/2] and [1/27, 1/4], each evaluated in its
+// own [-1, 1] variable and each accurate to 2e-16.  The square's rounding is
+// carried into the exponential, without which the decay loses its low bits
+// once x^2 is large enough for the rounding to move the exponent.
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256d v_erfc_tail_f64(__m256d ax) {
+    const __m256d one = _mm256_set1_pd(1.0);
+    const __m256d signbit = _mm256_set1_pd(-0.0);
+    const __m256d sq = _mm256_mul_pd(ax, ax);
+    // inf - inf would be a NaN, so the correction is masked off far outside
+    // the range where the rounding of x^2 can still move the result.
+    const __m256d sq_err = _mm256_and_pd(
+        _mm256_fnmadd_pd(ax, ax, sq),
+        _mm256_cmp_pd(ax, _mm256_set1_pd(1.0e100), _CMP_LT_OQ));
+    __m256d decay = v_exp_f64(_mm256_xor_pd(sq, signbit));
+    decay = _mm256_fmadd_pd(decay, sq_err, decay);
+    const __m256d u = _mm256_div_pd(one, ax);
+
+    __m256d t = _mm256_fmadd_pd(u, _mm256_set1_pd(9.391304347826086),
+                                _mm256_set1_pd(-1.3478260869565217));
+    __m256d q3 = _mm256_set1_pd(1.270557215101025e-12);
+    q3 = _mm256_fmadd_pd(q3, t, _mm256_set1_pd(-1.8649648578977482e-12));
+    q3 = _mm256_fmadd_pd(q3, t, _mm256_set1_pd(-2.3103889145888251e-11));
+    q3 = _mm256_fmadd_pd(q3, t, _mm256_set1_pd(1.244198439894267e-10));
+    q3 = _mm256_fmadd_pd(q3, t, _mm256_set1_pd(1.7271541321439504e-11));
+    q3 = _mm256_fmadd_pd(q3, t, _mm256_set1_pd(-3.2425988759683361e-09));
+    q3 = _mm256_fmadd_pd(q3, t, _mm256_set1_pd(1.3829296143901666e-08));
+    q3 = _mm256_fmadd_pd(q3, t, _mm256_set1_pd(4.0439111789263601e-08));
+    q3 = _mm256_fmadd_pd(q3, t, _mm256_set1_pd(-6.8591402601231557e-07));
+    q3 = _mm256_fmadd_pd(q3, t, _mm256_set1_pd(1.5388279071976929e-06));
+    q3 = _mm256_fmadd_pd(q3, t, _mm256_set1_pd(2.7903843311676303e-05));
+    q3 = _mm256_fmadd_pd(q3, t, _mm256_set1_pd(-0.00025153621852648002));
+    q3 = _mm256_fmadd_pd(q3, t, _mm256_set1_pd(-0.0012489683856544268));
+    q3 = _mm256_fmadd_pd(q3, t, _mm256_set1_pd(0.058308884888871725));
+    q3 = _mm256_fmadd_pd(q3, t, _mm256_set1_pd(0.080162269439375572));
+
+    t = _mm256_fmadd_pd(u, _mm256_set1_pd(8.0), _mm256_set1_pd(-3.0));
+    __m256d q2 = _mm256_set1_pd(4.5993232822733419e-14);
+    q2 = _mm256_fmadd_pd(q2, t, _mm256_set1_pd(-1.1795930729809297e-12));
+    q2 = _mm256_fmadd_pd(q2, t, _mm256_set1_pd(8.4940707554143757e-12));
+    q2 = _mm256_fmadd_pd(q2, t, _mm256_set1_pd(-3.0655432410488974e-11));
+    q2 = _mm256_fmadd_pd(q2, t, _mm256_set1_pd(-3.5305885227141051e-11));
+    q2 = _mm256_fmadd_pd(q2, t, _mm256_set1_pd(1.4900161035285428e-09));
+    q2 = _mm256_fmadd_pd(q2, t, _mm256_set1_pd(-1.2197543406237606e-08));
+    q2 = _mm256_fmadd_pd(q2, t, _mm256_set1_pd(4.7855642561464015e-08));
+    q2 = _mm256_fmadd_pd(q2, t, _mm256_set1_pd(1.365005441045398e-07));
+    q2 = _mm256_fmadd_pd(q2, t, _mm256_set1_pd(-3.9813218669108685e-06));
+    q2 = _mm256_fmadd_pd(q2, t, _mm256_set1_pd(3.2632400276842944e-05));
+    q2 = _mm256_fmadd_pd(q2, t, _mm256_set1_pd(-4.9930615067898893e-05));
+    q2 = _mm256_fmadd_pd(q2, t, _mm256_set1_pd(-0.0029078207025937937));
+    q2 = _mm256_fmadd_pd(q2, t, _mm256_set1_pd(0.059251971965833344));
+    q2 = _mm256_fmadd_pd(q2, t, _mm256_set1_pd(0.19907263099386563));
+
+    t = _mm256_fmadd_pd(u, _mm256_set1_pd(4.0), _mm256_set1_pd(-3.0));
+    __m256d q1 = _mm256_set1_pd(-1.1457539506950107e-11);
+    q1 = _mm256_fmadd_pd(q1, t, _mm256_set1_pd(8.9711182438166595e-11));
+    q1 = _mm256_fmadd_pd(q1, t, _mm256_set1_pd(-4.4142424933497509e-10));
+    q1 = _mm256_fmadd_pd(q1, t, _mm256_set1_pd(1.6867660545836935e-09));
+    q1 = _mm256_fmadd_pd(q1, t, _mm256_set1_pd(-4.1926104260693363e-09));
+    q1 = _mm256_fmadd_pd(q1, t, _mm256_set1_pd(-3.9729628449742441e-09));
+    q1 = _mm256_fmadd_pd(q1, t, _mm256_set1_pd(1.3591667276429934e-07));
+    q1 = _mm256_fmadd_pd(q1, t, _mm256_set1_pd(-1.0800984559415769e-06));
+    q1 = _mm256_fmadd_pd(q1, t, _mm256_set1_pd(5.8840374634930062e-06));
+    q1 = _mm256_fmadd_pd(q1, t, _mm256_set1_pd(-2.1678901569770582e-05));
+    q1 = _mm256_fmadd_pd(q1, t, _mm256_set1_pd(9.5464777288133952e-06));
+    q1 = _mm256_fmadd_pd(q1, t, _mm256_set1_pd(0.00077449644430332043));
+    q1 = _mm256_fmadd_pd(q1, t, _mm256_set1_pd(-0.0096606295821218147));
+    q1 = _mm256_fmadd_pd(q1, t, _mm256_set1_pd(0.085342214674858641));
+    q1 = _mm256_fmadd_pd(q1, t, _mm256_set1_pd(0.35113469402890529));
+
+    __m256d q = _mm256_blendv_pd(
+        q3, q2, _mm256_cmp_pd(u, _mm256_set1_pd(0.25), _CMP_GE_OQ));
+    q = _mm256_blendv_pd(
+        q, q1, _mm256_cmp_pd(u, _mm256_set1_pd(0.5), _CMP_GE_OQ));
+    return _mm256_mul_pd(decay, q);
+}
+
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256d v_erfc_f64(__m256d x) {
+    const __m256d one = _mm256_set1_pd(1.0);
+    const __m256d signbit = _mm256_set1_pd(-0.0);
+    const __m256d ax = _mm256_andnot_pd(signbit, x);
+    // The series is fitted in t = 2x^2 - 1 over [-1, 1].
+    const __m256d t = _mm256_fmadd_pd(
+        _mm256_mul_pd(x, x), _mm256_set1_pd(2.0), _mm256_set1_pd(-1.0));
+    __m256d p = _mm256_set1_pd(1.4543887079465116e-14);
+    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(-3.8078824063194953e-13));
+    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(9.167619596865806e-12));
+    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(-2.0352284058157691e-10));
+    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(4.1158005832081488e-09));
+    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(-7.5115692865917272e-08));
+    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(1.223382738359897e-06));
+    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(-1.7537169441124866e-05));
+    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(0.00021751715604159932));
+    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(-0.0022854855611441132));
+    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(0.019852496688983708));
+    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(-0.14053608902271711));
+    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(0.96546873866986727));
+    const __m256d near = _mm256_fnmadd_pd(x, p, one);
+    const __m256d tail = v_erfc_tail_f64(ax);
+    __m256d r = _mm256_blendv_pd(
+        tail, near, _mm256_cmp_pd(ax, one, _CMP_LE_OQ));
+    r = _mm256_blendv_pd(
+        r, _mm256_sub_pd(_mm256_set1_pd(2.0), tail),
+        _mm256_cmp_pd(x, _mm256_set1_pd(-1.0), _CMP_LT_OQ));
+    // The tail is a product of a zero decay and a signed factor, so the value
+    // at +inf would otherwise come back as a negative zero.
+    return _mm256_add_pd(r, _mm256_setzero_pd());
+}
+
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256d v_erf_f64(__m256d x) {
+    const __m256d one = _mm256_set1_pd(1.0);
+    const __m256d signbit = _mm256_set1_pd(-0.0);
+    const __m256d ax = _mm256_andnot_pd(signbit, x);
+    // The series is fitted in t = 2x^2 - 1 over [-1, 1].
+    const __m256d t = _mm256_fmadd_pd(
+        _mm256_mul_pd(x, x), _mm256_set1_pd(2.0), _mm256_set1_pd(-1.0));
+    __m256d p = _mm256_set1_pd(1.4543887079465116e-14);
+    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(-3.8078824063194953e-13));
+    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(9.167619596865806e-12));
+    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(-2.0352284058157691e-10));
+    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(4.1158005832081488e-09));
+    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(-7.5115692865917272e-08));
+    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(1.223382738359897e-06));
+    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(-1.7537169441124866e-05));
+    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(0.00021751715604159932));
+    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(-0.0022854855611441132));
+    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(0.019852496688983708));
+    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(-0.14053608902271711));
+    p = _mm256_fmadd_pd(p, t, _mm256_set1_pd(0.96546873866986727));
+    const __m256d near = _mm256_mul_pd(x, p);
+    const __m256d far = _mm256_sub_pd(one, v_erfc_tail_f64(ax));
+    const __m256d r = _mm256_blendv_pd(
+        far, near, _mm256_cmp_pd(ax, one, _CMP_LE_OQ));
+    return _mm256_or_pd(r, _mm256_and_pd(x, signbit));
+}
+
 // tanh on double lanes.  Below 0.5 the odd series in x^2 answers directly --
 // a degree-11 fit over x^2 in [0, 0.25] with a relative error of 6e-20 -- and
 // above it 1 - 2/(exp(2|x|)+1) has no cancellation left to lose.  Both are
@@ -1625,11 +1769,11 @@ inline __m256d apply_f64(VOp op, VParams prm, __m256d x) {
         case VOp::Round: return _mm256_round_pd(x, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
         case VOp::Frac: return _mm256_sub_pd(x, _mm256_round_pd(x, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC));
         case VOp::Relu: return _mm256_max_pd(zero, x);
-        case VOp::Exp: return tensorplay::tpsleef::exp(x);
+        case VOp::Exp: return v_exp_f64(x);
         case VOp::Expm1: return tensorplay::tpsleef::expm1(x);
-        case VOp::Log: return tensorplay::tpsleef::log(x);
-        case VOp::Log2: return tensorplay::tpsleef::log2(x);
-        case VOp::Log10: return tensorplay::tpsleef::log10(x);
+        case VOp::Log: return v_log_f64<LogBase64::E>(x);
+        case VOp::Log2: return v_log_f64<LogBase64::Two>(x);
+        case VOp::Log10: return v_log_f64<LogBase64::Ten>(x);
         case VOp::Log1p: return tensorplay::tpsleef::log1p(x);
         case VOp::Sin: return tensorplay::tpsleef::sin(x);
         case VOp::Cos: return tensorplay::tpsleef::cos(x);
@@ -1639,18 +1783,18 @@ inline __m256d apply_f64(VOp op, VParams prm, __m256d x) {
         case VOp::Atan: return tensorplay::tpsleef::atan(x);
         case VOp::Sinh: return tensorplay::tpsleef::sinh(x);
         case VOp::Cosh: return tensorplay::tpsleef::cosh(x);
-        case VOp::Tanh: return tensorplay::tpsleef::tanh(x);
+        case VOp::Tanh: return v_tanh_f64(x);
         case VOp::Asinh: return tensorplay::tpsleef::asinh(x);
         case VOp::Acosh: return tensorplay::tpsleef::acosh(x);
         case VOp::Atanh: return tensorplay::tpsleef::atanh(x);
-        case VOp::Erf: return tensorplay::tpsleef::erf(x);
-        case VOp::Erfc: return tensorplay::tpsleef::erfc(x);
+        case VOp::Erf: return v_erf_f64(x);
+        case VOp::Erfc: return v_erfc_f64(x);
         case VOp::Lgamma: return v_lgamma_pos_f64(x);
         case VOp::Sigmoid:
             return _mm256_div_pd(one, _mm256_add_pd(one, v_exp_f64(_mm256_xor_pd(x, signbit))));
         case VOp::GeluNone: {
             const __m256d kAlpha = _mm256_set1_pd(0.70710678118654752440);
-            __m256d cdf = _mm256_add_pd(one, tensorplay::tpsleef::erf(_mm256_mul_pd(kAlpha, x)));
+            __m256d cdf = _mm256_add_pd(one, v_erf_f64(_mm256_mul_pd(kAlpha, x)));
             return _mm256_mul_pd(_mm256_mul_pd(_mm256_set1_pd(0.5), x), cdf);
         }
         case VOp::GeluTanh: {
@@ -1845,7 +1989,7 @@ static void f64_chunk_avx2(VOp op, VParams prm, const double* src, double* dst, 
             const __m256d half = _mm256_set1_pd(0.5);
             TP_F64_SIMPLE_LOOP_4(_mm256_mul_pd(
                 _mm256_mul_pd(half, x),
-                _mm256_add_pd(one, tensorplay::tpsleef::erf(_mm256_mul_pd(kAlpha, x)))));
+                _mm256_add_pd(one, v_erf_f64(_mm256_mul_pd(kAlpha, x)))));
             break;
         }
         case VOp::GeluTanh: {
@@ -1877,10 +2021,10 @@ static void f64_chunk_avx2(VOp op, VParams prm, const double* src, double* dst, 
             TP_F64_SIMPLE_LOOP_4(tensorplay::tpsleef::atan(x));
             break;
         case VOp::Erf:
-            TP_F64_SIMPLE_LOOP_4(tensorplay::tpsleef::erf(x));
+            TP_F64_SIMPLE_LOOP_4(v_erf_f64(x));
             break;
         case VOp::Erfc:
-            TP_F64_SIMPLE_LOOP_4(tensorplay::tpsleef::erfc(x));
+            TP_F64_SIMPLE_LOOP_4(v_erfc_f64(x));
             break;
         case VOp::Relu6:
             TP_F64_SIMPLE_LOOP_4(_mm256_min_pd(_mm256_set1_pd(6.0), _mm256_max_pd(zero, x)));
