@@ -58,6 +58,15 @@ constexpr int loop_block_work_size() {
 // Widest vector, counted in scalars, that the vectorized path instantiates.
 constexpr int kLoopMaxVecSize = 4;
 
+// A warp feeds 16-byte transactions, so four scalars fill one when the result
+// is four bytes wide and eight do when it is two.  A two-byte result keeps
+// the wider vector; every other width stays at the cap above.
+template <typename func_t>
+constexpr int max_vec_size() {
+    using return_t = typename tensorplay::function_traits<func_t>::result_type;
+    return sizeof(return_t) == 2 ? 8 : kLoopMaxVecSize;
+}
+
 // Bytes the vectorized path moves per element slot: every operand the functor
 // reads plus the one it writes.
 template <typename args_t, size_t... Is>
@@ -845,7 +854,16 @@ inline void launch_vectorized_kernel(int64_t N, const func_t& f,
     // the width has to divide the thread work size; widths above the cap are
     // left to devices that feed wider transactions.
     int vec_size =
-        std::min(memory::can_vectorize_up_to<func_t>(data), kLoopMaxVecSize);
+        std::min(memory::can_vectorize_up_to<func_t>(data), max_vec_size<func_t>());
+    if constexpr (max_vec_size<func_t>() == 8) {
+        if (vec_size == 8) {
+            vectorized_elementwise_kernel<8, func_t, array_t>
+                <<<static_cast<unsigned>(grid), kLoopNumThreads, 0, stream>>>(
+                    static_cast<int>(N), f, data, streaming);
+            loop_launch_check("vectorized_elementwise_kernel<8>");
+            return;
+        }
+    }
     switch (vec_size) {
         case 4:
             vectorized_elementwise_kernel<4, func_t, array_t>
