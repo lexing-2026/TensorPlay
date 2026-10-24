@@ -21,6 +21,7 @@
 // combination instead of an N x N x N grid of per-dtype kernels.
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <limits>
 #include <tuple>
@@ -111,6 +112,35 @@ __device__ inline void store_vec_streaming(VecT* dst, const VecT& value) {
     }
 }
 
+// Reads that a later launch could still use are only marked evict-first once
+// the run is far too large for that to be possible: an operand line is touched
+// by exactly one block, so within one launch residency buys nothing, but a
+// launch that fits inside the level-two cache is fed to the next one, and a
+// line dropped early makes that launch come to DRAM.  Measured on a device
+// with a 6 MiB cache, the evict-first read costs six times the normal time at
+// one cache width of traffic and only turns consistently ahead past four.
+template <typename VecT>
+__device__ inline VecT load_vec_streaming(const VecT* src) {
+    if constexpr (sizeof(VecT) == 16) {
+        const uint4 w = __ldcs(reinterpret_cast<const uint4*>(src));
+        VecT v;
+        *reinterpret_cast<uint4*>(&v) = w;
+        return v;
+    } else if constexpr (sizeof(VecT) == 8) {
+        const uint2 w = __ldcs(reinterpret_cast<const uint2*>(src));
+        VecT v;
+        *reinterpret_cast<uint2*>(&v) = w;
+        return v;
+    } else if constexpr (sizeof(VecT) == 4) {
+        VecT v;
+        *reinterpret_cast<unsigned*>(&v) =
+            __ldcs(reinterpret_cast<const unsigned*>(src));
+        return v;
+    } else {
+        return *src;
+    }
+}
+
 // Lambdas passed to the loop dispatchers must carry both specifiers: a
 // host-side definition with only __device__ would be wrapped by nvcc into
 // an internal closure type whose call operator cannot be introspected.
@@ -133,6 +163,33 @@ inline void loop_launch_check(const char* what) {
                                    cudaGetErrorString(err));
     }
 }
+
+// Bytes the level-two cache of one device holds.  The launch decision below
+// runs on every elementwise call, so the driver answer is kept per device
+// instead of being asked again; a device that refuses is asked exactly once
+// and then treated as having no cache to protect.  The entries are atomic
+// because several host threads can reach a launch at the same time - two of
+// them querying is harmless, one of them writing a torn value is not.
+inline int64_t loop_l2_cache_bytes(int device_index) {
+    static constexpr int kMaxDevices = 64;
+    static std::atomic<int64_t> per_device[kMaxDevices]{};
+    if (device_index < 0 || device_index >= kMaxDevices) return 0;
+    std::atomic<int64_t>& cached = per_device[device_index];
+    const int64_t known = cached.load(std::memory_order_relaxed);
+    if (known != 0) return known > 0 ? known : 0;
+    int bytes = 0;
+    if (cudaDeviceGetAttribute(&bytes, cudaDevAttrL2CacheSize, device_index) !=
+        cudaSuccess) {
+        bytes = -1;
+    }
+    cached.store(bytes, std::memory_order_relaxed);
+    return bytes > 0 ? bytes : 0;
+}
+
+// How many cache widths of traffic a launch must move before its reads are
+// marked evict-first.  The crossover sits near four widths, well above the one
+// width where the reuse still happens, so the factor is not pushed lower.
+inline constexpr int64_t kStreamL2Factor = 4;
 
 namespace memory {
 
@@ -417,8 +474,12 @@ struct vectorized {
     }
 
     data_t data;
+    // Set from the launch: traffic far enough past the level-two cache to be
+    // read evict-first, narrower traffic left for a following kernel to find.
+    bool streaming;
 
-    __device__ vectorized(data_t data) : data(data) {}
+    __device__ vectorized(data_t data, bool streaming)
+        : data(data), streaming(streaming) {}
 
     __device__ inline constexpr bool check_inbounds(int) { return true; }
 
@@ -427,14 +488,28 @@ struct vectorized {
         using vec_t = aligned_vector<arg_t, vec_size>;
         const auto* from = reinterpret_cast<const vec_t*>(ptr);
         const int thread_idx = threadIdx.x;
+        // The choice is uniform across the block, so each arm keeps one
+        // straight-line run of wide loads.
+        if (streaming) {
 #pragma unroll
-        for (int i = 0; i < loop_size; i++) {
-            // One vector per round, a whole block-of-vectors apart: the lanes
-            // of a warp stay adjacent inside every transaction.
-            vec_t v = from[thread_idx + i * loop_num_threads()];
+            for (int i = 0; i < loop_size; i++) {
+                // One vector per round, a whole block-of-vectors apart: the
+                // lanes of a warp stay adjacent inside every transaction.
+                vec_t v =
+                    load_vec_streaming(&from[thread_idx + i * loop_num_threads()]);
 #pragma unroll
-            for (int j = 0; j < vec_size; ++j) {
-                to(vec_size * i + j) = v.val[j];
+                for (int j = 0; j < vec_size; ++j) {
+                    to(vec_size * i + j) = v.val[j];
+                }
+            }
+        } else {
+#pragma unroll
+            for (int i = 0; i < loop_size; i++) {
+                vec_t v = from[thread_idx + i * loop_num_threads()];
+#pragma unroll
+                for (int j = 0; j < vec_size; ++j) {
+                    to(vec_size * i + j) = v.val[j];
+                }
             }
         }
     }
@@ -688,7 +763,8 @@ inline bool check_binary_rt_types_for_specialization(
 
 template <int vec_size, int tws, typename func_t, typename array_t>
 __device__ inline void vectorized_elementwise_kernel_impl(int N, func_t f,
-                                                          array_t data) {
+                                                          array_t data,
+                                                          bool streaming) {
     constexpr int bws = tws * loop_num_threads();
     int remaining = N - bws * blockIdx.x;
 
@@ -696,7 +772,8 @@ __device__ inline void vectorized_elementwise_kernel_impl(int N, func_t f,
     // instruction stream, so the full-block path is written first.
     if (remaining >= bws) {
         elementwise_kernel_helper<tws>(
-            f, memory::policies::vectorized<vec_size, array_t, tws>(data));
+            f, memory::policies::vectorized<vec_size, array_t, tws>(data,
+                                                                    streaming));
     } else {
         // Tail block: unroll machinery with a per-element inbounds check.
         constexpr int kArity =
@@ -717,10 +794,11 @@ __device__ inline void vectorized_elementwise_kernel_impl(int N, func_t f,
 
 template <int vec_size, typename func_t, typename array_t>
 TP_LOOP_LAUNCH_BOUNDS(kLoopNumThreads)
-__global__ void vectorized_elementwise_kernel(int N, func_t f, array_t data) {
+__global__ void vectorized_elementwise_kernel(int N, func_t f, array_t data,
+                                              bool streaming) {
     constexpr int tws =
         vectorized_thread_work_size<calc_io_size<func_t>()>();
-    vectorized_elementwise_kernel_impl<vec_size, tws>(N, f, data);
+    vectorized_elementwise_kernel_impl<vec_size, tws>(N, f, data, streaming);
 }
 
 template <int elems_per_thread, typename func_t, typename array_t,
@@ -750,7 +828,19 @@ inline void launch_vectorized_kernel(int64_t N, const func_t& f,
     constexpr int threads = loop_num_threads();
     int64_t grid = (N + tws * static_cast<int64_t>(threads) - 1) /
                    (tws * static_cast<int64_t>(threads));
-    auto stream = getCurrentCUDAStream().stream();
+    const CUDAStream launch_stream = getCurrentCUDAStream();
+    auto stream = launch_stream.stream();
+    // Traffic of this launch, counted in the bytes every operand contributes
+    // per element.  A run several times the width of the level-two cache
+    // cannot be handed to anything that follows it, so its lines are read
+    // evict-first; a shorter one is left resident on purpose, and the margin
+    // is kept wide because the penalty for guessing wrong is far larger than
+    // the gain.
+    const int64_t l2_bytes = loop_l2_cache_bytes(launch_stream.device_index());
+    const bool streaming =
+        l2_bytes > 0 &&
+        N * static_cast<int64_t>(calc_io_size<func_t>()) >=
+            kStreamL2Factor * l2_bytes;
     // The vectorized policy slices each thread's slots into whole vectors, so
     // the width has to divide the thread work size; widths above the cap are
     // left to devices that feed wider transactions.
@@ -760,13 +850,13 @@ inline void launch_vectorized_kernel(int64_t N, const func_t& f,
         case 4:
             vectorized_elementwise_kernel<4, func_t, array_t>
                 <<<static_cast<unsigned>(grid), kLoopNumThreads, 0, stream>>>(
-                    static_cast<int>(N), f, data);
+                    static_cast<int>(N), f, data, streaming);
             loop_launch_check("vectorized_elementwise_kernel<4>");
             break;
         case 2:
             vectorized_elementwise_kernel<2, func_t, array_t>
                 <<<static_cast<unsigned>(grid), kLoopNumThreads, 0, stream>>>(
-                    static_cast<int>(N), f, data);
+                    static_cast<int>(N), f, data, streaming);
             loop_launch_check("vectorized_elementwise_kernel<2>");
             break;
         case 1: {

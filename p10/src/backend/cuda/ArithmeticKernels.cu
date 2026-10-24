@@ -16,6 +16,7 @@
 #include "CUDALoops.cuh"
 
 #include <cuda_runtime.h>
+#include <limits>
 
 #ifdef USE_CUDNN
 #include <cudnn.h>
@@ -643,33 +644,47 @@ __device__ inline void store_pack_streaming(PackT* dst, const PackT& value) {
     }
 }
 
-template <typename T, int VecSize, typename Op>
+template <typename T, int VecSize, typename Op, bool Streaming>
 __global__ void binary_same_shape_vectorized_kernel(
-    int64_t n, const T* __restrict__ a, const T* __restrict__ b,
+    int n, const T* __restrict__ a, const T* __restrict__ b,
     T* __restrict__ y, typename BinaryOpMath<T>::type alpha, Op op) {
     using M = typename BinaryOpMath<T>::type;
-    const int64_t vec_n = n / VecSize;
-    const int64_t tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (int64_t i = tid; i < vec_n; i += stride) {
-        TPVecPack<T, VecSize> pa = *reinterpret_cast<const TPVecPack<T, VecSize>*>(a + i * VecSize);
-        TPVecPack<T, VecSize> pb = *reinterpret_cast<const TPVecPack<T, VecSize>*>(b + i * VecSize);
-        TPVecPack<T, VecSize> po;
+    using PackT = TPVecPack<T, VecSize>;
+    // The counters stay 32-bit.  Each pack costs one add and one compare, and a
+    // 64-bit index makes both a pair of instructions, which the stream shows as
+    // a fraction of a microsecond per launch once the traffic is at the copy
+    // roof.  A run too long to count in 32 bits never reaches this kernel.
+    const int vec_n = n / VecSize;
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = blockDim.x * gridDim.x;
+    for (int i = tid; i < vec_n; i += stride) {
+        const PackT* sa = reinterpret_cast<const PackT*>(a + i * VecSize);
+        const PackT* sb = reinterpret_cast<const PackT*>(b + i * VecSize);
+        // The policy is a template argument, not a flag read in the loop: a
+        // runtime choice here serialises the two loads against the branch and
+        // costs more than the hint earns.
+        const PackT pa = Streaming ? load_vec_streaming(sa) : *sa;
+        const PackT pb = Streaming ? load_vec_streaming(sb) : *sb;
+        PackT po;
 #pragma unroll
         for (int v = 0; v < VecSize; ++v)
             po.v[v] = static_cast<T>(op(static_cast<M>(pa.v[v]), static_cast<M>(pb.v[v]), static_cast<M>(alpha)));
-        store_pack_streaming(reinterpret_cast<TPVecPack<T, VecSize>*>(y + i * VecSize), po);
+        store_pack_streaming(reinterpret_cast<PackT*>(y + i * VecSize), po);
     }
     // Tail elements past the last full vector, one per thread.
-    for (int64_t j = vec_n * VecSize + tid; j < n; j += stride) {
+    for (int j = vec_n * VecSize + tid; j < n; j += stride) {
         y[j] = static_cast<T>(op(static_cast<M>(a[j]), static_cast<M>(b[j]), static_cast<M>(alpha)));
     }
 }
 
 template <typename T, typename Op>
 inline bool launch_binary_vec(
-    int64_t n, const Tensor& a, const Tensor& b, Tensor& y,
+    int64_t count, const Tensor& a, const Tensor& b, Tensor& y,
     typename BinaryOpMath<T>::type alpha, Op op, cudaStream_t stream) {
+    // Beyond a countable run the general loop engine takes over: it walks 64-bit
+    // indices, where the extra instructions are lost in the address arithmetic.
+    if (count > std::numeric_limits<int>::max()) return false;
+    const int n = static_cast<int>(count);
     // One 16-byte pack per thread: the widest single load/store transaction, so
     // the address stream is one pack per operand regardless of element type.
     constexpr int kVec = 16 / sizeof(T);
@@ -683,11 +698,28 @@ inline bool launch_binary_vec(
     // 128 threads per block: at equal total threads the narrower block keeps
     // more blocks resident, and the block count carries the grid width.
     dim3 block(128);
-    const int64_t vec_n = n / kVec;
-    const int64_t want = (vec_n + block.x - 1) / block.x;
+    const int vec_n = n / kVec;
+    const int want = (vec_n + static_cast<int>(block.x) - 1) / static_cast<int>(block.x);
     dim3 grid(static_cast<unsigned>(want < 1 ? 1 : want));
-    binary_same_shape_vectorized_kernel<T, kVec, Op><<<grid, block, 0, stream>>>(
-        n, pa, pb, py, alpha, op);
+    // Both operands of a run several times the width of the level-two cache
+    // are gone before anything following this launch could read them again, so
+    // they are fetched evict-first and the room is left to the lines still in
+    // flight.  A shorter run is loaded normally on purpose.  Measured on the
+    // copy roof, the hint is worth a fifth of a percent and the wrong guess
+    // costs far more than that, so the margin matches the loop engine's.
+    const CUDAStream launch_stream = getCurrentCUDAStream();
+    const int64_t l2_bytes = loop_l2_cache_bytes(launch_stream.device_index());
+    const bool streaming =
+        l2_bytes > 0 &&
+        static_cast<int64_t>(n) * (3 * static_cast<int64_t>(sizeof(T))) >=
+            kStreamL2Factor * l2_bytes;
+    if (streaming) {
+        binary_same_shape_vectorized_kernel<T, kVec, Op, true>
+            <<<grid, block, 0, stream>>>(n, pa, pb, py, alpha, op);
+    } else {
+        binary_same_shape_vectorized_kernel<T, kVec, Op, false>
+            <<<grid, block, 0, stream>>>(n, pa, pb, py, alpha, op);
+    }
     return true;
 }
 
@@ -969,7 +1001,7 @@ __global__ void binary_row_flat_vec_kernel(
 // cache, since the operands of a shifted pair overlap almost entirely.
 template <typename T, bool ASplat, bool BSplat, typename Op>
 __global__ void binary_row_flat_scalar_kernel(
-    int64_t inner,
+    int inner,
     const T* __restrict__ a, int64_t a_row_stride,
     const T* __restrict__ b, int64_t b_row_stride,
     T* __restrict__ y, typename BinaryOpMath<T>::type alpha, Op op) {
@@ -979,12 +1011,15 @@ __global__ void binary_row_flat_scalar_kernel(
     const T* __restrict__ a_row = a + row * a_row_stride;
     const T* __restrict__ b_row = b + row * b_row_stride;
     T* __restrict__ y_row = y + row * inner;
-    const int64_t step = static_cast<int64_t>(blockDim.x) * gridDim.x * kColsPerThread;
-    for (int64_t col = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) * kColsPerThread;
+    // The walk along a row stays 32-bit.  The row base is the only 64-bit
+    // offset, and the loop body costs one add and one compare per two columns,
+    // which is where a wide counter shows up at the copy roof.
+    const int step = blockDim.x * gridDim.x * kColsPerThread;
+    for (int col = (blockIdx.x * blockDim.x + threadIdx.x) * kColsPerThread;
          col < inner; col += step) {
 #pragma unroll
         for (int k = 0; k < kColsPerThread; ++k) {
-            const int64_t c = col + k;
+            const int c = col + k;
             if (c < inner) {
                 y_row[c] = static_cast<T>(op(
                     static_cast<M>(ASplat ? a_row[0] : a_row[c]),
@@ -1009,6 +1044,9 @@ inline bool try_row_flat(
     constexpr int kVec = 4;
     const uintptr_t align_mask = sizeof(T) * kVec - 1;
     if (y.dim() != 2) return false;
+    // The column walk counts in 32 bits, so a row longer than a quarter of the
+    // addressable run is left to the general kernel.
+    if (inner > (1 << 30)) return false;
     if (rows <= 0 || rows > 65535 || a.dim() < 1 || b.dim() < 1) return false;
     if (a.dim() > 2 || b.dim() > 2) return false;
     // Broadcasting contract, right-aligned: the trailing dim spans the row or
@@ -1049,23 +1087,23 @@ inline bool try_row_flat(
             if (b_full) {
                 binary_row_flat_scalar_kernel<T, false, false, Op>
                     <<<grid, threads, 0, stream>>>(
-                        inner, a.data_ptr<T>(), a_row_stride,
+                        static_cast<int>(inner), a.data_ptr<T>(), a_row_stride,
                         b.data_ptr<T>(), b_row_stride, y.data_ptr<T>(), alpha, op);
             } else {
                 binary_row_flat_scalar_kernel<T, false, true, Op>
                     <<<grid, threads, 0, stream>>>(
-                        inner, a.data_ptr<T>(), a_row_stride,
+                        static_cast<int>(inner), a.data_ptr<T>(), a_row_stride,
                         b.data_ptr<T>(), b_row_stride, y.data_ptr<T>(), alpha, op);
             }
         } else if (b_full) {
             binary_row_flat_scalar_kernel<T, true, false, Op>
                 <<<grid, threads, 0, stream>>>(
-                    inner, a.data_ptr<T>(), a_row_stride,
+                    static_cast<int>(inner), a.data_ptr<T>(), a_row_stride,
                     b.data_ptr<T>(), b_row_stride, y.data_ptr<T>(), alpha, op);
         } else {
             binary_row_flat_scalar_kernel<T, true, true, Op>
                 <<<grid, threads, 0, stream>>>(
-                    inner, a.data_ptr<T>(), a_row_stride,
+                    static_cast<int>(inner), a.data_ptr<T>(), a_row_stride,
                     b.data_ptr<T>(), b_row_stride, y.data_ptr<T>(), alpha, op);
         }
         return true;
