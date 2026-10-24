@@ -1519,11 +1519,12 @@ inline __m256d v_log_f64(__m256d x) {
         x, _mm256_blendv_pd(one, _mm256_set1_pd(0x1p54), den));
     const __m256i bits = _mm256_and_si256(_mm256_castpd_si256(xs),
                                           _mm256_set1_epi64x(0x7FFFFFFFFFFFFFFFLL));
+    // The biased exponent is spliced into the low bits of 2^52, so one
+    // subtraction removes both the bias and the exponent offset.
     __m256d e = _mm256_sub_pd(
         _mm256_castsi256_pd(_mm256_or_si256(
             _mm256_srli_epi64(bits, 52), _mm256_set1_epi64x(0x4330000000000000LL))),
-        _mm256_set1_pd(0x1p52));
-    e = _mm256_sub_pd(e, _mm256_set1_pd(1023.0));
+        _mm256_set1_pd(0x1.00000000003ffp52));
     e = _mm256_sub_pd(e, _mm256_and_pd(den, _mm256_set1_pd(54.0)));
     __m256d m = _mm256_castsi256_pd(_mm256_or_si256(
         _mm256_and_si256(bits, _mm256_set1_epi64x(0x000FFFFFFFFFFFFFLL)),
@@ -1562,13 +1563,12 @@ inline __m256d v_log_f64(__m256d x) {
     }
     const __m256d inf = _mm256_castsi256_pd(_mm256_set1_epi64x(0x7FF0000000000000LL));
     const __m256d nan = _mm256_castsi256_pd(_mm256_set1_epi64x(0x7FF8000000000000LL));
+    // A NaN carries mantissa bits that decode as an ordinary fraction, so the
+    // unordered case is folded into the same test as the negative one.
+    r = _mm256_blendv_pd(r, nan, _mm256_cmp_pd(x, zero, _CMP_NGT_UQ));
     r = _mm256_blendv_pd(r, _mm256_xor_pd(inf, signbit),
                          _mm256_cmp_pd(x, zero, _CMP_EQ_OQ));
     r = _mm256_blendv_pd(r, inf, _mm256_cmp_pd(x, inf, _CMP_EQ_OQ));
-    r = _mm256_blendv_pd(r, nan, _mm256_cmp_pd(x, zero, _CMP_LT_OQ));
-    // A NaN carries mantissa bits that decode as an ordinary fraction, so it
-    // has to be recognised before the blend above can let it through.
-    r = _mm256_blendv_pd(r, nan, _mm256_cmp_pd(x, x, _CMP_UNORD_Q));
     return r;
 }
 
