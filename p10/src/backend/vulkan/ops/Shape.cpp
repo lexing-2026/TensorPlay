@@ -224,6 +224,33 @@ Tensor transpose_kernel(const Tensor& self, int64_t dim0, int64_t dim1) {
       dim0 >= 0 && dim0 < ndim && dim1 >= 0 && dim1 < ndim,
       "Vulkan transpose: dim out of range");
 
+  if (dim0 == dim1) {
+    return self;
+  }
+
+  // A matrix's transpose renames the two axes of a payload that a stride map
+  // already describes, so the storage stays put and only the TensorImpl moves:
+  // sizes (r, c) with strides (c, 1) become sizes (c, r) with strides (1, c).
+  // A product that wants the reduction along the other axis gathers straight
+  // out of that storage, which is what lets a weight a model hands over
+  // transposed keep one packed form for its whole life instead of being copied
+  // and re-gathered on every call.  Higher ranks and operands that are
+  // themselves views have no such reader yet, so they keep the permute walk.
+  if (ndim == 2 && self.is_contiguous() &&
+      self.unsafeGetTensorImpl()->storage_offset() == 0) {
+    const std::vector<int64_t> sizes{self.size(1), self.size(0)};
+    const std::vector<int64_t> strides{self.stride(1), self.stride(0)};
+    Tensor out(
+        self.unsafeGetTensorImpl()->storage(),
+        sizes,
+        strides,
+        self.dtype(),
+        /*storage_offset=*/0);
+    out.unsafeGetTensorImpl()->share_version_counter(
+        *self.unsafeGetTensorImpl());
+    return out;
+  }
+
   // A swap of innermost-first axes k0 = ndim-1-dim0, k1 = ndim-1-dim1
   // becomes a swap of prepadded axes p0 = 4-(k0+1), p1 = 4-(k1+1).
   std::vector<int64_t> perm{0, 1, 2, 3};

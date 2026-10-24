@@ -16,7 +16,11 @@ Tensor clone_kernel(const Tensor& self, std::optional<int64_t> memory_format) {
            "Vulkan supports Preserve and Contiguous memory formats");
   api::Context* const context = api::context();
 
-  api::vTensor v_self = convert(self);
+  // The copy binds a payload, so an operand whose strides disagree with the
+  // storage order is walked into a dense one first; the result is the same
+  // elements either way.
+  const Tensor src = dense_payload_of_view(self);
+  api::vTensor v_self = convert(src);
 
   // A clone is byte-identical, so the copy binds both operands in one storage
   // class and the result has to be released in the class the model uses: a

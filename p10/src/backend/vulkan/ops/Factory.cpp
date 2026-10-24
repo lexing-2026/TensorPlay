@@ -516,7 +516,11 @@ Tensor empty_like_kernel(
   // class must be named here rather than left to the shape, because a shape
   // that fits an image would silently pull a dense payload back into texels.
   if (dev.is_vulkan()) {
-    const api::vTensor v_self = convert(self);
+    // Only the storage class carries over, so a stride view is asked through
+    // the dense twin that shares its payload rather than gathered.
+    Tensor twin;
+    const bool axis_swap = transpose_view_of_dense(self, &twin);
+    const api::vTensor v_self = convert(axis_swap ? twin : self);
     api::vTensor made = allocate_output(
         api::context(),
         v_self.storage_type(),

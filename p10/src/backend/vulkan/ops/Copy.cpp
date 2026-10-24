@@ -418,7 +418,10 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
     // Vulkan -> Vulkan
     if (src.device().is_vulkan()) {
       api::Context* const context = api::context();
-      api::vTensor v_src = convert(src);
+      // A transfer binds a payload, so strides that disagree with the storage
+      // order are walked into a dense one before either side is sampled.
+      Tensor src_dense = dense_payload_of_view(src);
+      api::vTensor v_src = convert(src_dense);
       const bool linear_destination =
           v_self.storage_type() == api::StorageType::BUFFER;
 
@@ -427,7 +430,7 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
       // turns words into texels, the repack turns texels into words.  The
       // tensor that owns a gathered payload has to outlive the view of it,
       // because a view over an existing payload only points at the storage.
-      Tensor src_payload = src;
+      Tensor src_payload = std::move(src_dense);
       Tensor narrowed;
       Tensor gathered;
 
@@ -592,7 +595,10 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
     TP_CHECK(
         self.device().is_cpu(),
         "Vulkan copy_: only CPU destinations are supported");
-    api::vTensor v_src = convert(src);
+    // The read-back walks the payload in storage order, so a view whose
+    // strides name another order is gathered on the device first.
+    const Tensor src_dense = dense_payload_of_view(src);
+    api::vTensor v_src = convert(src_dense);
     transfer_vulkan_to_cpu(v_src, self);
     return self;
   }

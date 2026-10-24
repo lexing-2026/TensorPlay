@@ -10214,6 +10214,30 @@ class TestVulkanMatvec(unittest.TestCase):
                                    atol=1e-3,
                                    err_msg="transposed view past the image limit")
 
+    def test_a_matrix_transpose_carries_metadata_only(self):
+        # The swap renames the two axes of a payload that is already dense, so
+        # the result shares the storage and no element moves: a layer handed
+        # the swap reads the weight out of the order it really sits in.
+        rng = np.random.default_rng(21)
+        dense = (rng.standard_normal((12, 7)) * 0.5).astype(np.float32)
+        held = self._device(dense)
+        swapped = held.transpose(0, 1)
+        self.assertEqual(tuple(swapped.shape), (7, 12))
+        self.assertEqual(tuple(swapped.stride()), (1, 7))
+        self.assertFalse(swapped.is_contiguous())
+        np.testing.assert_allclose(
+            swapped.cpu().numpy().astype(np.float64),
+            dense.T.astype(np.float64), rtol=1e-4, atol=1e-4,
+            err_msg="read-back of an axis swap")
+
+        import tensorplay.functional as F
+        rows = (rng.standard_normal((5, 12)) * 0.5).astype(np.float32)
+        got = F.linear(self._device(rows), swapped).cpu().numpy()
+        np.testing.assert_allclose(
+            got.astype(np.float64),
+            rows.astype(np.float64) @ dense.astype(np.float64),
+            rtol=1e-4, atol=1e-4, err_msg="layer over an axis swap")
+
     def test_a_stride_pattern_the_gather_cannot_read_answers_the_same(self):
         rng = np.random.default_rng(16)
         wide = (rng.standard_normal((8, 20)) * 0.5).astype(np.float32)

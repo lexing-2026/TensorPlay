@@ -427,8 +427,12 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src_in, bool non_blocking) {
 
 #ifdef USE_VULKAN
     if (src.device().is_vulkan()) {
+        // The staging path walks the payload in storage order, so a source
+        // whose strides reorder that walk is materialized first.
+        Tensor src_dense =
+            tensorplay::vulkan::ops::dense_payload_of_view(src);
         tensorplay::vulkan::api::vTensor v_src =
-            tensorplay::vulkan::ops::convert(src);
+            tensorplay::vulkan::ops::convert(src_dense);
         tensorplay::vulkan::ops::transfer_vulkan_to_cpu_impl(v_src, self);
         return self;
     }

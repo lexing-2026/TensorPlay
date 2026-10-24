@@ -388,26 +388,6 @@ api::vTensor bmm_pack_rhs_height(const Tensor& src, int64_t batches) {
 }
 
 //
-// A 2d operand that is a pure transpose view of its own storage is packed
-// from the dense twin with a transposed gather instead of being copied into
-// a contiguous tensor first.  Returns false when the operand is not such a
-// view, in which case the caller materializes and packs normally.
-//
-bool transpose_view_of_dense(const Tensor& t, Tensor* dense_out) {
-  if (t.dim() != 2 || t.is_contiguous() ||
-      t.unsafeGetTensorImpl()->storage_offset() != 0) {
-    return false;
-  }
-  const int64_t r = t.size(0);
-  const int64_t c = t.size(1);
-  if (t.stride(0) == 1 && t.stride(1) == r) {
-    *dense_out = t.as_strided({c, r}, {r, 1});
-    return true;
-  }
-  return false;
-}
-
-//
 // Product dispatch over pre-packed operands.  Both packed textures use one
 // texel z slot per (batch of four output lanes); the 2d kernels keep a
 // single slot.
@@ -1526,25 +1506,69 @@ Tensor mm_impl(
     return out;
   }
 
-  api::vTensor v_self = convert(self);
-  api::vTensor v_other = convert(mat2);
+  // An operand that reaches the product as an axis swap of a dense storage is
+  // read straight out of that storage: the pack gathers the orientation the
+  // route wants, so a layout swap costs no walk over the elements.
+  Tensor lhs_dense;
+  Tensor rhs_dense;
+  const bool lhs_transposed = transpose_view_of_dense(self, &lhs_dense);
+  bool rhs_transposed = transpose_view_of_dense(mat2, &rhs_dense);
+
+  if (lhs_transposed && rhs_transposed && !bias.has_value()) {
+    // A^T B^T = (B A)^T: one plain product, transposed on the way out.
+    Tensor t = mm_impl(
+        rhs_dense,
+        lhs_dense,
+        std::nullopt,
+        Scalar(1.0),
+        Scalar(1.0));
+    return t.transpose(0, 1).contiguous();
+  }
+  if (rhs_transposed && bias.has_value()) {
+    // The epilogue has to land on the product's own axes, so an (B A)^T
+    // shortcut is out and this operand takes the relayout copy.
+    rhs_dense = dense_payload_of_view(mat2);
+    rhs_transposed = false;
+  }
+
+  Tensor lhs_src = lhs_transposed ? lhs_dense : self;
+  Tensor rhs_src = rhs_transposed ? rhs_dense : mat2;
+
+  api::vTensor v_self = convert(lhs_src);
+  api::vTensor v_other = convert(rhs_src);
 
   // A weight whose extents pass the image axis limit has no texture form at
   // all; decode products stream it straight out of its linear payload rather
   // than relaying it.
   if (v_other.storage_type() == api::StorageType::BUFFER) {
-    api::vTensor lhs = gemv_operand_lhs(self);
+    api::vTensor lhs = lhs_transposed
+        ? packed_cached(
+              lhs_src, shape_of(lhs_src),
+              api::GPUMemoryLayout::TENSOR_WIDTH_PACKED,
+              kTagMmWidthPackedTransposed,
+              [&] { return pack_lhs_width_transposed(lhs_src); })
+        : gemv_operand_lhs(lhs_src);
     return buffer_product(
-        lhs, v_other, M, N, K, 1, N, bias, beta, alpha, self.dtype());
+        lhs,
+        v_other,
+        M,
+        N,
+        K,
+        rhs_transposed ? K : 1,
+        rhs_transposed ? 1 : N,
+        bias,
+        beta,
+        alpha,
+        self.dtype());
   }
 
   // The product that follows reads both operands as images, so an activation
   // that carries its elements in words crosses into an image first: it is the
   // operand the walk reads least, and the relayout below then finds the lanes
   // it expects.
-  Tensor lhs_source = self;
+  Tensor lhs_source = lhs_src;
   if (v_self.storage_type() == api::StorageType::BUFFER) {
-    lhs_source = image_payload_of(self);
+    lhs_source = image_payload_of(lhs_src);
     v_self = convert(lhs_source);
   }
 
@@ -1561,13 +1585,25 @@ Tensor mm_impl(
   api::vTensor lhs =
       (v_self.gpu_memory_layout() == api::GPUMemoryLayout::TENSOR_WIDTH_PACKED)
       ? v_self
+      : lhs_transposed
+      ? packed_cached(
+            lhs_source, shape_of(lhs_source),
+            api::GPUMemoryLayout::TENSOR_WIDTH_PACKED,
+            kTagMmWidthPackedTransposed,
+            [&] { return pack_lhs_width_transposed(lhs_source); })
       : packed_cached(
             lhs_source, shape_of(lhs_source),
             api::GPUMemoryLayout::TENSOR_WIDTH_PACKED, kTagMmWidthPacked,
             [&] { return pack_lhs_width(lhs_source); });
 
   api::vTensor rhs = product_weight_operand(
-      mat2, v_other, /*weight_is_input_major=*/true, M, N, K, self.dtype());
+      rhs_src,
+      v_other,
+      /*weight_is_input_major=*/!rhs_transposed,
+      M,
+      N,
+      K,
+      self.dtype());
 
   return product_dispatch(
       lhs, rhs, M, N, K, std::move(bias), beta, alpha, self.dtype());
@@ -2218,92 +2254,18 @@ Tensor matmul_kernel(const Tensor& self_in, const Tensor& other_in) {
     return row.reshape({other_in.size(1)});
   }
 
-  // Matrix · matrix: transpose views fold into the pack gathers, so no
-  // operand is copied just to undo a layout swap.
+  // Matrix · matrix: the shared engine folds transpose views into the pack
+  // gathers, so no operand is copied just to undo a layout swap.
   if (self_ndim == 2 && other_ndim == 2) {
     TP_CHECK(
         self_in.size(1) == other_in.size(0),
         "Vulkan matmul: matrix dimensions do not match");
+    TP_CHECK(
+        self_in.dtype() == other_in.dtype(),
+        "Vulkan matmul: operands must have the same element type");
 
-    Tensor lhs_dense;
-    Tensor rhs_dense;
-    const bool lhs_transposed = transpose_view_of_dense(self_in, &lhs_dense);
-    const bool rhs_transposed = transpose_view_of_dense(other_in, &rhs_dense);
-    const Tensor& lhs_src = lhs_transposed ? lhs_dense : self_in;
-    const Tensor& rhs_src = rhs_transposed ? rhs_dense : other_in;
-
-    if (lhs_transposed && rhs_transposed) {
-      // A^T B^T = (B A)^T: one plain product, transposed on the way out.
-      Tensor t = mm_kernel(rhs_dense, lhs_dense);
-      return t.transpose(0, 1).contiguous();
-    }
-
-    const int64_t M = self_in.size(0);
-    const int64_t N = other_in.size(1);
-    const int64_t K = self_in.size(1);
-
-    api::vTensor v_rhs_dense = convert(rhs_src);
-    if (v_rhs_dense.storage_type() == api::StorageType::BUFFER) {
-      // A weight this size has no texture form to relay into.  The decode
-      // kernels read it in whichever orientation it actually sits in: the
-      // view's own [K, N] order, or the [N, K] order of a dense operand seen
-      // through a transpose.
-      api::vTensor v_lhs = lhs_transposed
-          ? packed_cached(
-                lhs_src, shape_of(lhs_src),
-                api::GPUMemoryLayout::TENSOR_WIDTH_PACKED,
-                kTagMmWidthPackedTransposed,
-                [&] { return pack_lhs_width_transposed(lhs_src); })
-          : gemv_operand_lhs(lhs_src);
-      return buffer_product(
-          v_lhs,
-          v_rhs_dense,
-          M,
-          N,
-          K,
-          rhs_transposed ? K : 1,
-          rhs_transposed ? 1 : N,
-          std::nullopt,
-          Scalar(1.0),
-          Scalar(1.0),
-          self_in.dtype());
-    }
-
-    api::vTensor v_lhs;
-    if (lhs_transposed) {
-      v_lhs = packed_cached(
-          lhs_src, shape_of(lhs_src),
-          api::GPUMemoryLayout::TENSOR_WIDTH_PACKED,
-          kTagMmWidthPackedTransposed,
-          [&] { return pack_lhs_width_transposed(lhs_src); });
-    } else {
-      v_lhs = packed_cached(
-          lhs_src, shape_of(lhs_src),
-          api::GPUMemoryLayout::TENSOR_WIDTH_PACKED, kTagMmWidthPacked,
-          [&] { return pack_lhs_width(lhs_src); });
-    }
-    // A transposed view hands its dense twin to the gather, so the weight
-    // reaches the route in whichever of the two orientations that dense tensor
-    // really sits in.
-    api::vTensor v_rhs = product_weight_operand(
-        rhs_src,
-        v_rhs_dense,
-        /*weight_is_input_major=*/!rhs_transposed,
-        M,
-        N,
-        K,
-        self_in.dtype());
-
-    return product_dispatch(
-        v_lhs,
-        v_rhs,
-        self_in.size(0),
-        other_in.size(1),
-        self_in.size(1),
-        std::nullopt,
-        Scalar(1.0),
-        Scalar(1.0),
-        self_in.dtype());
+    return mm_impl(
+        self_in, other_in, std::nullopt, Scalar(1.0), Scalar(1.0));
   }
 
   // Batch of matrices against a shared matrix: the product folds into one
@@ -2479,7 +2441,16 @@ Tensor linear_kernel(
       : std::nullopt;
 
   const int64_t M = in2.size(0);
-  api::vTensor v_weight = convert(weight);
+
+  // A layer kept in the [in, out] order reaches the layer as an axis swap of
+  // that storage.  The twin names the bytes as they actually lie, so the gather
+  // for the orientation this route reads runs once per weight instead of once
+  // per call, and the packed form is keyed on the weight's own identity.
+  Tensor weight_dense;
+  const bool weight_transposed =
+      transpose_view_of_dense(weight, &weight_dense);
+  const Tensor weight_src = weight_transposed ? weight_dense : weight;
+  api::vTensor v_weight = convert(weight_src);
 
   // A weight that kept its image means the product runs on texels, so an
   // activation carrying its elements in words crosses into an image here; the
@@ -2493,28 +2464,28 @@ Tensor linear_kernel(
   if (v_weight.storage_type() == api::StorageType::BUFFER) {
     // A weight this size has no texture form, and relaying it into the
     // transposed shape a matrix product asks for would cost as much again as
-    // the layer itself.  The kernel reads the layer's own [out, in] order
-    // instead: a column step skips a whole input row, a reduction step walks
-    // one.
+    // the layer itself.  The kernel reads the layer's own order instead: the
+    // [out, in] rows a layer stores, or the [in, out] ones an axis-swapped
+    // operand keeps in storage.  A column step and a reduction step say which.
     out2 = buffer_product(
         v_lhs,
         v_weight,
         M,
         N,
         K,
-        K,
-        1,
+        weight_transposed ? 1 : K,
+        weight_transposed ? N : 1,
         bias_arg,
         Scalar(1.0),
         Scalar(1.0),
         input.dtype());
   } else {
-    // The layer's own [out, in] rows are the sweep's columns; the packed
-    // operand carries whichever orientation the route reads.
+    // The layer's own rows are the sweep's columns; the packed operand carries
+    // whichever orientation the route reads.
     api::vTensor v_rhs = product_weight_operand(
-        weight,
+        weight_src,
         v_weight,
-        /*weight_is_input_major=*/false,
+        /*weight_is_input_major=*/weight_transposed,
         M,
         N,
         K,

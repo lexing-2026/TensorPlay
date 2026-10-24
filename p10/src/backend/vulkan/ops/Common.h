@@ -177,6 +177,26 @@ inline api::vTensor allocate_output_like(
       context, operand.storage_type(), sizes, dtype);
 }
 
+//
+// A two-dimensional operand that is a pure axis swap of its own dense storage
+// keeps its bytes in the other orientation, so no payload describes the order
+// the view names.  The twin names the same storage in the order it really sits
+// in, which is what a binding expects, and it aliases rather than copies: a
+// consumer can therefore read the swap straight out of the storage instead of
+// relaying every element.  Anything else (a rank that is not two, a nonzero
+// storage offset, strides that are not the plain swap) returns false.
+//
+bool transpose_view_of_dense(const Tensor& t, Tensor* dense_out);
+
+//
+// The payload an element-by-element reader can bind: the operand itself when
+// its strides already agree with the storage, otherwise a dense tensor holding
+// the viewed elements.  Products prefer the twin above; a read-back, a clone,
+// or an epilogue that cannot reorder the axes needs the elements laid out the
+// way the view names them.
+//
+Tensor dense_payload_of_view(const Tensor& t);
+
 // Elementwise linear-buffer kernels address payload in the slots of a 16-byte
 // word: a Float32 element fills one, a Float16 pair shares one, and a code
 // wider than a word owns a pair of them.  Byte-packed and Bool payloads have no

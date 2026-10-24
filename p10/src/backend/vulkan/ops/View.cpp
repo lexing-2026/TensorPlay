@@ -28,6 +28,11 @@ namespace ops {
 // viewed elements.  The result is an owning dense tensor that stays correct
 // under copy-out, further views, autograd, and batching.
 //
+// Swapping the two axes of a dense operand is the exception, because its
+// elements are a relabeling of a payload that is already dense: the result
+// carries the strides and aliases the storage, and readers below reach the
+// bytes through the twin or a gather.
+//
 // The host-side pieces of this file only reshape metadata; all element
 // movement happens in the view_gather shader.
 //
@@ -246,7 +251,55 @@ Tensor materialize_view(
     const std::vector<int64_t>& out_sizes,
     const std::vector<int64_t>& out_strides,
     int64_t storage_offset) {
+  // The gather names lanes by their position in the storage, so an axis-swapped
+  // operand is read through the twin that describes that storage: the strides a
+  // caller computed from the view index the same bytes either way, and nothing
+  // has to be laid out again before the walk.
+  Tensor twin;
+  if (transpose_view_of_dense(self, &twin)) {
+    return gather_view(twin, out_sizes, out_strides, storage_offset);
+  }
   return gather_view(self, out_sizes, out_strides, storage_offset);
+}
+
+bool transpose_view_of_dense(const Tensor& t, Tensor* dense_out) {
+  if (t.dim() != 2 || t.is_contiguous() ||
+      t.unsafeGetTensorImpl()->storage_offset() != 0) {
+    return false;
+  }
+  const int64_t r = t.size(0);
+  const int64_t c = t.size(1);
+  if (t.stride(0) == 1 && t.stride(1) == r) {
+    Tensor twin(
+        t.unsafeGetTensorImpl()->storage(),
+        std::vector<int64_t>{c, r},
+        std::vector<int64_t>{r, 1},
+        t.dtype(),
+        /*storage_offset=*/0);
+    twin.unsafeGetTensorImpl()->share_version_counter(
+        *t.unsafeGetTensorImpl());
+    *dense_out = std::move(twin);
+    return true;
+  }
+  return false;
+}
+
+Tensor dense_payload_of_view(const Tensor& t) {
+  if (t.is_contiguous() &&
+      t.unsafeGetTensorImpl()->storage_offset() == 0) {
+    return t;
+  }
+  // shape() and strides() each return a fresh container, so the walk is
+  // described by named copies rather than an iterator pair taken from two
+  // temporaries.
+  const std::vector<int64_t> sizes =
+      static_cast<std::vector<int64_t>>(t.shape());
+  const std::vector<int64_t> strides = t.strides();
+  return materialize_view(
+      t,
+      sizes,
+      strides,
+      static_cast<int64_t>(t.unsafeGetTensorImpl()->storage_offset()));
 }
 
 //
