@@ -11,8 +11,14 @@ void check_cublas_gemm_dtype(DType t);
 
 // Row-major single GEMM: result(M,N) = alpha * self(M,K) @ other(K,N) + beta * result.
 // `bias` (optional) enables the cuBLASLt bias epilogue and must be length-N.
+// `accum` (optional) is the matrix the beta term scales, read from its own
+// buffer instead of from the destination; it must have the destination's shape,
+// element type and dense layout.  A seed that is not already the destination
+// would otherwise have to be copied there first, which is a full extra
+// traversal of both operands and the answer.
 void gemm_impl(const Tensor& self, const Tensor& other, Tensor& result,
-               double alpha, double beta, const Tensor* bias);
+               double alpha, double beta, const Tensor* bias,
+               const Tensor* accum = nullptr);
 
 // One strided-batched GEMM over (batch_size, M, K) x (batch_size, K, N)
 // operand stacks into result (batch_size, M, N).  `stride_a`/`stride_b` are

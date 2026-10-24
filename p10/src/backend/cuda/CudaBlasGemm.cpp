@@ -692,7 +692,8 @@ Tensor& zero_matmul_output_cuda(Tensor& output) {
 }
 
 void gemm_impl(const Tensor& self, const Tensor& other, Tensor& result,
-               double alpha, double beta, const Tensor* bias) {
+               double alpha, double beta, const Tensor* bias,
+               const Tensor* accum) {
     if (self.dim() != 2 || other.dim() != 2) {
         TP_THROW(RuntimeError, "mm: tensors must be 2D");
     }
@@ -756,6 +757,12 @@ void gemm_impl(const Tensor& self, const Tensor& other, Tensor& result,
 
     const DType dtype = self_contig.dtype();
     if (isComplexType(dtype)) {
+        // The classic API folds beta into the destination it also writes, so a
+        // seed kept in another buffer has to land there first.
+        if (accum != nullptr) {
+            result.copy_(*accum);
+            accum = nullptr;
+        }
         // cublasLt's complex algorithm set is not available uniformly across
         // CUDA versions.  The classic GEMM API has the same row-major
         // transpose trick and is the stable path for complex matmul.
@@ -804,14 +811,26 @@ void gemm_impl(const Tensor& self, const Tensor& other, Tensor& result,
     // output, matching this function's accumulate contract.  With a bias the
     // epilogue path below stays in charge.
     if (!has_bias && (dtype == DType::Float16 || dtype == DType::BFloat16) &&
-        pinned_blas != BlasBackend::Cublaslt &&
-        try_half_gemv(self_contig, other_transposed ? other : other_contig,
-                      result, alpha, beta, other_transposed)) {
-        return;
+        pinned_blas != BlasBackend::Cublaslt) {
+        // The hand-written product folds beta into the destination it also
+        // writes, so a seed held in another buffer has to land there first.
+        if (accum != nullptr) {
+            result.copy_(*accum);
+            accum = nullptr;
+        }
+        if (try_half_gemv(self_contig, other_transposed ? other : other_contig,
+                          result, alpha, beta, other_transposed)) {
+            return;
+        }
     }
     if (!has_bias && pinned_blas != BlasBackend::Cublaslt &&
         (dtype == DType::Float16 || dtype == DType::BFloat16 ||
          prefer_classic_precision || self_kept_transposed)) {
+        // Same reason: the classic API accumulates into what it writes.
+        if (accum != nullptr) {
+            result.copy_(*accum);
+            accum = nullptr;
+        }
         const cudaDataType_t cuda_type = to_cublas_type(dtype);
         const cublasComputeType_t compute_type = to_compute_type(dtype);
         void* alpha_ptr = to_scalar_ptr(alpha, dtype, 0);
@@ -882,9 +901,11 @@ void gemm_impl(const Tensor& self, const Tensor& other, Tensor& result,
         // beta*C + alpha*A*B execution below still sees the original
         // accumulation buffer.  Without this, the trials' beta=0 output is
         // fed into the final beta=1 call and the first GEMM using a
-        // broadcast addmm bias returns (roughly) 2*AB.
+        // broadcast addmm bias returns (roughly) 2*AB.  A seed that arrives as
+        // its own matrix is never in the destination, so nothing is at risk.
+        const bool saves_seed = run_autotune && beta != 0.0 && accum == nullptr;
         Tensor saved_result;
-        if (run_autotune && beta != 0.0) {
+        if (saves_seed) {
             saved_result = result.clone();
         }
 
@@ -933,7 +954,7 @@ void gemm_impl(const Tensor& self, const Tensor& other, Tensor& result,
             plan->autotuned = true;
         }
 
-        if (run_autotune && beta != 0.0) {
+        if (saves_seed) {
             result.copy_(saved_result);
         }
     }
@@ -941,12 +962,17 @@ void gemm_impl(const Tensor& self, const Tensor& other, Tensor& result,
     // Restore the caller's beta for the real execution.
     beta_ptr = to_scalar_ptr(beta, dtype, 1);
 
+    // The accumulation term may arrive as its own matrix: the descriptor is
+    // shared by C and D, so a dense seed of the destination's shape feeds the
+    // product directly instead of being copied into the destination first.
+    const void* c_ptr = accum != nullptr ? accum->data_ptr() : result.data_ptr();
+
     CUBLASLT_CHECK(cublasLtMatmul(
         CUDAContext::getCublasLtHandle(), plan->matmul_desc, alpha_ptr,
         a_ptr, plan->a_desc,
         b_ptr, plan->b_desc,
         beta_ptr,
-        result.data_ptr(), plan->c_desc,
+        c_ptr, plan->c_desc,
         result.data_ptr(), plan->c_desc,
         chosen_algo ? chosen_algo : &plan->candidates[0].algo,
         shared_workspace(plan->device, plan->workspace_size), plan->workspace_size,

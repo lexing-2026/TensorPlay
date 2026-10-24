@@ -427,6 +427,17 @@ Tensor addmm_kernel_cuda(const Tensor& input, const Tensor& mat1, const Tensor& 
         return result;
     }
 
+    // A seed that is already a dense matrix of the answer's shape never needs
+    // a pass of its own: the product reads it as the accumulation term and
+    // writes the answer somewhere else, so the sum costs one traversal of the
+    // seed instead of a copy plus the read inside the product.
+    if (input.dim() == 2 && input.size(0) == M && input.size(1) == N &&
+        input.is_contiguous()) {
+        Tensor result = Tensor::empty({M, N}, mat1.dtype(), mat1.device());
+        gemm_impl(mat1, mat2, result, alpha_v, beta_v, nullptr, &input);
+        return result;
+    }
+
     // cuBLAS writes a dense row-major C matrix.  clone() alone may preserve
     // a transposed input's non-contiguous strides, so materialize the seed
     // as an independent contiguous destination before GEMM.
@@ -476,6 +487,15 @@ Tensor& addmm_out_kernel_cuda(const Tensor& input, const Tensor& mat1, const Ten
         // The seed is a row the epilogue adds while it writes, so the sum is
         // formed on the way out instead of being seeded into the destination.
         gemm_impl(mat1, mat2, out, alpha_v, 0.0, &input);
+        return out;
+    }
+    if (!shares_storage(out, input) &&
+        input.dim() == 2 && input.size(0) == M && input.size(1) == N &&
+        input.is_contiguous()) {
+        // The seed keeps its own buffer: the destination is a different one,
+        // so the product reads the seed as the accumulation term rather than
+        // seeing it copied in first.
+        gemm_impl(mat1, mat2, out, alpha_v, beta_v, nullptr, &input);
         return out;
     }
     if (!shares_storage(out, input)) {
