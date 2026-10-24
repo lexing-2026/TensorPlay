@@ -56,6 +56,19 @@ inline __m256 widen8(const uint16_t* p) {
         _mm_loadu_si128(reinterpret_cast<const __m128i*>(p)));
 }
 
+// Sixteen halfs crossed into single precision from one 32-byte load.  The
+// two answers keep the block's own order: the first carries the leading
+// eight elements, the second the trailing eight.  A walk that needs both
+// asks for them together, so the block reaches the load unit once instead
+// of twice.
+__attribute__((target("avx2,f16c"), always_inline))
+inline void widen_f16_16(const uint16_t* p, __m256& lo, __m256& hi) {
+    const __m256i bits =
+        _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+    lo = _mm256_cvtph_ps(_mm256_castsi256_si128(bits));
+    hi = _mm256_cvtph_ps(_mm256_extracti128_si256(bits, 1));
+}
+
 // The single-precision answer, held in the half layout.
 __attribute__((target("avx2,f16c"), always_inline))
 inline __m128i narrow8(__m256 v) {

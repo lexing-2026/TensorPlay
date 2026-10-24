@@ -4346,13 +4346,31 @@ void addcmul_half_walk(const tensorplay::Half* self,
     auto* out_bits = reinterpret_cast<uint16_t*>(result);
     const __m256 scale = _mm256_set1_ps(alpha);
     int64_t i = begin;
+    // Four answers are built before any of them is stored: the crossings and
+    // the products are independent per answer, so a wider step keeps more of
+    // them in flight.  The arithmetic order per answer is unchanged.
+    for (; i + 32 <= end; i += 32) {
+        __m256 s0, s1, s2, s3, x0, x1, x2, x3, y0, y1, y2, y3;
+        tensorplay::cpu::vecreduced::widen_f16_16(self_bits + i, s0, s1);
+        tensorplay::cpu::vecreduced::widen_f16_16(t1_bits + i, x0, x1);
+        tensorplay::cpu::vecreduced::widen_f16_16(t2_bits + i, y0, y1);
+        tensorplay::cpu::vecreduced::widen_f16_16(self_bits + i + 16, s2, s3);
+        tensorplay::cpu::vecreduced::widen_f16_16(t1_bits + i + 16, x2, x3);
+        tensorplay::cpu::vecreduced::widen_f16_16(t2_bits + i + 16, y2, y3);
+        const __m256 q0 = _mm256_mul_ps(_mm256_mul_ps(scale, x0), y0);
+        const __m256 q1 = _mm256_mul_ps(_mm256_mul_ps(scale, x1), y1);
+        const __m256 q2 = _mm256_mul_ps(_mm256_mul_ps(scale, x2), y2);
+        const __m256 q3 = _mm256_mul_ps(_mm256_mul_ps(scale, x3), y3);
+        tensorplay::cpu::vecreduced::store_f16_16(
+            out_bits + i, _mm256_add_ps(s0, q0), _mm256_add_ps(s1, q1));
+        tensorplay::cpu::vecreduced::store_f16_16(
+            out_bits + i + 16, _mm256_add_ps(s2, q2), _mm256_add_ps(s3, q3));
+    }
     for (; i + 16 <= end; i += 16) {
-        const __m256 s0 = tensorplay::cpu::vecreduced::widen8(self_bits + i);
-        const __m256 x0 = tensorplay::cpu::vecreduced::widen8(t1_bits + i);
-        const __m256 y0 = tensorplay::cpu::vecreduced::widen8(t2_bits + i);
-        const __m256 s1 = tensorplay::cpu::vecreduced::widen8(self_bits + i + 8);
-        const __m256 x1 = tensorplay::cpu::vecreduced::widen8(t1_bits + i + 8);
-        const __m256 y1 = tensorplay::cpu::vecreduced::widen8(t2_bits + i + 8);
+        __m256 s0, s1, x0, x1, y0, y1;
+        tensorplay::cpu::vecreduced::widen_f16_16(self_bits + i, s0, s1);
+        tensorplay::cpu::vecreduced::widen_f16_16(t1_bits + i, x0, x1);
+        tensorplay::cpu::vecreduced::widen_f16_16(t2_bits + i, y0, y1);
         const __m256 p0 = _mm256_mul_ps(scale, x0);
         const __m256 q0 = _mm256_mul_ps(p0, y0);
         const __m256 p1 = _mm256_mul_ps(scale, x1);
@@ -4389,13 +4407,30 @@ void addcdiv_half_walk(const tensorplay::Half* self,
     auto* out_bits = reinterpret_cast<uint16_t*>(result);
     const __m256 scale = _mm256_set1_ps(alpha);
     int64_t i = begin;
+    // The quotient has the longer dependency, so four of them are kept in
+    // flight per step; the arithmetic order per answer is unchanged.
+    for (; i + 32 <= end; i += 32) {
+        __m256 s0, s1, s2, s3, x0, x1, x2, x3, y0, y1, y2, y3;
+        tensorplay::cpu::vecreduced::widen_f16_16(self_bits + i, s0, s1);
+        tensorplay::cpu::vecreduced::widen_f16_16(t1_bits + i, x0, x1);
+        tensorplay::cpu::vecreduced::widen_f16_16(t2_bits + i, y0, y1);
+        tensorplay::cpu::vecreduced::widen_f16_16(self_bits + i + 16, s2, s3);
+        tensorplay::cpu::vecreduced::widen_f16_16(t1_bits + i + 16, x2, x3);
+        tensorplay::cpu::vecreduced::widen_f16_16(t2_bits + i + 16, y2, y3);
+        const __m256 q0 = _mm256_div_ps(_mm256_mul_ps(scale, x0), y0);
+        const __m256 q1 = _mm256_div_ps(_mm256_mul_ps(scale, x1), y1);
+        const __m256 q2 = _mm256_div_ps(_mm256_mul_ps(scale, x2), y2);
+        const __m256 q3 = _mm256_div_ps(_mm256_mul_ps(scale, x3), y3);
+        tensorplay::cpu::vecreduced::store_f16_16(
+            out_bits + i, _mm256_add_ps(s0, q0), _mm256_add_ps(s1, q1));
+        tensorplay::cpu::vecreduced::store_f16_16(
+            out_bits + i + 16, _mm256_add_ps(s2, q2), _mm256_add_ps(s3, q3));
+    }
     for (; i + 16 <= end; i += 16) {
-        const __m256 s0 = tensorplay::cpu::vecreduced::widen8(self_bits + i);
-        const __m256 x0 = tensorplay::cpu::vecreduced::widen8(t1_bits + i);
-        const __m256 y0 = tensorplay::cpu::vecreduced::widen8(t2_bits + i);
-        const __m256 s1 = tensorplay::cpu::vecreduced::widen8(self_bits + i + 8);
-        const __m256 x1 = tensorplay::cpu::vecreduced::widen8(t1_bits + i + 8);
-        const __m256 y1 = tensorplay::cpu::vecreduced::widen8(t2_bits + i + 8);
+        __m256 s0, s1, x0, x1, y0, y1;
+        tensorplay::cpu::vecreduced::widen_f16_16(self_bits + i, s0, s1);
+        tensorplay::cpu::vecreduced::widen_f16_16(t1_bits + i, x0, x1);
+        tensorplay::cpu::vecreduced::widen_f16_16(t2_bits + i, y0, y1);
         const __m256 p0 = _mm256_mul_ps(scale, x0);
         const __m256 q0 = _mm256_div_ps(p0, y0);
         const __m256 p1 = _mm256_mul_ps(scale, x1);
