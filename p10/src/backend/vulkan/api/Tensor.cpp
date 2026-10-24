@@ -244,6 +244,31 @@ api::UniformParamsBuffer make_metadata_uniform(
 namespace api {
 
 //
+// The storage a payload asks for from its shape and element type alone.
+//
+
+api::StorageType storage_type_of_payload(
+    const std::vector<int64_t>& sizes,
+    DType dtype) {
+  // A texel carries its lanes along the innermost axis of the four-slot form,
+  // which for two axes is the axis already shortest in the packing's eyes: no
+  // group of four elements shares a lane, so the other three stay empty.
+  if (sizes.size() == 2u &&
+      (dtype == DType::Float32 || dtype == DType::Float16)) {
+    return api::StorageType::BUFFER;
+  }
+  return api::StorageType::TEXTURE_3D;
+}
+
+api::GPUMemoryLayout memory_layout_of_payload(
+    const std::vector<int64_t>& sizes,
+    DType dtype) {
+  return api::StorageType::BUFFER == storage_type_of_payload(sizes, dtype)
+      ? api::GPUMemoryLayout::TENSOR_WIDTH_PACKED
+      : api::GPUMemoryLayout::TENSOR_CHANNELS_PACKED;
+}
+
+//
 // vTensorStorage
 //
 
@@ -574,6 +599,19 @@ void vTensorStorage::discard_and_reallocate(
 //
 // vTensor
 //
+
+vTensor::vTensor(
+    api::Context* context,
+    const std::vector<int64_t>& sizes,
+    const DType dtype,
+    const bool allocate_memory)
+    : vTensor(
+          context,
+          sizes,
+          dtype,
+          storage_type_of_payload(sizes, dtype),
+          memory_layout_of_payload(sizes, dtype),
+          allocate_memory) {}
 
 vTensor::vTensor(
     api::Context* context,

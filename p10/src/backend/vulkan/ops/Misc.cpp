@@ -19,6 +19,9 @@ Tensor mul_kernel(const Tensor& self, const Tensor& other);
 Tensor mul_scalar_kernel(const Tensor& self, const Scalar& other);
 Tensor div_kernel(const Tensor& self, const Tensor& other);
 Tensor gt_scalar_kernel(const Tensor& self, const Scalar& other);
+Tensor add_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha);
+Tensor sub_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha);
+Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking);
 Tensor& add_inplace_kernel(
     Tensor& self,
     const Tensor& other,
@@ -84,12 +87,48 @@ void validate_float_half_or_int_1d_to_4d(const Tensor& t, const char* name) {
       std::string("Vulkan ") + name + " supports 1d to 4d tensors");
 }
 
-// Refuses a payload that fell back to linear storage: the op samples every
-// operand as a texture, and a buffer has no texel to name.
-void require_texture_operand(const api::vTensor& v, const char* name) {
-  TP_CHECK(
-      v.storage_type() == api::StorageType::TEXTURE_3D,
-      std::string("Vulkan ") + name + " requires texture storage");
+// Whether the fused texel walk of a mix can run: it samples every operand and
+// writes the result through an image, so all three payloads must be laid out in
+// texels.  A matrix of the element types that fill a texel's lanes keeps its
+// elements in words, so the walk is closed there and the formula is evaluated
+// from the entries that read either storage instead.
+bool texel_walk_open(
+    api::Context* const context,
+    const api::vTensor& self,
+    const std::vector<const api::vTensor*>& sampled) {
+  if (self.storage_type() != api::StorageType::TEXTURE_3D ||
+      !image_form_of(context, self.sizes(), self.dtype())) {
+    return false;
+  }
+  for (const api::vTensor* const v : sampled) {
+    if (v->storage_type() != api::StorageType::TEXTURE_3D) {
+      return false;
+    }
+  }
+  return true;
+}
+
+//   out = self + weight * (end - self)
+// A scalar weight scales the whole spread; a tensor weight does it lane by
+// lane.
+Tensor lerp_by_arithmetic(
+    const Tensor& self,
+    const Tensor& end,
+    const Scalar& weight) {
+  return add_kernel(
+      self,
+      mul_scalar_kernel(sub_kernel(end, self, Scalar(1.0)), weight),
+      Scalar(1.0));
+}
+
+Tensor lerp_tensor_by_arithmetic(
+    const Tensor& self,
+    const Tensor& end,
+    const Tensor& weight) {
+  return add_kernel(
+      self,
+      mul_kernel(sub_kernel(end, self, Scalar(1.0)), weight),
+      Scalar(1.0));
 }
 
 } // namespace
@@ -216,8 +255,9 @@ Tensor lerp_scalar_kernel(const Tensor& self, const Tensor& end, const Scalar& w
 
   api::vTensor v_self = convert(self);
   api::vTensor v_end = convert(end);
-  require_texture_operand(v_self, "lerp");
-  require_texture_operand(v_end, "lerp");
+  if (!texel_walk_open(context, v_self, {&v_end})) {
+    return lerp_by_arithmetic(self, end, weight);
+  }
 
   api::vTensor v_output{context, v_self.sizes(), v_self.dtype()};
 
@@ -268,9 +308,9 @@ Tensor lerp_tensor_kernel(
   api::vTensor v_self = convert(self);
   api::vTensor v_end = convert(end);
   api::vTensor v_weight = convert(weight);
-  require_texture_operand(v_self, "lerp");
-  require_texture_operand(v_end, "lerp");
-  require_texture_operand(v_weight, "lerp");
+  if (!texel_walk_open(context, v_self, {&v_end, &v_weight})) {
+    return lerp_tensor_by_arithmetic(self, end, weight);
+  }
 
   api::vTensor v_output{context, v_self.sizes(), v_self.dtype()};
 
@@ -321,8 +361,10 @@ Tensor& lerp_scalar_inplace_kernel(
 
   api::vTensor v_self = convert(self);
   api::vTensor v_end = convert(end);
-  require_texture_operand(v_self, "lerp");
-  require_texture_operand(v_end, "lerp");
+  if (!texel_walk_open(context, v_self, {&v_end})) {
+    Tensor updated = lerp_by_arithmetic(self, end, weight);
+    return copy_kernel(self, updated, /*non_blocking=*/false);
+  }
 
   const struct LerpBlock final {
     ivec4 extents;
@@ -371,9 +413,10 @@ Tensor& lerp_tensor_inplace_kernel(
   api::vTensor v_self = convert(self);
   api::vTensor v_end = convert(end);
   api::vTensor v_weight = convert(weight);
-  require_texture_operand(v_self, "lerp");
-  require_texture_operand(v_end, "lerp");
-  require_texture_operand(v_weight, "lerp");
+  if (!texel_walk_open(context, v_self, {&v_end, &v_weight})) {
+    Tensor updated = lerp_tensor_by_arithmetic(self, end, weight);
+    return copy_kernel(self, updated, /*non_blocking=*/false);
+  }
 
   const struct LerpBlock final {
     ivec4 extents;

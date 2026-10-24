@@ -142,6 +142,23 @@ inline bool image_storage_supported(
 }
 
 //
+// Whether a payload of this shape and element type actually lands in an image.
+// An allocation that is not told otherwise keeps a matrix of the types that fill
+// a texel's lanes in words, so a shape with an image form is not yet a payload
+// with one; a kernel that is about to hand such a payload to a texel walk, or
+// to relay one into an image, asks this instead and skips the crossing when the
+// answer is no.
+//
+inline bool image_form_of(
+    api::Context* const context,
+    const std::vector<int64_t>& sizes,
+    DType dtype) {
+  return image_storage_supported(context, sizes) &&
+      api::StorageType::TEXTURE_3D ==
+          api::storage_type_of_payload(sizes, dtype);
+}
+
+//
 // The storage a result has to live in.  Kernel variants are written per
 // storage class: an image payload is read by sampling texels, a dense one by
 // indexing 32-bit words, and no variant crosses that line.  Releasing an
@@ -151,6 +168,10 @@ inline bool image_storage_supported(
 // leaves the image holding whatever the allocator recycled into it while the
 // real result sat in a buffer no read-back samples.  Naming the class the
 // operands use keeps the write in the storage the read uses.
+//
+// A caller that names TEXTURE_3D is asking for a texel walk on the result, so
+// the answer stays an image even for a shape that an unasked allocation would
+// keep in words: the request is about the kernel, not about the shape.
 //
 inline api::vTensor allocate_output(
     api::Context* const context,
@@ -165,7 +186,12 @@ inline api::vTensor allocate_output(
         api::StorageType::BUFFER,
         api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
   }
-  return api::vTensor{context, sizes, dtype};
+  return api::vTensor{
+      context,
+      sizes,
+      dtype,
+      api::StorageType::TEXTURE_3D,
+      api::GPUMemoryLayout::TENSOR_CHANNELS_PACKED};
 }
 
 inline api::vTensor allocate_output_like(
@@ -196,6 +222,16 @@ bool transpose_view_of_dense(const Tensor& t, Tensor* dense_out);
 // way the view names them.
 //
 Tensor dense_payload_of_view(const Tensor& t);
+
+//
+// The payload in image form, for a kernel that samples texels and was handed
+// one that carries its elements in words.  The crossing is one pass of the
+// strided gather and is worth it when the walk it feeds reads the payload many
+// times; a shape with no image form at all reports instead of quietly keeping
+// the caller in words.  An operand that already has an image comes back as it
+// was, without a copy.
+//
+Tensor to_image_storage(api::Context* const context, const Tensor& self);
 
 // Elementwise linear-buffer kernels address payload in the slots of a 16-byte
 // word: a Float32 element fills one, a Float16 pair shares one, and a code

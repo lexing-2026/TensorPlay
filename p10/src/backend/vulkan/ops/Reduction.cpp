@@ -281,11 +281,11 @@ Tensor reduce_one_axis(
     return release_reduced_output(context, v_output);
   }
 
-  api::vTensor v_output{
-      context,
-      out_sizes,
-      input.dtype(),
-  };
+  // The fold below reads and writes texels, so the result is reserved as an
+  // image; it still falls back to words when the shape has no image form at all,
+  // which is what the check right after it reports.
+  api::vTensor v_output = allocate_output(
+      context, api::StorageType::TEXTURE_3D, out_sizes, input.dtype());
 
   if (v_output.storage_type() == api::StorageType::BUFFER) {
     TP_THROW(NotImplementedError, "Vulkan reductions require texture storage");
@@ -581,7 +581,11 @@ Tensor extremum_one_axis(
     return release_reduced_output(context, v_output);
   }
 
-  api::vTensor v_output{context, out_sizes, input.dtype()};
+  // Both operands and the result of the fold below are read and written as
+  // texels, so the result is reserved as an image even for a shape an unasked
+  // allocation would keep in words.
+  api::vTensor v_output = allocate_output(
+      context, api::StorageType::TEXTURE_3D, out_sizes, input.dtype());
   TP_CHECK(
       v_input.storage_type() == api::StorageType::TEXTURE_3D &&
           v_output.storage_type() == api::StorageType::TEXTURE_3D,

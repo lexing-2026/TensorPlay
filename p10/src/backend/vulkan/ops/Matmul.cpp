@@ -76,18 +76,7 @@ Tensor image_payload_of(const Tensor& src) {
   if (v_src.storage_type() == api::StorageType::TEXTURE_3D) {
     return src;
   }
-  const std::vector<int64_t> sizes = shape_of(src);
-  TP_CHECK(
-      image_storage_supported(api::context(), sizes),
-      "Vulkan products cannot bring this operand into image storage: its shape "
-      "has no image form");
-  Tensor gathered = materialize_view(
-      src, sizes, SizesAndStrides::compute_contiguous_strides(sizes), 0);
-  api::vTensor v_gathered = convert(gathered);
-  TP_CHECK(
-      v_gathered.storage_type() == api::StorageType::TEXTURE_3D,
-      "Vulkan products cannot bring this operand into image storage");
-  return gathered;
+  return to_image_storage(api::context(), src);
 }
 
 Tensor linear_payload_of(const Tensor& src) {
@@ -452,7 +441,11 @@ Tensor gemv_decode(
   splits = std::min(splits, k_texels);
   const uint32_t chunk = api::utils::div_up(k_texels, splits);
 
-  api::vTensor v_output{context, {M, N}, dtype};
+  // The sweep below folds texel partials into a texel result, so the answer is
+  // reserved as an image even for a shape an unasked allocation would keep in
+  // words.
+  api::vTensor v_output = allocate_output(
+      context, api::StorageType::TEXTURE_3D, {M, N}, dtype);
 
   api::vTensor v_partials{
       context,
@@ -615,7 +608,11 @@ Tensor gemv_walk_width(
           api::utils::safe_downcast_to_u32(N), kGemvWidthColumns) *
       kGemvWidthColumns;
 
-  api::vTensor v_output{context, {M, N}, dtype};
+  // The sweep below folds texel partials into a texel result, so the answer is
+  // reserved as an image even for a shape an unasked allocation would keep in
+  // words.
+  api::vTensor v_output = allocate_output(
+      context, api::StorageType::TEXTURE_3D, {M, N}, dtype);
 
   // The addend broadcasts over singleton rows and columns the way the wider
   // product's epilogue does, and a zero beta term never fetches it, so a
@@ -1373,7 +1370,11 @@ Tensor product_dispatch(
         v_lhs, v_rhs, M, N, K, bias, beta, alpha, dtype);
   }
 
-  api::vTensor v_output{context, {M, N}, dtype};
+  // The sweep below folds texel partials into a texel result, so the answer is
+  // reserved as an image even for a shape an unasked allocation would keep in
+  // words.
+  api::vTensor v_output = allocate_output(
+      context, api::StorageType::TEXTURE_3D, {M, N}, dtype);
 
   TP_CHECK(
       v_output.storage_type() == api::StorageType::TEXTURE_3D,
@@ -1708,11 +1709,11 @@ Tensor release_product_output(
   Tensor flat = convert(v_product);
   const std::vector<int64_t> sizes(
       v_product.sizes().begin(), v_product.sizes().end());
+  const DType dtype = v_product.dtype();
   if (v_product.storage_type() != api::StorageType::BUFFER ||
-      !image_storage_supported(context, sizes)) {
+      !image_form_of(context, sizes, dtype)) {
     return flat;
   }
-  const DType dtype = v_product.dtype();
   if (dtype != DType::Float32 && dtype != DType::Int32 &&
       dtype != DType::Float16) {
     return flat;

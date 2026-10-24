@@ -332,8 +332,12 @@ Tensor embedding_kernel(
 
   // Output {index_count, features}: the 2-D texture geometry puts feature
   // columns on x and the lookup row on y.  Non-1d index tensors are flattened
-  // for the lookup and reshaped back to `index_shape + (features,)`.
-  api::vTensor v_output{context, {index_count, features}, weight.dtype()};
+  // for the lookup and reshaped back to `index_shape + (features,)`.  The walk
+  // writes texels, so the result is reserved as an image even for a shape an
+  // unasked allocation would keep in words.
+  api::vTensor v_output = allocate_output(
+      context, api::StorageType::TEXTURE_3D, {index_count, features},
+      weight.dtype());
 
   const struct EmbeddingBlock block{
       static_cast<int32_t>(index_count),
@@ -1181,8 +1185,10 @@ Tensor gather_kernel(const Tensor& self, int64_t dim, const Tensor& index) {
   // The texel route: one invocation per output texel, four channel lanes at a
   // time.  The depth axis stacks each payload's own channel groups, so the plane
   // a code is read from is counted with the source's groups per batch - the index
-  // tensor may hold fewer channels than the source.
-  api::vTensor v_output{context, out_sizes, self.dtype()};
+  // tensor may hold fewer channels than the source.  The result is reserved as an
+  // image, because the walk writes texels.
+  api::vTensor v_output = allocate_output(
+      context, api::StorageType::TEXTURE_3D, out_sizes, self.dtype());
 
   const ivec4 out_padded = padded_sizes(out_sizes);
   const ivec4 self_padded =

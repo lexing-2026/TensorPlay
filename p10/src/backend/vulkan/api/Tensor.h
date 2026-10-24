@@ -15,6 +15,29 @@ namespace api {
 class Context;
 
 //
+// The storage and the layout a payload asks for when whoever reserved it named
+// neither.  Two axes of numbers carry no channel group to line up with a
+// texel's four lanes: the four-slot form of a matrix pads its leading
+// singleton to four channels, so an image would hold one element per
+// sixteen-byte texel while three lanes and three quarters of the depth stay
+// empty.  A matrix of the types that fill those lanes therefore keeps the plain
+// linear layout, which costs the bytes its elements occupy and nothing else.
+//
+// This is a preference, not a limit: a creator that wants the texel form of a
+// matrix anyway -- because the kernel it feeds reads a sampler and pays for the
+// empty lanes -- names the storage, and the payload it gets is the one it asked
+// for.  The limit is elsewhere: an element wider than a word has no texel form
+// at any rank.
+//
+api::StorageType storage_type_of_payload(
+    const std::vector<int64_t>& sizes,
+    DType dtype);
+
+api::GPUMemoryLayout memory_layout_of_payload(
+    const std::vector<int64_t>& sizes,
+    DType dtype);
+
+//
 // Persistent per-storage state of a Vulkan tensor: the backing VkImage
 // (texture storage) or VkBuffer (buffer storage), plus the barrier history
 // used to insert minimal execution dependencies between shader invocations.
@@ -112,14 +135,21 @@ class vTensor final {
   // Do not allow empty vTensor construction
   vTensor() = default;
 
-  // Default constructor
+  // Construction that picks the storage the shape and element type ask for.
   vTensor(
       api::Context* context,
       const std::vector<int64_t>& sizes,
       const DType dtype,
-      const api::StorageType storage_type = api::StorageType::TEXTURE_3D,
-      const api::GPUMemoryLayout memory_layout =
-          api::GPUMemoryLayout::TENSOR_CHANNELS_PACKED,
+      const bool allocate_memory = true);
+
+  // Construction that keeps exactly the storage named, empty texel lanes and
+  // all.
+  vTensor(
+      api::Context* context,
+      const std::vector<int64_t>& sizes,
+      const DType dtype,
+      const api::StorageType storage_type,
+      const api::GPUMemoryLayout memory_layout,
       const bool allocate_memory = true);
 
   // View constructor: wraps an existing storage without taking ownership.

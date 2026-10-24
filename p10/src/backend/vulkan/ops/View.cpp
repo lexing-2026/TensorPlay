@@ -56,7 +56,8 @@ Tensor gather_view(
     const Tensor& input,
     const std::vector<int64_t>& out_sizes,
     const std::vector<int64_t>& out_strides_rowmajor,
-    int64_t offset) {
+    int64_t offset,
+    std::optional<api::StorageType> destination = std::nullopt) {
   TP_CHECK(
       input.dtype() == DType::Float32 || input.dtype() == DType::Float16 ||
           input.dtype() == DType::Int8 || input.dtype() == DType::Int32 ||
@@ -72,11 +73,14 @@ Tensor gather_view(
 
   api::Context* const context = api::context();
   api::vTensor v_input = convert(input);
-  // The destination class is decided by the shape alone: every pairing of a
-  // texel or word source with a texel or word destination has its own gather
-  // below, and a caller that wants a dense result kept image-shaped repacks
-  // it here rather than passing its own storage class through.
-  api::vTensor v_output{context, out_sizes, input.dtype()};
+  // The destination class: whatever a caller named, and otherwise the shape
+  // alone.  Every pairing of a texel or word source with a texel or word
+  // destination has its own gather below, so naming the class asks for one of
+  // them rather than leaving the choice to the layout.
+  api::vTensor v_output = destination.has_value()
+      ? allocate_output(
+            context, *destination, out_sizes, input.dtype())
+      : api::vTensor{context, out_sizes, input.dtype()};
 
   const std::vector<int64_t> in_sizes = prepadded(
       std::vector<int64_t>(v_input.sizes().begin(), v_input.sizes().end()));
@@ -250,16 +254,38 @@ Tensor materialize_view(
     const Tensor& self,
     const std::vector<int64_t>& out_sizes,
     const std::vector<int64_t>& out_strides,
-    int64_t storage_offset) {
+    int64_t storage_offset,
+    std::optional<api::StorageType> destination = std::nullopt) {
   // The gather names lanes by their position in the storage, so an axis-swapped
   // operand is read through the twin that describes that storage: the strides a
   // caller computed from the view index the same bytes either way, and nothing
   // has to be laid out again before the walk.
   Tensor twin;
   if (transpose_view_of_dense(self, &twin)) {
-    return gather_view(twin, out_sizes, out_strides, storage_offset);
+    return gather_view(
+        twin, out_sizes, out_strides, storage_offset, destination);
   }
-  return gather_view(self, out_sizes, out_strides, storage_offset);
+  return gather_view(
+      self, out_sizes, out_strides, storage_offset, destination);
+}
+
+Tensor to_image_storage(api::Context* const context, const Tensor& self) {
+  api::vTensor v_self = convert(self);
+  if (v_self.storage_type() == api::StorageType::TEXTURE_3D) {
+    return self;
+  }
+  const std::vector<int64_t> sizes =
+      static_cast<std::vector<int64_t>>(self.shape());
+  TP_CHECK(
+      image_storage_supported(context, sizes),
+      "Vulkan: this shape has no image form, so a kernel that samples texels "
+      "cannot be handed this payload");
+  return materialize_view(
+      self,
+      sizes,
+      SizesAndStrides::compute_contiguous_strides(sizes),
+      0,
+      api::StorageType::TEXTURE_3D);
 }
 
 bool transpose_view_of_dense(const Tensor& t, Tensor* dense_out) {

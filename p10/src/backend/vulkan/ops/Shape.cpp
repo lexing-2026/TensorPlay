@@ -157,8 +157,11 @@ Tensor permute_with_dims(const Tensor& self, const ivec4& perm) {
         self, permuted_sizes(self, perm), out_strides, offset);
   }
 
-  api::vTensor v_output{
-      context, permuted_sizes(self, perm), self.dtype()};
+  // The reorder below samples and writes texels, so the result keeps the image
+  // form even where an unasked allocation would choose words.
+  api::vTensor v_output = allocate_output(
+      context, api::StorageType::TEXTURE_3D, permuted_sizes(self, perm),
+      self.dtype());
 
   // Prepadded {d0, d1, d2, d3} logical sizes, d0 = batch, d1 = channel.
   auto prepadded = [](const std::vector<int64_t>& sizes) {
@@ -382,7 +385,6 @@ Tensor slice_kernel(
   api::Context* const context = api::context();
 
   api::vTensor v_input = convert(self);
-  api::vTensor v_output{context, new_sizes, self.dtype()};
 
   if (v_input.storage_type() == api::StorageType::BUFFER) {
     // A linear payload must be sliced through the strided-view gather,
@@ -401,6 +403,11 @@ Tensor slice_kernel(
         clamped_start * self_strides[static_cast<size_t>(dim)];
     return materialize_view(self, new_sizes, out_strides, offset);
   }
+
+  // The walk below samples texels and writes texels, so the result is reserved
+  // as an image even for a shape an unasked allocation would keep in words.
+  api::vTensor v_output = allocate_output(
+      context, api::StorageType::TEXTURE_3D, new_sizes, self.dtype());
 
   const struct SliceBlock final {
     ivec4 out_sizes;
@@ -470,7 +477,6 @@ Tensor select_kernel(const Tensor& self, int64_t dim, int64_t index) {
   api::Context* const context = api::context();
 
   api::vTensor v_input = convert(self);
-  api::vTensor v_output{context, new_sizes, self.dtype()};
 
   if (v_input.storage_type() == api::StorageType::BUFFER) {
     // Select over a linear payload is a strided view: the selected axis is
@@ -485,6 +491,11 @@ Tensor select_kernel(const Tensor& self, int64_t dim, int64_t index) {
         index * self_strides[static_cast<size_t>(dim)];
     return materialize_view(self, new_sizes, out_strides, offset);
   }
+
+  // As with a slice: the walk samples and writes texels, so the result keeps
+  // the image form even where an unasked allocation would choose words.
+  api::vTensor v_output = allocate_output(
+      context, api::StorageType::TEXTURE_3D, new_sizes, self.dtype());
 
   const struct SliceBlock final {
     ivec4 out_sizes;
