@@ -840,7 +840,7 @@ Tensor& exp2_out_cpu(const Tensor& self, Tensor& out) {
     return float_math_out_kernel(self, out, exp2_cpu, Exp2Scalar{}, "exp2");
 }
 Tensor sinc_cpu(const Tensor& self) {
-    return float_math_kernel(self, SincScalar{}, "sinc");
+    return float_math_vec_kernel(self, SincScalar{}, "sinc", vecunary::VOp::Sinc);
 }
 Tensor& sinc_out_cpu(const Tensor& self, Tensor& out) {
     return float_math_out_kernel(self, out, sinc_cpu, SincScalar{}, "sinc");
@@ -866,7 +866,8 @@ Tensor& erfinv_out_cpu(const Tensor& self, Tensor& out) {
 }
 Tensor logit_cpu(const Tensor& self, const std::optional<Scalar>& eps) {
     double e = eps.has_value() ? eps->toDouble() : -1.0;
-    return float_math_kernel(self, LogitScalar{e}, "logit");
+    return float_math_vec_kernel(self, LogitScalar{e}, "logit", vecunary::VOp::Logit,
+                                 vecunary::VParams{e, 0.0, 0.0});
 }
 // The destination form spells eps as the schema does, a width the caller chose;
 // the value it holds is what the allocating form would have clamped to.

@@ -157,7 +157,8 @@ Tensor log_ndtr_cpu(const Tensor& self) {
     return float_math_kernel(self, [](double x) { return calc_log_ndtr(x); }, "log_ndtr");
 }
 Tensor entr_cpu(const Tensor& self) {
-    return float_math_kernel(self, [](double x) { return calc_entr(x); }, "entr");
+    return float_math_vec_kernel(self, [](double x) { return calc_entr(x); }, "entr",
+                                 cpu::vecunary::VOp::Entr);
 }
 Tensor xlog1py_cpu(const Tensor& a, const Tensor& b) {
     return binary_float_kernel(a, b,

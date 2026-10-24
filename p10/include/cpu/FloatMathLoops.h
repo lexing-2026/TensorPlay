@@ -62,7 +62,7 @@ inline Tensor float_math_kernel(const Tensor& self, F f, const char* name,
 // a caller that supplies a destination.
 template <typename F>
 inline Tensor float_math_vec_kernel(const Tensor& self, F f, const char* name,
-                                    vecunary::VOp op,
+                                    vecunary::VOp op, vecunary::VParams prm = {},
                                     const Tensor* destination = nullptr) {
     const DType in = self.dtype();
     if ((in != DType::Float32 && in != DType::Float64) || destination != nullptr)
@@ -75,13 +75,13 @@ inline Tensor float_math_vec_kernel(const Tensor& self, F f, const char* name,
         const double* sp = w.data_ptr<double>();
         double* dp = t.data_ptr<double>();
         parallel::parallel_for(0, n, parallel::GRAIN_SIZE, [&](int64_t b, int64_t e) {
-            vecunary::run_f64(op, {}, sp, dp, b, e);
+            vecunary::run_f64(op, prm, sp, dp, b, e);
         });
     } else {
         const float* sp = w.data_ptr<float>();
         float* dp = t.data_ptr<float>();
         parallel::parallel_for(0, n, parallel::GRAIN_SIZE, [&](int64_t b, int64_t e) {
-            vecunary::run_f32(op, {}, sp, dp, b, e);
+            vecunary::run_f32(op, prm, sp, dp, b, e);
         });
     }
     return t;

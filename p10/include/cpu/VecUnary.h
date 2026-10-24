@@ -25,8 +25,10 @@
 
 #include "cpu/vec/intrinsics.h"
 #include <cmath>
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 
 #include "Half.h"
 #include "BFloat16.h"
@@ -58,6 +60,9 @@ enum class VOp : int {
     Sin, Cos, Tan, Asin, Acos, Atan,
     Sinh, Cosh, Tanh, Asinh, Acosh, Atanh,
     Erf, Erfc, ErfInv, Lgamma,
+    // composed: a vector walk over one of the ops above plus an elementwise
+    // fix-up, so they need no kernel of their own
+    Sinc, Entr, Logit,
     // library-only: no vector form below, so these run the scalar tail unless
     // the library is linked in
     Ndtr, NdtrI, Erfcx,
@@ -169,6 +174,22 @@ inline T scalar_apply(VOp op, VParams prm, T x) {
             return static_cast<T>(special_math::calc_ndtri(static_cast<double>(x)));
         case VOp::Erfcx:
             return static_cast<T>(special_math::calc_erfcx(static_cast<double>(x)));
+        case VOp::Sinc: {
+            const T px = static_cast<T>(3.14159265358979323846) * x;
+            return std::fabs(px) < T(1e-30) ? T(1) : std::sin(px) / px;
+        }
+        case VOp::Entr:
+            return x != x ? x
+                 : (x > T(0) ? -x * std::log(x)
+                             : (x == T(0) ? T(0)
+                                          : -std::numeric_limits<T>::infinity()));
+        case VOp::Logit: {
+            T p = x;
+            if (prm.p0 >= 0.0)
+                p = std::min(std::max(p, static_cast<T>(prm.p0)),
+                             T(1) - static_cast<T>(prm.p0));
+            return std::log(p / (T(1) - p));
+        }
         case VOp::Lgamma: return std::lgamma(x);
         case VOp::Sigmoid: return T(1) / (T(1) + std::exp(-x));
         case VOp::GeluNone: {
@@ -3004,7 +3025,100 @@ inline bool vml_only_op(VOp op) {
 // ---------------------------------------------------------------------------
 // Public entry points: process [b, e) of contiguous src -> dst.
 // ---------------------------------------------------------------------------
+
+// Forward declaration: the composed ops below re-enter the walk with the
+// building-block op they are made of.
+inline void run_f32(VOp op, VParams prm, const float* src, float* dst, int64_t b, int64_t e);
+inline void run_f64(VOp op, VParams prm, const double* src, double* dst, int64_t b, int64_t e);
+
+// sinc and logit need the scaling/clamping applied before the transcendental,
+// entr the result after it.  Both halves stay in the vector walk: the fix-up is
+// one elementwise pass, and the transcendental is the same entry the plain op
+// uses, so the composed form costs one extra pass over the block.
+inline bool composed_f32(VOp op, VParams prm, const float* src, float* dst, int64_t b,
+                         int64_t e) {
+    switch (op) {
+        case VOp::Sinc: {
+            constexpr float kPi = 3.14159265358979323846f;
+            for (int64_t i = b; i < e; ++i) dst[i] = kPi * src[i];
+            run_f32(VOp::Sin, {}, dst, dst, b, e);
+            for (int64_t i = b; i < e; ++i) {
+                const float px = kPi * src[i];
+                dst[i] = std::fabs(px) < 1e-30f ? 1.0f : dst[i] / px;
+            }
+            return true;
+        }
+        case VOp::Entr:
+            run_f32(VOp::Log, {}, src, dst, b, e);
+            for (int64_t i = b; i < e; ++i) {
+                const float x = src[i];
+                const float v = dst[i];
+                dst[i] = x > 0.0f
+                             ? -x * v
+                             : (x == 0.0f ? 0.0f
+                                          : (x != x ? x
+                                                    : -std::numeric_limits<float>::infinity()));
+            }
+            return true;
+        case VOp::Logit: {
+            const float eps = static_cast<float>(prm.p0);
+            const bool clamp = prm.p0 >= 0.0;
+            for (int64_t i = b; i < e; ++i) {
+                float p = src[i];
+                if (clamp) p = std::min(std::max(p, eps), 1.0f - eps);
+                dst[i] = p / (1.0f - p);
+            }
+            run_f32(VOp::Log, {}, dst, dst, b, e);
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
+inline bool composed_f64(VOp op, VParams prm, const double* src, double* dst, int64_t b,
+                         int64_t e) {
+    switch (op) {
+        case VOp::Sinc: {
+            constexpr double kPi = 3.14159265358979323846;
+            for (int64_t i = b; i < e; ++i) dst[i] = kPi * src[i];
+            run_f64(VOp::Sin, {}, dst, dst, b, e);
+            for (int64_t i = b; i < e; ++i) {
+                const double px = kPi * src[i];
+                dst[i] = std::fabs(px) < 1e-30 ? 1.0 : dst[i] / px;
+            }
+            return true;
+        }
+        case VOp::Entr:
+            run_f64(VOp::Log, {}, src, dst, b, e);
+            for (int64_t i = b; i < e; ++i) {
+                const double x = src[i];
+                const double v = dst[i];
+                dst[i] = x > 0.0
+                             ? -x * v
+                             : (x == 0.0 ? 0.0
+                                         : (x != x ? x
+                                                   : -std::numeric_limits<double>::infinity()));
+            }
+            return true;
+        case VOp::Logit: {
+            const double eps = prm.p0;
+            const bool clamp = prm.p0 >= 0.0;
+            for (int64_t i = b; i < e; ++i) {
+                double p = src[i];
+                if (clamp) p = std::min(std::max(p, eps), 1.0 - eps);
+                dst[i] = p / (1.0 - p);
+            }
+            run_f64(VOp::Log, {}, dst, dst, b, e);
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
 inline void run_f32(VOp op, VParams prm, const float* src, float* dst, int64_t b, int64_t e) {
+    if (composed_f32(op, prm, src, dst, b, e)) return;
 #ifdef USE_MKL
     if (Vml32Entry fn = vml32_entry(op)) {
         MKL_Set_Num_Threads_Local(1);
@@ -3041,6 +3155,7 @@ inline void run_f32(VOp op, VParams prm, const float* src, float* dst, int64_t b
 
 
 inline void run_f64(VOp op, VParams prm, const double* src, double* dst, int64_t b, int64_t e) {
+    if (composed_f64(op, prm, src, dst, b, e)) return;
 #ifdef USE_MKL
     if (Vml64Entry fn = vml64_entry(op)) {
         // Every worker owns a slice of the walk, so the library must not spread
