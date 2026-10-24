@@ -31,6 +31,7 @@
 #include "Half.h"
 #include "BFloat16.h"
 
+#include <SpecialMath.h>
 #include "cpu/vec/ErfPoly.h"
 #include "cpu/vec/SleefShims.h"
 
@@ -56,7 +57,10 @@ enum class VOp : int {
     Exp, Exp2, Expm1, Log, Log2, Log10, Log1p,
     Sin, Cos, Tan, Asin, Acos, Atan,
     Sinh, Cosh, Tanh, Asinh, Acosh, Atanh,
-    Erf, Erfc, Lgamma,
+    Erf, Erfc, ErfInv, Lgamma,
+    // library-only: no vector form below, so these run the scalar tail unless
+    // the library is linked in
+    Ndtr, NdtrI, Erfcx,
     // composite activations
     Sigmoid, GeluNone, GeluTanh, Silu, Mish, Selu,
     Elu, Softplus, Hardswish, Hardsigmoid, LeakyRelu,
@@ -157,6 +161,14 @@ inline T scalar_apply(VOp op, VParams prm, T x) {
         case VOp::Atanh: return std::atanh(x);
         case VOp::Erf: return std::erf(x);
         case VOp::Erfc: return std::erfc(x);
+        case VOp::ErfInv:
+            return static_cast<T>(special_math::calc_erfinv(static_cast<double>(x)));
+        case VOp::Ndtr:
+            return static_cast<T>(special_math::calc_ndtr(static_cast<double>(x)));
+        case VOp::NdtrI:
+            return static_cast<T>(special_math::calc_ndtri(static_cast<double>(x)));
+        case VOp::Erfcx:
+            return static_cast<T>(special_math::calc_erfcx(static_cast<double>(x)));
         case VOp::Lgamma: return std::lgamma(x);
         case VOp::Sigmoid: return T(1) / (T(1) + std::exp(-x));
         case VOp::GeluNone: {
@@ -2883,6 +2895,10 @@ void vmsAcosh(const int, const float[], float[], const long long) noexcept;
 void vmsAtanh(const int, const float[], float[], const long long) noexcept;
 void vmsErf(const int, const float[], float[], const long long) noexcept;
 void vmsErfc(const int, const float[], float[], const long long) noexcept;
+void vmsErfInv(const int, const float[], float[], const long long) noexcept;
+void vmsCdfNorm(const int, const float[], float[], const long long) noexcept;
+void vmsCdfNormInv(const int, const float[], float[], const long long) noexcept;
+void vmsErfcx(const int, const float[], float[], const long long) noexcept;
 void vmdExp(const int, const double[], double[], const long long) noexcept;
 void vmdExp2(const int, const double[], double[], const long long) noexcept;
 void vmdLn(const int, const double[], double[], const long long) noexcept;
@@ -2892,6 +2908,10 @@ void vmdLog1p(const int, const double[], double[], const long long) noexcept;
 void vmdExpm1(const int, const double[], double[], const long long) noexcept;
 void vmdErf(const int, const double[], double[], const long long) noexcept;
 void vmdErfc(const int, const double[], double[], const long long) noexcept;
+void vmdErfInv(const int, const double[], double[], const long long) noexcept;
+void vmdCdfNorm(const int, const double[], double[], const long long) noexcept;
+void vmdCdfNormInv(const int, const double[], double[], const long long) noexcept;
+void vmdErfcx(const int, const double[], double[], const long long) noexcept;
 void vmdSin(const int, const double[], double[], const long long) noexcept;
 void vmdCos(const int, const double[], double[], const long long) noexcept;
 void vmdTan(const int, const double[], double[], const long long) noexcept;
@@ -2933,6 +2953,10 @@ inline Vml32Entry vml32_entry(VOp op) {
         case VOp::Atanh: return vmsAtanh;
         case VOp::Erf:   return vmsErf;
         case VOp::Erfc:  return vmsErfc;
+        case VOp::ErfInv: return vmsErfInv;
+        case VOp::Ndtr:   return vmsCdfNorm;
+        case VOp::NdtrI:  return vmsCdfNormInv;
+        case VOp::Erfcx:  return vmsErfcx;
         default:         return nullptr;
     }
 }
@@ -2959,11 +2983,23 @@ inline Vml64Entry vml64_entry(VOp op) {
         case VOp::Atanh: return vmdAtanh;
         case VOp::Erf:   return vmdErf;
         case VOp::Erfc:  return vmdErfc;
+        case VOp::ErfInv: return vmdErfInv;
+        case VOp::Ndtr:   return vmdCdfNorm;
+        case VOp::NdtrI:  return vmdCdfNormInv;
+        case VOp::Erfcx:  return vmdErfcx;
         default:         return nullptr;
     }
 }
 
 #endif
+
+// No vector form below: the library is the only vector path for these, so
+// without it the block runs the scalar tail rather than reaching the chunk
+// kernels, whose default arm hands the input back unchanged.
+inline bool vml_only_op(VOp op) {
+    return op == VOp::ErfInv || op == VOp::Ndtr || op == VOp::NdtrI ||
+           op == VOp::Erfcx;
+}
 
 // ---------------------------------------------------------------------------
 // Public entry points: process [b, e) of contiguous src -> dst.
@@ -2980,6 +3016,10 @@ inline void run_f32(VOp op, VParams prm, const float* src, float* dst, int64_t b
         return;
     }
 #endif
+    if (vml_only_op(op)) {
+        for (int64_t i = b; i < e; ++i) dst[i] = scalar_apply(op, prm, src[i]);
+        return;
+    }
 #ifdef TP_VECUNARY_SLEEF
 #if defined(CPU_CAPABILITY_AVX512)
     // Tier-compiled copy: the ISA is guaranteed by the tier's -m flags, so
@@ -3016,6 +3056,10 @@ inline void run_f64(VOp op, VParams prm, const double* src, double* dst, int64_t
         return;
     }
 #endif
+    if (vml_only_op(op)) {
+        for (int64_t i = b; i < e; ++i) dst[i] = scalar_apply(op, prm, src[i]);
+        return;
+    }
 #ifdef TP_VECUNARY_SLEEF
 #if defined(CPU_CAPABILITY_AVX512)
     // Tier-compiled copy (see run_f32).  The f64_avx2_only ops have no
@@ -3053,6 +3097,13 @@ inline bool vec_ready() {
 // round-to-nearest-even — same semantics as tensorplay::Half(float).
 // Scalar fallback goes through the Half type itself.
 inline void run_f16(VOp op, VParams prm, const uint16_t* src, uint16_t* dst, int64_t b, int64_t e) {
+    if (vml_only_op(op)) {
+        const Half* hs = reinterpret_cast<const Half*>(src);
+        Half* hd = reinterpret_cast<Half*>(dst);
+        for (int64_t i = b; i < e; ++i)
+            hd[i] = static_cast<Half>(scalar_apply(op, prm, static_cast<float>(hs[i])));
+        return;
+    }
 #ifdef TP_VECUNARY_SLEEF
     if (avx2_available() && f16c_available()) {
         half_chunk_avx2(op, prm, src, dst, b, e);
@@ -3069,6 +3120,13 @@ inline void run_f16(VOp op, VParams prm, const uint16_t* src, uint16_t* dst, int
 // bf16 path: widen by bit shift, compute, narrow with round-to-nearest-even
 // (matches tensorplay::BFloat16(float)). Scalar fallback via BFloat16 type.
 inline void run_bf16(VOp op, VParams prm, const uint16_t* src, uint16_t* dst, int64_t b, int64_t e) {
+    if (vml_only_op(op)) {
+        const BFloat16* bs = reinterpret_cast<const BFloat16*>(src);
+        BFloat16* bd = reinterpret_cast<BFloat16*>(dst);
+        for (int64_t i = b; i < e; ++i)
+            bd[i] = static_cast<BFloat16>(scalar_apply(op, prm, static_cast<float>(bs[i])));
+        return;
+    }
 #ifdef TP_VECUNARY_SLEEF
     if (avx2_available()) {
         bf16_chunk_avx2(op, prm, src, dst, b, e);

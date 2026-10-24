@@ -71,6 +71,7 @@ using tensorplay::cpu::binary_float_kernel;
 using tensorplay::cpu::binary_float_out_kernel;
 using tensorplay::cpu::float_math_kernel;
 using tensorplay::cpu::float_math_out_kernel;
+using tensorplay::cpu::float_math_vec_kernel;
 
 // ---------------------------------------------------------------------------
 // Unary specials
@@ -141,13 +142,16 @@ Tensor i1e_cpu(const Tensor& self) {
 // ---------------------------------------------------------------------------
 
 Tensor erfcx_cpu(const Tensor& self) {
-    return float_math_kernel(self, [](double x) { return calc_erfcx(x); }, "erfcx");
+    return float_math_vec_kernel(self, [](double x) { return calc_erfcx(x); },
+                                 "erfcx", cpu::vecunary::VOp::Erfcx);
 }
 Tensor ndtr_cpu(const Tensor& self) {
-    return float_math_kernel(self, [](double x) { return calc_ndtr(x); }, "ndtr");
+    return float_math_vec_kernel(self, [](double x) { return calc_ndtr(x); },
+                                 "ndtr", cpu::vecunary::VOp::Ndtr);
 }
 Tensor ndtri_cpu(const Tensor& self) {
-    return float_math_kernel(self, [](double x) { return calc_ndtri(x); }, "ndtri");
+    return float_math_vec_kernel(self, [](double x) { return calc_ndtri(x); },
+                                 "ndtri", cpu::vecunary::VOp::NdtrI);
 }
 Tensor log_ndtr_cpu(const Tensor& self) {
     return float_math_kernel(self, [](double x) { return calc_log_ndtr(x); }, "log_ndtr");

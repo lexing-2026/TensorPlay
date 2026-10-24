@@ -18,6 +18,7 @@
 #include "OutWrite.h"
 #include "Parallel.h"
 #include "Tensor.h"
+#include "cpu/VecUnary.h"
 #include "TypePromotion.h"
 #include "Utils.h"
 
@@ -52,6 +53,38 @@ inline Tensor float_math_kernel(const Tensor& self, F f, const char* name,
     }
     (void)name;
     return (out_dt == compute_dt) ? t : t.to(out_dt);
+}
+
+// The loop above widens every element to double before calling `f`, so a
+// single-precision input pays the double routine and lands at about half the
+// rate.  Ops that have a vector walk take that instead, at their own width.
+// Every other dtype keeps the generic loop and its promotion rules, and so does
+// a caller that supplies a destination.
+template <typename F>
+inline Tensor float_math_vec_kernel(const Tensor& self, F f, const char* name,
+                                    vecunary::VOp op,
+                                    const Tensor* destination = nullptr) {
+    const DType in = self.dtype();
+    if ((in != DType::Float32 && in != DType::Float64) || destination != nullptr)
+        return float_math_kernel(self, f, name, destination);
+    Tensor w = self.contiguous();
+    Tensor t = Tensor::empty(static_cast<std::vector<int64_t>>(w.shape()), in,
+                             w.device());
+    const int64_t n = w.numel();
+    if (in == DType::Float64) {
+        const double* sp = w.data_ptr<double>();
+        double* dp = t.data_ptr<double>();
+        parallel::parallel_for(0, n, parallel::GRAIN_SIZE, [&](int64_t b, int64_t e) {
+            vecunary::run_f64(op, {}, sp, dp, b, e);
+        });
+    } else {
+        const float* sp = w.data_ptr<float>();
+        float* dp = t.data_ptr<float>();
+        parallel::parallel_for(0, n, parallel::GRAIN_SIZE, [&](int64_t b, int64_t e) {
+            vecunary::run_f32(op, {}, sp, dp, b, e);
+        });
+    }
+    return t;
 }
 
 // Whether the flat map over `self` can fill `out` itself instead of making a
