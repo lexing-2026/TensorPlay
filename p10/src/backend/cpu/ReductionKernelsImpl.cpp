@@ -3040,6 +3040,189 @@ T extrema_identity(bool maximum_value) {
     }
 }
 
+// One contiguous run folded the way the rule is written: every combine tests
+// for a NaN, so the walk costs a compare, a broadcast of its result and an or
+// per vector on top of the max itself.  It is the answer of record, and the
+// fast walk below hands a run that met a NaN back to it.
+template <typename ctype, bool WantMax>
+inline ctype fold_run_exact(const ctype* data, int64_t n) {
+    using Vec = Vectorized<ctype>;
+    constexpr int64_t lanes = Vec::size();
+    Vec acc[4];
+    for (auto& a : acc) a = Vec(extrema_identity<ctype>(WantMax));
+    int64_t i = 0;
+    for (; i + 4 * lanes <= n; i += 4 * lanes) {
+        for (int j = 0; j < 4; ++j) {
+            const Vec value = Vec::loadu(data + i + j * lanes);
+            acc[j] = WantMax ? maximum(acc[j], value) : minimum(acc[j], value);
+        }
+    }
+    ctype values[lanes];
+    ctype best = extrema_identity<ctype>(WantMax);
+    for (auto& a : acc) {
+        a.store(values);
+        for (int64_t k = 0; k < lanes; ++k) {
+            best = WantMax ? nan_max(best, values[k]) : nan_min(best, values[k]);
+        }
+    }
+    for (; i < n; ++i) best = WantMax ? nan_max(best, data[i]) : nan_min(best, data[i]);
+    return best;
+}
+
+// Lane-wise larger (WantMax) or smaller value, taken straight from the
+// instruction that owns the compare.  What that instruction does with a NaN
+// operand is its own business: the caller runs a second chain over the same
+// loads, and a NaN anywhere in the run shows up in it, so the ordering walk
+// never has to stop and check.
+template <bool WantMax>
+inline Vectorized<float> extremum_vec(const Vectorized<float>& acc,
+                                      const Vectorized<float>& value) {
+#if defined(__AVX512F__)
+    return WantMax ? _mm512_max_ps(acc, value) : _mm512_min_ps(acc, value);
+#elif defined(__AVX2__)
+    return WantMax ? _mm256_max_ps(acc, value) : _mm256_min_ps(acc, value);
+#else
+    return WantMax ? maximum(acc, value) : minimum(acc, value);
+#endif
+}
+
+template <bool WantMax>
+inline Vectorized<double> extremum_vec(const Vectorized<double>& acc,
+                                       const Vectorized<double>& value) {
+#if defined(__AVX512F__)
+    return WantMax ? _mm512_max_pd(acc, value) : _mm512_min_pd(acc, value);
+#elif defined(__AVX2__)
+    return WantMax ? _mm256_max_pd(acc, value) : _mm256_min_pd(acc, value);
+#else
+    return WantMax ? maximum(acc, value) : minimum(acc, value);
+#endif
+}
+
+// One contiguous run folded into four accumulators.  Grouping an extremum is
+// free: the answer is the same in any order, NaN included, because a NaN
+// operand puts a NaN in the result wherever it lands.  Four chains hide the
+// latency of the compare the way the iterator's own inner loop does, and the
+// lane chain and the ragged end are the only scalar work the row needs.
+//
+// The run is walked for its largest value with one instruction per vector, and
+// the same vectors are accumulated into a sum on the side.  A NaN reaches the
+// sum and stays there whichever lane it was in, while a finite run can only
+// take the sum to another finite value or to an infinity, so a NaN in the sum
+// means either that the run holds one or that it holds both infinities.  Both
+// answers come from the exact walk, and the cost of that second pass falls only
+// on a run that holds a NaN or an infinity pair.
+template <typename ctype, bool WantMax>
+inline ctype fold_run_extremum(const ctype* data, int64_t n) {
+    using Vec = Vectorized<ctype>;
+    constexpr int64_t lanes = Vec::size();
+    Vec acc[4];
+    for (auto& a : acc) a = Vec(extrema_identity<ctype>(WantMax));
+    Vec traced[2]{Vec(ctype(0)), Vec(ctype(0))};
+    int64_t i = 0;
+    for (; i + 4 * lanes <= n; i += 4 * lanes) {
+        for (int j = 0; j < 4; ++j) {
+            const Vec value = Vec::loadu(data + i + j * lanes);
+            acc[j] = extremum_vec<WantMax>(acc[j], value);
+            traced[j & 1] = traced[j & 1] + value;
+        }
+    }
+    ctype marks[lanes];
+    (traced[0] + traced[1]).store(marks);
+    for (int64_t k = 0; k < lanes; ++k) {
+        if (!(marks[k] == marks[k])) return fold_run_exact<ctype, WantMax>(data, n);
+    }
+    ctype values[lanes];
+    ctype best = extrema_identity<ctype>(WantMax);
+    for (auto& a : acc) {
+        a.store(values);
+        for (int64_t k = 0; k < lanes; ++k) {
+            best = WantMax ? (best < values[k] ? values[k] : best)
+                           : (values[k] < best ? values[k] : best);
+        }
+    }
+    for (; i < n; ++i) {
+        const ctype value = data[i];
+        if (!(value == value)) return fold_run_exact<ctype, WantMax>(data, n);
+        best = WantMax ? (best < value ? value : best)
+                       : (value < best ? value : best);
+    }
+    return best;
+}
+
+// A single trailing dimension of a dense tensor is one contiguous run per row,
+// so the rows can go straight to the pool and skip the reduction iterator with
+// its identity fill and its per-element stride machinery.  Answers agree with
+// the iterator because both fold the same run with the same compare.
+template <typename ctype>
+bool fold_trailing_extrema(Tensor& result, const Tensor& self, int64_t ndim,
+                           const std::vector<int64_t>& resolved,
+                           bool maximum_value) {
+    if (resolved.size() != 1 || ndim < 1 || resolved[0] != ndim - 1) return false;
+    if (!self.is_contiguous()) return false;
+    const int64_t run = self.size(-1);
+    if (run <= 0) return false;
+    const int64_t rows = self.numel() / run;
+    if (rows * run != self.numel() || result.numel() != rows) return false;
+
+    const ctype* data = self.data_ptr<ctype>();
+    ctype* out = result.data_ptr<ctype>();
+    auto fold_rows = [&](int64_t begin, int64_t end) {
+        for (int64_t r = begin; r < end; ++r) {
+            out[r] = maximum_value
+                ? fold_run_extremum<ctype, true>(data + r * run, run)
+                : fold_run_extremum<ctype, false>(data + r * run, run);
+        }
+    };
+    if (self.numel() < GRAIN_SIZE || get_num_threads() == 1 ||
+        in_parallel_region()) {
+        fold_rows(0, rows);
+    } else {
+        parallel_for(0, rows, 1, fold_rows);
+    }
+    return true;
+}
+
+// Every dimension of a dense tensor reduced away leaves one contiguous run over
+// the whole buffer and one answer.  The run is cut into a chunk per thread, each
+// chunk folded into its own slot, and the slots combined at the end: an
+// extremum of chunk extrema is the extremum, and a chunk that met a NaN hands
+// one to the combine, so no identity value enters anywhere.
+template <typename ctype>
+bool fold_whole_extrema(Tensor& result, const Tensor& self, int64_t ndim,
+                        const std::vector<int64_t>& resolved,
+                        bool maximum_value) {
+    if (ndim < 1 || resolved.size() != static_cast<size_t>(ndim)) return false;
+    if (!self.is_contiguous()) return false;
+    const int64_t n = self.numel();
+    if (n <= 0 || result.numel() != 1) return false;
+
+    const ctype* data = self.data_ptr<ctype>();
+    // A chunk below a grain is not worth a slot: the split would cost more than
+    // the walk it saves.
+    const int64_t chunks = std::min<int64_t>(
+        get_num_threads(), (n + GRAIN_SIZE - 1) / GRAIN_SIZE);
+    const int64_t per = (n + chunks - 1) / chunks;
+    std::vector<ctype> parts(chunks);
+    auto fold_chunks = [&](int64_t begin, int64_t end) {
+        for (int64_t c = begin; c < end; ++c) {
+            const int64_t lo = c * per;
+            const int64_t hi = std::min(lo + per, n);
+            parts[c] = maximum_value
+                ? fold_run_extremum<ctype, true>(data + lo, hi - lo)
+                : fold_run_extremum<ctype, false>(data + lo, hi - lo);
+        }
+    };
+    parallel_for(0, chunks, 1, fold_chunks);
+
+    ctype* out = result.data_ptr<ctype>();
+    ctype best = parts[0];
+    for (int64_t c = 1; c < chunks; ++c) {
+        best = maximum_value ? nan_max(best, parts[c]) : nan_min(best, parts[c]);
+    }
+    *out = best;
+    return true;
+}
+
 // ---- Fused dual-input reductions -------------------------------------------
 // A single pass over both inputs accumulates sum((a-b)^2) or sum(|a-b|), so
 // regression metrics never materialise the difference/power tensors and their
@@ -3205,6 +3388,17 @@ Tensor extrema_dim_kernel_impl(const Tensor& self, const std::vector<int64_t>& d
     TensorIterator iter = TensorIterator::reduce_op(viewed, self);
 #define TP_EXTREMA_CASE(ctype, name) \
     case DType::name: \
+        if constexpr (std::is_same_v<ctype, float> || \
+                      std::is_same_v<ctype, double>) { \
+            if (fold_trailing_extrema<ctype>(result, self, ndim, resolved, \
+                                             maximum_value)) { \
+                return result; \
+            } \
+            if (fold_whole_extrema<ctype>(result, self, ndim, resolved, \
+                                          maximum_value)) { \
+                return result; \
+            } \
+        } \
         if constexpr (std::is_integral_v<ctype> && sizeof(ctype) == 8) { \
             binary_kernel_reduce(iter, ExtremaValuesOps<ctype>{maximum_value}, \
                                  extrema_identity<ctype>(maximum_value)); \
