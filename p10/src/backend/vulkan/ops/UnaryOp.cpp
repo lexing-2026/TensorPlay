@@ -101,7 +101,11 @@ Tensor unary_op(
     const char* buffer_shader_name) {
   api::Context* const context = api::context();
 
-  api::vTensor v_self = convert(self_arg);
+  // An out-of-place walk reads a payload, so an operand carried through
+  // swapped strides is gathered before the lane names are computed.  The
+  // binding borrows that payload, so the gathered operand stays named here.
+  const Tensor dense_self = dense_payload_of_view(self_arg);
+  api::vTensor v_self = convert(dense_self);
 
   // A buffer-stored input keeps the op on the linear path even when the
   // output shape is small enough for image storage; the image path has no

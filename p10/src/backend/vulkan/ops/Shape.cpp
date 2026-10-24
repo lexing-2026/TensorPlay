@@ -559,13 +559,24 @@ Tensor cat_kernel(const std::vector<Tensor>& tensors, int64_t dim) {
     }
   }
 
+  // A join copies each part through a payload walk, so a part that carries
+  // its elements through swapped strides is gathered once here; the shape
+  // checks above stay on the operands the caller handed over because a
+  // gathered part keeps the shape it was viewed with.
+  std::vector<Tensor> gathered;
+  gathered.reserve(tensors.size());
+  for (const Tensor& t : tensors) {
+    gathered.push_back(dense_payload_of_view(t));
+  }
+  const std::vector<Tensor>& sources = gathered;
+
   api::Context* const context = api::context();
 
   // One dense input makes the whole result dense: the linear route pulls a
   // texel operand into words, but nothing turns a word operand into a texel
   // for the image route to sample.
   api::StorageType storage = api::StorageType::TEXTURE_3D;
-  for (const Tensor& t : tensors) {
+  for (const Tensor& t : sources) {
     if (convert(t).storage_type() == api::StorageType::BUFFER) {
       storage = api::StorageType::BUFFER;
       break;
@@ -620,7 +631,7 @@ Tensor cat_kernel(const std::vector<Tensor>& tensors, int64_t dim) {
     // barrier system, the same way the image path does.
     api::PipelineBarrier pipeline_barrier{};
     int64_t offset = 0;
-    for (const Tensor& t : tensors) {
+    for (const Tensor& t : sources) {
       api::vTensor v_src = convert(t);
       // A small texture input has no linear buffer backing; copy it into a
       // dense buffer first so the linear cat shader can read it.
@@ -694,7 +705,7 @@ Tensor cat_kernel(const std::vector<Tensor>& tensors, int64_t dim) {
   api::PipelineBarrier pipeline_barrier{};
 
   int64_t offset = 0;
-  for (const Tensor& t : tensors) {
+  for (const Tensor& t : sources) {
     api::vTensor v_src = convert(t);
 
     const struct CatBlock final {

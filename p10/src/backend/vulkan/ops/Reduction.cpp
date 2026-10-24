@@ -219,7 +219,10 @@ Tensor reduce_one_axis(
     int var_mode) {
   api::Context* const context = api::context();
 
-  api::vTensor v_input = convert(input);
+  // A binding borrows the payload without owning it, so the operand it was
+  // gathered into stays named beside the binding for as long as the walk reads.
+  const Tensor dense_input = dense_payload_of_view(input);
+  api::vTensor v_input = convert(dense_input);
 
   const int64_t ndim = input.dim();
   const int axis_innermost = static_cast<int>(ndim - 1 - axis_from_left);
@@ -507,7 +510,8 @@ Tensor extremum_one_axis(
     int64_t axis_from_left,
     ExtremumKind kind) {
   api::Context* const context = api::context();
-  api::vTensor v_input = convert(input);
+  const Tensor dense_input = dense_payload_of_view(input);
+  api::vTensor v_input = convert(dense_input);
 
   const int axis_innermost =
       static_cast<int>(input.dim() - 1 - axis_from_left);
@@ -694,7 +698,8 @@ Tensor integer_prod_one_axis(
     const Tensor& input,
     int64_t axis_from_left) {
   api::Context* const context = api::context();
-  api::vTensor v_input = convert(input);
+  const Tensor dense_input = dense_payload_of_view(input);
+  api::vTensor v_input = convert(dense_input);
 
   const int axis_innermost =
       static_cast<int>(input.dim() - 1 - axis_from_left);
@@ -797,7 +802,8 @@ Tensor wide_total_one_axis(
     int64_t axis_from_left,
     TotalKind kind) {
   api::Context* const context = api::context();
-  api::vTensor v_input = convert(input);
+  const Tensor dense_input = dense_payload_of_view(input);
+  api::vTensor v_input = convert(dense_input);
 
   std::vector<int64_t> out_sizes = shape_vector(input);
   out_sizes[static_cast<size_t>(axis_from_left)] = 1;
@@ -888,7 +894,8 @@ Tensor arg_one_axis(
     int64_t axis_from_left,
     bool greater) {
   api::Context* const context = api::context();
-  api::vTensor v_input = convert(input);
+  const Tensor dense_input = dense_payload_of_view(input);
+  api::vTensor v_input = convert(dense_input);
   std::vector<int64_t> out_sizes = shape_vector(input);
   out_sizes[static_cast<size_t>(axis_from_left)] = 1;
 
@@ -1045,7 +1052,8 @@ Tensor bool_reduce_one_axis(
     int64_t axis_from_left,
     BoolReduceKind kind) {
   api::Context* const context = api::context();
-  api::vTensor v_input = convert(input);
+  const Tensor dense_input = dense_payload_of_view(input);
+  api::vTensor v_input = convert(dense_input);
   std::vector<int64_t> out_sizes = shape_vector(input);
   out_sizes[static_cast<size_t>(axis_from_left)] = 1;
 
@@ -1120,9 +1128,10 @@ Tensor bool_reduce_impl(
   // standing is the greatest.  The walk that compares lanes as they are carried
   // needs a texel to read, so a payload held in linear storage takes those ends
   // through the fold that walks a row and answers by whether the end stands.
-  if (convert(self).storage_type() == api::StorageType::BUFFER) {
+  const Tensor dense_self = dense_payload_of_view(self);
+  if (convert(dense_self).storage_type() == api::StorageType::BUFFER) {
     const Tensor end = extremum_impl(
-        self.to(DType::Float32),
+        dense_self.to(DType::Float32),
         dims,
         keepdim,
         kind == BoolReduceKind::kAll ? ExtremumKind::kMin
@@ -1130,7 +1139,7 @@ Tensor bool_reduce_impl(
     return end.ne(Scalar(0.0));
   }
 
-  Tensor current = self;
+  Tensor current = dense_self;
   for (const int64_t axis : dims) {
     current = bool_reduce_one_axis(current, axis, kind);
   }
@@ -1178,7 +1187,8 @@ Tensor reduce_int64(
     }
   }
   api::Context* context = api::context();
-  api::vTensor input = convert(self);
+  const Tensor dense_self = dense_payload_of_view(self);
+  api::vTensor input = convert(dense_self);
   api::vTensor output{
       context, output_sizes, DType::Int64, api::StorageType::BUFFER,
       api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
@@ -1282,18 +1292,19 @@ Tensor integral_total(
     return wanted == DType::Float32 ? total : total.to(wanted);
   }
 
-  if (convert(self).storage_type() == api::StorageType::TEXTURE_3D) {
-    return self.dtype() == DType::Int32
-        ? reduce_int64(self, dims, keepdim, "sum_int64")
+  const Tensor dense_self = dense_payload_of_view(self);
+  if (convert(dense_self).storage_type() == api::StorageType::TEXTURE_3D) {
+    return dense_self.dtype() == DType::Int32
+        ? reduce_int64(dense_self, dims, keepdim, "sum_int64")
         : reduce_int64(
-              self.to(DType::Float32), dims, keepdim, "sum_int64_float");
+              dense_self.to(DType::Float32), dims, keepdim, "sum_int64_float");
   }
   // A signed word crosses to the wide word as itself; every narrower code is
   // exact in single precision, so it steps through that width on the way.
   return wide_total_impl(
-      self.dtype() == DType::Int32
-          ? self.to(DType::Int64)
-          : self.to(DType::Float32).to(DType::Int64),
+      dense_self.dtype() == DType::Int32
+          ? dense_self.to(DType::Int64)
+          : dense_self.to(DType::Float32).to(DType::Int64),
       dims,
       keepdim,
       TotalKind::kSum);
@@ -1327,16 +1338,20 @@ Tensor count_impl(const Tensor& self, const std::vector<int64_t>& dims_in) {
   }
   const bool counted_in_texels =
       self.dtype() == DType::Float32 || self.dtype() == DType::Int32;
+  const Tensor dense_self = dense_payload_of_view(self);
   if (counted_in_texels &&
-      convert(self).storage_type() == api::StorageType::TEXTURE_3D) {
+      convert(dense_self).storage_type() == api::StorageType::TEXTURE_3D) {
     return reduce_int64(
-        self,
+        dense_self,
         dims,
         false,
-        self.dtype() == DType::Int32 ? "count_int64_i32" : "count_int64_float");
+        dense_self.dtype() == DType::Int32 ? "count_int64_i32"
+                                           : "count_int64_float");
   }
   return integral_total(
-      self.dtype() == DType::Bool ? self : self.ne(Scalar(0.0)),
+      dense_self.dtype() == DType::Bool
+          ? dense_self
+          : dense_self.ne(Scalar(0.0)),
       dims,
       false,
       DType::Int64);
@@ -1611,7 +1626,8 @@ Tensor cumprod_kernel(
   int64_t axis = dim < 0 ? dim + self.dim() : dim;
   TP_CHECK(axis >= 0 && axis < self.dim(), "Vulkan cumprod: dim out of range");
   api::Context* const context = api::context();
-  api::vTensor v_input = convert(self);
+  const Tensor dense_self = dense_payload_of_view(self);
+  api::vTensor v_input = convert(dense_self);
   api::vTensor v_output{context, v_input.sizes(), DType::Float32};
 
   const struct CumprodBlock final {
@@ -1743,7 +1759,8 @@ Tensor broadcast_sub(const Tensor& a, const Tensor& b) {
 Tensor square(const Tensor& a) {
   api::Context* const context = api::context();
 
-  api::vTensor v_a = convert(a);
+  const Tensor dense_a = dense_payload_of_view(a);
+  api::vTensor v_a = convert(dense_a);
   api::vTensor v_out{context, v_a.sizes(), a.dtype()};
 
   const struct Block final {
@@ -1895,14 +1912,17 @@ Tensor var_kernel(const Tensor& self, int64_t correction) {
     return *fused;
   }
 
-  api::vTensor v_self = convert(self);
+  const Tensor dense_self = dense_payload_of_view(self);
+  api::vTensor v_self = convert(dense_self);
   if (v_self.storage_type() == api::StorageType::BUFFER) {
-    return var_buffer_one_pass(self, dims, /*keepdim=*/false, correction);
+    return var_buffer_one_pass(
+        dense_self, dims, /*keepdim=*/false, correction);
   }
 
   const int64_t count = self.numel();
-  Tensor mean = reduce_impl(self, dims, /*keepdim=*/true, true, false, 0);
-  Tensor centered_sq = square(broadcast_sub(self, mean));
+  Tensor mean =
+      reduce_impl(dense_self, dims, /*keepdim=*/true, true, false, 0);
+  Tensor centered_sq = square(broadcast_sub(dense_self, mean));
   Tensor summed = reduce_impl(centered_sq, dims, false, false, false, 0);
   const double denom =
       std::max(0.0, static_cast<double>(count - correction));
@@ -1978,21 +1998,23 @@ std::tuple<Tensor, Tensor> var_mean_pair(
 
   Tensor mean_keep;
   Tensor var_keep;
-  if (convert(wide).storage_type() == api::StorageType::BUFFER) {
+  const Tensor dense_wide = dense_payload_of_view(wide);
+  if (convert(dense_wide).storage_type() == api::StorageType::BUFFER) {
     // Linear elementwise kernels refuse broadcasts, so the centered walk is
     // replaced by the equivalent raw-moment form
     //   (sum(x^2) - sum(x)^2 / n) / (n - c).
-    const Tensor sum = reduce_impl(wide, dims, /*keepdim=*/true,
+    const Tensor sum = reduce_impl(dense_wide, dims, /*keepdim=*/true,
                                    /*mean_mode=*/false, /*var_mode=*/false, 0);
-    const Tensor sum_sq = reduce_impl(wide.mul(wide), dims, /*keepdim=*/true,
-                                      /*mean_mode=*/false, /*var_mode=*/false,
-                                      0);
+    const Tensor sum_sq =
+        reduce_impl(dense_wide.mul(dense_wide), dims, /*keepdim=*/true,
+                    /*mean_mode=*/false, /*var_mode=*/false, 0);
     mean_keep = sum.mul(Scalar(1.0 / static_cast<double>(count)));
     var_keep = sum_sq.sub(sum.mul(mean_keep)).mul(Scalar(inverse_denom));
   } else {
-    mean_keep = reduce_impl(wide, dims, /*keepdim=*/true,
+    mean_keep = reduce_impl(dense_wide, dims, /*keepdim=*/true,
                             /*mean_mode=*/true, /*var_mode=*/false, 0);
-    const Tensor centered_sq = square(broadcast_sub(wide, mean_keep));
+    const Tensor centered_sq =
+        square(broadcast_sub(dense_wide, mean_keep));
     var_keep = reduce_impl(centered_sq, dims, /*keepdim=*/true,
                            /*mean_mode=*/false, /*var_mode=*/false, 0)
                    .mul(Scalar(inverse_denom));
@@ -2053,16 +2075,18 @@ Tensor var_dim_kernel(
   if (auto fused = var_half_single_axis(self, dims, keepdim, correction)) {
     return *fused;
   }
-  api::vTensor v_self = convert(self);
+  const Tensor dense_self = dense_payload_of_view(self);
+  api::vTensor v_self = convert(dense_self);
   if (v_self.storage_type() == api::StorageType::BUFFER) {
-    return var_buffer_one_pass(self, dims, keepdim, correction);
+    return var_buffer_one_pass(dense_self, dims, keepdim, correction);
   }
 
   // Two-pass variance over the whole reduced span: a keepdim mean
   // broadcasts against the input exactly, so the elementwise kernels apply
   // to any axis set and the sum aggregates the squared deviations.
-  Tensor mean = reduce_impl(self, dims, /*keepdim=*/true, true, false, 0);
-  Tensor centered_sq = square(broadcast_sub(self, mean));
+  Tensor mean =
+      reduce_impl(dense_self, dims, /*keepdim=*/true, true, false, 0);
+  Tensor centered_sq = square(broadcast_sub(dense_self, mean));
   Tensor summed =
       reduce_impl(centered_sq, dims, keepdim, false, false, 0);
 

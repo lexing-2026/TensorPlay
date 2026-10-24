@@ -10238,6 +10238,39 @@ class TestVulkanMatvec(unittest.TestCase):
             rows.astype(np.float64) @ dense.astype(np.float64),
             rtol=1e-4, atol=1e-4, err_msg="layer over an axis swap")
 
+    def test_a_walk_over_an_axis_swap_answers_its_own_shape(self):
+        # An op that binds a payload gathers the swap instead of refusing it,
+        # so a walk or a fold answers the axes the view names.
+        rng = np.random.default_rng(24)
+        dense = (rng.standard_normal((9, 5)) * 0.5).astype(np.float32)
+        swapped = self._device(dense).transpose(0, 1)
+        want = np.transpose(dense, (1, 0))
+
+        walked = tensorplay.exp(swapped).cpu().numpy()
+        np.testing.assert_allclose(
+            walked.astype(np.float64), np.exp(want).astype(np.float64),
+            rtol=1e-4, atol=1e-4, err_msg="unary walk over an axis swap")
+
+        paired = (swapped + swapped).cpu().numpy()
+        np.testing.assert_allclose(
+            paired.astype(np.float64), (want + want).astype(np.float64),
+            rtol=1e-4, atol=1e-4, err_msg="binary walk over an axis swap")
+
+        folded = swapped.sum(0).cpu().numpy()
+        np.testing.assert_allclose(
+            folded.astype(np.float64), want.sum(axis=0, dtype=np.float64),
+            rtol=1e-4, atol=1e-4, err_msg="fold across an axis swap")
+
+        spread = swapped.std(dim=1).cpu().numpy()
+        np.testing.assert_allclose(
+            spread.astype(np.float64), want.std(axis=1, ddof=1),
+            rtol=1e-3, atol=1e-3, err_msg="spread along an axis swap")
+
+        grouped = swapped.var(dim=0).cpu().numpy()
+        np.testing.assert_allclose(
+            grouped.astype(np.float64), want.var(axis=0, ddof=1),
+            rtol=1e-3, atol=1e-3, err_msg="spread across an axis swap")
+
     def test_a_stride_pattern_the_gather_cannot_read_answers_the_same(self):
         rng = np.random.default_rng(16)
         wide = (rng.standard_normal((8, 20)) * 0.5).astype(np.float32)

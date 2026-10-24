@@ -464,8 +464,13 @@ Tensor binary_op_tensor(
 
   api::Context* const context = api::context();
 
-  api::vTensor v_self = convert(self);
-  api::vTensor v_other = convert(other);
+  // A walk reads both payloads, so an operand carried through swapped strides
+  // is gathered first; each binding borrows its payload, so the gathered
+  // operands stay named beside the bindings.
+  const Tensor dense_self = dense_payload_of_view(self);
+  const Tensor dense_other = dense_payload_of_view(other);
+  api::vTensor v_self = convert(dense_self);
+  api::vTensor v_other = convert(dense_other);
 
   // Infer the broadcasted output shape. Texture storage supports arbitrary
   // leading-singleton broadcasts through the texel mapping; buffer storage
@@ -785,7 +790,10 @@ Tensor binary_op_scalar(
 
   api::Context* const context = api::context();
 
-  api::vTensor v_self = convert(operand);
+  // The binding borrows the payload it walks, so a gathered operand stays
+  // named beside the binding.
+  const Tensor dense_operand = dense_payload_of_view(operand);
+  api::vTensor v_self = convert(dense_operand);
 
   // A buffer-stored input keeps the whole op on the linear path even when
   // the output shape is small enough for image storage; the image path has

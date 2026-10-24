@@ -115,6 +115,13 @@ inline Tensor convert(const api::vTensor& tensor) {
 // storage offset would silently mis-address reads; guard that case at the
 // boundary.
 //
+// The returned view borrows the storage rather than owning it, so the tensor
+// it came from has to outlive every read the binding serves.  An operand that
+// needs gathering first is therefore named beside its binding:
+//
+//   const Tensor dense_operand = dense_payload_of_view(operand);
+//   api::vTensor v_operand = convert(dense_operand);
+//
 inline api::vTensor convert(const Tensor& tensor) {
   TP_CHECK(tensor.device().is_vulkan(), "Vulkan tensor expected!");
   TP_CHECK(
