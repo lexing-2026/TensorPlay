@@ -1445,6 +1445,163 @@ inline __m256d v_softplus_f64(__m256d beta, __m256d threshold, __m256d x) {
     return _mm256_blendv_pd(sp, x, _mm256_cmp_pd(bx, threshold, _CMP_GT_OQ));
 }
 
+// exp on double lanes.  The argument loses k*ln2 in two parts, so the reduced
+// argument keeps the bits a single subtraction would round away, and the
+// series is a degree-12 fit over [-ln2/2, ln2/2] with a relative error of
+// 6e-20.  The scale is applied as two half exponents: both halves stay normal
+// for every k, so a result that lands in the subnormal range is rounded once,
+// by the final multiply.
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256d v_exp_f64(__m256d x) {
+    const __m256d kLog2e = _mm256_set1_pd(1.4426950408889634074);
+    const __m256d ln2_hi = _mm256_set1_pd(0x1.62e42fef00000p-1);
+    const __m256d ln2_lo = _mm256_set1_pd(0x1.473de6af278edp-34);
+    // The argument is clamped, not the exponent: the reduction has to stay
+    // consistent with the clamp, or a lane far outside the range would come
+    // back with a reduced argument the series cannot represent.  The bounds
+    // sit just past the overflow and underflow thresholds, so every result
+    // outside them is already inf or zero.  A NaN survives both clamps,
+    // because the second operand only wins when the first is not NaN.
+    x = _mm256_min_pd(_mm256_set1_pd(709.9), x);
+    x = _mm256_max_pd(_mm256_set1_pd(-745.2), x);
+    __m256d k = _mm256_round_pd(_mm256_mul_pd(x, kLog2e),
+                                _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    __m256d r = _mm256_fnmadd_pd(k, ln2_hi, x);
+    r = _mm256_fnmadd_pd(k, ln2_lo, r);
+    __m256d p = _mm256_set1_pd(2.0921579964950299e-09);
+    p = _mm256_fmadd_pd(p, r, _mm256_set1_pd(2.5114869528657765e-08));
+    p = _mm256_fmadd_pd(p, r, _mm256_set1_pd(2.7557251904174915e-07));
+    p = _mm256_fmadd_pd(p, r, _mm256_set1_pd(2.7557224958392624e-06));
+    p = _mm256_fmadd_pd(p, r, _mm256_set1_pd(2.4801587350110797e-05));
+    p = _mm256_fmadd_pd(p, r, _mm256_set1_pd(0.000198412699092171));
+    p = _mm256_fmadd_pd(p, r, _mm256_set1_pd(0.0013888888888871889));
+    p = _mm256_fmadd_pd(p, r, _mm256_set1_pd(0.0083333333333095276));
+    p = _mm256_fmadd_pd(p, r, _mm256_set1_pd(0.041666666666666692));
+    p = _mm256_fmadd_pd(p, r, _mm256_set1_pd(0.16666666666666702));
+    p = _mm256_fmadd_pd(p, r, _mm256_set1_pd(0.5));
+    p = _mm256_fmadd_pd(p, r, _mm256_set1_pd(1.0));
+    p = _mm256_fmadd_pd(p, r, _mm256_set1_pd(1.0));
+    const __m256d half = _mm256_round_pd(_mm256_mul_pd(k, _mm256_set1_pd(0.5)),
+                                         _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    const __m256i bias = _mm256_set1_epi64x(1023);
+    const __m256d s1 = _mm256_castsi256_pd(_mm256_slli_epi64(
+        _mm256_add_epi64(_mm256_cvtepi32_epi64(_mm256_cvtpd_epi32(half)), bias), 52));
+    const __m256d s2 = _mm256_castsi256_pd(_mm256_slli_epi64(
+        _mm256_add_epi64(_mm256_cvtepi32_epi64(_mm256_cvtpd_epi32(
+                             _mm256_sub_pd(k, half))), bias), 52));
+    return _mm256_mul_pd(_mm256_mul_pd(p, s1), s2);
+}
+
+enum class LogBase64 { E, Two, Ten };
+
+constexpr double log_base_scale64(LogBase64 base) {
+    return base == LogBase64::Two ? 1.4426950408889634074
+         : base == LogBase64::Ten ? 0.43429448190325182765
+                                  : 1.0;
+}
+
+// log on double lanes.  The mantissa is folded into [sqrt(1/2), sqrt(2)) and
+// its logarithm comes from the atanh series in s = (m-1)/(m+1): |s| <= 0.1716,
+// so the series splits into the leading 2s plus a correction of at most 3.4e-3
+// of it, and only the final add rounds at the result's own magnitude.  The
+// exponent term is split in two so that e*ln2 stays exact.
+template <LogBase64 Base>
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256d v_log_f64(__m256d x) {
+    const __m256d one = _mm256_set1_pd(1.0);
+    const __m256d zero = _mm256_setzero_pd();
+    const __m256d signbit = _mm256_set1_pd(-0.0);
+    const __m256d ax = _mm256_andnot_pd(signbit, x);
+    const __m256d den = _mm256_cmp_pd(ax, _mm256_set1_pd(0x1p-1022), _CMP_LT_OQ);
+    const __m256d xs = _mm256_mul_pd(
+        x, _mm256_blendv_pd(one, _mm256_set1_pd(0x1p54), den));
+    const __m256i bits = _mm256_and_si256(_mm256_castpd_si256(xs),
+                                          _mm256_set1_epi64x(0x7FFFFFFFFFFFFFFFLL));
+    __m256d e = _mm256_sub_pd(
+        _mm256_castsi256_pd(_mm256_or_si256(
+            _mm256_srli_epi64(bits, 52), _mm256_set1_epi64x(0x4330000000000000LL))),
+        _mm256_set1_pd(0x1p52));
+    e = _mm256_sub_pd(e, _mm256_set1_pd(1023.0));
+    e = _mm256_sub_pd(e, _mm256_and_pd(den, _mm256_set1_pd(54.0)));
+    __m256d m = _mm256_castsi256_pd(_mm256_or_si256(
+        _mm256_and_si256(bits, _mm256_set1_epi64x(0x000FFFFFFFFFFFFFLL)),
+        _mm256_set1_epi64x(0x3FF0000000000000LL)));
+    const __m256d big = _mm256_cmp_pd(m, _mm256_set1_pd(1.4142135623730951),
+                                      _CMP_GT_OQ);
+    m = _mm256_blendv_pd(m, _mm256_mul_pd(m, _mm256_set1_pd(0.5)), big);
+    e = _mm256_add_pd(e, _mm256_and_pd(big, one));
+    const __m256d s = _mm256_div_pd(_mm256_sub_pd(m, one), _mm256_add_pd(m, one));
+    const __m256d y = _mm256_mul_pd(s, s);
+    __m256d q = _mm256_set1_pd(2.0 / 23.0);
+    q = _mm256_fmadd_pd(q, y, _mm256_set1_pd(2.0 / 21.0));
+    q = _mm256_fmadd_pd(q, y, _mm256_set1_pd(2.0 / 19.0));
+    q = _mm256_fmadd_pd(q, y, _mm256_set1_pd(2.0 / 17.0));
+    q = _mm256_fmadd_pd(q, y, _mm256_set1_pd(2.0 / 15.0));
+    q = _mm256_fmadd_pd(q, y, _mm256_set1_pd(2.0 / 13.0));
+    q = _mm256_fmadd_pd(q, y, _mm256_set1_pd(2.0 / 11.0));
+    q = _mm256_fmadd_pd(q, y, _mm256_set1_pd(2.0 / 9.0));
+    q = _mm256_fmadd_pd(q, y, _mm256_set1_pd(2.0 / 7.0));
+    q = _mm256_fmadd_pd(q, y, _mm256_set1_pd(2.0 / 5.0));
+    q = _mm256_fmadd_pd(q, y, _mm256_set1_pd(2.0 / 3.0));
+    constexpr double kScale = log_base_scale64(Base);
+    const __m256d lead = _mm256_mul_pd(s, _mm256_set1_pd(2.0 * kScale));
+    const __m256d corr = _mm256_mul_pd(
+        _mm256_mul_pd(s, y), _mm256_mul_pd(q, _mm256_set1_pd(kScale)));
+    const __m256d logm = _mm256_add_pd(lead, corr);
+    __m256d r;
+    if constexpr (Base == LogBase64::Two) {
+        r = _mm256_add_pd(e, logm);
+    } else if constexpr (Base == LogBase64::Ten) {
+        r = _mm256_fmadd_pd(e, _mm256_set1_pd(0x1.3441350900000p-2),
+                            _mm256_fmadd_pd(e, _mm256_set1_pd(0x1.ef3fde623e256p-35), logm));
+    } else {
+        r = _mm256_fmadd_pd(e, _mm256_set1_pd(0x1.62e42fef00000p-1),
+                            _mm256_fmadd_pd(e, _mm256_set1_pd(0x1.473de6af278edp-34), logm));
+    }
+    const __m256d inf = _mm256_castsi256_pd(_mm256_set1_epi64x(0x7FF0000000000000LL));
+    const __m256d nan = _mm256_castsi256_pd(_mm256_set1_epi64x(0x7FF8000000000000LL));
+    r = _mm256_blendv_pd(r, _mm256_xor_pd(inf, signbit),
+                         _mm256_cmp_pd(x, zero, _CMP_EQ_OQ));
+    r = _mm256_blendv_pd(r, inf, _mm256_cmp_pd(x, inf, _CMP_EQ_OQ));
+    r = _mm256_blendv_pd(r, nan, _mm256_cmp_pd(x, zero, _CMP_LT_OQ));
+    // A NaN carries mantissa bits that decode as an ordinary fraction, so it
+    // has to be recognised before the blend above can let it through.
+    r = _mm256_blendv_pd(r, nan, _mm256_cmp_pd(x, x, _CMP_UNORD_Q));
+    return r;
+}
+
+// tanh on double lanes.  Below 0.5 the odd series in x^2 answers directly --
+// a degree-11 fit over x^2 in [0, 0.25] with a relative error of 6e-20 -- and
+// above it 1 - 2/(exp(2|x|)+1) has no cancellation left to lose.  Both are
+// evaluated and blended, which costs one exp more than a branch and keeps the
+// lanes independent.
+__attribute__((target("avx2,fma"), always_inline))
+inline __m256d v_tanh_f64(__m256d x) {
+    const __m256d signbit = _mm256_set1_pd(-0.0);
+    const __m256d ax = _mm256_andnot_pd(signbit, x);
+    const __m256d y = _mm256_mul_pd(x, x);
+    __m256d p = _mm256_set1_pd(-2.1859258591298787e-05);
+    p = _mm256_fmadd_pd(p, y, _mm256_set1_pd(8.672444658882306e-05));
+    p = _mm256_fmadd_pd(p, y, _mm256_set1_pd(-0.00023550170267042957));
+    p = _mm256_fmadd_pd(p, y, _mm256_set1_pd(0.0005891889958817433));
+    p = _mm256_fmadd_pd(p, y, _mm256_set1_pd(-0.0014557048421519495));
+    p = _mm256_fmadd_pd(p, y, _mm256_set1_pd(0.0035921145924042454));
+    p = _mm256_fmadd_pd(p, y, _mm256_set1_pd(-0.008863234607457774));
+    p = _mm256_fmadd_pd(p, y, _mm256_set1_pd(0.021869488495914118));
+    p = _mm256_fmadd_pd(p, y, _mm256_set1_pd(-0.053968253967215975));
+    p = _mm256_fmadd_pd(p, y, _mm256_set1_pd(0.13333333333331948));
+    p = _mm256_fmadd_pd(p, y, _mm256_set1_pd(-0.33333333333333326));
+    p = _mm256_fmadd_pd(p, y, _mm256_set1_pd(1.0));
+    const __m256d small = _mm256_mul_pd(x, p);
+    const __m256d e = v_exp_f64(_mm256_add_pd(ax, ax));
+    __m256d wide = _mm256_sub_pd(_mm256_set1_pd(1.0),
+                                 _mm256_div_pd(_mm256_set1_pd(2.0),
+                                               _mm256_add_pd(e, _mm256_set1_pd(1.0))));
+    wide = _mm256_or_pd(wide, _mm256_and_pd(x, signbit));
+    return _mm256_blendv_pd(wide, small,
+                            _mm256_cmp_pd(ax, _mm256_set1_pd(0.5), _CMP_LT_OQ));
+}
+
 __attribute__((target("avx2,fma"), always_inline))
 inline __m256d apply_f64(VOp op, VParams prm, __m256d x) {
     const __m256d one = _mm256_set1_pd(1.0);
@@ -1490,7 +1647,7 @@ inline __m256d apply_f64(VOp op, VParams prm, __m256d x) {
         case VOp::Erfc: return tensorplay::tpsleef::erfc(x);
         case VOp::Lgamma: return v_lgamma_pos_f64(x);
         case VOp::Sigmoid:
-            return _mm256_div_pd(one, _mm256_add_pd(one, tensorplay::tpsleef::exp(_mm256_xor_pd(x, signbit))));
+            return _mm256_div_pd(one, _mm256_add_pd(one, v_exp_f64(_mm256_xor_pd(x, signbit))));
         case VOp::GeluNone: {
             const __m256d kAlpha = _mm256_set1_pd(0.70710678118654752440);
             __m256d cdf = _mm256_add_pd(one, tensorplay::tpsleef::erf(_mm256_mul_pd(kAlpha, x)));
@@ -1501,16 +1658,16 @@ inline __m256d apply_f64(VOp op, VParams prm, __m256d x) {
             const __m256d kKappa = _mm256_set1_pd(0.044715);
             __m256d x_cube = _mm256_mul_pd(_mm256_mul_pd(x, x), x);
             __m256d inner = _mm256_mul_pd(kBeta, _mm256_add_pd(x, _mm256_mul_pd(kKappa, x_cube)));
-            __m256d cdf = _mm256_add_pd(one, tensorplay::tpsleef::tanh(inner));
+            __m256d cdf = _mm256_add_pd(one, v_tanh_f64(inner));
             return _mm256_mul_pd(_mm256_mul_pd(_mm256_set1_pd(0.5), x), cdf);
         }
         case VOp::Silu: {
-            __m256d den = _mm256_add_pd(one, tensorplay::tpsleef::exp(_mm256_xor_pd(x, signbit)));
+            __m256d den = _mm256_add_pd(one, v_exp_f64(_mm256_xor_pd(x, signbit)));
             return _mm256_div_pd(x, den);
         }
         case VOp::Mish: {
-            __m256d sp = tensorplay::tpsleef::log(_mm256_add_pd(one, tensorplay::tpsleef::exp(x)));
-            return _mm256_mul_pd(x, tensorplay::tpsleef::tanh(sp));
+            __m256d sp = v_log_f64<LogBase64::E>(_mm256_add_pd(one, v_exp_f64(x)));
+            return _mm256_mul_pd(x, v_tanh_f64(sp));
         }
         case VOp::Selu: {
             const __m256d lambda = _mm256_set1_pd(1.0507009873554804934193349852946);
@@ -1650,38 +1807,38 @@ static void f64_chunk_avx2(VOp op, VParams prm, const double* src, double* dst, 
             break;
         }
         case VOp::Exp:
-            TP_F64_SIMPLE_LOOP_4(tensorplay::tpsleef::exp(x));
+            TP_F64_SIMPLE_LOOP_4(v_exp_f64(x));
             break;
         case VOp::Expm1:
             TP_F64_SIMPLE_LOOP_4(tensorplay::tpsleef::expm1(x));
             break;
         case VOp::Log:
-            TP_F64_SIMPLE_LOOP_4(tensorplay::tpsleef::log(x));
+            TP_F64_SIMPLE_LOOP_4(v_log_f64<LogBase64::E>(x));
             break;
         case VOp::Log1p:
             TP_F64_SIMPLE_LOOP_4(tensorplay::tpsleef::log1p(x));
             break;
         case VOp::Log2:
-            TP_F64_SIMPLE_LOOP_4(tensorplay::tpsleef::log2(x));
+            TP_F64_SIMPLE_LOOP_4(v_log_f64<LogBase64::Two>(x));
             break;
         case VOp::Log10:
-            TP_F64_SIMPLE_LOOP_4(tensorplay::tpsleef::log10(x));
+            TP_F64_SIMPLE_LOOP_4(v_log_f64<LogBase64::Ten>(x));
             break;
         case VOp::Tanh:
-            TP_F64_SIMPLE_LOOP_4(tensorplay::tpsleef::tanh(x));
+            TP_F64_SIMPLE_LOOP_4(v_tanh_f64(x));
             break;
         case VOp::Sigmoid:
             TP_F64_SIMPLE_LOOP_4(_mm256_div_pd(
-                one, _mm256_add_pd(one, tensorplay::tpsleef::exp(_mm256_xor_pd(x, signbit)))));
+                one, _mm256_add_pd(one, v_exp_f64(_mm256_xor_pd(x, signbit)))));
             break;
         case VOp::Silu:
             TP_F64_SIMPLE_LOOP_4(_mm256_div_pd(
-                x, _mm256_add_pd(one, tensorplay::tpsleef::exp(_mm256_xor_pd(x, signbit)))));
+                x, _mm256_add_pd(one, v_exp_f64(_mm256_xor_pd(x, signbit)))));
             break;
         case VOp::Mish:
             TP_F64_SIMPLE_LOOP_4(_mm256_mul_pd(
-                x, tensorplay::tpsleef::tanh(tensorplay::tpsleef::log(
-                       _mm256_add_pd(one, tensorplay::tpsleef::exp(x))))));
+                x, v_tanh_f64(v_log_f64<LogBase64::E>(
+                       _mm256_add_pd(one, v_exp_f64(x))))));
             break;
         case VOp::GeluNone: {
             const __m256d kAlpha = _mm256_set1_pd(0.70710678118654752440);
@@ -1697,7 +1854,7 @@ static void f64_chunk_avx2(VOp op, VParams prm, const double* src, double* dst, 
             const __m256d half = _mm256_set1_pd(0.5);
             TP_F64_SIMPLE_LOOP_4(_mm256_mul_pd(
                 _mm256_mul_pd(half, x),
-                _mm256_add_pd(one, tensorplay::tpsleef::tanh(_mm256_mul_pd(
+                _mm256_add_pd(one, v_tanh_f64(_mm256_mul_pd(
                     kBeta, _mm256_add_pd(x, _mm256_mul_pd(kKappa, _mm256_mul_pd(_mm256_mul_pd(x, x), x))))))));
             break;
         }
