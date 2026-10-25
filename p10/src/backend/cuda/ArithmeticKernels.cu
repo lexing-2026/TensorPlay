@@ -2,6 +2,7 @@
 #include "SparseKernels.h"
 #include "Dispatcher.h"
 #include "CUDARuntime.h"
+#include "StreamingAccess.cuh"
 #include "CUDAContext.h"
 #include "Exception.h"
 #include "Allocator.h"
@@ -638,8 +639,8 @@ inline TensorIterator make_scalar_iter(const Tensor& out, const Tensor& input,
 template <typename PackT>
 __device__ inline void store_pack_streaming(PackT* dst, const PackT& value) {
     if constexpr (sizeof(PackT) == 16) {
-        __stcs(reinterpret_cast<uint4*>(dst),
-               *reinterpret_cast<const uint4*>(&value));
+        tp_stcs(reinterpret_cast<uint4*>(dst),
+                *reinterpret_cast<const uint4*>(&value));
     } else {
         *dst = value;
     }
@@ -651,14 +652,14 @@ __device__ inline void store_pack_streaming(PackT* dst, const PackT& value) {
 template <typename T>
 __device__ inline void store_val_streaming(T* dst, const T& value) {
     if constexpr (sizeof(T) == 16) {
-        __stcs(reinterpret_cast<uint4*>(dst),
-               *reinterpret_cast<const uint4*>(&value));
+        tp_stcs(reinterpret_cast<uint4*>(dst),
+                *reinterpret_cast<const uint4*>(&value));
     } else if constexpr (sizeof(T) == 8) {
-        __stcs(reinterpret_cast<uint2*>(dst),
-               *reinterpret_cast<const uint2*>(&value));
+        tp_stcs(reinterpret_cast<uint2*>(dst),
+                *reinterpret_cast<const uint2*>(&value));
     } else if constexpr (sizeof(T) == 4) {
-        __stcs(reinterpret_cast<unsigned*>(dst),
-               *reinterpret_cast<const unsigned*>(&value));
+        tp_stcs(reinterpret_cast<unsigned*>(dst),
+                *reinterpret_cast<const unsigned*>(&value));
     } else {
         *dst = value;
     }

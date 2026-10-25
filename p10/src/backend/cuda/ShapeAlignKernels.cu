@@ -10,6 +10,7 @@
 #include "Tensor.h"
 #include "CUDARuntime.h"
 #include "CUDALoops.cuh"
+#include "StreamingAccess.cuh"
 #include "Exception.h"
 #include "Quantizer.h"
 
@@ -82,7 +83,7 @@ __device__ inline VecT load_run_chunk(const VecT* src) {
 template <typename VecT>
 __device__ inline void store_run_chunk(VecT* dst, const VecT value) {
     if constexpr (sizeof(VecT) == 16) {
-        __stcs(dst, value);
+        tp_stcs(dst, value);
     } else {
         *dst = value;
     }

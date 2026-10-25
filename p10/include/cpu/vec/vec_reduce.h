@@ -6,6 +6,7 @@
 // abstraction has no primitive yet (bit-pattern blends across element types
 // and horizontal NaN probes).
 
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -258,7 +259,7 @@ inline std::pair<T, int64_t> row_extremum(const T* input, int64_t n) {
   const Vec first = Vec::loadu(input);
   const uint32_t first_nan = nan_lane_mask(first);
   if (first_nan != 0) {
-    return {nan_value, static_cast<int64_t>(__builtin_ctz(first_nan))};
+    return {nan_value, static_cast<int64_t>(std::countr_zero(first_nan))};
   }
 
   const IVec lane_indices = IVec::arange(static_cast<idx_t>(0),
@@ -270,7 +271,7 @@ inline std::pair<T, int64_t> row_extremum(const T* input, int64_t n) {
     const Vec values = Vec::loadu(input + i);
     const uint32_t nan_mask = nan_lane_mask(values);
     if (nan_mask != 0) {
-      return {nan_value, i + static_cast<int64_t>(__builtin_ctz(nan_mask))};
+      return {nan_value, i + static_cast<int64_t>(std::countr_zero(nan_mask))};
     }
     const Vec better =
         IsMax ? (values > best_values) : (values < best_values);

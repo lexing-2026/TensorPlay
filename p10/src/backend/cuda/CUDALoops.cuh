@@ -35,6 +35,7 @@
 #include "CUDARuntime.h"
 #include "Exception.h"
 #include "OffsetCalculator.cuh"
+#include "StreamingAccess.cuh"
 
 #include <cuda_runtime.h>
 
@@ -108,14 +109,14 @@ constexpr int vectorized_thread_work_size() {
 template <typename VecT>
 __device__ inline void store_vec_streaming(VecT* dst, const VecT& value) {
     if constexpr (sizeof(VecT) == 16) {
-        __stcs(reinterpret_cast<uint4*>(dst),
-               *reinterpret_cast<const uint4*>(&value));
+        tp_stcs(reinterpret_cast<uint4*>(dst),
+                *reinterpret_cast<const uint4*>(&value));
     } else if constexpr (sizeof(VecT) == 8) {
-        __stcs(reinterpret_cast<uint2*>(dst),
-               *reinterpret_cast<const uint2*>(&value));
+        tp_stcs(reinterpret_cast<uint2*>(dst),
+                *reinterpret_cast<const uint2*>(&value));
     } else if constexpr (sizeof(VecT) == 4) {
-        __stcs(reinterpret_cast<unsigned*>(dst),
-               *reinterpret_cast<const unsigned*>(&value));
+        tp_stcs(reinterpret_cast<unsigned*>(dst),
+                *reinterpret_cast<const unsigned*>(&value));
     } else {
         *dst = value;
     }
@@ -131,19 +132,19 @@ __device__ inline void store_vec_streaming(VecT* dst, const VecT& value) {
 template <typename VecT>
 __device__ inline VecT load_vec_streaming(const VecT* src) {
     if constexpr (sizeof(VecT) == 16) {
-        const uint4 w = __ldcs(reinterpret_cast<const uint4*>(src));
+        const uint4 w = tp_ldcs(reinterpret_cast<const uint4*>(src));
         VecT v;
         *reinterpret_cast<uint4*>(&v) = w;
         return v;
     } else if constexpr (sizeof(VecT) == 8) {
-        const uint2 w = __ldcs(reinterpret_cast<const uint2*>(src));
+        const uint2 w = tp_ldcs(reinterpret_cast<const uint2*>(src));
         VecT v;
         *reinterpret_cast<uint2*>(&v) = w;
         return v;
     } else if constexpr (sizeof(VecT) == 4) {
         VecT v;
         *reinterpret_cast<unsigned*>(&v) =
-            __ldcs(reinterpret_cast<const unsigned*>(src));
+            tp_ldcs(reinterpret_cast<const unsigned*>(src));
         return v;
     } else {
         return *src;
