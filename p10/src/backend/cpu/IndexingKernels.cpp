@@ -61,6 +61,17 @@ inline void relaxed_increment(T& counter) {
 #endif
 }
 
+// Warms the line holding `p` for a read.  The prefetch is a pure latency
+// hint; the loops are correct without it, so compilers without the builtin
+// skip it.
+inline void prefetch_read(const void* p) {
+#if defined(__GNUC__) || defined(__clang__)
+    __builtin_prefetch(p, 0, 3);
+#else
+    (void)p;
+#endif
+}
+
 inline int64_t wrap_scan_dim(int64_t dim, int64_t ndim) {
     if (ndim == 0) {
         if (dim == -1 || dim == 0) return 0;
@@ -700,9 +711,7 @@ void gather_named_rows(const ctype* self, const int64_t* index, ctype* result,
             ctype* d_row = result + g * idx_dim_size;
             if (idx_dim_size <= kPrefetchWholeRow) {
                 for (int64_t c = 0; c < idx_dim_size; ++c)
-                    __builtin_prefetch(
-                        reinterpret_cast<const char*>(
-                            s_g + ip_row[c] * self_inner), 0, 3);
+                    prefetch_read(s_g + ip_row[c] * self_inner);
                 for (int64_t c = 0; c < idx_dim_size; ++c) {
                     const int64_t pick = ip_row[c];
                     if (pick < 0 || pick >= self_dim_size) {
@@ -715,9 +724,7 @@ void gather_named_rows(const ctype* self, const int64_t* index, ctype* result,
             int64_t c = 0;
             for (; c < idx_dim_size; ++c) {
                 if (c + kLookahead < idx_dim_size) {
-                    __builtin_prefetch(
-                        reinterpret_cast<const char*>(
-                            s_g + ip_row[c + kLookahead] * self_inner), 0, 3);
+                    prefetch_read(s_g + ip_row[c + kLookahead] * self_inner);
                 }
                 const int64_t pick = ip_row[c];
                 if (pick < 0 || pick >= self_dim_size) {
