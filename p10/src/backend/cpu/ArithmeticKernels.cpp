@@ -4337,7 +4337,7 @@ Tensor& div_scalar_inplace_kernel(Tensor& self, const Scalar& other) {
 // one element at a time.
 template <bool Stream>
 __attribute__((target("avx2,f16c"), noinline))
-void addcmul_half_walk(const tensorplay::Half* self,
+void addcmul_half_avx2(const tensorplay::Half* self,
                        const tensorplay::Half* tensor1,
                        const tensorplay::Half* tensor2, float alpha,
                        tensorplay::Half* result, int64_t begin, int64_t end) {
@@ -4419,7 +4419,7 @@ void addcmul_half_walk(const tensorplay::Half* self,
 
 template <bool Stream>
 __attribute__((target("avx2,f16c"), noinline))
-void addcdiv_half_walk(const tensorplay::Half* self,
+void addcdiv_half_avx2(const tensorplay::Half* self,
                        const tensorplay::Half* tensor1,
                        const tensorplay::Half* tensor2, float alpha,
                        tensorplay::Half* result, int64_t begin, int64_t end) {
@@ -4902,13 +4902,13 @@ void addcmul_dense_walk(const Tensor& self, const Tensor& tensor1,
             if (tensorplay::cpu::streamdst::ternary_works_past_cache(
                     n, result_ptr, self_ptr, tensor1_ptr, tensor2_ptr)) {
                 parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-                    addcmul_half_walk<true>(self_ptr, tensor1_ptr, tensor2_ptr,
+                    addcmul_half_avx2<true>(self_ptr, tensor1_ptr, tensor2_ptr,
                                             scale, result_ptr, begin, end);
                 });
                 return;
             }
             parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-                addcmul_half_walk<false>(self_ptr, tensor1_ptr, tensor2_ptr,
+                addcmul_half_avx2<false>(self_ptr, tensor1_ptr, tensor2_ptr,
                                          scale, result_ptr, begin, end);
             });
             return;
@@ -5211,13 +5211,13 @@ void addcdiv_dense_walk(const Tensor& self, const Tensor& tensor1,
             if (tensorplay::cpu::streamdst::ternary_works_past_cache(
                     n, result_ptr, self_ptr, tensor1_ptr, tensor2_ptr)) {
                 parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-                    addcdiv_half_walk<true>(self_ptr, tensor1_ptr, tensor2_ptr,
+                    addcdiv_half_avx2<true>(self_ptr, tensor1_ptr, tensor2_ptr,
                                             scale, result_ptr, begin, end);
                 });
                 return;
             }
             parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-                addcdiv_half_walk<false>(self_ptr, tensor1_ptr, tensor2_ptr,
+                addcdiv_half_avx2<false>(self_ptr, tensor1_ptr, tensor2_ptr,
                                          scale, result_ptr, begin, end);
             });
             return;
