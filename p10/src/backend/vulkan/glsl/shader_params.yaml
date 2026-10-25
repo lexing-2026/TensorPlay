@@ -1808,6 +1808,12 @@ view_gather_int8:
   parameter_names_with_default_values: {}
   shader_variants:
   - NAME: view_gather_int8
+view_gather_int8_buffer:
+  parameter_names_with_default_values: {}
+  shader_variants:
+  - NAME: view_gather_int8_buffer
+  - NAME: view_gather_int8_buffer_to_buffer
+  - NAME: view_gather_int8_buffer_to_texture
 view_gather_buffer:
   parameter_names_with_default_values: {}
   shader_variants:

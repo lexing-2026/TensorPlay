@@ -60,11 +60,15 @@ Tensor gather_view(
     std::optional<api::StorageType> destination = std::nullopt) {
   TP_CHECK(
       input.dtype() == DType::Float32 || input.dtype() == DType::Float16 ||
-          input.dtype() == DType::Int8 || input.dtype() == DType::Int32 ||
-          input.dtype() == DType::Int64 || input.dtype() == DType::Bool,
-      "Vulkan view materialization supports Float32, Float16, Int8, Int32, "
-      "Int64 and Bool tensors only");
-  const bool is_int8 = input.dtype() == DType::Int8 || input.dtype() == DType::Bool;
+          input.dtype() == DType::Int8 || input.dtype() == DType::QInt8 ||
+          input.dtype() == DType::Int32 || input.dtype() == DType::Int64 ||
+          input.dtype() == DType::Bool,
+      "Vulkan view materialization supports Float32, Float16, Int8, QInt8, "
+      "Int32, Int64 and Bool tensors only");
+  // A byte names one code, whether it arrives as a plain count or as the
+  // signed payload a quantized weight keeps.
+  const bool is_int8 = input.dtype() == DType::Int8 ||
+      input.dtype() == DType::QInt8 || input.dtype() == DType::Bool;
   const bool is_int32 = input.dtype() == DType::Int32;
   const bool is_half = input.dtype() == DType::Float16;
   // A code wider than a word has no texel format to name it, so both sides of
@@ -131,16 +135,18 @@ Tensor gather_view(
   // buffer storage; the gather then writes plain row-major elements through
   // a buffer-binding variant instead of an image store.
   if (v_output.storage_type() == api::StorageType::BUFFER) {
-    // Byte-packed payloads have no buffer-writing shader yet; reject loudly
-    // instead of corrupting them.
-    TP_CHECK(
-        input.dtype() != DType::Int8 && input.dtype() != DType::Bool,
-        "Vulkan view materialization of this dtype into buffer storage is "
-        "not supported yet");
-    // A half destination shares one 32-bit word between two elements, so its
-    // grid runs over words and each invocation writes both lanes it covers.
+    // How many elements of the destination share one 32-bit word: a half pair,
+    // a byte of four codes.  A walk whose lanes share a word runs over words,
+    // so the invocation that covers a word is the only one that writes it.
+    const uint32_t elements_per_word =
+        is_int8 ? 4u : (is_half ? 2u : 1u);
+    const bool word_walk = elements_per_word > 1u;
     const api::utils::uvec3 word_grid{
-        static_cast<uint32_t>((multiply_integers(out_sizes) + 1) / 2), 1u, 1u};
+        static_cast<uint32_t>(
+            (multiply_integers(out_sizes) + elements_per_word - 1u) /
+            elements_per_word),
+        1u,
+        1u};
     const api::utils::uvec3 grid{
         static_cast<uint32_t>(out_padded[3]),
         static_cast<uint32_t>(out_padded[2]),
@@ -155,14 +161,16 @@ Tensor gather_view(
           ? VK_KERNEL(view_gather_i64_buffer_to_buffer)
           : is_int32
           ? VK_KERNEL(view_gather_int32_buffer_to_buffer)
+          : is_int8
+          ? VK_KERNEL(view_gather_int8_buffer_to_buffer)
           : is_half
           ? VK_KERNEL_FROM_STR("view_gather_buffer_to_buffer_half")
           : kernel_for("view_gather_buffer_to_buffer", input.dtype());
-      const api::utils::uvec3 launch = is_half ? word_grid : grid;
+      const api::utils::uvec3 launch = word_walk ? word_grid : grid;
       context->submit_compute_job(
           shader, pipeline_barrier, launch,
-          is_half ? api::utils::uvec3{256u, 1u, 1u}
-                  : adaptive_work_group_size(launch),
+          word_walk ? api::utils::uvec3{256u, 1u, 1u}
+                    : adaptive_work_group_size(launch),
           VK_NULL_HANDLE,
           v_output.buffer(
               pipeline_barrier,
@@ -176,14 +184,16 @@ Tensor gather_view(
     }
     const api::ShaderInfo shader = is_int32
         ? VK_KERNEL(view_gather_int32_buffer)
+        : is_int8
+        ? VK_KERNEL(view_gather_int8_buffer)
         : is_half
         ? VK_KERNEL_FROM_STR("view_gather_buffer_half")
         : kernel_for("view_gather_buffer", input.dtype());
-    const api::utils::uvec3 launch = is_half ? word_grid : grid;
+    const api::utils::uvec3 launch = word_walk ? word_grid : grid;
     context->submit_compute_job(
         shader, pipeline_barrier, launch,
-        is_half ? api::utils::uvec3{256u, 1u, 1u}
-                : adaptive_work_group_size(launch),
+        word_walk ? api::utils::uvec3{256u, 1u, 1u}
+                  : adaptive_work_group_size(launch),
         VK_NULL_HANDLE,
         v_output.buffer(
             pipeline_barrier,
@@ -198,15 +208,15 @@ Tensor gather_view(
   // reads through the linear binding and writes the dense output in one
   // pass, for both buffer and image destinations.
   if (v_input.storage_type() == api::StorageType::BUFFER) {
-    // Byte-packed payloads have no buffer-reading shader yet; reject loudly
-    // instead of misreading them.
     TP_CHECK(
         input.dtype() == DType::Float32 || input.dtype() == DType::Int32 ||
-            input.dtype() == DType::Float16,
+            input.dtype() == DType::Float16 || is_int8,
         "Vulkan view materialization from buffer storage supports "
-        "Float32, Int32 and Float16 inputs only");
+        "Float32, Int32, Float16 and one-byte inputs only");
     const api::ShaderInfo shader = is_int32
         ? VK_KERNEL(view_gather_int32_buffer_to_texture)
+        : is_int8
+        ? VK_KERNEL(view_gather_int8_buffer_to_texture)
         : is_half
         ? VK_KERNEL_FROM_STR("view_gather_buffer_to_texture_half")
         : kernel_for("view_gather_buffer_to_texture", input.dtype());

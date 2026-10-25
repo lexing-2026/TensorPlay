@@ -4750,6 +4750,138 @@ class TestVulkanWidePayload(unittest.TestCase):
                 err_msg=f"single precision payload of {count} codes")
 
 
+class TestVulkanBytePayload(unittest.TestCase):
+    # A one-byte code has no word to itself: four of them share one, so a walk
+    # over such a payload has to name the slot inside the word as well as the
+    # word.  Which gather runs depends on the class each side keeps its codes in,
+    # and a payload taller than an image axis has no choice of its own class: it
+    # is linear whatever the shape, so the walks below start in words.
+
+    ROWS = 20001
+
+    @staticmethod
+    def _in_words(payload):
+        # A payload kept in words owns the buffer a binding names, while an image
+        # carries its lanes through a texture view and has no such pointer.
+        return payload.data_ptr() != 0
+
+    def _device(self, payload):
+        return tensorplay.from_numpy(np.ascontiguousarray(payload)).to("vulkan")
+
+    def _codes(self, seed):
+        rng = np.random.default_rng(seed)
+        return rng.integers(-128, 128, (self.ROWS, 8)).astype(np.int8)
+
+    def test_words_gather_into_words_at_every_byte_slot(self):
+        # Four cases, one per slot a source code can sit in inside its word, plus
+        # strides that skip a byte, repeat a row, and end on a part word.  A walk
+        # that took the whole word for one code would answer these with the three
+        # neighbours of every lane it moved.
+        base = self._codes(21)
+        device = self._device(base)
+        self.assertTrue(
+            self._in_words(device),
+            "a payload taller than an image axis was not kept in words")
+        cases = (
+            ("column 0", base[:, 2:6], (self.ROWS, 4), (8, 1), 2),
+            ("column 1", base[:, 3:7], (self.ROWS, 4), (8, 1), 3),
+            ("column 2", base[:, 4:8], (self.ROWS, 4), (8, 1), 4),
+            ("every second column", base[:, ::2],
+             (self.ROWS, 4), (8, 2), 0),
+            ("a row named by every lane",
+             np.broadcast_to(base[:1, :4], (self.ROWS, 4)),
+             (self.ROWS, 4), (0, 1), 0),
+            ("a part word at the end", base[:, 1:4],
+             (self.ROWS, 3), (8, 1), 1),
+            ("one byte of a column", base[:, 7:],
+             (self.ROWS, 1), (8, 1), 7),
+        )
+        for name, want, size, stride, offset in cases:
+            got = device.as_strided(size, stride, offset)
+            self.assertTrue(
+                self._in_words(got), f"{name} arrived outside words")
+            np.testing.assert_array_equal(
+                got.cpu().numpy(), want,
+                err_msg=f"{name} of a payload kept in words gathered into words")
+
+    def test_words_gather_into_texels(self):
+        # The destination here is short enough to have an image form, so each
+        # invocation restates four codes as the lanes of one texel.  A code read
+        # out of a word and written into an eight-bit texel lane comes back signed
+        # through an integer image, so the sign has to be restated on the way out.
+        base = self._codes(22)
+        device = self._device(base)
+        cases = (
+            ("a block of rows", base[:120], (120, 8), (8, 1), 0),
+            ("a part texel at the end", base[:63, 1:7], (63, 6), (8, 1), 1),
+            ("one row", base[:1], (1, 8), (8, 1), 0),
+            ("a repeated row", np.broadcast_to(base[5:6], (64, 8)),
+             (64, 8), (0, 1), 5 * 8),
+            ("every second column", base[:63, 2:8:2], (63, 3), (8, 2), 2),
+        )
+        for name, want, size, stride, offset in cases:
+            got = device.as_strided(size, stride, offset)
+            self.assertFalse(
+                self._in_words(got), f"{name} arrived outside texels")
+            np.testing.assert_array_equal(
+                got.cpu().numpy(), want,
+                err_msg=f"{name} of a payload kept in words gathered into texels")
+
+    def test_a_rank_four_payload_splits_its_channels_between_lanes(self):
+        # A rank-four payload keeps four channels in the four lanes of one texel,
+        # so a code has to be found by channel plane as well as by the slot it
+        # holds in its word.  Each case here crosses in a different direction,
+        # and the last repeats an axis, so one stored code is named from several
+        # positions and has to arrive whole at every one of them.
+        rng = np.random.default_rng(24)
+        base4 = rng.integers(-128, 128, (2, 5, 60, 4)).astype(np.int8)
+        wide4 = rng.integers(-128, 128, (2, 5, 20000, 4)).astype(np.int8)
+        strides = (5 * 20000 * 4, 20000 * 4, 4, 1)
+
+        device_wide = self._device(wide4)
+        self.assertTrue(
+            self._in_words(device_wide),
+            "a payload past an image axis was not kept in words")
+        got = device_wide.as_strided((2, 5, 60, 4), strides, 0)
+        self.assertFalse(
+            self._in_words(got),
+            "a shape that has an image form arrived outside texels")
+        np.testing.assert_array_equal(
+            got.cpu().numpy(), wide4[:, :, :60, :],
+            err_msg="words gathered into the channel lanes of texels")
+        np.testing.assert_array_equal(
+            device_wide.as_strided((2, 5, 20000, 3), strides, 1).cpu().numpy(),
+            wide4[:, :, :, 1:4],
+            err_msg="words gathered into words across channel planes")
+
+        device_texel = self._device(base4)
+        self.assertFalse(
+            self._in_words(device_texel),
+            "a shape that has an image form was not kept in texels")
+        np.testing.assert_array_equal(
+            device_texel.as_strided(
+                (2, 5, 20000, 4), (5 * 60 * 4, 60 * 4, 0, 1), 0).cpu().numpy(),
+            np.broadcast_to(base4[:, :, :1], (2, 5, 20000, 4)),
+            err_msg="channel lanes gathered into words")
+
+    def test_counting_lanes_cross_the_same_walks(self):
+        # A Bool payload is one byte wide but names a count rather than a
+        # measurement, so it shares the walks a signed byte takes: only the value
+        # a lane holds differs, and refusing to move it would leave the same gap.
+        rng = np.random.default_rng(23)
+        base = rng.integers(0, 2, (self.ROWS, 8)).astype(bool)
+        device = self._device(base)
+        self.assertTrue(
+            self._in_words(device), "a counting payload was not kept in words")
+        np.testing.assert_array_equal(
+            device.as_strided((self.ROWS, 5), (8, 1), 1).cpu().numpy(),
+            base[:, 1:6],
+            err_msg="counting lanes gathered into words")
+        np.testing.assert_array_equal(
+            device.as_strided((40, 8), (8, 1), 0).cpu().numpy(), base[:40],
+            err_msg="counting lanes gathered into texels")
+
+
 class TestVulkanGather(unittest.TestCase):
     # A gather reads one code per output element, so the output shape is the index
     # shape and the source keeps its own.  Which route runs depends on where the
