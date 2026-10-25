@@ -1630,7 +1630,7 @@ void softmax_rows(const T* x, T* y, int64_t width, int64_t inner, int64_t first,
         if (inner == 1) {
             // A code grows with the value it stands for, so the largest code of a
             // row is the value every exponent of that row is shifted by.
-            QV best(Q(std::numeric_limits<T>::lowest()));
+            QV best = QV(Q(std::numeric_limits<T>::lowest()));
             int64_t c = 0;
             for (; c + codes_per_run <= width; c += codes_per_run)
                 best = best.maximum(QV::loadu(x + base + c));
