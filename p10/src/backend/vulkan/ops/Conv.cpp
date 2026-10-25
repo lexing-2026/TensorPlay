@@ -185,12 +185,15 @@ api::vTensor upload_parameter_cached(
       logical_sizes,
       api::GPUMemoryLayout::TENSOR_CHANNELS_PACKED,
       tag,
-      [&]() -> api::vTensor {
+      [&]() -> Tensor {
         if (param.device().is_vulkan()) {
           if (!device_pack) {
-            // The payload already carries the consumer's layout; reuse it
-            // in place.
-            return convert(param);
+            // The payload already carries the consumer's layout; reuse it in
+            // place, drawing it into an image first whenever its shape alone
+            // kept it in words.  This cache runs the crossing once per source
+            // identity, so a walk that binds the parameter every call does not
+            // pay for the gather every call.
+            return to_image_storage(api::context(), param);
           }
           api::Context* const context = api::context();
           api::vTensor v{
@@ -201,7 +204,7 @@ api::vTensor upload_parameter_cached(
               api::GPUMemoryLayout::TENSOR_CHANNELS_PACKED,
           };
           device_pack(v);
-          return v;
+          return convert(v);
         }
 
         api::Context* const context = api::context();
@@ -223,7 +226,7 @@ api::vTensor upload_parameter_cached(
             v,
             packed_nc4hw.impl()->storage().data(),
             packed_nc4hw.numel() * packed_nc4hw.itemsize());
-        return v;
+        return convert(v);
       });
 }
 
@@ -816,9 +819,10 @@ Tensor conv1d_kernel(
         api::vTensor v_src = convert(weight);
         if (v_src.gpu_memory_layout() ==
             api::GPUMemoryLayout::TENSOR_WIDTH_PACKED) {
-          return v_src;
+          return convert(v_src);
         }
-        return packing::convert_image_channels_packed_to_width_packed(v_src);
+        return convert(
+            packing::convert_image_channels_packed_to_width_packed(v_src));
       });
   } else {
     v_weight = ParamTextureCache::singleton().get_or_create(
@@ -834,10 +838,11 @@ Tensor conv1d_kernel(
               &pack_identity);
           if (v_uploaded.gpu_memory_layout() ==
               api::GPUMemoryLayout::TENSOR_WIDTH_PACKED) {
-            return v_uploaded;
+            return convert(v_uploaded);
           }
-          return packing::convert_image_channels_packed_to_width_packed(
-              v_uploaded);
+          return convert(
+              packing::convert_image_channels_packed_to_width_packed(
+                  v_uploaded));
         });
   }
   api::vTensor v_bias;
@@ -845,9 +850,15 @@ Tensor conv1d_kernel(
     v_bias = upload_parameter_cached(
         *bias, shape_of(*bias), kTagIdentity, &pack_identity);
   } else {
-    // The shader signature keeps a valid bias image for both variants.
+    // The shader signature keeps a valid bias image for both variants, so the
+    // filler is reserved as one even though its shape alone would keep it in
+    // words.
     api::vTensor v_zero_bias{
-        context, {O}, input_arg.dtype()};
+        context,
+        {O},
+        input_arg.dtype(),
+        api::StorageType::TEXTURE_3D,
+        api::GPUMemoryLayout::TENSOR_CHANNELS_PACKED};
     Tensor zero_bias = convert(v_zero_bias);
     zero_bias.fill_(Scalar(0.0));
     v_bias = std::move(v_zero_bias);

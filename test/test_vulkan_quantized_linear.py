@@ -483,12 +483,13 @@ def test_quantized_linear_of_a_weight_named_on_the_device(m, k, n):
     np.testing.assert_array_equal(int_repr(out).cpu().numpy(), expected)
 
 
-# A matrix the device quantizer writes keeps a byte per code, since four codes
-# share the word that one float filled, while a payload whose shape draws an
-# image keeps the texel walk.  Both routes round the way the host does: to the
-# even neighbour, then clamped into the code range, so the corners below sit far
-# outside it.  A width that does not divide by four leaves a partly used word the
-# run has to stop before, which is what the short shapes probe.
+# A payload the shape keeps in words writes its codes into words too, keeping a
+# byte per code since four codes share the word that one float filled, while a
+# payload whose shape draws an image keeps the texel walk.  Both routes round the
+# way the host does: to the even neighbour, then clamped into the code range, so
+# the corners below sit far outside it.  A width that does not divide by four
+# leaves a partly used word the run has to stop before, which is what the short
+# shapes probe.
 @pytest.mark.parametrize("shape", [(6,), (4, 16), (5, 7), (2, 3, 4)])
 def test_a_device_quantizer_writes_codes_where_its_shape_keeps_them(shape):
     rng = np.random.default_rng(7 + 11 * sum(shape) + 5 * len(shape))
@@ -507,7 +508,7 @@ def test_a_device_quantizer_writes_codes_where_its_shape_keeps_them(shape):
         np.rint(values / scale) + zero_point, -128, 127
     ).astype(np.int8)
     np.testing.assert_array_equal(int_repr(q).cpu().numpy(), expected)
-    assert (q.data_ptr() != 0) == (len(shape) == 2), (
+    assert (q.data_ptr() != 0) == (len(shape) <= 2), (
         "the codes did not land where the shape keeps them")
 
     # The undo reads the codes back from the class they landed in, so a round

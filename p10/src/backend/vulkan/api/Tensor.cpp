@@ -251,9 +251,12 @@ api::StorageType storage_type_of_payload(
     const std::vector<int64_t>& sizes,
     DType dtype) {
   // A texel carries its lanes along the innermost axis of the four-slot form,
-  // which for two axes is the axis already shortest in the packing's eyes: no
-  // group of four elements shares a lane, so the other three stay empty.
-  if (sizes.size() == 2u &&
+  // which for one or two axes is the axis already shortest in the packing's
+  // eyes: no group of four elements shares a lane, so the other three stay
+  // empty.  A single measurement costs sixteen bytes of texel for four of
+  // payload, and every walk that reads one on the linear route would rather
+  // fetch the words it holds than have the operand drawn across first.
+  if ((sizes.size() == 1u || sizes.size() == 2u) &&
       (dtype == DType::Float32 || dtype == DType::Float16)) {
     return api::StorageType::BUFFER;
   }

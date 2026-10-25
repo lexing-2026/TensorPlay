@@ -125,9 +125,11 @@ DType product_answer_dtype(DType source, DType asked) {
 // A reduced payload inherits linear storage from its source, but storage is
 // otherwise a function of the shape alone: consumers pick their route by
 // looking at the operand, and a texture-only kernel handed a 32-element
-// buffer payload has no linear variant to run.  A result that still fits an
-// image therefore repacks into one on the way out.  The gather covers the
-// 4-byte element types; every other type stays where the kernel wrote it.
+// buffer payload has no linear variant to run.  A result whose shape and width
+// actually land in an image therefore repacks into one on the way out.  A
+// result the policy already keeps in words is handed back where the walk wrote
+// it: the gather would copy the payload into the class it already sat in.  The
+// repack covers the 4-byte element types; every other type stays as written.
 //
 Tensor release_reduced_output(
     api::Context* const context,
@@ -135,7 +137,7 @@ Tensor release_reduced_output(
   Tensor flat = convert(v_reduced);
   const std::vector<int64_t> sizes(
       v_reduced.sizes().begin(), v_reduced.sizes().end());
-  if (!image_storage_supported(context, sizes) ||
+  if (!image_form_of(context, sizes, v_reduced.dtype()) ||
       (v_reduced.dtype() != DType::Float32 &&
        v_reduced.dtype() != DType::Int32)) {
     return flat;

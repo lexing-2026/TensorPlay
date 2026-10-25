@@ -315,10 +315,11 @@ Tensor embedding_kernel(
             api::MemoryAccessType::READ),
         params.buffer());
     Tensor out = convert(v_output);
-    // A lookup that had to stream its table still hands its rows out in the
-    // form their own shape fits: the kernels downstream read a texture, and a
-    // small payload left in words has no linear variant to run on.
-    if (image_storage_supported(context, {index_count, features})) {
+    // A lookup that had to stream its table hands its rows out in the form their
+    // own shape and element type draw: only a payload that allocation would put
+    // in an image crosses, so a matrix of the types that fill a texel's lanes
+    // stays in the words it was written to and skips a copy onto itself.
+    if (image_form_of(context, {index_count, features}, weight.dtype())) {
       out = materialize_view(
           out, {index_count, features}, {features, 1}, 0);
     }
@@ -936,10 +937,16 @@ Tensor index_select_kernel(
   // The list is built in the class the gather is going to use, so a source with
   // an image form is not dragged into dense storage just because the codes
   // arrived wide.
+  //
+  // The texel route addresses the payload flattened, and the walk reads it as a
+  // 1-D texture; a shape that its own allocation keeps in words has no such
+  // texture to sample, so the flat route is chosen for that gather too and the
+  // crossing never happens.
+  const bool flat_image_form =
+      image_form_of(context, {self.numel()}, self.dtype());
   const api::StorageType index_storage =
       v_self.storage_type() == api::StorageType::BUFFER ||
-          !image_storage_supported(context, {self.numel()}) ||
-          !image_storage_supported(context, {out_count})
+          !flat_image_form || !image_storage_supported(context, {out_count})
       ? api::StorageType::BUFFER
       : api::StorageType::TEXTURE_3D;
   api::vTensor v_indices = upload_index_payload(index, index_storage);
@@ -954,8 +961,7 @@ Tensor index_select_kernel(
   const bool texture_gather =
       v_self.storage_type() != api::StorageType::BUFFER &&
       v_indices.storage_type() != api::StorageType::BUFFER &&
-      image_storage_supported(context, {self.numel()}) &&
-      image_storage_supported(context, {out_count});
+      flat_image_form && image_storage_supported(context, {out_count});
   if (!texture_gather) {
     api::vTensor v_input_buf =
         v_self.storage_type() == api::StorageType::BUFFER
@@ -1008,10 +1014,17 @@ Tensor index_select_kernel(
   }
 
   // Both operands have an image form, so the gather walks the flattened texture
-  // with one texel per selected element.
+  // with one texel per selected element, and the answer is written as texels by
+  // the same walk: the row it gathers has no reason to match the shape a bare
+  // allocation would have kept in words.
   Tensor flat = self.reshape({self.numel()});
   api::vTensor v_input = convert(flat);
-  api::vTensor v_output{context, {out_count}, self.dtype()};
+  api::vTensor v_output{
+      context,
+      {out_count},
+      self.dtype(),
+      api::StorageType::TEXTURE_3D,
+      api::GPUMemoryLayout::TENSOR_CHANNELS_PACKED};
 
   const struct IndexSelectBlock block{
       static_cast<int32_t>(width),

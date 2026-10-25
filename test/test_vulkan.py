@@ -1278,15 +1278,33 @@ class TestVulkanIndexCopy(unittest.TestCase):
             positions = tensorplay.tensor(idx, dtype=tensorplay.int64)
             tensorplay.index_copy_(buf, 2, positions, src)
             got = buf.cpu().numpy()
+            moved = src.cpu().numpy().astype(got.dtype)
+            if len(set(idx)) != len(idx):
+                # Two codes naming the same row race for it texel by texel, so
+                # which source row survives is unspecified.  Pin only that the
+                # contested row ends as one of the rows that name it and that
+                # every row the scatter did not name stays as it was.
+                for row in set(idx):
+                    named = [k for k, code in enumerate(idx) if code == row]
+                    self.assertTrue(
+                        any(np.array_equal(got[:, :, row, :],
+                                           moved[:, :, k, :])
+                            for k in named),
+                        f"a contested row held no source that named it at {idx}")
+                untouched = [r for r in range(S) if r not in idx]
+                np.testing.assert_array_equal(
+                    got[:, :, untouched, :], before[:, :, untouched, :])
+                continue
             want = before.copy()
-            want[:, :, idx, :] = src.cpu().numpy().astype(got.dtype)
+            want[:, :, idx, :] = moved
             np.testing.assert_array_equal(got, want)
 
     def test_a_short_cache_scatters_the_rows_its_shape_offers(self):
-        # A cache of two or three axes has the same texel geometry as the four-axis
-        # one: the axis above the last is the texture's height, so its rows are
-        # lines of whole texels.  Appending a decode step into a [slots, features]
-        # page is the shape a runtime actually holds.
+        # A two-axis float page now lives in words, so its rows are runs of
+        # consecutive elements; a three- or four-axis page keeps the texel
+        # geometry, where the axis above the last is the texture's height and
+        # its rows are lines of whole texels.  Appending a decode step into a
+        # [slots, features] page is the shape a runtime actually holds.
         tensorplay.manual_seed(4242)
         cases = (
             ((9, 64), 0, [0, 8, 3], tensorplay.float32),
@@ -1364,9 +1382,12 @@ class TestVulkanIndexCopy(unittest.TestCase):
                 want,
                 err_msg=f"a {shape} linear cache along axis {axis}")
     def test_an_image_row_that_straddles_its_packed_axis_stays_refused(self):
-        # A texel holds four lanes of the axis a payload packs, so writing one of
-        # its rows means rewriting lanes the scatter did not name.  Neither the
-        # innermost axis nor a rank-1 payload's only axis is the texture's height.
+        # A texel holds four lanes of the axis a payload packs, so writing one
+        # of its rows means rewriting lanes the scatter did not name.  Only the
+        # axis just above the last is the texture's height, so any other axis
+        # of a payload that keeps an image stays refused.  A rank-one float
+        # vector has no image form at all, so it scatters its only axis
+        # through linear storage instead of refusing.
         buf = tensorplay.randn((3, 9, 64), device="cpu").to("vulkan")
         self.assertEqual(
             buf.data_ptr(), 0,
@@ -1377,14 +1398,14 @@ class TestVulkanIndexCopy(unittest.TestCase):
         with self.assertRaisesRegex(
                 RuntimeError, "an image payload scatters the axis above"):
             tensorplay.index_copy_(buf, 2, codes, src)
-        flat = tensorplay.randn((12,), device="cpu").to("vulkan")
+        planes = tensorplay.randn((2, 9, 64), device="cpu").to("vulkan")
         with self.assertRaisesRegex(
                 RuntimeError, "an image payload scatters the axis above"):
             tensorplay.index_copy_(
-                flat, 0,
+                buf, 0,
                 tensorplay.tensor([1, 5], dtype=tensorplay.int64,
                                   device="vulkan"),
-                tensorplay.randn((2,), device="cpu").to("vulkan"))
+                planes)
 
     def test_index_copy_writes_nothing_for_a_row_it_cannot_name(self):
         # Nothing asserts on the device, and folding a list onto the host to
@@ -13936,12 +13957,12 @@ class TestVulkanSquaredErrorLoss(unittest.TestCase):
                 first = make(values)
                 second = make(compared)
                 # A plane the device lays out itself is reserved in words, and
-                # so is a host arrival of two measured axes; the single axis and
-                # the three-axis block that arrived from the host keep the texel
+                # so is a host arrival of one or two measured axes; the
+                # three-axis block that arrived from the host keeps the texel
                 # walk.
                 self.assertIs(
                     self._uses_dense_storage(first),
-                    make is self._built or len(shape) == 2,
+                    make is self._built or len(shape) <= 2,
                     f"a {name} plane was not reserved in the class its builder "
                     "and shape name")
                 for reduction, want in (
@@ -19947,6 +19968,150 @@ class TestVulkanDivergenceLoss(unittest.TestCase):
                 F.tp_kl_div(
                     self._device(np.zeros(4, np.float32)),
                     self._device(np.arange(4, dtype=np.int32)), 1, True)
+
+
+class TestVulkanVectorStorage(unittest.TestCase):
+    @staticmethod
+    def _kept_in_words(payload):
+        # A payload reserved in words owns the buffer a binding names, while an
+        # image carries its lanes through a texture view and has no such
+        # pointer: the class a payload was reserved in is therefore readable
+        # without asking some op which walk it took.
+        return payload.data_ptr() != 0
+
+    def test_a_vector_of_measurements_is_reserved_in_the_words_it_fills(self):
+        # One measurement per texel leaves three of a texel's four lanes empty,
+        # so a single-axis float payload is reserved in words just as a matrix
+        # of them already is.  An odd length ends a word in the middle of the
+        # vector, and a half vector pairs two measurements in one word, so both
+        # are named here.
+        for length in (5, 8, 40):
+            host = ((np.arange(length, dtype=np.float32) % 13) - 6) / 4.0
+            for name, vector in (
+                    ("uploaded",
+                     tensorplay.from_numpy(host.copy()).to("vulkan")),
+                    ("built", tensorplay.tensor(host.copy(), device="vulkan"))):
+                self.assertTrue(
+                    self._kept_in_words(vector),
+                    f"a {length}-entry {name} vector was not reserved in words")
+                self.assertEqual(tuple(vector.shape), (length,))
+                np.testing.assert_array_equal(
+                    vector.cpu().numpy(), host,
+                    err_msg=f"a {name} vector lost its values")
+                half = vector.to(tensorplay.float16)
+                self.assertTrue(
+                    self._kept_in_words(half),
+                    f"a {length}-entry {name} vector changed class on the way "
+                    "to half")
+                np.testing.assert_array_equal(
+                    half.cpu().numpy(),
+                    host.astype(np.float16).astype(np.float32),
+                    err_msg=f"a {length}-entry {name} half vector changed value")
+
+    def test_a_fold_or_slice_of_a_vector_stays_in_words(self):
+        # A fold over the single axis answers one number, and the rows of a
+        # vector laid out as a plane answer a vector each: neither walks back
+        # into a texel form the shape no longer asks for.
+        host = (np.arange(30, dtype=np.float32) % 7) / 2.0
+        vector = tensorplay.from_numpy(host.copy()).to("vulkan")
+        np.testing.assert_allclose(
+            vector.sum().cpu().numpy(), np.array(host.sum(), np.float32),
+            rtol=1e-6, atol=1e-6, err_msg="the total of a vector moved")
+        middle = vector[4:13]
+        self.assertTrue(
+            self._kept_in_words(middle),
+            "a slice of a vector was not reserved in words")
+        np.testing.assert_array_equal(
+            middle.cpu().numpy(), host[4:13],
+            err_msg="a slice of a vector lost its values")
+        rows = vector.reshape((6, 5)).sum(1)
+        self.assertTrue(
+            self._kept_in_words(rows),
+            "a fold to one answer per row was not reserved in words")
+        np.testing.assert_allclose(
+            rows.cpu().numpy(), host.reshape((6, 5)).sum(1),
+            rtol=1e-6, atol=1e-6, err_msg="a fold to one answer per row moved")
+
+    def test_a_walk_that_samples_a_word_resident_vector_answers(self):
+        # The affine vector of a normalization, and the shift of a convolution,
+        # are read one position per output element by a walk over texels: the
+        # payload that came in words is drawn into the form the walk names, and
+        # the answer is the one the host computes from the same numbers.  Every
+        # device call runs twice, because the second reads the form kept for the
+        # parameter rather than drawing it again.
+        nnF = tensorplay.nn.functional
+        rng = np.random.default_rng(11)
+        plane = rng.random((2, 3, 8)).astype(np.float32)
+        weight = (rng.random(8).astype(np.float32) + 0.5)
+        shift = (rng.random(8).astype(np.float32) - 0.5) / 3
+        image = rng.random((1, 2, 4, 4)).astype(np.float32)
+        kernel = rng.random((3, 2, 2, 2)).astype(np.float32)
+        bias = (rng.random(3).astype(np.float32) - 0.5) / 2
+        sequence = rng.random((1, 2, 5)).astype(np.float32)
+        tap = rng.random((3, 2, 2)).astype(np.float32)
+        spread = rng.random((2, 3, 2, 2)).astype(np.float32)
+
+        def agreed(label, call, args):
+            host = call(*[tensorplay.from_numpy(a.copy()) for a in args])
+            device_args = [
+                tensorplay.from_numpy(a.copy()).to("vulkan") for a in args]
+            first = call(*device_args).cpu().numpy()
+            second = call(*device_args).cpu().numpy()
+            np.testing.assert_array_equal(
+                second, first,
+                err_msg=f"{label} answered differently on the second call over "
+                "the same operands")
+            np.testing.assert_allclose(
+                first, host.cpu().numpy(), rtol=1e-5, atol=1e-6,
+                err_msg=f"a device-side {label} moved")
+
+        agreed(
+            "rms_norm",
+            lambda x, w: nnF.rms_norm(x, [x.shape[-1]], w, 1e-5),
+            (plane, weight))
+        agreed(
+            "layer_norm",
+            lambda x, w, b: nnF.layer_norm(x, [x.shape[-1]], w, b, 1e-5),
+            (plane, weight, shift))
+        # A convolution's shift is one number per output channel, and the
+        # channels of a plane share one texel's lanes, so the walk samples the
+        # vector rather than indexing it.  The variant with no shift keeps the
+        # filler the shader signature still binds honest.
+        agreed(
+            "conv2d", lambda x, w, b: nnF.conv2d(x, w, b),
+            (image, kernel, bias))
+        agreed(
+            "conv2d without a shift", lambda x, w: nnF.conv2d(x, w),
+            (image, kernel))
+        agreed(
+            "conv1d", lambda x, w, b: nnF.conv1d(x, w, b),
+            (sequence, tap, bias))
+        agreed(
+            "conv1d without a shift", lambda x, w: nnF.conv1d(x, w),
+            (sequence, tap))
+        # A transposed convolution names the input channels first, so the plane
+        # with two of them takes the pair drawn in that order rather than the
+        # one laid out for the forward walk.
+        agreed(
+            "conv_transpose2d",
+            lambda x, w, b: nnF.conv_transpose2d(x, w, b),
+            (image, spread, bias))
+        # Batch normalization reads four vectors of one length: the affine
+        # scale and shift, and the running mean and variance it folds.
+        channels = image.shape[1]
+        affine = ((np.arange(channels, dtype=np.float32) + 1) / 4).astype(
+            np.float32)
+        added = ((np.arange(channels, dtype=np.float32) - 1) / 8).astype(
+            np.float32)
+        mean = ((np.arange(channels, dtype=np.float32) % 5 - 2) / 4).astype(
+            np.float32)
+        var = ((np.arange(channels, dtype=np.float32) % 7 + 1) / 2).astype(
+            np.float32)
+        agreed(
+            "batch_norm",
+            lambda x, w, b, m, v: tensorplay.batch_norm(
+                x, w, b, m, v, False, 0.1, 1e-5),
+            (image, affine, added, mean, var))
 
 
 if __name__ == "__main__":

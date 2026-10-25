@@ -3,6 +3,7 @@
 #include "Blocks.h"
 #include "Common.h"
 #include "Convert.h"
+#include "ParamCache.h"
 
 #include "Tensor.h"
 #include "TensorImpl.h"
@@ -296,6 +297,47 @@ Tensor to_image_storage(api::Context* const context, const Tensor& self) {
       SizesAndStrides::compute_contiguous_strides(sizes),
       0,
       api::StorageType::TEXTURE_3D);
+}
+
+//
+// The texel form of a parameter a sampling walk was handed in words.  A
+// resident weight, scale or shift is read by every call that runs the walk, so
+// the one crossing that draws it as an image is kept under the parameter's
+// storage identity and reused; a payload that already arrived as an image, or
+// one whose view is not dense enough for the cache to key on, takes the plain
+// crossing above.
+//
+Tensor texel_form_of_param(
+    api::Context* const context,
+    const Tensor& param,
+    uint32_t tag) {
+  api::vTensor v_param = convert(param);
+  if (v_param.storage_type() == api::StorageType::TEXTURE_3D) {
+    return std::move(param);
+  }
+  const std::vector<int64_t> sizes =
+      static_cast<std::vector<int64_t>>(param.shape());
+  TP_CHECK(
+      image_storage_supported(context, sizes),
+      "Vulkan: this shape has no image form, so a kernel that samples texels "
+      "cannot be handed this parameter");
+  if (!param.is_contiguous()) {
+    return to_image_storage(context, param);
+  }
+  return convert(
+      ParamTextureCache::singleton().get_or_create(
+          param,
+          sizes,
+          api::GPUMemoryLayout::TENSOR_CHANNELS_PACKED,
+          tag,
+          [&]() {
+            return materialize_view(
+                param,
+                sizes,
+                SizesAndStrides::compute_contiguous_strides(sizes),
+                0,
+                api::StorageType::TEXTURE_3D);
+          }));
 }
 
 bool transpose_view_of_dense(const Tensor& t, Tensor* dense_out) {

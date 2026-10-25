@@ -1208,7 +1208,7 @@ api::vTensor qlinear_params_linear(
     const std::optional<Tensor>& bias,
     const int64_t out_features,
     const int64_t params_width) {
-  return ParamTextureCache::singleton().get_or_create(
+  return ParamTextureCache::singleton().get_or_create_packed_view(
       weight,
       {3, params_width},
       api::GPUMemoryLayout::TENSOR_WIDTH_PACKED,
@@ -1479,7 +1479,7 @@ Tensor quantized_linear_kernel(
   // never rounds-trips the per-channel qparams through the host.  Rows are
   // padded to a multiple of four so the width-packed params texture never
   // straddles a row boundary.
-  api::vTensor v_params = ParamTextureCache::singleton().get_or_create(
+  api::vTensor v_params = ParamTextureCache::singleton().get_or_create_packed_view(
       weight, {3, params_width}, api::GPUMemoryLayout::TENSOR_WIDTH_PACKED,
       kTagQLinearParams,
       [&]() {
@@ -1605,7 +1605,7 @@ Tensor quantized_linear_kernel(
   }
   // The packed weight payload is materialized once per source storage
   // identity and reused across calls (weight prepack for inference).
-  api::vTensor v_weight_packed = ParamTextureCache::singleton().get_or_create(
+  api::vTensor v_weight_packed = ParamTextureCache::singleton().get_or_create_packed_view(
       weight, {K, N}, api::GPUMemoryLayout::TENSOR_HEIGHT_PACKED,
       kTagQLinearWeightHeightPacked,
       [&]() {
@@ -2413,7 +2413,7 @@ api::vTensor w4a16_linear_params(
     const std::optional<Tensor>& bias,
     const int64_t out_features,
     const int64_t params_width) {
-  return ParamTextureCache::singleton().get_or_create(
+  return ParamTextureCache::singleton().get_or_create_packed_view(
       weight, {2, params_width}, api::GPUMemoryLayout::TENSOR_WIDTH_PACKED,
       kTagW4A16ParamsLinear,
       [&]() {
@@ -2461,7 +2461,7 @@ api::vTensor w4a16_linear_packed_weight(
     const int64_t N,
     const int64_t k_words) {
   const int64_t words = N * k_words;
-  return ParamTextureCache::singleton().get_or_create(
+  return ParamTextureCache::singleton().get_or_create_packed_view(
       weight, {words}, api::GPUMemoryLayout::TENSOR_WIDTH_PACKED,
       kTagW4A16WeightLinear,
       [&]() {
@@ -2696,7 +2696,7 @@ Tensor w4a16_linear_kernel(
   // Per-channel scale (row 0) and bias (row 2) float texture, cached on
   // the weight identity.  Row 1 (zero points) is unused by the symmetric
   // W4A16 scheme and stays zero.
-  api::vTensor v_params = ParamTextureCache::singleton().get_or_create(
+  api::vTensor v_params = ParamTextureCache::singleton().get_or_create_packed_view(
       weight, {3, params_width}, api::GPUMemoryLayout::TENSOR_WIDTH_PACKED,
       kTagW4A16Params,
       [&]() {
@@ -2735,7 +2735,7 @@ Tensor w4a16_linear_kernel(
   // The packed 4-bit weight payload (eight nibbles per texel) is
   // materialized once per weight identity (weight prepack).
   api::PipelineBarrier pipeline_barrier{};
-  api::vTensor v_weight_packed = ParamTextureCache::singleton().get_or_create(
+  api::vTensor v_weight_packed = ParamTextureCache::singleton().get_or_create_packed_view(
       weight, {K, N}, api::GPUMemoryLayout::TENSOR_HEIGHT_PACKED,
       kTagW4A16WeightHeightPacked,
       [&]() {

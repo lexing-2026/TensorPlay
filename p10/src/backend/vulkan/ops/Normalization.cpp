@@ -213,11 +213,13 @@ Tensor layer_norm_impl(
           api::MemoryAccessType::WRITE),
       v_input.image(pipeline_barrier, api::PipelineStage::COMPUTE),
       bind_weight
-          ? convert(weight_opt.value())
+          ? convert(texel_form_of_param(
+                context, weight_opt.value(), kTagTexelAffineWeight))
                 .image(pipeline_barrier, api::PipelineStage::COMPUTE)
           : v_input.image(pipeline_barrier, api::PipelineStage::COMPUTE),
       bind_bias
-          ? convert(bias_opt.value())
+          ? convert(texel_form_of_param(
+                context, bias_opt.value(), kTagTexelAffineBias))
                 .image(pipeline_barrier, api::PipelineStage::COMPUTE)
           : v_input.image(pipeline_barrier, api::PipelineStage::COMPUTE),
       // params buffer
@@ -411,16 +413,20 @@ Tensor batch_norm_kernel(
           api::MemoryAccessType::WRITE),
       v_input.image(pipeline_barrier, api::PipelineStage::COMPUTE),
       has_weight
-          ? convert(weight_opt.value())
+          ? convert(texel_form_of_param(
+                context, weight_opt.value(), kTagTexelAffineWeight))
                 .image(pipeline_barrier, api::PipelineStage::COMPUTE)
           : v_input.image(pipeline_barrier, api::PipelineStage::COMPUTE),
       has_bias
-          ? convert(bias_opt.value())
+          ? convert(texel_form_of_param(
+                context, bias_opt.value(), kTagTexelAffineBias))
                 .image(pipeline_barrier, api::PipelineStage::COMPUTE)
           : v_input.image(pipeline_barrier, api::PipelineStage::COMPUTE),
-      convert(running_mean_opt.value())
+      convert(texel_form_of_param(
+          context, running_mean_opt.value(), kTagTexelRunningMean))
           .image(pipeline_barrier, api::PipelineStage::COMPUTE),
-      convert(running_var_opt.value())
+      convert(texel_form_of_param(
+          context, running_var_opt.value(), kTagTexelRunningVar))
           .image(pipeline_barrier, api::PipelineStage::COMPUTE),
       // params buffer
       params.buffer());
@@ -1246,7 +1252,8 @@ Tensor rms_norm_fused(
           api::MemoryAccessType::WRITE),
       v_input.image(pipeline_barrier, api::PipelineStage::COMPUTE),
       has_weight
-          ? convert(weight_opt.value())
+          ? convert(texel_form_of_param(
+                context, weight_opt.value(), kTagTexelAffineWeight))
                 .image(pipeline_barrier, api::PipelineStage::COMPUTE)
           : v_input.image(pipeline_barrier, api::PipelineStage::COMPUTE),
       // params buffer

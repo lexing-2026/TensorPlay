@@ -37,7 +37,7 @@ api::vTensor ParamTextureCache::get_or_create(
     const std::vector<int64_t>& logical_sizes,
     api::GPUMemoryLayout layout,
     uint32_t tag,
-    const std::function<api::vTensor()>& build) {
+    const std::function<Tensor()>& build) {
   const intrusive_ptr<TensorImpl>& impl = param.impl();
   TP_CHECK(
       impl->is_contiguous(), "Parameter texture cache expects dense tensors");
@@ -59,9 +59,9 @@ api::vTensor ParamTextureCache::get_or_create(
     }
   }
 
-  api::vTensor v = build();
-
-  Tensor device_tensor = convert(v);
+  // The built payload is owned by the tensor the factory returns, and the
+  // entry below keeps that tensor; the view handed to the caller borrows it.
+  Tensor device_tensor = build();
 
   std::lock_guard<std::mutex> lock(mutex_);
   // A racing thread may have materialized this exact identity meanwhile; both
@@ -88,7 +88,21 @@ api::vTensor ParamTextureCache::get_or_create(
     drop(std::prev(lru_.end()));
   }
 
-  return v;
+  return convert(ref->second.packed);
+}
+
+api::vTensor ParamTextureCache::get_or_create_packed_view(
+    const Tensor& param,
+    const std::vector<int64_t>& logical_sizes,
+    api::GPUMemoryLayout layout,
+    uint32_t tag,
+    const std::function<api::vTensor()>& build) {
+  return get_or_create(
+      param,
+      logical_sizes,
+      layout,
+      tag,
+      [&]() { return convert(build()); });
 }
 
 } // namespace ops

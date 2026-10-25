@@ -433,6 +433,7 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
       // because a view over an existing payload only points at the storage.
       Tensor src_payload = std::move(src_dense);
       Tensor narrowed;
+      Tensor widened;
       Tensor gathered;
 
       // A pair no kernel of either storage answers at once crosses the hub: one
@@ -507,6 +508,39 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src, bool non_blocking) {
             src.shape() == self.shape(),
             "Vulkan copies between storage classes require equal shapes");
         if (linear_destination) {
+          // The kernel that gathers a texel payload into words names the lanes
+          // that fill a word four to a lane, so a byte code reaches them
+          // through the hub: it widens while it still sits in texels, crosses
+          // as a payload the gather does own, and narrows on the way to the
+          // answer's type below.
+          if (v_src.dtype() == DType::Int8 || v_src.dtype() == DType::UInt8) {
+            const char* const widen =
+                texture_cast_shader(v_src.dtype(), DType::Float32);
+            TP_CHECK(
+                widen != nullptr,
+                "Unsupported Vulkan dtype conversion from a byte code");
+            api::vTensor v_scratch{
+                context,
+                static_cast<std::vector<int64_t>>(self.shape()),
+                DType::Float32,
+                api::StorageType::TEXTURE_3D,
+                api::GPUMemoryLayout::TENSOR_CHANNELS_PACKED};
+            api::PipelineBarrier barrier{};
+            context->submit_compute_job(
+                VK_KERNEL_FROM_STR(widen),
+                barrier,
+                v_scratch.extents(),
+                adaptive_work_group_size(v_scratch.extents()),
+                VK_NULL_HANDLE,
+                v_scratch.image(
+                    barrier,
+                    api::PipelineStage::COMPUTE,
+                    api::MemoryAccessType::WRITE),
+                v_src.image(barrier, api::PipelineStage::COMPUTE));
+            widened = convert(v_scratch);
+            v_src = convert(widened);
+            src_payload = widened;
+          }
           v_src = to_buffer_storage_dispatch(context, v_src);
         } else {
           const std::vector<int64_t> sizes(

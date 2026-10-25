@@ -120,7 +120,7 @@ api::vTensor packed_cached(
     api::GPUMemoryLayout layout,
     uint32_t tag,
     const std::function<api::vTensor()>& build) {
-  return ParamTextureCache::singleton().get_or_create(
+  return ParamTextureCache::singleton().get_or_create_packed_view(
       src, cache_sizes, layout, tag, build);
 }
 

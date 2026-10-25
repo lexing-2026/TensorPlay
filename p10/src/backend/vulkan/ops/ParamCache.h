@@ -36,13 +36,30 @@ namespace ops {
 // set that fits stays resident instead of being flushed as a whole.
 //
 // `build` performs the actual materialization (host pack + upload, or a
-// device-side regroup dispatch); it runs at most once per identity.
+// device-side regroup dispatch); it runs at most once per identity.  It hands
+// back the tensor that owns the payload rather than a view of it: a view keeps
+// no reference of its own, so one built over a payload that dies in the
+// expression that returns it would leave the entry, and every binding drawn
+// from it, reading memory the allocator has moved on from.
 //
 class ParamTextureCache final {
  public:
   static ParamTextureCache& singleton();
 
   api::vTensor get_or_create(
+      const Tensor& param,
+      const std::vector<int64_t>& logical_sizes,
+      api::GPUMemoryLayout layout,
+      uint32_t tag,
+      const std::function<Tensor()>& build);
+
+  // Same, for a factory that materializes the payload and hands back the view
+  // of it: the view is turned into the tensor that shares its storage before
+  // the entry is written.  A factory whose view borrows storage the entry also
+  // pins (a packer reading the source in place) is fine here.  A factory whose
+  // view borrows a payload that dies inside its own return statement is not --
+  // nothing here can revive it, so such a crossing takes the tensor form above.
+  api::vTensor get_or_create_packed_view(
       const Tensor& param,
       const std::vector<int64_t>& logical_sizes,
       api::GPUMemoryLayout layout,

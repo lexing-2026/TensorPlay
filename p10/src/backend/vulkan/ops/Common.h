@@ -233,6 +233,22 @@ Tensor dense_payload_of_view(const Tensor& t);
 //
 Tensor to_image_storage(api::Context* const context, const Tensor& self);
 
+// The texel form of a parameter a sampling walk was handed in words, kept under
+// the parameter's storage identity: a walk that reads the same weight, shift or
+// statistic every call crosses it into an image once rather than paying the
+// gather on each call.  The tags name which parameter was drawn, so two payloads
+// sharing a storage never read one another's form.  A payload that already
+// arrived as an image comes back as it was.
+constexpr uint32_t kTagTexelAffineWeight = 30u;
+constexpr uint32_t kTagTexelAffineBias = 31u;
+constexpr uint32_t kTagTexelRunningMean = 32u;
+constexpr uint32_t kTagTexelRunningVar = 33u;
+
+Tensor texel_form_of_param(
+    api::Context* const context,
+    const Tensor& param,
+    uint32_t tag);
+
 // Elementwise linear-buffer kernels address payload in the slots of a 16-byte
 // word: a Float32 element fills one, a Float16 pair shares one, and a code
 // wider than a word owns a pair of them.  Byte-packed and Bool payloads have no
