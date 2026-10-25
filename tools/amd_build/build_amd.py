@@ -32,6 +32,9 @@ INCLUDE_FIXES = {
     # The sparse solver API ships in the same compatibility package and is
     # declared by the same umbrella header.
     "#include <cusolverSp.h>": "#include <hipsolver/hipsolver.h>",
+    # The math-constants header has a HIP counterpart; the one constant taken
+    # from it here is spelled out in SYMBOL_FIXES below.
+    "#include <math_constants.h>": "#include <hip/hip_math_constants.h>",
     "#include <tensorpipe/tensorpipe_hip.h>": "#include <tensorpipe/tensorpipe_cuda.h>",
     # The device-standard functors (equal_to, less, ...) resolve through the
     # thrust compatibility layer on the AMD side; the CUDA device-standard
@@ -65,6 +68,14 @@ SYMBOL_FIXES = {
     "cusolverSpDcsrlsvqr": "hipsolverSpDcsrlsvqr",
     "cusolverSpCcsrlsvqr": "hipsolverSpCcsrlsvqr",
     "cusolverSpZcsrlsvqr": "hipsolverSpZcsrlsvqr",
+    # The layout-order attribute of the int8 matmul: the mapping table carries
+    # the rest of the cuBLASLt matrix-layout API but not these.
+    "cublasLtOrder_t": "hipblasLtOrder_t",
+    "CUBLASLT_ORDER_ROW": "HIPBLASLT_ORDER_ROW",
+    "CUBLASLT_MATRIX_LAYOUT_ORDER": "HIPBLASLT_MATRIX_LAYOUT_ORDER",
+    # hip_math_constants.h has no infinity; this is how math_constants.h
+    # itself defines it.
+    "CUDART_INF_F": "__int_as_float(0x7f800000U)",
     # Device-standard functors live in the thrust namespace on the AMD side
     # (paired with the include fix above); HIP has no cuda/std namespace.
     "cuda::std::": "thrust::",

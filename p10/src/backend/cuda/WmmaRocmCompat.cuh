@@ -255,9 +255,9 @@ __device__ inline void mma_sync(
 #pragma unroll
         for (int k = 0; k < 16; ++k) {
             const float av =
-                __shfl_sync(full_mask, __half2float(a.x[k]), src_a);
+                __shfl_sync(full_mask, static_cast<float>(a.x[k]), src_a);
             const float bv =
-                __shfl_sync(full_mask, __half2float(b.x[k]), col);
+                __shfl_sync(full_mask, static_cast<float>(b.x[k]), col);
             acc += av * bv;
         }
         d.x[i] = acc;
