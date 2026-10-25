@@ -48,6 +48,19 @@ inline int64_t wrap_dim(int64_t dim, int64_t ndim) {
     return dim;
 }
 
+// Bumps a counter that other threads bump too. Feature-detect atomic_ref:
+// toolchains whose standard library predates it (Xcode 15's libc++) view the
+// counter as std::atomic<T>, which shares the representation of a lock-free
+// integer.
+template <typename T>
+inline void relaxed_increment(T& counter) {
+#if defined(__cpp_lib_atomic_ref) && __cpp_lib_atomic_ref >= 201806L
+    std::atomic_ref<T>(counter).fetch_add(1, std::memory_order_relaxed);
+#else
+    reinterpret_cast<std::atomic<T>&>(counter).fetch_add(1, std::memory_order_relaxed);
+#endif
+}
+
 inline int64_t wrap_scan_dim(int64_t dim, int64_t ndim) {
     if (ndim == 0) {
         if (dim == -1 || dim == 0) return 0;
@@ -2236,8 +2249,7 @@ Tensor bincount_cpu_impl(const Tensor& self, const Tensor& weights,
         // threads share the counters instead.
         parallel_for(0, self_size, GRAIN_SIZE, [&](int64_t b, int64_t e) {
             for (int64_t i = b; i < e; ++i) {
-                std::atomic_ref<int64_t>(rp[static_cast<int64_t>(ip[i])])
-                    .fetch_add(1, std::memory_order_relaxed);
+                relaxed_increment(rp[static_cast<int64_t>(ip[i])]);
             }
         });
     }
@@ -2447,8 +2459,7 @@ std::tuple<Tensor, Tensor, Tensor> unique_flat_cpu_template(
                 parallel_for(0, numel, GRAIN_SIZE, [&](int64_t b, int64_t e) {
                     for (int64_t i = b; i < e; ++i) {
                         const uint64_t v = static_cast<uint64_t>(in[i]) - base;
-                        std::atomic_ref<int32_t>(tally[static_cast<size_t>(v)])
-                            .fetch_add(1, std::memory_order_relaxed);
+                        relaxed_increment(tally[static_cast<size_t>(v)]);
                     }
                 });
                 int64_t n_groups = 0;
