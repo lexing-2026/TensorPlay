@@ -9,6 +9,7 @@
 // clang-format on
 
 layout(std430) buffer;
+#include "channel_lanes.h"
 
 layout(set = 0, binding = 0, FORMAT) uniform PRECISION restrict writeonly image3D uOutput;
 layout(set = 0, binding = 1) uniform PRECISION sampler3D uInput;
@@ -92,19 +93,15 @@ void main() {
     // (n * out_c_depth + c4) of the output.  All channels of the batch
     // collapse into one value per texel position.
     const int n = pos.z / uBlock.out_c_depth;
-    const vec4 lane_mask = vec4(lessThan(
-        ivec4(0, 1, 2, 3), ivec4(uBlock.in_sizes.z)));
-    const vec4 first_texel =
-        mix(vec4(NEUTRAL), texelFetch(uInput, ivec3(pos.x, pos.y, n * uBlock.in_c_depth), 0),
-            lane_mask);
+    const vec4 first_texel = guarded_lanes(
+        texelFetch(uInput, ivec3(pos.x, pos.y, n * uBlock.in_c_depth), 0),
+        0, uBlock.in_sizes.z, NEUTRAL);
     acc = first_texel;
     for (int z = n * uBlock.in_c_depth + 1;
          z < (n + 1) * uBlock.in_c_depth; ++z) {
-      const vec4 v = mix(
-          vec4(NEUTRAL), texelFetch(uInput, ivec3(pos.x, pos.y, z), 0),
-          vec4(lessThan(
-              ivec4(0, 1, 2, 3) + (z - n * uBlock.in_c_depth) * 4,
-              ivec4(uBlock.in_sizes.z))));
+      const vec4 v = guarded_lanes(
+          texelFetch(uInput, ivec3(pos.x, pos.y, z), 0),
+          (z - n * uBlock.in_c_depth) * 4, uBlock.in_sizes.z, NEUTRAL);
       acc = OP(acc, v);
     }
     imageStore(

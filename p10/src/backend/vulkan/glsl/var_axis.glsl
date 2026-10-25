@@ -5,6 +5,7 @@
 // clang-format on
 
 layout(std430) buffer;
+#include "channel_lanes.h"
 
 layout(set = 0, binding = 0, FORMAT) uniform PRECISION restrict writeonly image3D uOutput;
 layout(set = 0, binding = 1) uniform PRECISION sampler3D uInput;
@@ -57,25 +58,21 @@ void main() {
     const int n = pos.z;
     vec4 lane_sum = vec4(0.0f);
     for (int c4 = 0; c4 < uBlock.in_c_depth; ++c4) {
-      const vec4 lane_mask = vec4(lessThan(
-          ivec4(c4 * 4) + ivec4(0, 1, 2, 3),
-          ivec4(uBlock.in_sizes.z)));
-      lane_sum += lane_mask *
+      lane_sum += guarded_lanes(
           texelFetch(
-              uInput, ivec3(pos.x, pos.y, n * uBlock.in_c_depth + c4), 0);
+              uInput, ivec3(pos.x, pos.y, n * uBlock.in_c_depth + c4), 0),
+          c4 * 4, uBlock.in_sizes.z, 0.0);
     }
     const float line_mean =
         (lane_sum.x + lane_sum.y + lane_sum.z + lane_sum.w) /
         float(uBlock.count);
     float dev_sq = 0.0f;
     for (int c4 = 0; c4 < uBlock.in_c_depth; ++c4) {
-      const vec4 lane_mask = vec4(lessThan(
-          ivec4(c4 * 4) + ivec4(0, 1, 2, 3),
-          ivec4(uBlock.in_sizes.z)));
-      const vec4 d = lane_mask *
-          (texelFetch(
-               uInput, ivec3(pos.x, pos.y, n * uBlock.in_c_depth + c4), 0) -
-           vec4(line_mean));
+      const vec4 d = guarded_lanes(
+          texelFetch(
+              uInput, ivec3(pos.x, pos.y, n * uBlock.in_c_depth + c4), 0) -
+          vec4(line_mean),
+          c4 * 4, uBlock.in_sizes.z, 0.0);
       dev_sq += dot(d, d);
     }
     const float var =

@@ -5,6 +5,7 @@
 // clang-format on
 
 layout(std430) buffer;
+#include "channel_lanes.h"
 
 layout(set = 0, binding = 0, FORMAT) uniform PRECISION restrict writeonly image3D uOutput;
 layout(set = 0, binding = 1) uniform PRECISION sampler3D uInput;
@@ -58,12 +59,14 @@ void main() {
     // value per lane.
     const int n = pos.z;
     for (int c4 = 0; c4 < uBlock.in_c_depth; ++c4) {
-      const vec4 lane_mask = vec4(lessThan(
-          ivec4(c4 * 4) + ivec4(0, 1, 2, 3),
-          ivec4(uBlock.in_sizes.z)));
-      acc += lane_mask *
+      // The texel is fetched whole, so its lanes beyond the channel count are
+      // replaced by the identity a running sum starts at rather than multiplied
+      // away: a padded lane holding an infinity or a not-a-number would fold
+      // into the kept lanes through that product.
+      acc += guarded_lanes(
           texelFetch(uInput, ivec3(pos.x, pos.y, n * uBlock.in_c_depth + c4),
-                     0);
+                     0),
+          c4 * 4, uBlock.in_sizes.z, 0.0);
     }
     const float total =
         (acc.x + acc.y) + (acc.z + acc.w);
