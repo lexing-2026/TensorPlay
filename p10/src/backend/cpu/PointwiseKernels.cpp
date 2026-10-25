@@ -206,6 +206,20 @@ static bool destination_writable(const Tensor& self, const Tensor& out,
     return true;
 }
 
+// An outer dim of a strided_unary_loop walk, with byte steps on both sides.
+// Kept outside the template so the vector and the sort over them are
+// instantiated once rather than once per loop body.
+struct StridedOuterDim { int64_t size, src_step, dst_step; };
+
+// Outermost first (descending source stride) so the fastest-varying outer
+// step takes the shortest source jumps.
+static void sort_outer_dims(std::vector<StridedOuterDim>& dims) {
+    std::sort(dims.begin(), dims.end(),
+              [](const StridedOuterDim& a, const StridedOuterDim& b) {
+                  return a.src_step > b.src_step;
+              });
+}
+
 // Elementwise work over a strided source without a materialization copy.
 // The result carries the input's layout (dense permuted views keep their
 // strides), so the innermost dim -- unit stride on the result side -- is
@@ -261,8 +275,7 @@ static bool strided_unary_loop(const Tensor& self, Tensor& result,
     // Outer dims, outermost first (descending source stride) so the
     // fastest-varying outer step takes the shortest source jumps.  Offsets
     // are byte-based: the two tensors may have different item sizes.
-    struct OuterDim { int64_t size, src_step, dst_step; };
-    std::vector<OuterDim> dims;
+    std::vector<StridedOuterDim> dims;
     dims.reserve(ndim);
     for (int64_t d = 0; d < ndim; ++d) {
         if (d == inner_dim || sizes[d] <= 1) continue;
@@ -270,11 +283,10 @@ static bool strided_unary_loop(const Tensor& self, Tensor& result,
                         src_strides[d] * static_cast<int64_t>(self.itemsize()),
                         dst_strides[d] * static_cast<int64_t>(result.itemsize())});
     }
-    std::sort(dims.begin(), dims.end(),
-              [](const OuterDim& a, const OuterDim& b) { return a.src_step > b.src_step; });
+    sort_outer_dims(dims);
 
     int64_t outer_count = 1;
-    for (const OuterDim& od : dims) outer_count *= od.size;
+    for (const StridedOuterDim& od : dims) outer_count *= od.size;
     const int64_t grain_iters = std::max<int64_t>(
         1, kUnaryGrain / std::max<int64_t>(inner_size, 1));
 
@@ -438,7 +450,9 @@ Tensor unary_float_op_kernel(const Tensor& self, Func func,
             break; \
         }
         switch (self.dtype()) {
-            TENSORPLAY_FORALL_SCALAR_TYPES(INT_CASE) // This macro covers floats too, but we filtered with if
+            // Only the integral dtypes reach this branch; a case per float or bool
+            // dtype would be two more instantiated loops per map for nothing.
+            TENSORPLAY_FORALL_INT_TYPES(INT_CASE)
             default: TP_THROW(TypeError, "Unsupported dtype");
         }
         #undef INT_CASE
