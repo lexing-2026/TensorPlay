@@ -398,3 +398,120 @@ def test_dequantize_affine_refuses_operands_it_cannot_read():
     with pytest.raises(RuntimeError):
         short = tp.from_numpy(scales[:8].copy()).to("vulkan")
         tp.dequantize_affine(weight, [1, 4], short, None)
+
+
+# A matrix of codes spends four bytes of a texel on each code that needs one, so
+# the entry that attaches an affine parameter set to a matrix already on the
+# device reserves the codes in words instead.  The first two shapes below do have
+# an image form, so it is the width of a code and not the shape that keeps the
+# payload linear; the third is one no image covers at all, where the reservation
+# has to agree with the shape rather than draw a texel back.
+@pytest.mark.parametrize("n,k", [(97, 64), (12, 1), (16384, 8)])
+def test_a_matrix_of_codes_named_on_the_device_lands_in_words(n, k):
+    rng = np.random.default_rng(n * 11 + k)
+    codes = rng.integers(-128, 128, (n, k)).astype(np.int8)
+    weight = tp._C._make_per_tensor_quantized_tensor(
+        tp.from_numpy(codes.copy()).to("vulkan"), 0.25, -4)
+    assert weight.data_ptr() != 0, "the codes were not kept in words"
+    assert tuple(weight.shape) == (n, k)
+    np.testing.assert_array_equal(int_repr(weight).cpu().numpy(), codes)
+    expected = 0.25 * (codes.astype(np.float32) + 4.0)
+    np.testing.assert_array_equal(
+        tp.dequantize(weight).cpu().numpy(), expected)
+
+
+# That reservation runs through the strided gather, so the order the incoming
+# matrix names is the order that lands dense: codes whose storage sits the other
+# way round still arrive with the row a product later multiplies, and the
+# reference below reads that same row.
+def test_a_matrix_of_codes_named_from_a_transposed_arrival_is_dense():
+    rng = np.random.default_rng(29)
+    codes = rng.integers(-128, 128, (9, 7)).astype(np.int8)
+    stored = tp.from_numpy(codes.copy()).to("vulkan")
+    weight = tp._C._make_per_tensor_quantized_tensor(
+        stored.transpose(0, 1), 0.5, 3)
+    assert weight.data_ptr() != 0, "a transposed arrival was not kept in words"
+    assert tuple(weight.shape) == (7, 9)
+    named = codes.T
+    np.testing.assert_array_equal(int_repr(weight).cpu().numpy(), named)
+    expected = 0.5 * (named.astype(np.float32) - 3.0)
+    np.testing.assert_array_equal(
+        tp.dequantize(weight).cpu().numpy(), expected)
+
+
+# The tiled product samples four channels of one texel per fetch, so an operand
+# that arrives in words is laid out as an image once before the walk rather than
+# refused.  The crossing costs one pass and the walk reads every code many times
+# over, and the answer stays exactly the one the host reference computes from the
+# same codes.
+@pytest.mark.parametrize("m,k,n", [(4, 16, 8), (17, 33, 5)])
+def test_quantized_linear_of_a_weight_named_on_the_device(m, k, n):
+    rng = np.random.default_rng(m * 31 + k * 7 + n)
+    x_codes = rng.integers(-32, 33, (m, k), dtype=np.int32)
+    w_codes = rng.integers(-32, 33, (n, k), dtype=np.int32)
+    x_scale, x_zp = 0.125, -3
+    w_scales = np.exp2(-rng.integers(2, 6, n)).astype(np.float32)
+    w_zps = rng.integers(-4, 5, n, dtype=np.int32)
+    bias_values = rng.integers(-8, 9, n).astype(np.float32)
+
+    xq = tp._C._make_per_tensor_quantized_tensor(
+        tp.from_numpy(x_codes.astype(np.int8).copy()).to("vulkan"),
+        x_scale, x_zp)
+    wq = tp._C._make_per_tensor_quantized_tensor(
+        tp.from_numpy(w_codes.astype(np.int8).copy()).to("vulkan"), 1.0, 0)
+    assert xq.data_ptr() != 0 and wq.data_ptr() != 0
+
+    out = tp._C.quantized_linear(
+        xq,
+        wq,
+        x_scale,
+        x_zp,
+        tp.tensor(w_scales, dtype=tp.float32),
+        tp.tensor(w_zps, dtype=tp.int32),
+        tp.tensor(bias_values, dtype=tp.float32),
+        0.25,
+        3,
+    )
+    acc = (x_codes - x_zp) @ (w_codes - w_zps[:, None]).T
+    expected = np.clip(
+        np.rint((acc * x_scale * w_scales + bias_values) / 0.25) + 3,
+        -128,
+        127,
+    ).astype(np.int8)
+    assert out.dtype == tp.qint8
+    np.testing.assert_array_equal(int_repr(out).cpu().numpy(), expected)
+
+
+# Both remaining walks read a texel's four byte lanes too, so a pair of matrices
+# the entry above kept in words crosses into images before either folds.  The
+# rounding back into the byte is the host's own, so the check is one call over
+# the same codes and the same parameters on both sides of the transfer.
+def test_quantized_binary_and_clamp_answer_from_words_backed_matrices():
+    rng = np.random.default_rng(71)
+    a_codes = rng.integers(-128, 129, (23, 5)).astype(np.int8)
+    b_codes = rng.integers(-128, 129, (23, 5)).astype(np.int8)
+
+    a_cpu = tp._C._make_per_tensor_quantized_tensor(
+        tp.from_numpy(a_codes.copy()), 0.1, 5)
+    b_cpu = tp._C._make_per_tensor_quantized_tensor(
+        tp.from_numpy(b_codes.copy()), 0.2, -3)
+    a = tp._C._make_per_tensor_quantized_tensor(
+        tp.from_numpy(a_codes.copy()).to("vulkan"), 0.1, 5)
+    b = tp._C._make_per_tensor_quantized_tensor(
+        tp.from_numpy(b_codes.copy()).to("vulkan"), 0.2, -3)
+    assert a.data_ptr() != 0 and b.data_ptr() != 0
+
+    for name, out_scale, out_zp in (
+        ("quantized_add", 0.05, 7),
+        ("quantized_mul", 0.4, -1),
+    ):
+        run = getattr(tp._C, name)
+        got = run(a, b, 0.1, 5, 0.2, -3, out_scale, out_zp)
+        want = run(a_cpu, b_cpu, 0.1, 5, 0.2, -3, out_scale, out_zp)
+        np.testing.assert_array_equal(
+            int_repr(got).cpu().numpy(), int_repr(want).cpu().numpy())
+
+    got = tp._C.quantized_clamp(a, 0.1, 5, 0.1, 5, 0.15, 0.45)
+    want = tp._C.quantized_clamp(a_cpu, 0.1, 5, 0.1, 5, 0.15, 0.45)
+    np.testing.assert_array_equal(
+        int_repr(got).cpu().numpy(), int_repr(want).cpu().numpy())

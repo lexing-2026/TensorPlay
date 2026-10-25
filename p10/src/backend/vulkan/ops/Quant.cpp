@@ -8,6 +8,8 @@
 #include "Quantizer.h"
 #include "Utils.h"
 
+#include "TensorImpl.h"
+
 #include <Utils.h>
 
 #include <algorithm>
@@ -21,6 +23,15 @@
 namespace tensorplay {
 namespace vulkan {
 namespace ops {
+
+// Defined in View.cpp; materializes a strided view into a dense payload, in the
+// storage class the caller names when it names one.
+Tensor materialize_view(
+    const Tensor& self,
+    const std::vector<int64_t>& out_sizes,
+    const std::vector<int64_t>& out_strides,
+    int64_t storage_offset,
+    std::optional<api::StorageType> destination = std::nullopt);
 
 // Cache tag for the height-packed Int8 weight payload of quantized_linear.
 // Distinct from the mm packing tags in Matmul.cpp (10..15).
@@ -661,14 +672,13 @@ Tensor quantized_binary_kernel_impl(
 
   api::Context* const context = api::context();
 
-  api::vTensor v_a = convert(a);
-  api::vTensor v_b = convert(b);
-  if (v_a.storage_type() != api::StorageType::TEXTURE_3D ||
-      v_b.storage_type() != api::StorageType::TEXTURE_3D) {
-    TP_THROW(
-        NotImplementedError,
-        "Vulkan quantized ops require texture storage");
-  }
+  // Both operands are read by texel, so a payload that arrives in words is
+  // laid out as an image first: one pass of the strided gather, and an operand
+  // that is already an image comes back without a copy.
+  const Tensor a_image = to_image_storage(context, a);
+  const Tensor b_image = to_image_storage(context, b);
+  api::vTensor v_a = convert(a_image);
+  api::vTensor v_b = convert(b_image);
 
   api::vTensor v_output{context, result_sizes, DType::Int8};
 
@@ -792,12 +802,11 @@ Tensor quantized_clamp_kernel(
 
   api::Context* const context = api::context();
 
-  api::vTensor v_input = convert(self);
-  if (v_input.storage_type() != api::StorageType::TEXTURE_3D) {
-    TP_THROW(
-        NotImplementedError,
-        "Vulkan quantized clamp requires texture storage");
-  }
+  // The walk reads and writes a texel's four byte lanes, so a payload that
+  // arrives in words is laid out as an image first: one pass of the strided
+  // gather, and an operand that is already an image comes back without a copy.
+  const Tensor input_image = to_image_storage(context, self);
+  api::vTensor v_input = convert(input_image);
 
   api::vTensor v_output{context, v_input.sizes(), DType::Int8};
 
@@ -966,14 +975,15 @@ Tensor quantized_linear_kernel(
 
   api::Context* const context = api::context();
 
-  api::vTensor v_input = convert(input);
-  api::vTensor v_weight = convert(weight);
-  if (v_input.storage_type() != api::StorageType::TEXTURE_3D ||
-      v_weight.storage_type() != api::StorageType::TEXTURE_3D) {
-    TP_THROW(
-        NotImplementedError,
-        "Vulkan quantized_linear requires texture storage");
-  }
+  // The tiled walk samples four channels of a texel per fetch, so a payload
+  // that arrives in words is laid out as texels first.  The crossing is one
+  // pass of the strided gather and pays for itself when the walk reads the
+  // payload many times; a shape too large for any image has no texel form to
+  // cross into and says so.
+  const Tensor input_image = to_image_storage(context, input);
+  const Tensor weight_image = to_image_storage(context, weight);
+  api::vTensor v_input = convert(input_image);
+  api::vTensor v_weight = convert(weight_image);
 
   // Pack the per-channel parameters into a 3-row float texture indexed by
   // the output channel: scale (row 0), zero point (row 1), bias (row 2).
@@ -1831,6 +1841,12 @@ Tensor int_repr_kernel(const Tensor& self) {
 // a weight uploaded once never crosses back over the host, and the copy keeps
 // the quantized tensor independent of the integer tensor it was made from.
 //
+// A matrix of codes is copied into linear storage rather than where its shape
+// alone would reserve it: a texel spends four bytes on a code that needs one,
+// and the affine readers that walk a weight take the whole word four codes
+// share.  The crossing is the strided gather, so a payload that arrives
+// transposed or part-way into its storage still lands dense and whole.
+//
 Tensor make_per_tensor_quantized_tensor_kernel(
     const Tensor& self,
     double scale,
@@ -1843,8 +1859,21 @@ Tensor make_per_tensor_quantized_tensor_kernel(
       isQuantizedType(quantized_dtype),
       "Vulkan _make_per_tensor_quantized_tensor: expected an Int8, UInt8 or "
       "Int32 code payload to name");
+  Tensor codes;
+  if (quantized_dtype == DType::QInt8 && self.dim() == 2) {
+    const std::vector<int64_t> sizes =
+        static_cast<std::vector<int64_t>>(self.shape());
+    codes = materialize_view(
+        self,
+        sizes,
+        self.strides(),
+        static_cast<int64_t>(self.unsafeGetTensorImpl()->storage_offset()),
+        api::StorageType::BUFFER);
+  } else {
+    codes = clone_kernel(self);
+  }
   return quantized::make_qtensor(
-      clone_kernel(self),
+      std::move(codes),
       make_per_tensor_affine_quantizer(scale, zero_point, quantized_dtype),
       quantized_dtype);
 }
