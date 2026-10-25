@@ -3,6 +3,7 @@
 #include "Macros.h"
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 
 namespace tensorplay {
@@ -175,16 +176,34 @@ inline void parallel_for_balanced(int64_t begin, int64_t end,
 
 namespace internal {
 
+// The one callable type the cores are handed: the body stays where the caller
+// holds it (the cores return only after every range has run) and is reached
+// through a trampoline per body type.  A std::function built from each body
+// would instantiate its whole type-erasure machinery once per lambda, which
+// across a kernel file of dtype-switched loops costs gigabytes of compiler
+// memory; built from this it is instantiated once.
+struct RangeBodyRef {
+  const void* body;
+  void (*call)(const void* body, int64_t begin, int64_t end);
+  void operator()(int64_t b, int64_t e) const { call(body, b, e); }
+};
+
+template <class F>
+RangeBodyRef range_body_ref(const F& f) {
+  return {std::addressof(f), [](const void* body, int64_t b, int64_t e) {
+            (*static_cast<const F*>(body))(b, e);
+          }};
+}
+
 template <class F>
 void invoke_parallel(int64_t begin, int64_t end, int64_t grain_size, const F& f) {
-  invoke_parallel_impl(begin, end, grain_size, [&f](int64_t b, int64_t e) { f(b, e); });
+  invoke_parallel_impl(begin, end, grain_size, range_body_ref(f));
 }
 
 template <class F>
 void invoke_parallel_balanced(int64_t begin, int64_t end, int64_t grain_size,
                               const F& f) {
-  invoke_parallel_balanced_impl(
-      begin, end, grain_size, [&f](int64_t b, int64_t e) { f(b, e); });
+  invoke_parallel_balanced_impl(begin, end, grain_size, range_body_ref(f));
 }
 
 } // namespace internal
