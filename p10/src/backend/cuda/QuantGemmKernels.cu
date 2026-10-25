@@ -481,6 +481,14 @@ constexpr __host__ __device__ bool isPowerOf2(T v) {
   return (v && !(v & (v - 1)));
 }
 
+// The tinygemm schedule below and the direct tensor-core GEMM further down are
+// written in one vendor's matrix and copy instructions (mma.sync, cp.async,
+// ldmatrix, lop3), which the AMD toolchain does not have.  Neither is reached
+// on any lane -- the tinygemm launcher has no caller and the direct path is
+// switched off in _weight_int4pack_mm_cuda -- so the AMD lane compiles both
+// out, as it does the toolchain-specific attention schedules.
+#if !defined(USE_ROCM)
+
 // Converts eight int4 nibbles held in one uint32 into four bf16x2 values
 // representing the signed int4 range [-8, 7], then applies the per-group
 // (scale, zero):  reconstructed = bf16(int4) * scale + zero.
@@ -823,6 +831,8 @@ void launch_tinygemm_kernel(const Tensor& A, const Tensor& B,
   checkCuda(cudaGetLastError(), "int4 tinygemm kernel");
 }
 
+#endif // !defined(USE_ROCM)
+
 // Repacks the packed nibble tensor [n][k/2] (uint8) into the m16n8k16
 // B-fragment layout [n/8][k/(InnerKTiles*16)][32][InnerKTiles/2] (int32).
 template <int InnerKTiles>
@@ -866,6 +876,7 @@ __global__ void matrix_to_m16n8k16_Bint4_layout(
   }
 }
 
+#if !defined(USE_ROCM)
 // ---------------------------------------------------------------------------
 // Large-tile direct int4 tensor-core GEMM.
 //
@@ -1151,6 +1162,8 @@ __global__ __launch_bounds__(256) void int4pack_tc_mm_kernel(
   }
 }
 
+#endif // !defined(USE_ROCM)
+
 // Dequantizes the m16n8k16-packed weight back to a dense [N, K] matrix.
 // One thread per packed int32 word; each word expands to eight output
 // elements along K for one row.
@@ -1249,6 +1262,7 @@ Tensor _weight_int4pack_mm_cuda(const Tensor& self, const Tensor& mat2,
     // throughput than the hand-written MMA loop on current hardware, so the
     // cuBLAS path is faster for production shapes.  Flip this flag to true
     // to route aligned fp16/bf16 shapes through the direct path instead.
+#if !defined(USE_ROCM)
     const bool direct_ok = false;
     if (direct_ok) {
         Tensor A = self.contiguous();
@@ -1279,6 +1293,7 @@ Tensor _weight_int4pack_mm_cuda(const Tensor& self, const Tensor& mat2,
         checkCuda(cudaGetLastError(), "int4pack tc mm kernel");
         return C;
     }
+#endif
 
     // Fallback: dequantize the packed weight (from the tensor-core layout)
     // and run a cuBLAS GEMM (out = activations @ weight.T).
@@ -1419,7 +1434,7 @@ __global__ void rowwise_quantize_kernel(const scalar_t* __restrict__ x,
         absmax = fmaxf(absmax, fabsf(static_cast<float>(row_ptr[i])));
     }
     for (int offset = 16; offset > 0; offset >>= 1) {
-        absmax = fmaxf(absmax, __shfl_down_sync(0xffffffffu, absmax, offset));
+        absmax = fmaxf(absmax, __shfl_down_sync(0xffffffffffffffffull, absmax, offset));
     }
     __shared__ float s_max[32];
     const int lane = tid & 31;
@@ -1429,7 +1444,7 @@ __global__ void rowwise_quantize_kernel(const scalar_t* __restrict__ x,
     if (warp == 0) {
         absmax = (lane < (nthreads >> 5)) ? s_max[lane] : 0.0f;
         for (int offset = 16; offset > 0; offset >>= 1) {
-            absmax = fmaxf(absmax, __shfl_down_sync(0xffffffffu, absmax, offset));
+            absmax = fmaxf(absmax, __shfl_down_sync(0xffffffffffffffffull, absmax, offset));
         }
         if (lane == 0) s_max[0] = absmax;
     }
@@ -1465,7 +1480,7 @@ __global__ void rowwise_quantize_shared_kernel(
         absmax = fmaxf(absmax, fabsf(v));
     }
     for (int offset = 16; offset > 0; offset >>= 1) {
-        absmax = fmaxf(absmax, __shfl_down_sync(0xffffffffu, absmax, offset));
+        absmax = fmaxf(absmax, __shfl_down_sync(0xffffffffffffffffull, absmax, offset));
     }
     __shared__ float s_max[32];
     const int lane = tid & 31;
@@ -1475,7 +1490,7 @@ __global__ void rowwise_quantize_shared_kernel(
     if (warp == 0) {
         absmax = (lane < (nthreads >> 5)) ? s_max[lane] : 0.0f;
         for (int offset = 16; offset > 0; offset >>= 1) {
-            absmax = fmaxf(absmax, __shfl_down_sync(0xffffffffu, absmax, offset));
+            absmax = fmaxf(absmax, __shfl_down_sync(0xffffffffffffffffull, absmax, offset));
         }
         if (lane == 0) s_max[0] = absmax;
     }

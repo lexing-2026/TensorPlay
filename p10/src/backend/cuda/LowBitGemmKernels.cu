@@ -40,7 +40,7 @@ __global__ void lowbit_quantize_kernel(const scalar_t* __restrict__ x,
         absmax = fmaxf(absmax, fabsf(static_cast<float>(row_ptr[i])));
     }
     for (int offset = 16; offset > 0; offset >>= 1) {
-        absmax = fmaxf(absmax, __shfl_down_sync(0xffffffffu, absmax, offset));
+        absmax = fmaxf(absmax, __shfl_down_sync(0xffffffffffffffffull, absmax, offset));
     }
     __shared__ float s_max[32];
     const int lane = tid & 31;
@@ -50,7 +50,7 @@ __global__ void lowbit_quantize_kernel(const scalar_t* __restrict__ x,
     if (warp == 0) {
         absmax = (lane < (nthreads >> 5)) ? s_max[lane] : 0.0f;
         for (int offset = 16; offset > 0; offset >>= 1) {
-            absmax = fmaxf(absmax, __shfl_down_sync(0xffffffffu, absmax, offset));
+            absmax = fmaxf(absmax, __shfl_down_sync(0xffffffffffffffffull, absmax, offset));
         }
         if (lane == 0) s_max[0] = absmax;
     }

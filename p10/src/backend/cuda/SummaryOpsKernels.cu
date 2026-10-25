@@ -334,8 +334,8 @@ __device__ inline int32_t mode_run_start(
 __device__ inline int32_t mode_block_longest_run(int32_t length,
                                                  int32_t position) {
     for (int offset = 16; offset > 0; offset >>= 1) {
-        const int32_t other_length = __shfl_down_sync(0xffffffffu, length, offset);
-        const int32_t other_position = __shfl_down_sync(0xffffffffu, position, offset);
+        const int32_t other_length = __shfl_down_sync(0xffffffffffffffffull, length, offset);
+        const int32_t other_position = __shfl_down_sync(0xffffffffffffffffull, position, offset);
         if (other_length > length ||
             (other_length == length && other_position < position)) {
             length = other_length;
@@ -357,9 +357,9 @@ __device__ inline int32_t mode_block_longest_run(int32_t length,
         position = lane < warps ? warp_positions[lane] : 0;
         for (int offset = 16; offset > 0; offset >>= 1) {
             const int32_t other_length =
-                __shfl_down_sync(0xffffffffu, length, offset);
+                __shfl_down_sync(0xffffffffffffffffull, length, offset);
             const int32_t other_position =
-                __shfl_down_sync(0xffffffffu, position, offset);
+                __shfl_down_sync(0xffffffffffffffffull, position, offset);
             if (other_length > length ||
                 (other_length == length && other_position < position)) {
                 length = other_length;
@@ -388,7 +388,7 @@ template <typename IndexType>
 __device__ inline void mode_block_span(IndexType own, bool farthest,
                                        IndexType* result) {
     for (int offset = 16; offset > 0; offset >>= 1) {
-        const IndexType other = __shfl_down_sync(0xffffffffu, own, offset);
+        const IndexType other = __shfl_down_sync(0xffffffffffffffffull, own, offset);
         if (farthest) {
             if (other > own) own = other;
         } else if (other >= 0 && (own < 0 || other < own)) {

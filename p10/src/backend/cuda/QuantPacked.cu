@@ -368,8 +368,8 @@ __global__ void packed_gemv(const X* input,const int8_t* weight,const int64_t* o
         sum+=dot4(a,0x01010101,0);
     }
     for (int step=16;step;step/=2) {
-        acc+=__shfl_down_sync(0xffffffffu,acc,step);
-        sum+=__shfl_down_sync(0xffffffffu,sum,step);
+        acc+=__shfl_down_sync(0xffffffffffffffffull,acc,step);
+        sum+=__shfl_down_sync(0xffffffffffffffffull,sum,step);
     }
     if (lane) return;
     if (output_float && shift==128) acc-=shift*offsets[n];

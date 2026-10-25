@@ -202,6 +202,25 @@ __device__ inline void topk_count_radix_using_mask(
   }
   __syncthreads();
 
+#if defined(USE_ROCM)
+  // The AMD toolchain has no match-any, so each lane whose value fits the
+  // pattern adds itself to its digit; the counts are the same, reached with
+  // one atomic per value instead of one per group.
+  for (IndexType i = static_cast<IndexType>(threadIdx.x); i < slice_size;
+       i += static_cast<IndexType>(blockDim.x)) {
+    const Key value = TopKRadixTraits<T>::encode(
+        topk_load(&data[i * within_slice_stride]));
+    if ((value & desired_mask) == desired) {
+      const unsigned bucket = static_cast<unsigned>(
+          (value >> digit_pos) & static_cast<Key>(radix_size - 1));
+      if constexpr (sizeof(IndexType) == sizeof(uint32_t)) {
+        atomicAdd(&smem[bucket], static_cast<IndexType>(1));
+      } else {
+        atomicAdd(reinterpret_cast<unsigned long long*>(&smem[bucket]), 1ull);
+      }
+    }
+  }
+#else
   unsigned active = __ballot_sync(0xffffffffu,
                                   static_cast<IndexType>(threadIdx.x) <
                                       slice_size);
@@ -227,6 +246,7 @@ __device__ inline void topk_count_radix_using_mask(
     i += static_cast<IndexType>(blockDim.x);
     active = __ballot_sync(active, i < slice_size);
   }
+#endif
   __syncthreads();
 #pragma unroll
   for (int i = 0; i < radix_size; ++i) counts[i] = smem[i];
