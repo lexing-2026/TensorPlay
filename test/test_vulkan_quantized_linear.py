@@ -483,13 +483,51 @@ def test_quantized_linear_of_a_weight_named_on_the_device(m, k, n):
     np.testing.assert_array_equal(int_repr(out).cpu().numpy(), expected)
 
 
+# A matrix the device quantizer writes keeps a byte per code, since four codes
+# share the word that one float filled, while a payload whose shape draws an
+# image keeps the texel walk.  Both routes round the way the host does: to the
+# even neighbour, then clamped into the code range, so the corners below sit far
+# outside it.  A width that does not divide by four leaves a partly used word the
+# run has to stop before, which is what the short shapes probe.
+@pytest.mark.parametrize("shape", [(6,), (4, 16), (5, 7), (2, 3, 4)])
+def test_a_device_quantizer_writes_codes_where_its_shape_keeps_them(shape):
+    rng = np.random.default_rng(7 + 11 * sum(shape) + 5 * len(shape))
+    values = (rng.normal(0.0, 6.0, shape) * 4.0).astype(np.float32)
+    values.flat[0] = 1.0e3
+    values.flat[1] = -1.0e3
+    scale, zero_point = 0.25, 4
+
+    q = tp._C.quantize_per_tensor(
+        tp.tensor(values, dtype=tp.float32).to("vulkan"),
+        scale,
+        zero_point,
+        tp.qint8,
+    )
+    expected = np.clip(
+        np.rint(values / scale) + zero_point, -128, 127
+    ).astype(np.int8)
+    np.testing.assert_array_equal(int_repr(q).cpu().numpy(), expected)
+    assert (q.data_ptr() != 0) == (len(shape) == 2), (
+        "the codes did not land where the shape keeps them")
+
+    # The undo reads the codes back from the class they landed in, so a round
+    # trip names the quantized grid rather than the incoming value.
+    np.testing.assert_allclose(
+        tp.dequantize(q).cpu().numpy(),
+        (expected.astype(np.int64) - zero_point) * scale,
+        rtol=0.0,
+        atol=1e-6,
+    )
+
+
 # A decode step pairs an activation the device quantizer just wrote with a
-# weight that was uploaded once and named, and those two arrive in different
-# classes: the codes of the first still sit in the lanes of a texel, the codes of
-# the second one byte per word.  Each operand is packed from the class it is in,
-# so the pair answers the same product the host reference gives.
+# weight that was uploaded once and named.  Both now keep a byte per code, so the
+# product reads the two through the same word-bound pack, and the answer is the
+# one the host reference gives.
 @pytest.mark.parametrize("m,k,n", [(1, 13, 6), (4, 16, 8)])
-def test_quantized_linear_of_an_image_activation_and_a_word_weight(m, k, n):
+def test_quantized_linear_of_the_two_routes_a_matrix_of_codes_can_arrive_by(
+    m, k, n
+):
     rng = np.random.default_rng(m * 17 + k * 11 + n)
     x_codes = rng.integers(-32, 33, (m, k), dtype=np.int32)
     w_codes = rng.integers(-32, 33, (n, k), dtype=np.int32)
@@ -502,7 +540,7 @@ def test_quantized_linear_of_an_image_activation_and_a_word_weight(m, k, n):
         x_scale, x_zp, tp.qint8)
     wq = tp._C._make_per_tensor_quantized_tensor(
         tp.from_numpy(w_codes.astype(np.int8).copy()).to("vulkan"), 1.0, 0)
-    assert xq.data_ptr() == 0, "a device-quantized activation was not an image"
+    assert xq.data_ptr() != 0, "a device-quantized activation was not kept in words"
     assert wq.data_ptr() != 0, "the weight codes were not kept in words"
 
     out = tp._C.quantized_linear(
@@ -521,6 +559,33 @@ def test_quantized_linear_of_an_image_activation_and_a_word_weight(m, k, n):
         np.rint(acc * x_scale * w_scales / 0.5) - 1, -128, 127
     ).astype(np.int8)
     np.testing.assert_array_equal(int_repr(out).cpu().numpy(), expected)
+
+    # An elementwise fold still writes its result into a texel's four byte
+    # lanes, so the same codes pushed through a fold that changes nothing
+    # arrive in the other class.  The product packs from whichever class an
+    # operand is in, and both routes have to answer the same codes.
+    x_image = tp._C.quantized_clamp(
+        xq, x_scale, x_zp, x_scale, x_zp, -1.0e9, 1.0e9)
+    w_image = tp._C.quantized_clamp(wq, 1.0, 0, 1.0, 0, -1.0e9, 1.0e9)
+    assert x_image.data_ptr() == 0 and w_image.data_ptr() == 0, (
+        "the fold did not leave the codes in a texel")
+    np.testing.assert_array_equal(
+        int_repr(x_image).cpu().numpy(), int_repr(xq).cpu().numpy())
+
+    out_image = tp._C.quantized_linear(
+        x_image,
+        w_image,
+        x_scale,
+        x_zp,
+        tp.tensor(w_scales, dtype=tp.float32),
+        tp.tensor(w_zps, dtype=tp.int32),
+        None,
+        0.5,
+        -1,
+    )
+    np.testing.assert_array_equal(
+        int_repr(out_image).cpu().numpy(), expected)
+
 
 
 # Both remaining walks read a texel's four byte lanes too, so a pair of matrices

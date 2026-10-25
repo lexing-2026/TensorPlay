@@ -219,13 +219,71 @@ Tensor quantize_per_tensor_qint8_kernel(
   // Downcast double inputs once on the host so the shader reads floats.
   const Tensor input_f32 =
       self.dtype() == DType::Float64 ? self.to(DType::Float32) : self;
-  // The walk below samples and writes texels, and a code payload has no linear
-  // twin, so a payload the shape keeps in words crosses into an image first.
-  const Tensor input = to_image_storage(context, input_f32);
-  api::vTensor v_src = convert(input);
+  api::vTensor v_src = convert(input_f32);
+
+  // A payload the shape keeps in words writes its codes into words too, a byte
+  // to a code, so the two ways a code matrix can reach the device agree about
+  // where it sits: an upload stores one, and quantizing on the device stores
+  // the same.  Neither pass turns the payload over first, and the packed forms
+  // the products read are unchanged.
+  if (v_src.storage_type() == api::StorageType::BUFFER) {
+    api::vTensor v_output{
+        context,
+        v_src.sizes(),
+        DType::Int8,
+        api::StorageType::BUFFER,
+        api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+
+    const struct QuantizeLinearBlock final {
+      float inv_scale; // 1 / scale
+      int32_t zero_point;
+      int32_t quant_min;
+      int32_t quant_max;
+      uint32_t buf_length; // element count, shared by both payloads
+      int32_t fill;
+    } block{
+        static_cast<float>(1.0 / scale),
+        static_cast<int32_t>(zero_point),
+        static_cast<int32_t>(quant_min),
+        static_cast<int32_t>(quant_max),
+        static_cast<uint32_t>(v_output.numel()),
+        0};
+
+    api::UniformParamsBuffer params(context, block);
+    api::PipelineBarrier pipeline_barrier{};
+
+    // One invocation owns one word of four codes.
+    const api::utils::uvec3 grid{
+        api::utils::div_up(
+            api::utils::safe_downcast_to_u32(
+                static_cast<int64_t>(v_output.numel())),
+            4u),
+        1u,
+        1u};
+
+    context->submit_compute_job(
+        VK_KERNEL(quantize_per_tensor_buffer),
+        pipeline_barrier,
+        grid,
+        adaptive_work_group_size(grid),
+        VK_NULL_HANDLE,
+        v_output.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::WRITE),
+        v_src.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+        params.buffer());
+
+    return quantized::make_qtensor(
+        convert(v_output),
+        make_per_tensor_affine_quantizer(scale, zero_point, DType::QInt8),
+        DType::QInt8);
+  }
 
   // The output texture is allocated over the underlying integer code type;
-  // the quantized dtype view with its quantizer is wrapped on below.
+  // the quantized dtype view with its quantizer is wrapped on below.  The walk
+  // samples and writes texels, and only a payload that already draws an image
+  // can be read that way; the shapes that draw words took the route above.
   api::vTensor v_output =
       allocate_output(context, api::StorageType::TEXTURE_3D,
                       v_src.sizes(), DType::Int8);
