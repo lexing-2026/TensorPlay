@@ -98,14 +98,14 @@ Tensor spherical_bessel_j0_cpu(const Tensor& self) {
         "spherical_bessel_j0", cpu::vecunary::VOp::SphBesselJ0);
 }
 Tensor modified_bessel_i0_cpu(const Tensor& self) {
-    return float_math_kernel(self,
-                             [](double x) { return modified_bessel_i0_forward(x); },
-                             "modified_bessel_i0");
+    return float_math_vec_kernel(
+        self, [](double x) { return modified_bessel_i0_forward(x); },
+        "modified_bessel_i0", cpu::vecunary::VOp::I0);
 }
 Tensor modified_bessel_i1_cpu(const Tensor& self) {
-    return float_math_kernel(self,
-                             [](double x) { return modified_bessel_i1_forward(x); },
-                             "modified_bessel_i1");
+    return float_math_vec_kernel(
+        self, [](double x) { return modified_bessel_i1_forward(x); },
+        "modified_bessel_i1", cpu::vecunary::VOp::I1);
 }
 Tensor modified_bessel_k0_cpu(const Tensor& self) {
     return float_math_kernel(self,
@@ -128,10 +128,13 @@ Tensor scaled_modified_bessel_k1_cpu(const Tensor& self) {
                              "scaled_modified_bessel_k1");
 }
 Tensor i0e_cpu(const Tensor& self) {
-    return float_math_kernel(self, [](double x) { return calc_i0e(x); }, "i0e");
+    return float_math_vec_kernel(self, [](double x) { return calc_i0e(x); }, "i0e",
+                                 cpu::vecunary::VOp::I0e);
 }
 Tensor i1_cpu(const Tensor& self) {
-    return float_math_kernel(self, [](double x) { return modified_bessel_i1_forward(x); }, "i1");
+    return float_math_vec_kernel(
+        self, [](double x) { return modified_bessel_i1_forward(x); }, "i1",
+        cpu::vecunary::VOp::I1);
 }
 Tensor i1e_cpu(const Tensor& self) {
     return float_math_vec_kernel(self, [](double x) { return calc_i1e(x); }, "i1e",

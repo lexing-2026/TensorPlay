@@ -64,7 +64,7 @@ enum class VOp : int {
     // fix-up, so they need no kernel of their own
     Sinc, Entr, Logit, SphBesselJ0,
     // Chebyshev series evaluated across the lanes (see the Bessel block below)
-    I1e,
+    I0e, I0, I1e, I1,
     // library-only: no vector form below, so these run the scalar tail unless
     // the library is linked in
     Ndtr, NdtrI, Erfcx,
@@ -220,7 +220,10 @@ inline T scalar_apply(VOp op, VParams prm, T x) {
             return std::log(p / (T(1) - p));
         }
         case VOp::SphBesselJ0: return spherical_j0_from_sin(x, std::sin(x));
+        case VOp::I0e: return special_math::calc_i0e(x);
+        case VOp::I0: return special_math::calc_i0(x);
         case VOp::I1e: return special_math::calc_i1e(x);
+        case VOp::I1: return special_math::modified_bessel_i1_forward(x);
         case VOp::Lgamma: return std::lgamma(x);
         case VOp::Sigmoid: return T(1) / (T(1) + std::exp(-x));
         case VOp::GeluNone: {
@@ -3165,9 +3168,9 @@ inline bool composed_f64(VOp op, VParams prm, const double* src, double* dst, in
 // index: one value can only advance one step at a time, so a single value is a
 // pure latency chain.  The parallelism has to come from the values instead --
 // eight of them (four for double) walk the coefficient list together, which
-// turns latency into throughput.  A group that holds a value outside the
-// series interval, or a non-finite one, takes the scalar routine; the check is
-// per group, so ordinary input never pays for it.
+// turns latency into throughput.  Each member is a pair of series, one for
+// |x| <= 8 and one above it, and the two differ only in how the result is
+// scaled, so the four members share one walk.
 // ---------------------------------------------------------------------------
 #if defined(TP_VECUNARY_X86) && defined(__x86_64__) \
     && (defined(__GNUC__) || defined(__clang__))
@@ -3175,9 +3178,9 @@ inline bool composed_f64(VOp op, VParams prm, const double* src, double* dst, in
 #endif
 
 #ifdef TP_VECUNARY_SIMD_MATH
-// The multiply, subtract and add are kept apart rather than fused: the scalar
-// routine rounds three times per step, and doing the same here keeps the lanes
-// bit-identical to it instead of trading a rounding step for a wider error.
+// The step is a fused multiply-add with the constant already subtracted, which
+// keeps it to one operation on the dependency chain; the scalar routine rounds
+// the same step twice, so a lane can sit a couple of ulp away from it.
 __attribute__((target("avx2,fma")))
 static inline __m256 chbevl_f32x8(__m256 x, const float* a, int len) {
     const __m256 zero = _mm256_setzero_ps();
@@ -3185,33 +3188,66 @@ static inline __m256 chbevl_f32x8(__m256 x, const float* a, int len) {
     for (int i = 1; i < len; ++i) {
         b2 = b1;
         b1 = b0;
-        b0 = _mm256_add_ps(_mm256_sub_ps(_mm256_mul_ps(x, b1), b2), _mm256_set1_ps(a[i]));
+        b0 = _mm256_fmadd_ps(x, b1, _mm256_sub_ps(_mm256_set1_ps(a[i]), b2));
     }
     return _mm256_mul_ps(_mm256_set1_ps(0.5f), _mm256_sub_ps(b0, b2));
 }
 
-// The series changes at |x| = 8: below it the argument is x/2 - 2 and the
-// result scales by x, above it the argument is 32/x - 2 and the result scales
-// by 1/sqrt(x).  A group that straddles the split evaluates both and blends,
-// which is cheaper than dropping the whole group to the scalar routine.
 __attribute__((target("avx2,fma")))
-static inline __m256 i1e_small_f32x8(__m256 x, const float* a, int len) {
+static inline __m256d chbevl_f64x4(__m256d x, const double* a, int len) {
+    const __m256d zero = _mm256_setzero_pd();
+    __m256d b0 = _mm256_set1_pd(a[0]), b1 = zero, b2 = zero;
+    for (int i = 1; i < len; ++i) {
+        b2 = b1;
+        b1 = b0;
+        b0 = _mm256_fmadd_pd(x, b1, _mm256_sub_pd(_mm256_set1_pd(a[i]), b2));
+    }
+    return _mm256_mul_pd(_mm256_set1_pd(0.5), _mm256_sub_pd(b0, b2));
+}
+
+// The series changes at |x| = 8: below it the argument is x/2 - 2 and the
+// result scales by x for the first-order pair, above it the argument is
+// 32/x - 2 and the result scales by 1/sqrt(x).  A group that straddles the
+// split evaluates both and blends, which is cheaper than dropping the whole
+// group to the scalar routine.
+//
+// The four members differ only in two scalings, so they share one walk:
+// kScaleX multiplies the small-branch result by x, kExp rescales by exp(x) on
+// both branches.  The first-order pair is odd and the zeroth-order pair even,
+// so kScaleX also picks whether a negative input flips the sign.
+template <bool kScaleX>
+__attribute__((target("avx2,fma")))
+static inline __m256 bessel_small_f32x8(__m256 x, const float* a, int len) {
     const __m256 y = _mm256_sub_ps(_mm256_mul_ps(x, _mm256_set1_ps(0.5f)),
                                    _mm256_set1_ps(2.0f));
-    return _mm256_mul_ps(chbevl_f32x8(y, a, len), x);
+    __m256 r = chbevl_f32x8(y, a, len);
+    if constexpr (kScaleX) r = _mm256_mul_ps(r, x);
+    return r;
 }
 
 __attribute__((target("avx2,fma")))
-static inline __m256 i1e_large_f32x8(__m256 x, const float* b, int len) {
+static inline __m256 bessel_large_f32x8(__m256 x, const float* b, int len) {
     const __m256 y = _mm256_sub_ps(_mm256_div_ps(_mm256_set1_ps(32.0f), x),
                                    _mm256_set1_ps(2.0f));
     return _mm256_div_ps(chbevl_f32x8(y, b, len), _mm256_sqrt_ps(x));
 }
 
+template <bool kScaleX>
 __attribute__((target("avx2,fma")))
-static void i1e_block_f32_avx2(const float* src, float* dst, int64_t b, int64_t e) {
-    const auto [small, small_len] = special_math::chebyshev_coefficients_i1e_A<float>();
-    const auto [large, large_len] = special_math::chebyshev_coefficients_i1e_B<float>();
+static inline __m256 bessel_core_f32x8(__m256 x, __m256 below, const float* small,
+                                       int small_len, const float* large, int large_len) {
+    const int lanes = _mm256_movemask_ps(below);
+    if (lanes == 0xFF) return bessel_small_f32x8<kScaleX>(x, small, small_len);
+    if (lanes == 0) return bessel_large_f32x8(x, large, large_len);
+    return _mm256_blendv_ps(bessel_large_f32x8(x, large, large_len),
+                            bessel_small_f32x8<kScaleX>(x, small, small_len), below);
+}
+
+template <bool kScaleX, bool kExp>
+__attribute__((target("avx2,fma")))
+static void bessel_i_family_f32_avx2(VOp op, const float* src, float* dst, int64_t b,
+                                     int64_t e, const float* small, int small_len,
+                                     const float* large, int large_len) {
     const __m256 sgn = _mm256_set1_ps(-0.0f);
     const __m256 eight = _mm256_set1_ps(8.0f);
     const __m256 zero = _mm256_setzero_ps();
@@ -3219,45 +3255,166 @@ static void i1e_block_f32_avx2(const float* src, float* dst, int64_t b, int64_t 
     for (; i + 8 <= e; i += 8) {
         const __m256 v = _mm256_loadu_ps(src + i);
         const __m256 x = _mm256_andnot_ps(sgn, v);
-        const __m256 below = _mm256_cmp_ps(x, eight, _CMP_LE_OQ);
-        const int lanes = _mm256_movemask_ps(below);
-        __m256 r;
-        if (lanes == 0xFF) {
-            r = i1e_small_f32x8(x, small, static_cast<int>(small_len));
-        } else if (lanes == 0) {
-            r = i1e_large_f32x8(x, large, static_cast<int>(large_len));
-        } else {
-            r = _mm256_blendv_ps(i1e_large_f32x8(x, large, static_cast<int>(large_len)),
-                                 i1e_small_f32x8(x, small, static_cast<int>(small_len)),
-                                 below);
-        }
-        r = _mm256_blendv_ps(r, _mm256_sub_ps(zero, r), _mm256_cmp_ps(v, zero, _CMP_LT_OQ));
+        __m256 r = bessel_core_f32x8<kScaleX>(x, _mm256_cmp_ps(x, eight, _CMP_LE_OQ),
+                                              small, small_len, large, large_len);
+        if constexpr (kExp) r = _mm256_mul_ps(r, tpsleef::exp(x));
+        if constexpr (kScaleX)
+            r = _mm256_blendv_ps(r, _mm256_sub_ps(zero, r),
+                                 _mm256_cmp_ps(v, zero, _CMP_LT_OQ));
         _mm256_storeu_ps(dst + i, r);
     }
-    for (; i < e; ++i) dst[i] = scalar_apply(VOp::I1e, {}, src[i]);
+    for (; i < e; ++i) dst[i] = scalar_apply(op, {}, src[i]);
+}
+
+template <bool kScaleX>
+__attribute__((target("avx2,fma")))
+static inline __m256d bessel_small_f64x4(__m256d x, const double* a, int len) {
+    const __m256d y = _mm256_sub_pd(_mm256_mul_pd(x, _mm256_set1_pd(0.5)),
+                                    _mm256_set1_pd(2.0));
+    __m256d r = chbevl_f64x4(y, a, len);
+    if constexpr (kScaleX) r = _mm256_mul_pd(r, x);
+    return r;
+}
+
+__attribute__((target("avx2,fma")))
+static inline __m256d bessel_large_f64x4(__m256d x, const double* b, int len) {
+    const __m256d y = _mm256_sub_pd(_mm256_div_pd(_mm256_set1_pd(32.0), x),
+                                    _mm256_set1_pd(2.0));
+    return _mm256_div_pd(chbevl_f64x4(y, b, len), _mm256_sqrt_pd(x));
+}
+
+template <bool kScaleX>
+__attribute__((target("avx2,fma")))
+static inline __m256d bessel_core_f64x4(__m256d x, __m256d below, const double* small,
+                                        int small_len, const double* large, int large_len) {
+    const int lanes = _mm256_movemask_pd(below);
+    if (lanes == 0xF) return bessel_small_f64x4<kScaleX>(x, small, small_len);
+    if (lanes == 0) return bessel_large_f64x4(x, large, large_len);
+    return _mm256_blendv_pd(bessel_large_f64x4(x, large, large_len),
+                            bessel_small_f64x4<kScaleX>(x, small, small_len), below);
+}
+
+template <bool kScaleX, bool kExp>
+__attribute__((target("avx2,fma")))
+static void bessel_i_family_f64_avx2(VOp op, const double* src, double* dst, int64_t b,
+                                     int64_t e, const double* small, int small_len,
+                                     const double* large, int large_len) {
+    const __m256d sgn = _mm256_set1_pd(-0.0);
+    const __m256d eight = _mm256_set1_pd(8.0);
+    const __m256d zero = _mm256_setzero_pd();
+    int64_t i = b;
+    for (; i + 4 <= e; i += 4) {
+        const __m256d v = _mm256_loadu_pd(src + i);
+        const __m256d x = _mm256_andnot_pd(sgn, v);
+        __m256d r = bessel_core_f64x4<kScaleX>(x, _mm256_cmp_pd(x, eight, _CMP_LE_OQ),
+                                               small, small_len, large, large_len);
+        if constexpr (kExp) r = _mm256_mul_pd(r, tpsleef::exp(x));
+        if constexpr (kScaleX)
+            r = _mm256_blendv_pd(r, _mm256_sub_pd(zero, r),
+                                 _mm256_cmp_pd(v, zero, _CMP_LT_OQ));
+        _mm256_storeu_pd(dst + i, r);
+    }
+    for (; i < e; ++i) dst[i] = scalar_apply(op, {}, src[i]);
 }
 #endif
 
-inline void i1e_block_f32(const float* src, float* dst, int64_t b, int64_t e) {
+// The dispatch reads the two scaling flags and the coefficient pair once per
+// block, so the walk itself carries no per-element branch on which member it
+// is running.
+inline void bessel_i_block_f32(VOp op, const float* src, float* dst, int64_t b,
+                               int64_t e) {
 #ifdef TP_VECUNARY_SIMD_MATH
     if (avx2_available() && fma_available()) {
-        i1e_block_f32_avx2(src, dst, b, e);
+        const float* small = nullptr;
+        const float* large = nullptr;
+        size_t small_len = 0, large_len = 0;
+        bool scale_x = false, exp = false;
+        switch (op) {
+            case VOp::I0e:
+                std::tie(small, small_len) = special_math::chebyshev_coefficients_i0e_A<float>();
+                std::tie(large, large_len) = special_math::chebyshev_coefficients_i0e_B<float>();
+                break;
+            case VOp::I0:
+                std::tie(small, small_len) = special_math::chebyshev_coefficients_i0e_A<float>();
+                std::tie(large, large_len) = special_math::chebyshev_coefficients_i0e_B<float>();
+                exp = true;
+                break;
+            case VOp::I1e:
+                std::tie(small, small_len) = special_math::chebyshev_coefficients_i1e_A<float>();
+                std::tie(large, large_len) = special_math::chebyshev_coefficients_i1e_B<float>();
+                scale_x = true;
+                break;
+            default:
+                std::tie(small, small_len) = special_math::chebyshev_coefficients_i1e_A<float>();
+                std::tie(large, large_len) = special_math::chebyshev_coefficients_i1e_B<float>();
+                scale_x = true;
+                exp = true;
+                break;
+        }
+        const int sl = static_cast<int>(small_len), ll = static_cast<int>(large_len);
+        if (scale_x && exp)
+            bessel_i_family_f32_avx2<true, true>(op, src, dst, b, e, small, sl, large, ll);
+        else if (scale_x)
+            bessel_i_family_f32_avx2<true, false>(op, src, dst, b, e, small, sl, large, ll);
+        else if (exp)
+            bessel_i_family_f32_avx2<false, true>(op, src, dst, b, e, small, sl, large, ll);
+        else
+            bessel_i_family_f32_avx2<false, false>(op, src, dst, b, e, small, sl, large, ll);
         return;
     }
 #endif
-    for (int64_t i = b; i < e; ++i) dst[i] = scalar_apply(VOp::I1e, {}, src[i]);
+    for (int64_t i = b; i < e; ++i) dst[i] = scalar_apply(op, {}, src[i]);
 }
 
-// The double series carries 29 coefficients, so a four-wide walk only buys a
-// few times over the scalar routine; that path keeps the routine it had.
-inline void i1e_block_f64(const double* src, double* dst, int64_t b, int64_t e) {
-    for (int64_t i = b; i < e; ++i) dst[i] = scalar_apply(VOp::I1e, {}, src[i]);
+inline void bessel_i_block_f64(VOp op, const double* src, double* dst, int64_t b,
+                               int64_t e) {
+#ifdef TP_VECUNARY_SIMD_MATH
+    if (avx2_available() && fma_available()) {
+        const double* small = nullptr;
+        const double* large = nullptr;
+        size_t small_len = 0, large_len = 0;
+        bool scale_x = false, exp = false;
+        switch (op) {
+            case VOp::I0e:
+                std::tie(small, small_len) = special_math::chebyshev_coefficients_i0e_A<double>();
+                std::tie(large, large_len) = special_math::chebyshev_coefficients_i0e_B<double>();
+                break;
+            case VOp::I0:
+                std::tie(small, small_len) = special_math::chebyshev_coefficients_i0e_A<double>();
+                std::tie(large, large_len) = special_math::chebyshev_coefficients_i0e_B<double>();
+                exp = true;
+                break;
+            case VOp::I1e:
+                std::tie(small, small_len) = special_math::chebyshev_coefficients_i1e_A<double>();
+                std::tie(large, large_len) = special_math::chebyshev_coefficients_i1e_B<double>();
+                scale_x = true;
+                break;
+            default:
+                std::tie(small, small_len) = special_math::chebyshev_coefficients_i1e_A<double>();
+                std::tie(large, large_len) = special_math::chebyshev_coefficients_i1e_B<double>();
+                scale_x = true;
+                exp = true;
+                break;
+        }
+        const int sl = static_cast<int>(small_len), ll = static_cast<int>(large_len);
+        if (scale_x && exp)
+            bessel_i_family_f64_avx2<true, true>(op, src, dst, b, e, small, sl, large, ll);
+        else if (scale_x)
+            bessel_i_family_f64_avx2<true, false>(op, src, dst, b, e, small, sl, large, ll);
+        else if (exp)
+            bessel_i_family_f64_avx2<false, true>(op, src, dst, b, e, small, sl, large, ll);
+        else
+            bessel_i_family_f64_avx2<false, false>(op, src, dst, b, e, small, sl, large, ll);
+        return;
+    }
+#endif
+    for (int64_t i = b; i < e; ++i) dst[i] = scalar_apply(op, {}, src[i]);
 }
 
 inline void run_f32(VOp op, VParams prm, const float* src, float* dst, int64_t b, int64_t e) {
     if (composed_f32(op, prm, src, dst, b, e)) return;
-    if (op == VOp::I1e) {
-        i1e_block_f32(src, dst, b, e);
+    if (op == VOp::I0e || op == VOp::I0 || op == VOp::I1e || op == VOp::I1) {
+        bessel_i_block_f32(op, src, dst, b, e);
         return;
     }
 #ifdef USE_MKL
@@ -3297,8 +3454,8 @@ inline void run_f32(VOp op, VParams prm, const float* src, float* dst, int64_t b
 
 inline void run_f64(VOp op, VParams prm, const double* src, double* dst, int64_t b, int64_t e) {
     if (composed_f64(op, prm, src, dst, b, e)) return;
-    if (op == VOp::I1e) {
-        i1e_block_f64(src, dst, b, e);
+    if (op == VOp::I0e || op == VOp::I0 || op == VOp::I1e || op == VOp::I1) {
+        bessel_i_block_f64(op, src, dst, b, e);
         return;
     }
 #ifdef USE_MKL
