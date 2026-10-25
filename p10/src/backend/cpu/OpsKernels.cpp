@@ -891,7 +891,7 @@ Tensor i0_cpu(const Tensor& self) {
     // Modified Bessel I0.  The Chebyshev expansion holds across the whole
     // range; the ((|x|/2)^k / k!)^2 series it replaces needs more terms than
     // any fixed cap allows once |x| passes ~50.
-    return float_math_kernel(self, I0Scalar{}, "i0");
+    return float_math_vec_kernel(self, I0Scalar{}, "i0", vecunary::VOp::I0);
 }
 Tensor& i0_out_cpu(const Tensor& self, Tensor& out) {
     return float_math_out_kernel(self, out, i0_cpu, I0Scalar{}, "i0");

@@ -158,7 +158,7 @@ Tensor ndtri_cpu(const Tensor& self) {
                                  "ndtri", cpu::vecunary::VOp::NdtrI);
 }
 Tensor log_ndtr_cpu(const Tensor& self) {
-    return float_math_kernel(self, [](double x) { return calc_log_ndtr(x); }, "log_ndtr");
+    return float_math_kernel(self, [](auto x) { return calc_log_ndtr(x); }, "log_ndtr");
 }
 Tensor entr_cpu(const Tensor& self) {
     return float_math_vec_kernel(self, [](double x) { return calc_entr(x); }, "entr",
@@ -259,7 +259,10 @@ Tensor gammaincc_cpu(const Tensor& a, const Tensor& x) {
 struct PolygammaMap {
     int64_t n;
 
-    double operator()(double v) const {
+    // Each order has a single-precision form, so a float tensor is evaluated
+    // in float rather than widened and narrowed around the call.
+    template <typename T>
+    T operator()(T v) const {
         if (n == 0) return calc_digamma(v);
         if (n == 1) return trigamma(v);
         return calc_polygamma(v, static_cast<int>(n));
