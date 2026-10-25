@@ -25,6 +25,24 @@
 namespace tensorplay {
 namespace cpu {
 
+// A baseline translation unit leaves the compiler without the wide registers
+// even on a machine that has them.  A routine built from a handful of libm
+// calls per element then runs at the baseline width, which costs about a
+// fifth of its rate; the same loop compiled under an AVX2 target recovers it.
+// The check is done once per call, and a routine that needs double anyway
+// gains nothing from the wider target.
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#define TP_FLOAT_LOOP_AVX2 1
+#endif
+
+#ifdef TP_FLOAT_LOOP_AVX2
+template <typename F>
+__attribute__((target("avx2,fma")))
+inline void float_loop_f32_avx2(const float* s, float* d, int64_t b, int64_t e, F f) {
+    for (int64_t i = b; i < e; ++i) d[i] = static_cast<float>(f(s[i]));
+}
+#endif
+
 template <typename F>  // F: double -> double
 inline Tensor float_math_kernel(const Tensor& self, F f, const char* name,
                                 const Tensor* destination = nullptr) {
@@ -47,9 +65,21 @@ inline Tensor float_math_kernel(const Tensor& self, F f, const char* name,
     } else {
         const float* sp = w.data_ptr<float>();
         float* dp = t.data_ptr<float>();
-        parallel::parallel_for(0, n, parallel::GRAIN_SIZE, [&](int64_t b, int64_t e) {
-            for (int64_t i = b; i < e; ++i) dp[i] = static_cast<float>(f(sp[i]));
-        });
+        bool wide = false;
+#ifdef TP_FLOAT_LOOP_AVX2
+        wide = vecunary::avx2_available() && vecunary::fma_available();
+#endif
+        if (wide) {
+#ifdef TP_FLOAT_LOOP_AVX2
+            parallel::parallel_for(0, n, parallel::GRAIN_SIZE, [&](int64_t b, int64_t e) {
+                float_loop_f32_avx2(sp, dp, b, e, f);
+            });
+#endif
+        } else {
+            parallel::parallel_for(0, n, parallel::GRAIN_SIZE, [&](int64_t b, int64_t e) {
+                for (int64_t i = b; i < e; ++i) dp[i] = static_cast<float>(f(sp[i]));
+            });
+        }
     }
     (void)name;
     return (out_dt == compute_dt) ? t : t.to(out_dt);

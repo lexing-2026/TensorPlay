@@ -78,19 +78,19 @@ using tensorplay::cpu::float_math_vec_kernel;
 // ---------------------------------------------------------------------------
 
 Tensor airy_ai_cpu(const Tensor& self) {
-    return float_math_kernel(self, [](double x) { return airy_ai_forward(x); }, "airy_ai");
+    return float_math_kernel(self, [](auto x) { return airy_ai_forward(x); }, "airy_ai");
 }
 Tensor bessel_j0_cpu(const Tensor& self) {
-    return float_math_kernel(self, [](double x) { return bessel_j0_forward(x); }, "bessel_j0");
+    return float_math_kernel(self, [](auto x) { return bessel_j0_forward(x); }, "bessel_j0");
 }
 Tensor bessel_j1_cpu(const Tensor& self) {
-    return float_math_kernel(self, [](double x) { return bessel_j1_forward(x); }, "bessel_j1");
+    return float_math_kernel(self, [](auto x) { return bessel_j1_forward(x); }, "bessel_j1");
 }
 Tensor bessel_y0_cpu(const Tensor& self) {
-    return float_math_kernel(self, [](double x) { return bessel_y0_forward(x); }, "bessel_y0");
+    return float_math_kernel(self, [](auto x) { return bessel_y0_forward(x); }, "bessel_y0");
 }
 Tensor bessel_y1_cpu(const Tensor& self) {
-    return float_math_kernel(self, [](double x) { return bessel_y1_forward(x); }, "bessel_y1");
+    return float_math_kernel(self, [](auto x) { return bessel_y1_forward(x); }, "bessel_y1");
 }
 Tensor spherical_bessel_j0_cpu(const Tensor& self) {
     return float_math_vec_kernel(
@@ -109,22 +109,22 @@ Tensor modified_bessel_i1_cpu(const Tensor& self) {
 }
 Tensor modified_bessel_k0_cpu(const Tensor& self) {
     return float_math_kernel(self,
-                             [](double x) { return modified_bessel_k0_forward(x); },
+                             [](auto x) { return modified_bessel_k0_forward(x); },
                              "modified_bessel_k0");
 }
 Tensor modified_bessel_k1_cpu(const Tensor& self) {
     return float_math_kernel(self,
-                             [](double x) { return modified_bessel_k1_forward(x); },
+                             [](auto x) { return modified_bessel_k1_forward(x); },
                              "modified_bessel_k1");
 }
 Tensor scaled_modified_bessel_k0_cpu(const Tensor& self) {
     return float_math_kernel(self,
-                             [](double x) { return scaled_modified_bessel_k0_forward(x); },
+                             [](auto x) { return scaled_modified_bessel_k0_forward(x); },
                              "scaled_modified_bessel_k0");
 }
 Tensor scaled_modified_bessel_k1_cpu(const Tensor& self) {
     return float_math_kernel(self,
-                             [](double x) { return scaled_modified_bessel_k1_forward(x); },
+                             [](auto x) { return scaled_modified_bessel_k1_forward(x); },
                              "scaled_modified_bessel_k1");
 }
 Tensor i0e_cpu(const Tensor& self) {
