@@ -142,12 +142,17 @@ uint32_t select_first(const std::vector<Runtime::DeviceMapping>& devices) {
     }
     const VkPhysicalDeviceType type =
         devices[i].first.properties.deviceType;
+    // A returned std::string has no meaningful representation inside a
+    // varargs argument, so the label is bound first and handed over as a char
+    // pointer; printing the object itself makes every adapter name come out
+    // with a garbage type suffix.
+    const std::string device_type = get_device_type_str(type);
     std::fprintf(
         stderr,
         "[tensorplay/vulkan] adapter %zu: %s (%s)\n",
         i,
         devices[i].first.properties.deviceName,
-        get_device_type_str(type));
+        device_type.c_str());
     if (type == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
       return static_cast<uint32_t>(i);
     }
