@@ -2934,52 +2934,63 @@ static void bf16_chunk_avx2(VOp op, VParams prm, const uint16_t* src, uint16_t* 
 //
 // tanh is never forwarded: the piecewise form here is about fifteen percent
 // faster than the library kernel.
+//
+// These have to agree with mkl_vml_functions.h and mkl_service.h, which a
+// translation unit may include after this header: the library declares its
+// vector math entry points noexcept except on Windows, where they carry no
+// exception specification, and its service calls without one everywhere.
+#if defined(_WIN32)
+#define TP_VML_NOTHROW
+#else
+#define TP_VML_NOTHROW noexcept
+#endif
 extern "C" {
-void vmsExp(const int, const float[], float[], const long long) noexcept;
-void vmsExp2(const int, const float[], float[], const long long) noexcept;
-void vmsExpm1(const int, const float[], float[], const long long) noexcept;
-void vmsLog1p(const int, const float[], float[], const long long) noexcept;
-void vmsSin(const int, const float[], float[], const long long) noexcept;
-void vmsCos(const int, const float[], float[], const long long) noexcept;
-void vmsAsin(const int, const float[], float[], const long long) noexcept;
-void vmsAcos(const int, const float[], float[], const long long) noexcept;
-void vmsSinh(const int, const float[], float[], const long long) noexcept;
-void vmsCosh(const int, const float[], float[], const long long) noexcept;
-void vmsAsinh(const int, const float[], float[], const long long) noexcept;
-void vmsAcosh(const int, const float[], float[], const long long) noexcept;
-void vmsAtanh(const int, const float[], float[], const long long) noexcept;
-void vmsErf(const int, const float[], float[], const long long) noexcept;
-void vmsErfc(const int, const float[], float[], const long long) noexcept;
-void vmsErfInv(const int, const float[], float[], const long long) noexcept;
-void vmsCdfNorm(const int, const float[], float[], const long long) noexcept;
-void vmsCdfNormInv(const int, const float[], float[], const long long) noexcept;
-void vmsErfcx(const int, const float[], float[], const long long) noexcept;
-void vmdExp(const int, const double[], double[], const long long) noexcept;
-void vmdExp2(const int, const double[], double[], const long long) noexcept;
-void vmdLn(const int, const double[], double[], const long long) noexcept;
-void vmdLog2(const int, const double[], double[], const long long) noexcept;
-void vmdLog10(const int, const double[], double[], const long long) noexcept;
-void vmdLog1p(const int, const double[], double[], const long long) noexcept;
-void vmdExpm1(const int, const double[], double[], const long long) noexcept;
-void vmdErf(const int, const double[], double[], const long long) noexcept;
-void vmdErfc(const int, const double[], double[], const long long) noexcept;
-void vmdErfInv(const int, const double[], double[], const long long) noexcept;
-void vmdCdfNorm(const int, const double[], double[], const long long) noexcept;
-void vmdCdfNormInv(const int, const double[], double[], const long long) noexcept;
-void vmdErfcx(const int, const double[], double[], const long long) noexcept;
-void vmdSin(const int, const double[], double[], const long long) noexcept;
-void vmdCos(const int, const double[], double[], const long long) noexcept;
-void vmdTan(const int, const double[], double[], const long long) noexcept;
-void vmdAsin(const int, const double[], double[], const long long) noexcept;
-void vmdAcos(const int, const double[], double[], const long long) noexcept;
-void vmdAtan(const int, const double[], double[], const long long) noexcept;
-void vmdSinh(const int, const double[], double[], const long long) noexcept;
-void vmdCosh(const int, const double[], double[], const long long) noexcept;
-void vmdAsinh(const int, const double[], double[], const long long) noexcept;
-void vmdAcosh(const int, const double[], double[], const long long) noexcept;
-void vmdAtanh(const int, const double[], double[], const long long) noexcept;
-int MKL_Set_Num_Threads_Local(int) noexcept;
+void vmsExp(const int, const float[], float[], const long long) TP_VML_NOTHROW;
+void vmsExp2(const int, const float[], float[], const long long) TP_VML_NOTHROW;
+void vmsExpm1(const int, const float[], float[], const long long) TP_VML_NOTHROW;
+void vmsLog1p(const int, const float[], float[], const long long) TP_VML_NOTHROW;
+void vmsSin(const int, const float[], float[], const long long) TP_VML_NOTHROW;
+void vmsCos(const int, const float[], float[], const long long) TP_VML_NOTHROW;
+void vmsAsin(const int, const float[], float[], const long long) TP_VML_NOTHROW;
+void vmsAcos(const int, const float[], float[], const long long) TP_VML_NOTHROW;
+void vmsSinh(const int, const float[], float[], const long long) TP_VML_NOTHROW;
+void vmsCosh(const int, const float[], float[], const long long) TP_VML_NOTHROW;
+void vmsAsinh(const int, const float[], float[], const long long) TP_VML_NOTHROW;
+void vmsAcosh(const int, const float[], float[], const long long) TP_VML_NOTHROW;
+void vmsAtanh(const int, const float[], float[], const long long) TP_VML_NOTHROW;
+void vmsErf(const int, const float[], float[], const long long) TP_VML_NOTHROW;
+void vmsErfc(const int, const float[], float[], const long long) TP_VML_NOTHROW;
+void vmsErfInv(const int, const float[], float[], const long long) TP_VML_NOTHROW;
+void vmsCdfNorm(const int, const float[], float[], const long long) TP_VML_NOTHROW;
+void vmsCdfNormInv(const int, const float[], float[], const long long) TP_VML_NOTHROW;
+void vmsErfcx(const int, const float[], float[], const long long) TP_VML_NOTHROW;
+void vmdExp(const int, const double[], double[], const long long) TP_VML_NOTHROW;
+void vmdExp2(const int, const double[], double[], const long long) TP_VML_NOTHROW;
+void vmdLn(const int, const double[], double[], const long long) TP_VML_NOTHROW;
+void vmdLog2(const int, const double[], double[], const long long) TP_VML_NOTHROW;
+void vmdLog10(const int, const double[], double[], const long long) TP_VML_NOTHROW;
+void vmdLog1p(const int, const double[], double[], const long long) TP_VML_NOTHROW;
+void vmdExpm1(const int, const double[], double[], const long long) TP_VML_NOTHROW;
+void vmdErf(const int, const double[], double[], const long long) TP_VML_NOTHROW;
+void vmdErfc(const int, const double[], double[], const long long) TP_VML_NOTHROW;
+void vmdErfInv(const int, const double[], double[], const long long) TP_VML_NOTHROW;
+void vmdCdfNorm(const int, const double[], double[], const long long) TP_VML_NOTHROW;
+void vmdCdfNormInv(const int, const double[], double[], const long long) TP_VML_NOTHROW;
+void vmdErfcx(const int, const double[], double[], const long long) TP_VML_NOTHROW;
+void vmdSin(const int, const double[], double[], const long long) TP_VML_NOTHROW;
+void vmdCos(const int, const double[], double[], const long long) TP_VML_NOTHROW;
+void vmdTan(const int, const double[], double[], const long long) TP_VML_NOTHROW;
+void vmdAsin(const int, const double[], double[], const long long) TP_VML_NOTHROW;
+void vmdAcos(const int, const double[], double[], const long long) TP_VML_NOTHROW;
+void vmdAtan(const int, const double[], double[], const long long) TP_VML_NOTHROW;
+void vmdSinh(const int, const double[], double[], const long long) TP_VML_NOTHROW;
+void vmdCosh(const int, const double[], double[], const long long) TP_VML_NOTHROW;
+void vmdAsinh(const int, const double[], double[], const long long) TP_VML_NOTHROW;
+void vmdAcosh(const int, const double[], double[], const long long) TP_VML_NOTHROW;
+void vmdAtanh(const int, const double[], double[], const long long) TP_VML_NOTHROW;
+int MKL_Set_Num_Threads_Local(int);
 }
+#undef TP_VML_NOTHROW
 
 constexpr long long kVmlMode =
     0x2LL /* VML_HA */ | 0x100LL /* VML_ERRMODE_IGNORE */ |
