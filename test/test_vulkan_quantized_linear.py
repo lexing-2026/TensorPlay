@@ -770,3 +770,171 @@ def test_quantized_linear_refuses_a_weight_whose_storage_sits_the_other_way_roun
             0.5,
             4,
         )
+
+
+# A weight whose row count passes the device's image axis limit has no packed
+# texel form, and neither has the product, so the reduction reads the codes and
+# the per-channel parameters straight out of words.  That is the shape an output
+# projection over a vocabulary has, and the answer cannot depend on which route
+# ran: the same code bytes, swept a handful of columns wide through the walk that
+# does have a texel form, have to answer the codes the long one writes.
+@pytest.mark.parametrize(
+    "m,k,n",
+    [(1, 7, 20000), (2, 13, 20001), (3, 12, 17000), (1, 8, 20002)],
+)
+def test_quantized_linear_of_a_weight_with_no_image_form(m, k, n):
+    rng = np.random.default_rng(m * 101 + k * 7 + n)
+    x_codes = rng.integers(-32, 33, (m, k), dtype=np.int32)
+    w_codes = rng.integers(-32, 33, (n, k), dtype=np.int32)
+    x_scale, x_zp = 0.125, 2
+    w_scales = np.exp2(-rng.integers(2, 6, n)).astype(np.float32)
+    w_zps = rng.integers(-4, 5, n, dtype=np.int32)
+    bias_values = (rng.integers(-8, 9, n) * 0.125).astype(np.float32)
+    out_scale, out_zp = 0.5, -1
+
+    xq = tp._C._make_per_tensor_quantized_tensor(
+        tp.from_numpy(x_codes.astype(np.int8).copy()).to("vulkan"),
+        x_scale,
+        x_zp,
+    )
+    wq = tp._C._make_per_tensor_quantized_tensor(
+        tp.from_numpy(w_codes.astype(np.int8).copy()).to("vulkan"), 1.0, 0)
+    assert wq.data_ptr() != 0, "the long weight was not kept in words"
+
+    acc = (x_codes - x_zp) @ (w_codes - w_zps[:, None]).T
+    expected = np.clip(
+        np.rint((acc * x_scale * w_scales + bias_values) / out_scale) + out_zp,
+        -128,
+        127,
+    ).astype(np.int8)
+
+    out = tp._C.quantized_linear(
+        xq,
+        wq,
+        x_scale,
+        x_zp,
+        tp.tensor(w_scales, dtype=tp.float32),
+        tp.tensor(w_zps, dtype=tp.int32),
+        tp.tensor(bias_values, dtype=tp.float32),
+        out_scale,
+        out_zp,
+    )
+    assert out.dtype == tp.qint8
+    assert out.q_scale() == out_scale and out.q_zero_point() == out_zp
+    codes = int_repr(out).cpu().numpy()
+    np.testing.assert_array_equal(codes, expected)
+    assert out.data_ptr() != 0, "the long product did not stay in words"
+
+    # The same codes a handful of columns wide keep their image form, so both
+    # walks are handed identical bytes and their answers must not differ.
+    n_short = 6
+    w_short = tp._C._make_per_tensor_quantized_tensor(
+        tp.from_numpy(w_codes[:n_short].astype(np.int8).copy()).to("vulkan"),
+        1.0,
+        0,
+    )
+    out_short = tp._C.quantized_linear(
+        xq,
+        w_short,
+        x_scale,
+        x_zp,
+        tp.tensor(w_scales[:n_short], dtype=tp.float32),
+        tp.tensor(w_zps[:n_short], dtype=tp.int32),
+        tp.tensor(bias_values[:n_short], dtype=tp.float32),
+        out_scale,
+        out_zp,
+    )
+    np.testing.assert_array_equal(
+        int_repr(out_short).cpu().numpy(), codes[:, :n_short])
+
+    # A reduction whose length does not divide by four names every code on its
+    # own byte lane, and an element count that fills no whole last word stops the
+    # run before the partial word it leaves, so both walks of the shapes above
+    # land on those edges.  A repeat call reads the parameter row the first one
+    # staged on the weight identity, and must answer the same codes.
+    again = tp._C.quantized_linear(
+        xq,
+        wq,
+        x_scale,
+        x_zp,
+        tp.tensor(w_scales, dtype=tp.float32),
+        tp.tensor(w_zps, dtype=tp.int32),
+        tp.tensor(bias_values, dtype=tp.float32),
+        out_scale,
+        out_zp,
+    )
+    np.testing.assert_array_equal(int_repr(again).cpu().numpy(), codes)
+
+
+# The other axis of the same route: a reduction longer than the image limit
+# leaves the packed operands with no texel form while the product itself still
+# has one, so the walk reads words and writes an image.  The result therefore
+# lands where its own shape keeps it, not where the route put it.
+@pytest.mark.parametrize("m,k,n", [(2, 20000, 4), (1, 16385, 8)])
+def test_quantized_linear_of_a_reduction_longer_than_the_image_axis(m, k, n):
+    rng = np.random.default_rng(m * 31 + k + n * 3)
+    x_codes = rng.integers(-32, 33, (m, k), dtype=np.int32)
+    w_codes = rng.integers(-32, 33, (n, k), dtype=np.int32)
+    x_scale, x_zp = 0.125, -3
+    w_scales = np.exp2(-rng.integers(2, 6, n)).astype(np.float32)
+    w_zps = rng.integers(-4, 5, n, dtype=np.int32)
+    out_scale, out_zp = 0.25, 5
+
+    xq = tp._C._make_per_tensor_quantized_tensor(
+        tp.from_numpy(x_codes.astype(np.int8).copy()).to("vulkan"),
+        x_scale,
+        x_zp,
+    )
+    wq = tp._C._make_per_tensor_quantized_tensor(
+        tp.from_numpy(w_codes.astype(np.int8).copy()).to("vulkan"), 1.0, 0)
+    assert xq.data_ptr() != 0, "the long activation was not kept in words"
+
+    acc = (x_codes - x_zp) @ (w_codes - w_zps[:, None]).T
+    expected = np.clip(
+        np.rint(acc * x_scale * w_scales / out_scale) + out_zp, -128, 127
+    ).astype(np.int8)
+    out = tp._C.quantized_linear(
+        xq,
+        wq,
+        x_scale,
+        x_zp,
+        tp.tensor(w_scales, dtype=tp.float32),
+        tp.tensor(w_zps, dtype=tp.int32),
+        None,
+        out_scale,
+        out_zp,
+    )
+    codes = int_repr(out).cpu().numpy()
+    np.testing.assert_array_equal(codes, expected)
+    assert out.data_ptr() == 0, (
+        "a product with an image form was not written as one")
+
+
+# A product with no rows has no payload for either route to stage, so it is
+# released empty rather than dispatched into a walk that reads nothing.
+def test_quantized_linear_of_a_product_with_no_rows():
+    k, n = 5, 4
+    w_codes = np.arange(n * k, dtype=np.int32).reshape(n, k) - 7
+    xq = tp._C._make_per_tensor_quantized_tensor(
+        tp.from_numpy(np.zeros((0, k), dtype=np.int8)).to("vulkan"),
+        0.25,
+        0,
+    )
+    wq = tp._C._make_per_tensor_quantized_tensor(
+        tp.from_numpy(w_codes.astype(np.int8).copy()).to("vulkan"), 1.0, 0)
+
+    out = tp._C.quantized_linear(
+        xq,
+        wq,
+        0.25,
+        0,
+        tp.tensor(np.full(n, 0.125, dtype=np.float32)),
+        tp.tensor(np.zeros(n, dtype=np.int32)),
+        None,
+        0.5,
+        0,
+    )
+    assert out.dtype == tp.qint8
+    assert tuple(out.shape) == (0, n)
+    assert int_repr(out).cpu().numpy().shape == (0, n)
+

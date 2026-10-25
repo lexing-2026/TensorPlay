@@ -41,6 +41,7 @@ constexpr uint32_t kTagW4A16WeightHeightPacked = 22u;
 constexpr uint32_t kTagW4A16Params = 23u;
 constexpr uint32_t kTagW4A16WeightLinear = 24u;
 constexpr uint32_t kTagW4A16ParamsLinear = 25u;
+constexpr uint32_t kTagQLinearParamsLinear = 26u;
 
 //
 // Quantized elementwise arithmetic over Int8 textures with explicit affine
@@ -1167,6 +1168,215 @@ Tensor quantized_max_pool2d_kernel(
   return squeezed ? out.squeeze(0) : out;
 }
 
+//
+// The codes of a quantized payload read straight out of words whenever their
+// storage draws them that way; a payload that drew an image is laid out dense
+// in linear storage by the gather that relays any other view, which names every
+// byte through the position its storage holds it in.  A payload that does not
+// name its elements in the order its storage holds them is refused by the
+// binding before either step, as every device walk here refuses it.
+//
+api::vTensor codes_in_words(
+    api::Context* const context,
+    const Tensor& codes) {
+  api::vTensor v = convert(codes);
+  if (v.storage_type() == api::StorageType::BUFFER) {
+    return v;
+  }
+  Tensor dense = materialize_view(
+      codes,
+      static_cast<std::vector<int64_t>>(codes.shape()),
+      codes.strides(),
+      static_cast<int64_t>(codes.unsafeGetTensorImpl()->storage_offset()),
+      api::StorageType::BUFFER);
+  return convert(dense);
+}
+
+//
+// The per-output-channel scales, zero points and addends of a quantized linear,
+// staged as one linear single-precision payload: `params_width` slots of
+// scales, then that many slots of zero points, then that many slots of addends,
+// each row zero-filled past its own length.  The reader takes the triple from
+// one binding, so a call without an addend still lands on the same shape and
+// adds zero.
+//
+api::vTensor qlinear_params_linear(
+    api::Context* const context,
+    const Tensor& weight,
+    const Tensor& weight_scales,
+    const Tensor& weight_zero_points,
+    const std::optional<Tensor>& bias,
+    const int64_t out_features,
+    const int64_t params_width) {
+  return ParamTextureCache::singleton().get_or_create(
+      weight,
+      {3, params_width},
+      api::GPUMemoryLayout::TENSOR_WIDTH_PACKED,
+      kTagQLinearParamsLinear,
+      [&]() {
+        std::vector<float> host(
+            static_cast<size_t>(3 * params_width), 0.0f);
+        const Tensor sc = weight_scales.to(Device(DeviceType::CPU))
+                              .to(DType::Float32)
+                              .contiguous();
+        const Tensor zp = weight_zero_points.to(Device(DeviceType::CPU))
+                              .to(DType::Float32)
+                              .contiguous();
+        std::memcpy(
+            host.data(),
+            sc.data_ptr<float>(),
+            sizeof(float) * static_cast<size_t>(out_features));
+        std::memcpy(
+            host.data() + params_width,
+            zp.data_ptr<float>(),
+            sizeof(float) * static_cast<size_t>(out_features));
+        if (bias.has_value()) {
+          const Tensor bias_f = bias->to(Device(DeviceType::CPU))
+                                    .to(DType::Float32)
+                                    .contiguous();
+          std::memcpy(
+              host.data() + 2 * params_width,
+              bias_f.data_ptr<float>(),
+              sizeof(float) * static_cast<size_t>(out_features));
+        }
+        api::vTensor v{
+            context,
+            {3, params_width},
+            DType::Float32,
+            api::StorageType::BUFFER,
+            api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+        utils::upload_host_bytes(v, host.data(), host.size() * sizeof(float));
+        return v;
+      });
+}
+
+//
+// The quantized product over operands whose shape has no texel form.  A weight
+// whose row count passes the device's image axis limit -- the shape a large
+// output projection has -- arrives in linear storage and never gains an image
+// form, and neither do the packed payloads the tiled walk reads, so the
+// reduction takes codes and parameters straight out of buffer words instead of
+// sampling texels.  The result follows whichever storage its own shape fits.
+//
+Tensor quantized_linear_over_buffers(
+    api::Context* const context,
+    const Tensor& input,
+    const Tensor& weight,
+    double input_scale,
+    int64_t input_zero_point,
+    const Tensor& weight_scales,
+    const Tensor& weight_zero_points,
+    const std::optional<Tensor>& bias,
+    double out_scale,
+    int64_t out_zero_point,
+    const int64_t M,
+    const int64_t N,
+    const int64_t K) {
+  // Every offset the walk computes is a 32-bit integer: it names an activation
+  // element by row * K and a weight element by column * K, so an operand whose
+  // rows pass that range has no addressable form here.
+  TP_CHECK(
+      M * K <= std::numeric_limits<int32_t>::max(),
+      "Vulkan quantized_linear: the activation rows pass what one linear "
+      "payload can address; split the batch");
+  TP_CHECK(
+      N * K <= std::numeric_limits<int32_t>::max(),
+      "Vulkan quantized_linear: the weight rows pass what one linear payload "
+      "can address; split the layer");
+  TP_CHECK(
+      M * N <= std::numeric_limits<int32_t>::max(),
+      "Vulkan quantized_linear: the product of the row and channel counts "
+      "passes what one linear payload can address; split the batch");
+
+  const int64_t params_width = api::utils::align_up(N, 4);
+
+  api::vTensor v_act = codes_in_words(context, input);
+  api::vTensor v_weight_codes = codes_in_words(context, weight);
+  api::vTensor v_params = qlinear_params_linear(
+      context, weight, weight_scales, weight_zero_points, bias, N, params_width);
+
+  api::vTensor v_output{context, {M, N}, DType::Int8};
+  const bool out_buffer =
+      v_output.storage_type() == api::StorageType::BUFFER;
+
+  const struct LinearBlock final {
+    ivec4 out_sizes;
+    int k;
+    int params_words;
+    float input_scale;
+    int32_t input_zero_point;
+    float out_inv_scale;
+    int32_t out_zero_point;
+    int32_t quant_min;
+    int32_t quant_max;
+  } block{
+      api::utils::make_whcn_ivec4({M, N}),
+      static_cast<int32_t>(K),
+      static_cast<int32_t>(params_width / 4),
+      static_cast<float>(input_scale),
+      static_cast<int32_t>(input_zero_point),
+      static_cast<float>(1.0 / out_scale),
+      static_cast<int32_t>(out_zero_point),
+      -128,
+      127};
+  api::UniformParamsBuffer params(context, block);
+  api::PipelineBarrier pipeline_barrier{};
+
+  // A linear result carries four codes in every word, so the launch counts
+  // words; a texel one names one element per invocation.
+  const api::utils::uvec3 grid = out_buffer
+      ? api::utils::uvec3{
+            api::utils::div_up(
+                api::utils::safe_downcast_to_u32(M * N), 4u),
+            1u,
+            1u}
+      : api::utils::uvec3{
+            api::utils::safe_downcast_to_u32(N),
+            api::utils::safe_downcast_to_u32(M),
+            1u};
+  const char* const kernel =
+      out_buffer ? "quantized_linear_buffer" : "quantized_linear_buffer_image";
+
+  if (out_buffer) {
+    context->submit_compute_job(
+        VK_KERNEL_FROM_STR(kernel),
+        pipeline_barrier,
+        grid,
+        adaptive_work_group_size(grid),
+        VK_NULL_HANDLE,
+        v_output.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::WRITE),
+        v_act.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+        v_weight_codes.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+        v_params.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+        params.buffer());
+  } else {
+    context->submit_compute_job(
+        VK_KERNEL_FROM_STR(kernel),
+        pipeline_barrier,
+        grid,
+        adaptive_work_group_size(grid),
+        VK_NULL_HANDLE,
+        v_output.image(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::WRITE),
+        v_act.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+        v_weight_codes.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+        v_params.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+        params.buffer());
+  }
+
+  Tensor out_codes = convert(v_output);
+  return quantized::make_qtensor(
+      std::move(out_codes),
+      make_per_tensor_affine_quantizer(
+          out_scale, out_zero_point, DType::QInt8),
+      DType::QInt8);
+}
+
 Tensor quantized_linear_kernel(
     const Tensor& input,
     const Tensor& weight,
@@ -1207,6 +1417,51 @@ Tensor quantized_linear_kernel(
 
   api::Context* const context = api::context();
 
+  const int64_t M = input.size(0);
+  const int64_t N = weight.size(0);
+  const int64_t K = input.size(1);
+  const int64_t params_width = api::utils::align_up(N, 4);
+  if (M == 0 || N == 0) {
+    // A product with no rows or no channels has no payload for either route to
+    // stage, so the result is released empty instead of dispatched.
+    Tensor empty_codes =
+        empty_kernel({M, N}, DType::Int8, input.device(), false);
+    return quantized::make_qtensor(
+        std::move(empty_codes),
+        make_per_tensor_affine_quantizer(
+            out_scale, out_zero_point, DType::QInt8),
+        DType::QInt8);
+  }
+  TP_CHECK(
+      K > 0,
+      "Vulkan quantized_linear: a reduction with no terms leaves both code "
+      "operands empty, so no walk here can run; total the addend instead");
+
+  // The texel route stages four payloads as images: the width-packed
+  // activation, the height-packed weight, the parameter rows and the product.
+  // A shape with no image form for any of them runs on linear storage instead,
+  // because which storage a shape draws is a property of the device's image
+  // limit, not of the caller's choosing.
+  if (!image_storage_supported(context, {M, K}) ||
+      !image_storage_supported(context, {K, N}) ||
+      !image_storage_supported(context, {M, N}) ||
+      !image_storage_supported(context, {3, params_width})) {
+    return quantized_linear_over_buffers(
+        context,
+        input,
+        weight,
+        input_scale,
+        input_zero_point,
+        weight_scales,
+        weight_zero_points,
+        bias,
+        out_scale,
+        out_zero_point,
+        M,
+        N,
+        K);
+  }
+
   // Both operands are packed before the walk reads them, and a pack writes the
   // same texels whatever width its source codes share, so the class an operand
   // arrives in picks which pack runs instead of forcing a pass over the whole
@@ -1224,7 +1479,6 @@ Tensor quantized_linear_kernel(
   // never rounds-trips the per-channel qparams through the host.  Rows are
   // padded to a multiple of four so the width-packed params texture never
   // straddles a row boundary.
-  const int64_t params_width = api::utils::align_up(out_features, 4);
   api::vTensor v_params = ParamTextureCache::singleton().get_or_create(
       weight, {3, params_width}, api::GPUMemoryLayout::TENSOR_WIDTH_PACKED,
       kTagQLinearParams,
@@ -1271,9 +1525,6 @@ Tensor quantized_linear_kernel(
         return v_p;
       });
 
-  const int64_t M = input.size(0);
-  const int64_t N = weight.size(0);
-  const int64_t K = input.size(1);
   const int64_t K_tex = (K + 3) / 4;
   api::vTensor v_output{context, {M, N}, DType::Int8};
 
