@@ -29,6 +29,9 @@ INCLUDE_FIXES = {
     "#include <cudnn.h>": '#include "tp_amd_compat/cudnn_stub.h"',
     "#include <cudnn_frontend.h>": '#include "tp_amd_compat/cudnn_frontend_disabled.h"',
     "#include <cusolverDn.h>": "#include <hipsolver/hipsolver.h>",
+    # The sparse solver API ships in the same compatibility package and is
+    # declared by the same umbrella header.
+    "#include <cusolverSp.h>": "#include <hipsolver/hipsolver.h>",
     "#include <tensorpipe/tensorpipe_hip.h>": "#include <tensorpipe/tensorpipe_cuda.h>",
     # The device-standard functors (equal_to, less, ...) resolve through the
     # thrust compatibility layer on the AMD side; the CUDA device-standard
@@ -51,6 +54,17 @@ SYMBOL_FIXES = {
     "cuFloatComplex": "hipFloatComplex",
     "cuDoubleComplex": "hipDoubleComplex",
     "cuConj": "hipConj",
+    # The sparse solver handle and the sparse QR solve: the mapping table
+    # carries no cusolverSp entries, but hipSOLVER declares each of these
+    # with the same arguments in hipsolver-sparse.h.
+    "cusolverSpHandle_t": "hipsolverSpHandle_t",
+    "cusolverSpCreate": "hipsolverSpCreate",
+    "cusolverSpDestroy": "hipsolverSpDestroy",
+    "cusolverSpSetStream": "hipsolverSpSetStream",
+    "cusolverSpScsrlsvqr": "hipsolverSpScsrlsvqr",
+    "cusolverSpDcsrlsvqr": "hipsolverSpDcsrlsvqr",
+    "cusolverSpCcsrlsvqr": "hipsolverSpCcsrlsvqr",
+    "cusolverSpZcsrlsvqr": "hipsolverSpZcsrlsvqr",
     # Device-standard functors live in the thrust namespace on the AMD side
     # (paired with the include fix above); HIP has no cuda/std namespace.
     "cuda::std::": "thrust::",
