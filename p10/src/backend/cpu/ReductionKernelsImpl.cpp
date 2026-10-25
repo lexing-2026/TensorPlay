@@ -3080,13 +3080,15 @@ inline ctype fold_run_exact(const ctype* data, int64_t n) {
 // instruction that owns the compare.  What that instruction does with a NaN
 // operand is its own business: the caller runs a second chain over the same
 // loads, and a NaN anywhere in the run shows up in it, so the ordering walk
-// never has to stop and check.
+// never has to stop and check.  The branch follows the tier the vector type
+// was built for, not the compiler's ISA macros: MSVC builds every tier with
+// /arch:AVX2, where the baseline Vectorized is not a __m256.
 template <bool WantMax>
 inline Vectorized<float> extremum_vec(const Vectorized<float>& acc,
                                       const Vectorized<float>& value) {
-#if defined(__AVX512F__)
+#if defined(CPU_CAPABILITY_AVX512)
     return WantMax ? _mm512_max_ps(acc, value) : _mm512_min_ps(acc, value);
-#elif defined(__AVX2__)
+#elif defined(CPU_CAPABILITY_AVX2)
     return WantMax ? _mm256_max_ps(acc, value) : _mm256_min_ps(acc, value);
 #else
     return WantMax ? maximum(acc, value) : minimum(acc, value);
@@ -3096,9 +3098,9 @@ inline Vectorized<float> extremum_vec(const Vectorized<float>& acc,
 template <bool WantMax>
 inline Vectorized<double> extremum_vec(const Vectorized<double>& acc,
                                        const Vectorized<double>& value) {
-#if defined(__AVX512F__)
+#if defined(CPU_CAPABILITY_AVX512)
     return WantMax ? _mm512_max_pd(acc, value) : _mm512_min_pd(acc, value);
-#elif defined(__AVX2__)
+#elif defined(CPU_CAPABILITY_AVX2)
     return WantMax ? _mm256_max_pd(acc, value) : _mm256_min_pd(acc, value);
 #else
     return WantMax ? maximum(acc, value) : minimum(acc, value);

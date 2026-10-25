@@ -47,7 +47,7 @@ void unsigned_pack_impl(const float* input, uint8_t* output, int64_t size, float
 // Running the same merge again folds four codes into a byte, so the halves only
 // have to be brought together once per level.
 template <int Bits>
-__attribute__((always_inline)) inline __m256i codes_to_items(__m256i lower, __m256i upper) {
+TP_ALWAYS_INLINE __m256i codes_to_items(__m256i lower, __m256i upper) {
     // Each narrow below discards a code once it no longer fits: a negative one
     // becomes zero, so only the top of the grid has to be stated, and once per
     // sixteen codes instead of twice per eight.
@@ -58,7 +58,7 @@ __attribute__((always_inline)) inline __m256i codes_to_items(__m256i lower, __m2
 }
 
 template <int Shift>
-__attribute__((always_inline)) inline __m256i merge_pairs(__m256i items) {
+TP_ALWAYS_INLINE __m256i merge_pairs(__m256i items) {
     const __m256i whole = _mm256_or_si256(items,
         _mm256_slli_epi16(_mm256_srli_si256(items, 1), Shift));
     // Bytes 0, 2, 4 and 6 of each half hold a finished byte of codes.
@@ -73,7 +73,7 @@ inline __m256i join_halves(__m256i packed) {
 // Sixteen codes leave as the bytes that hold them: eight for a nibble, four for a
 // pair of bits.
 template <int Bits>
-__attribute__((always_inline)) inline void pack_sixteen(__m256 lower, __m256 upper,
+TP_ALWAYS_INLINE void pack_sixteen(__m256 lower, __m256 upper,
                                                         uint8_t* output) {
     const __m256i items =
         codes_to_items<Bits>(_mm256_cvtps_epi32(lower), _mm256_cvtps_epi32(upper));
@@ -2026,7 +2026,7 @@ inline void pair_codes(const uint8_t* row, int64_t first, vec::Vectorized<float>
 // adding a row's bias where it stands costs a vector add per column vector of the
 // run, which is as many adds as there are fused products.
 template <int Bits, int Blocks>
-__attribute__((always_inline)) inline void hold_blocks(const uint8_t* const* rows,
+TP_ALWAYS_INLINE void hold_blocks(const uint8_t* const* rows,
         const float* gradients, int held, float biases, int64_t columns, int64_t col,
         float* y, int64_t bag, bool carried) {
     using FV = vec::Vectorized<float>;
