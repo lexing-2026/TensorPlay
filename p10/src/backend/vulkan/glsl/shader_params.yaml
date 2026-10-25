@@ -2169,6 +2169,18 @@ quantized_binary_op:
     OPERATOR: X * Y
   - NAME: quantized_div
     OPERATOR: X / Y
+quantized_binary_op_buffer:
+  parameter_names_with_default_values:
+    OPERATOR: X + Y
+  shader_variants:
+  - NAME: quantized_add_buffer
+    OPERATOR: X + Y
+  - NAME: quantized_sub_buffer
+    OPERATOR: X - Y
+  - NAME: quantized_mul_buffer
+    OPERATOR: X * Y
+  - NAME: quantized_div_buffer
+    OPERATOR: X / Y
 quantized_clamp:
   parameter_names_with_default_values: {}
   shader_variants:

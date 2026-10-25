@@ -730,6 +730,127 @@ Tensor quantized_binary_kernel_impl(
 
   api::Context* const context = api::context();
 
+  // The axes a payload lays out in row-major order, as the walks name them:
+  // (W, H, C, N), the width fastest.
+  const auto whcn_of = [](const std::vector<int64_t>& sizes) {
+    return std::vector<int64_t>{
+        get_dim<Dim4D::Width>(sizes),
+        get_dim<Dim4D::Height>(sizes),
+        get_dim<Dim4D::Channel>(sizes),
+        get_dim<Dim4D::Batch>(sizes)};
+  };
+  const auto strides_of = [](const std::vector<int64_t>& whcn) {
+    int64_t running = 1;
+    ivec4 strides{0, 0, 0, 0};
+    for (int axis = 0; axis < 4; ++axis) {
+      strides[axis] = static_cast<int32_t>(running);
+      running *= whcn[axis];
+    }
+    return strides;
+  };
+
+  const std::vector<int64_t> a_whcn = whcn_of(
+      static_cast<std::vector<int64_t>>(a.shape()));
+  const std::vector<int64_t> b_whcn = whcn_of(
+      static_cast<std::vector<int64_t>>(b.shape()));
+  const std::vector<int64_t> out_whcn = whcn_of(result_sizes);
+
+  // A pair that both keeps its codes one byte per element is folded by walking
+  // the words those codes share: the four lanes of one word name four
+  // consecutive output positions, and each position is drawn from wherever its
+  // operand's strides put it, so the broadcast wraps the same axes the texel
+  // walk wraps.  A pair that mixes the classes crosses into images below, since
+  // the texel walk samples both operands.
+  const api::vTensor v_a_linear = convert(a);
+  const api::vTensor v_b_linear = convert(b);
+  if (v_a_linear.storage_type() == api::StorageType::BUFFER &&
+      v_b_linear.storage_type() == api::StorageType::BUFFER) {
+    api::vTensor v_output{
+        context,
+        result_sizes,
+        DType::Int8,
+        api::StorageType::BUFFER,
+        api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+
+    const struct QuantizedBinaryLinearBlock final {
+      ivec4 out_sizes;
+      ivec4 out_strides;
+      ivec4 a_sizes;
+      ivec4 a_strides;
+      ivec4 b_sizes;
+      ivec4 b_strides;
+      float a_scale;
+      int32_t a_zero_point;
+      float b_scale;
+      int32_t b_zero_point;
+      float inv_out_scale;
+      int32_t out_zero_point;
+      uint32_t buf_length; // output element count
+      int32_t fill;
+    } block{
+        ivec4(
+            static_cast<int32_t>(out_whcn[0]),
+            static_cast<int32_t>(out_whcn[1]),
+            static_cast<int32_t>(out_whcn[2]),
+            static_cast<int32_t>(out_whcn[3])),
+        strides_of(out_whcn),
+        ivec4(
+            static_cast<int32_t>(a_whcn[0]),
+            static_cast<int32_t>(a_whcn[1]),
+            static_cast<int32_t>(a_whcn[2]),
+            static_cast<int32_t>(a_whcn[3])),
+        strides_of(a_whcn),
+        ivec4(
+            static_cast<int32_t>(b_whcn[0]),
+            static_cast<int32_t>(b_whcn[1]),
+            static_cast<int32_t>(b_whcn[2]),
+            static_cast<int32_t>(b_whcn[3])),
+        strides_of(b_whcn),
+        static_cast<float>(a_scale),
+        static_cast<int32_t>(a_zero_point),
+        static_cast<float>(b_scale),
+        static_cast<int32_t>(b_zero_point),
+        static_cast<float>(1.0 / out_scale),
+        static_cast<int32_t>(out_zero_point),
+        static_cast<uint32_t>(v_output.numel()),
+        0};
+
+    api::UniformParamsBuffer params(context, block);
+    api::PipelineBarrier pipeline_barrier{};
+
+    // One invocation owns one word of four output codes.
+    const api::utils::uvec3 grid{
+        api::utils::div_up(
+            api::utils::safe_downcast_to_u32(
+                static_cast<int64_t>(v_output.numel())),
+            4u),
+        1u,
+        1u};
+
+    const std::string buffer_kernel_name =
+        std::string(kernel_name) + "_buffer";
+
+    context->submit_compute_job(
+        VK_KERNEL_FROM_STR(buffer_kernel_name),
+        pipeline_barrier,
+        grid,
+        adaptive_work_group_size(grid),
+        VK_NULL_HANDLE,
+        v_output.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::WRITE),
+        v_a_linear.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+        v_b_linear.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+        params.buffer());
+
+    return quantized::make_qtensor(
+        convert(v_output),
+        make_per_tensor_affine_quantizer(
+            out_scale, out_zero_point, DType::QInt8),
+        DType::QInt8);
+  }
+
   // Both operands are read by texel, so a payload that arrives in words is
   // laid out as an image first: one pass of the strided gather, and an operand
   // that is already an image comes back without a copy.
@@ -739,22 +860,6 @@ Tensor quantized_binary_kernel_impl(
   api::vTensor v_b = convert(b_image);
 
   api::vTensor v_output{context, result_sizes, DType::Int8};
-
-  const std::vector<int64_t> a_whcn{
-      get_dim<Dim4D::Width>(v_a.sizes()),
-      get_dim<Dim4D::Height>(v_a.sizes()),
-      get_dim<Dim4D::Channel>(v_a.sizes()),
-      get_dim<Dim4D::Batch>(v_a.sizes())};
-  const std::vector<int64_t> b_whcn{
-      get_dim<Dim4D::Width>(v_b.sizes()),
-      get_dim<Dim4D::Height>(v_b.sizes()),
-      get_dim<Dim4D::Channel>(v_b.sizes()),
-      get_dim<Dim4D::Batch>(v_b.sizes())};
-  const std::vector<int64_t> out_whcn{
-      get_dim<Dim4D::Width>(v_output.sizes()),
-      get_dim<Dim4D::Height>(v_output.sizes()),
-      get_dim<Dim4D::Channel>(v_output.sizes()),
-      get_dim<Dim4D::Batch>(v_output.sizes())};
 
   const struct QuantizedBinaryBlock block{
       ivec4(
@@ -860,12 +965,81 @@ Tensor quantized_clamp_kernel(
 
   api::Context* const context = api::context();
 
-  // The walk reads and writes a texel's four byte lanes, so a payload that
-  // arrives in words is laid out as an image first: one pass of the strided
-  // gather, and an operand that is already an image comes back without a copy.
-  const Tensor input_image = to_image_storage(context, self);
-  api::vTensor v_input = convert(input_image);
+  api::vTensor v_input = convert(self);
 
+  // The fold is elementwise on the payload's own order, so a payload that keeps
+  // its codes one byte per element has the four lanes of one word feeding the
+  // four lanes of the next: one fetch, one store, and no pass over the payload
+  // to lay it out somewhere else first.
+  if (v_input.storage_type() == api::StorageType::BUFFER) {
+    api::vTensor v_output{
+        context,
+        v_input.sizes(),
+        DType::Int8,
+        api::StorageType::BUFFER,
+        api::GPUMemoryLayout::TENSOR_WIDTH_PACKED};
+
+    const struct QuantizedClampLinearBlock final {
+      float in_scale;
+      int32_t in_zero_point;
+      float inv_out_scale;
+      int32_t out_zero_point;
+      int32_t has_min;
+      int32_t has_max;
+      float min_value;
+      float max_value;
+      uint32_t buf_length; // element count, shared by both payloads
+      int32_t fill0;
+      int32_t fill1;
+      int32_t fill2;
+    } block{
+        static_cast<float>(self_scale),
+        static_cast<int32_t>(self_zero_point),
+        static_cast<float>(1.0 / out_scale),
+        static_cast<int32_t>(out_zero_point),
+        min.has_value() ? 1 : 0,
+        max.has_value() ? 1 : 0,
+        min.has_value() ? static_cast<float>(min->toDouble()) : 0.0f,
+        max.has_value() ? static_cast<float>(max->toDouble()) : 0.0f,
+        static_cast<uint32_t>(v_output.numel()),
+        0,
+        0,
+        0};
+
+    api::UniformParamsBuffer params(context, block);
+    api::PipelineBarrier pipeline_barrier{};
+
+    // One invocation owns one word of four codes.
+    const api::utils::uvec3 grid{
+        api::utils::div_up(
+            api::utils::safe_downcast_to_u32(
+                static_cast<int64_t>(v_output.numel())),
+            4u),
+        1u,
+        1u};
+
+    context->submit_compute_job(
+        VK_KERNEL(quantized_clamp_buffer),
+        pipeline_barrier,
+        grid,
+        adaptive_work_group_size(grid),
+        VK_NULL_HANDLE,
+        v_output.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::WRITE),
+        v_input.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+        params.buffer());
+
+    return quantized::make_qtensor(
+        convert(v_output),
+        make_per_tensor_affine_quantizer(
+            out_scale, out_zero_point, DType::QInt8),
+        DType::QInt8);
+  }
+
+  // The walk reads and writes a texel's four byte lanes, so it takes the
+  // payload in its image form; a payload that draws words took the route above.
   api::vTensor v_output{context, v_input.sizes(), DType::Int8};
 
   const struct QuantizedClampBlock block{

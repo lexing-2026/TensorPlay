@@ -560,21 +560,22 @@ def test_quantized_linear_of_the_two_routes_a_matrix_of_codes_can_arrive_by(
     ).astype(np.int8)
     np.testing.assert_array_equal(int_repr(out).cpu().numpy(), expected)
 
-    # An elementwise fold still writes its result into a texel's four byte
-    # lanes, so the same codes pushed through a fold that changes nothing
-    # arrive in the other class.  The product packs from whichever class an
-    # operand is in, and both routes have to answer the same codes.
-    x_image = tp._C.quantized_clamp(
-        xq, x_scale, x_zp, x_scale, x_zp, -1.0e9, 1.0e9)
-    w_image = tp._C.quantized_clamp(wq, 1.0, 0, 1.0, 0, -1.0e9, 1.0e9)
-    assert x_image.data_ptr() == 0 and w_image.data_ptr() == 0, (
-        "the fold did not leave the codes in a texel")
+    # A payload that reaches the device through the ordinary transfer keeps the
+    # texel form its shape alone asks for, so the very same codes arrive in the
+    # other class.  Each operand is packed from the class it is in, and both
+    # routes have to answer the codes the host reference gives.
+    x_texel = tp._C._make_per_tensor_quantized_tensor(
+        tp.from_numpy(x_codes.astype(np.int8).copy()), x_scale, x_zp).to("vulkan")
+    w_texel = tp._C._make_per_tensor_quantized_tensor(
+        tp.from_numpy(w_codes.astype(np.int8).copy()), 1.0, 0).to("vulkan")
+    assert x_texel.data_ptr() == 0 and w_texel.data_ptr() == 0, (
+        "the transfer did not leave the codes in a texel")
     np.testing.assert_array_equal(
-        int_repr(x_image).cpu().numpy(), int_repr(xq).cpu().numpy())
+        int_repr(x_texel).cpu().numpy(), int_repr(xq).cpu().numpy())
 
-    out_image = tp._C.quantized_linear(
-        x_image,
-        w_image,
+    out_texel = tp._C.quantized_linear(
+        x_texel,
+        w_texel,
         x_scale,
         x_zp,
         tp.tensor(w_scales, dtype=tp.float32),
@@ -584,43 +585,155 @@ def test_quantized_linear_of_the_two_routes_a_matrix_of_codes_can_arrive_by(
         -1,
     )
     np.testing.assert_array_equal(
-        int_repr(out_image).cpu().numpy(), expected)
+        int_repr(out_texel).cpu().numpy(), expected)
 
 
+# A fold of two payloads that keep their codes one byte per element walks the
+# words those codes share: four consecutive output positions land in one word on
+# the result side, while on each operand's side they sit wherever that operand's
+# own row-major order puts them.  A singleton axis repeats through the same
+# modulo the texel walk uses, which is what the broadcast shapes below try, and
+# every pair is folded down both walks so the two answers can be compared byte
+# for byte, then against the host.
+@pytest.mark.parametrize(
+    "a_shape,b_shape",
+    [((23, 5), (23, 5)), ((6, 7), (6, 7)), ((23, 5), (1, 5)),
+     ((23, 5), (23, 1)), ((4, 9), (1, 1)), ((5, 12), (1, 12))],
+)
+def test_a_fold_of_words_backed_matrices_stays_in_words(a_shape, b_shape):
+    rng = np.random.default_rng(
+        7 + 13 * a_shape[0] + 5 * a_shape[1] + 11 * b_shape[0] + b_shape[1])
+    a_codes = rng.integers(-128, 129, a_shape).astype(np.int8)
+    b_codes = rng.integers(-128, 129, b_shape).astype(np.int8)
+    # A divisor that names its own zero point would read as nothing, so the sweep
+    # keeps away from it and every quotient stays a finite number.
+    b_codes = np.where(b_codes == -2, -1, b_codes).astype(np.int8)
 
-# Both remaining walks read a texel's four byte lanes too, so a pair of matrices
-# the entry above kept in words crosses into images before either folds.  The
-# rounding back into the byte is the host's own, so the check is one call over
-# the same codes and the same parameters on both sides of the transfer.
-def test_quantized_binary_and_clamp_answer_from_words_backed_matrices():
-    rng = np.random.default_rng(71)
-    a_codes = rng.integers(-128, 129, (23, 5)).astype(np.int8)
-    b_codes = rng.integers(-128, 129, (23, 5)).astype(np.int8)
+    a_scale, a_zp = 0.25, 4
+    b_scale, b_zp = 0.5, -2
 
-    a_cpu = tp._C._make_per_tensor_quantized_tensor(
-        tp.from_numpy(a_codes.copy()), 0.1, 5)
-    b_cpu = tp._C._make_per_tensor_quantized_tensor(
-        tp.from_numpy(b_codes.copy()), 0.2, -3)
     a = tp._C._make_per_tensor_quantized_tensor(
-        tp.from_numpy(a_codes.copy()).to("vulkan"), 0.1, 5)
+        tp.from_numpy(a_codes.copy()).to("vulkan"), a_scale, a_zp)
     b = tp._C._make_per_tensor_quantized_tensor(
-        tp.from_numpy(b_codes.copy()).to("vulkan"), 0.2, -3)
+        tp.from_numpy(b_codes.copy()).to("vulkan"), b_scale, b_zp)
     assert a.data_ptr() != 0 and b.data_ptr() != 0
 
+    # The same codes reaching the device through the ordinary transfer keep the
+    # texel form their shape alone asks for, so each fold runs down both walks
+    # over one pair of payloads and the two answers have to be the same bytes.
+    a_texel = tp._C._make_per_tensor_quantized_tensor(
+        tp.from_numpy(a_codes.copy()), a_scale, a_zp).to("vulkan")
+    b_texel = tp._C._make_per_tensor_quantized_tensor(
+        tp.from_numpy(b_codes.copy()), b_scale, b_zp).to("vulkan")
+    assert a_texel.data_ptr() == 0 and b_texel.data_ptr() == 0, (
+        "the transfer did not leave the codes in a texel")
+
+    a_cpu = tp._C._make_per_tensor_quantized_tensor(
+        tp.from_numpy(a_codes.copy()), a_scale, a_zp)
+    b_cpu = tp._C._make_per_tensor_quantized_tensor(
+        tp.from_numpy(b_codes.copy()), b_scale, b_zp)
+
     for name, out_scale, out_zp in (
-        ("quantized_add", 0.05, 7),
-        ("quantized_mul", 0.4, -1),
+        ("quantized_add", 0.125, 0),
+        ("quantized_sub", 0.125, 3),
+        ("quantized_mul", 0.5, -1),
+        ("quantized_div", 0.25, 2),
     ):
         run = getattr(tp._C, name)
-        got = run(a, b, 0.1, 5, 0.2, -3, out_scale, out_zp)
-        want = run(a_cpu, b_cpu, 0.1, 5, 0.2, -3, out_scale, out_zp)
-        np.testing.assert_array_equal(
-            int_repr(got).cpu().numpy(), int_repr(want).cpu().numpy())
+        got = int_repr(
+            run(a, b, a_scale, a_zp, b_scale, b_zp, out_scale, out_zp)
+        ).cpu().numpy()
+        texel = int_repr(
+            run(a_texel, b_texel, a_scale, a_zp, b_scale, b_zp, out_scale, out_zp)
+        ).cpu().numpy()
+        np.testing.assert_array_equal(got, texel)
+        assert got.shape == np.broadcast_shapes(a_shape, b_shape)
 
-    got = tp._C.quantized_clamp(a, 0.1, 5, 0.1, 5, 0.15, 0.45)
-    want = tp._C.quantized_clamp(a_cpu, 0.1, 5, 0.1, 5, 0.15, 0.45)
+    # Both scales are a power of two, so a sum, a difference or a product of two
+    # dequantized codes names a whole number of the grid exactly and the host's
+    # rounding is the walk's own.  A quotient names such a number far less often,
+    # and a value that lands between two codes can fall on either side of the tie
+    # on the way there, so the quotient is only pinned to the host within one.
+    for name, out_scale, out_zp in (
+        ("quantized_add", 0.125, 0),
+        ("quantized_sub", 0.125, 3),
+        ("quantized_mul", 0.5, -1),
+    ):
+        run = getattr(tp._C, name)
+        got = int_repr(
+            run(a, b, a_scale, a_zp, b_scale, b_zp, out_scale, out_zp)
+        ).cpu().numpy()
+        want = int_repr(
+            run(a_cpu, b_cpu, a_scale, a_zp, b_scale, b_zp, out_scale, out_zp)
+        ).cpu().numpy()
+        np.testing.assert_array_equal(got, want)
+
+    quotient = int_repr(
+        tp._C.quantized_div(a, b, a_scale, a_zp, b_scale, b_zp, 0.25, 2)
+    ).cpu().numpy().astype(np.int64)
+    host_quotient = int_repr(
+        tp._C.quantized_div(a_cpu, b_cpu, a_scale, a_zp, b_scale, b_zp, 0.25, 2)
+    ).cpu().numpy().astype(np.int64)
+    assert np.max(np.abs(quotient - host_quotient)) <= 1
+
+    # A pair that mixes the classes still folds: the payload kept in words is the
+    # one that has to cross, and the answer cannot depend on which side crossed.
+    mixed = int_repr(
+        tp._C.quantized_add(a, b_texel, a_scale, a_zp, b_scale, b_zp, 0.125, 0)
+    ).cpu().numpy()
     np.testing.assert_array_equal(
-        int_repr(got).cpu().numpy(), int_repr(want).cpu().numpy())
+        mixed,
+        int_repr(
+            tp._C.quantized_add(
+                a_texel, b_texel, a_scale, a_zp, b_scale, b_zp, 0.125, 0)
+        ).cpu().numpy())
+
+    # The words route writes its result into words too, so a fold of a pair that
+    # arrived one byte per code does not hand the next consumer a texel to cross.
+    stayed = tp._C.quantized_add(a, b, a_scale, a_zp, b_scale, b_zp, 0.125, 0)
+    assert stayed.data_ptr() != 0, "the fold left its codes outside the words"
+
+
+# The bounds fold reads the four lanes of one word and writes the next, so the
+# codes it requantizes stay in the storage they arrived in.  The bounds sit in the
+# dequantized domain and one pair of parameters maps the grid onto another, so
+# both the window and the requantization are exercised.  The two walks of the
+# same payload have to agree byte for byte, while the host, which reads the same
+# formula in its own width, is only pinned to within one code: a value that lands
+# between two codes can fall on either side of the tie on the way there.
+@pytest.mark.parametrize(
+    "out_scale,out_zp,low,high",
+    [
+        (0.1, 5, -2.0, 2.0),
+        (0.2, -4, -1.0, 1.0),
+        (0.05, 0, 0.3, None),
+        (0.4, 1, None, 0.75),
+    ],
+)
+def test_a_bounds_fold_of_a_words_payload_keeps_its_codes_in_words(
+    out_scale, out_zp, low, high
+):
+    rng = np.random.default_rng(101 + int(1000 * out_scale) + out_zp)
+    codes = rng.integers(-128, 129, (19, 6)).astype(np.int8)
+
+    on_cpu = tp._C._make_per_tensor_quantized_tensor(
+        tp.from_numpy(codes.copy()), 0.1, 5)
+    on_device = tp._C._make_per_tensor_quantized_tensor(
+        tp.from_numpy(codes.copy()).to("vulkan"), 0.1, 5)
+    on_texel = tp._C._make_per_tensor_quantized_tensor(
+        tp.from_numpy(codes.copy()), 0.1, 5).to("vulkan")
+    assert on_device.data_ptr() != 0 and on_texel.data_ptr() == 0
+
+    got = tp._C.quantized_clamp(on_device, 0.1, 5, out_scale, out_zp, low, high)
+    texel = tp._C.quantized_clamp(on_texel, 0.1, 5, out_scale, out_zp, low, high)
+    want = tp._C.quantized_clamp(on_cpu, 0.1, 5, out_scale, out_zp, low, high)
+    np.testing.assert_array_equal(
+        int_repr(got).cpu().numpy(), int_repr(texel).cpu().numpy())
+    assert got.data_ptr() != 0, "the fold left its codes outside the words"
+    difference = (
+        int_repr(got).cpu().numpy().astype(np.int64)
+        - int_repr(want).cpu().numpy().astype(np.int64))
+    assert np.max(np.abs(difference)) <= 1
 
 
 # A weight whose storage sits the other way round names its rows through strides
