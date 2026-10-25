@@ -153,7 +153,7 @@ binary_op_scalar:
     OPERATOR: X * Y
     FORMAT: rgba32i
   - NAME: pow_tensor_scalar
-    OPERATOR: 'pow_guard(X, Y, (fract(Y) == vec4(0.0)) ? (mod(Y, vec4(2.0)) == vec4(0.0) ? pow(abs(X), Y) : sign(X) * pow(abs(X), Y)) : pow(X, Y))'
+    OPERATOR: 'pow_guard(X, Y, (fract(Y) == vec4(0.0)) ? (mod(Y, vec4(2.0)) == vec4(0.0) ? pow(abs(X), Y) : mix(pow(abs(X), Y), -pow(abs(X), Y), lessThan(X, vec4(0.0)))) : pow(X, Y))'
   - NAME: rsub_scalar
     OPERATOR: Y - X
   - NAME: rsub_scalar_i32
@@ -172,7 +172,7 @@ binary_op_scalar:
   # exponents of all kinds, so whether the answer is whole and which sign it
   # carries is decided lane by lane.
   - NAME: pow_scalar_tensor
-    OPERATOR: 'pow_guard(Y, X, mix(pow(Y, X), pow(abs(Y), X) * mix(vec4(1.0), sign(Y), notEqual(mod(X, vec4(2.0)), vec4(0.0))), equal(fract(X), vec4(0.0))))'
+    OPERATOR: 'pow_guard(Y, X, mix(pow(Y, X), mix(pow(abs(Y), X), mix(pow(abs(Y), X), -pow(abs(Y), X), lessThan(Y, vec4(0.0))), notEqual(mod(X, vec4(2.0)), vec4(0.0))), equal(fract(X), vec4(0.0))))'
   # Two counts need no estimate in between: the exponent is spent one bit at a
   # time over the word itself, so the power lands on the number it names and a
   # fraction of anything but the two words that are their own reciprocals is
@@ -262,7 +262,7 @@ binary_op_tensor:
   # even one are taken lane by lane.  A base of nothing is answered outside the
   # power itself, which names nothing for it.
   - NAME: pow
-    OPERATOR: 'pow_guard(X, Y, mix(pow(X, Y), pow(abs(X), Y) * mix(vec4(1.0), sign(X), notEqual(mod(Y, vec4(2.0)), vec4(0.0))), equal(fract(Y), vec4(0.0))))'
+    OPERATOR: 'pow_guard(X, Y, mix(pow(X, Y), mix(pow(abs(X), Y), mix(pow(abs(X), Y), -pow(abs(X), Y), lessThan(X, vec4(0.0))), notEqual(mod(Y, vec4(2.0)), vec4(0.0))), equal(fract(Y), vec4(0.0))))'
   # Both operands are counts, so the word is raised to the word and no single
   # precision estimate of the answer is ever asked for: an exponent of nothing
   # names one, a negative one keeps only the bases that are their own
@@ -414,9 +414,9 @@ buffer_unary_op:
   - NAME: buffer_cosh
     OPERATOR: cosh(X)
   - NAME: buffer_asin
-    OPERATOR: asin(X)
+    OPERATOR: atan(X, sqrt(1.0f - X * X))
   - NAME: buffer_acos
-    OPERATOR: acos(X)
+    OPERATOR: atan(sqrt(1.0f - X * X), X)
   - NAME: buffer_atan
     OPERATOR: atan(X)
   - NAME: buffer_exp2
@@ -509,7 +509,7 @@ buffer_binary_op_tensor:
   # The linear writer covers four exponents per word, so the whole-number test
   # and the sign an odd exponent restores are both taken lane by lane.
   - NAME: buffer_pow
-    OPERATOR: 'pow_guard(X, Y, mix(pow(X, Y), pow(abs(X), Y) * mix(vec4(1.0), sign(X), notEqual(mod(Y, vec4(2.0)), vec4(0.0))), equal(fract(Y), vec4(0.0))))'
+    OPERATOR: 'pow_guard(X, Y, mix(pow(X, Y), mix(pow(abs(X), Y), mix(pow(abs(X), Y), -pow(abs(X), Y), lessThan(X, vec4(0.0))), notEqual(mod(Y, vec4(2.0)), vec4(0.0))), equal(fract(Y), vec4(0.0))))'
   # The linear twin of the signed-word power, four exponents per word.
   - NAME: buffer_pow_i32
     DTYPE: int
@@ -570,14 +570,14 @@ buffer_binary_op_scalar:
     DTYPE: int
     OPERATOR: X * Y
   - NAME: buffer_pow_scalar
-    OPERATOR: 'pow_guard(X, Y, (fract(Y) == 0.0) ? (mod(Y, 2.0) == 0.0 ? pow(abs(X), Y) : sign(X) * pow(abs(X), Y)) : pow(X, Y))'
+    OPERATOR: 'pow_guard(X, Y, (fract(Y) == 0.0) ? (mod(Y, 2.0) == 0.0 ? pow(abs(X), Y) : (X < 0.0 ? -pow(abs(X), Y) : pow(abs(X), Y))) : pow(X, Y))'
   # The exponent arrives as a whole uniform, so the count is raised over the
   # word itself and stays exact the whole way up.
   - NAME: buffer_pow_scalar_i32
     DTYPE: int
     OPERATOR: pow_count(X, Y)
   - NAME: buffer_pow_scalar_tensor
-    OPERATOR: 'pow_guard(Y, X, (fract(X) == 0.0) ? (mod(X, 2.0) == 0.0 ? pow(abs(Y), X) : sign(Y) * pow(abs(Y), X)) : pow(Y, X))'
+    OPERATOR: 'pow_guard(Y, X, (fract(X) == 0.0) ? (mod(X, 2.0) == 0.0 ? pow(abs(Y), X) : (Y < 0.0 ? -pow(abs(Y), X) : pow(abs(Y), X))) : pow(Y, X))'
   - NAME: buffer_pow_scalar_tensor_i32
     DTYPE: int
     OPERATOR: pow_count(Y, X)
@@ -2502,16 +2502,16 @@ buffer_half_unary_op:
     OPERATOR: 'abs(X)'
     INPLACE: true
   - NAME: buffer_acos_half
-    OPERATOR: 'acos(X)'
+    OPERATOR: 'atan(sqrt(1.0f - X * X), X)'
     INPLACE: false
   - NAME: buffer_acos_halfinplace
-    OPERATOR: 'acos(X)'
+    OPERATOR: 'atan(sqrt(1.0f - X * X), X)'
     INPLACE: true
   - NAME: buffer_asin_half
-    OPERATOR: 'asin(X)'
+    OPERATOR: 'atan(X, sqrt(1.0f - X * X))'
     INPLACE: false
   - NAME: buffer_asin_halfinplace
-    OPERATOR: 'asin(X)'
+    OPERATOR: 'atan(X, sqrt(1.0f - X * X))'
     INPLACE: true
   - NAME: buffer_atan_half
     OPERATOR: 'atan(X)'
@@ -2832,10 +2832,10 @@ buffer_half_binary_op_tensor:
     OPERATOR: 'X * Y'
     INPLACE: true
   - NAME: buffer_pow_half
-    OPERATOR: 'pow_guard(X, Y, (fract(Y) == 0.0) ? (mod(Y, 2.0) == 0.0 ? pow(abs(X), Y) : sign(X) * pow(abs(X), Y)) : pow(X, Y))'
+    OPERATOR: 'pow_guard(X, Y, (fract(Y) == 0.0) ? (mod(Y, 2.0) == 0.0 ? pow(abs(X), Y) : (X < 0.0 ? -pow(abs(X), Y) : pow(abs(X), Y))) : pow(X, Y))'
     INPLACE: false
   - NAME: buffer_pow_halfinplace
-    OPERATOR: 'pow_guard(X, Y, (fract(Y) == 0.0) ? (mod(Y, 2.0) == 0.0 ? pow(abs(X), Y) : sign(X) * pow(abs(X), Y)) : pow(X, Y))'
+    OPERATOR: 'pow_guard(X, Y, (fract(Y) == 0.0) ? (mod(Y, 2.0) == 0.0 ? pow(abs(X), Y) : (X < 0.0 ? -pow(abs(X), Y) : pow(abs(X), Y))) : pow(X, Y))'
     INPLACE: true
   - NAME: buffer_remainder_half
     OPERATOR: 'X - Y * floor(X / Y)'
@@ -2877,13 +2877,13 @@ buffer_half_binary_op_scalar:
     OPERATOR: 'X * Y'
     INPLACE: true
   - NAME: buffer_pow_scalar_half
-    OPERATOR: 'pow_guard(X, Y, (fract(Y) == 0.0) ? (mod(Y, 2.0) == 0.0 ? pow(abs(X), Y) : sign(X) * pow(abs(X), Y)) : pow(X, Y))'
+    OPERATOR: 'pow_guard(X, Y, (fract(Y) == 0.0) ? (mod(Y, 2.0) == 0.0 ? pow(abs(X), Y) : (X < 0.0 ? -pow(abs(X), Y) : pow(abs(X), Y))) : pow(X, Y))'
     INPLACE: false
   - NAME: buffer_pow_scalar_halfinplace
-    OPERATOR: 'pow_guard(X, Y, (fract(Y) == 0.0) ? (mod(Y, 2.0) == 0.0 ? pow(abs(X), Y) : sign(X) * pow(abs(X), Y)) : pow(X, Y))'
+    OPERATOR: 'pow_guard(X, Y, (fract(Y) == 0.0) ? (mod(Y, 2.0) == 0.0 ? pow(abs(X), Y) : (X < 0.0 ? -pow(abs(X), Y) : pow(abs(X), Y))) : pow(X, Y))'
     INPLACE: true
   - NAME: buffer_pow_scalar_tensor_half
-    OPERATOR: 'pow_guard(Y, X, (fract(X) == 0.0) ? (mod(X, 2.0) == 0.0 ? pow(abs(Y), X) : sign(Y) * pow(abs(Y), X)) : pow(Y, X))'
+    OPERATOR: 'pow_guard(Y, X, (fract(X) == 0.0) ? (mod(X, 2.0) == 0.0 ? pow(abs(Y), X) : (Y < 0.0 ? -pow(abs(Y), X) : pow(abs(Y), X))) : pow(Y, X))'
     INPLACE: false
   - NAME: buffer_mod_scalar_half
     OPERATOR: 'X - Y * floor(X / Y)'
