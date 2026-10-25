@@ -439,12 +439,13 @@ def test_a_matrix_of_codes_named_from_a_transposed_arrival_is_dense():
         tp.dequantize(weight).cpu().numpy(), expected)
 
 
-# The tiled product samples four channels of one texel per fetch, so an operand
-# that arrives in words is laid out as an image once before the walk rather than
-# refused.  The crossing costs one pass and the walk reads every code many times
-# over, and the answer stays exactly the one the host reference computes from the
-# same codes.
-@pytest.mark.parametrize("m,k,n", [(4, 16, 8), (17, 33, 5)])
+# The product packs both operands before its walk reads them, so an operand kept
+# in words is packed from the byte lanes of the words its codes share instead of
+# first being laid out as an image.  A row whose length does not divide by four
+# splits the four codes of one texel across word boundaries, and a width below
+# four leaves a texel whose tail lanes are padding, so both ends of that range
+# are swept here against the host reference.
+@pytest.mark.parametrize("m,k,n", [(4, 16, 8), (17, 33, 5), (5, 3, 7), (2, 1, 4)])
 def test_quantized_linear_of_a_weight_named_on_the_device(m, k, n):
     rng = np.random.default_rng(m * 31 + k * 7 + n)
     x_codes = rng.integers(-32, 33, (m, k), dtype=np.int32)
@@ -482,6 +483,46 @@ def test_quantized_linear_of_a_weight_named_on_the_device(m, k, n):
     np.testing.assert_array_equal(int_repr(out).cpu().numpy(), expected)
 
 
+# A decode step pairs an activation the device quantizer just wrote with a
+# weight that was uploaded once and named, and those two arrive in different
+# classes: the codes of the first still sit in the lanes of a texel, the codes of
+# the second one byte per word.  Each operand is packed from the class it is in,
+# so the pair answers the same product the host reference gives.
+@pytest.mark.parametrize("m,k,n", [(1, 13, 6), (4, 16, 8)])
+def test_quantized_linear_of_an_image_activation_and_a_word_weight(m, k, n):
+    rng = np.random.default_rng(m * 17 + k * 11 + n)
+    x_codes = rng.integers(-32, 33, (m, k), dtype=np.int32)
+    w_codes = rng.integers(-32, 33, (n, k), dtype=np.int32)
+    x_scale, x_zp = 0.125, 2
+    w_scales = np.exp2(-rng.integers(2, 6, n)).astype(np.float32)
+    w_zps = rng.integers(-4, 5, n, dtype=np.int32)
+
+    xq = tp._C.quantize_per_tensor(
+        tp.tensor((x_codes - x_zp) * x_scale, dtype=tp.float32).to("vulkan"),
+        x_scale, x_zp, tp.qint8)
+    wq = tp._C._make_per_tensor_quantized_tensor(
+        tp.from_numpy(w_codes.astype(np.int8).copy()).to("vulkan"), 1.0, 0)
+    assert xq.data_ptr() == 0, "a device-quantized activation was not an image"
+    assert wq.data_ptr() != 0, "the weight codes were not kept in words"
+
+    out = tp._C.quantized_linear(
+        xq,
+        wq,
+        x_scale,
+        x_zp,
+        tp.tensor(w_scales, dtype=tp.float32),
+        tp.tensor(w_zps, dtype=tp.int32),
+        None,
+        0.5,
+        -1,
+    )
+    acc = (x_codes - x_zp) @ (w_codes - w_zps[:, None]).T
+    expected = np.clip(
+        np.rint(acc * x_scale * w_scales / 0.5) - 1, -128, 127
+    ).astype(np.int8)
+    np.testing.assert_array_equal(int_repr(out).cpu().numpy(), expected)
+
+
 # Both remaining walks read a texel's four byte lanes too, so a pair of matrices
 # the entry above kept in words crosses into images before either folds.  The
 # rounding back into the byte is the host's own, so the check is one call over
@@ -515,3 +556,39 @@ def test_quantized_binary_and_clamp_answer_from_words_backed_matrices():
     want = tp._C.quantized_clamp(a_cpu, 0.1, 5, 0.1, 5, 0.15, 0.45)
     np.testing.assert_array_equal(
         int_repr(got).cpu().numpy(), int_repr(want).cpu().numpy())
+
+
+# A weight whose storage sits the other way round names its rows through strides
+# that walk the words by columns, while both packs read bytes by their position
+# in the storage.  Nothing here re-lays such a view out, so the product refuses it
+# loudly instead of answering with the transposed codes: naming the refusal is
+# what keeps a strided weight from quietly becoming a wrong layer.
+def test_quantized_linear_refuses_a_weight_whose_storage_sits_the_other_way_round():
+    m, k, n = 3, 13, 8
+    rng = np.random.default_rng(m * 23 + k * 5 + n)
+    x_codes = rng.integers(-32, 33, (m, k), dtype=np.int32)
+    stored = rng.integers(-32, 33, (k, n), dtype=np.int32)
+    x_scale, x_zp = 0.125, -2
+    w_scales = np.exp2(-rng.integers(2, 6, n)).astype(np.float32)
+    w_zps = rng.integers(-4, 5, n, dtype=np.int32)
+
+    xq = tp._C._make_per_tensor_quantized_tensor(
+        tp.from_numpy(x_codes.astype(np.int8).copy()).to("vulkan"),
+        x_scale, x_zp)
+    wq = tp._C._make_per_tensor_quantized_tensor(
+        tp.from_numpy(stored.astype(np.int8).copy()).to("vulkan"), 1.0, 0)
+    weight = wq.transpose(0, 1)
+    assert tuple(weight.shape) == (n, k)
+
+    with pytest.raises(RuntimeError, match="dense"):
+        tp._C.quantized_linear(
+            xq,
+            weight,
+            x_scale,
+            x_zp,
+            tp.tensor(w_scales, dtype=tp.float32),
+            tp.tensor(w_zps, dtype=tp.int32),
+            None,
+            0.5,
+            4,
+        )

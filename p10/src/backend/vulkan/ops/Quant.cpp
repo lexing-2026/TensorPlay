@@ -975,15 +975,16 @@ Tensor quantized_linear_kernel(
 
   api::Context* const context = api::context();
 
-  // The tiled walk samples four channels of a texel per fetch, so a payload
-  // that arrives in words is laid out as texels first.  The crossing is one
-  // pass of the strided gather and pays for itself when the walk reads the
-  // payload many times; a shape too large for any image has no texel form to
-  // cross into and says so.
-  const Tensor input_image = to_image_storage(context, input);
-  const Tensor weight_image = to_image_storage(context, weight);
-  api::vTensor v_input = convert(input_image);
-  api::vTensor v_weight = convert(weight_image);
+  // Both operands are packed before the walk reads them, and a pack writes the
+  // same texels whatever width its source codes share, so the class an operand
+  // arrives in picks which pack runs instead of forcing a pass over the whole
+  // payload first.  A weight kept one byte per code is therefore read straight
+  // out of words, and the packed form the cache reuses across calls is
+  // unchanged.  A payload that does not name its elements in the order its
+  // storage holds them is refused by the binding, as every device walk here
+  // refuses it: the packs read bytes by their position in the storage.
+  api::vTensor v_input = convert(input);
+  api::vTensor v_weight = convert(weight);
 
   // Pack the per-channel parameters into a 3-row float texture indexed by
   // the output channel: scale (row 0), zero point (row 1), bias (row 2).
@@ -1093,15 +1094,32 @@ Tensor quantized_linear_kernel(
       api::utils::safe_downcast_to_u32(K_tex),
       1u};
 
-  context->submit_compute_job(
-      VK_KERNEL(pack_int8_width), pipeline_barrier, pack_in_grid,
-      adaptive_work_group_size(pack_in_grid), VK_NULL_HANDLE,
-      v_input_packed.image(
-          pipeline_barrier,
-          api::PipelineStage::COMPUTE,
-          api::MemoryAccessType::WRITE),
-      v_input.image(pipeline_barrier, api::PipelineStage::COMPUTE),
-      pack_in_params.buffer());
+  // The two builds differ only in where the codes come from, so the packed
+  // payload the walk reads never depends on the class its source drew.
+  if (v_input.storage_type() == api::StorageType::BUFFER) {
+    context->submit_compute_job(
+        VK_KERNEL(pack_int8_width_from_buffer),
+        pipeline_barrier,
+        pack_in_grid,
+        adaptive_work_group_size(pack_in_grid),
+        VK_NULL_HANDLE,
+        v_input_packed.image(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::WRITE),
+        v_input.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+        pack_in_params.buffer());
+  } else {
+    context->submit_compute_job(
+        VK_KERNEL(pack_int8_width), pipeline_barrier, pack_in_grid,
+        adaptive_work_group_size(pack_in_grid), VK_NULL_HANDLE,
+        v_input_packed.image(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::WRITE),
+        v_input.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+        pack_in_params.buffer());
+  }
   // The packed weight payload is materialized once per source storage
   // identity and reused across calls (weight prepack for inference).
   api::vTensor v_weight_packed = ParamTextureCache::singleton().get_or_create(
@@ -1114,15 +1132,30 @@ Tensor quantized_linear_kernel(
             DType::QInt8,
             api::StorageType::TEXTURE_3D,
             api::GPUMemoryLayout::TENSOR_HEIGHT_PACKED};
-        context->submit_compute_job(
-            VK_KERNEL(pack_int8_height), pipeline_barrier, pack_w_grid,
-            adaptive_work_group_size(pack_w_grid), VK_NULL_HANDLE,
-            v_wp.image(
-                pipeline_barrier,
-                api::PipelineStage::COMPUTE,
-                api::MemoryAccessType::WRITE),
-            v_weight.image(pipeline_barrier, api::PipelineStage::COMPUTE),
-            pack_w_params.buffer());
+        if (v_weight.storage_type() == api::StorageType::BUFFER) {
+          context->submit_compute_job(
+              VK_KERNEL(pack_int8_height_from_buffer),
+              pipeline_barrier,
+              pack_w_grid,
+              adaptive_work_group_size(pack_w_grid),
+              VK_NULL_HANDLE,
+              v_wp.image(
+                  pipeline_barrier,
+                  api::PipelineStage::COMPUTE,
+                  api::MemoryAccessType::WRITE),
+              v_weight.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+              pack_w_params.buffer());
+        } else {
+          context->submit_compute_job(
+              VK_KERNEL(pack_int8_height), pipeline_barrier, pack_w_grid,
+              adaptive_work_group_size(pack_w_grid), VK_NULL_HANDLE,
+              v_wp.image(
+                  pipeline_barrier,
+                  api::PipelineStage::COMPUTE,
+                  api::MemoryAccessType::WRITE),
+              v_weight.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+              pack_w_params.buffer());
+        }
         return v_wp;
       });
 
