@@ -398,10 +398,15 @@ jobs:
           # fall back to 1 so the version metadata never sees an empty value.
           echo "TENSORPLAY_BUILD_NUMBER=${{ inputs.build_number || '1' }}" >> "$GITHUB_ENV"
 
+      # ROCm lanes run in a container that mounts the host tool cache at
+      # /__t, but the cached interpreter's pip script keeps its host
+      # /opt/hostedtoolcache shebang, so the pip-cache probe cannot spawn
+      # it there. Skip the pip cache in the container; later steps call
+      # pip through a venv or `python -m pip`, which resolve correctly.
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ inputs.python_version }}
-          cache: pip
+          cache: ${{ inputs.rocm == '' && 'pip' || '' }}
           cache-dependency-path: requirements-build.txt
 
       # Self-hosted runners share one tool cache, so several lanes point at
@@ -631,10 +636,15 @@ jobs:
           submodules: false
           show-progress: false
 
+      # ROCm lanes run in a container that mounts the host tool cache at
+      # /__t, but the cached interpreter's pip script keeps its host
+      # /opt/hostedtoolcache shebang, so the pip-cache probe cannot spawn
+      # it there. Skip the pip cache in the container; later steps call
+      # pip through a venv or `python -m pip`, which resolve correctly.
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ inputs.python_version }}
-          cache: pip
+          cache: ${{ inputs.rocm == '' && 'pip' || '' }}
           cache-dependency-path: requirements-build.txt
 
       # Windows CUDA wheels resolve their runtime DLLs (cudart, cublas, ...)

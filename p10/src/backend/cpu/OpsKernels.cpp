@@ -1017,6 +1017,9 @@ static bool pair_math_takes(const Tensor& a, const Tensor& b, const Tensor& out)
 // thread, and the thread answers the elements of that chunk.
 template <vecbinary::BOp op, typename T>
 static void pair_math_walk(const T* a, const T* b, T* d, int64_t n) {
+    // The chunk kernels exist only where SLEEF's AVX2 bodies are built;
+    // elsewhere avx2_available() is false and no caller reaches the walk.
+#if defined(TP_VECBINARY_SLEEF)
     parallel_for_balanced(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
         if constexpr (std::is_same_v<T, float>) {
             vecbinary::f32_chunk_avx2<op>(
@@ -1036,6 +1039,7 @@ static void pair_math_walk(const T* a, const T* b, T* d, int64_t n) {
                 reinterpret_cast<uint16_t*>(d + begin), 0, end - begin);
         }
     });
+#endif
 }
 
 template <vecbinary::BOp op, typename F>
