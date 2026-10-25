@@ -647,6 +647,10 @@ class TestMPSUnaryOperandReads(MPSCase):
                   -4.0, -0.0, 0.0, 4.0]
         cpu = tp.tensor(values, dtype=tp.float32, device="cpu")
         mps = tp.tensor(values, dtype=tp.float32, device="mps")
+        # exp runs on the hardware approximation, whose contract admits a few
+        # units in the last place on an ordinary value; the infinities, the
+        # zeros and the NaNs still have to come back exactly.
+        ulps = {"exp": 4}
         for name, fn in (("abs", tp.abs), ("exp", tp.exp), ("relu", tp.relu),
                          ("sqrt", tp.sqrt), ("rsqrt", tp.rsqrt)):
             with self.subTest(op=name):
@@ -656,6 +660,10 @@ class TestMPSUnaryOperandReads(MPSCase):
                     if math.isnan(other):
                         self.assertTrue(math.isnan(one),
                                         msg=f"{name}[{index}]: {one}, want NaN")
+                    elif name in ulps and math.isfinite(other) and other != 0.0:
+                        ulp = math.ulp(other) * 2.0 ** 29  # float32 spacing
+                        self.assertLessEqual(abs(one - other), ulps[name] * ulp,
+                                             msg=f"{name}[{index}]: {one} vs {other}")
                     else:
                         self.assertEqual(one, other, msg=f"{name}[{index}]")
 
