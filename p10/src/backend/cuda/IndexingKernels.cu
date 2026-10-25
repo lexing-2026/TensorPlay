@@ -5,6 +5,7 @@
 #include "Scalar.h"
 #include "Exception.h"
 #include "CUDARuntime.h"
+#include "StreamingAccess.cuh"
 #include "GradMode.h"
 
 #include <cuda_runtime.h>
@@ -373,7 +374,7 @@ __global__ void index_select_cell_kernel(int64_t cells, int64_t n_idx,
     const int64_t step = static_cast<int64_t>(blockDim.x) * gridDim.y;
     for (int64_t c = static_cast<int64_t>(blockIdx.y) * blockDim.x + threadIdx.x;
          c < cells; c += step) {
-        __stcs(destination + c, __ldg(source + c));
+        tp_stcs(destination + c, __ldg(source + c));
     }
 }
 

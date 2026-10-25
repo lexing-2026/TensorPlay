@@ -1,6 +1,7 @@
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "CUDARuntime.h"
+#include "StreamingAccess.cuh"
 #include "Exception.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
 
@@ -57,11 +58,11 @@ __device__ inline void ln_stream_store(V* dst, const V& v) {
     *dst = v;
 #else
     if constexpr (sizeof(V) == 16) {
-        __stcs(reinterpret_cast<uint4*>(dst),
-               *reinterpret_cast<const uint4*>(&v));
+        tp_stcs(reinterpret_cast<uint4*>(dst),
+                *reinterpret_cast<const uint4*>(&v));
     } else if constexpr (sizeof(V) == 8) {
-        __stcs(reinterpret_cast<uint2*>(dst),
-               *reinterpret_cast<const uint2*>(&v));
+        tp_stcs(reinterpret_cast<uint2*>(dst),
+                *reinterpret_cast<const uint2*>(&v));
     } else {
         *dst = v;
     }
