@@ -753,6 +753,18 @@ api::vTensor product_weight_operand(
  */
 constexpr int64_t kGemvLinearSpanElements = 256;
 
+/*
+ * The widest step form hands a whole workgroup to one column, because a lane
+ * reading alone would leave its neighbours on unrelated rows.  Sixty-four lanes
+ * therefore stride one column's chunk together, which changes what sizes the
+ * split: the span is measured per workgroup instead of per invocation, and the
+ * parallelism floor counts lanes, since a column now contributes sixty-four of
+ * them at once.
+ */
+constexpr int64_t kGemvGroupLanes = 64;
+constexpr int64_t kGemvLinearGroupSpanElements = 2048;
+constexpr int64_t kGemvLaneFloor = 65536;
+
 // The decode kernels read activations either from a width-packed texture or
 // from their linear payload, whichever the activation row actually fits.
 api::vTensor gemv_operand_lhs(const Tensor& src) {
@@ -818,17 +830,31 @@ Tensor gemv_decode_linear(
       api::utils::div_up(api::utils::safe_downcast_to_u32(K), 4u);
   const uint32_t column_row_jobs =
       api::utils::safe_downcast_to_u32(N * M);
+  // The wide step shares a column across a group, so both the span that sizes a
+  // split and the parallelism floor are counted in lanes; every narrower step
+  // gives one invocation per column and counts invocations directly.
+  const bool group_walk = rhs_vec8;
+  const uint32_t walk_jobs = group_walk
+      ? column_row_jobs * static_cast<uint32_t>(kGemvGroupLanes)
+      : column_row_jobs;
+  const uint32_t span_elements = static_cast<uint32_t>(group_walk
+          ? kGemvLinearGroupSpanElements
+          : kGemvLinearSpanElements);
+  const uint32_t job_floor = static_cast<uint32_t>(
+      group_walk ? kGemvLaneFloor : kGemvThreadBudget);
   uint32_t splits = std::max(
       api::utils::div_up(
-          api::utils::safe_downcast_to_u32(K),
-          static_cast<uint32_t>(kGemvLinearSpanElements)),
-      column_row_jobs > 0u
-          ? api::utils::div_up(
-                static_cast<uint32_t>(kGemvThreadBudget), column_row_jobs)
-          : 1u);
+          api::utils::safe_downcast_to_u32(K), span_elements),
+      walk_jobs > 0u ? api::utils::div_up(job_floor, walk_jobs) : 1u);
   splits = std::max(splits, 1u);
   splits = std::min(splits, static_cast<uint32_t>(kGemvSplitMax));
-  splits = std::min(splits, k_texels);
+  // Chunks open on a step boundary, so a split is never worth fewer elements
+  // than one step carries.
+  splits = std::min(
+      splits,
+      group_walk
+          ? api::utils::safe_downcast_to_u32(K / 8)
+          : k_texels);
   // Split boundaries open on texel edges so the packed operand never starts a
   // chunk in the middle of a group; a chunk therefore covers at least four
   // elements, or eight wherever the wide half step runs.
@@ -885,8 +911,13 @@ Tensor gemv_decode_linear(
   }
   split_shader = buffer_shader_for_dtype(split_shader, dtype);
 
+  // A group walk spreads one column over its lanes, so the width counts
+  // invocations; every other step names a column per invocation.
   const api::utils::uvec3 split_grid{
-      api::utils::safe_downcast_to_u32(N),
+      group_walk
+          ? api::utils::safe_downcast_to_u32(N) *
+              static_cast<uint32_t>(kGemvGroupLanes)
+          : api::utils::safe_downcast_to_u32(N),
       splits,
       api::utils::safe_downcast_to_u32(M),
   };

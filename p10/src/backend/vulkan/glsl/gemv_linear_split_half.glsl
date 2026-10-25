@@ -11,6 +11,7 @@
 #define TWO 2
 #define FOUR 4
 #define EIGHT 8
+#define GROUP 64
 
 layout(std430) buffer;
 
@@ -21,16 +22,21 @@ layout(std430) buffer;
  * low lane first, so every read goes through an unpack while rows stay
  * addressed by element.
  *
- * One invocation owns one output column and one chunk of the reduction axis, and
- * the accumulation stays in single precision: partials travel to the fold pass
+ * The accumulation stays in single precision: partials travel to the fold pass
  * as floats, so a long reduction never narrows between terms.  The two weight
  * orientations differ only in which step a fetch takes; a row-major (N x K)
  * payload whose length divides by four moves eight bytes per fetch, because one
  * aligned pair of words already carries the four elements a step consumes, and
- * one that also divides by eight doubles that to sixteen bytes per fetch.  The
- * wide step keeps two partial sums so a second load leaves before the first one
- * is folded in, which is what a column-at-a-time walk over a long row needs to
- * hold enough reads in flight.
+ * one that also divides by eight doubles that to sixteen bytes per fetch.
+ *
+ * The eight-element step hands a whole workgroup one column instead of one
+ * invocation: the sixty-four lanes stride the column together, so a group
+ * iteration reads sixty-four consecutive quadruples and each warp moves five
+ * hundred twelve contiguous bytes per instruction.  Naming one column per
+ * invocation instead would spread a warp over thirty-two unrelated rows, a whole
+ * weight row apart from each other, which no cache turns back into a contiguous
+ * fetch.  The lane totals meet in shared memory, so the walk needs no subgroup
+ * operation.  Every narrower step keeps one invocation per column.
  *
  * The activation operand arrives either as its own linear payload or as a
  * width-packed image, and a half image hands its four lanes back as floats, so
@@ -84,6 +90,11 @@ layout(set = 0, binding = 3) uniform PRECISION restrict Block {
 uBlock;
 
 layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
+
+// clang-format off
+$if RHS_VEC8 == 1:
+  shared float sGroup[GROUP];
+// clang-format on
 
 // clang-format off
 $if RHS_VEC8 == 1:
@@ -147,7 +158,15 @@ $else:
 void main() {
   const ivec3 pos = ivec3(gl_GlobalInvocationID);
 
-  const int col = pos.x;
+  // clang-format off
+  $if RHS_VEC8 == 1:
+    // The group's sixty-four invocations share one column, so the lane is the
+    // step index along that column and the group index names the column.
+    const int lane = int(gl_LocalInvocationIndex);
+    const int col = pos.x / GROUP;
+  $else:
+    const int col = pos.x;
+  // clang-format on
   const int split = pos.y;
   const int row = pos.z;
 
@@ -167,9 +186,11 @@ void main() {
   $if RHS_NK == 1 and RHS_VEC8 == 1:
     // Chunks open on an eight-element boundary, since the host sizes them in
     // multiples of eight, so both ends of the span sit inside one weight row.
+    // Two accumulators let the second fetch of a pair leave before the first
+    // one is folded in, which is what a long row needs to hold reads in flight.
     float even = 0.0;
     float odd = 0.0;
-    for (int g = k_begin / EIGHT; g < k_end / EIGHT; ++g) {
+    for (int g = k_begin / EIGHT + lane; g < k_end / EIGHT; g += GROUP) {
       const uvec4 packed = weight_words(col, g);
       even += dot(lhs_vec(row, TWO * g), half_pair(packed.x, packed.y));
       odd += dot(lhs_vec(row, TWO * g + 1), half_pair(packed.z, packed.w));
@@ -211,5 +232,23 @@ void main() {
     }
   // clang-format on
 
-  uPartials.data[(split * m + row) * n + col] = acc;
+  // clang-format off
+  $if RHS_VEC8 == 1:
+    // The lane totals meet in shared memory, which is what lets the group share
+    // a column without a subgroup operation.  A span that is not a multiple of
+    // the group size simply leaves the last lanes at zero.
+    sGroup[lane] = acc;
+    barrier();
+    for (int span = GROUP / 2; span > 0; span /= 2) {
+      if (lane < span) {
+        sGroup[lane] += sGroup[lane + span];
+      }
+      barrier();
+    }
+    if (lane == 0) {
+      uPartials.data[(split * m + row) * n + col] = sGroup[0];
+    }
+  $else:
+    uPartials.data[(split * m + row) * n + col] = acc;
+  // clang-format on
 }
