@@ -2374,6 +2374,9 @@ Tensor sum_kernel_impl(const Tensor& self, DType dtype) {
         input = self.to(out_dtype);
     }
 
+    // try_sum_real is defined in the x86 section above; the other
+    // architectures reach the iterator below.
+#if defined(__x86_64__)
     if ((acc_dtype == DType::Float32 || acc_dtype == DType::Float64) &&
         input.dtype() == acc_dtype && input.is_contiguous() &&
         input.numel() > 0) {
@@ -2387,6 +2390,7 @@ Tensor sum_kernel_impl(const Tensor& self, DType dtype) {
             return out;
         }
     }
+#endif
 
     if (acc_dtype == DType::Float32 || acc_dtype == DType::Float64) {
         TensorIterator iter = TensorIterator::reduce_op(out, input);
@@ -2499,10 +2503,13 @@ Tensor sum_dim_kernel_impl(const Tensor& self, const std::vector<int64_t>& dims,
         }
         if (dims.size() == 1) {
             const int64_t dim = dims[0] < 0 ? dims[0] + ndim : dims[0];
+            // try_sum_dim_real is x86-only like try_sum_leading_rows above.
+#if defined(__x86_64__)
             if (input.dtype() == out_dtype &&
                 try_sum_dim_real(input, out, dim)) {
                 return out;
             }
+#endif
             bool handled = false;
             if (out_dtype == DType::Float16) {
                 handled = sum_detail::contiguous_sum_dim<float, Half>(input, out, dim);
@@ -4352,6 +4359,8 @@ Tensor all_dim_kernel_impl(const Tensor& self, const std::vector<int64_t>& dims,
         }
 #endif
 
+        // logical_reduce_dim0_rows is defined in the x86 section above.
+#if defined(__x86_64__)
         if (outer == 1 && inner >= 16 && inner <= 262144) {
             switch (self.dtype()) {
 #define TP_ALL_DIM_ROW_CASE(ctype, name) \
@@ -4365,6 +4374,7 @@ Tensor all_dim_kernel_impl(const Tensor& self, const std::vector<int64_t>& dims,
                 default: break;
             }
         }
+#endif
 
 #define TP_ALL_DIM_FAST_CASE(ctype, name) \
         case DType::name: { \
@@ -4484,6 +4494,8 @@ Tensor any_dim_kernel_impl(const Tensor& self, const std::vector<int64_t>& dims,
         }
 #endif
 
+        // logical_reduce_dim0_rows is defined in the x86 section above.
+#if defined(__x86_64__)
         if (outer == 1 && inner >= 16 && inner <= 262144) {
             switch (self.dtype()) {
 #define TP_ANY_DIM_ROW_CASE(ctype, name) \
@@ -4497,6 +4509,7 @@ Tensor any_dim_kernel_impl(const Tensor& self, const std::vector<int64_t>& dims,
                 default: break;
             }
         }
+#endif
 
 #define TP_ANY_DIM_FAST_CASE(ctype, name) \
         case DType::name: { \
