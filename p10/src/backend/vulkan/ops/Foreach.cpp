@@ -791,9 +791,9 @@ void check_optimizer_state(
 // Every term is a walk over the whole payload, so the update stays on the
 // device.
 std::vector<Tensor> foreach_sgd_kernel(
-    std::vector<Tensor> params,
+    const std::vector<Tensor>& params,
     const std::vector<Tensor>& grads,
-    std::vector<Tensor> momentum_buffers,
+    const std::vector<Tensor>& momentum_buffers,
     double lr,
     double momentum,
     double dampening,
@@ -818,12 +818,12 @@ std::vector<Tensor> foreach_sgd_kernel(
 
   const bool has_wd = weight_decay != 0.0;
   for (size_t i = 0; i < count; ++i) {
-    Tensor& param = params[i];
+    Tensor param = params[i];
     Tensor grad = has_wd
         ? tpx::ops::add(grads[i], tpx::ops::mul(param, weight_decay))
         : grads[i];
     if (has_momentum) {
-      Tensor& buffer = momentum_buffers[i];
+      Tensor buffer = momentum_buffers[i];
       const Tensor value = first_momentum_step
           ? grad
           : tpx::ops::add(
@@ -833,7 +833,7 @@ std::vector<Tensor> foreach_sgd_kernel(
       grad = nesterov ? tpx::ops::add(grad, tpx::ops::mul(value, momentum))
                       : value;
     }
-    tpx::ops::copy_(params[i], tpx::ops::sub(param, tpx::ops::mul(grad, lr)));
+    tpx::ops::copy_(param, tpx::ops::sub(param, tpx::ops::mul(grad, lr)));
   }
   return params;
 }
@@ -844,11 +844,11 @@ std::vector<Tensor> foreach_sgd_kernel(
 // by the corrected root of that average plus the epsilon.  The bias correction
 // is one count per parameter, so its constants are folded before the walk.
 std::vector<Tensor> foreach_adam_kernel(
-    std::vector<Tensor> params,
+    const std::vector<Tensor>& params,
     const std::vector<Tensor>& grads,
-    std::vector<Tensor> exp_avgs,
-    std::vector<Tensor> exp_avg_sqs,
-    std::vector<Tensor> max_exp_avg_sqs,
+    const std::vector<Tensor>& exp_avgs,
+    const std::vector<Tensor>& exp_avg_sqs,
+    const std::vector<Tensor>& max_exp_avg_sqs,
     const std::vector<int64_t>& steps,
     double lr,
     double beta1,
@@ -882,7 +882,9 @@ std::vector<Tensor> foreach_adam_kernel(
 
   const bool has_wd = weight_decay != 0.0;
   for (size_t i = 0; i < count; ++i) {
-    Tensor& param = params[i];
+    Tensor param = params[i];
+    Tensor first_moment = exp_avgs[i];
+    Tensor second_moment = exp_avg_sqs[i];
     const double correction1 =
         1.0 - std::pow(beta1, static_cast<double>(steps[i]));
     const double correction2 =
@@ -891,17 +893,18 @@ std::vector<Tensor> foreach_adam_kernel(
         ? tpx::ops::add(grads[i], tpx::ops::mul(param, weight_decay))
         : grads[i];
     const Tensor first = tpx::ops::add(
-        tpx::ops::mul(exp_avgs[i], beta1),
+        tpx::ops::mul(first_moment, beta1),
         tpx::ops::mul(grad, 1.0 - beta1));
-    tpx::ops::copy_(exp_avgs[i], first);
+    tpx::ops::copy_(first_moment, first);
     const Tensor second = tpx::ops::add(
-        tpx::ops::mul(exp_avg_sqs[i], beta2),
+        tpx::ops::mul(second_moment, beta2),
         tpx::ops::mul(tpx::ops::mul(grad, grad), 1.0 - beta2));
-    tpx::ops::copy_(exp_avg_sqs[i], second);
+    tpx::ops::copy_(second_moment, second);
     Tensor carried = second;
     if (amsgrad) {
-      carried = tpx::ops::maximum(max_exp_avg_sqs[i], second);
-      tpx::ops::copy_(max_exp_avg_sqs[i], carried);
+      Tensor maximum_second = max_exp_avg_sqs[i];
+      carried = tpx::ops::maximum(maximum_second, second);
+      tpx::ops::copy_(maximum_second, carried);
     }
     const Tensor denom = tpx::ops::add(
         tpx::ops::div(tpx::ops::sqrt(carried), std::sqrt(correction2)), eps);
