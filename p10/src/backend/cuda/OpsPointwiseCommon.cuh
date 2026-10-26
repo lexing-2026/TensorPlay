@@ -387,8 +387,16 @@ struct HFn41 : GenFnBase<HFn41> {
 
 struct HFn42 : GenFnBase<HFn42> {
     __host__ __device__ auto run(double x, double y) const {
+#if defined(USE_ROCM)
+        // A sign test rather than ::copysign: with Half or bfloat16 operands
+        // LLVM narrows the widened copysign back to the operand types, and
+        // the ROCm 7.2 AMDGPU backend cannot select an f16 copysign whose
+        // sign comes from a bf16 value.
+        return std::signbit(y) ? -::fabs(x) : ::fabs(x);
+#else
         return ::copysign(x, y);
-    
+#endif
+
     }
 };
 
