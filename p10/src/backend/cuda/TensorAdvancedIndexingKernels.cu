@@ -696,7 +696,7 @@ __global__ void count_nonzero_vec_kernel(const scalar_t* __restrict__ input,
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     for (int offset = 16; offset > 0; offset >>= 1) {
-        count += __shfl_down_sync(0xffffffffu, count, offset);
+        count += __shfl_down_sync(0xffffffffffffffffull, count, offset);
     }
     __shared__ int64_t warp_counts[32];
     if (lane == 0) warp_counts[warp] = count;
@@ -705,7 +705,7 @@ __global__ void count_nonzero_vec_kernel(const scalar_t* __restrict__ input,
         const int warp_count = (blockDim.x + 31) / 32;
         count = lane < warp_count ? warp_counts[lane] : 0;
         for (int offset = 16; offset > 0; offset >>= 1) {
-            count += __shfl_down_sync(0xffffffffu, count, offset);
+            count += __shfl_down_sync(0xffffffffffffffffull, count, offset);
         }
         if (lane == 0) atomicAdd(reinterpret_cast<unsigned long long*>(out),
                                  static_cast<unsigned long long>(count));

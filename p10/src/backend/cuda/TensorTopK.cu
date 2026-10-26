@@ -831,10 +831,10 @@ __device__ inline typename TopKRadixTraits<T>::key_type topk_shfl_down(
     const unsigned long long bits =
         static_cast<unsigned long long>(value);
     return static_cast<typename TopKRadixTraits<T>::key_type>(
-        __shfl_down_sync(0xffffffffu, bits, offset));
+        __shfl_down_sync(0xffffffffffffffffull, bits, offset));
   } else {
     return static_cast<typename TopKRadixTraits<T>::key_type>(
-        __shfl_down_sync(0xffffffffu, static_cast<unsigned>(value), offset));
+        __shfl_down_sync(0xffffffffffffffffull, static_cast<unsigned>(value), offset));
   }
 }
 
@@ -845,7 +845,7 @@ __device__ inline void topk_single_warp_reduce(
   for (int offset = 16; offset > 0; offset >>= 1) {
     const auto other = topk_shfl_down<T>(*best, offset);
     const int64_t other_index =
-        __shfl_down_sync(0xffffffffu, *best_index, offset);
+        __shfl_down_sync(0xffffffffffffffffull, *best_index, offset);
     topk_single_take<T>(best, best_index, other, other_index, largest);
   }
 }
