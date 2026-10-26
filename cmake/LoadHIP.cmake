@@ -84,6 +84,11 @@ if(NOT WIN32)
   string(APPEND CMAKE_HIP_FLAGS " -fPIC")
 endif()
 string(APPEND CMAKE_HIP_FLAGS " -std=c++20")
+# Every object carries a code object per target, which for the multi-arch
+# wheel lands libp10.so past 2 GB and out of reach of the 32-bit
+# PC-relative relocations between its text and read-only data.  Compress
+# the bundles; the HIP runtime inflates them when it loads the module.
+string(APPEND CMAKE_HIP_FLAGS " --offload-compress")
 
 # The hipify-staged tree keeps the CUDA namespace/class spelling; only API
 # calls are rewritten.  These defines match what the staged sources expect
