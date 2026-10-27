@@ -316,8 +316,12 @@ jobs:
       - prepare
       - create-nightly-release
     # An unchanged main (schedule guard) yields an empty version: every
-    # wheel for today was already published by the trunk runs.
-    if: needs.prepare.outputs.version != ''
+    # wheel for today was already published by the trunk runs. A retry
+    # whose CPU wheels are all on the release yields an empty matrix, which
+    # GitHub rejects as a run failure; skip the job instead.
+    if: >-
+      needs.prepare.outputs.version != ''
+      && needs.define-wheel-matrix.outputs.cpu != '[]'
     strategy:
       fail-fast: false
       matrix:
@@ -354,8 +358,12 @@ jobs:
       - prepare
       - create-nightly-release
     # An unchanged main (schedule guard) yields an empty version: every
-    # wheel for today was already published by the trunk runs.
-    if: needs.prepare.outputs.version != ''
+    # wheel for today was already published by the trunk runs. A retry
+    # whose CUDA wheels are all on the release yields an empty matrix, which
+    # GitHub rejects as a run failure; skip the job instead.
+    if: >-
+      needs.prepare.outputs.version != ''
+      && needs.define-wheel-matrix.outputs.cuda != '[]'
     strategy:
       fail-fast: false
       matrix:
@@ -385,8 +393,12 @@ jobs:
       - prepare
       - create-nightly-release
     # An unchanged main (schedule guard) yields an empty version: every
-    # wheel for today was already published by the trunk runs.
-    if: needs.prepare.outputs.version != ''
+    # wheel for today was already published by the trunk runs. A retry
+    # whose ROCm wheels are all on the release yields an empty matrix, which
+    # GitHub rejects as a run failure; skip the job instead.
+    if: >-
+      needs.prepare.outputs.version != ''
+      && needs.define-wheel-matrix.outputs.rocm != '[]'
     strategy:
       fail-fast: false
       matrix:
