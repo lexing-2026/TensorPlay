@@ -75,13 +75,20 @@ struct StaxFastLauncherObject {
 // address, None is a NULL, a plain tensor wrapper is read through the C++
 // value holder, and anything else falls back to a ``data_ptr()`` call.
 //
-// CUdeviceptr is an integer type on Linux and a pointer type on Windows, so
-// no single cast spelling is valid on both; branch on the platform typedef.
+// CUdeviceptr is an integer type on Linux and a pointer type on Windows
+// (and under HIP, where it becomes hipDeviceptr_t), so no single cast
+// spelling is valid everywhere; branch on the platform typedef.
 template <typename T>
 CUdeviceptr to_device_pointer(T addr) {
     if constexpr (std::is_pointer_v<CUdeviceptr>) {
-        // The driver API spells device addresses as pointers on Windows.
-        return static_cast<CUdeviceptr>(addr);
+        // Device addresses are spelled as pointers here: a pointer converts
+        // directly, an integer address needs reinterpret_cast.
+        if constexpr (std::is_pointer_v<T>) {
+            return static_cast<CUdeviceptr>(addr);
+        } else {
+            return reinterpret_cast<CUdeviceptr>(
+                static_cast<std::uintptr_t>(addr));
+        }
     } else if constexpr (std::is_pointer_v<T>) {
         // ... and as integer-sized handles elsewhere; a pointer-to-integer
         // conversion needs reinterpret_cast.
