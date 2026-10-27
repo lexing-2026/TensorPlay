@@ -45,7 +45,11 @@ def published(name: str, version: str, entry: dict) -> bool:
     if variant == "cpu" and entry["platform"] == "macos-arm64":
         prefix = f"tensorplay-{version}-{py}-"
     else:
-        prefix = f"tensorplay-{version}+{variant}-{py}-"
+        # Wheel names carry the PEP 440-normalized local label, which
+        # spells separators as dots: rocm72-multiarch ships as
+        # +rocm72.multiarch.
+        label = variant.lower().replace("-", ".").replace("_", ".")
+        prefix = f"tensorplay-{version}+{label}-{py}-"
     return name.startswith(prefix) and all(token in name for token in tokens)
 
 
