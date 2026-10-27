@@ -692,6 +692,21 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends libopenblas0
 
+      # libp10 links the system OpenBLAS and libgomp alongside the HIP
+      # libraries; the ROCm image ships the latter only, and the build
+      # container's apt packages do not carry over. Container jobs run as
+      # root here, so no sudo is needed.
+      - name: Install ROCm runtime dependencies
+        if: ${{ inputs.rocm != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          SUDO=""
+          if [ "$(id -u)" != "0" ]; then SUDO=sudo; fi
+          $SUDO apt-get update -qq
+          $SUDO apt-get install -y -qq --no-install-recommends \
+            libopenblas0 libgomp1 1>/dev/null
+
       - name: Download built wheel
         uses: actions/download-artifact@v8
         with:
