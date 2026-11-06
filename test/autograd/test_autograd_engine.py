@@ -51,6 +51,88 @@ class TestAutogradEngine(unittest.TestCase):
         # grad should be dy1/dx + dy2/dx = 2x + 3x^2 = 4 + 12 = 16
         self.assertEqual(x.grad.item(), 16.0)
 
+    def test_grad_capture_runs_tensor_hooks_once(self):
+        for leaf in (True, False):
+            with self.subTest(leaf=leaf):
+                x = tp.tensor([1.0], requires_grad=True)
+                target = x if leaf else x * 2
+                calls = []
+
+                def hook(grad):
+                    calls.append(grad.tolist())
+                    return grad * 3
+
+                target.register_hook(hook)
+                (grad,) = tp.autograd.grad((target * 2).sum(), target)
+                self.assertEqual(grad.tolist(), [6.0])
+                self.assertEqual(calls, [[2.0]])
+                self.assertIsNone(x.grad)
+
+    def test_grad_executes_intermediate_tensor_hook_once(self):
+        x = tp.tensor([1.0], requires_grad=True)
+        intermediate = x * 2
+        calls = []
+
+        def hook(grad):
+            calls.append(grad.tolist())
+            return grad * 3
+
+        intermediate.register_hook(hook)
+        (grad,) = tp.autograd.grad(intermediate.sum(), x)
+        self.assertEqual(grad.tolist(), [6.0])
+        self.assertEqual(calls, [[1.0]])
+
+    def test_grad_capture_retains_modified_intermediate_gradient(self):
+        x = tp.tensor([1.0], requires_grad=True)
+        intermediate = x * 2
+        intermediate.retain_grad()
+        intermediate.register_hook(lambda grad: grad * 3)
+        (grad,) = tp.autograd.grad(intermediate.sum(), intermediate)
+        self.assertEqual(grad.tolist(), [3.0])
+        self.assertEqual(intermediate.grad.tolist(), [3.0])
+        self.assertIsNone(x.grad)
+
+    def test_grad_hook_preserves_higher_order_graph(self):
+        x = tp.tensor([2.0], requires_grad=True)
+        handle = x.register_hook(lambda grad: grad * 3)
+        (grad,) = tp.autograd.grad((x * x).sum(), x, create_graph=True)
+        handle.remove()
+        self.assertEqual(grad.tolist(), [12.0])
+        (second,) = tp.autograd.grad(grad.sum(), x)
+        self.assertEqual(second.tolist(), [6.0])
+
+    def test_leaf_frozen_after_forward_is_not_updated(self):
+        x = tp.tensor([1.0], requires_grad=True)
+        optimizer = tp.optim.SGD([x], lr=0.1)
+        calls = []
+        x.register_post_accumulate_grad_hook(lambda value: calls.append(value))
+        result = (x * 2).sum()
+        x.requires_grad_(False)
+        result.backward()
+        self.assertIsNone(x.grad)
+        # The hook says this leaf's backward arrived; it does not say a
+        # gradient was written, so a frozen leaf still reports in.
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].tolist(), [1.0])
+        optimizer.step()
+        self.assertEqual(x.tolist(), [1.0])
+
+    def test_frozen_leaf_keeps_existing_gradient(self):
+        x = tp.tensor([1.0], requires_grad=True)
+        x.grad = tp.tensor([7.0])
+        result = (x * 2).sum()
+        x.requires_grad_(False)
+        result.backward()
+        self.assertEqual(x.grad.tolist(), [7.0])
+
+    def test_leaf_reenabled_before_backward_accumulates(self):
+        x = tp.tensor([1.0], requires_grad=True)
+        result = (x * 2).sum()
+        x.requires_grad_(False)
+        x.requires_grad_(True)
+        result.backward()
+        self.assertEqual(x.grad.tolist(), [2.0])
+
     def _check_reentrant_grad(self, device):
         from tensorplay.autograd import enable_grad, Function
 

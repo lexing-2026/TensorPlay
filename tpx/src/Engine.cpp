@@ -490,6 +490,14 @@ void Engine::evaluate_function(GraphTask& task, Node* func, InputBuffer& inputs,
 
     if (!exec_info_.empty()) {
         GraphTask::ExecInfo& fn_info = exec_info_.at(func);
+        if (!fn_info.needed_) {
+            for (const auto& hook : func->tensor_pre_hooks()) {
+                inputs.buffer = hook(std::move(inputs.buffer));
+            }
+            for (const auto& entry : func->retains_grad_hooks()) {
+                inputs.buffer = entry.second(std::move(inputs.buffer));
+            }
+        }
         // Captured gradients (grad() mode) are read straight out of the
         // input buffer; no whole-buffer copy for nodes without captures.
         if (auto* capture_vec = fn_info.captures_.get()) {

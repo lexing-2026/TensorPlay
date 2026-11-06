@@ -30,6 +30,19 @@ struct AccumulateGrad : public Node {
     variable_list apply(variable_list&& inputs) override {
         if (inputs.empty() || !inputs[0].defined()) return {};
 
+        // A leaf whose gradient flag was cleared after the graph was built
+        // keeps whatever it holds: nothing is accumulated into it.  The
+        // readiness hooks still fire, because what they report is that this
+        // leaf's backward arrived, not that a gradient was written.
+        if (!value_.requires_grad()) {
+            if (auto* meta = impl::get_autograd_meta(value_)) {
+                for (const auto& hook : meta->post_acc_grad_hooks()) {
+                    hook(value_);
+                }
+            }
+            return {};
+        }
+
         // Take the engine's handle rather than copying it: whether the
         // gradient may be kept without a deep copy is decided from its
         // holder count, which must not include a second local handle.
