@@ -157,8 +157,8 @@ def _mesh_from_process_group(process_group: Any, device_type: str) -> DeviceMesh
     if process_group is None:
         return None
     groups = list(process_group) if isinstance(process_group, tuple) else [process_group]
-    if not groups:
-        raise ValueError("process_group cannot be empty")
+    if len(groups) not in (1, 2):
+        raise ValueError("process_group must contain one or two process groups")
     if len(groups) == 1:
         ranks = dist.get_process_group_ranks(groups[0])
         return DeviceMesh.from_group(
@@ -167,24 +167,38 @@ def _mesh_from_process_group(process_group: Any, device_type: str) -> DeviceMesh
             mesh=ranks,
             mesh_dim_names=("dp",),
         )
-    sizes = [len(dist.get_process_group_ranks(group)) for group in groups]
-    ranks = sorted({rank for group in groups for rank in dist.get_process_group_ranks(group)})
-    if math.prod(sizes) != len(ranks):
+    shard_group, replicate_group = groups
+    shard_ranks = dist.get_process_group_ranks(shard_group)
+    replicate_ranks = dist.get_process_group_ranks(replicate_group)
+    rank = dist.get_rank()
+    if rank not in shard_ranks or rank not in replicate_ranks:
+        raise ValueError("current rank must belong to both hybrid process groups")
+
+    shard_rows: list[Any] = [None] * len(replicate_ranks)
+    dist.all_gather_object(shard_rows, shard_ranks, group=replicate_group)
+    if any(
+        not isinstance(row, (list, tuple)) or len(row) != len(shard_ranks)
+        for row in shard_rows
+    ):
         raise ValueError("hybrid process groups must describe a rectangular mesh")
+    flat_ranks = [value for row in shard_rows for value in row]
+    if len(set(flat_ranks)) != len(flat_ranks):
+        raise ValueError("hybrid process groups must not contain duplicate ranks")
+    if list(shard_rows[replicate_ranks.index(rank)]) != shard_ranks:
+        raise ValueError("gathered shard ranks must match the local shard group in order")
+    shard_index = shard_ranks.index(rank)
+    if [row[shard_index] for row in shard_rows] != replicate_ranks:
+        raise ValueError(
+            "gathered ranks at the local shard coordinate must match the replicate group in order"
+        )
 
-    def nest(values: list[int], shape: list[int]) -> Any:
-        if len(shape) == 1:
-            return values
-        width = math.prod(shape[1:])
-        return [nest(values[index * width:(index + 1) * width], shape[1:]) for index in range(shape[0])]
-
-    mesh = DeviceMesh(
-        device_type,
-        nest(ranks, sizes),
-        mesh_dim_names=tuple(f"dp{index}" for index in range(len(groups))),
+    # Collected rows follow the replicate axis; the mesh's first axis shards.
+    return DeviceMesh.from_group(
+        groups,
+        device_type=device_type,
+        mesh=[list(column) for column in zip(*shard_rows)],
+        mesh_dim_names=("dp0", "dp1"),
     )
-    mesh._dim_groups = {index: group for index, group in enumerate(groups)}
-    return mesh
 
 
 def _get_dp_mesh_dims(strategy: ShardingStrategy, mesh: DeviceMesh) -> Any:

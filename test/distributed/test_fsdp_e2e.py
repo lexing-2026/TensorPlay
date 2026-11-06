@@ -16,14 +16,21 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import tensorplay as tp
 from tensorplay import nn
+from tensorplay.distributed import distributed_core as dist
+from tensorplay.distributed.device_mesh import DeviceMesh
 from tensorplay.distributed.fsdp import FullyShardedDataParallel
 from tensorplay.distributed.fsdp._fully_shard._fsdp_param import ShardedState
 from tensorplay.distributed.fsdp.api import ShardingStrategy
+from tensorplay.distributed.fsdp.fully_sharded_data_parallel import (
+    _get_dp_mesh_dims,
+    _mesh_from_process_group,
+)
 
 
 class _Tiny(nn.Module):
@@ -44,6 +51,152 @@ def _fsdp_params(module):
 
 def _shard_states(module):
     return {p.module_info.fqn: p._state for p in _fsdp_params(module)}
+
+
+class TestFSDPProcessGroupMesh(unittest.TestCase):
+    def setUp(self):
+        self.gather = self.enterContext(
+            mock.patch.object(dist, "all_gather_object", autospec=True)
+        )
+        self.from_group = self.enterContext(
+            mock.patch.object(DeviceMesh, "from_group", wraps=DeviceMesh.from_group)
+        )
+        self.enterContext(mock.patch(
+            "tensorplay.distributed.new_group",
+            side_effect=AssertionError("unexpected process group creation"),
+        ))
+
+    def _hybrid_mesh(self, rank, shard_ranks, replicate_ranks, rows):
+        self.gather.reset_mock()
+        self.from_group.reset_mock()
+        shard = dist.ProcessGroup(shard_ranks, "shard")
+        replicate = dist.ProcessGroup(replicate_ranks, "replicate")
+
+        def gather(object_list, obj, group=None):
+            self.assertIs(group, replicate)
+            self.assertEqual(obj, shard_ranks)
+            self.assertEqual(object_list, [None] * len(replicate_ranks))
+            object_list[:] = copy.deepcopy(rows)
+
+        self.gather.side_effect = gather
+        with mock.patch.object(dist, "get_rank", return_value=rank):
+            mesh = _mesh_from_process_group((shard, replicate), "cpu")
+        self.gather.assert_called_once_with(rows, shard_ranks, group=replicate)
+        self.from_group.assert_called_once_with(
+            [shard, replicate], device_type="cpu", mesh=mesh.mesh,
+            mesh_dim_names=("dp0", "dp1"),
+        )
+        self.assertIs(mesh.get_group(0), shard)
+        self.assertIs(mesh.get_group(1), replicate)
+        self.assertEqual(mesh.mesh_dim_names, ("dp0", "dp1"))
+        for strategy in (ShardingStrategy.HYBRID_SHARD, ShardingStrategy._HYBRID_SHARD_ZERO2):
+            dims = _get_dp_mesh_dims(strategy, mesh)
+            self.assertEqual(dims.shard_names, ("dp0",))
+            self.assertEqual(dims.replicate_names, ("dp1",))
+        return mesh
+
+    def test_none_process_group(self):
+        self.assertIsNone(_mesh_from_process_group(None, "cpu"))
+        self.gather.assert_not_called()
+        self.from_group.assert_not_called()
+
+    def test_single_process_group_preserves_order(self):
+        group = dist.ProcessGroup([17, 3, 29], "single")
+        for process_group in (group, (group,)):
+            with self.subTest(process_group=process_group):
+                self.from_group.reset_mock()
+                mesh = _mesh_from_process_group(process_group, "cpu")
+                self.assertEqual(mesh.mesh, [17, 3, 29])
+                self.assertEqual(mesh.shape, (3,))
+                self.assertEqual(mesh.mesh_dim_names, ("dp",))
+                self.assertEqual(mesh.device_type, "cpu")
+                self.assertIs(mesh.get_group(), group)
+                self.from_group.assert_called_once_with(
+                    group, device_type="cpu", mesh=[17, 3, 29],
+                    mesh_dim_names=("dp",),
+                )
+                self.gather.assert_not_called()
+
+    def test_hybrid_mesh_collects_missing_ranks(self):
+        rows = [[0, 1], [2, 3]]
+        for row in rows:
+            for shard_index, rank in enumerate(row):
+                with self.subTest(rank=rank):
+                    replica = [other[shard_index] for other in rows]
+                    mesh = self._hybrid_mesh(rank, row, replica, rows)
+                    self.assertEqual(mesh.mesh, [[0, 2], [1, 3]])
+                    self.assertEqual(mesh.shape, (2, 2))
+
+    def test_hybrid_mesh_preserves_noncontiguous_order(self):
+        rows = [[29, 3, 17], [41, 11, 7]]
+        for row in rows:
+            for shard_index, rank in enumerate(row):
+                with self.subTest(rank=rank):
+                    replica = [other[shard_index] for other in rows]
+                    mesh = self._hybrid_mesh(rank, row, replica, rows)
+                    self.assertEqual(mesh.mesh, [[29, 41], [3, 11], [17, 7]])
+                    self.assertEqual(mesh.shape, (3, 2))
+
+    def test_hybrid_mesh_preserves_singleton_dimensions(self):
+        cases = (
+            ([[7, 3]], [[7], [3]]),
+            ([[7], [3]], [[7, 3]]),
+            ([[7]], [[7]]),
+        )
+        for rows, expected in cases:
+            with self.subTest(rows=rows):
+                replica = [row[0] for row in rows]
+                mesh = self._hybrid_mesh(7, rows[0], replica, rows)
+                self.assertEqual(mesh.mesh, expected)
+                self.assertEqual(mesh.shape, (len(rows[0]), len(rows)))
+
+    def test_hybrid_mesh_rejects_ragged_rows(self):
+        for remote_row in ([2], [2, 3, 4], None):
+            with self.subTest(remote_row=remote_row):
+                with self.assertRaisesRegex(ValueError, "rectangular"):
+                    self._hybrid_mesh(0, [0, 1], [0, 2], [[0, 1], remote_row])
+                self.from_group.assert_not_called()
+
+    def test_hybrid_mesh_rejects_duplicate_ranks(self):
+        cases = (
+            ([0, 1], [0, 2], [[0, 1], [2, 1]]),
+            ([0, 0], [0, 2], [[0, 0], [2, 3]]),
+            ([0, 1], [0, 1], [[0, 1], [0, 1]]),
+        )
+        for shard, replica, rows in cases:
+            with self.subTest(rows=rows):
+                with self.assertRaisesRegex(ValueError, "duplicate ranks"):
+                    self._hybrid_mesh(0, shard, replica, rows)
+                self.from_group.assert_not_called()
+
+    def test_hybrid_mesh_rejects_local_shard_mismatch(self):
+        for local_row in ([2, 4], [3, 2]):
+            with self.subTest(local_row=local_row):
+                with self.assertRaisesRegex(ValueError, "local shard group"):
+                    self._hybrid_mesh(2, [2, 3], [0, 2], [[0, 1], local_row])
+                self.from_group.assert_not_called()
+
+    def test_hybrid_mesh_rejects_replica_order_mismatch(self):
+        with self.assertRaisesRegex(ValueError, "replicate group in order"):
+            self._hybrid_mesh(3, [2, 3], [1, 3, 5], [[4, 5], [2, 3], [0, 1]])
+        self.from_group.assert_not_called()
+
+    def test_hybrid_mesh_requires_current_rank_in_both_groups(self):
+        for shard, replica in (([2, 3], [0, 2]), ([0, 1], [2, 3])):
+            with self.subTest(shard=shard, replica=replica):
+                with self.assertRaisesRegex(ValueError, "belong to both"):
+                    self._hybrid_mesh(0, shard, replica, [[0, 1], [2, 3]])
+                self.gather.assert_not_called()
+                self.from_group.assert_not_called()
+
+    def test_invalid_process_group_tuple_lengths(self):
+        group = dist.ProcessGroup([0], "single")
+        for size in (0, 3, 4):
+            with self.subTest(size=size):
+                with self.assertRaisesRegex(ValueError, "one or two"):
+                    _mesh_from_process_group((group,) * size, "cpu")
+                self.gather.assert_not_called()
+                self.from_group.assert_not_called()
 
 
 class TestFSDPSingleRankInProcess(unittest.TestCase):
