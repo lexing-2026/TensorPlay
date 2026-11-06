@@ -257,6 +257,15 @@ if(USE_CUDA)
     string(APPEND CMAKE_CXX_FLAGS " -DUSE_CUDNN")
     if(CUDNN_FRONTEND_INCLUDE_DIR)
         message(STATUS "Found cuDNN frontend: ${CUDNN_FRONTEND_INCLUDE_DIR}")
+    else()
+        # The convolution plans are header-only and build out silently without
+        # it, which changes the layout reduced-precision convolutions answer in
+        # -- say so, since a device build that looks fine is not a fine build.
+        message(WARNING
+            "cuDNN frontend headers not found: the graph-API convolution plans "
+            "are compiled out, so reduced-precision convolutions run in "
+            "row-major order and return row-major results. Set CUDNN_FRONTEND_DIR "
+            "or CUDNN_ROOT to a directory holding cudnn_frontend.h to build them in.")
     endif()
 
     add_library(tp::cudnn INTERFACE IMPORTED)
