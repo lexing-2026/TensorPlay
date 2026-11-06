@@ -3249,12 +3249,10 @@ class KernelTemplate:
 
 
 __all__ = [
-    "BACKEND_FEATURES", "BACKEND_ORDER", "BACKEND_ORDER_BY_DEVICE",
     "BackendFeature", "BasicMathOpsMixin", "DTYPE_TO_COMPUTATION_DTYPE", "CSE", "CSEProxy", "Kernel",
     "KernelArgs",
     "KernelTemplate", "OpOverrides",
-    "OperatorNotSupported", "backend_supports", "required_features",
-    "select_backend", "jinja2_env",
+    "OperatorNotSupported", "jinja2_env",
 ]
 
 
