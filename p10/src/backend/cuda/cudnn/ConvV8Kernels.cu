@@ -1,6 +1,6 @@
-#if defined(USE_CUDNN) && __has_include(<cudnn_frontend.h>) && \
-    __has_include(<cudnn_frontend_find_plan.h>)
-#define TP_HAS_CUDNN_FRONTEND 1
+// TP_HAS_CUDNN_FRONTEND comes from the build, which also puts the headers on
+// the include path: a CUDA target that cannot see them fails to configure.
+#if defined(TP_HAS_CUDNN_FRONTEND)
 #include <cudnn_frontend.h>
 #include <cudnn_frontend_find_plan.h>
 namespace fe = cudnn_frontend;

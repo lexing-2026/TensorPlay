@@ -1185,10 +1185,14 @@ if(USE_CUDA)
     if(USE_CUDNN)
          target_link_libraries(p10 PRIVATE ${CUDNN_LIBRARY})
          target_include_directories(p10 PRIVATE ${CUDNN_INCLUDE_DIR})
-         if(CUDNN_FRONTEND_INCLUDE_DIR)
-             target_include_directories(p10 PRIVATE ${CUDNN_FRONTEND_INCLUDE_DIR})
-         endif()
-         target_compile_definitions(p10 PRIVATE USE_CUDNN)
+         # The frontend is header-only and its directory was assigned and
+         # checked by the CUDA block of the top-level build.  The define is
+         # what the convolution sources guard their graph plans with: the
+         # AMD backend defines USE_CUDNN for its own compatibility layer and
+         # compiles the same sources without the frontend, so the plans are
+         # turned on here rather than by a probe of the include paths.
+         target_include_directories(p10 PRIVATE ${CUDNN_FRONTEND_INCLUDE_DIR})
+         target_compile_definitions(p10 PRIVATE USE_CUDNN TP_HAS_CUDNN_FRONTEND)
     endif()
 endif()
 if(USE_ROCM)
