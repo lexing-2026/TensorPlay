@@ -23,7 +23,12 @@ def traverse_state_dict(
     visitor: Callable[[OBJ_PATH, STATE_DICT_ITEM], None],
     keep_traversing: Callable[[STATE_DICT_ITEM], bool] = _keep_visiting_tensors,
 ) -> None:
+    # The walk deletes both helpers once it is done, so a recursive closure
+    # does not keep itself alive.  Each helper declares the other as nonlocal
+    # because a name deleted after use is not seen as bound where a checker
+    # resolves the recursive references.
     def _is_terminal(value: STATE_DICT_ITEM) -> bool:
+        nonlocal _is_terminal
         values: Collection[STATE_DICT_ITEM]
         if isinstance(value, Mapping):
             return False
@@ -39,6 +44,7 @@ def traverse_state_dict(
         return True
 
     def _traverse_obj(path: OBJ_PATH, value: STATE_DICT_ITEM) -> None:
+        nonlocal _traverse_obj, _is_terminal
         if isinstance(value, Mapping):
             for key, child in value.items():
                 _traverse_obj(path + (str(key),), child)
