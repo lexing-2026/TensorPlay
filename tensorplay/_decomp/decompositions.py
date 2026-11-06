@@ -463,7 +463,7 @@ def matmul(tensor1, tensor2, *, is_out=False):
     those rather than a case.
     """
 
-    from tensorplay.graph.experimental.symbolic_shapes import guard_or_true
+    from tensorplay.graph.experimental.symbolic_shapes import guard_or_false, guard_or_true
 
     dim_tensor1 = tensor1.dim()
     dim_tensor2 = tensor2.dim()
