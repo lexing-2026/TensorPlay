@@ -21,8 +21,9 @@ import textwrap
 import itertools
 from enum import Enum, auto
 from typing import overload
-from collections.abc import Iterable, MutableSet, Reversible
+from collections.abc import Callable, Iterable, Iterator, MutableSet, Reversible
 from typing import Any, Generic, SupportsFloat, TypeVar
+from typing_extensions import TypeIs, TypeVarTuple, Unpack
 
 import sympy
 
@@ -72,6 +73,17 @@ __all__ = [
 
 T = TypeVar("T")
 _T = TypeVar("_T")
+_Ts = TypeVarTuple("_Ts")
+
+ExprIn = int | float | sympy.Expr
+BoolIn = bool | SympyBoolean
+AllIn = ExprIn | BoolIn
+ExprFn = Callable[[sympy.Expr], sympy.Expr]
+ExprFn2 = Callable[[sympy.Expr, sympy.Expr], sympy.Expr]
+BoolFn = Callable[[SympyBoolean], SympyBoolean]
+BoolFn2 = Callable[[SympyBoolean, SympyBoolean], SympyBoolean]
+AllFn = ExprFn | BoolFn
+AllFn2 = ExprFn2 | BoolFn2
 
 #: Above this many terms an addition is not handed to the polynomial gcd,
 #: which is where the cost of a wide sum stops being acceptable.
@@ -176,6 +188,10 @@ def vr_is_expr(vr) -> bool:
     """Whether a range is over numbers rather than over the two truth values."""
 
     return not vr.is_bool
+
+
+def is_sympy_integer(value: object) -> TypeIs[sympy.Integer]:
+    return isinstance(value, sympy.Integer)
 
 
 class ValueRanges(Generic[_T]):
@@ -474,6 +490,11 @@ class ValueRanges(Generic[_T]):
             for a, b in itertools.product([x.lower, x.upper], [y.lower, y.upper])
         ]
         return ValueRanges(min(products), max(products))
+
+
+ExprVR = ValueRanges[sympy.Expr]
+BoolVR = ValueRanges[SympyBoolean]
+AllVR = ExprVR | BoolVR
 
 
 # The operations below are the ones a range cannot be computed through, because
@@ -1206,7 +1227,7 @@ def _run_sympy_handler(
     analysis: Any,
     args: list[Any],
     expr: sympy.Basic,
-    index_dtype: dtype = tp.int64,
+    index_dtype: tp.dtype = tp.int64,
 ) -> Any:
     # Special cases
     if isinstance(expr, sympy.Pow) and isinstance(
@@ -1283,7 +1304,7 @@ def sympy_interp(
     env: dict[sympy.Symbol, Any],
     expr: sympy.Expr | SympyBoolean,
     *,
-    index_dtype: dtype = tp.int64,
+    index_dtype: tp.dtype = tp.int64,
     missing_handler: Callable[[sympy.Symbol], object] | None = None,
 ) -> Any:
     # Handle base cases

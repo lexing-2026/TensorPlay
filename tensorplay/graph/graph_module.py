@@ -685,11 +685,6 @@ class GraphModule:
                 GraphModule._resolve(value.stop, env),
                 GraphModule._resolve(value.step, env),
             )
-        if isinstance(value, range):
-            return (
-                f"range({self._expr(value.start)}, {self._expr(value.stop)}, "
-                f"{self._expr(value.step)})"
-            )
         return value
 
     def _get_attr(self, target: str) -> Any:

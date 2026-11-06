@@ -5,7 +5,11 @@ import keyword
 import re
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Any, Callable, Dict, Iterable, Optional
+from typing import Any, Callable, Dict, Iterable, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .node import Node
+    from .proxy import Proxy
 
 
 class _LazyString:

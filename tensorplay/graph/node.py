@@ -6,9 +6,12 @@ import inspect
 import operator
 import types
 from collections.abc import Callable, Iterable, Iterator, Mapping
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
 
 from ._utils import GraphCaptureError, _iter_nodes
+
+if TYPE_CHECKING:
+    from .graph import Graph
 
 Argument = Any
 Target = Any

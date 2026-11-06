@@ -29,7 +29,7 @@ def _tensorify_impl(value: Any, factory) -> Any:
             return slice(convert(item.start), convert(item.stop), convert(item.step))
         return item
 
-    return _map_arg(value, convert)
+    return convert(value)
 
 
 def tensorify_python_scalars(
