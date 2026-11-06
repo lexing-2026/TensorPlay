@@ -3832,16 +3832,312 @@ def grouped_mm(input, mat2, offs):
     return _C.grouped_mm(input, mat2, offs)
 
 
-def scaled_grouped_mm(*args, **kwargs):
-    raise NotImplementedError(
-        "scaled_grouped_mm requires native FP8 grouped GEMM kernels, which "
-        "are not yet available in this build.")
+#: The narrow formats a scaled product reads.  Four-bit operands are packed two
+#: values to a byte and this build carries no such dtype, so the narrowest
+#: operand here is an eight-bit one.
+_FP8_DTYPES = (DType.float8_e4m3fn, DType.float8_e5m2)
+
+#: How a scale itself is held.  A block-wise scale of a narrow format is a power
+#: of two stored in eight bits rather than a float, so both readings are legal.
+_SCALE_DTYPES = (DType.float32, DType.float8_e8m0fnu)
 
 
-def scaled_mm(*args, **kwargs):
-    raise NotImplementedError(
-        "scaled_mm requires native FP8 GEMM kernels, which are not yet "
-        "available in this build.")
+def _scaling_levels(value):
+    """Read one scale or a list of them: the two-level recipes hand two."""
+
+    return list(value) if isinstance(value, (list, tuple)) else [value]
+
+
+def _as_recipe(recipe):
+    return recipe if isinstance(recipe, ScalingType) else ScalingType(recipe)
+
+
+def _recipe_tile(recipe):
+    """The length a recipe blocks its contraction axis into, or ``None``.
+
+    ``None`` covers the recipes whose scale is not blocked along the contraction
+    at all: one number for the whole tile, or one per row.
+    """
+
+    match _as_recipe(recipe):
+        case ScalingType.BlockWise1x128 | ScalingType.BlockWise128x128:
+            return 128
+        case ScalingType.BlockWise1x32:
+            return 32
+        case ScalingType.BlockWise1x16:
+            return 16
+        case _:
+            return None
+
+
+def _recipe_ndim(recipe):
+    """How many axes a single group's scale for this recipe has."""
+
+    match _as_recipe(recipe):
+        case ScalingType.TensorWise:
+            return 0
+        case ScalingType.RowWise:
+            return 1
+        case _:
+            return 2
+
+
+def _check_scale(scale, name):
+    if scale.dtype not in _SCALE_DTYPES:
+        raise RuntimeError(
+            f"{name} must be float32 or an eight-bit power-of-two scale dtype, "
+            f"got {scale.dtype}")
+    return scale.to(DType.float32)
+
+
+def _dequantized(mat, scales, recipes, contraction, name):
+    """Return ``mat`` widened to float32 with each scale spread as its recipe says.
+
+    ``contraction`` is the axis the product sums over: the last axis of the left
+    operand, the first of the right.  A blocked scale indexes that axis and is
+    repeated across the other, so the same recipe reads the two operands' scales
+    against different axes -- a scale read against the wrong axis scales the
+    wrong thing rather than nothing.
+    """
+
+    out = mat.to(DType.float32)
+    d0, d1 = out.shape
+    blocked_len = d1 if contraction == 1 else d0
+    free_len = d0 if contraction == 1 else d1
+    for scale, recipe in zip(scales, recipes):
+        recipe = _as_recipe(recipe)
+        s = _check_scale(scale, f"scale_{name}")
+        if recipe is ScalingType.TensorWise:
+            if s.numel() != 1:
+                raise RuntimeError(f"scale_{name} must hold one value for the "
+                                   f"whole tile, got {s.numel()}")
+            out = out * s.reshape(())
+        elif recipe is ScalingType.RowWise:
+            if s.numel() != free_len:
+                raise RuntimeError(
+                    f"scale_{name} must hold one value per row of the side it "
+                    f"scales: {free_len} expected, got {s.numel()}")
+            shape = (free_len, 1) if contraction == 1 else (1, free_len)
+            out = out * s.reshape(shape)
+        elif recipe is ScalingType.BlockWise128x128:
+            want = (-(-d0 // 128), -(-d1 // 128))
+            if s.numel() != want[0] * want[1]:
+                raise RuntimeError(
+                    f"scale_{name} must cover a 128 by 128 tile per value: "
+                    f"{want[0] * want[1]} expected for a "
+                    f"({d0}, {d1}) operand, got {s.numel()}")
+            s = s.reshape(want)
+            out = s.index_select(0, _block_index(d0, 128, s.device)).index_select(
+                1, _block_index(d1, 128, s.device)) * out
+        else:
+            tile = _recipe_tile(recipe)
+            blocks = -(-blocked_len // tile)
+            want = (free_len, blocks) if contraction == 1 else (blocks, free_len)
+            if s.numel() != want[0] * want[1]:
+                raise RuntimeError(
+                    f"scale_{name} must hold one value per block of {tile} "
+                    f"along the contraction axis and one per row of the other: "
+                    f"{want[0] * want[1]} expected, got {s.numel()}")
+            axis = 1 if contraction == 1 else 0
+            out = out * s.reshape(want).index_select(axis, _block_index(blocked_len,
+                                                                         tile, s.device))
+    return out
+
+
+def _block_index(count, tile, device):
+    """Which block each of ``count`` values falls in."""
+
+    return tensorplay.floor_divide(tensorplay.arange(count, device=device,
+                                                    dtype=DType.int64), tile)
+
+
+def _check_operand(mat, name):
+    if mat.dim() != 2:
+        raise RuntimeError(f"{name} must be 2-dimensional, got {mat.dim()} dimensions")
+    if mat.dtype not in _FP8_DTYPES:
+        raise RuntimeError(f"{name} must be an eight-bit narrow dtype, got {mat.dtype}")
+    return mat
+
+
+def _check_swizzle(swizzle, name):
+    swizzle = swizzle if isinstance(swizzle, SwizzleType) else SwizzleType(swizzle)
+    if swizzle is not SwizzleType.NO_SWIZZLE:
+        raise RuntimeError(
+            f"{name}: this path reads scales held in plain row order, so a "
+            f"swizzled scale buffer has to be unswizzled before the call")
+    return swizzle
+
+
+def _scaled_mm_result(out, bias, output_dtype):
+    if bias is not None:
+        out = out + bias.to(DType.float32)
+    if output_dtype is None:
+        return out
+    return out.to(output_dtype)
+
+
+def scaled_mm(mat_a, mat_b, scale_a, scale_recipe_a, scale_b, scale_recipe_b,
+              swizzle_a=None, swizzle_b=None, bias=None,
+              output_dtype=DType.bfloat16, contraction_dim=(), use_fast_accum=False):
+    r"""Multiply two narrow-format operands, reading each one's scaling as its
+    recipe describes.
+
+    ``scale_recipe_a``/``scale_recipe_b`` say how each operand was scaled -- one
+    number for the whole tile, one per row, or one per block of the contraction
+    axis -- and the scale tensors are checked against what that says.  A recipe
+    may be handed as a list for a two-level scale, where every level's number
+    multiplies in.  ``contraction_dim`` and ``use_fast_accum`` describe how a
+    tensor-core kernel reads its operands; this path multiplies in float32, so
+    it accepts the default axes and no fast accumulation.
+    """
+
+    _check_operand(mat_a, "mat_a")
+    _check_operand(mat_b, "mat_b")
+    if mat_a.shape[1] != mat_b.shape[0]:
+        raise RuntimeError(f"mat_a and mat_b must share their contraction axis, "
+                           f"got {mat_a.shape[1]} and {mat_b.shape[0]}")
+    if contraction_dim not in ((), None, (-1, -2), [-1, -2]):
+        raise RuntimeError("this path contracts the last axis of mat_a with the "
+                           "first axis of mat_b; contraction_dim has to be (-1, -2)")
+    if use_fast_accum:
+        warnings.warn("scaled_mm: use_fast_accum is a kernel-side accumulator "
+                      "width and has no effect on this path.", stacklevel=2)
+    scales_a = _scaling_levels(scale_a)
+    recipes_a = _scaling_levels(scale_recipe_a)
+    scales_b = _scaling_levels(scale_b)
+    recipes_b = _scaling_levels(scale_recipe_b)
+    if len(scales_a) != len(recipes_a) or len(scales_b) != len(recipes_b):
+        raise RuntimeError("every scale needs a recipe of its own")
+    _check_swizzle(swizzle_a if swizzle_a is not None else SwizzleType.NO_SWIZZLE,
+                   "swizzle_a")
+    _check_swizzle(swizzle_b if swizzle_b is not None else SwizzleType.NO_SWIZZLE,
+                   "swizzle_b")
+    out = _dequantized(mat_a, scales_a, recipes_a, 1, "a") @ \
+        _dequantized(mat_b, scales_b, recipes_b, 0, "b")
+    return _scaled_mm_result(out, bias, output_dtype)
+
+
+def _group_scale(scale, recipe, contraction, packed, start, end, index, groups):
+    """Read one group's scale out of a scale that describes every group.
+
+    A stacked operand's scale carries the group as a leading axis -- one axis
+    more than the operand's own scale would need, and as long as the operand is
+    stacked -- so the group is picked by index; a scale already shaped for a
+    single group is shared.  A packed operand is cut along its outer axis and
+    its scale is cut the same way, which is the free axis of the left operand
+    but a blocked axis of the right -- and a blocked axis only cuts where a
+    group begins and ends on a block, since a value of the scale covers a run of
+    rows rather than one.
+    """
+
+    recipe = _as_recipe(recipe)
+    if not packed:
+        if scale.dim() == _recipe_ndim(recipe) + 1 and scale.shape[0] == groups:
+            return scale[index]
+        return scale
+    if recipe is ScalingType.TensorWise:
+        return scale
+    if contraction == 1:
+        return scale[start:end]
+    if recipe is ScalingType.RowWise:
+        # The cut axis is the contraction of the right operand, which a per-row
+        # scale never indexes: every group reads the same per-column numbers.
+        return scale
+    tile = _recipe_tile(recipe)
+    if start % tile or end % tile:
+        raise RuntimeError(
+            f"a packed group has to begin and end on a block of {tile} along the "
+            f"contraction axis, got {start} and {end}")
+    return scale[start // tile:end // tile]
+
+
+def scaled_grouped_mm(mat_a, mat_b, scale_a, scale_recipe_a, scale_b, scale_recipe_b,
+                      swizzle_a=None, swizzle_b=None, bias=None, offs=None,
+                      output_dtype=DType.bfloat16, contraction_dim=(),
+                      use_fast_accum=False):
+    r"""Multiply a group of narrow-format operand pairs, one scaled product each.
+
+    Both operands are three-dimensional with the same leading group count, or
+    one is packed along its outer axis and ``offs`` gives the running end of
+    each group inside it.  Every product is taken in float32 and the results are
+    handed back stacked -- or packed along the rows, when the left operand was.
+    """
+
+    if bias is not None:
+        raise RuntimeError("scaled_grouped_mm adds no bias: a grouped result has "
+                           "no single axis a bias vector would line up with")
+    if output_dtype is not None and output_dtype != DType.bfloat16:
+        raise RuntimeError("a grouped result is held in bfloat16")
+    if contraction_dim not in ((), None, (-1, -2), [-1, -2]):
+        raise RuntimeError("this path contracts the last axis of mat_a with the "
+                           "first axis of mat_b; contraction_dim has to be (-1, -2)")
+    if use_fast_accum:
+        warnings.warn("scaled_grouped_mm: use_fast_accum is a kernel-side "
+                      "accumulator width and has no effect on this path.",
+                      stacklevel=2)
+    _check_swizzle(swizzle_a if swizzle_a is not None else SwizzleType.NO_SWIZZLE,
+                   "swizzle_a")
+    _check_swizzle(swizzle_b if swizzle_b is not None else SwizzleType.NO_SWIZZLE,
+                   "swizzle_b")
+    for mat, name in ((mat_a, "mat_a"), (mat_b, "mat_b")):
+        if mat.dim() not in (2, 3):
+            raise RuntimeError(f"{name} must be 2- or 3-dimensional, got {mat.dim()}")
+        if mat.dtype not in _FP8_DTYPES:
+            raise RuntimeError(f"{name} must be an eight-bit narrow dtype, got "
+                               f"{mat.dtype}")
+    if mat_a.shape[-1] % 16 != 0:
+        raise RuntimeError("the contraction axis of mat_a has to be a multiple of "
+                           f"16, got {mat_a.shape[-1]}")
+    if mat_b.shape[-2] % 16 != 0 or mat_b.shape[-1] % 16 != 0:
+        raise RuntimeError("both axes of mat_b have to be multiples of 16, got "
+                           f"{tuple(mat_b.shape)}")
+    a_packed, b_packed = mat_a.dim() == 2, mat_b.dim() == 2
+    if offs is not None:
+        if not (a_packed or b_packed):
+            raise RuntimeError("offsets describe where a packed operand's groups "
+                               "end; both operands here are stacked")
+        if offs.dim() != 1 or offs.dtype != DType.int32:
+            raise RuntimeError("offs must be a 1-dimensional int32 tensor")
+        ends = offs.tolist()
+    elif a_packed or b_packed:
+        raise RuntimeError("a packed operand needs offsets to say where its groups end")
+    else:
+        if mat_a.shape[0] != mat_b.shape[0]:
+            raise RuntimeError("stacked operands must agree on their group count")
+        ends = [None] * mat_a.shape[0]
+    scales_a = _scaling_levels(scale_a)
+    recipes_a = _scaling_levels(scale_recipe_a)
+    scales_b = _scaling_levels(scale_b)
+    recipes_b = _scaling_levels(scale_recipe_b)
+    if len(scales_a) != len(recipes_a) or len(scales_b) != len(recipes_b):
+        raise RuntimeError("every scale needs a recipe of its own")
+    for recipe in recipes_a + recipes_b:
+        if _as_recipe(recipe) is ScalingType.BlockWise128x128:
+            raise RuntimeError("a grouped scale cannot cover a square block: a group "
+                               "ends where it ends, not on a 128-row boundary")
+
+    pieces = []
+    start = 0
+    for index, end in enumerate(ends):
+        row = []
+        for mat, scales, recipes, contraction, packed, name in (
+                (mat_a, scales_a, recipes_a, 1, a_packed, "a"),
+                (mat_b, scales_b, recipes_b, 0, b_packed, "b")):
+            if packed:
+                operand = mat[start:end]
+            else:
+                operand = mat[index]
+            group_scales = [_group_scale(scale, recipe, contraction, packed,
+                                         start, end, index, len(ends))
+                            for scale, recipe in zip(scales, recipes)]
+            row.append(_dequantized(operand, group_scales, recipes, contraction, name))
+        pieces.append(row[0] @ row[1])
+        start = end
+    # A packed left operand means the results stack along the same axis the
+    # operand was packed along; otherwise each result keeps its own group.
+    grouped = tensorplay.cat(pieces, dim=0) if a_packed or len(pieces) == 1 \
+        else tensorplay.stack(pieces, dim=0)
+    return _scaled_mm_result(grouped, None, output_dtype)
 
 
 # -----------------------------------------------------------------------------
@@ -4638,3 +4934,20 @@ class ScalingType(enum.Enum):
     BlockWise1x32 = "blockwise1x32"
     #: One number per row of blocks, and 16 within a row.
     BlockWise1x16 = "blockwise1x16"
+
+
+class SwizzleType(enum.Enum):
+    """How a scale buffer is laid out in memory rather than what it scales.
+
+    The same numbers read in a different order are different scales to a kernel
+    that walks the buffer in that order, so the layout is named next to the
+    recipe rather than left to be assumed.  The swizzled entries describe a
+    buffer whose blocks are interleaved for a tiled kernel to read one tile at
+    a time; plain row order is what every other reader, and this build's
+    reference path, expects.
+    """
+
+    #: Rows of the scale follow one another in the order they index the tile.
+    NO_SWIZZLE = "no_swizzle"
+    #: Blocks of 32 by 4 by 4, interleaved the way a tensor-core loader wants.
+    SWIZZLE_32_4_4 = "swizzle_32_4_4"

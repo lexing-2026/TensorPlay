@@ -697,17 +697,136 @@ def test_linear_cross_entropy_reference_equivalence():
 
 
 def test_grouped_mm_stubs_raise():
-    # grouped_mm is a real op backed by the native grouped GEMM; only the
-    # FP8 variants are stubs in this build.
+    # grouped_mm is a real op backed by the native grouped GEMM.
     a = np.random.RandomState(0).randn(4, 8).astype(np.float64)
     b = np.random.RandomState(1).randn(2, 8, 6).astype(np.float64)
     offs = np.array([2, 4], dtype=np.int64)
     got = F.grouped_mm(tp.tensor(a), tp.tensor(b), tp.tensor(offs))
     assert_reference_close(got, _mm_grouped(a, b, offs))
 
-    for fn in (F.scaled_mm, F.scaled_grouped_mm):
-        with pytest.raises(NotImplementedError):
-            fn(None)
+
+def _narrow(array):
+    """Round a float array through the eight-bit format it is read as."""
+
+    return tp.tensor(array).to(tp.float8_e4m3fn).to(tp.float32).numpy()
+
+
+def test_scaled_mm_reads_each_scaling_recipe():
+    rng = np.random.RandomState(7)
+    M, K, N = 8, 32, 8
+    a = rng.randn(M, K).astype(np.float32)
+    b = rng.randn(K, N).astype(np.float32)
+    prod = _narrow(a) @ _narrow(b)
+    ma, mb = tp.tensor(a).to(tp.float8_e4m3fn), tp.tensor(b).to(tp.float8_e4m3fn)
+
+    # One number for each whole operand.
+    one_a, one_b = tp.tensor(np.float32(2.0)), tp.tensor(np.float32(0.5))
+    got = F.scaled_mm(ma, mb, one_a, F.ScalingType.TensorWise, one_b,
+                      F.ScalingType.TensorWise, output_dtype=tp.float32)
+    assert_reference_close(got, 2.0 * 0.5 * prod, rtol=1e-4, atol=1e-5)
+
+    # One number per row of the operand it scales.
+    sa = (rng.rand(M) + 0.5).astype(np.float32)
+    sb = (rng.rand(N) + 0.5).astype(np.float32)
+    got = F.scaled_mm(ma, mb, tp.tensor(sa[:, None]), F.ScalingType.RowWise,
+                      tp.tensor(sb), F.ScalingType.RowWise, output_dtype=tp.float32)
+    assert_reference_close(got, sa[:, None] * prod * sb[None, :], rtol=1e-4,
+                           atol=1e-5)
+
+    # One number per block of 32 along the contraction, which K = 32 is one of.
+    ba = (rng.rand(M, 1) + 0.5).astype(np.float32)
+    bb = (rng.rand(1, N) + 0.5).astype(np.float32)
+    got = F.scaled_mm(ma, mb, tp.tensor(ba), "blockwise1x32", tp.tensor(bb),
+                      "blockwise1x32", output_dtype=tp.float32)
+    assert_reference_close(got, ba * prod * bb, rtol=1e-4, atol=1e-5)
+
+    # Two levels multiply in together: a per-row scale over a whole-tensor one.
+    got = F.scaled_mm(ma, mb, [tp.tensor(sa[:, None]), one_a],
+                      [F.ScalingType.RowWise, F.ScalingType.TensorWise],
+                      [tp.tensor(sb), one_b],
+                      [F.ScalingType.RowWise, F.ScalingType.TensorWise],
+                      output_dtype=tp.float32)
+    assert_reference_close(got, 2.0 * 0.5 * sa[:, None] * prod * sb[None, :],
+                           rtol=1e-4, atol=1e-5)
+
+
+def test_scaled_mm_bias_output_dtype_and_rejections():
+    rng = np.random.RandomState(8)
+    M, K, N = 8, 16, 8
+    a = rng.randn(M, K).astype(np.float32)
+    b = rng.randn(K, N).astype(np.float32)
+    ma, mb = tp.tensor(a).to(tp.float8_e4m3fn), tp.tensor(b).to(tp.float8_e4m3fn)
+    one = tp.tensor(np.float32(1.0))
+    bias = rng.rand(N).astype(np.float32)
+
+    got = F.scaled_mm(ma, mb, one, "tensorwise", one, "tensorwise",
+                      bias=tp.tensor(bias), output_dtype=tp.float32)
+    assert_reference_close(got, _narrow(a) @ _narrow(b) + bias, rtol=1e-4, atol=1e-5)
+
+    out = F.scaled_mm(ma, mb, one, "tensorwise", one, "tensorwise")
+    assert out.dtype == tp.bfloat16
+
+    # A wide operand is not a narrowed one, and a float16 scale is not a scale
+    # this reads.
+    with pytest.raises(RuntimeError, match="eight-bit"):
+        F.scaled_mm(tp.tensor(a), mb, one, "tensorwise", one, "tensorwise")
+    with pytest.raises(RuntimeError, match="scale_b must be"):
+        F.scaled_mm(ma, mb, one, "tensorwise", tp.tensor(np.ones(1, dtype=np.float16)),
+                    "tensorwise")
+    # A scale shaped for another recipe.
+    with pytest.raises(RuntimeError, match="one value per row"):
+        F.scaled_mm(ma, mb, tp.tensor(np.ones(M, dtype=np.float32)), "rowwise",
+                    tp.tensor(np.ones(N + 1, dtype=np.float32)), "rowwise")
+    # A swizzled buffer is a kernel-side layout, not a scale this path reads.
+    with pytest.raises(RuntimeError, match="swizzle_a"):
+        F.scaled_mm(ma, mb, one, "tensorwise", one, "tensorwise",
+                    swizzle_a=F.SwizzleType.SWIZZLE_32_4_4)
+
+
+def test_scaled_grouped_mm_stacked_and_packed():
+    rng = np.random.RandomState(9)
+    G, M, K, N = 2, 8, 16, 16
+    a = rng.randn(G, M, K).astype(np.float32)
+    b = rng.randn(G, K, N).astype(np.float32)
+    ma = tp.tensor(a).to(tp.float8_e4m3fn)
+    mb = tp.tensor(b).to(tp.float32).to(tp.float8_e4m3fn)
+    per_group = [ma.float()[g].numpy() @ mb.float()[g].numpy() for g in range(G)]
+
+    sa = (rng.rand(G, M) + 0.5).astype(np.float32)
+    sb = (rng.rand(G, N) + 0.5).astype(np.float32)
+    got = F.scaled_grouped_mm(ma, mb, tp.tensor(sa), "rowwise", tp.tensor(sb),
+                              "rowwise")
+    want = np.stack([sa[g][:, None] * per_group[g] * sb[g][None, :]
+                     for g in range(G)])
+    assert got.dtype == tp.bfloat16
+    assert_reference_close(got, want, rtol=1e-2, atol=1e-2)
+
+    # The left operand packed along its rows: the group boundaries cut the
+    # operand and its per-row scale the same way.
+    packed = np.concatenate([a[g] for g in range(G)])
+    offs = tp.tensor(np.array([M, 2 * M], dtype=np.int32))
+    mp = tp.tensor(packed).to(tp.float8_e4m3fn)
+    rows = F.scaled_grouped_mm(mp, mb, tp.tensor(np.concatenate([sa[g] for g in range(G)])),
+                               "rowwise", tp.tensor(np.ones((1, N), dtype=np.float32)),
+                               "rowwise", offs=offs)
+    want_rows = np.concatenate([sa[g][:, None] * per_group[g] for g in range(G)])
+    assert tuple(rows.shape) == (2 * M, N)
+    assert_reference_close(rows, want_rows, rtol=1e-2, atol=1e-2)
+
+    # Offsets belong to a packed operand, and a square-block scale to a dense one.
+    with pytest.raises(RuntimeError, match="offsets"):
+        F.scaled_grouped_mm(ma, mb, tp.tensor(np.ones((G, M), dtype=np.float32)),
+                            "rowwise", tp.tensor(np.ones((G, N), dtype=np.float32)),
+                            "rowwise", offs=offs)
+    with pytest.raises(RuntimeError, match="square block"):
+        F.scaled_grouped_mm(ma, mb, tp.tensor(np.ones((G, M, 1), dtype=np.float32)),
+                            "blockwise128x128", tp.tensor(np.ones((G, 1, N), dtype=np.float32)),
+                            "blockwise128x128")
+    with pytest.raises(RuntimeError, match="multiples of 16"):
+        F.scaled_grouped_mm(tp.tensor(rng.randn(2, 8, 16).astype(np.float32)).to(tp.float8_e4m3fn),
+                            tp.tensor(rng.randn(2, 16, 12).astype(np.float32)).to(tp.float8_e4m3fn),
+                            tp.tensor(np.ones(1, dtype=np.float32)), "tensorwise",
+                            tp.tensor(np.ones(1, dtype=np.float32)), "tensorwise")
 
 
 def _mm_grouped(a, b, offs):
