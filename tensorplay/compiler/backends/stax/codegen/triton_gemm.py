@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import linecache
 from typing import Any, Callable, Optional, Sequence, Tuple
 
 try:

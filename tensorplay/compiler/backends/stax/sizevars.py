@@ -21,6 +21,7 @@ import dataclasses
 import functools
 import itertools
 import logging
+from collections.abc import Iterable, Sequence
 from typing import Any
 
 import sympy

@@ -13,6 +13,7 @@ import logging
 #: the messages are here rather than printed.
 log = logging.getLogger(__name__)
 
+from collections.abc import Sequence
 from typing import Any
 
 import tensorplay as tp

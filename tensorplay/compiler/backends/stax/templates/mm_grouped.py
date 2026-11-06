@@ -29,9 +29,10 @@ from typing import Any
 from ..op_lowerings import register_lowering
 from ..codegen.cutedsl.cutedsl_template import CuteDSLTemplate
 from ..kernel_inputs import KernelInputs, MMKernelInputs
-from ..ir import Layout
+from ..ir import Layout, TensorBox
 from ..heuristics.template.base import TemplateConfigHeuristics
 from .mm_common import (
+    _is_static_problem,
     check_supported_striding,
     use_tp_gemm_kernels,
     use_triton_template,
@@ -49,7 +50,15 @@ from .select_algorithm import (
 from .triton import CHOICES, dtype_size
 from ..heuristics.template.cutedsl import get_groupgemm_configs
 from ..runtime.triton_compat import tl
-from ..utils import get_gpu_shared_memory, get_max_num_sms, get_num_sms, has_free_symbols, use_blackwell_cutedsl_grouped_mm
+from ..utils import (
+    _descriptor_shape_fits_in_int32,
+    _tma_descriptor_max_offset_fits_in_int32,
+    get_gpu_shared_memory,
+    get_max_num_sms,
+    get_num_sms,
+    has_free_symbols,
+    use_blackwell_cutedsl_grouped_mm,
+)
 from ..virtualized import V
 from .mm import (
     MMKernelInputs,
@@ -885,7 +894,6 @@ def _tuned_grouped_mm_common(operator_name: str, algorithm_name: str, extern_ker
         input_gen_fns[input_offs_idx] = lambda x: create_offsets(x, a_is_2d, b_is_2d, m, n, k, alignment)
     node, _ = autotune_select_algorithm(algorithm_name, choices, input_nodes, layout, input_gen_fns=input_gen_fns)
     return node
-    from ..templates.mm_common import _is_static_problem
 
 
 @register_lowering(framework._grouped_mm, type_promotion_kind=None)

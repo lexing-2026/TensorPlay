@@ -4,7 +4,7 @@ from __future__ import annotations
 import functools
 import logging
 import operator
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 import tensorplay as tp
 from tensorplay import Tensor, primitives as _prims

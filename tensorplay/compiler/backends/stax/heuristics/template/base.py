@@ -14,11 +14,14 @@ import sympy
 from ......graph.experimental.sympy_functions import CeilDiv
 
 import functools
-from typing import Any, Callable, Iterator, Sequence
+from typing import Any, Callable, Iterator, Sequence, TYPE_CHECKING
 
 from ...op_lowerings import ceildiv
 from ...runtime.runtime_utils import next_power_of_2
-from .params import DictKernelTemplateParams
+from .params import DictKernelTemplateParams, KernelTemplateParams
+
+if TYPE_CHECKING:
+    from ...kernel_inputs import KernelInputs
 
 class SymbolicGridFn:
     """A grid function whose extents are symbolic rather than concrete.

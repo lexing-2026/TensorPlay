@@ -16,7 +16,8 @@ from __future__ import annotations
 
 import contextlib
 import os
-from typing import Literal
+from collections.abc import Callable
+from typing import Any, Literal
 
 import sys
 

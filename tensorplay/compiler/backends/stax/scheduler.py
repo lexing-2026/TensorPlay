@@ -21,6 +21,7 @@ from concurrent.futures import as_completed, Future
 from typing import Any, Generic, Literal, overload, TYPE_CHECKING, TypeAlias, TypeVar
 from typing_extensions import ParamSpec
 
+from tensorplay.graph import Node
 from tensorplay.graph.experimental.sympy_functions import OrderedSet
 
 from .ir import ComputedBuffer, Pointwise
@@ -55,7 +56,7 @@ from tensorplay.graph.experimental.sympy_functions import (
 from .runtime.triton_compat import triton as _triton
 
 from .metrics import get_metric_table, is_metric_table_enabled
-from . import comms, config, config_comms, dependencies, ir, metrics
+from . import codecache, comms, config, config_comms, dependencies, ir, metrics
 from .compile_log import timed_block, trace_structured
 from .analyze_preserves_zero_mask import can_codegen_without_upcasts
 from .codegen.common import BackendFeature, get_scheduling_for_device, Kernel
@@ -5858,6 +5859,8 @@ class Scheduler:
         Check if selecting a Triton template would cause layout conflicts.
         Returns True if there's a conflict and we should fall back to eager.
         """
+        from .templates.select_algorithm import should_use_layout_constraints
+
         constraints = V.graph.buffer_layout_constraints
         if not constraints:
             return False
@@ -5891,7 +5894,6 @@ class Scheduler:
                 return True
 
         return False
-        from .templates.select_algorithm import should_use_layout_constraints
 
     def finalize_multi_template_buffers(self) -> None:
         """
@@ -5902,6 +5904,7 @@ class Scheduler:
         If a MultiTemplateBuffer did not have any fusion opportunities, finalizing a choice
         will force completion of compilation and benchmarking.
         """
+        from .templates.select_algorithm import ExternKernelCaller
 
         for i, node in enumerate(self.nodes):
             if isinstance(node, SchedulerNode) and isinstance(
@@ -10728,6 +10731,8 @@ class Scheduler:
         This allows further applying different optimizations (e.g., cudagraph) to
         each function.
         """
+        from .utils import counters
+
         partitions, signatures = self.graph_partition()
 
         if len(partitions) > 1:
@@ -10756,7 +10761,6 @@ class Scheduler:
                 raise AssertionError(
                     f"Expect {num_partitions} partition maps but got {len(V.graph.partition_maps)}"
                 )
-        from .utils import counters
 
     def _codegen(self, nodes: list[BaseSchedulerNode]) -> None:
         if config.check_stack_no_cycles_TESTING_ONLY:

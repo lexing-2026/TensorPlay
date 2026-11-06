@@ -28,7 +28,13 @@ import threading
 import sympy
 import dataclasses
 from dataclasses import dataclass, field
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Sequence, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .ir import Buffer, Loops
+    # Published at first use by the module attribute below, since the module
+    # that owns it reaches this one while it is still being set up.
+    from .virtualized import V
 
 from tensorplay.graph.experimental.sympy_functions import OrderedSet
 from . import config, metrics

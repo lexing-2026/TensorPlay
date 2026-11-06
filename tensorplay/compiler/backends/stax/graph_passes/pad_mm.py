@@ -43,6 +43,7 @@ from tensorplay.utils._dispatch import _disable_current_modes
 from ..fx_utils import get_fake_args_kwargs, get_node_storage
 from ..utils import counters
 from ..graph_passes.decompose_mem_bound_mm import check_device
+from ....._higher_order_ops._hop_base import is_fake_tensor
 from ..virtualized import V
 from tensorplay.graph import GraphModule, Node
 from tensorplay.graph.experimental.symbolic_shapes import statically_known_true
@@ -191,8 +192,9 @@ def can_pad(
     ):
         return False
 
-    # Triton availability check - required for padding to work
-    if not has_triton():
+    # Padding writes a device kernel: without one to write it with there is
+    # nothing to pad for.
+    if not utils.has_triton_package():
         return False
 
     return True

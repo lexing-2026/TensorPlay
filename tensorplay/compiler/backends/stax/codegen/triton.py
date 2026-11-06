@@ -24,6 +24,7 @@ import itertools
 import math
 import os
 import re
+import textwrap
 import sympy
 from sympy.printing.precedence import PRECEDENCE
 from typing import Any, Callable, Iterable, Sequence, TYPE_CHECKING, TypeVar, cast
@@ -35,9 +36,14 @@ import operator
 
 import tensorplay as tp
 from tensorplay.utils import _pytree as pytree
-from tensorplay.primitives.common import is_integer_dtype
+from tensorplay.primitives.common import is_integer_dtype, type_to_dtype
 
 log = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
+
+if TYPE_CHECKING:
+    from ..dtype_propagation import DtypePropagationOpsHandler
 
 #: The compiler that hands a written-out kernel to whoever will run it.  It is
 #: asked once here rather than made per call, because what it holds is the set
@@ -48,14 +54,17 @@ from ..async_compile import AsyncCompile
 async_compile = AsyncCompile()
 
 from .....graph.experimental.sympy_functions import (
+    CeilDiv,
+    Min,
     OrderedSet,
+    TruncToFloat,
     TruncToInt,
     ValueRanges,
     prefix_str,
     symbol_is_type,
     SymT,
 )
-from .. import config, ir
+from .. import config, ir, metrics
 from ..config import triton as triton_config
 from ..loops import V
 from ..virtualized import _ops as ops
@@ -109,11 +118,12 @@ from ..runtime.hints import (
 )
 from ..scheduler import (
     BaseSchedulerNode,
+    ForeachKernelSchedulerNode,
     FusedExternTritonKernelSchedulerNode,
     FusedSchedulerNode,
     SchedulerNode,
 )
-from ..shape_propagation import get_broadcasted_shape
+from ..shape_propagation import BlockShapeType, get_broadcasted_shape
 from .common import (
     ArgName,
     BackendFeature,
@@ -2703,7 +2713,7 @@ class TritonKernel(SIMDKernel):  # type: ignore[misc,valid-type]
             "num_store": self.num_store,
             "num_reduction": self.num_reduction,
             # Triton will not accept an OrderedSet for autotune_hints
-            "autotune_hints": set(self.autotune_hints),  # noqa: set_linter
+            "autotune_hints": set(self.autotune_hints),
         }
         if self.mix_order_reduction:
             out["RSPLIT_SIZE"] = self.rsplit_size
@@ -4616,6 +4626,8 @@ class TritonKernel(SIMDKernel):  # type: ignore[misc,valid-type]
 
     @staticmethod
     def _enable_pdl_codegen():
+        from ..templates.select_algorithm import TritonTemplateKernel
+
         if not config.triton.enable_pdl:
             return False
         if isinstance(V.kernel, TritonTemplateKernel):
@@ -5518,6 +5530,8 @@ def triton_store_type(dtype) -> str:
 
     @staticmethod
     def _enable_pdl_codegen():
+        from ..templates.select_algorithm import TritonTemplateKernel
+
         if not config.triton.enable_pdl:
             return False
         if isinstance(V.kernel, TritonTemplateKernel):
@@ -7100,7 +7114,7 @@ class TritonCSE(CSE):
         return cache_key
 
 
-class TritonPrinter(PythonPrinter):  # noqa: docstring_linter
+class TritonPrinter(PythonPrinter):
     def _print_TruncToInt(self, expr: sympy.Expr) -> str:
         if len(expr.args) != 1:
             raise AssertionError(f"expected 1 arg, got {len(expr.args)}")

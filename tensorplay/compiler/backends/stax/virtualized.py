@@ -79,6 +79,10 @@ if TYPE_CHECKING:
     from typing import Protocol
 
     import tensorplay as tp
+    from tensorplay.graph import Node
+
+    InputType = tp.Tensor | int | tp.SymInt | None
+
     from .config import TpChoices
     from .codegen.common import CSE, CSEVariable, KernelArgs
     from .codegen.common import LocalBufferContext

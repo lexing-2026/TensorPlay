@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import itertools
 from collections.abc import Callable, Sequence
-from typing import Literal, NamedTuple
+from typing import Any, Literal, NamedTuple, TypeVar
 
 import sympy
 
@@ -32,6 +32,11 @@ from tensorplay.utils import _pytree as pytree
 from tensorplay.graph.experimental.sympy_functions import OrderedSet
 
 from .utils import IndentedBuffer
+
+
+T = TypeVar("T")
+dtype = tp.dtype
+expr = sympy.Expr
 
 
 def _arg_str(a) -> str:

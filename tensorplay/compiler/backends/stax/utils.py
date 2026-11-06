@@ -44,6 +44,7 @@ from typing import (
     Generic,
     ParamSpec,
     Protocol,
+    TYPE_CHECKING,
     TypeVar,
 )
 
@@ -62,6 +63,10 @@ from tensorplay.graph.experimental.sympy_functions import (
 )
 
 from . import config
+
+if TYPE_CHECKING:
+    # A name a signature reads, from a module that is set up after this one.
+    from .codegen.wrapper import PythonWrapperCodegen
 
 _T = TypeVar("_T")
 _FN_TYPE = TypeVar("_FN_TYPE", bound=Callable[..., Any])
@@ -1306,6 +1311,19 @@ def _align(nbytes: int) -> int:
     return (nbytes + ALIGN_BYTES - 1) & -ALIGN_BYTES
 
 
+def _is_aligned(value: sympy.Expr) -> bool:
+    """Whether an expression is statically a whole number of aligned rows.
+
+    A sum or a maximum is aligned when every part of it is, and nothing else
+    needs the value itself: what the alignment and the expression have in common
+    already says whether the one divides the other.
+    """
+
+    if isinstance(value, (sympy.Add, sympy.Max)):
+        return all(map(_is_aligned, value.args))
+    return isinstance(value, align) or sympy.gcd(value, ALIGN_BYTES) == ALIGN_BYTES
+
+
 class align(sympy.Function):
     """Symbolically round up to the nearest multiple of ALIGN_BYTES"""
 
@@ -1552,6 +1570,7 @@ def use_blackwell_cutedsl_grouped_mm(
     """
 
     from .codegen.cuda.cuda_env import is_datacenter_blackwell_arch
+    from .templates.mm_common import _use_autotune_backend
 
     if not ensure_cute_available():
         return False
@@ -1576,7 +1595,6 @@ def use_blackwell_cutedsl_grouped_mm(
     if bias is not None or scale_result is not None:
         return False
     return True
-    from .templates.mm_common import _use_autotune_backend
 
 
 def can_use_tma(*matrices, output_layout=None, add_guards: bool = False) -> bool:
@@ -3040,6 +3058,18 @@ def is_gpu(device: str | None) -> bool:
     return device in GPU_TYPES
 
 
+def _use_template_for_gpu(layout, allowed_layout_dtypes: list[Any]) -> bool:
+    """Whether a template written for a device generation may be offered here.
+
+    Two answers make such a template wrong rather than slow: the work is not on
+    a device at all, or the result it writes is a type that template does not
+    cover.  Which generation the template was written for is the caller's to ask
+    about, because it is the caller that knows what its kernel is written in.
+    """
+
+    return is_gpu(layout.device.type) and layout.dtype in allowed_layout_dtypes
+
+
 def device_need_guard(device: str) -> bool:
     """Whether work on a device has to be told apart from work elsewhere.
 
@@ -3436,6 +3466,8 @@ def can_use_tma(*matrices: Any, output_layout: Any = None, add_guards: bool = Fa
     cannot be built makes the whole launch unable to use them.
     """
 
+    from .virtualized import V
+
     def _aligned(expr_bytes: Any) -> bool:
         return V.graph.sizevars.statically_known_multiple_of(expr_bytes, TMA_ALIGNMENT)
 
@@ -3511,3 +3543,60 @@ def can_use_tma(*matrices: Any, output_layout: Any = None, add_guards: bool = Fa
     if output_layout is not None:
         ret = ret and _is_tma_compatible_layout(output_layout)
     return ret
+
+
+def _descriptor_shape_fits_in_int32(sizes: Sequence[Any], add_guards: bool = False) -> bool:
+    """Whether every extent a tile descriptor is handed can be held in its index.
+
+    A descriptor names an extent in thirty-two bits, so an extent beyond that is
+    not a larger tile but a tile that cannot be described at all.  An extent not
+    settled yet is answered by the guards, and asked of them only when the caller
+    means to build a descriptor from the answer: an unproven extent is then
+    settled one way or the other rather than left open.
+    """
+
+    int32_max = tp.iinfo(tp.int32).max
+    conditions = []
+    for size in sizes:
+        if isinstance(size, (int, sympy.Integer)):
+            if size > int32_max:
+                return False
+        else:
+            conditions.append(sympy.Le(size, int32_max))
+
+    if not conditions:
+        return True
+
+    from .virtualized import V
+
+    condition = conditions[0] if len(conditions) == 1 else sympy.And(*conditions)
+    return (
+        V.graph.sizevars.guard_or_false(condition)
+        if add_guards
+        else V.graph.sizevars.statically_known_true(condition)
+    )
+
+
+def _tma_descriptor_max_offset_fits_in_int32(mat: Any, add_guards: bool = False) -> bool:
+    """Whether the furthest address a descriptor can reach is inside its index too.
+
+    Every extent fitting is not enough: the far corner of a strided region is how
+    far each axis can run times how far it walks, summed, and that sum overflows
+    where none of the parts do.
+    """
+
+    int32_max = tp.iinfo(tp.int32).max
+    max_offset = sum(
+        (size - 1) * stride for size, stride in zip(mat.get_size(), mat.get_stride())
+    )
+    if isinstance(max_offset, (int, sympy.Integer)):
+        return max_offset <= int32_max
+
+    from .virtualized import V
+
+    condition = sympy.Le(max_offset, int32_max)
+    return (
+        V.graph.sizevars.guard_or_false(condition)
+        if add_guards
+        else V.graph.sizevars.statically_known_true(condition)
+    )

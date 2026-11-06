@@ -4614,7 +4614,7 @@ class SIMDScheduling(BaseScheduling):
                             # value, the first configuration is enough; on one
                             # where they are not, only a choice with little to
                             # choose between is worth fusing on.
-                            if tensorplay.version.hip:
+                            if tp.version.hip:
                                 fuse_ok = configs and not probe_kernel.autotune_hints
                             else:
                                 fuse_ok = configs and len(configs) <= 2

@@ -717,13 +717,11 @@ def get_omni_flash_fwd_configs(
         graph_module=score_mod_graph_module,
         other_buffers=score_mod_other_buffers,
     )
+    # A mask tested a whole vector of positions at a time is chosen by reading
+    # the mask's graph as a set of intervals, which is an analysis this build
+    # does not carry.  With nothing chosen, the mask is tested one position at a
+    # time and the vector size a packed mask would set stays at its default.
     mask_mod_packed_intervals = None
-    if has_mask_mod and cuda_major in (10, 11) and mask_mod_graph_module is not None:
-        mask_mod_packed_intervals = select_packed_mask_intervals(
-            mask_mod_graph_module,
-            mask_mod_other_buffers,
-            CuteDSLAuxScalarBindings(tuple(aux_scalar_symbols)).symbol_codes(),
-        )
     if mask_mod_packed_intervals is not None:
         mask_mod_vec_size = DEFAULT_MASK_MOD_VEC_SIZE
 
@@ -1373,6 +1371,7 @@ def zeros_and_scatter_lowering(shape: Any, indices: Any, values: Any) -> Any:
         _full,
         check_and_broadcast_indices,
         index_output_size_and_inner_fn,
+        lower_expand,
         to_dtype,
     )
 

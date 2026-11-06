@@ -28,7 +28,7 @@ from typing import Any, Callable, Iterator
 
 import tensorplay as tp
 
-from .. import config
+from .. import config, ir
 from ..codegen.common import KernelTemplate
 from ..kernel_inputs import KernelInputs
 from ..ir import (

@@ -16,7 +16,9 @@ import tensorplay as tp
 from .. import config
 from ..heuristics.template.base import TemplateConfigHeuristics
 
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
+from typing import Any
 
 @dataclass
 class TritonConfig:

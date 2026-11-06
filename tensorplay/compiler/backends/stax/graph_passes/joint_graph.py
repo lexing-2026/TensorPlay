@@ -11,6 +11,7 @@ from typing import Any
 import tensorplay as tp
 from tensorplay.utils import _pytree as pytree
 from tensorplay.graph import GraphModule, Node
+from tensorplay.graph.passes.graph_transform_observer import GraphTransformObserver
 from tensorplay.graph import map_arg
 from tensorplay.utils._dispatch import _disable_current_modes
 from tensorplay.graph.experimental.symbolic_shapes import (

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import functools
 import itertools
+from collections.abc import Callable, Iterable
 from typing import Any
 from unittest.mock import patch
 

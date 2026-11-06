@@ -31,10 +31,11 @@ from enum import Enum, auto
 from abc import ABC, abstractmethod
 from itertools import chain
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, ClassVar, Generic, NamedTuple
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Generic, NamedTuple, Optional, Sequence
 from typing_extensions import TypeVar
 
 import sympy
+from sympy import Expr
 from sympy.printing.python import PythonPrinter as _PythonPrinter
 from sympy.printing.precedence import PRECEDENCE
 import tensorplay as tp
@@ -286,6 +287,7 @@ from ..utils import (
 )
 
 if TYPE_CHECKING:
+    from ..scheduler import SchedulerNode
     from ..loop_body import LoopBody
     from ..templates.select_algorithm import ChoiceCaller
 

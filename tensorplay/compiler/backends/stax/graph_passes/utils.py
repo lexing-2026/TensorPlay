@@ -1,4 +1,5 @@
 from collections import defaultdict
+from typing import Any
 
 from tensorplay.graph import Graph, Node, map_arg
 from tensorplay.graph.experimental.sympy_functions import OrderedSet

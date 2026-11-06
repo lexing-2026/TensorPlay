@@ -116,6 +116,8 @@ from .triton_utils import config_of, should_unwrap_unspec_arg, signature_to_meta
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator, Sequence
 
+    import triton
+
     from ..graph_lowering import GraphLowering
     from ..ir import ExternKernel
     from ..scheduler import BaseSchedulerNode
@@ -578,7 +580,7 @@ class WrapperLine:
     def codegen(self, code: Any) -> None:
         raise NotImplementedError(f"Codegen not yet supported for type {type(self)}")
 
-    def codegen_fx(self, converter: FxConverter) -> FxConversionFunc:
+    def codegen_fx(self, converter: Any) -> FxConversionFunc:
         raise NotImplementedError(f"FX codegen not yet supported for type {type(self)}")
 
 
@@ -594,7 +596,7 @@ class EnterSubgraphLine(WrapperLine):
         self.wrapper.push_codegened_graph(self.graph)
         code.do_indent()
 
-    def codegen_fx(self, converter: FxConverter) -> FxConversionFunc:
+    def codegen_fx(self, converter: Any) -> FxConversionFunc:
         return converter._generate_enter_subgraph
 
 
@@ -607,7 +609,7 @@ class SwitchLine(WrapperLine):
         raise NotImplementedError("Only supports FX codegen")
 
     @staticmethod
-    def codegen_fx(converter: FxConverter) -> FxConversionFunc:
+    def codegen_fx(converter: Any) -> FxConversionFunc:
         return converter._generate_switch
 
 
@@ -619,7 +621,7 @@ class CommentLine(WrapperLine):
         code.writeline(self.line)
 
     @staticmethod
-    def codegen_fx(converter: FxConverter) -> FxConversionFunc:
+    def codegen_fx(converter: Any) -> FxConversionFunc:
         return converter._generate_comment
 
 
@@ -632,7 +634,7 @@ class DynamicScalarLine(WrapperLine):
         self.wrapper._codegen_dynamic_scalar(self.node)
 
     @staticmethod
-    def codegen_fx(converter: FxConverter) -> FxConversionFunc:
+    def codegen_fx(converter: Any) -> FxConversionFunc:
         return converter._generate_dynamic_scalar
 
 
@@ -647,7 +649,7 @@ class ExitSubgraphLine(WrapperLine):
         self.wrapper.pop_codegened_graph()
         code.do_unindent()
 
-    def codegen_fx(self, converter: FxConverter) -> FxConversionFunc:
+    def codegen_fx(self, converter: Any) -> FxConversionFunc:
         return converter._generate_exit_subgraph
 
 
@@ -714,7 +716,7 @@ class EnterDeviceContextManagerLine(WrapperLine):
             code.do_indent()
             code.writeline(V.graph.device_ops.set_device(idx))
 
-    def codegen_fx(self, converter: FxConverter) -> FxConversionFunc:
+    def codegen_fx(self, converter: Any) -> FxConversionFunc:
         return converter._generate_enter_device_context_manager
 
 
@@ -723,7 +725,7 @@ class ExitDeviceContextManagerLine(WrapperLine):
         if not V.graph.cpp_wrapper:
             code.do_unindent()
 
-    def codegen_fx(self, converter: FxConverter) -> FxConversionFunc:
+    def codegen_fx(self, converter: Any) -> FxConversionFunc:
         return converter._generate_exit_device_context_manager
 
 
@@ -737,7 +739,7 @@ class ExternKernelAllocLine(WrapperLine):
         args = [*node.codegen_args(), *node.codegen_kwargs()]
         self.wrapper._generate_extern_kernel_alloc_helper(self.node, args)
 
-    def codegen_fx(self, converter: FxConverter) -> FxConversionFunc:
+    def codegen_fx(self, converter: Any) -> FxConversionFunc:
         return converter._generate_extern_kernel_alloc
 
 
@@ -769,7 +771,7 @@ class ExternKernelOutLine(WrapperLine):
             self.node.get_stack_traces(),
         )
 
-    def codegen_fx(self, converter: FxConverter) -> FxConversionFunc:
+    def codegen_fx(self, converter: Any) -> FxConversionFunc:
         return converter._generate_extern_kernel_out
 
 
@@ -809,7 +811,7 @@ class FreeLine(WrapperLine):
             )
         code.writeline(self.wrapper.make_buffer_free(self.node))
 
-    def codegen_fx(self, converter: FxConverter) -> FxConversionFunc:
+    def codegen_fx(self, converter: Any) -> FxConversionFunc:
         return converter._generate_free
 
 
@@ -845,7 +847,7 @@ class KernelCallLine(WrapperLine):
             current_stream_idx=self.current_stream_idx,
         )
 
-    def codegen_fx(self, converter: FxConverter) -> FxConversionFunc:
+    def codegen_fx(self, converter: Any) -> FxConversionFunc:
         return converter._generate_kernel_call
 
 
@@ -867,7 +869,7 @@ class KernelDefinitionLine(WrapperLine):
             cpp_definition=self.cpp_definition,
         )
 
-    def codegen_fx(self, converter: FxConverter) -> FxConversionFunc:
+    def codegen_fx(self, converter: Any) -> FxConversionFunc:
         return converter._generate_kernel_definition
 
 
@@ -1164,7 +1166,7 @@ class AllocateLine(MemoryPlanningLine):
             )
         code.writeline(line)
 
-    def codegen_fx(self, converter: FxConverter) -> FxConversionFunc:
+    def codegen_fx(self, converter: Any) -> FxConversionFunc:
         if self.comm_buffer:
             return converter._generate_comm_buffer_allocate
         return converter._generate_allocate
@@ -1219,7 +1221,7 @@ class FreeIfNotReusedLine(MemoryPlanningLine):
             else:
                 code.writeline(line)
 
-    def codegen_fx(self, converter: FxConverter) -> FxConversionFunc:
+    def codegen_fx(self, converter: Any) -> FxConversionFunc:
         if self.comm_buffer:
             return converter._generate_comm_buffer_free
         return converter._generate_free_if_not_reused
@@ -1245,7 +1247,7 @@ class ReinterpretLine(MemoryPlanningLine):
             self.reused_as.get_name(), self.layout.view
         )
 
-    def codegen_fx(self, converter: FxConverter) -> FxConversionFunc:
+    def codegen_fx(self, converter: Any) -> FxConversionFunc:
         return converter._generate_reinterpret
 
 
@@ -1282,12 +1284,12 @@ class ReuseLine(MemoryPlanningLine):
             self.wrapper.make_buffer_reuse(self.node, self.reused_as, self.delete_old)
         )
 
-    def codegen_fx(self, converter: FxConverter) -> FxConversionFunc:
+    def codegen_fx(self, converter: Any) -> FxConversionFunc:
         return converter._generate_reuse
 
 
 class NullLine(MemoryPlanningLine):
-    def codegen_fx(self, converter: FxConverter) -> FxConversionFunc:
+    def codegen_fx(self, converter: Any) -> FxConversionFunc:
         return converter._generate_null
 
 
@@ -1326,7 +1328,7 @@ class MultiOutputLine(WrapperLine):
             f"{self.wrapper.declare}{self.result_name} = {value}{self.wrapper.ending}"
         )
 
-    def codegen_fx(self, converter: FxConverter) -> FxConversionFunc:
+    def codegen_fx(self, converter: Any) -> FxConversionFunc:
         return converter._generate_multi_output
 
 
@@ -1354,7 +1356,7 @@ class IndexPutFallbackLine(WrapperLine):
             *(self.wrapper.val_to_arg_str(a) for a in node.constant_args),
         )
 
-    def codegen_fx(self, converter: FxConverter) -> FxConversionFunc:
+    def codegen_fx(self, converter: Any) -> FxConversionFunc:
         return converter._generate_index_put_fallback
 
 
@@ -1384,7 +1386,7 @@ class ScatterFallbackLine(WrapperLine):
             device,
         )
 
-    def codegen_fx(self, converter: FxConverter) -> FxConversionFunc:
+    def codegen_fx(self, converter: Any) -> FxConversionFunc:
         return converter._generate_scatter_fallback
 
 
@@ -1397,7 +1399,7 @@ class SymbolicCallArgLine(WrapperLine):
     def codegen(self, code: IndentedBuffer) -> None:
         self.wrapper._generate_symbolic_call_arg_helper(self.arg, self.graph)
 
-    def codegen_fx(self, converter: FxConverter) -> FxConversionFunc:
+    def codegen_fx(self, converter: Any) -> FxConversionFunc:
         return converter._generate_symbolic_call_arg
 
 
@@ -1413,7 +1415,7 @@ class UnbackedSymbolDefsLine(WrapperLine):
             self.output_name, self.outputs, self.unbacked_bindings
         )
 
-    def codegen_fx(self, converter: FxConverter) -> FxConversionFunc:
+    def codegen_fx(self, converter: Any) -> FxConversionFunc:
         return converter._generate_unbacked_symbol_defs
 
 
@@ -1432,7 +1434,7 @@ class AssertSizeStrideLine(WrapperLine):
         )
 
     @staticmethod
-    def codegen_fx(converter: FxConverter) -> FxConversionFunc:
+    def codegen_fx(converter: Any) -> FxConversionFunc:
         return converter._generate_assert_size_stride
 
 
@@ -1448,7 +1450,7 @@ class GroupedAssertSizeStrideLine(WrapperLine):
         )
 
     @staticmethod
-    def codegen_fx(converter: FxConverter) -> FxConversionFunc:
+    def codegen_fx(converter: Any) -> FxConversionFunc:
         return converter._generate_assert_size_stride
 
 
