@@ -20,8 +20,9 @@
 #   CUDNN_VERSION             - "<major>.<minor>.<patch>" parsed from headers
 #   CUDNN_INCLUDE_DIR/CUDNN_LIBRARY - aliases of the *_PATH variables kept for
 #                    the existing p10 wiring
-#   CUDNN_FRONTEND_INCLUDE_DIR - directory holding cudnn_frontend.h (optional;
-#                    no failure when absent)
+# The frontend include directory (the header-only graph API the convolution
+# plans are built against) is not searched for here; it names a pinned vendored
+# copy and the CUDA block of the top-level build assigns it.
 
 include(FindPackageHandleStandardArgs)
 
@@ -121,23 +122,13 @@ if(CUDNN_INCLUDE_PATH)
     unset(_CUDNN_VERSION_HEADER)
 endif()
 
-# Header-only frontend (graph API). Optional: the runtime-only path builds
-# fine without it.
-find_path(CUDNN_FRONTEND_INCLUDE_DIR
-    NAMES cudnn_frontend.h
-    HINTS
-        "$ENV{CUDNN_FRONTEND_DIR}/include"
-        "${CUDNN_INCLUDE_PATH}/cudnn_frontend"
-        "${CUDNN_INCLUDE_PATH}"
-)
-
 find_package_handle_standard_args(CUDNN
     REQUIRED_VARS CUDNN_LIBRARY_PATH CUDNN_INCLUDE_PATH
     VERSION_VAR CUDNN_VERSION
 )
 
 mark_as_advanced(CUDNN_ROOT CUDNN_INCLUDE_PATH CUDNN_LIBRARY_PATH
-                 CUDNN_VERSION CUDNN_FRONTEND_INCLUDE_DIR)
+                 CUDNN_VERSION)
 
 if(CUDNN_FOUND)
     set(CUDNN_INCLUDE_DIR "${CUDNN_INCLUDE_PATH}")

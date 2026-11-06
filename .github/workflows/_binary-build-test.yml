@@ -256,13 +256,15 @@ jobs:
       # provisions the pinned MKL trio plus libuv.
 
       # The CUDA kernel sources (grouped GEMM tensor-op route, native flash
-      # attention) consume the cutlass and flash-attention submodules; the
-      # pinned gitlinks come with the checkout, so only the worktrees are
+      # attention) consume the cutlass and flash-attention submodules, and the
+      # convolution graph plans are written against the frontend headers, which
+      # the configure step reads from third_party and refuses to build without.
+      # The pinned gitlinks come with the checkout, so only the worktrees are
       # missing.  CPU lanes compile no .cu sources and skip the fetch.
       - name: Fetch CUDA kernel submodules
         if: ${{ inputs.cuda != 'cpu' }}
         shell: bash
-        run: git submodule update --init third_party/cutlass third_party/flash-attention
+        run: git submodule update --init third_party/cutlass third_party/flash-attention third_party/cudnn_frontend
 
       # The wheel links vendored SLEEF/NNPACK trees that CI checkouts do
       # not carry; fetch the pinned revisions before configuring.
