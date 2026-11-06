@@ -1,4 +1,8 @@
 from importlib.metadata import EntryPoint
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import warnings
 
 import pytest
 
@@ -93,6 +97,92 @@ def test_reset_calls_backend_reset_hooks():
         assert calls == ["reset"]
     finally:
         tp.compiler.unregister_backend("stateful_reset_backend")
+
+
+@pytest.fixture
+def simulated_stax_lowering(monkeypatch):
+    from tensorplay.compiler.backends.stax import graph_lowering
+    from tensorplay.graph import Tracer
+
+    monkeypatch.delenv("TP_STAX_LOWER_DEBUG", raising=False)
+    x = tp.tensor([2.0])
+    gm = Tracer().trace(lambda x: x + 1, sample_inputs={"x": x})
+    recompile = Mock(wraps=gm.recompile)
+    monkeypatch.setattr(gm, "recompile", recompile)
+    lowered = SimpleNamespace(
+        single_output=True,
+        run=Mock(),
+        compile_to_module=Mock(
+            return_value=SimpleNamespace(call=lambda values: (values[0] + 1,))
+        ),
+    )
+    monkeypatch.setattr(graph_lowering, "GraphLowering", lambda *a, **kw: lowered)
+    return gm, x, lowered, recompile
+
+
+def test_stax_lowering_success_does_not_warn_or_fallback(simulated_stax_lowering):
+    from tensorplay.compiler.backends.stax.backend import stax
+
+    gm, x, lowered, recompile = simulated_stax_lowering
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        compiled = stax(gm, [x])
+        assert compiled(x).tolist() == [3.0]
+    assert not caught
+    recompile.assert_not_called()
+    lowered.run.assert_called_once_with(x)
+    lowered.compile_to_module.assert_called_once_with()
+    assert compiled._tensorplay_codegen == "stax-cpu"
+
+
+@pytest.mark.parametrize("stage", ["run", "compile_to_module"])
+@pytest.mark.parametrize("error_type", [NotImplementedError, Exception])
+@pytest.mark.parametrize("strict", [False, True])
+def test_stax_lowering_failure_is_visible(
+    simulated_stax_lowering, stage, error_type, strict
+):
+    from tensorplay.compiler.backends.stax.backend import stax
+
+    gm, x, lowered, recompile = simulated_stax_lowering
+    error = error_type("simulated lowering failure")
+    getattr(lowered, stage).side_effect = error
+    if strict:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with pytest.raises(RuntimeError, match="strict_native") as info:
+                stax(gm, [x], strict_native=True)
+        assert info.value.__cause__ is error
+        assert not caught
+        recompile.assert_not_called()
+    else:
+        with pytest.warns(UserWarning, match="simulated lowering failure") as caught:
+            compiled = stax(gm, [x])
+        assert len(caught) == 1
+        message = str(caught[0].message)
+        assert error_type.__name__ in message
+        assert "falling back" in message
+        recompile.assert_called_once_with()
+        assert compiled(x).tolist() == [3.0]
+
+
+@pytest.mark.parametrize("stage", ["run", "compile_to_module"])
+@pytest.mark.parametrize("error_type", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("strict", [False, True])
+def test_stax_lowering_does_not_swallow_process_exceptions(
+    simulated_stax_lowering, stage, error_type, strict
+):
+    from tensorplay.compiler.backends.stax.backend import stax
+
+    gm, x, lowered, recompile = simulated_stax_lowering
+    error = error_type("stop lowering")
+    getattr(lowered, stage).side_effect = error
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(error_type) as info:
+            stax(gm, [x], strict_native=strict)
+    assert info.value is error
+    assert not caught
+    recompile.assert_not_called()
 
 
 DEBUG_BACKENDS = (

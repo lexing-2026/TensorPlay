@@ -460,6 +460,7 @@ def compile(
         target_signature = None
     last_call_fp: Any = None
     last_quick_parts: tuple[Any, ...] | None = None
+    last_module_state: Any = None
 
     def _guard_component(
         args_: tuple[Any, ...],
@@ -483,23 +484,26 @@ def compile(
             ),
         )
 
-    def _bind_dispatcher_fast(fast: Any, nargs: int) -> None:
+    def _bind_dispatcher_fast(fast: Any, nargs: int, bound_module_state: Any) -> None:
         """Hand a resolved steady-state entry to the outer C dispatcher.
 
         The dispatcher re-enters it directly once its argument memo passes;
         any slow call routes through here again, so the binding stays
         current across recompiles and specialization switches.
 
-        The argument memo cannot see the ambient autograd state, so the
-        entry carries the state it was resolved under and falls back to the
-        trampoline when a call arrives under a flipped state; the trampoline
-        then resolves (and binds) the specialization for that state.
+        The argument memo cannot see ambient autograd or module state, so
+        the entry checks both against the specialization it was bound to.
+        A state change returns to specialization lookup rather than reusing
+        an artifact captured under a different mode or module hierarchy.
         """
 
         bound_grad_state = _grad_state_component()
 
         def _fast(*args: Any) -> Any:
-            if _grad_state_component() == bound_grad_state:
+            if (
+                _grad_state_component() == bound_grad_state
+                and _module_state_component(model) == bound_module_state
+            ):
                 return fast(*args)
             return optimized(*args)
 
@@ -509,10 +513,16 @@ def compile(
     def optimized(*args: Any, **kwargs: Any) -> Any:
         nonlocal last_quick_key, last_compiled_fn
         nonlocal guard_param_names, gate_evaluator
-        nonlocal last_call_fp, last_quick_parts
+        nonlocal last_call_fp, last_quick_parts, last_module_state
         nonlocal compile_attempts
         if _capture_disabled.get():
             return model(*args, **kwargs)
+        module_state = _module_state_component(model)
+        if module_state != last_module_state:
+            # Input identity does not certify gates that read module state.
+            last_call_fp = None
+            last_quick_parts = None
+            last_module_state = module_state
         # Steady-state memo: identical objects with unchanged versions (or
         # unchanged scalars) cannot produce different signatures or gate
         # outcomes -- skip metadata reads and evaluator replay entirely.
@@ -554,7 +564,9 @@ def compile(
             )
             last_call_fp = call_fp
         grad_state = _grad_state_component()
-        quick_key = (input_signature, shape_component, data_component, grad_state)
+        quick_key = (
+            input_signature, shape_component, data_component, grad_state, module_state
+        )
         with lock:
             if cache_enabled and cache and last_compiled_fn is not None and quick_key == last_quick_key:
                 compiled_fn = last_compiled_fn
@@ -564,6 +576,7 @@ def compile(
                     _guard_component(args, kwargs, _value_signature),
                     data_component,
                     grad_state,
+                    module_state,
                 )
                 compiled_fn = cache.get(key) if cache_enabled else None
             if compiled_fn is not None:
@@ -574,6 +587,7 @@ def compile(
                         _guard_component(args, kwargs, _value_signature),
                         data_component,
                         grad_state,
+                        module_state,
                     )
                     compiled_fn = next((
                         variant for variant in backend_variants.get(key, ())
@@ -651,6 +665,7 @@ def compile(
                     _guard_component(args, kwargs, _value_signature),
                     data_component,
                     grad_state,
+                    module_state,
                 )
                 if store_compiled:
                     cache[key] = compiled_fn
@@ -663,13 +678,14 @@ def compile(
                         dynamic=specialization_dynamic,
                         target=model.forward if _is_module_like(model) else model,
                         gate_evaluator=gate_evaluator,
+                        module_evaluator=lambda: _module_state_component(model),
                     )
             last_quick_key = quick_key
             last_compiled_fn = compiled_fn
         if not kwargs:
             fast = getattr(compiled_fn, "_fast_call", None)
             if fast is not None:
-                _bind_dispatcher_fast(fast, len(args))
+                _bind_dispatcher_fast(fast, len(args), module_state)
                 return compiled_fn(*args)
         return compiled_fn(*args, **kwargs)
 
@@ -738,9 +754,30 @@ def _modules_reached(program: Any) -> list[Any]:
         except ValueError:
             continue
     scope = function.__globals__
-    for name in _loaded_global_names(function):
+    for name in sorted(_loaded_global_names(function)):
         add(scope.get(name))
     return found
+
+
+def _module_state_component(program: Any) -> tuple[Any, ...]:
+    """Read live module identities, training modes and child bindings.
+
+    Rediscover roots on each call: closure cells and globals can be rebound,
+    and children can be replaced without changing the root's training flag.
+    Child bindings retain aliases even though each module is visited once.
+    """
+
+    return tuple(
+        (
+            index,
+            name,
+            id(module),
+            module.training,
+            tuple((child_name, id(child)) for child_name, child in module._modules.items()),
+        )
+        for index, root in enumerate(_modules_reached(program))
+        for name, module in root.named_modules(remove_duplicate=True)
+    )
 
 
 def _free_tensor_sources(

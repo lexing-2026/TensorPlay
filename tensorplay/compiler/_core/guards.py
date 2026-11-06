@@ -111,10 +111,12 @@ class GuardChain:
         dynamic: bool,
         target: Any = None,
         gate_evaluator: Callable[..., Tuple] | None = None,
+        module_evaluator: Callable[..., Tuple] | None = None,
     ) -> None:
         self.key = key
         self.param_names = tuple(param_names)
         self.gate_evaluator = gate_evaluator
+        self.module_evaluator = module_evaluator
         self.dynamic = dynamic
         self._target = target
         components: Tuple[Any, ...] = key if isinstance(key, tuple) else (key,)
@@ -127,6 +129,11 @@ class GuardChain:
         )
         self._state_component = (
             components[3] if len(components) > 3 and isinstance(key, tuple) else ()
+        )
+        self._module_component = (
+            components[4]
+            if len(components) > 4 and module_evaluator is not None
+            else ()
         )
         self._evaluate: Callable[..., bool] | None = None
         self.hits = 0
@@ -157,6 +164,12 @@ class GuardChain:
                 "ambient autograd state matches the captured state",
                 self._state_component,
             ))
+        if self._module_component:
+            rendered.append(Guard(
+                "module-state",
+                "module identities, training modes and child bindings match the captured state",
+                self._module_component,
+            ))
         return rendered
 
     @property
@@ -177,6 +190,7 @@ class GuardChain:
             self._live_guard_component(args, kwargs),
             self._live_data_component(args, kwargs),
             self._state_component and _grad_state_component(),
+            self._module_component and self._live_module_component(),
         )
 
     def _bind_arguments(
@@ -210,6 +224,11 @@ class GuardChain:
             return ()
         return self.gate_evaluator(args, kwargs)
 
+    def _live_module_component(self) -> Tuple:
+        if self.module_evaluator is None:
+            return ()
+        return self.module_evaluator()
+
     def evaluate(self, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> bool:
         if self._evaluate is None:
             # Compile once: bind this chain into a closure so the hot path is
@@ -223,6 +242,7 @@ class GuardChain:
                     _chain._guard_component,
                     _chain._data_component,
                     _chain._state_component,
+                    _chain._module_component,
                 )
 
             self._evaluate = _compiled
@@ -239,6 +259,7 @@ class GuardChain:
             self._guard_component,
             self._data_component,
             self._state_component,
+            self._module_component,
         )
         live_sig = self._live_signature(args, kwargs)
         if expected_sig == live_sig:
@@ -260,6 +281,13 @@ class GuardChain:
                 expected_sig[3],
                 live_sig[3],
             ))
+        if self._module_component and expected_sig[4] != live_sig[4]:
+            failures.append(Guard(
+                "module-state",
+                "module identities, training modes and child bindings match the captured state",
+                expected_sig[4],
+                live_sig[4],
+            ))
         return failures
 
 
@@ -271,6 +299,7 @@ def build_guard_chain(
     dynamic: bool,
     target: Any,
     gate_evaluator: Callable[..., Tuple] | None = None,
+    module_evaluator: Callable[[], Tuple] | None = None,
 ) -> GuardChain:
     """Create the GuardChain stored alongside one compiled specialization."""
 
@@ -290,6 +319,7 @@ def build_guard_chain(
         dynamic=dynamic,
         target=target,
         gate_evaluator=gate_evaluator,
+        module_evaluator=module_evaluator,
     )
 
 

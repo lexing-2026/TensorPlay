@@ -10,6 +10,7 @@ from __future__ import annotations
 import inspect
 import os
 import sys
+import warnings
 
 from typing import Any
 
@@ -297,6 +298,11 @@ def _lower_stax_region(
             raise RuntimeError(
                 "strict_native Stax lowering failed: captured graph has no built form"
             ) from exc
+        warnings.warn(
+            "Stax lowering failed; falling back to the graph executor: "
+            f"{type(exc).__name__}: {exc}",
+            stacklevel=3,
+        )
         return graph_module.recompile()
     except Exception as exc:
         if os.environ.get("TP_STAX_LOWER_DEBUG"):
@@ -311,6 +317,11 @@ def _lower_stax_region(
             raise RuntimeError(
                 "strict_native Stax lowering failed: captured graph has no built form"
             ) from exc
+        warnings.warn(
+            "Stax lowering failed; falling back to the graph executor: "
+            f"{type(exc).__name__}: {exc}",
+            stacklevel=3,
+        )
         return graph_module.recompile()
     finally:
         _exit_lowered_graph_scope()
