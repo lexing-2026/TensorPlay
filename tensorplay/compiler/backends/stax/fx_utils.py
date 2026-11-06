@@ -890,28 +890,15 @@ def count_flops_fx(node: Node) -> int | None:
         success, args, kwargs = get_fake_args_kwargs(node)
 
         if success:
-            # Attention HOPs have registered formulas, but invoking them
-            # here can require tracing-only context, e.g. TransformGetItemToIndex.
-            from tensorplay._higher_order_ops.omni_attention import (
-                omni_attention,
-                omni_attention_backward,
-            )
-
-            if node.target in (
-                omni_attention,
-                omni_attention_backward,
-            ):
-                flop_formula = flop_registry.get(node.target)
-                if flop_formula is not None:
-                    return flop_formula(*args, **kwargs, out_val=node.meta.get("val"))
-
-            with _flop_counter_mode(
-                display=False
-            ) as flop_counter_mode:
-                node.target(*args, **kwargs)
-
-            counted_flops = flop_counter_mode.get_total_flops()
-            return counted_flops
+            # A registered formula counts the node from the values handed to
+            # it, which is what the attention family needs: those operations
+            # are only whole when they are being traced, and tracing one to
+            # count its parts would cost the trace.  A node with no formula
+            # here has no count, rather than a wrong one.
+            formula = flop_registry.get(node.target)
+            if formula is None:
+                return None
+            return formula(*args, **kwargs, out_val=node.meta.get("val"))
     return None
 
 

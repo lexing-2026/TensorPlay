@@ -73,12 +73,6 @@ def _pycodecache_kernel_compile_env() -> dict[str, str | None]:
     return {v: os.environ.get(v) for v in env_vars}
 
 
-def caching_device_properties():
-    for _, device_interface in get_registered_device_interfaces():
-        if device_interface.is_available():
-            device_interface.Worker.get_device_properties()
-
-
 def _compile_start() -> None:
     global _t0, _triton_kernel_metrics
     if _t0 is None:
@@ -474,6 +468,4 @@ def maybe_warm_pool() -> None:
     # TODO: This starts the SubprocPool's internal process pool as early as possible at
     # the expense of creating a bunch of worker processes that might not be needed. We
     # could start them lazily if we're willing to lose a small amount of compile time.
-    from .utils import has_triton_package
-
     AsyncCompile.wakeup()

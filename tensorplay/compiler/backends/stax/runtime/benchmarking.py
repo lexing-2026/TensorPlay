@@ -621,7 +621,7 @@ class TritonBenchmarker(Benchmarker):
             raise
 
 
-class TpBenchmarker(TritonBenchmarker):  # noqa: docstring_linter
+class TpBenchmarker(TritonBenchmarker):
     def __init__(self: Self) -> None:
         super().__init__()
         self._in_cudagraph_benchmark = False
@@ -843,7 +843,7 @@ class TpBenchmarker(TritonBenchmarker):  # noqa: docstring_linter
             )
 
 
-class ProfilerBenchmarker(TpBenchmarker):  # noqa: docstring_linter
+class ProfilerBenchmarker(TpBenchmarker):
     """Benchmarker that uses tp.profiler for GPU kernel benchmarking."""
 
     @time_and_count
@@ -960,7 +960,7 @@ class ProfilerBenchmarker(TpBenchmarker):  # noqa: docstring_linter
         # processing: _parse_kineto_results (wrapping every raw event in
         # a Python FunctionEvent), _build_tree, and grouping/aggregation.
 
-        profiler_device_type = getattr(_DeviceType, device_type_upper)
+        profiler_device_type = getattr(DeviceType, device_type_upper)
         callable_gpu_time_us = 0.0
         for kineto_event in prof.profiler.kineto_results.events():
             if (
@@ -981,7 +981,7 @@ class ProfilerBenchmarker(TpBenchmarker):  # noqa: docstring_linter
 
         if callable_gpu_time_us <= 0:
             raise AssertionError(
-                f"TorchProfilerBenchmarker: '_CALLABLE' {device_type_upper} event not found in "
+                f"ProfilerBenchmarker: '_CALLABLE' {device_type_upper} event not found in "
                 "raw kineto results, and no correlated device events were found."
             )
 
@@ -1005,8 +1005,10 @@ class ProfilerBenchmarker(TpBenchmarker):  # noqa: docstring_linter
 
 
 def _make_default_benchmarker() -> Benchmarker:
+    # A trace-based measurement takes precedence over the experimental one,
+    # since the knob asks for the profiler's numbers specifically.
     if tp_config.use_torch_profiler_benchmarker:
-        return TorchProfilerBenchmarker()
+        return ProfilerBenchmarker()
     if tp_config.use_experimental_benchmarker:
         return TpBenchmarker()
     return TritonBenchmarker()

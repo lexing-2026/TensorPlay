@@ -9,9 +9,15 @@ run that padded from a run that did not.
 
 from __future__ import annotations
 
+import csv
 import dataclasses
 import os
+from collections.abc import Callable
 from functools import lru_cache
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .runtime.triton_compat import Config
 
 from ....graph.experimental.sympy_functions import OrderedSet
 from . import config
@@ -102,6 +108,7 @@ def reset() -> None:
     global generated_cpp_vec_kernel_count, cpp_outer_loop_fused_inner_counts
     global cpp_to_dtype_count
     global num_kernel_reuse, num_load, num_store, num_reduction
+    global parallel_reduction_count
 
     num_comprehensive_padding = 0
     generated_kernel_count = 0
@@ -113,9 +120,6 @@ def reset() -> None:
     num_store = 0
     num_reduction = 0
     parallel_reduction_count = 0
-
-def get_metric_fields() -> list[str]:
-    return [field.name for field in dataclasses.fields(CachedMetricsDeltas)]
 
 
 @dataclasses.dataclass
@@ -177,50 +181,6 @@ class MetricTable:
     def register_table(name: str, column_names: list[str]) -> None:
         table = MetricTable(name, column_names)
         REGISTERED_METRIC_TABLES[name] = table
-
-
-def log_kernel_metadata(
-    kernel_name: str, kernel_path: str, kernel_module_code: str
-) -> None:
-    """
-    A utility to log kernel metadata. We may parse metadata from kernel source code here.
-
-    It's fine to parse the generated kernel code here since the logging is
-    disabled by default. It would hurt compilation time.
-    """
-    from .runtime.benchmark_report import get_kernel_category_by_source_code
-
-    kernel_category = get_kernel_category_by_source_code(kernel_module_code)
-    reduction_hint = _parse_reduction_hint(kernel_category, kernel_module_code)
-    size_hints = _parse_size_hints(kernel_module_code, kernel_category)
-    kernel_fn_code = _parse_kernel_fn_code(kernel_module_code)
-
-    proper_kernel_fn_code = _parse_proper_kernel_fn_code(kernel_fn_code)
-
-    # the line of code excluding the decortors
-    kernel_line_of_code = _parse_kernel_line_of_code(proper_kernel_fn_code)
-
-    get_metric_table("kernel_metadata").add_row(
-        lambda: {
-            "kernel_name": kernel_name,
-            "kernel_path": kernel_path,
-            "kernel_category": kernel_category,
-            "size_hints": size_hints,
-            "reduction_hint": reduction_hint,
-            "line_of_code": kernel_line_of_code,
-            "num_load": _count_pattern(proper_kernel_fn_code, "tl.load"),
-            "num_store": _count_pattern(proper_kernel_fn_code, "tl.store"),
-            "num_for_loop": _count_pattern(proper_kernel_fn_code, "for "),
-            "num_atomic_add": _count_pattern(proper_kernel_fn_code, "tl.atomic_add"),
-            "num_args": _count_args(proper_kernel_fn_code),
-            "xnumel": _parse_numel(proper_kernel_fn_code, "xnumel"),
-            "ynumel": _parse_numel(proper_kernel_fn_code, "ynumel"),
-            "rnumel": _parse_numel(proper_kernel_fn_code, "rnumel"),
-            "kernel_args_num_gb": _parse_kernel_args_num_gb(
-                kernel_fn_code, kernel_category
-            ),
-        }
-    )
 
 
 def enabled_metric_tables() -> OrderedSet[str]:
@@ -311,32 +271,6 @@ MetricTable.register_table(
         "node2_debug_str",
         "common_buffer_names",
         "failure_reason",
-    ],
-)
-
-MetricTable.register_table(
-    "kernel_metadata",
-    [
-        "kernel_name",
-        "kernel_path",
-        "kernel_category",  # pointwise/reduction/foreach etc.
-        "size_hints",
-        "reduction_hint",
-        "line_of_code",
-        "num_load",
-        "num_store",
-        "num_for_loop",
-        "num_atomic_add",
-        "num_args",
-        # xyz numel can be different to size_hints since size_hints are rounded
-        # up to the nearest power of 2.
-        # The compiler kernel will burn in the xyz numel in kernel code for static
-        # shape kernels.
-        # Logging them will be helpful to find unaligned shape for reduction
-        "xnumel",
-        "ynumel",
-        "rnumel",
-        "kernel_args_num_gb",
     ],
 )
 

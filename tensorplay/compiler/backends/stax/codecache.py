@@ -24,6 +24,8 @@ import pickle
 import sys
 import sysconfig
 import textwrap
+from collections.abc import Callable, Generator, Sequence
+from concurrent.futures import Future
 from functools import lru_cache
 
 from .compile_worker.utils import in_toplevel_process
@@ -40,7 +42,7 @@ import tempfile
 import threading
 from pathlib import Path
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, NotRequired, TypedDict, TypeVar
 
 import tensorplay as tp
 
@@ -57,7 +59,6 @@ from tensorplay._subclasses.fake_tensor import (
     TensorMetadata,
 )
 
-from .runtime.cache_artifacts import CacheArtifact, CacheArtifactFactory
 from .runtime.cache_dir_utils import cache_dir
 from .runtime.device_compiler import compiler_module
 from .utils import clear_on_fresh_cache
@@ -286,16 +287,25 @@ class GuardedCache(Generic[T]):
         return ctx.fake_mode.shape_env
 
 
-@CacheArtifactFactory.register
-class TpCacheArtifact(CacheArtifact):
-    """One compiled graph, to be put back in the local cache when read."""
+# What a cache key describes about the device a kernel was built for: which
+# accelerator it is, and which builds of the compilers that ran on it were
+# loaded.  A cache written for one of these cannot be read into another, and a
+# run with no device has nothing of the kind to record, which is why the device
+# and version entries below are optional rather than empty.
+class SystemDeviceInfo(TypedDict):
+    name: str | None
 
-    def populate_cache(self) -> None:
-        FxGraphCache._write_to_local_cache(self.key, self.content)
 
-    @staticmethod
-    def type() -> str:
-        return "tp"
+class SystemVersionInfo(TypedDict, total=False):
+    triton: str | None
+    cuda: str
+    hip: str | None
+
+
+class SystemInfo(TypedDict):
+    hash: str
+    device: NotRequired[SystemDeviceInfo]
+    version: NotRequired[SystemVersionInfo]
 
 
 def triton_key() -> str | None:
