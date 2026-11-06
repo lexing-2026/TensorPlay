@@ -20,6 +20,7 @@ if __package__ in (None, ''):
     raise SystemExit(main())
 
 from .model import parse_native_yaml  # noqa: F401 (re-exported)
+from .model import NativeFunction
 
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------

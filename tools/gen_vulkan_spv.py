@@ -193,7 +193,7 @@ def parse_bindings_text(expanded: str, label: str = "") -> list[str]:
         bindings[binding_idx] = descriptor_type
 
     if not bindings:
-        raise AssertionError(f"No set-0 bindings found in {label or src_path}")
+        raise AssertionError(f"No set-0 bindings found in {label or '<shader text>'}")
 
     # The runtime builds the descriptor set layout from this ordered list and
     # assigns layout(binding=N) to the Nth argument of a dispatch, so binding
@@ -203,7 +203,7 @@ def parse_bindings_text(expanded: str, label: str = "") -> list[str]:
     order = sorted(bindings)
     if order != list(range(len(order))):
         raise AssertionError(
-            f"Binding numbers of {label or src_path} are {order}; "
+            f"Binding numbers of {label or '<shader text>'} are {order}; "
             "they must be numbered contiguously from 0")
 
     return [bindings[i] for i in order]
