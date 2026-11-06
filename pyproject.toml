@@ -189,7 +189,12 @@ dev = [
 [tool.ruff]
 line-length = 120
 src = ["tensorplay", "tpx", "tools", "test"]
-extend-exclude = ["third_party", "build", "alpha", "stax", "p10", "tensorplay/_C"]
+# A leading slash anchors each entry to this file's directory, which is the
+# only reading that works: unanchored, "stax" also names
+# tensorplay/compiler/backends/stax and test/stax, so the gate silently skipped
+# the whole lowering backend and its tests.  The vendored and C++ trees are
+# listed instead, and tensorplay/_C is not needed since stubs are not linted.
+extend-exclude = ["/third_party", "/build", "/alpha", "/stax", "/p10"]
 
 [tool.ruff.lint]
 select = [
@@ -202,7 +207,7 @@ ignore = [
     "E701", "E702", "E731", # colon/semicolon compound statements, lambda assign
     "E741",                 # ambiguous variable name `l`; used in math-heavy code
     "F401", "F403", "F405", # unused/star imports
-    "F811", "F821", "F822", "F841", # redefinition, undefined name, unused variable
+    "F811", "F841",         # redefinition, unused variable
     "F541",                 # f-string without placeholders
 ]
 
