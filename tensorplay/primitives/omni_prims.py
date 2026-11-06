@@ -17,7 +17,6 @@ from typing import Any
 import tensorplay
 
 __all__ = [
-    "zeros_and_scatter",
     "register_omni_prims",
 ]
 

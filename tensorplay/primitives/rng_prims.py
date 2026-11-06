@@ -23,9 +23,6 @@ __all__ = [
     "PhiloxState",
     "PhiloxStateTracker",
     "CUDARngStateHelper",
-    "philox_rand",
-    "philox_rand_like",
-    "philox_seed",
     "register_rng_prims",
 ]
 
