@@ -338,7 +338,7 @@ git submodule sync
 git submodule update --init --recursive
 ```
 
-The third-party sources ride the submodules, pinned to specific revisions. A checkout that skips them still builds, but the missing pieces degrade: no BLAS vector math, no distributed transports, and the Vulkan backend falls back to CPU unless a system install provides what it needs.
+The third-party sources ride the submodules, pinned to specific revisions. A checkout that skips them still builds, but the missing pieces degrade: no BLAS vector math, no distributed transports, and the Vulkan backend falls back to CPU unless a system install provides what it needs. A CUDA build is the exception: its convolution plans are built against the frontend headers, so a checkout that lacks them stops at configure and names the command that fetches them.
 
 #### Install Build Dependencies
 
