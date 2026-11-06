@@ -61,6 +61,7 @@ from .loop_body import LoopBody
 from .codegen.common import (
     BackendFeature,
     CodegenSymbol,
+    get_scheduling_for_device,
     index_prevent_reordering,
 )
 from .ops_handler import OpCounterCSE
@@ -520,7 +521,6 @@ def is_triton(x) -> bool:
     if not isinstance(device_scheduling, type):
         raise AssertionError(type(device_scheduling))
     return issubclass(device_scheduling, TritonScheduling)
-    from .codegen.common import get_scheduling_for_device
 
 
 def get_device_type(x):
@@ -5098,32 +5098,50 @@ class Reduction(Loops):
         position taken.
         """
 
-        reduction_ranges = list(reduction_ranges)
-        if len(reduction_ranges) == 0:
-            return lambda index: inner_fn(index, [])
-
-        if len(reduction_ranges) == 1:
-            (r0,) = reduction_ranges
-
-            def unrolled_fn(index):
-                value = None
-                for i in range(int(r0)):
-                    value = inner_fn(index, [i])
-                return value
-
-            return unrolled_fn
+        reduction_ranges = V.graph.sizevars.guard_int_seq(reduction_ranges)
 
         combine_fn = get_reduction_combine_fn(reduction_type, src_dtype)
 
-        def unrolled_fn(index):
-            value = None
-            for i in range(int(r0)):
-                for j in range(int(r1)):
-                    cur = inner_fn(index, [i, j])
-                    value = cur if value is None else combine_fn(value, cur)
-            return value
+        def fn(index):
+            positions = itertools.product(*(range(size) for size in reduction_ranges))
+            return functools.reduce(
+                combine_fn, (value_fn(index, list(position)) for position in positions)
+            )
 
-        return unrolled_fn
+        if reduction_type in (
+            "argmin",
+            "argmax",
+            "argmin_value",
+            "argmax_value",
+            "argmin_with_value",
+            "argmax_with_value",
+        ):
+            # Which position won is part of the answer, so a value read here
+            # is carried as the pair the combining function expects: the value
+            # itself and the flattened position it came from.
+            flatten_index = _fixed_indexer(
+                reduction_ranges,
+                FlexibleLayout.contiguous_strides(reduction_ranges),
+            )
+
+            def value_fn(index, rindex):
+                rindex = [sympy.expand(i) for i in rindex]
+                value = inner_fn(index, rindex)
+                if isinstance(value, tuple):
+                    return value
+                return (
+                    value,
+                    ops.index_expr(flatten_index(rindex), tp.int64),
+                )
+
+            if reduction_type in ("argmin_with_value", "argmax_with_value"):
+                return fn
+            if reduction_type in ("argmin_value", "argmax_value"):
+                return lambda index: fn(index)[0]
+            return lambda index: fn(index)[1]
+
+        value_fn = inner_fn
+        return fn
 
     @classmethod
     def check_for_split_dense_dim_reindexing(cls, reduction_numel, input_node):
@@ -7202,7 +7220,7 @@ class ExternKernel(InputsKernel):
             )[0]
 
         if isinstance(x, TensorBox) and isinstance(x.data, ReinterpretView):
-            x = TensorBox.create(ir.ExternKernel.copy_input(x.data))
+            x = TensorBox.create(ExternKernel.copy_input(x.data))
             x.realize()
             return x
 
