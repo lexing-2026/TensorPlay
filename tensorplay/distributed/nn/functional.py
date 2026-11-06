@@ -194,7 +194,7 @@ class _AllGather(Function):
             raise RuntimeError(
                 "all_gather backward received an invalid number of output gradients"
             )
-        reduced: Any = None
+        reduced: tp.Tensor | None = None
         for index, grad_output in enumerate(grad_outputs):
             if grad_output is None:
                 current = tp.zeros(

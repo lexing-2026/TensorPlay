@@ -4,6 +4,7 @@ from collections.abc import Callable, Collection, Mapping
 from copy import deepcopy
 from typing import Any, overload
 
+import tensorplay as tp
 from tensorplay import optim
 
 from tensorplay.nn.modules.module import Module

@@ -1,6 +1,7 @@
 import os
 from typing import Tuple
 
+import tensorplay
 from tensorplay import Tensor
 from tensorplay.utils.data import Dataset
 from tensorplay.hub import download_url_to_file

@@ -44,6 +44,43 @@ def test_qconfig_equals_and_default_dict():
     assert "" in d2
 
 
+@pytest.mark.parametrize("module_cls", [nn.ConvTranspose1d, nn.ConvTranspose2d, nn.ConvTranspose3d])
+@pytest.mark.parametrize("observer_cls", [q.MinMaxObserver, q.MovingAverageMinMaxObserver])
+def test_assert_valid_qconfig_accepts_per_tensor_observers(module_cls, observer_cls):
+    from tensorplay.ao.quantization.qconfig import _assert_valid_qconfig
+
+    module = module_cls(2, 3, 3, device="cpu")
+    weight = observer_cls.with_args(dtype=tp.qint8, factory_kwargs={"device": "cpu"})
+    qconfig = q.QConfig(q.MinMaxObserver, weight)
+
+    assert _assert_valid_qconfig(qconfig, module) is None
+
+
+@pytest.mark.parametrize("module_cls", [nn.ConvTranspose1d, nn.ConvTranspose2d, nn.ConvTranspose3d])
+@pytest.mark.parametrize(
+    "observer_cls", [q.PerChannelMinMaxObserver, q.MovingAveragePerChannelMinMaxObserver]
+)
+def test_assert_valid_qconfig_rejects_per_channel_observers(module_cls, observer_cls):
+    from tensorplay.ao.quantization.qconfig import _assert_valid_qconfig
+
+    module = module_cls(2, 3, 3, device="cpu")
+    weight = observer_cls.with_args(dtype=tp.qint8, factory_kwargs={"device": "cpu"})
+    qconfig = q.QConfig(q.MinMaxObserver, weight)
+
+    with pytest.raises(AssertionError, match="Per channel weight observer is not supported yet for ConvTranspose"):
+        _assert_valid_qconfig(qconfig, module)
+
+
+@pytest.mark.parametrize("module_cls", [nn.ConvTranspose1d, nn.ConvTranspose2d, nn.ConvTranspose3d])
+@pytest.mark.parametrize("qconfig", [None, q.QConfig(q.MinMaxObserver, None)], ids=["none", "no_weight"])
+def test_assert_valid_qconfig_accepts_optional_config(module_cls, qconfig):
+    from tensorplay.ao.quantization.qconfig import _assert_valid_qconfig
+
+    module = module_cls(2, 3, 3, device="cpu")
+
+    assert _assert_valid_qconfig(qconfig, module) is None
+
+
 def test_quant_wrapper():
     from tensorplay.ao.quantization.stubs import QuantWrapper
 

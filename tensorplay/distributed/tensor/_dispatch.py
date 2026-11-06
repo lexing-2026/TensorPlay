@@ -859,6 +859,7 @@ class OpDispatcher:
         use_val_from_redistribute_schema: bool,
     ) -> None:
         from ...utils._pytree import tree_flatten
+        from ._dtensor_spec import DTensorSpec
         from ._redistribute import redistribute_local_tensor
         from ._utils import (
             ExplicitRedistributionContext,

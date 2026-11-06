@@ -24,6 +24,7 @@ from .quantization_mappings import (
     get_default_static_quant_module_mappings,
 )
 from .stubs import DeQuantStub, QuantStub
+from .utils import get_qparam_dict, has_no_children_ignoring_parametrizations
 
 __all__ = [
     "prepare",

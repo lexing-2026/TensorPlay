@@ -15,6 +15,7 @@ from tensorplay import nn
 
 from .observer import (
     MovingAverageMinMaxObserver,
+    MovingAveragePerChannelMinMaxObserver,
     PerChannelMinMaxObserver,
     PlaceholderObserver,
     default_dynamic_quant_observer,

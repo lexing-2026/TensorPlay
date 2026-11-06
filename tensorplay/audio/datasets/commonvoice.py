@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 from typing import Dict, List, Tuple, Union
 
+import tensorplay
 from tensorplay import Tensor
 from tensorplay.utils.data import Dataset
 

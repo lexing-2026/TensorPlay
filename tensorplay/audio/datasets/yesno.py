@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 from typing import List, Tuple, Union
 
+import tensorplay
 from tensorplay import Tensor
 from tensorplay.utils.data import Dataset
 from tensorplay.hub import download_url_to_file

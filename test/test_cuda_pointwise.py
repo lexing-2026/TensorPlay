@@ -239,8 +239,8 @@ class TestCUDAPointwise(unittest.TestCase):
     def test_masked_select(self):
         print("\nTesting CUDA masked_select... (Skipped due to known issue)")
         return
-        # device = self.device
-        # a = tp.tensor([[1, 2], [3, 4]], dtype=tp.float32, device=device)
+        device = self.device
+        a = tp.tensor([[1, 2], [3, 4]], dtype=tp.float32, device=device)
         mask = tp.tensor([[True, False], [False, True]], dtype=tp.bool, device=device)
         
         res = tp.masked_select(a, mask)

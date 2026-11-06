@@ -32,6 +32,7 @@ from ._utils import (
     _stringify_shape,
     _stringify_dtensor_spec,
     _tensor_debug_string,
+    REDISTRIBUTE_FUNC,
     TensorIdTracker,
 )
 

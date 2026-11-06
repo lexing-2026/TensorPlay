@@ -783,7 +783,7 @@ class TileLangOpCaptureTest(unittest.TestCase):
         def shift(x):
             # Eager path would launch here; tracing never runs the body.
             launched.append(True)
-            del wrapped
+            _ = wrapped
             return tp.add(x, 1.0)
 
         x = tp.tensor([1.0, 2.0])
@@ -853,7 +853,7 @@ class RealTritonJITFunctionTest(unittest.TestCase):
         def shift(x):
             # Eager path: a real launch would go through `wrapped` here.
             body_ran.append(True)
-            del wrapped
+            _ = wrapped
             return tp.add(x, 1.0)
 
         x = tp.tensor([1.0, 2.0])

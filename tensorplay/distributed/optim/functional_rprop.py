@@ -112,7 +112,7 @@ class _FunctionalRprop:
                 state = self.state[param]
                 state["step"] = tp.tensor(0.0)
                 state["prev"] = tp.zeros_like(param)
-                state["step_size"] = tp.full_like(gradient, self.defaults["lr"])
+                state["step_size"] = tp.full_like(grad, self.defaults["lr"])
 
             state = self.state[param]
             prevs.append(state["prev"])

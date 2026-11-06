@@ -146,7 +146,7 @@ class MegaStorageWriter(FileSystemWriter):
         self.path = str(path)
         self.resolver = _PathResolver(path)
         self.fqn_to_index_mapping = fqn_to_index_mapping
-        self.weight_map: Dict[str, str] = {}
+        self.weight_map: dict[str, str] = {}
         self.total_size = 0
         self._written_names: set[str] = set()
 

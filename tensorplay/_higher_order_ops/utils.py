@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any, Iterator
 

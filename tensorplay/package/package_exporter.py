@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from enum import Enum
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
-from typing import Any
+from typing import Any, IO
 
 import tensorplay
 from tensorplay.types import FileLike

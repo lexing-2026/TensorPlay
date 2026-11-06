@@ -4,6 +4,7 @@ import tarfile
 import zipfile
 from typing import Any, List, Optional  # noqa: F401
 
+import tensorplay
 
 _LG = logging.getLogger(__name__)
 

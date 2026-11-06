@@ -174,5 +174,5 @@ def save_image(
     grid = make_grid(tensor, **kwargs)
     # Add 0.5 after unnormalizing to [0, 255] to round to the nearest integer
     ndarr = grid.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to("cpu", tensorplay.uint8).numpy()
-    im = Image.fromarray(ndarr)
+    im = _Image_fromarray(ndarr)
     im.save(fp, format=format)

@@ -13,6 +13,7 @@ from ._nested_dict import flatten_state_dict, unflatten_state_dict
 from .default_planner import DefaultLoadPlanner
 from .metadata import (
     BytesStorageMetadata,
+    ChunkStorageMetadata,
     Metadata,
     MetadataIndex,
     TensorProperties,
