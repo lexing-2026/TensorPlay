@@ -1110,8 +1110,8 @@ def _handle_combo_kernel_per_subkernel_blocks(
 
         all_num_warps.append(cfg.num_warps)
         all_num_stages.append(cfg.num_stages)
-        for config in cfgs:
-            unique_warp_stage_pairs.add((config.num_warps, config.num_stages))
+        for conf in cfgs:
+            unique_warp_stage_pairs.add((conf.num_warps, conf.num_stages))
 
         group_key = (
             _subkernel_fingerprint(combo_meta, i)

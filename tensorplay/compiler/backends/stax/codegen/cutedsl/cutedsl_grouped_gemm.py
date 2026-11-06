@@ -779,7 +779,7 @@ class GroupedGemmKernel:
         #
         if warp_idx == self.tma_warp_id and initial_work_tile_info.is_valid_tile:
             # Initialize tensormaps for A, B
-            if cutlass.const_expr(self.delegate_tensormap_ab_init == False):
+            if cutlass.const_expr(not self.delegate_tensormap_ab_init):
                 tensormap_manager.init_tensormap_from_atom(
                     tma_atom_a, tensormap_a_init_ptr, self.tma_warp_id
                 )

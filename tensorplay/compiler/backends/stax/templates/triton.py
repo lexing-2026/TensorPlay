@@ -179,32 +179,32 @@ class _TileConfigHeuristic(TemplateConfigHeuristics):
         k_hint = self._fit(k, minimum_k)
         fitted: list[BaseConfig] = []
         for hint in (None,) + tuple(self.multi_kernel_hints):
-            for config in configs:
-                block_m = max(min(int(config.block_m * scale), m_hint), self.min_block_size)
-                block_n = max(min(int(config.block_n * scale), n_hint), self.min_block_size)
-                block_k = max(min(int(config.block_k * scale), k_hint), minimum_k)
+            for conf in configs:
+                block_m = max(min(int(conf.block_m * scale), m_hint), self.min_block_size)
+                block_n = max(min(int(conf.block_n * scale), n_hint), self.min_block_size)
+                block_k = max(min(int(conf.block_k * scale), k_hint), minimum_k)
                 if exclude(block_m, block_n, block_k):
                     continue
                 if (block_m, block_n, block_k, hint) == (
-                    config.block_m,
-                    config.block_n,
-                    config.block_k,
-                    config.hint_override,
+                    conf.block_m,
+                    conf.block_n,
+                    conf.block_k,
+                    conf.hint_override,
                 ):
-                    fitted.append(config)
+                    fitted.append(conf)
                     continue
                 fitted.append(
-                    type(config)(
+                    type(conf)(
                         block_m,
                         block_n,
                         block_k,
-                        config.num_stages,
-                        config.num_warps,
+                        conf.num_stages,
+                        conf.num_warps,
                         hint_override=hint,
                     )
-                    if config.hint_override is not None
-                    else type(config)(
-                        block_m, block_n, block_k, config.num_stages, config.num_warps
+                    if conf.hint_override is not None
+                    else type(conf)(
+                        block_m, block_n, block_k, conf.num_stages, conf.num_warps
                     )
                 )
         return fitted
@@ -296,11 +296,11 @@ class _TileConfigHeuristic(TemplateConfigHeuristics):
         if not warp_size:
             return configs
         kept = []
-        for config in configs:
-            per_thread = -(-config.block_m * config.block_n // (config.num_warps * warp_size))
+        for conf in configs:
+            per_thread = -(-conf.block_m * conf.block_n // (conf.num_warps * warp_size))
             if per_thread > _REGISTERS_PER_THREAD:
                 continue
-            kept.append(config)
+            kept.append(conf)
         return kept
 
     def _filter_configs(self, configs: list) -> list:
@@ -319,13 +319,13 @@ class _TileConfigHeuristic(TemplateConfigHeuristics):
         """
 
         seen = set()
-        for config in configs:
-            geometry = (tuple(sorted(config.tile().items())),
-                        config.num_stages, config.num_warps)
+        for conf in configs:
+            geometry = (tuple(sorted(conf.tile().items())),
+                        conf.num_stages, conf.num_warps)
             if geometry in seen:
                 continue
             seen.add(geometry)
-            yield TritonConfig(config.tile(), config.num_stages, config.num_warps)
+            yield TritonConfig(conf.tile(), conf.num_stages, conf.num_warps)
 
     def preprocess_mm_configs(
         self,
