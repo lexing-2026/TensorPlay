@@ -168,6 +168,15 @@ on:
         type: string
         default: '[{"name":"core","test_files":"test/test_set_native.py test/test_compressed_sparse_constructors.py test/nn/test_nn_utils_norm.py"}]'
         description: JSON array of test shard names and space-separated test files
+      run_test_suite:
+        required: false
+        type: boolean
+        default: false
+        description: >
+          Run the test_matrix suites for a build that is not a CPU one. A
+          device build lane on a runner without the device only proves the
+          wheel imports, so the suites there are asked for by the lane that
+          runs on hardware which has it.
       pytest_extra_args:
         required: false
         type: string
@@ -754,8 +763,8 @@ jobs:
           print("ROCm wheel import ok:", getattr(tp, "__version__", "ok"))
           PY
 
-      - name: Run CPU regression tests
-        if: ${{ inputs.cuda == 'cpu' && inputs.rocm == '' }}
+      - name: Run regression tests
+        if: ${{ (inputs.cuda == 'cpu' && inputs.rocm == '') || inputs.run_test_suite }}
         shell: bash
         env:
           TEST_FILES: ${{ matrix.test_files }}
@@ -782,8 +791,8 @@ jobs:
             --junitxml="$result_root/junit.xml" \
             2>&1 | tee "$result_root/pytest.log"
 
-      - name: Upload CPU test results
-        if: ${{ always() && inputs.cuda == 'cpu' && inputs.rocm == '' }}
+      - name: Upload test results
+        if: ${{ always() && ((inputs.cuda == 'cpu' && inputs.rocm == '') || inputs.run_test_suite) }}
         uses: actions/upload-artifact@v7
         with:
           name: ${{ inputs.build_name }}-tests-${{ matrix.name }}-${{ github.run_id }}-${{ github.run_attempt }}

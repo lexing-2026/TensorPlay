@@ -1,0 +1,78 @@
+name: cuda_acceptance
+
+# CUDA device acceptance.  No runner in the hosted pool has a CUDA device, so
+# a device build lane can only prove that its wheel imports; the suites that
+# exercise a device therefore run only when someone dispatches this workflow
+# against a runner that has one.  The `runs_on` label must name such a runner,
+# and the toolkit must be one of the variants listed in
+# .github/cuda-variants.json.
+#
+# Nothing here gates a pull request.  Until a device runner is attached,
+# device changes are accepted by running the same suites on the development
+# host, and the lane records the result for the reviewer.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs_on:
+        description: >-
+          Runner label of a machine that has a visible CUDA device (for
+          example a self-hosted pool name).  The hosted pool has none, so the
+          device suites time out waiting for a runner here.
+        required: false
+        default: "tensorplay-runner"
+        type: string
+      cuda_variant:
+        description: Variant tag of the wheel under test
+        required: false
+        default: "cu130"
+        type: choice
+        options:
+          - cu124
+          - cu126
+          - cu130
+      cuda_toolkit:
+        description: CUDA Toolkit version that builds the variant above
+        required: false
+        default: "13.0.2"
+        type: string
+      python_version:
+        description: Python version of the wheel under test
+        required: false
+        default: "3.12"
+        type: string
+      pytest_extra_args:
+        description: >-
+          Extra pytest arguments for the device test run (e.g.
+          "-k 'reduction or graph' --tb=long").  Empty runs the full list.
+        required: false
+        default: ""
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+permissions: read-all
+
+jobs:
+  cuda-acceptance:
+    name: cuda-acceptance
+    permissions:
+      contents: write
+      actions: read
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/_binary-build-test.yml
+    with:
+      build_name: ${{ format('tensorplay-linux-x86_64-py{0}-{1}', replace(inputs.python_version, '.', '_'), inputs.cuda_variant) }}
+      build_environment: ${{ format('cuda-acceptance-linux-x86_64-py{0}-{1}', replace(inputs.python_version, '.', '_'), inputs.cuda_variant) }}
+      runs_on: ${{ inputs.runs_on }}
+      python_version: ${{ inputs.python_version }}
+      cuda: ${{ inputs.cuda_variant }}
+      cuda_toolkit: ${{ inputs.cuda_toolkit }}
+      run_test_suite: true
+      test_matrix: '[{"name":"device","test_files":"test/test_cuda_pointwise.py test/test_cuda_reductions.py test/test_cuda_backward.py test/test_cuda_ops.py test/test_cuda_batch_norm.py test/stax/test_stax_cudagraphs.py test/stax/test_stax_native_lowerings.py test/stax/test_stax_batch_norm_training.py test/stax/test_stax_training_grads_reach.py test/stax/test_runtime_assert_native.py"}]'
+      pytest_extra_args: ${{ inputs.pytest_extra_args }}
+      upload_release: false
+    secrets: inherit
