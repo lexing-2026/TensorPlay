@@ -11,7 +11,9 @@ from typing import Any
 import tensorplay as tp
 from tensorplay.utils import _pytree as pytree
 from tensorplay.graph import GraphModule, Node
-from tensorplay.graph.passes.graph_transform_observer import GraphTransformObserver
+from tensorplay.graph.passes.graph_transform_observer import (
+    GraphTransformObserver as _GraphTransformObserver,
+)
 from tensorplay.graph import map_arg
 from tensorplay.utils._dispatch import _disable_current_modes
 from tensorplay.graph.experimental.symbolic_shapes import (
@@ -720,8 +722,11 @@ def joint_graph_passes(
     """
     Run FX transformations on the joint forwards+backwards graph.
     """
+    # The class arrives under another name because this very statement rebinds
+    # the plain one: a partial over a name the function also assigns to would
+    # read the local before it exists.
     GraphTransformObserver = functools.partial(
-        GraphTransformObserver,
+        _GraphTransformObserver,
         subsystem="joint_graph_passes",
     )
 
