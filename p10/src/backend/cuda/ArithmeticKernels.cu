@@ -12,6 +12,7 @@
 #include "Utils.h"
 #include "TypePromotion.h"
 #include "GradMode.h"
+#include "OutWrite.h"
 #include "CUDABroadcast.cuh"
 #include "CUDAComplex.cuh"
 #include "CUDALoops.cuh"
@@ -1644,6 +1645,43 @@ bool try_add_out_direct(const Tensor& self, const Tensor& other, Scalar alpha,
     return true;
 }
 
+// Root of the out= fast path for the elementwise arithmetic family.  Writes
+// directly into the destination when it is already the tensor the allocating
+// form would have produced and no operand is overwritten before it is read.
+// Returns false when the destination cannot be taken, so the caller falls back
+// to computing the value and copying it in.  Bool and complex answers leave
+// this path: their bodies have dedicated handling in the allocating kernels.
+template <template <typename> class IterFunctor, typename VecOp>
+bool try_arithmetic_out(const Tensor& self, const Tensor& other, const Scalar& alpha,
+                        Tensor& out, DType result_dtype, VecOp vec_op) {
+    if (isComplexType(result_dtype) || result_dtype == DType::Bool) {
+        return false;
+    }
+    const std::vector<int64_t> out_shape = broadcast_shapes(
+        static_cast<std::vector<int64_t>>(self.shape()),
+        static_cast<std::vector<int64_t>>(other.shape()));
+    if (!destination_takes(out, self.device(), result_dtype, out_shape) ||
+        !read_while_write_is_safe(self, out) || !read_while_write_is_safe(other, out)) {
+        return false;
+    }
+    const int64_t n = out.numel();
+    if (n == 0) return true;
+    Tensor a = (self.dtype() == result_dtype) ? self : self.to(result_dtype);
+    Tensor b = (other.dtype() == result_dtype) ? other : other.to(result_dtype);
+    if (try_binary_vectorized(n, a, b, out, alpha, vec_op)) {
+        CUDA_CHECK(cudaGetLastError());
+        return true;
+    }
+    if (try_row_broadcast(n, a, b, out, alpha, vec_op)) {
+        CUDA_CHECK(cudaGetLastError());
+        return true;
+    }
+    TensorIterator iter = make_binary_iter(out, self, other);
+    run_binary_iter<IterFunctor>(iter, alpha);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 #ifdef USE_CUDNN
 // Helper for cuDNN binary op
 void cudnn_binary_op(const Tensor& a, const Tensor& b, Tensor& c, cudnnOpTensorOp_t op, double alpha1, double alpha2, double beta) {
@@ -2181,6 +2219,37 @@ Tensor div_kernel(const Tensor& self, const Tensor& other) {
     return result;
 }
 
+// out= entry points: the direct path writes into the caller's buffer, the
+// allocating kernel is the fallback when the buffer cannot be taken.
+Tensor& mul_out_kernel(const Tensor& self, const Tensor& other, Tensor& out) {
+    if (try_arithmetic_out<IterMulFunctor>(self, other, Scalar(1), out,
+                                           native::result_type(self, other),
+                                           BinaryMulVecOp{})) {
+        return out;
+    }
+    return write_out(out, mul_kernel(self, other));
+}
+
+Tensor& sub_out_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha,
+                       Tensor& out) {
+    if (try_arithmetic_out<IterSubFunctor>(self, other, alpha, out,
+                                           native::result_type(self, other),
+                                           BinarySubVecOp{})) {
+        return out;
+    }
+    return write_out(out, sub_kernel(self, other, alpha));
+}
+
+Tensor& div_out_kernel(const Tensor& self, const Tensor& other, Tensor& out) {
+    DType result_dtype = native::result_type(self, other);
+    if (isIntegralType(result_dtype)) result_dtype = DType::Float32;  // Div promotes to float
+    if (try_arithmetic_out<IterDivFunctor>(self, other, Scalar(1), out, result_dtype,
+                                           BinaryDivVecOp{})) {
+        return out;
+    }
+    return write_out(out, div_kernel(self, other));
+}
+
 Tensor& div_inplace_kernel(Tensor& self, const Tensor& other) {
     int64_t n = self.numel();
     if (n == 0) return self;
@@ -2676,11 +2745,15 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, ArithmeticKernels) {
     m.impl("add_.Scalar", add_scalar_inplace_kernel);
     
     m.impl("sub.Tensor", sub_kernel);
+    m.impl("sub.out", sub_out_kernel);
+    m.impl("subtract.out", sub_out_kernel);
     m.impl("sub_.Tensor", sub_inplace_kernel);
     m.impl("sub.Scalar", sub_scalar_kernel);
     m.impl("sub_.Scalar", sub_scalar_inplace_kernel);
     
     m.impl("mul.Tensor", mul_kernel);
+    m.impl("mul.out", mul_out_kernel);
+    m.impl("multiply.out", mul_out_kernel);
     m.impl("fused_mul_add", fused_mul_add_kernel);
     m.impl("fused_mul_add.Scalar", fused_mul_add_scalar_kernel);
     m.impl("mul_.Tensor", mul_inplace_kernel);
@@ -2688,6 +2761,8 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, ArithmeticKernels) {
     m.impl("mul_.Scalar", mul_scalar_inplace_kernel);
     
     m.impl("div.Tensor", div_kernel);
+    m.impl("div.out", div_out_kernel);
+    m.impl("divide.out", div_out_kernel);
     m.impl("addcmul", addcmul_cuda);
     m.impl("addcmul_", addcmul_inplace_cuda);
     m.impl("addcdiv", addcdiv_cuda);
