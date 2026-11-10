@@ -72,6 +72,8 @@ const ExecCacheApi& exec_cache_api() {
         resolved.get = reinterpret_cast<aclOpExecutor* (*)(uint64_t, uint64_t*)>(
             op_api_symbol("PTAGetExecCache"));
         resolved.usable = reinterpret_cast<bool (*)(const char*)>(op_api_symbol("CanUsePTACache"));
+        resolved.add_tensor_addr =
+            reinterpret_cast<void (*)(void*)>(op_api_symbol("AddTensorAddrToCachedList"));
         return resolved;
     }();
     return api;
@@ -192,8 +194,10 @@ AclTensorRef AclArgs::tensor(const Tensor& t) {
     tensors_.push_back(created);
     AclTensorRef view;
     view.ptr = created;
-    view.data = t.data_ptr();
+    view.storage = const_cast<void*>(storage.data());
     view.dtype = t.dtype();
+    view.storage_offset = static_cast<int64_t>(t.impl()->storage_offset());
+    view.storage_elems = storage_elems;
     view.ndim = static_cast<int32_t>(ndim);
     std::memcpy(view.sizes, dims, sizeof(int64_t) * static_cast<size_t>(ndim));
     std::memcpy(view.strides, strides, sizeof(int64_t) * static_cast<size_t>(ndim));

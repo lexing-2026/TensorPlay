@@ -40,14 +40,18 @@ Tensor cast_on_device(const Tensor& t, DType dtype);
 // otherwise a cast into a fresh dense tensor.
 Tensor compute_operand(const Tensor& t, DType dtype);
 
-// Views of one launch's arguments.  Each carries what phase one sees, so
-// the executor cache can tell two calls apart without rebuilding anything.
+// Views of one launch's arguments.  Each carries the descriptor metadata
+// phase one saw, so the executor cache can tell two calls apart; the data
+// pointer itself stays out of that key, because a cache hit patches the
+// addresses of the cached plan from the list below.
 struct AclTensorRef {
     aclTensor* ptr = nullptr;
-    const void* data = nullptr;
+    void* storage = nullptr;
     DType dtype = DType::Float32;
     int64_t sizes[kMaxAclDims] = {};
     int64_t strides[kMaxAclDims] = {};
+    int64_t storage_offset = 0;
+    int64_t storage_elems = 0;
     int32_t ndim = 0;
     operator aclTensor*() const { return ptr; }
 };
@@ -120,13 +124,14 @@ inline void hash_mix(uint64_t& h, uint64_t v) {
 }
 
 inline void hash_arg(uint64_t& h, const AclTensorRef& t) {
-    hash_mix(h, static_cast<uint64_t>(reinterpret_cast<uintptr_t>(t.data)));
     hash_mix(h, static_cast<uint64_t>(t.dtype));
     hash_mix(h, static_cast<uint64_t>(t.ndim));
     for (int32_t i = 0; i < t.ndim; ++i) {
         hash_mix(h, static_cast<uint64_t>(t.sizes[i]));
         hash_mix(h, static_cast<uint64_t>(t.strides[i]));
     }
+    hash_mix(h, static_cast<uint64_t>(t.storage_offset));
+    hash_mix(h, static_cast<uint64_t>(t.storage_elems));
 }
 
 inline void hash_arg(uint64_t& h, const AclScalarRef& s) {
@@ -154,9 +159,24 @@ struct ExecCacheApi {
     void (*set_key)(uint64_t) = nullptr;
     aclOpExecutor* (*get)(uint64_t, uint64_t*) = nullptr;
     bool (*usable)(const char*) = nullptr;
+    void (*add_tensor_addr)(void*) = nullptr;
 };
 
 const ExecCacheApi& exec_cache_api();
+
+// Every tensor argument's storage base goes into the cache's per-thread
+// address list, in call order.  A hit rewrites the cached plan's tensor
+// addresses from that list, so the list has to describe this call even
+// though its addresses never take part in the key.
+template <typename A>
+inline void note_tensor_addr(const ExecCacheApi&, const A&) {}
+inline void note_tensor_addr(const ExecCacheApi& cache, const AclTensorRef& t) {
+    cache.add_tensor_addr(t.storage);
+}
+template <typename... A>
+inline void note_tensor_addrs(const ExecCacheApi& cache, A... args) {
+    (note_tensor_addr(cache, args), ...);
+}
 
 // Grow-only device scratch reused by every launch of this thread.
 void* workspace_for(int index, uint64_t nbytes);
@@ -191,13 +211,14 @@ public:
 
         const detail::ExecCacheApi& cache = detail::exec_cache_api();
         const bool cacheable = cacheable_ && cache.get != nullptr && cache.init != nullptr &&
-                               cache.set_key != nullptr;
+                               cache.set_key != nullptr && cache.add_tensor_addr != nullptr;
         uint64_t workspace_size = 0;
         aclOpExecutor* executor = nullptr;
         bool cache_live = false;
         if (cacheable) {
             cache.init();
             cache_live = true;
+            detail::note_tensor_addrs(cache, args...);
             cache.set_key(key);
             executor = cache.get(key, &workspace_size);
         }
