@@ -124,12 +124,23 @@ def linear(input: Tensor, weight: Tensor, bias: Optional[Tensor] = None) -> Tens
     return tensorplay.linear(input, weight, bias)
 
 
+_DISTRIBUTED_UNRESOLVED = object()
+_distributed_types: Any = _DISTRIBUTED_UNRESOLVED
+
+
 def _distributed_tensor_types() -> tuple[type, type] | None:
-    try:
-        from tensorplay.distributed.tensor import DTensor
-    except (ImportError, AttributeError):
-        return None
-    return DTensor, Tensor
+    # Resolved once: a build without distributed support fails the import on
+    # every attempt, and a failed import is not cached by Python, so probing
+    # per call would cost a full import search each time.
+    global _distributed_types
+    if _distributed_types is _DISTRIBUTED_UNRESOLVED:
+        try:
+            from tensorplay.distributed.tensor import DTensor
+        except (ImportError, AttributeError):
+            _distributed_types = None
+        else:
+            _distributed_types = (DTensor, Tensor)
+    return _distributed_types
 
 
 def _distributed_linear(input: Any, weight: Any, bias: Any, dtensor_type: type) -> Any:
@@ -265,11 +276,8 @@ def embedding(input, weight, padding_idx=None, max_norm=None, norm_type=2.0, sca
         captured = _capture_call(embedding, (input, weight, padding_idx, max_norm, norm_type, scale_grad_by_freq, sparse), {})
         if captured is not None:
             return captured
-    try:
-        from tensorplay.distributed.tensor import DTensor, Shard
-    except (ImportError, AttributeError):
-        DTensor = ()
-        Shard = ()
+    distributed = _distributed_tensor_types()
+    DTensor = distributed[0] if distributed is not None else ()
     if DTensor and (isinstance(input, DTensor) or isinstance(weight, DTensor)):
         input_dtensor = input if isinstance(input, DTensor) else None
         weight_dtensor = weight if isinstance(weight, DTensor) else None
