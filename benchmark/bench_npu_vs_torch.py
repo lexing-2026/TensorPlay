@@ -155,11 +155,14 @@ def main() -> int:
         if args.filter:
             cmd += ["-k", args.filter]
         proc = subprocess.run(cmd, capture_output=True, text=True)
-        lines = proc.stdout.strip().splitlines()
-        if proc.returncode != 0 or not lines:
+        # The runtime announces driver teardown on stdout after the result,
+        # so the measurement is the last line that parses as JSON.
+        results = [line for line in proc.stdout.splitlines()
+                   if line.startswith("{")]
+        if proc.returncode != 0 or not results:
             print(f"{name} failed:\n{proc.stdout}\n{proc.stderr}", file=sys.stderr)
             return 1
-        sides[name] = json.loads(lines[-1])
+        sides[name] = json.loads(results[-1])
 
     labels = list(sides["torch"]) + [k for k in sides["tp"] if k not in sides["torch"]]
     print(f"{'case':44s} {'torch ms':>10s} {'tp ms':>10s} {'tp/torch':>9s}")
