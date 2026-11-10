@@ -27,6 +27,15 @@ Fn resolve_symbol(const char* name) {
         return reinterpret_cast<Fn>(symbol);
     }
 #else
+#if defined(USE_METAX)
+    // The compatibility runtime ships the first-generation query: a plain
+    // three-argument call with no status out-parameter, where a successful
+    // return already means the symbol was found.
+    if (cudaGetDriverEntryPoint(name, &symbol, cudaEnableDefault) == cudaSuccess &&
+        symbol != nullptr) {
+        return reinterpret_cast<Fn>(symbol);
+    }
+#else
     cudaDriverEntryPointQueryResult query{};
 #if defined(CUDA_VERSION) && (CUDA_VERSION >= 12050)
     if (cudaGetDriverEntryPointByVersion(name, &symbol, 12000, cudaEnableDefault,
@@ -41,6 +50,7 @@ Fn resolve_symbol(const char* name) {
         query == cudaDriverEntryPointSuccess && symbol != nullptr) {
         return reinterpret_cast<Fn>(symbol);
     }
+#endif
 #endif
 #endif
     return nullptr;

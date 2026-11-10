@@ -93,10 +93,14 @@ endforeach()
 # Host translation units see only the library headers.  The template-library
 # directories (mctlass, cute, mccub, ...) ship files named like system
 # headers -- mctlass/semaphore.h shadows <semaphore.h>, which <thread> and
-# <mutex> pull in -- so they stay on the device compile line alone.
+# <mutex> pull in -- so they stay on the device compile line alone.  The
+# common directory is part of the device compiler's own search path and holds
+# the fp16 and complex type headers that the compatibility headers reach for,
+# so it joins the host line explicitly.
 set(TP_MACA_HOST_INCLUDE_DIRS
   "${TP_MACA_CU_BRIDGE}/include"
   "${TP_MACA_PATH}/include"
+  "${TP_MACA_PATH}/include/common"
 )
 foreach(_tp_maca_sub
     mcr mcblas mcdnn mccl mcrand mcfft mcsolver mcsparse mcpti)
@@ -105,11 +109,19 @@ foreach(_tp_maca_sub
   endif()
 endforeach()
 
-# Libraries a device translation unit links against.  Names follow the CUDA
-# spelling they replace so the source keeps its usual includes.
+# Libraries a device build links against.  The compatibility surface and the
+# native runtime are distinct libraries: the CUDA-spelling headers rename every
+# runtime and driver call to a w-prefixed symbol, which lives in
+# libruntime_cu.so, while the objects produced by the device compiler call the
+# native mc* runtime in libmcruntime.so and the fat-binary registration entry
+# points in libmccompiler.so.  The RTC calls go through the same split: the
+# native compiler interface is in libmcruntime.so, its nvrtc-spelling face in
+# libruntime_cu.so.
 set(TP_MACA_LIBRARY_DIR "${TP_MACA_PATH}/lib64")
 set(TP_MACA_LIBRARIES
-  "${TP_MACA_LIBRARY_DIR}/libmxc-runtime64.so"
+  "${TP_MACA_LIBRARY_DIR}/libmcruntime.so"
+  "${TP_MACA_LIBRARY_DIR}/libruntime_cu.so"
+  "${TP_MACA_LIBRARY_DIR}/libmccompiler.so"
   "${TP_MACA_LIBRARY_DIR}/libmcblas.so"
   "${TP_MACA_LIBRARY_DIR}/libmcblasLt.so"
   "${TP_MACA_LIBRARY_DIR}/libmcdnn.so"
@@ -150,6 +162,22 @@ set(TP_MACA_COMPILE_FLAGS
   -O3
 )
 
+# Host translation units that still pull the SDK's CUDA-spelling headers are
+# compiled by the SDK driver as plain C++: no device architecture and no
+# device-language macro, so the compatibility headers keep the host
+# definitions of the standard library intact.  The language level, the
+# backend defines and the workaround include stay the same.
+set(TP_MACA_HOST_COMPILE_FLAGS
+  -std=c++20
+  -DUSE_CUDA
+  -DUSE_CUDNN
+  -DUSE_METAX
+  -include
+  climits
+  -fPIC
+  -O3
+)
+
 set(TP_MACA_FOUND TRUE)
 message(STATUS "MACA SDK: ${TP_MACA_PATH} (mxcc: ${TP_MACA_MXCC}, arch: ${TP_MACA_DEVICE_ARCH})")
 
@@ -176,13 +204,20 @@ endif()
 set_property(GLOBAL APPEND PROPERTY JOB_POOLS "tp_maca_device=${TP_MACA_JOBS}")
 message(STATUS "MACA device compiles: ${TP_MACA_JOBS} concurrent")
 
-# Compile one .cu source into an object file with mxcc.
+# Compile one source into an object file with mxcc.
 #
-#   tp_maca_compile_object(<output-object> <source> <include-dirs...>)
+#   tp_maca_compile_object(<output-object> <source> <mode> <include-dirs...>)
 #
-# mxcc writes a make-style depfile next to the object, so a header edit
-# recompiles exactly the translation units that include it.
-function(tp_maca_compile_object out_obj src)
+# <mode> is DEVICE for a translation unit that carries device code and HOST
+# for one that only happens to include the SDK's headers (see the flag sets
+# above).  mxcc writes a make-style depfile next to the object, so a header
+# edit recompiles exactly the translation units that include it.
+function(tp_maca_compile_object out_obj src mode)
+  if(mode STREQUAL "HOST")
+    set(_flags ${TP_MACA_HOST_COMPILE_FLAGS})
+  else()
+    set(_flags ${TP_MACA_COMPILE_FLAGS})
+  endif()
   set(_includes "")
   foreach(_dir IN LISTS ARGN)
     list(APPEND _includes "-I${_dir}")
@@ -199,7 +234,7 @@ function(tp_maca_compile_object out_obj src)
   add_custom_command(
     OUTPUT "${_obj}"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${_obj_dir}"
-    COMMAND "${TP_MACA_MXCC}" ${TP_MACA_COMPILE_FLAGS} ${_includes}
+    COMMAND "${TP_MACA_MXCC}" ${_flags} ${_includes}
             -MD -MF "${_obj}.d" -MT "${_obj_rel}"
             -c "${CMAKE_CURRENT_SOURCE_DIR}/${src}" -o "${_obj}"
     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${src}"

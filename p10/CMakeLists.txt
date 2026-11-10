@@ -521,10 +521,13 @@ if(USE_CUDA OR USE_ROCM OR USE_METAX)
         # inline PTX (mma.sync, lop3, cp.async), and the wide-tiled
         # attention schedule draws on the same tensor-core surface.  Their
         # operators fall back to the generic paths.
+        #
+        # The cuDNN file stays in the build: its graph-plan frontend is
+        # guarded by a macro this lane does not set, so the file compiles to
+        # the legacy descriptor path its operators register.
         list(REMOVE_ITEM TP_CUDA_BACKEND_SOURCES
             src/backend/cuda/QuantGemmKernels.cu
             src/backend/cuda/GroupedGemmKernels.cu
-            src/backend/cuda/cudnn/ConvV8Kernels.cu
             src/backend/cuda/transformers/AttentionKernels.cu
             src/backend/cuda/transformers/AttentionGemmKernels.cu
             src/backend/cuda/transformers/WideTiledAttention.cu
@@ -544,16 +547,42 @@ if(USE_CUDA OR USE_ROCM OR USE_METAX)
             ${CMAKE_CURRENT_SOURCE_DIR}/src/backend/cuda
             ${CMAKE_SOURCE_DIR}/tpx/include
             ${GEN_BASE_DIR})
+        # The CUDA-JIT pair is host-side code, but its header reaches the
+        # device vector-type definitions, which the SDK exposes to its own
+        # compiler alone; both files therefore go through mxcc as well.  They
+        # need no template-library directory, so they take the narrower host
+        # include set (a template library ships headers named like system
+        # ones; see LoadMACA.cmake).
+        set(TP_METAX_CU_CPP
+            src/backend/cuda/JitUtils.cpp
+            src/backend/cuda/Jiterator.cpp)
+        set(TP_METAX_CU_HOST_INCLUDES
+            ${TP_MACA_HOST_INCLUDE_DIRS}
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/backend/cuda
+            ${CMAKE_SOURCE_DIR}/tpx/include
+            ${GEN_BASE_DIR})
         set(TP_METAX_CU_OBJECTS "")
         foreach(_tp_src IN LISTS TP_CUDA_BACKEND_SOURCES)
             if(_tp_src MATCHES "\\.cu$")
-                tp_maca_compile_object(_tp_obj "${_tp_src}" ${TP_METAX_CU_INCLUDES})
+                tp_maca_compile_object(_tp_obj "${_tp_src}" DEVICE
+                                       ${TP_METAX_CU_INCLUDES})
+                list(APPEND TP_METAX_CU_OBJECTS "${_tp_obj}")
+            elseif(_tp_src IN_LIST TP_METAX_CU_CPP)
+                tp_maca_compile_object(_tp_obj "${_tp_src}" HOST
+                                       ${TP_METAX_CU_HOST_INCLUDES})
                 list(APPEND TP_METAX_CU_OBJECTS "${_tp_obj}")
             else()
                 list(APPEND P10_SOURCES "${_tp_src}")
             endif()
         endforeach()
         list(APPEND P10_SOURCES ${TP_METAX_CU_OBJECTS})
+        # The grouped GEMM above is excluded but one of its entry points stays
+        # referenced by the attention reduction; the fallback reports every
+        # configuration as outside its envelope, so that caller keeps the
+        # per-group math-library path.
+        list(APPEND P10_SOURCES src/backend/cuda/GroupedGemmFallback.cpp)
     else()
         list(APPEND TP_CUDA_BACKEND_SOURCES src/backend/cuda/NCCLContext.cpp)
         list(APPEND P10_SOURCES ${TP_CUDA_BACKEND_SOURCES})

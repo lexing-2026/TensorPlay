@@ -75,7 +75,14 @@ DeviceHandles& handlesForCurrentDevice() {
 
     auto* created = new DeviceHandles();
     checkCusolver(cusolverDnCreate(&created->cusolver_dn), "cusolverDnCreate");
+#ifdef USE_METAX
+    // The compatibility sparse-solver entry point reports this device as
+    // unsupported, so the handle cannot be created up front.  It is created
+    // on demand by the accessor, which then surfaces the failure at the
+    // point a sparse routine is actually reached.
+#else
     checkCusolver(cusolverSpCreate(&created->cusolver_sp), "cusolverSpCreate");
+#endif
     checkCublas(cublasCreate(&created->cublas), "cublasCreate");
     checkCublas(cublasLtCreate(&created->cublas_lt), "cublasLtCreate");
 #ifdef USE_CUDNN
@@ -116,6 +123,11 @@ cusolverDnHandle_t CUDAContext::getCusolverDnHandle() {
 
 cusolverSpHandle_t CUDAContext::getCusolverSpHandle() {
     auto& handles = handlesForCurrentDevice();
+#ifdef USE_METAX
+    if (handles.cusolver_sp == nullptr) {
+        checkCusolver(cusolverSpCreate(&handles.cusolver_sp), "cusolverSpCreate");
+    }
+#endif
     checkCusolver(cusolverSpSetStream(handles.cusolver_sp, getCurrentCUDAStream().stream()),
                   "cusolverSpSetStream");
     return handles.cusolver_sp;

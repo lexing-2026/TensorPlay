@@ -220,7 +220,9 @@ if(USE_CUDA)
 elseif(USE_METAX)
     # No CUDA toolkit: the device compiler and the CUDA-spelling headers
     # come from the MACA SDK, and every device source is compiled by mxcc
-    # through the rules in cmake/LoadMACA.cmake.
+    # through the rules in cmake/LoadMACA.cmake.  The backend macro that
+    # tells the compatibility surface apart is set on the targets that
+    # consume those headers, next to their compile definitions.
     string(APPEND CMAKE_CXX_FLAGS " -DUSE_CUDA")
     message(STATUS "GPU backend: MACA (${TP_MACA_PATH})")
 else()
@@ -1617,9 +1619,12 @@ if(USE_METAX)
     # The bindings call the runtime directly (device queries, byte copies);
     # the MACA libraries provide the same entry points.  Only the library
     # headers come along: the template headers carry files named after
-    # system headers and break host compilation.
+    # system headers and break host compilation.  The backend macro reaches
+    # the shared driver-loader header so it picks the compatibility dialect
+    # of the entry-point query.
     target_include_directories(_C PRIVATE ${TP_MACA_HOST_INCLUDE_DIRS})
     target_compile_options(_C PRIVATE -include climits)
+    target_compile_definitions(_C PRIVATE USE_METAX)
     target_link_directories(_C PRIVATE ${TP_MACA_LIBRARY_DIR})
     target_link_libraries(_C PRIVATE ${TP_MACA_LIBRARIES})
 elseif(TP_CUDA_ENABLED)
