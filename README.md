@@ -48,8 +48,7 @@
 </p>
 </div>
 
-<details>
-<summary>Build matrix &amp; community signals</summary>
+<div align="center">
 
 <p>
     <a href="https://github.com/lexing-2026/TensorPlay/actions/workflows/lint.yml">
@@ -103,7 +102,7 @@
         <img src="https://img.shields.io/badge/Docs-tensorplay.cn-11B5D1?style=flat-square&labelColor=23347A&logo=readthedocs&logoColor=white" alt="Documentation">
     </a>
 </p>
-</details>
+</div>
 
 <div align="center">
     <video src="https://github.com/user-attachments/assets/e4ba112d-62a3-4639-aa7f-2e2b050a9b4d" controls preload="metadata" width="100%" style="max-width: 960px; display: block; margin: 0 auto; border-radius: 8px;"></video>
