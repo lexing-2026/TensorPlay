@@ -82,6 +82,14 @@ turns the CUDA language off, and routes every `.cu` through the
 backend (context, allocator, graph, generator) build with the normal C++
 compiler against the same headers.
 
+The runtime-compilation pair (`JitUtils.cpp`, `Jiterator.cpp`) is host-side
+code, yet one of its headers reaches the device vector-type definitions,
+which only the SDK's own driver exposes on its search path.  Both files
+therefore go through `mxcc` as well, in a **host mode** that drops the device
+architecture and the device-language macro — so the compatibility headers
+keep the host definitions of the standard library — and takes a narrower
+include set that leaves out the template-library directories.
+
 Keep the job count low: device translation units hold several GB while
 `mxcc` optimizes them (the elementwise files, with their full dtype fan-out,
 peak past 10 GB), and the SDK does not cap its own parallelism.  The device
@@ -98,13 +106,14 @@ quickest way to check a source after a header change:
 mxcc -c -std=c++20 -offload-arch=xcore1000 \
   -D__CUDACC__ -Xdevice -D__CUDA_ARCH__=800 -include climits \
   -I p10/include -I p10/src -I p10/src/backend/cuda -I tpx/include \
-  -I build/generated -I third_party/cutlass/include \
-  -I third_party/cudnn_frontend/include \
+  -I build/generated -I build-metax/metax_cutlass_shim \
   -I /opt/maca/tools/cu-bridge/include -I /opt/maca/include \
   -I /opt/maca/include/mcr -I /opt/maca/include/mcblas \
   -I /opt/maca/include/mcdnn -I /opt/maca/include/mccl \
   -I /opt/maca/include/mcrand -I /opt/maca/include/mcfft \
   -I /opt/maca/include/mcsolver -I /opt/maca/include/mcsparse \
+  -I /opt/maca/include/mctlass -I /opt/maca/include/mccub \
+  -I /opt/maca/include/cute \
   -DUSE_CUDA -DUSE_CUDNN \
   p10/src/backend/cuda/CopyKernels.cu -o /tmp/copy.o
 ```
@@ -125,6 +134,28 @@ Four of those flags do real work:
 
 `build/generated` comes from `tools.codegen.main`; run it once before the
 first compile (see the top-level build, which does this automatically).
+`metax_cutlass_shim` is a forward tree the configure step writes so that a
+`<cutlass/...>` include resolves to the SDK's template headers; both
+directories exist once the build has been configured.
+
+Host-side files that still include the SDK headers — the runtime-compilation
+pair — go through the same driver with the device options removed:
+
+```bash
+mxcc -c -std=c++20 -DUSE_CUDA -DUSE_CUDNN -DUSE_METAX -include climits \
+  -fPIC -O3 \
+  -I p10/include -I p10/src -I p10/src/backend/cuda -I tpx/include \
+  -I build/generated \
+  -I /opt/maca/tools/cu-bridge/include -I /opt/maca/include \
+  -I /opt/maca/include/common -I /opt/maca/include/mcr \
+  p10/src/backend/cuda/JitUtils.cpp -o /tmp/jitutils.o
+```
+
+No `-offload-arch`, no `-D__CUDACC__`, no `-Xdevice`: the translation unit has
+no device pass, and the compatibility headers must keep the host definitions
+of the standard library. The template-library directories stay off the line,
+while `include/common` joins it to supply the fp16 and complex headers the
+compatibility surface reaches for.
 
 ## Supported operations
 
@@ -135,9 +166,12 @@ cannot run:
 | --- | --- |
 | Elementwise, activations, reductions | CUDA kernels compiled by `mxcc` |
 | BLAS (`mm`, `addmm`, `bmm`, ...) | CUDA kernels calling `mcblas` through the cuBLAS compatibility headers |
-| Convolution | the shared and v7 cuDNN paths build against `mcdnn`; the v8 cuDNN-frontend graph API is excluded |
-| Quantized / grouped GEMM | excluded — inline PTX (`mma.sync`, `lop3`, `cp.async`); operators fall back to the generic paths |
-| Transformers attention | excluded — the flash and wide-tiled schedules draw on the same tensor-core surface; falls back |
+| Convolution | the shared, v7 and v8 kernel files build against `mcdnn`; the v8 graph-plan frontend compiles out, so `conv2d` runs the legacy path and the gradient kernels use the descriptor API |
+| Quantized GEMM | excluded — inline PTX (`mma.sync`, `lop3`, `cp.async`); operators fall back to the generic paths |
+| Grouped GEMM | excluded — the grouped tensor-core schedule is not shipped; a fallback entry point reports every configuration as outside its envelope, so callers keep the per-group math-library path |
+| Transformers attention | the flash and wide-tiled schedules are excluded; attention runs the math path, which builds here |
+| Sparse linear algebra | the solver library builds, but the sparse-solver handle cannot be created on this device, so the sparse solve entry point raises when reached |
+| CUDA Graph capture and replay | capture, instantiate and replay run against the compatibility runtime's graph entry points; conditional nodes (CUDA >= 12.4) are excluded by the version gate and refused at the API |
 | Profiling | per-operation device time, kernel-level records through `libmcpti` |
 
 ## Profiling
@@ -163,6 +197,7 @@ records arrive through the same path as on NVIDIA.
 | root `CMakeLists.txt` | the `USE_METAX` switch, SDK discovery, `_C` linkage |
 | `p10/CMakeLists.txt` | source selection, per-TU `mxcc` objects, the exclusion list |
 | `p10/src/backend/cuda/*.cu` | the reused device kernels |
+| `p10/src/backend/cuda/GroupedGemmFallback.cpp` | the grouped-GEMM entry point the excluded kernel file would have defined |
 | `p10/include/BFloat16.h`, `p10/include/Half.h` | conversion intrinsics take integer paths under `mxcc` |
 | `p10/src/ProfilerCupti.cpp` | `libmcpti.so` as the tracing library in a MACA build |
 
@@ -170,11 +205,22 @@ All paths are relative to the repository root.
 
 ## Status
 
-Verified on a MetaX C500 (64 GB, MACA 3.3.0):
+Verified on a MetaX C500 (64 GB, MACA 3.3.0), Python 3.12:
 
-- a minimal `cudaMalloc` / kernel / `cudaMemcpy` program compiles and runs;
-- `CopyKernels.cu`, `Convolution.cu`, `TensorFactories.cu` and
-  `ActivationKernels.cu` compile with `mxcc`.
+- `p10` and the `_C` extension build cleanly, and `libp10.so` links with no
+  unresolved backend symbols;
+- `import tensorplay` succeeds and the runtime reports a single device,
+  `MetaX C500`;
+- a BLAS matmul, `softmax` and elementwise arithmetic run and produce finite
+  results;
+- the profiler loads `libmcpti.so` and records per-operation device time and
+  kernel-level entries;
+- CUDA Graph capture, instantiate and replay round-trip a matmul node: the
+  replayed result matches the value computed outside the graph;
+- conditional nodes are refused — the compatibility runtime reports CUDA
+  11.6, below the 12.4 the gate requires;
+- the sparse-solver handle cannot be created on this device, so sparse solves
+  raise when reached (the operation table records the exclusion).
 
 ## Compatibility
 
