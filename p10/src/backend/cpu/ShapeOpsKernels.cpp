@@ -964,5 +964,14 @@ TENSORPLAY_LIBRARY_IMPL(CPU, ShapeOpsKernels) {
     m.impl("diagonal_scatter", diagonal_scatter_cpu);
 }
 
+// The out-of-tree device slot shares the kernels above that only rewrite
+// sizes, strides and storage offsets: they never read element data, so
+// they serve any device whose tensors carry ordinary strided storage.
+TENSORPLAY_LIBRARY_IMPL(PrivateUse1, ShapeOpsKernelsPrivateUse1) {
+    m.impl("narrow", narrow_cpu);
+    m.impl("split_with_sizes", split_with_sizes_cpu);
+    m.impl("unfold", unfold_cpu);
+}
+
 } // namespace cpu
 } // namespace tensorplay

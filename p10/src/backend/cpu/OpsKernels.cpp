@@ -2002,5 +2002,10 @@ TENSORPLAY_LIBRARY_IMPL(CPU, OpsKernels) {
     m.impl("prelu", prelu_cpu);
 }
 
+// positive is a clone through the dispatcher, valid on any device.
+TENSORPLAY_LIBRARY_IMPL(PrivateUse1, OpsKernelsPrivateUse1) {
+    m.impl("positive", positive_cpu);
+}
+
 } // namespace cpu
 } // namespace tensorplay

@@ -53,4 +53,13 @@ TENSORPLAY_LIBRARY_IMPL(CPU, NativeTensorShape) {
     m.impl("set_", set_cpu_);
 }
 
+// The out-of-tree device slot shares the kernels above that only rewrite
+// which storage a tensor views: they never read element data, so
+// they serve any device whose tensors carry ordinary strided storage.
+TENSORPLAY_LIBRARY_IMPL(PrivateUse1, NativeTensorShapePrivateUse1) {
+    m.impl("set_.source_Storage", set_storage_cpu);
+    m.impl("set_.source_Storage_storage_offset", set_storage_cpu_);
+    m.impl("set_.source_Tensor", set_tensor_cpu);
+}
+
 } // namespace tensorplay::cpu

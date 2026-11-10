@@ -542,6 +542,13 @@ TENSORPLAY_LIBRARY_IMPL(CPU, MiscKernels) {
     m.impl("_transform_bias_rescale_qkv", transform_bias_rescale_qkv_cpu);
 }
 
+// resize_ grows storage through the tensor's own allocator and copies the
+// old bytes with the device's copy hook, so it serves the out-of-tree slot
+// unchanged.
+TENSORPLAY_LIBRARY_IMPL(PrivateUse1, MiscKernelsPrivateUse1) {
+    m.impl("resize_", resize__cpu);
+}
+
 // resize_ grows the storage in place (preserving the old contents) and then
 // adopts contiguous strides; shrinking only changes the logical shape, like
 Tensor& resize__cpu(Tensor& self, const std::vector<int64_t>& size) {

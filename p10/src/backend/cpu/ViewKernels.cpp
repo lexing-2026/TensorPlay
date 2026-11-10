@@ -786,6 +786,34 @@ TENSORPLAY_LIBRARY_IMPL(CPU, ViewKernels) {
     m.impl("unbind", unbind_kernel);
 }
 
+// The out-of-tree device slot shares the kernels above that only rewrite
+// sizes, strides and storage offsets: they never read element data, so
+// they serve any device whose tensors carry ordinary strided storage.
+TENSORPLAY_LIBRARY_IMPL(PrivateUse1, ViewKernelsPrivateUse1) {
+    m.impl("view_as_real", view_as_real_cpu);
+    m.impl("view_as_complex", view_as_complex_cpu);
+    m.impl("transpose", transpose_kernel);
+    m.impl("t", t_kernel);
+    m.impl("permute", permute_kernel);
+    m.impl("permute_backward", permute_backward_kernel);
+    m.impl("squeeze", squeeze_kernel);
+    m.impl("squeeze_backward", squeeze_backward_kernel);
+    m.impl("squeeze.dim", squeeze_dim_kernel);
+    m.impl("squeeze.dims", squeeze_dims_kernel);
+    m.impl("unsqueeze", unsqueeze_kernel);
+    m.impl("slice.Tensor", slice_kernel);
+    m.impl("select_backward", select_backward_kernel);
+    m.impl("slice_backward", slice_backward_kernel);
+    m.impl("diagonal", diagonal_kernel);
+    m.impl("diagonal_backward", diagonal_backward_kernel);
+    m.impl("movedim", movedim_kernel);
+    m.impl("split", split_kernel);
+    m.impl("split.sizes", split_sizes_kernel);
+    m.impl("chunk", chunk_kernel);
+    m.impl("reshape", reshape_kernel);
+    m.impl("unbind", unbind_kernel);
+}
+
 // A sparse self derives the sparse dispatch key, so sparse layout cloning
 // needs its own slot; clone_impl copies the sparse metadata alongside the
 // values buffer.
