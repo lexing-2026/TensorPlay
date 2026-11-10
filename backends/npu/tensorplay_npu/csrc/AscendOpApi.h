@@ -36,6 +36,10 @@ DType binary_result_dtype(const Tensor& a, const Tensor& b);
 // itself when it already has that dtype.
 Tensor cast_on_device(const Tensor& t, DType dtype);
 
+// ``src`` converted into ``dst`` itself, one pass: ``dst`` must be dense
+// (contiguous from its storage base) and have ``src``'s shape.
+void cast_into(const Tensor& dst, const Tensor& src);
+
 // ``t`` in the compute type: the view itself when the types agree,
 // otherwise a cast into a fresh dense tensor.
 Tensor compute_operand(const Tensor& t, DType dtype);

@@ -81,9 +81,14 @@ void device_to_device(Tensor& self, const Tensor& src) {
         strided_copy(self, source);
         return;
     }
-    // The operator library converts the values on the device; the result
-    // then takes the ordinary strided copy into ``self``.
+    // The operator library converts the values on the device.  A dense
+    // destination takes the result directly; anything else receives it
+    // through the ordinary strided copy.
     if (!source.is_contiguous()) source = contiguous_on_device(source);
+    if (self.is_contiguous() && self.impl()->storage_offset() == 0) {
+        cast_into(self, source);
+        return;
+    }
     strided_copy(self, cast_on_device(source, self.dtype()));
 }
 

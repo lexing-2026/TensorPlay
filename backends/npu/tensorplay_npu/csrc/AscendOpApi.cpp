@@ -148,6 +148,19 @@ Tensor cast_on_device(const Tensor& t, DType dtype) {
     return out;
 }
 
+void cast_into(const Tensor& dst, const Tensor& src) {
+    static const OpApi api("aclnnCast");
+    TP_CHECK(api.valid(), "aclnnCast is missing from the operator library");
+    aclDataType target = ACL_DT_UNDEFINED;
+    TP_CHECK(acl_dtype_of(dst.dtype(), &target), "no acl element type for ", dst.dtype());
+    if (dst.numel() == 0) return;
+    const int index = index_of(dst.device());
+    AclArgs args;
+    const AclTensorRef self = args.tensor(src);
+    const AclTensorRef result = args.tensor(dst);
+    api.run(index, self, target, result);
+}
+
 Tensor compute_operand(const Tensor& t, DType dtype) {
     if (t.dtype() != dtype) return cast_on_device(t, dtype);
     return t;
