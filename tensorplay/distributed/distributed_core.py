@@ -88,6 +88,7 @@ __all__ = [
     "reduce_scatter_single",
     "reduce_scatter_single_coalesced",
     "reduce_scatter_tensor",
+    "register_device_backend",
     "scatter",
     "scatter_object_list",
     "send",
@@ -441,6 +442,9 @@ class ProcessGroup:
         self.comm: Optional[int] = None
         self.gloo_pg = None
         self.mpi_pg = None
+        # Provider object for a device backend registered through
+        # ``register_device_backend`` (None for gloo / MPI / NCCL).
+        self.device_pg = None
         self._timeout_s: float = default_pg_timeout.total_seconds()
         self._lock = threading.Lock()
         self._pending_p2p_works = []
@@ -490,6 +494,10 @@ class ProcessGroup:
         self._timeout_s = timeout.total_seconds()
         if self.gloo_pg is not None:
             self.gloo_pg.set_timeout(int(self._timeout_s * 1000))
+        if self.device_pg is not None:
+            setter = getattr(self.device_pg, "set_timeout", None)
+            if callable(setter):
+                setter(int(self._timeout_s * 1000))
 
     def _retain_p2p_work(self, work):
         if work is not None:
@@ -593,6 +601,41 @@ def is_gloo_available() -> bool:
 
 def is_mpi_available() -> bool:
     return hasattr(_C, "ProcessGroupMPI")
+
+
+def _validate_backend(backend: str) -> str:
+    """Check that ``backend`` is known and usable, and return it.
+
+    The built-in backends are probed for their runtime; a backend registered
+    through the entry points or :func:`register_device_backend` is taken at
+    its word, since it owns the check.
+    """
+    if backend == Backend.NCCL:
+        if not is_available():
+            raise RuntimeError(
+                "Distributed package is not available (NCCL library could "
+                "not be loaded)"
+            )
+        return backend
+    if backend == Backend.GLOO:
+        if not is_gloo_available():
+            raise RuntimeError(
+                "The gloo backend was not compiled into this build"
+            )
+        return backend
+    if backend == Backend.MPI:
+        if not is_mpi_available():
+            raise RuntimeError(
+                "The MPI backend was not compiled into this build; MPI is "
+                "only included when the host has an MPI runtime"
+            )
+        return backend
+    if Backend._plugins.get(backend.upper()) is not None:
+        return backend
+    raise ValueError(
+        f"Invalid backend: '{backend}'. TensorPlay currently supports: "
+        f"'{Backend.NCCL}', '{Backend.GLOO}', '{Backend.MPI}'"
+    )
 
 
 def is_backend_available(backend: str) -> bool:
@@ -730,12 +773,57 @@ def _ensure_mpi_comm(pg: ProcessGroup) -> object:
         return pg.mpi_pg
 
 
+#: Backends whose collectives live outside this module (an accelerator
+#: backend shipping its own process group).  Each factory builds an object
+#: exposing the same collective methods the code below calls on the C++ gloo
+#: group.
+_DEVICE_PG_FACTORIES: dict[str, Callable[[ProcessGroup], Any]] = {}
+
+
+def register_device_backend(name: str,
+                            factory: Callable[[ProcessGroup], Any]) -> None:
+    """Register the collective provider for a device backend.
+
+    ``factory`` receives the :class:`ProcessGroup` and returns the object the
+    collectives dispatch to.  Calling this is what makes ``name`` usable as a
+    backend, so it also registers the backend itself.
+    """
+    if not callable(factory):
+        raise TypeError("device backend factory must be callable")
+    normalized = str(name).lower()
+    Backend._ensure_backend_registered(normalized)
+    _DEVICE_PG_FACTORIES[normalized] = factory
+
+
+def _teardown_device_pg(pg: ProcessGroup) -> None:
+    """Release a device backend's provider object, if any."""
+    impl = pg.device_pg
+    if impl is None:
+        return
+    pg.device_pg = None
+    destroy = getattr(impl, "destroy", None)
+    if callable(destroy):
+        destroy()
+
+
 def _cpu_pg(pg: ProcessGroup):
-    """Returns the C++ process group for CPU backends (gloo / MPI)."""
+    """Returns the collective provider for a non-NCCL backend.
+
+    The CPU backends (gloo / MPI) hand back their C++ process group; any
+    other backend that registered itself through
+    :func:`register_device_backend` supplies its own object with the same
+    method surface.
+    """
     if pg.backend == Backend.GLOO:
         return _ensure_gloo_comm(pg)
     if pg.backend == Backend.MPI:
         return _ensure_mpi_comm(pg)
+    factory = _DEVICE_PG_FACTORIES.get(str(pg.backend).lower())
+    if factory is not None:
+        with pg._lock:
+            if pg.device_pg is None:
+                pg.device_pg = factory(pg)
+            return pg.device_pg
     raise RuntimeError(f"Unknown backend: '{pg.backend}'")
 
 
@@ -963,28 +1051,7 @@ def init_process_group(
                 f"No backend configured for active device '{active_device}'"
             ) from exc
     backend = str(backend).lower()
-    if backend == Backend.NCCL:
-        if not is_available():
-            raise RuntimeError(
-                "Distributed package is not available (NCCL library could "
-                "not be loaded)"
-            )
-    elif backend == Backend.GLOO:
-        if not is_gloo_available():
-            raise RuntimeError(
-                "The gloo backend was not compiled into this build"
-            )
-    elif backend == Backend.MPI:
-        if not is_mpi_available():
-            raise RuntimeError(
-                "The MPI backend was not compiled into this build; MPI is "
-                "only included when the host has an MPI runtime"
-            )
-    else:
-        raise ValueError(
-            f"Invalid backend: '{backend}'. TensorPlay currently supports: "
-            f"'{Backend.NCCL}', '{Backend.GLOO}', '{Backend.MPI}'"
-        )
+    _validate_backend(backend)
 
     timeout_s = timeout.total_seconds()
     if init_method is None:
@@ -1030,6 +1097,7 @@ def destroy_process_group(group=None) -> None:
                 pg.comm = None
             pg.gloo_pg = None
             pg.mpi_pg = None
+            _teardown_device_pg(pg)
             pg._release_p2p_works()
         _world_group = None
         GroupMember.WORLD = None
@@ -1043,6 +1111,7 @@ def destroy_process_group(group=None) -> None:
         pg.comm = None
     pg.gloo_pg = None
     pg.mpi_pg = None
+    _teardown_device_pg(pg)
     pg._release_p2p_works()
     if pg is _world_group:
         _world_group = None
@@ -1203,17 +1272,7 @@ def new_group(ranks: Optional[List[int]] = None,
                 f"No backend configured for active device '{active_device}'"
             ) from exc
     backend = str(backend).lower()
-    if backend not in (Backend.NCCL, Backend.GLOO, Backend.MPI):
-        raise ValueError(
-            f"Invalid backend: '{backend}'. TensorPlay currently supports: "
-            f"'{Backend.NCCL}', '{Backend.GLOO}', '{Backend.MPI}'"
-        )
-    if backend == Backend.NCCL and not is_available():
-        raise RuntimeError("NCCL library could not be loaded")
-    if backend == Backend.GLOO and not is_gloo_available():
-        raise RuntimeError("The gloo backend was not compiled into this build")
-    if backend == Backend.MPI and not is_mpi_available():
-        raise RuntimeError("The MPI backend was not compiled into this build")
+    _validate_backend(backend)
     if ranks is None:
         ranks = list(range(get_world_size()))
     ranks = list(ranks)
@@ -2551,6 +2610,10 @@ def _get_object_coll_device(group=None) -> str:
         pg = _resolve_group(group)
         if pg.backend == Backend.NCCL:
             return f"cuda:{tp.cuda.current_device()}"
+        if str(pg.backend).lower() in _DEVICE_PG_FACTORIES:
+            devices = Backend.backend_capability.get(str(pg.backend).lower(), [])
+            if devices:
+                return f"{devices[0]}:0"
     except Exception:  # noqa: BLE001 - fall back to the CPU marshal path
         pass
     return "cpu"
