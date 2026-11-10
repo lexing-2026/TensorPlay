@@ -307,3 +307,30 @@ def test_memory_statistics():
     assert tp.npu.memory_reserved() >= before
     free, total = tp.npu.mem_get_info()
     assert 0 < free <= total
+
+
+def test_profiler_reports_device_time():
+    from tensorplay.profiler import ProfilerActivity, profile, supported_activities
+
+    assert ProfilerActivity.PrivateUse1 in supported_activities()
+    a = rand(512, 512).to("npu")
+    a @ a
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]) as prof:
+        for _ in range(3):
+            (a @ a).relu()
+    rows = {row.key: row for row in prof.key_averages()}
+    assert rows["mm"].count == 3 and rows["mm"].device_time_total > 0
+    assert rows["relu"].device_time_total > 0
+    assert "NPU" in prof.key_averages().table(sort_by="device_time_total", row_limit=5)
+
+
+def test_profiler_records_device_memory_events():
+    from tensorplay.profiler import profile
+
+    with profile(profile_memory=True) as prof:
+        x = tp.empty(1 << 20, device="npu")
+        del x
+    # (ts_ns, ptr, bytes, is_alloc, is_cuda, device, stream, tid)
+    device_events = [event for event in prof.mem_events if event[4]]
+    assert len(device_events) >= 2
+    assert sum(event[2] for event in device_events if event[3]) >= (1 << 20) * 4
