@@ -157,7 +157,7 @@ TensorPlay 是一个面向学习者的深度学习框架：它融合了类 NumPy
 | 组件 | 说明 |
 | ---- | ---- |
 | **tensorplay** | Python API：张量、自动微分、`nn`、`optim`、数据加载、序列化——对外公开层 |
-| **p10** | C++ 核心引擎：张量存储与内存管理、基础的 CPU、CUDA、ROCm/HIP、MPS 与 Vulkan 内核实现 |
+| **p10** | C++ 核心引擎：张量存储与内存管理、基础的 CPU、CUDA、ROCm/HIP、MetaX (MACA)、MPS 与 Vulkan 内核实现 |
 | **tpx** | 自动微分层：显式构建计算图并执行反向传播，与核心完全解耦 |
 | **stax** | JIT 编译器试验场：静态图捕获与算子融合实验，支持自定义算子的原生下沉 |
 | **tensorplay.nn** | 神经网络构件：`Module`、`Linear`、`Conv2d`、激活函数、损失函数与容器抽象——以及现代 LLM 全家桶：旋转位置编码、分组查询/潜在/压缩稀疏注意力、delta 规则线性注意力、KV 缓存、自回归生成 |
@@ -185,15 +185,20 @@ flowchart TB
 
 ### 支持的后端与设备
 
-TensorPlay 将请求分派到五大后端家族，每个后端都有一张透明、可读的内核表：
+TensorPlay 将请求分派到八大后端家族——五个内置后端，各自有一张透明、可读的内核表，另有三个加速器后端通过两条扩展路径接入：MetaX 走树内集成（与 ROCm 类似，是基于共享源码的构建开关），Cambricon MLU 与华为昇腾 NPU 则是 `PrivateUse1` 设备槽上的树外插件（参见[添加设备后端](docs/source/notes/backends.md)）：
 
 | 后端 | 目标硬件 | 启用方式 | 可用性检测 |
 | ---- | ---- | ---- | ---- |
-| **CPU** | x86_64 / aarch64 CPU，SIMD 分派（AVX2/AVX512/NEON），可选 BLAS、oneDNN、MKL、NNPACK 与 OpenMP 加速 | 始终内置 | `tp.cpu.is_available()` |
-| **CUDA** | NVIDIA GPU —— CUDA 12.x / 13.x，cuBLAS/cuDNN | `USE_CUDA=ON`（自动探测） | `tp.cuda.is_available()` |
-| **ROCm / HIP** | AMD GPU —— ROCm 7.2，MIOpen | `USE_ROCM=ON`（与 CUDA 互斥） | 构建期开关 |
-| **Vulkan** | 任意支持 Vulkan 1.0+ 的 GPU —— 独立 NVIDIA/AMD 或 Intel/AMD 集成显卡（iGPU） | `USE_VULKAN=ON`（自动探测） | `tp.is_vulkan_available()` |
-| **MPS** | 通过 Metal Performance Shaders 使用 Apple GPU —— Apple 芯片集成显卡及受支持的 Mac 独立显卡 | `USE_MPS=ON`（Apple 平台自动启用） | `tp.mps.is_available()` |
+| <img src="docs/images/backends/cpu.svg" height="18" alt="CPU">&nbsp;**CPU** | x86_64 / aarch64 —— SIMD、BLAS、oneDNN、MKL | 始终内置 | `tp.cpu.is_available()` |
+| <img src="docs/images/backends/nvidia.svg" height="18" alt="NVIDIA">&nbsp;**CUDA** | NVIDIA GPU —— CUDA 12.x / 13.x，cuBLAS / cuDNN | `USE_CUDA=ON` | `tp.cuda.is_available()` |
+| <img src="docs/images/backends/amd.svg" height="18" alt="AMD">&nbsp;**ROCm&nbsp;/&nbsp;HIP** | AMD GPU —— ROCm 7.2，MIOpen | `USE_ROCM=ON` | 构建期开关 |
+| <img src="docs/images/backends/metax.png" height="18" alt="MetaX">&nbsp;[**MetaX&nbsp;(MACA)**](docs/metax.md) | MetaX C500（曦云）—— MACA SDK，`mxcc` 编译 | `USE_METAX=ON` | 构建期开关 |
+| <img src="docs/images/backends/vulkan.svg" height="18" alt="Vulkan">&nbsp;**Vulkan** | 任意 Vulkan 1.0+ GPU —— 独立显卡或集成显卡 | `USE_VULKAN=ON` | `tp.is_vulkan_available()` |
+| <img src="docs/images/backends/apple-mps.svg" height="18" alt="Apple">&nbsp;**MPS** | Apple GPU —— Metal Performance Shaders | `USE_MPS=ON` | `tp.mps.is_available()` |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/backends/cambricon-mlu-dark.png"><img src="docs/images/backends/cambricon-mlu.png" height="18" alt="Cambricon"></picture>&nbsp;**Cambricon&nbsp;MLU** | 寒武纪 MLU —— CNRT / CNNL，主机回退 | [`tensorplay-mlu`](https://github.com/ohtensorplay/tensorplay-mlu) | `device="mlu"` |
+| <img src="docs/images/backends/ascend.svg" height="18" alt="Ascend">&nbsp;**Ascend&nbsp;NPU** | 华为昇腾 NPU —— CANN，主机回退 | [`tensorplay-npu`](https://github.com/ohtensorplay/tensorplay-npu) | `device="npu"` |
+
+每次构建只启用一个 GPU 后端：`USE_CUDA`、`USE_ROCM` 与 `USE_METAX` 互斥。CUDA、Vulkan 与 MPS 在检测到可用设备与工具链时自动启用，ROCm 与 MetaX 则需显式开关。两个插件分别用 `pip install tensorplay-mlu` / `tensorplay-npu` 安装，对尚未实现的算子回退到主机实现。
 
 ### 为什么选择 TensorPlay
 
