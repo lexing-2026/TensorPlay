@@ -79,8 +79,10 @@ std::optional<std::vector<int64_t>> matmul_shape(const Tensor& a, const Tensor& 
     if (inner_a != inner_b) return std::nullopt;
     std::vector<int64_t> shape;
     if (da > 2 || db > 2) {
-        const std::vector<int64_t> batch_a(sa.begin(), sa.end() - 2);
-        const std::vector<int64_t> batch_b(sb.begin(), sb.end() - 2);
+        std::vector<int64_t> batch_a;
+        std::vector<int64_t> batch_b;
+        if (da > 2) batch_a.assign(sa.begin(), sa.end() - 2);
+        if (db > 2) batch_b.assign(sb.begin(), sb.end() - 2);
         shape = broadcast_shapes(IntArrayRef(batch_a), IntArrayRef(batch_b));
     }
     if (da > 1) shape.push_back(sa[static_cast<size_t>(da - 2)]);
