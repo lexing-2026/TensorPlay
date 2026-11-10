@@ -54,12 +54,6 @@ DType reduce_out_dtype(const Tensor& self, DType requested) {
     return self.dtype();
 }
 
-// Narrow floats are summed at single precision and narrowed once, so the
-// running total cannot overflow the output type.
-DType accumulate_dtype(DType out_dtype) {
-    return isReducedFloatingType(out_dtype) ? DType::Float32 : out_dtype;
-}
-
 bool native_reduce(const Tensor& self, DType out_dtype, const OpApi& api) {
     return self.device().is_privateuse1() && self.dim() <= kMaxAclDims &&
            is_native_float(self.dtype()) && is_native_float(out_dtype) &&
@@ -68,14 +62,14 @@ bool native_reduce(const Tensor& self, DType out_dtype, const OpApi& api) {
 
 enum class ReduceMode { Sum, Mean };
 
-// Reduce ``self`` to its accumulation type, over ``dims`` (all when empty)
-// and, for ``Mean``, divided by the number of reduced elements.  The
-// reduced axes stay size one for the operator and are viewed away after.
+// Reduce ``self`` over ``dims`` (all when empty) into ``out_dtype``; ``Mean``
+// divides by the number of reduced elements.  The operator reads the
+// operand and produces the requested type; the reduced axes stay size one
+// for it and are viewed away afterwards.
 Tensor reduced(const Tensor& self, DType out_dtype, std::vector<int64_t> dims, bool keepdim,
                ReduceMode mode) {
     const int index = index_of(self.device());
-    const DType acc = accumulate_dtype(out_dtype);
-    const Tensor x = compute_operand(self, acc);
+    const Tensor x = contiguous_on_device(self);
     const int64_t nd = x.dim();
     if (nd == 0) {
         // A single element: the reduction only converts the type.
@@ -83,10 +77,9 @@ Tensor reduced(const Tensor& self, DType out_dtype, std::vector<int64_t> dims, b
             TP_CHECK(d == 0 || d == -1, "reduction: dimension ", d,
                      " out of range for a 0-d tensor");
         }
-        Tensor out = empty_on({}, acc, index);
+        Tensor out = empty_on({}, out_dtype, index);
         strided_copy(out, x);
-        const Tensor result = keepdim ? out.view({1}) : out;
-        return acc == out_dtype ? result : cast_on_device(result, out_dtype);
+        return keepdim ? out.view({1}) : out;
     }
     if (dims.empty()) {
         dims.resize(static_cast<size_t>(nd));
@@ -110,17 +103,16 @@ Tensor reduced(const Tensor& self, DType out_dtype, std::vector<int64_t> dims, b
             final_shape.push_back(x.sizes()[static_cast<size_t>(i)]);
         }
     }
-    Tensor out = empty_on(keep_shape, acc, index);
-    aclDataType acl_acc = ACL_DT_UNDEFINED;
-    TP_CHECK(acl_dtype_of(acc, &acl_acc), "reduction: no device element type for the result");
+    Tensor out = empty_on(keep_shape, out_dtype, index);
+    aclDataType acl_out = ACL_DT_UNDEFINED;
+    TP_CHECK(acl_dtype_of(out_dtype, &acl_out), "reduction: no device element type for the result");
     AclArgs args;
     const AclTensorRef xr = args.tensor(x);
     const AclIntArrayRef dimsr = args.ints(axes);
     const AclTensorRef outr = args.tensor(out);
     const OpApi& api = mode == ReduceMode::Mean ? mean_api() : sum_api();
-    api.run(index, xr, dimsr, true, acl_acc, outr);
-    const Tensor result = keepdim ? out : out.view(final_shape);
-    return acc == out_dtype ? result : cast_on_device(result, out_dtype);
+    api.run(index, xr, dimsr, true, acl_out, outr);
+    return keepdim ? out : out.view(final_shape);
 }
 
 Tensor sum_kernel(const Tensor& self, DType dtype) {
