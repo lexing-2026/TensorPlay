@@ -15,9 +15,10 @@ struct Box {
     int64_t width = 1; // elements the box spans
 };
 
-// The smallest range of elements that holds every element of ``t``.  Strides
-// may be negative (a reversed view), so the range is not always anchored at
-// the view's first element.
+// The smallest range of elements that holds every element of ``t``.  The
+// offset of an element is the sum of one reach per dimension, so the range
+// adds up the negative reaches below the first element and the positive ones
+// above it; strides may be negative (a reversed view).
 Box box_of(const Tensor& t) {
     Box box;
     int64_t hi = 0;
@@ -26,8 +27,8 @@ Box box_of(const Tensor& t) {
     for (size_t i = 0; i < sizes.size(); ++i) {
         if (sizes[i] <= 1) continue;
         const int64_t reach = (sizes[i] - 1) * strides[i];
-        box.lo = std::min(box.lo, reach);
-        hi = std::max(hi, reach);
+        box.lo += std::min<int64_t>(0, reach);
+        hi += std::max<int64_t>(0, reach);
     }
     box.width = hi - box.lo + 1;
     return box;
