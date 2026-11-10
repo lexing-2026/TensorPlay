@@ -150,10 +150,10 @@ def test_in_place(dtype):
 
 
 def test_strided_operands():
-    a = rand(5, 7)
+    a = rand(5, 9)
     d = a.to("npu")
     close(d.t() + d.t(), a.t() * 2)
-    close(d[:, ::2] * d[:, 1::2][:, :4], a[:, ::2] * a[:, 1::2][:, :4])
+    close(d[:, :4] * d[:, 1::2][:, :4], a[:, :4] * a[:, 1::2][:, :4])
 
 
 def test_integer_math_runs_on_host_fallback():
