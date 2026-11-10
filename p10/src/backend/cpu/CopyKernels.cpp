@@ -491,8 +491,16 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src_in, bool non_blocking) {
     }
 #endif
 
+    // A copy out of the out-of-tree device is the device backend's to do:
+    // only its copy kernel knows how to read its memory.
+    if (src.device().is_privateuse1()) {
+        return DispatchStub<Tensor&, Tensor&, const Tensor&, bool>::call(
+            "copy_", DispatchKey::PrivateUse1, self, src, non_blocking);
+    }
+
     if (!src.device().is_cpu()) {
-        throw std::runtime_error("copy_kernel only supports CPU, CUDA, Vulkan or MPS source");
+        throw std::runtime_error("copy_kernel only supports CPU, CUDA, Vulkan, MPS or "
+                                 "out-of-tree device source");
     }
 
     if (self.dim() == 0 && src.dim() == 0) {
