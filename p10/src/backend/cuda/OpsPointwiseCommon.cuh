@@ -11,6 +11,7 @@
 #include "CUDAComplex.cuh"
 #include "Scalar.h"
 #include "Exception.h"
+#include "OutWrite.h"
 #include "Utils.h"
 #include "TypePromotion.h"
 #include "CUDARuntime.h"
@@ -705,6 +706,31 @@ void launch_ew(dim3& grid, dim3& block, int64_t n) {
 
 // Binary on common promoted dtype.
 
+// Runs the promoted-dtype elementwise body into a destination whose shape and
+// width the caller has already matched to the allocating form.
+template <typename Op>
+void binary_same_into(const Tensor& ac, const Tensor& bc, const Tensor& out,
+                      Op op, const char* name) {
+    if (out.numel() == 0) return;
+    TensorIterator iter = TensorIteratorConfig()
+        .check_all_same_dtype(true)
+        .add_output(out)
+        .add_const_input(ac)
+        .add_const_input(bc)
+        .build();
+#define TP_BIN_INTO(ctype, name_) \
+    case DType::name_: \
+        gpu_kernel(iter, [op] __host__ __device__(ctype lhs, ctype rhs) -> ctype { \
+            return op(lhs, rhs); \
+        }); \
+        break;
+    switch (out.dtype()) {
+        TENSORPLAY_FORALL_SCALAR_TYPES(TP_BIN_INTO)
+        default: TP_THROW(TypeError, name, ": unsupported dtype");
+    }
+#undef TP_BIN_INTO
+}
+
 template <typename Op>
 Tensor binary_same_cuda(const Tensor& a_in, const Tensor& b_in, Op op, const char* name) {
     std::vector<int64_t> out_shape = broadcast_shapes(shape_of(a_in), shape_of(b_in));
@@ -712,26 +738,28 @@ Tensor binary_same_cuda(const Tensor& a_in, const Tensor& b_in, Op op, const cha
     Tensor ac = a_in.to(dt).expand(out_shape);
     Tensor bc = b_in.to(dt).expand(out_shape);
     Tensor out = Tensor::empty(out_shape, dt, a_in.device());
-    if (out.numel() == 0) return out;
-    TensorIterator iter = TensorIteratorConfig()
-        .check_all_same_dtype(true)
-        .add_output(out)
-        .add_const_input(ac)
-        .add_const_input(bc)
-        .build();
-#define TP_BIN(ctype, name_) \
-    case DType::name_: \
-        gpu_kernel(iter, [op] __host__ __device__(ctype lhs, ctype rhs) -> ctype { \
-            return op(lhs, rhs); \
-        }); \
-        break;
-    switch (dt) {
-        TENSORPLAY_FORALL_SCALAR_TYPES(TP_BIN)
-        default: TP_THROW(TypeError, name, ": unsupported dtype");
-    }
-#undef TP_BIN
+    binary_same_into(ac, bc, out, op, name);
     CUDA_CHECK(cudaGetLastError());
     return out;
+}
+
+// out= entry: computes into the caller's buffer when it already carries the
+// shape and width the allocating form produces and nothing that is read is
+// overwritten first; hands the value over otherwise.
+template <typename Op>
+Tensor& binary_same_cuda_out(const Tensor& a_in, const Tensor& b_in, Tensor& out,
+                             Op op, const char* name) {
+    const std::vector<int64_t> out_shape = broadcast_shapes(shape_of(a_in), shape_of(b_in));
+    const DType dt = promoteTypes(a_in.dtype(), b_in.dtype());
+    if (destination_takes(out, a_in.device(), dt, out_shape) &&
+        read_while_write_is_safe(a_in, out) && read_while_write_is_safe(b_in, out)) {
+        Tensor ac = a_in.to(dt).expand(out_shape);
+        Tensor bc = b_in.to(dt).expand(out_shape);
+        binary_same_into(ac, bc, out, op, name);
+        CUDA_CHECK(cudaGetLastError());
+        return out;
+    }
+    return write_out(out, binary_same_cuda(a_in, b_in, op, name));
 }
 
 template <typename Pred>
@@ -952,20 +980,18 @@ Tensor float_math_cuda(const Tensor& self, F f, const char* name) {
 
 // Math binary with floating promotion.
 
+// Runs the floating-compute elementwise body into a destination whose shape
+// and width the caller has already matched to the allocating form.  The width
+// the answer comes back in is `dt`; the half and bfloat16 widths widen and
+// narrow inside the single launch.
 template <typename F>
-Tensor binary_float_cuda(const Tensor& a_in, const Tensor& b_in, F f, const char* name) {
-    DType dt = promoteTypes(a_in.dtype(), b_in.dtype());
-    if (!isFloatingType(dt)) dt = DType::Float32;
-    DType compute_dt = (dt == DType::Float64) ? DType::Float64 : DType::Float32;
-    const std::vector<int64_t> out_shape = broadcast_shapes(
-        shape_of(a_in), shape_of(b_in));
-    // Half and bfloat16 operands stay in their own width: the widening and
-    // the narrowing happen inside the single elementwise launch.
+void binary_float_into(const Tensor& a_in, const Tensor& b_in, const Tensor& out,
+                       DType dt, const std::vector<int64_t>& out_shape, F f) {
+    if (out.numel() == 0) return;
+    const DType compute_dt = (dt == DType::Float64) ? DType::Float64 : DType::Float32;
     if (dt != compute_dt) {
         Tensor ac = a_in.expand(out_shape);
         Tensor bc = b_in.expand(out_shape);
-        Tensor out = Tensor::empty(out_shape, dt, a_in.device());
-        if (out.numel() == 0) return out;
         TensorIterator iter = TensorIteratorConfig()
             .check_all_same_dtype(true)
             .add_output(out)
@@ -981,13 +1007,10 @@ Tensor binary_float_cuda(const Tensor& a_in, const Tensor& b_in, F f, const char
                 return static_cast<BFloat16>(f(static_cast<float>(x), static_cast<float>(y)));
             });
         }
-        CUDA_CHECK(cudaGetLastError());
-        return out;
+        return;
     }
     Tensor ac = a_in.to(compute_dt).expand(out_shape);
     Tensor bc = b_in.to(compute_dt).expand(out_shape);
-    Tensor out = Tensor::empty(out_shape, compute_dt, a_in.device());
-    if (out.numel() == 0) return (dt == compute_dt) ? out : out.to(dt);
     TensorIterator iter = TensorIteratorConfig()
         .check_all_same_dtype(true)
         .add_output(out)
@@ -1004,8 +1027,37 @@ Tensor binary_float_cuda(const Tensor& a_in, const Tensor& b_in, F f, const char
                                         static_cast<double>(y)));
         });
     }
+}
+
+template <typename F>
+Tensor binary_float_cuda(const Tensor& a_in, const Tensor& b_in, F f, const char* name) {
+    DType dt = promoteTypes(a_in.dtype(), b_in.dtype());
+    if (!isFloatingType(dt)) dt = DType::Float32;
+    const std::vector<int64_t> out_shape = broadcast_shapes(
+        shape_of(a_in), shape_of(b_in));
+    Tensor out = Tensor::empty(out_shape, dt, a_in.device());
+    binary_float_into(a_in, b_in, out, dt, out_shape, f);
     CUDA_CHECK(cudaGetLastError());
-    return (dt == compute_dt) ? out : out.to(dt);
+    return out;
+}
+
+// out= entry: computes into the caller's buffer when it already carries the
+// shape and width the allocating form produces and nothing that is read is
+// overwritten first; hands the value over otherwise.
+template <typename F>
+Tensor& binary_float_cuda_out(const Tensor& a_in, const Tensor& b_in, Tensor& out,
+                              F f, const char* name) {
+    DType dt = promoteTypes(a_in.dtype(), b_in.dtype());
+    if (!isFloatingType(dt)) dt = DType::Float32;
+    const std::vector<int64_t> out_shape = broadcast_shapes(
+        shape_of(a_in), shape_of(b_in));
+    if (destination_takes(out, a_in.device(), dt, out_shape) &&
+        read_while_write_is_safe(a_in, out) && read_while_write_is_safe(b_in, out)) {
+        binary_float_into(a_in, b_in, out, dt, out_shape, f);
+        CUDA_CHECK(cudaGetLastError());
+        return out;
+    }
+    return write_out(out, binary_float_cuda(a_in, b_in, f, name));
 }
 
 // ---------------------------------------------------------------------------

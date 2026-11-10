@@ -200,6 +200,32 @@ Tensor floor_divide_scalar_cuda(const Tensor& self, const Scalar& other) {
     return div_rounded_scalar(self, other, DivRounding::kFloor);
 }
 
+// out= entry points for the tensor-tensor spellings: the generic promoted-dtype
+// and floating-compute bodies write into the caller's buffer when it already
+// carries the shape and width the allocating form produces, and hand the value
+// over otherwise.  The complex divide has a dedicated body, so it keeps the
+// allocating kernel and copies.
+Tensor& true_divide_tensor_out_cuda(const Tensor& self, const Tensor& other,
+                                    Tensor& out) {
+    if (isComplexType(self.dtype()) || isComplexType(other.dtype())) {
+        return write_out(out, div_kernel(self, other));
+    }
+    return binary_float_cuda_out(self, other, out, HFn1{}, "true_divide");
+}
+
+Tensor& remainder_tensor_out_cuda(const Tensor& self, const Tensor& other,
+                                  Tensor& out) {
+    return binary_same_cuda_out(self, other, out, RemainderTypedFn{}, "remainder");
+}
+
+Tensor& fmod_tensor_out_cuda(const Tensor& self, const Tensor& other, Tensor& out) {
+    return binary_same_cuda_out(self, other, out, FmodTypedFn{}, "fmod");
+}
+
+Tensor& floor_divide_out_cuda(const Tensor& self, const Tensor& other, Tensor& out) {
+    return binary_same_cuda_out(self, other, out, HFn8{true}, "floor_divide");
+}
+
 }  // namespace
 
 TENSORPLAY_LIBRARY_IMPL(CUDA, BinaryPointwiseKernels) {
@@ -207,12 +233,15 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, BinaryPointwiseKernels) {
     m.impl("rsub.Tensor", rsub_tensor_cuda);
     m.impl("true_divide.Tensor", true_divide_tensor_cuda);
     m.impl("true_divide.Scalar", true_divide_scalar_cuda);
+    m.impl("true_divide.out", true_divide_tensor_out_cuda);
     m.impl("divide.Tensor", divide_tensor_cuda);
     m.impl("divide.Scalar", divide_scalar_cuda);
     m.impl("remainder.Tensor", remainder_tensor_cuda);
     m.impl("remainder.Scalar", remainder_scalar_cuda);
+    m.impl("remainder.Tensor_out", remainder_tensor_out_cuda);
     m.impl("fmod.Tensor", fmod_tensor_cuda);
     m.impl("fmod.Scalar", fmod_scalar_cuda);
+    m.impl("fmod.Tensor_out", fmod_tensor_out_cuda);
     m.impl("subtract.Tensor", subtract_tensor_cuda);
     m.impl("subtract.Scalar", subtract_scalar_cuda);
     m.impl("multiply.Tensor", multiply_tensor_cuda);
@@ -224,6 +253,7 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, BinaryPointwiseKernels) {
     m.impl("divide.Scalar_mode", div_mode_scalar_cuda);
     m.impl("floor_divide", floor_divide_cuda);
     m.impl("floor_divide.Scalar", floor_divide_scalar_cuda);
+    m.impl("floor_divide.out", floor_divide_out_cuda);
 }
 
 }  // namespace cuda
