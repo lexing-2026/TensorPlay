@@ -536,7 +536,7 @@ if(USE_CUDA OR USE_ROCM OR USE_METAX)
         endforeach()
         # Device translation units go through mxcc; the host-compiled ones
         # stay in the source list.  The include set matches what a manual
-        # mxcc invocation needs (see backends/metax/tensorplay_metax).
+        # mxcc invocation needs (see cmake/LoadMACA.cmake).
         set(TP_METAX_CU_INCLUDES
             ${TP_MACA_INCLUDE_DIRS}
             ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -1066,7 +1066,7 @@ if(USE_METAX)
     # Host translation units of the device backend include the same
     # CUDA-spelling headers as the device ones, so the library include set
     # and the UINT_MAX workaround apply to the whole target.  The template
-    # libraries stay off this path (see maca.cmake).
+    # libraries stay off this path (see LoadMACA.cmake).
     target_include_directories(p10 PRIVATE ${TP_MACA_HOST_INCLUDE_DIRS})
     target_compile_options(p10 PRIVATE -include climits)
     target_link_directories(p10 PRIVATE ${TP_MACA_LIBRARY_DIR})

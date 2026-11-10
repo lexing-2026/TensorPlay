@@ -1,12 +1,12 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="../../../docs/images/metax-lockup-dark.svg">
-    <source media="(prefers-color-scheme: light)" srcset="../../../docs/images/metax-lockup.svg">
-    <img src="../../../docs/images/metax-lockup.svg" alt="MetaX 沐曦" width="420">
+    <source media="(prefers-color-scheme: dark)" srcset="images/metax-lockup-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="images/metax-lockup.svg">
+    <img src="images/metax-lockup.svg" alt="MetaX 沐曦" width="420">
   </picture>
 </p>
 
-<h1 align="center">tensorplay_metax</h1>
+<h1 align="center">MetaX (MACA) backend</h1>
 
 **MetaX (曦云) GPU backend for [TensorPlay]** — the CUDA device backend
 compiled for MetaX C500 cards through the MACA SDK (cu-bridge + mxcc).
@@ -51,8 +51,9 @@ written from scratch against the vendor library and it fills TensorPlay's
 out-of-tree `PrivateUse1` slot.  MACA instead ships a CUDA-compatible
 surface, so the cheaper and more faithful integration is in-tree: the same
 source files, selected by the same `USE_CUDA`-family switch as `USE_ROCM`,
-with only the build adapted.  That is why this directory holds a toolchain
-module and notes rather than a package.
+with only the build adapted.  MetaX therefore needs no package of its own —
+a toolchain module (`cmake/LoadMACA.cmake`) plus the reuse of the existing
+CUDA sources.
 
 ## Requirements
 
@@ -90,7 +91,7 @@ compiles therefore share one Ninja pool sized from physical memory
 
 ## Compiling one translation unit
 
-The flags below are what `cmake/maca.cmake` produces; they are also the
+The flags below are what `cmake/LoadMACA.cmake` produces; they are also the
 quickest way to check a source after a header change:
 
 ```bash
@@ -157,16 +158,15 @@ records arrive through the same path as on NVIDIA.
 
 | Path | Role |
 | --- | --- |
-| `cmake/maca.cmake` | SDK discovery, the `mxcc` compile rule, the device job pool, host/device include separation |
-| `bench_ops.py` | operator benchmark against the reference library, one library per process |
+| `cmake/LoadMACA.cmake` | SDK discovery, the `mxcc` compile rule, the device job pool, host/device include separation |
+| `benchmark/bench_metax_ops.py` | operator benchmark against the reference library, one library per process |
 | root `CMakeLists.txt` | the `USE_METAX` switch, SDK discovery, `_C` linkage |
 | `p10/CMakeLists.txt` | source selection, per-TU `mxcc` objects, the exclusion list |
 | `p10/src/backend/cuda/*.cu` | the reused device kernels |
 | `p10/include/BFloat16.h`, `p10/include/Half.h` | conversion intrinsics take integer paths under `mxcc` |
 | `p10/src/ProfilerCupti.cpp` | `libmcpti.so` as the tracing library in a MACA build |
 
-Paths without a prefix are relative to the repository root; the two files
-under this directory live in `backends/metax/tensorplay_metax/`.
+All paths are relative to the repository root.
 
 ## Status
 

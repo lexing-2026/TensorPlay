@@ -4,8 +4,8 @@
 Runs the same shapes through either library selected on the command line, so
 the two numbers are comparable:
 
-    python3 bench_ops.py torch
-    python3 bench_ops.py tensorplay
+    python3 benchmark/bench_metax_ops.py torch
+    python3 benchmark/bench_metax_ops.py tensorplay
 
 Every case reports milliseconds per call and the derived rate (memory
 bandwidth for elementwise work, FLOPs for GEMM).  Timings use device events

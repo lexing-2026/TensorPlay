@@ -79,7 +79,7 @@ endif()
 # only resolves paths and compile flags; the backend sources stay the CUDA
 # ones.
 if(USE_METAX)
-    include(${CMAKE_CURRENT_SOURCE_DIR}/backends/metax/tensorplay_metax/cmake/maca.cmake)
+    include(cmake/LoadMACA.cmake)
     if(NOT TP_MACA_FOUND)
         message(FATAL_ERROR
             "USE_METAX requested but no usable MACA SDK was found. Set MACA_PATH to the SDK root.")
@@ -220,7 +220,7 @@ if(USE_CUDA)
 elseif(USE_METAX)
     # No CUDA toolkit: the device compiler and the CUDA-spelling headers
     # come from the MACA SDK, and every device source is compiled by mxcc
-    # through the rules in backends/metax/tensorplay_metax/cmake.
+    # through the rules in cmake/LoadMACA.cmake.
     string(APPEND CMAKE_CXX_FLAGS " -DUSE_CUDA")
     message(STATUS "GPU backend: MACA (${TP_MACA_PATH})")
 else()
