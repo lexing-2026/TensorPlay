@@ -191,14 +191,14 @@ TensorPlay dispatches to eight backend families — five built in, each with a t
 
 | Backend | Target hardware | How to enable | Check availability |
 | ---- | ---- | ---- | ---- |
-| **CPU** | x86_64 / aarch64 CPUs with SIMD dispatch (AVX2/AVX512/NEON) and optional BLAS, oneDNN, MKL, NNPACK and OpenMP acceleration | always built in | `tp.cpu.is_available()` |
-| **CUDA** | NVIDIA GPUs — CUDA 12.x / 13.x, cuBLAS/cuDNN | `USE_CUDA=ON` (auto-detected) | `tp.cuda.is_available()` |
-| **ROCm / HIP** | AMD GPUs — ROCm 7.2, MIOpen | `USE_ROCM=ON` (mutually exclusive with CUDA) | build-time flag |
-| **MetaX (MACA)** | MetaX C500 (曦云) GPUs — MACA SDK, the CUDA-compatible sources compiled by `mxcc` | `USE_METAX=ON` (mutually exclusive with CUDA) | build-time flag |
-| **Vulkan** | Any Vulkan 1.0+ GPU — discrete NVIDIA/AMD or integrated Intel/AMD iGPU | `USE_VULKAN=ON` (auto-detected) | `tp.is_vulkan_available()` |
-| **MPS** | Apple GPUs on macOS via Metal Performance Shaders — Apple silicon integrated GPU and supported Mac discrete GPUs | `USE_MPS=ON` (auto-enabled on Apple) | `tp.mps.is_available()` |
-| **Cambricon MLU** | Cambricon MLU accelerators — CNRT driver, CNNL kernels, host fallback for the rest | [`tensorplay-mlu`](https://github.com/ohtensorplay/tensorplay-mlu) plugin, `pip install` from that repo | `device="mlu"` after the plugin loads |
-| **Ascend NPU** | Huawei Ascend NPUs — CANN toolkit, Ascend operator calls, host fallback for the rest | [`tensorplay-npu`](https://github.com/ohtensorplay/tensorplay-npu) plugin, `pip install` from that repo | `device="npu"` after the plugin loads |
+| <img src="docs/images/backends/cpu.svg" height="18" alt=""> **CPU** | x86_64 / aarch64 CPUs with SIMD dispatch (AVX2/AVX512/NEON) and optional BLAS, oneDNN, MKL, NNPACK and OpenMP acceleration | always built in | `tp.cpu.is_available()` |
+| <img src="docs/images/backends/nvidia.svg" height="18" alt=""> **CUDA** | NVIDIA GPUs — CUDA 12.x / 13.x, cuBLAS/cuDNN | `USE_CUDA=ON` (auto-detected) | `tp.cuda.is_available()` |
+| <img src="docs/images/backends/amd.svg" height="18" alt=""> **ROCm / HIP** | AMD GPUs — ROCm 7.2, MIOpen | `USE_ROCM=ON` (mutually exclusive with CUDA) | build-time flag |
+| <img src="docs/images/backends/metax.png" height="18" alt=""> **MetaX (MACA)** | MetaX C500 (曦云) GPUs — MACA SDK, the CUDA-compatible sources compiled by `mxcc` | `USE_METAX=ON` (mutually exclusive with CUDA) | build-time flag |
+| <img src="docs/images/backends/vulkan.svg" height="18" alt=""> **Vulkan** | Any Vulkan 1.0+ GPU — discrete NVIDIA/AMD or integrated Intel/AMD iGPU | `USE_VULKAN=ON` (auto-detected) | `tp.is_vulkan_available()` |
+| <img src="docs/images/backends/apple-mps.svg" height="18" alt=""> **MPS** | Apple GPUs on macOS via Metal Performance Shaders — Apple silicon integrated GPU and supported Mac discrete GPUs | `USE_MPS=ON` (auto-enabled on Apple) | `tp.mps.is_available()` |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/backends/cambricon-mlu-dark.png"><img src="docs/images/backends/cambricon-mlu.png" height="18" alt=""></picture> **Cambricon MLU** | Cambricon MLU accelerators — CNRT driver, CNNL kernels, host fallback for the rest | [`tensorplay-mlu`](https://github.com/ohtensorplay/tensorplay-mlu) plugin, `pip install` from that repo | `device="mlu"` after the plugin loads |
+| <img src="docs/images/backends/ascend.svg" height="18" alt=""> **Ascend NPU** | Huawei Ascend NPUs — CANN toolkit, Ascend operator calls, host fallback for the rest | [`tensorplay-npu`](https://github.com/ohtensorplay/tensorplay-npu) plugin, `pip install` from that repo | `device="npu"` after the plugin loads |
 
 ### Why TensorPlay
 
