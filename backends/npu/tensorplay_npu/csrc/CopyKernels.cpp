@@ -6,6 +6,7 @@
 #include <utility>
 
 #include "AscendAllocator.h"
+#include "AscendOpApi.h"
 #include "AscendRuntime.h"
 #include "AscendTensor.h"
 #include "Dispatcher.h"
@@ -80,9 +81,10 @@ void device_to_device(Tensor& self, const Tensor& src) {
         strided_copy(self, source);
         return;
     }
-    // The dtype conversion is not wired to the device yet: the host casts
-    // the values.
-    host_to_device(self, to_host_dense(source));
+    // The operator library converts the values on the device; the result
+    // then takes the ordinary strided copy into ``self``.
+    if (!source.is_contiguous()) source = contiguous_on_device(source);
+    strided_copy(self, cast_on_device(source, self.dtype()));
 }
 
 } // namespace

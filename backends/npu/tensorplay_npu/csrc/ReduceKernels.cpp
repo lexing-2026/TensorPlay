@@ -192,6 +192,27 @@ Tensor log_softmax_kernel(const Tensor& self, int64_t dim, bool half_to_float) {
     return softmax_forward(self, dim, log_softmax_api());
 }
 
+// The dtype-taking entry point shares the operator body: a requested result
+// type is reached by converting the operand first, exactly as the value
+// semantics of the operator describe.
+Tensor softmax_dtype_kernel(const Tensor& self, int64_t dim, DType dtype) {
+    const DType out = dtype == DType::Undefined ? self.dtype() : dtype;
+    if (!native_softmax(self) || !is_native_float(out) || !softmax_api().valid()) {
+        return cpu_fallback::Kernel<"softmax", sig::softmax>::call(self, dim, dtype);
+    }
+    const Tensor src = out == self.dtype() ? self : self.to(out);
+    return softmax_forward(src, dim, softmax_api());
+}
+
+Tensor log_softmax_dtype_kernel(const Tensor& self, int64_t dim, DType dtype) {
+    const DType out = dtype == DType::Undefined ? self.dtype() : dtype;
+    if (!native_softmax(self) || !is_native_float(out) || !log_softmax_api().valid()) {
+        return cpu_fallback::Kernel<"log_softmax", sig::log_softmax>::call(self, dim, dtype);
+    }
+    const Tensor src = out == self.dtype() ? self : self.to(out);
+    return softmax_forward(src, dim, log_softmax_api());
+}
+
 bool native_softmax_backward(const Tensor& grad_output, const Tensor& output, DType input_dtype) {
     return grad_output.device().is_privateuse1() && output.device().is_privateuse1() &&
            is_native_float(grad_output.dtype()) && output.dtype() == grad_output.dtype() &&
@@ -244,6 +265,8 @@ TENSORPLAY_LIBRARY_IMPL(PrivateUse1, NPUReduceKernels) {
     m.impl("sum.dim_IntList", static_cast<sig::sum__dim_IntList*>(&sum_dim_kernel));
     m.impl("mean", static_cast<sig::mean*>(&mean_kernel));
     m.impl("mean.dim", static_cast<sig::mean__dim*>(&mean_dim_kernel));
+    m.impl("softmax", static_cast<sig::softmax*>(&softmax_dtype_kernel));
+    m.impl("log_softmax", static_cast<sig::log_softmax*>(&log_softmax_dtype_kernel));
     m.impl("_softmax", static_cast<sig::_softmax*>(&softmax_kernel));
     m.impl("_log_softmax", static_cast<sig::_log_softmax*>(&log_softmax_kernel));
     m.impl("_softmax_backward_data",

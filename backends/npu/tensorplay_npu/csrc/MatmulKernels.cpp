@@ -150,6 +150,33 @@ Tensor matmul_kernel(const Tensor& self, const Tensor& other) {
     return product(matmul_api(), self, other, *shape);
 }
 
+// [.., K] @ [N, K]^T -> [.., N]: the leading dimensions flatten into the
+// rows of one product, so a single operator call covers every input rank.
+// The bias, when present, is the addend of the same call.
+Tensor linear_kernel(const Tensor& input, const Tensor& weight,
+                     const std::optional<Tensor>& bias) {
+    const bool has_bias = bias.has_value() && bias->defined();
+    const bool native = input.device().is_privateuse1() && weight.device().is_privateuse1() &&
+                        input.dtype() == weight.dtype() && is_native_float(input.dtype()) &&
+                        input.dim() >= 1 && weight.dim() == 2 &&
+                        !has_negative_stride(input) && !has_negative_stride(weight) &&
+                        input.numel() > 0 && weight.sizes()[1] > 0;
+    if (!native) {
+        return cpu_fallback::Kernel<"linear", sig::linear>::call(input, weight, bias);
+    }
+    const int64_t in_features = weight.sizes()[1];
+    const int64_t out_features = weight.sizes()[0];
+    TP_CHECK(input.sizes()[input.dim() - 1] == in_features, "linear: input has ",
+             input.sizes()[input.dim() - 1], " features, weight expects ", in_features);
+    const Tensor flat = input.reshape({input.numel() / in_features, in_features});
+    const Tensor wt = weight.t();
+    Tensor out = has_bias ? addmm_kernel(*bias, flat, wt, Scalar(1), Scalar(1))
+                          : mm_kernel(flat, wt);
+    std::vector<int64_t> shape(input.sizes().begin(), input.sizes().end());
+    shape[static_cast<size_t>(shape.size() - 1)] = out_features;
+    return out.view(shape);
+}
+
 } // namespace
 
 TENSORPLAY_LIBRARY_IMPL(PrivateUse1, NPUMatmulKernels) {
@@ -157,6 +184,7 @@ TENSORPLAY_LIBRARY_IMPL(PrivateUse1, NPUMatmulKernels) {
     m.impl("bmm", static_cast<sig::bmm*>(&bmm_kernel));
     m.impl("addmm", static_cast<sig::addmm*>(&addmm_kernel));
     m.impl("matmul", static_cast<sig::matmul*>(&matmul_kernel));
+    m.impl("linear", static_cast<sig::linear*>(&linear_kernel));
 }
 
 } // namespace npu
