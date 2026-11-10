@@ -159,7 +159,7 @@ At a granular level, TensorPlay consists of the following components:
 | Component | Description |
 | ---- | ---- |
 | **tensorplay** | The Python API: tensors, autograd, `nn`, `optim`, data loading, serialization — the public surface |
-| **p10** | C++ core engine: tensor storage and memory management, foundational CPU, CUDA, ROCm/HIP, MPS and Vulkan kernels |
+| **p10** | C++ core engine: tensor storage and memory management, foundational CPU, CUDA, ROCm/HIP, MetaX (MACA), MPS and Vulkan kernels |
 | **tpx** | Autograd layer: explicit computation-graph construction and backward execution, fully decoupled from the core |
 | **stax** | JIT compiler playground: static graph capture and operator fusion experiments, including native lowering of custom ops |
 | **tensorplay.nn** | Neural network building blocks: `Module`, `Linear`, `Conv2d`, activations, losses, containers — plus the modern LLM stack: rotary embeddings, grouped-query / latent / compressed-sparse attention, delta-rule linear attention, KV caches, autoregressive generation |
@@ -187,15 +187,18 @@ flowchart TB
 
 ### Supported Backends and Devices
 
-TensorPlay dispatches to five backend families, each with a transparent, readable kernel table:
+TensorPlay dispatches to eight backend families — five built in, each with a transparent, readable kernel table, plus three accelerator backends added through the two extension paths: MetaX in-tree (like ROCm, a build flag over shared sources), and Cambricon MLU and Huawei Ascend NPU as out-of-tree plugins over the `PrivateUse1` device slot (see [adding a device backend](docs/source/notes/backends.md)):
 
 | Backend | Target hardware | How to enable | Check availability |
 | ---- | ---- | ---- | ---- |
 | **CPU** | x86_64 / aarch64 CPUs with SIMD dispatch (AVX2/AVX512/NEON) and optional BLAS, oneDNN, MKL, NNPACK and OpenMP acceleration | always built in | `tp.cpu.is_available()` |
 | **CUDA** | NVIDIA GPUs — CUDA 12.x / 13.x, cuBLAS/cuDNN | `USE_CUDA=ON` (auto-detected) | `tp.cuda.is_available()` |
 | **ROCm / HIP** | AMD GPUs — ROCm 7.2, MIOpen | `USE_ROCM=ON` (mutually exclusive with CUDA) | build-time flag |
+| **MetaX (MACA)** | MetaX C500 (曦云) GPUs — MACA SDK, the CUDA-compatible sources compiled by `mxcc` | `USE_METAX=ON` (mutually exclusive with CUDA) | build-time flag |
 | **Vulkan** | Any Vulkan 1.0+ GPU — discrete NVIDIA/AMD or integrated Intel/AMD iGPU | `USE_VULKAN=ON` (auto-detected) | `tp.is_vulkan_available()` |
 | **MPS** | Apple GPUs on macOS via Metal Performance Shaders — Apple silicon integrated GPU and supported Mac discrete GPUs | `USE_MPS=ON` (auto-enabled on Apple) | `tp.mps.is_available()` |
+| **Cambricon MLU** | Cambricon MLU accelerators — CNRT driver, CNNL kernels, host fallback for the rest | [`tensorplay-mlu`](https://github.com/ohtensorplay/tensorplay-mlu) plugin, `pip install` from that repo | `device="mlu"` after the plugin loads |
+| **Ascend NPU** | Huawei Ascend NPUs — CANN toolkit, Ascend operator calls, host fallback for the rest | [`tensorplay-npu`](https://github.com/ohtensorplay/tensorplay-npu) plugin (sources also in [`backends/npu/`](backends/npu/)) | `device="npu"` after the plugin loads |
 
 ### Why TensorPlay
 
@@ -213,7 +216,7 @@ TensorPlay is not a thin binding over an opaque engine. The public surface — `
 
 #### DIY Hardware Acceleration
 
-The CPU, CUDA, Vulkan and MPS backends are deliberately simplified: one kernel family per file, one registration macro per unit, no hidden scheduling. That makes them a playground for learning parallel computing and prototyping kernels — bring your own device backend and wire it into the dispatcher without touching the framework itself. On macOS the MPS backend is enabled automatically and follows the same readable structure with one Objective-C++/Metal kernel file per operator family.
+The CPU, CUDA, Vulkan and MPS backends are deliberately simplified: one kernel family per file, one registration macro per unit, no hidden scheduling. That makes them a playground for learning parallel computing and prototyping kernels — bring your own device backend and wire it into the dispatcher without touching the framework itself. On macOS the MPS backend is enabled automatically and follows the same readable structure with one Objective-C++/Metal kernel file per operator family. The out-of-tree [`tensorplay-mlu`](https://github.com/ohtensorplay/tensorplay-mlu) and [`tensorplay-npu`](https://github.com/ohtensorplay/tensorplay-npu) plugins are that idea shipped: complete device backends — allocator, hooks, kernels, profiler — living outside this repository.
 
 #### An Explicit Autograd Engine
 
