@@ -160,6 +160,17 @@ def test_strided_operands():
     close(d, a + 1.0)
 
 
+def test_reversed_view_takes_the_host():
+    a = rand(5, 9)
+    d = a.to("npu")
+    rev = tp.as_strided(d, (5, 9), (-9, 1), 36)
+    close(rev + 1.0, a.flip(0) + 1.0)
+    close(rev.sum(dim=0), a.flip(0).sum(dim=0), scale=5)
+    close(tp.relu(rev), a.flip(0).relu())
+    rev.add_(2.0)
+    close(d, a + 2.0)
+
+
 def test_integer_math_runs_on_host_fallback():
     x = tp.arange(10).to("npu")
     assert tp.equal((x * 3 + 1).cpu(), tp.arange(10) * 3 + 1)
