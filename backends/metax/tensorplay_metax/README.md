@@ -1,46 +1,69 @@
-# tensorplay_metax
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="../../../docs/images/metax-lockup-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="../../../docs/images/metax-lockup.svg">
+    <img src="../../../docs/images/metax-lockup.svg" alt="MetaX 沐曦" width="420">
+  </picture>
+</p>
 
-Device backend for MetaX (曦云) GPUs, built on the MACA SDK.
+<h1 align="center">tensorplay_metax</h1>
 
-## Why this backend does not look like `tensorplay_mlu`
+**MetaX (曦云) GPU backend for [TensorPlay]** — the CUDA device backend
+compiled for MetaX C500 cards through the MACA SDK (cu-bridge + mxcc).
 
-`tensorplay_mlu` targets a runtime (CNRT/CNNL) whose API has no CUDA
-counterpart, so its kernels are written from scratch against the vendor
-library and the rest of the operator surface goes through host fallbacks.
+```python
+import tensorplay as tp
 
-MACA is different: `tools/cu-bridge` ships a CUDA-compatible surface
-(`cuda_runtime.h`, `cublas*.h`, `cudnn.h`, `nccl.h`, `curand*.h`, `cufft.h`,
-`cusolver*.h`, `cusparse*.h`, `cub`, `thrust`, `cutlass`) whose wrapper
-headers route each call to the `mc*` libraries, and `mxcc` compiles CUDA
-translation units for the `xcore1000` architecture. The CUDA backend sources
-therefore compile unchanged; only the build has to select `mxcc` and the
-MACA libraries.
+x = tp.randn(256, 256, device="cuda")   # a MACA build speaks the CUDA spelling
+y = (x @ x).relu()
+s = tp.softmax(x, dim=-1)
+print(float(y.sum()), float(s.sum()))
+```
+
+---
+
+## What this is
+
+TensorPlay's GPU backend is written once, against the CUDA surface, and the
+MACA stack is CUDA-compatible enough to target it from the same sources.  In
+a `-DUSE_METAX` build:
+
+- device kernels are the **CUDA backend sources compiled unchanged** by
+  `mxcc` for the `xcore1000` architecture;
+- runtime, BLAS, DNN, random, FFT, solver, sparse and collective calls go
+  through the **cu-bridge compatibility headers** (`cuda_runtime.h`,
+  `cublas*.h`, `cudnn.h`, `nccl.h`, ...) to the `mc*` libraries;
+- the device is spelled `"cuda"` and reached through `tensorplay.cuda`;
+- sources that need NVIDIA-only instructions are excluded (see below) and
+  their operators take the generic paths;
+- the profiler records kernels, copies and fills through `libmcpti`.
 
 Keeping the existing kernels is what makes the performance target
 meaningful: the elementwise, reduction, GEMM and convolution paths carry
 their CUDA tuning, instead of being rewritten against a vendor library that
 covers a fraction of the operators.
 
-## Layout
+### Why this is not a plugin like `tensorplay_mlu`
 
-```
-backends/metax/tensorplay_metax/
-├── cmake/maca.cmake     locate the SDK, compile a .cu with mxcc
-├── bench_ops.py         operator benchmark against the reference library
-└── README.md
-```
-
-The build itself is selected from the top-level tree with `-DUSE_METAX=ON`;
-this directory only carries the toolchain module and the notes.
+[`tensorplay_mlu`](https://github.com/ohtensorplay/tensorplay-mlu) targets a
+runtime (CNRT/CNNL) whose API has no CUDA counterpart, so its kernels are
+written from scratch against the vendor library and it fills TensorPlay's
+out-of-tree `PrivateUse1` slot.  MACA instead ships a CUDA-compatible
+surface, so the cheaper and more faithful integration is in-tree: the same
+source files, selected by the same `USE_CUDA`-family switch as `USE_ROCM`,
+with only the build adapted.  That is why this directory holds a toolchain
+module and notes rather than a package.
 
 ## Requirements
 
-- MACA SDK (tested with 3.3.0 at `/opt/maca`), driver loaded (`mx-smi` works)
-- cu-bridge extracted to `/opt/maca/tools/cu-bridge`
-- CMake >= 3.18, a C++20 host compiler
+- a MetaX C500 card with the driver loaded (`mx-smi` works)
+- MACA SDK (tested with 3.3.0), with `tools/cu-bridge` extracted
+- CMake >= 3.18 and a C++20 host compiler
 
-`MACA_PATH` overrides the SDK root; `TP_MACA_DEVICE_ARCH` overrides
-`xcore1000`.
+```bash
+export MACA_PATH=/opt/maca              # SDK root (default; overrides if relocated)
+# export TP_MACA_DEVICE_ARCH=xcore1000  # device arch (default)
+```
 
 ## Building
 
@@ -102,12 +125,76 @@ Four of those flags do real work:
 `build/generated` comes from `tools.codegen.main`; run it once before the
 first compile (see the top-level build, which does this automatically).
 
+## Supported operations
+
+The build compiles the whole CUDA backend except what this architecture
+cannot run:
+
+| Area | State in a MACA build |
+| --- | --- |
+| Elementwise, activations, reductions | CUDA kernels compiled by `mxcc` |
+| BLAS (`mm`, `addmm`, `bmm`, ...) | CUDA kernels calling `mcblas` through the cuBLAS compatibility headers |
+| Convolution | the shared and v7 cuDNN paths build against `mcdnn`; the v8 cuDNN-frontend graph API is excluded |
+| Quantized / grouped GEMM | excluded — inline PTX (`mma.sync`, `lop3`, `cp.async`); operators fall back to the generic paths |
+| Transformers attention | excluded — the flash and wide-tiled schedules draw on the same tensor-core surface; falls back |
+| Profiling | per-operation device time, kernel-level records through `libmcpti` |
+
+## Profiling
+
+```python
+from tensorplay.profiler import profile, ProfilerActivity
+
+with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+    train_step()
+print(prof.key_averages().table(sort_by="device_time_total", row_limit=10))
+```
+
+The MACA tracing library keeps the CUPTI entry points under its own name
+(`libmcpti.so`), so the profiler loads it first in a MACA build and the
+records arrive through the same path as on NVIDIA.
+
+## Layout
+
+| Path | Role |
+| --- | --- |
+| `cmake/maca.cmake` | SDK discovery, the `mxcc` compile rule, the device job pool, host/device include separation |
+| `bench_ops.py` | operator benchmark against the reference library, one library per process |
+| root `CMakeLists.txt` | the `USE_METAX` switch, SDK discovery, `_C` linkage |
+| `p10/CMakeLists.txt` | source selection, per-TU `mxcc` objects, the exclusion list |
+| `p10/src/backend/cuda/*.cu` | the reused device kernels |
+| `p10/include/BFloat16.h`, `p10/include/Half.h` | conversion intrinsics take integer paths under `mxcc` |
+| `p10/src/ProfilerCupti.cpp` | `libmcpti.so` as the tracing library in a MACA build |
+
+Paths without a prefix are relative to the repository root; the two files
+under this directory live in `backends/metax/tensorplay_metax/`.
+
 ## Status
 
 Verified on a MetaX C500 (64 GB, MACA 3.3.0):
 
 - a minimal `cudaMalloc` / kernel / `cudaMemcpy` program compiles and runs;
 - `CopyKernels.cu`, `Convolution.cu`, `TensorFactories.cu` and
-  `ActivationKernels.cu` compile with `mxcc`.
+  `ActivationKernels.cu` compile with `mxcc`;
+- the full-library build (415 translation units, device and host) is
+  running on the card server with no failures so far.
 
-Build integration and runtime bring-up are in progress.
+Operator and profiler validation on the card is in progress.
+
+## Compatibility
+
+| Component | Version |
+| --- | --- |
+| TensorPlay | in-tree backend; moves with the framework (`main`) |
+| MACA SDK | 3.3.0 (`/opt/maca`) |
+| Device | MetaX C500 (`xcore1000`) |
+| `mxcc` | cu-bridge, LLVM/clang 19 based |
+
+## License
+
+Apache License 2.0, as the rest of the repository.
+
+*MetaX, 曦云 and 沐曦 are trademarks of MetaX Technologies Inc.  This project
+is not affiliated with or endorsed by MetaX Technologies.  The lockup above
+is the vendor's public logo, used to identify the supported hardware.*
+
+[TensorPlay]: https://github.com/lexing-2026/TensorPlay
