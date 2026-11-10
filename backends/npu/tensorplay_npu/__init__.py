@@ -58,7 +58,10 @@ def _build(verbose: bool) -> ctypes.CDLL:
         "tensorplay_npu",
         sorted(glob.glob(os.path.join(_CSRC, "*.cpp"))),
         extra_cflags=["-O3", "-DNDEBUG", "-Wno-deprecated-declarations"],
-        extra_ldflags=[f"-L{libdir}", "-lascendcl", f"-Wl,-rpath,{libdir}"],
+        # aclCreateTensor and friends are the operator-side tensor API of
+        # libnnopbase, not the runtime API of libascendcl.
+        extra_ldflags=[f"-L{libdir}", "-lascendcl", "-lnnopbase", "-lopapi",
+                       f"-Wl,-rpath,{libdir}"],
         extra_include_paths=[_CSRC, os.path.join(home, "include")],
         verbose=verbose,
     )
