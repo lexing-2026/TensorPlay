@@ -548,6 +548,13 @@ set(GEN_AUTOCAST_CPP "${GEN_INCLUDE_DIR}/AutocastGenerated.cpp")
 set(GEN_TPX_REDISPATCH_H "${GEN_INCLUDE_DIR}/TensorRedispatchGenerated.h")
 set(GEN_STRUCTURED_H "${GEN_INCLUDE_DIR}/StructuredGenerated.h")
 set(GEN_PYTHON_DISPATCH_CPP "${GEN_INCLUDE_DIR}/PythonDispatchGenerated.cpp")
+set(GEN_KERNEL_SIGNATURES_H "${GEN_INCLUDE_DIR}/KernelSignatures.h")
+# Host fallback registration tables, split so they compile in parallel
+# (count: HOST_FALLBACK_CHUNKS in tools/codegen/gen_kernel_signatures.py).
+set(GEN_HOST_FALLBACK_CPPS)
+foreach(tp_chunk RANGE 7)
+    list(APPEND GEN_HOST_FALLBACK_CPPS "${GEN_INCLUDE_DIR}/HostFallbackRegistration_${tp_chunk}.cpp")
+endforeach()
 
 # Python Interface Stub Generation
 if(NOT DEFINED TP_PACKAGE_DIR)
@@ -570,7 +577,7 @@ add_custom_command(
 )
 
 # Add a custom target to ensure code generation runs before library building
-add_custom_target(generate_code DEPENDS ${GEN_HEADER} ${GEN_CPP} ${GEN_TPX_OPS_CPP} ${GEN_TPX_AUTOGRAD_REG_CPP} ${GEN_AUTOCAST_CPP} ${GEN_TPX_REDISPATCH_H} ${GEN_STRUCTURED_H} ${GEN_PYTHON_DISPATCH_CPP} ${TP_VERSION_PY})
+add_custom_target(generate_code DEPENDS ${GEN_HEADER} ${GEN_CPP} ${GEN_KERNEL_SIGNATURES_H} ${GEN_HOST_FALLBACK_CPPS} ${GEN_TPX_OPS_CPP} ${GEN_TPX_AUTOGRAD_REG_CPP} ${GEN_AUTOCAST_CPP} ${GEN_TPX_REDISPATCH_H} ${GEN_STRUCTURED_H} ${GEN_PYTHON_DISPATCH_CPP} ${TP_VERSION_PY})
 
 include_directories(${GEN_BASE_DIR})
 
@@ -1204,6 +1211,7 @@ add_custom_command(
                    ${GEN_AUTOGRAD_NODES_H} ${GEN_TPX_OPS_H} ${GEN_TPX_OPS_CPP}
                    ${GEN_TPX_AUTOGRAD_REG_CPP} ${GEN_AUTOCAST_CPP} ${GEN_TPX_REDISPATCH_H}
                    ${GEN_STRUCTURED_H} ${GEN_PYTHON_DISPATCH_CPP}
+                   ${GEN_KERNEL_SIGNATURES_H} ${GEN_HOST_FALLBACK_CPPS}
             COMMAND ${CMAKE_COMMAND} -E env PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR} ${Python_EXECUTABLE} -m tools.codegen.main
                     --yaml ${CMAKE_CURRENT_SOURCE_DIR}/config/native_functions.yaml
                     --derivatives ${CMAKE_CURRENT_SOURCE_DIR}/config/derivatives.yaml
@@ -1226,6 +1234,7 @@ add_custom_command(
                 ${CMAKE_CURRENT_SOURCE_DIR}/tools/codegen/gen_python_c.py
                 ${CMAKE_CURRENT_SOURCE_DIR}/tools/codegen/gen_structured.py
                 ${CMAKE_CURRENT_SOURCE_DIR}/tools/codegen/gen_inplace_or_view.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/tools/codegen/gen_kernel_signatures.py
                 ${tp_codegen_reference}
                 ${CMAKE_CURRENT_SOURCE_DIR}/src/bindings/python/CPythonBridge.h
                 ${CMAKE_CURRENT_SOURCE_DIR}/src/bindings/python/CPythonBridge.cpp
@@ -1237,6 +1246,7 @@ set_source_files_properties(
     ${GEN_AUTOGRAD_NODES_H} ${GEN_TPX_OPS_H} ${GEN_TPX_OPS_CPP}
     ${GEN_TPX_AUTOGRAD_REG_CPP} ${GEN_AUTOCAST_CPP} ${GEN_TPX_REDISPATCH_H}
     ${GEN_STRUCTURED_H} ${GEN_PYTHON_DISPATCH_CPP}
+    ${GEN_KERNEL_SIGNATURES_H} ${GEN_HOST_FALLBACK_CPPS}
     PROPERTIES GENERATED TRUE
 )
 

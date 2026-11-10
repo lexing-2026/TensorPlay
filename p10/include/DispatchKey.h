@@ -6,71 +6,73 @@
 
 namespace tensorplay {
 
+// Backend components, in dispatch-key order.  Every layered key family
+// (autograd, autocast, vmap) holds one key per component, laid out in this
+// same order, so a backend added here receives all of its layers at once.
+//
+// PrivateUse1 is the slot reserved for a backend that lives outside this
+// repository: an extension registers kernels, an allocator and device hooks
+// for it at load time and may give the device a name of its own (see
+// Device.h).
+#define TENSORPLAY_FORALL_BACKEND_COMPONENTS(_) \
+    _(CPU)                                      \
+    _(CUDA)                                     \
+    _(Vulkan)                                   \
+    _(SparseCPU)                                \
+    _(SparseCUDA)                               \
+    _(Sparse)                                   \
+    _(Meta)                                     \
+    _(MPS)                                      \
+    _(PrivateUse1)
+
 // Dispatch keys used by the runtime.
 //
 // Backend keys occupy the low bits; the Python key sits directly above them,
-// autograd keys above that, and autocast keys above the autograd keys.
-// Dispatch walks from the numerically largest key down, so the priority is
-// Autocast > Autograd > Python > backend. Sparse layouts form their own
-// backend component: a tensor whose storage is sparse metadata carries the
-// Sparse key instead of the dense backend key of its device.
+// autograd keys above that, then autocast keys and vmap keys.  Dispatch
+// walks from the numerically largest key down, so the priority is
+// Vmap > Autocast > Autograd > Python > backend.  Sparse layouts form their
+// own backend component: a tensor whose storage is sparse metadata carries
+// the Sparse key instead of the dense backend key of its device.
 enum class DispatchKey : uint8_t {
-    CPU = 0,
-    CUDA = 1,
-    Vulkan = 2,
-    SparseCPU = 3,
-    SparseCUDA = 4,
-    Sparse = 5,
-    Meta = 6,
-    MPS = 7,
-    Python = 8,
-    DynamicLayerBackMode = 9,
-    AutogradCPU = 10,
-    AutogradCUDA = 11,
-    AutogradVulkan = 12,
-    AutogradSparseCPU = 13,
-    AutogradSparseCUDA = 14,
-    AutogradSparse = 15,
-    AutogradMeta = 16,
-    AutogradMPS = 17,
-    AutocastCPU = 18,
-    AutocastCUDA = 19,
-    AutocastVulkan = 20,
-    AutocastSparseCPU = 21,
-    AutocastSparseCUDA = 22,
-    AutocastSparse = 23,
-    AutocastMeta = 24,
-    AutocastMPS = 25,
-    VmapCPU = 26,
-    VmapCUDA = 27,
-    VmapVulkan = 28,
-    VmapSparseCPU = 29,
-    VmapSparseCUDA = 30,
-    VmapSparse = 31,
-    VmapMeta = 32,
-    VmapMPS = 33,
-    Composite = 34,
-    VmapMode = 35,
-    DynamicLayerFrontMode = 36,
-    EndOfKeys = 37
+#define TP_DISPATCH_BACKEND_KEY(name) name,
+    TENSORPLAY_FORALL_BACKEND_COMPONENTS(TP_DISPATCH_BACKEND_KEY)
+#undef TP_DISPATCH_BACKEND_KEY
+    Python,
+    DynamicLayerBackMode,
+#define TP_DISPATCH_AUTOGRAD_KEY(name) Autograd##name,
+    TENSORPLAY_FORALL_BACKEND_COMPONENTS(TP_DISPATCH_AUTOGRAD_KEY)
+#undef TP_DISPATCH_AUTOGRAD_KEY
+#define TP_DISPATCH_AUTOCAST_KEY(name) Autocast##name,
+    TENSORPLAY_FORALL_BACKEND_COMPONENTS(TP_DISPATCH_AUTOCAST_KEY)
+#undef TP_DISPATCH_AUTOCAST_KEY
+#define TP_DISPATCH_VMAP_KEY(name) Vmap##name,
+    TENSORPLAY_FORALL_BACKEND_COMPONENTS(TP_DISPATCH_VMAP_KEY)
+#undef TP_DISPATCH_VMAP_KEY
+    Composite,
+    VmapMode,
+    DynamicLayerFrontMode,
+    EndOfKeys
 };
 
-constexpr size_t kBackendKeyCount = 8;
-constexpr size_t kAutogradKeyOffset = 10;
-constexpr size_t kAutocastKeyOffset = 18;
-constexpr size_t kVmapKeyOffset = 26;
+constexpr size_t kBackendKeyCount =
+    static_cast<size_t>(DispatchKey::Python);
+constexpr size_t kAutogradKeyOffset =
+    static_cast<size_t>(DispatchKey::AutogradCPU);
+constexpr size_t kAutocastKeyOffset =
+    static_cast<size_t>(DispatchKey::AutocastCPU);
+constexpr size_t kVmapKeyOffset =
+    static_cast<size_t>(DispatchKey::VmapCPU);
 
-static_assert(static_cast<size_t>(DispatchKey::AutogradCPU) ==
-                  static_cast<size_t>(DispatchKey::CPU) + kAutogradKeyOffset,
-              "autograd key offset out of sync with the key layout");
-static_assert(static_cast<size_t>(DispatchKey::AutocastCPU) ==
-                  static_cast<size_t>(DispatchKey::CPU) + kAutocastKeyOffset,
-              "autocast key offset out of sync with the key layout");
-static_assert(static_cast<size_t>(DispatchKey::VmapCPU) ==
-                  static_cast<size_t>(DispatchKey::CPU) + kVmapKeyOffset,
-              "vmap key offset out of sync with the key layout");
-static_assert(static_cast<size_t>(DispatchKey::Python) > static_cast<size_t>(DispatchKey::Sparse) &&
-                  static_cast<size_t>(DispatchKey::Python) < static_cast<size_t>(DispatchKey::DynamicLayerBackMode),
+static_assert(static_cast<size_t>(DispatchKey::EndOfKeys) <= 64,
+              "DispatchKeySet holds one bit per key in a 64-bit mask");
+static_assert(kAutocastKeyOffset == kAutogradKeyOffset + kBackendKeyCount &&
+                  kVmapKeyOffset == kAutocastKeyOffset + kBackendKeyCount &&
+                  static_cast<size_t>(DispatchKey::Composite) ==
+                      kVmapKeyOffset + kBackendKeyCount,
+              "each layered key family must hold exactly one key per backend");
+static_assert(static_cast<size_t>(DispatchKey::Python) == kBackendKeyCount &&
+                  static_cast<size_t>(DispatchKey::Python) <
+                      static_cast<size_t>(DispatchKey::DynamicLayerBackMode),
               "the Python key must sit between the backends and every transform/autograd layer");
 
 inline constexpr DispatchKey toAutocastKey(DispatchKey backend) {
@@ -86,14 +88,13 @@ inline constexpr DispatchKey toVmapKey(DispatchKey backend) {
 }
 
 inline constexpr bool is_autocast_key(DispatchKey key) {
-    // Autocast keys occupy [kAutocastKeyOffset, kAutocastKeyOffset + kBackendKeyCount).
     const uint8_t k = static_cast<uint8_t>(key);
     return k >= kAutocastKeyOffset && k < kAutocastKeyOffset + kBackendKeyCount;
 }
 
 inline constexpr bool is_autograd_key(DispatchKey key) {
-    // Autograd keys occupy [kAutogradKeyOffset, kAutogradKeyOffset + kBackendKeyCount);
-    // the Composite key sits above them and must not be classified as autograd.
+    // The Composite key sits above every layered family and is not
+    // classified as autograd.
     const uint8_t k = static_cast<uint8_t>(key);
     return k >= kAutogradKeyOffset && k < kAutogradKeyOffset + kBackendKeyCount;
 }
@@ -103,16 +104,14 @@ inline constexpr bool is_vmap_key(DispatchKey key) {
     return k >= kVmapKeyOffset && k < kVmapKeyOffset + kBackendKeyCount;
 }
 
-// True for the backend component keys (dense backends and the sparse
-// layout family).
+// True for the backend component keys (dense backends, the sparse layout
+// family and the out-of-tree slot).
 inline constexpr bool is_backend_key(DispatchKey key) {
-    return key == DispatchKey::CPU || key == DispatchKey::CUDA ||
-           key == DispatchKey::Vulkan || key == DispatchKey::SparseCPU ||
-           key == DispatchKey::SparseCUDA || key == DispatchKey::Sparse ||
-           key == DispatchKey::Meta || key == DispatchKey::MPS;
+    return static_cast<size_t>(key) < kBackendKeyCount;
 }
 
-// The backend component of an autocast or autograd key (identity for backend keys).
+// The backend component of an autocast, autograd or vmap key (identity for
+// backend keys).
 inline constexpr DispatchKey toBackendKey(DispatchKey key) {
     return is_vmap_key(key)
         ? static_cast<DispatchKey>(static_cast<uint8_t>(key) - kVmapKeyOffset)
@@ -125,38 +124,13 @@ inline constexpr DispatchKey toBackendKey(DispatchKey key) {
 
 inline std::string toString(DispatchKey key) {
     switch (key) {
-        case DispatchKey::CPU: return "CPU";
-        case DispatchKey::CUDA: return "CUDA";
-        case DispatchKey::Vulkan: return "Vulkan";
-        case DispatchKey::SparseCPU: return "SparseCPU";
-        case DispatchKey::SparseCUDA: return "SparseCUDA";
-        case DispatchKey::Sparse: return "Sparse";
-        case DispatchKey::Meta: return "Meta";
-        case DispatchKey::MPS: return "MPS";
-        case DispatchKey::AutocastCPU: return "AutocastCPU";
-        case DispatchKey::AutocastCUDA: return "AutocastCUDA";
-        case DispatchKey::AutocastVulkan: return "AutocastVulkan";
-        case DispatchKey::AutocastSparseCPU: return "AutocastSparseCPU";
-        case DispatchKey::AutocastSparseCUDA: return "AutocastSparseCUDA";
-        case DispatchKey::AutocastSparse: return "AutocastSparse";
-        case DispatchKey::AutocastMeta: return "AutocastMeta";
-        case DispatchKey::AutocastMPS: return "AutocastMPS";
-        case DispatchKey::AutogradCPU: return "AutogradCPU";
-        case DispatchKey::AutogradCUDA: return "AutogradCUDA";
-        case DispatchKey::AutogradVulkan: return "AutogradVulkan";
-        case DispatchKey::AutogradSparseCPU: return "AutogradSparseCPU";
-        case DispatchKey::AutogradSparseCUDA: return "AutogradSparseCUDA";
-        case DispatchKey::AutogradSparse: return "AutogradSparse";
-        case DispatchKey::AutogradMeta: return "AutogradMeta";
-        case DispatchKey::AutogradMPS: return "AutogradMPS";
-        case DispatchKey::VmapCPU: return "VmapCPU";
-        case DispatchKey::VmapCUDA: return "VmapCUDA";
-        case DispatchKey::VmapVulkan: return "VmapVulkan";
-        case DispatchKey::VmapSparseCPU: return "VmapSparseCPU";
-        case DispatchKey::VmapSparseCUDA: return "VmapSparseCUDA";
-        case DispatchKey::VmapSparse: return "VmapSparse";
-        case DispatchKey::VmapMeta: return "VmapMeta";
-        case DispatchKey::VmapMPS: return "VmapMPS";
+#define TP_DISPATCH_KEY_NAMES(name)                                   \
+        case DispatchKey::name: return #name;                         \
+        case DispatchKey::Autograd##name: return "Autograd" #name;    \
+        case DispatchKey::Autocast##name: return "Autocast" #name;    \
+        case DispatchKey::Vmap##name: return "Vmap" #name;
+        TENSORPLAY_FORALL_BACKEND_COMPONENTS(TP_DISPATCH_KEY_NAMES)
+#undef TP_DISPATCH_KEY_NAMES
         case DispatchKey::Composite: return "Composite";
         case DispatchKey::VmapMode: return "VmapMode";
         case DispatchKey::DynamicLayerFrontMode: return "DynamicLayerFrontMode";
@@ -238,7 +212,29 @@ public:
         return DispatchKeySet(mask_ & ~vmap_mask);
     }
 
+    // One family of layered keys, every backend included.
+    static constexpr DispatchKeySet autograd_keys() {
+        return family(kAutogradKeyOffset);
+    }
+    static constexpr DispatchKeySet autocast_keys() {
+        return family(kAutocastKeyOffset);
+    }
+    static constexpr DispatchKeySet vmap_keys() {
+        return family(kVmapKeyOffset);
+    }
+    static constexpr DispatchKeySet backend_keys() {
+        return family(0);
+    }
+
 private:
+    static constexpr DispatchKeySet family(size_t offset) {
+        raw_t mask = 0;
+        for (size_t i = 0; i < kBackendKeyCount; ++i) {
+            mask |= raw_t(1) << (i + offset);
+        }
+        return DispatchKeySet(mask);
+    }
+
     raw_t mask_ = 0;
 };
 

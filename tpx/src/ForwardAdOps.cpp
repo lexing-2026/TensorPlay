@@ -89,13 +89,19 @@ TENSORPLAY_LIBRARY_IMPL(Composite, ForwardAdComposite) {
 // storage-level kernel serves there: _unpack_dual carries no backward
 // formula, so there is no autograd bookkeeping to add.  (_fw_primal has one;
 // its generated autograd kernel redispatches to the composite kernel.)
-TENSORPLAY_LIBRARY_IMPL(AutogradCPU, ForwardAdAutogradCPU) {
-    m.impl("_unpack_dual", unpack_dual_native);
-}
-
-TENSORPLAY_LIBRARY_IMPL(AutogradCUDA, ForwardAdAutogradCUDA) {
-    m.impl("_unpack_dual", unpack_dual_native);
-}
+// Every backend's autograd key is covered, the out-of-tree one included.
+namespace {
+struct RegisterUnpackDualAutograd {
+    RegisterUnpackDualAutograd() {
+        auto& dispatcher = Dispatcher::singleton();
+        for (size_t i = 0; i < kBackendKeyCount; ++i) {
+            dispatcher.registerKernel(
+                "_unpack_dual", toAutogradKey(static_cast<DispatchKey>(i)),
+                &unpack_dual_native);
+        }
+    }
+} register_unpack_dual_autograd;
+} // namespace
 
 } // namespace tpx
 } // namespace tensorplay

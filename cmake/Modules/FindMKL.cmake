@@ -278,8 +278,24 @@ if(MKL_FOUND AND NOT TARGET MKL::MKL)
         set_target_properties(MKL::MKL PROPERTIES
             INTERFACE_INCLUDE_DIRECTORIES "${MKL_INCLUDE_DIR}")
     endif()
+    # The static archives reference each other in a cycle (the interface
+    # layer calls into the threading layer, which calls back into core), so
+    # a single left-to-right pass leaves symbols unresolved.  A shared
+    # library accepts that at link time and fails at load time, hence the
+    # explicit group.
+    set(_tp_mkl_link_libraries "${MKL_LIBRARIES}")
+    if(UNIX AND NOT APPLE)
+        foreach(_tp_mkl_lib IN LISTS MKL_LIBRARIES)
+            if(_tp_mkl_lib MATCHES "\\.a$")
+                set(_tp_mkl_link_libraries
+                    "-Wl,--start-group" ${MKL_LIBRARIES} "-Wl,--end-group")
+                break()
+            endif()
+        endforeach()
+    endif()
     set_target_properties(MKL::MKL PROPERTIES
-        INTERFACE_LINK_LIBRARIES "${MKL_LIBRARIES}")
+        INTERFACE_LINK_LIBRARIES "${_tp_mkl_link_libraries}")
+    unset(_tp_mkl_link_libraries)
 endif()
 
 set(MKL_INCLUDE_DIRS "${MKL_INCLUDE_DIR}")

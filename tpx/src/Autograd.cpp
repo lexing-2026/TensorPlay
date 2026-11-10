@@ -981,15 +981,7 @@ struct BelowConversionAutograd {
     std::optional<tensorplay::impl::ExcludeDispatchKeyGuard> guard;
     BelowConversionAutograd() {
         if (!tensorplay::transform::are_transforms_active()) {
-            guard.emplace(
-                DispatchKeySet::make(DispatchKey::AutogradCPU) |
-                DispatchKeySet::make(DispatchKey::AutogradCUDA) |
-                DispatchKeySet::make(DispatchKey::AutogradVulkan) |
-                DispatchKeySet::make(DispatchKey::AutogradSparseCPU) |
-                DispatchKeySet::make(DispatchKey::AutogradSparseCUDA) |
-                DispatchKeySet::make(DispatchKey::AutogradSparse) |
-                DispatchKeySet::make(DispatchKey::AutogradMeta) |
-                DispatchKeySet::make(DispatchKey::AutogradMPS));
+            guard.emplace(DispatchKeySet::autograd_keys());
         }
     }
 };

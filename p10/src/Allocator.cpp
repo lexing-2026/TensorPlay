@@ -1,6 +1,9 @@
 #include "Allocator.h"
 #include "Exception.h"
+#include "PrivateUse1Hooks.h"
 #include "Profiler.h"
+#include <array>
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <cstdlib>
@@ -164,6 +167,11 @@ void copyAllocationBytes(void* destination, const Device& destination_device,
         std::memcpy(destination, source, nbytes);
         return;
     }
+    if (destination_device.is_privateuse1() || source_device.is_privateuse1()) {
+        get_privateuse1_hooks().copy_bytes(destination, destination_device,
+                                           source, source_device, nbytes);
+        return;
+    }
 #ifdef USE_VULKAN
     if (destination_device.is_vulkan() || source_device.is_vulkan()) {
         vulkan::copyHostVisibleBytes(
@@ -224,9 +232,71 @@ Allocator* getVulkanAllocator();
 Allocator* getMPSAllocator();
 #endif
 
+namespace {
+
+struct RegisteredAllocator {
+    std::atomic<Allocator*> allocator{nullptr};
+    uint8_t priority = 0;
+};
+
+std::array<RegisteredAllocator, kDeviceTypeCount>& registered_allocators() {
+    static std::array<RegisteredAllocator, kDeviceTypeCount> slots;
+    return slots;
+}
+
+std::mutex& registered_allocators_lock() {
+    static std::mutex lock;
+    return lock;
+}
+
+// Device types this build serves with an allocator of its own.
+bool has_builtin_allocator(DeviceType t) {
+    switch (t) {
+        case DeviceType::CPU:
+        case DeviceType::Meta:
+            return true;
+#ifdef USE_CUDA
+        case DeviceType::CUDA:
+            return true;
+#endif
+#ifdef USE_VULKAN
+        case DeviceType::Vulkan:
+            return true;
+#endif
+#ifdef USE_MPS
+        case DeviceType::MPS:
+            return true;
+#endif
+        default:
+            return false;
+    }
+}
+
+} // namespace
+
+void SetAllocator(DeviceType t, Allocator* allocator, uint8_t priority) {
+    TP_CHECK(allocator != nullptr, "SetAllocator: allocator must not be null");
+    TP_CHECK(!has_builtin_allocator(t),
+             "SetAllocator: device type '", device_type_name(t),
+             "' is served by this build's own allocator and cannot be replaced");
+    auto& slot = registered_allocators()[static_cast<size_t>(t)];
+    std::lock_guard<std::mutex> guard(registered_allocators_lock());
+    if (slot.allocator.load(std::memory_order_acquire) != nullptr &&
+        priority < slot.priority) {
+        return;
+    }
+    slot.priority = priority;
+    slot.allocator.store(allocator, std::memory_order_release);
+}
+
 Allocator* getAllocator(DeviceType t) {
     if (t == DeviceType::CPU) {
         return getCPUAllocator();
+    }
+    if (Allocator* registered =
+            registered_allocators()[static_cast<size_t>(t)].allocator.load(
+                std::memory_order_acquire)) {
+        return registered;
     }
     if (t == DeviceType::Meta) {
         return getMetaAllocator();
@@ -247,7 +317,16 @@ Allocator* getAllocator(DeviceType t) {
     }
 #endif
 
-    TP_THROW(NotImplementedError, "Allocator not implemented for this device type");
+    if (t == DeviceType::PrivateUse1) {
+        TP_THROW(NotImplementedError,
+                 "no allocator is registered for the out-of-tree backend '" +
+                     get_privateuse1_backend() +
+                     "'; its extension registers one with "
+                     "REGISTER_ALLOCATOR(DeviceType::PrivateUse1, ...)");
+    }
+    TP_THROW(NotImplementedError,
+             "Allocator not implemented for device type '" +
+                 device_type_name(t) + "' in this build");
 }
 
 } // namespace tensorplay

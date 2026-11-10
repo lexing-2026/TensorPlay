@@ -44,6 +44,8 @@ inline constexpr DispatchKey get_autocast_dispatch_key_from_device_type(
             return DispatchKey::AutocastVulkan;
         case DeviceType::Meta:
             return DispatchKey::AutocastMeta;
+        case DeviceType::PrivateUse1:
+            return DispatchKey::AutocastPrivateUse1;
         default:
             TP_THROW(NotImplementedError,
                 "unknown device type for autocast in get_autocast_dispatch_key_from_device_type");
@@ -69,6 +71,8 @@ inline constexpr DeviceType get_device_type_from_autocast_key(DispatchKey key) {
             // The meta device owns no data, so autocast is never enabled
             // for it; the key still maps so state queries stay total.
             return DeviceType::Meta;
+        case DispatchKey::AutocastPrivateUse1:
+            return DeviceType::PrivateUse1;
         default:
             TP_THROW(NotImplementedError,
                 "unknown autocast dispatch key in get_device_type_from_autocast_key");
@@ -80,11 +84,14 @@ constexpr std::array<DeviceType, 3> _AUTOCAST_SUPPORTED_DEVICES{
     DeviceType::CUDA,
     DeviceType::MPS};
 
+// The out-of-tree device joins once a backend has named it: its autocast
+// layer runs the same policy as CUDA (see tools/codegen/gen_autocast.py).
 inline bool is_autocast_available(DeviceType device_type) {
     for (const auto& supported : _AUTOCAST_SUPPORTED_DEVICES) {
         if (supported == device_type) return true;
     }
-    return false;
+    return device_type == DeviceType::PrivateUse1 &&
+           is_privateuse1_backend_registered();
 }
 
 // ------------------------------------------------------------------

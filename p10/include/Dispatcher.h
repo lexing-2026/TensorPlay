@@ -47,6 +47,7 @@ inline DispatchKey computeDispatchKey(const Device& device) {
     if (device.is_vulkan()) return DispatchKey::Vulkan;
     if (device.is_meta()) return DispatchKey::Meta;
     if (device.is_mps()) return DispatchKey::MPS;
+    if (device.is_privateuse1()) return DispatchKey::PrivateUse1;
     return DispatchKey::CPU;
 }
 

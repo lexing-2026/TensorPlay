@@ -2444,12 +2444,9 @@ struct BatchRulePlumbing<Function, Random, Return (*)(Args...)> {
     static inline OperatorHandle handle;
 
     static Return call(Args... args) {
-        auto excluded = DispatchKeySet::make(DispatchKey::VmapCPU) |
-            DispatchKeySet::make(DispatchKey::VmapCUDA) |
-            DispatchKeySet::make(DispatchKey::VmapVulkan) |
-            DispatchKeySet::make(DispatchKey::VmapSparseCPU) |
-            DispatchKeySet::make(DispatchKey::VmapSparseCUDA) |
-            DispatchKeySet::make(DispatchKey::VmapSparse);
+        // Every backend's vmap key: a batched meta, MPS or out-of-tree
+        // tensor re-entering here would otherwise run its batch rule again.
+        auto excluded = DispatchKeySet::vmap_keys();
         if constexpr (Random) excluded.add(DispatchKey::VmapMode);
         impl::ExcludeDispatchKeyGuard guard(excluded);
         const Layer layer = current_vmap_layer();

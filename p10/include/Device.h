@@ -29,6 +29,23 @@ enum class DeviceType : int8_t {
     #undef DEFINE_DEVICE_TYPE
 };
 
+constexpr size_t kDeviceTypeCount = static_cast<size_t>(DeviceType::Unknown) + 1;
+
+// The out-of-tree device slot.  Until a backend names it, the slot is
+// spelled "privateuseone"; an extension may register one name of its own
+// (e.g. "npu"), once per process, after which device strings, printing and
+// the Python ``device.type`` all use that name.  The default spelling keeps
+// parsing either way.
+P10_API void register_privateuse1_backend(const std::string& backend_name);
+P10_API bool is_privateuse1_backend_registered();
+P10_API std::string get_privateuse1_backend(bool lower_case = true);
+
+// Lower-case spelling of a device type ("cuda", "mps", or the registered
+// out-of-tree name).
+P10_API std::string device_type_name(DeviceType type);
+// Device type for a lower-case spelling; throws ValueError when unknown.
+P10_API DeviceType parse_device_type(const std::string& name);
+
 // Device class to represent computation device
 class P10_API Device {
 private:
@@ -56,27 +73,12 @@ public:
     // parsed "mps:0" round-trips to the same spelling.
     bool is_mps() const { return type_ == DeviceType::MPS; }
 
-    // Convert device to string representation using macro-based mapping
-    std::string toString() const {
-        switch (type_) {
-            #define CASE_DEVICE_TYPE(name) \
-                case DeviceType::name: { \
-                    std::string result = #name; \
-                    /* Convert to lowercase */ \
-                    for (auto& c : result) c = std::tolower(c); \
-                    /* Handle device index for accelerator devices */ \
-                    if ((DeviceType::name == DeviceType::CUDA || DeviceType::name == DeviceType::Vulkan || DeviceType::name == DeviceType::MPS || DeviceType::name == DeviceType::CPU) && index_ >= 0) { \
-                        result += ":" + std::to_string(index_); \
-                    } \
-                    return result; \
-                }
-            TENSORPLAY_FORALL_DEVICE_TYPES(CASE_DEVICE_TYPE)
-            #undef CASE_DEVICE_TYPE
-            default:
-                return "unknown";
-        }
-    }
-    
+    bool is_privateuse1() const { return type_ == DeviceType::PrivateUse1; }
+
+    // "cpu", "cuda:1", "mps:0", or the registered out-of-tree name with its
+    // index.  Indexed devices print their index when one is set.
+    std::string toString() const;
+
     bool operator==(const Device& other) const {
         if (type_ != other.type_) return false;
         // Treat all CPU devices as the same, regardless of index

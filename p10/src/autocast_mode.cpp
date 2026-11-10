@@ -16,25 +16,26 @@ namespace {
 // the autocasting region.
 thread_local int nesting = 0;
 
-// The order of this array MUST exactly match the definition order of
-// DeviceType in Device.h.
-constexpr size_t kNumDeviceTypes = 3; // CPU, CUDA, Unknown
-thread_local std::array<DType, kNumDeviceTypes> autocast_dtype = {
-    DType::BFloat16, // CPU
-    DType::Float16,  // CUDA
-    DType::Undefined, // Unknown
-};
+// One slot per device type, indexed by DeviceType.  CPU defaults to
+// bfloat16; the accelerators, the out-of-tree one included, to float16.
+constexpr std::array<DType, kDeviceTypeCount> default_autocast_dtypes() {
+    std::array<DType, kDeviceTypeCount> dtypes{};
+    for (auto& dtype : dtypes) dtype = DType::Undefined;
+    dtypes[static_cast<size_t>(DeviceType::CPU)] = DType::BFloat16;
+    dtypes[static_cast<size_t>(DeviceType::CUDA)] = DType::Float16;
+    dtypes[static_cast<size_t>(DeviceType::MPS)] = DType::Float16;
+    dtypes[static_cast<size_t>(DeviceType::PrivateUse1)] = DType::Float16;
+    return dtypes;
+}
+thread_local std::array<DType, kDeviceTypeCount> autocast_dtype =
+    default_autocast_dtypes();
 
 // Should we enable the cache inside autocast.
 thread_local bool cache_enabled = true;
 
 // excluded set (all Autocast keys start excluded); a plain flag per device is
 // the equivalent contract for TensorPlay's explicit-key dispatch.
-thread_local std::array<bool, kNumDeviceTypes> autocast_enabled = {
-    false, // CPU
-    false, // CUDA
-    false, // Unknown
-};
+thread_local std::array<bool, kDeviceTypeCount> autocast_enabled{};
 
 // ------------------------------------------------------------------
 // Cast cache: thread-local, lock-free on the hot path.
@@ -78,14 +79,7 @@ void prune_expired(std::unordered_map<TensorImpl*, CacheEntry>& cache) {
 
 } // anonymous namespace
 size_t device_index(DeviceType device_type) {
-    switch (device_type) {
-        case DeviceType::CPU:
-            return 0;
-        case DeviceType::CUDA:
-            return 1;
-        default:
-            return 2;
-    }
+    return static_cast<size_t>(device_type);
 }
 
 } // anonymous namespace

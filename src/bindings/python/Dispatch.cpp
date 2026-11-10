@@ -20,89 +20,29 @@
 
 namespace {
 
-// Key order follows the dispatch walk: backend, then autograd, autocast and
-// vmap layers, then the backend-neutral composite key.
-const tensorplay::DispatchKey kDumpKeys[] = {
-    tensorplay::DispatchKey::CPU,
-    tensorplay::DispatchKey::CUDA,
-    tensorplay::DispatchKey::Vulkan,
-    tensorplay::DispatchKey::SparseCPU,
-    tensorplay::DispatchKey::SparseCUDA,
-    tensorplay::DispatchKey::Sparse,
-    tensorplay::DispatchKey::Meta,
-    tensorplay::DispatchKey::MPS,
-    tensorplay::DispatchKey::Python,
-    tensorplay::DispatchKey::AutogradCPU,
-    tensorplay::DispatchKey::AutogradCUDA,
-    tensorplay::DispatchKey::AutogradVulkan,
-    tensorplay::DispatchKey::AutogradSparseCPU,
-    tensorplay::DispatchKey::AutogradSparseCUDA,
-    tensorplay::DispatchKey::AutogradSparse,
-    tensorplay::DispatchKey::AutogradMeta,
-    tensorplay::DispatchKey::AutogradMPS,
-    tensorplay::DispatchKey::AutocastCPU,
-    tensorplay::DispatchKey::AutocastCUDA,
-    tensorplay::DispatchKey::AutocastVulkan,
-    tensorplay::DispatchKey::AutocastSparseCPU,
-    tensorplay::DispatchKey::AutocastSparseCUDA,
-    tensorplay::DispatchKey::AutocastSparse,
-    tensorplay::DispatchKey::AutocastMeta,
-    tensorplay::DispatchKey::AutocastMPS,
-    tensorplay::DispatchKey::VmapCPU,
-    tensorplay::DispatchKey::VmapCUDA,
-    tensorplay::DispatchKey::VmapVulkan,
-    tensorplay::DispatchKey::VmapSparseCPU,
-    tensorplay::DispatchKey::VmapSparseCUDA,
-    tensorplay::DispatchKey::VmapSparse,
-    tensorplay::DispatchKey::VmapMeta,
-    tensorplay::DispatchKey::VmapMPS,
-    tensorplay::DispatchKey::Composite,
-    tensorplay::DispatchKey::VmapMode,
-    tensorplay::DispatchKey::DynamicLayerFrontMode,
-    tensorplay::DispatchKey::DynamicLayerBackMode,
-};
+// Every dispatch key in numeric order: backends, the Python key, then the
+// autograd, autocast and vmap layers, then the backend-neutral composite key
+// and the transform modes.  Built from the key enumeration itself so a
+// backend added there is listed here without further edits.
+const std::vector<tensorplay::DispatchKey>& dump_keys() {
+    static const std::vector<tensorplay::DispatchKey> keys = [] {
+        std::vector<tensorplay::DispatchKey> out;
+        const auto end = static_cast<uint8_t>(tensorplay::DispatchKey::EndOfKeys);
+        for (uint8_t k = 0; k < end; ++k) {
+            out.push_back(static_cast<tensorplay::DispatchKey>(k));
+        }
+        return out;
+    }();
+    return keys;
+}
 
 tensorplay::DispatchKey parse_key_or_throw(const std::string& name) {
     static const std::unordered_map<std::string, tensorplay::DispatchKey>
-        kByName = {
-            {"CPU", tensorplay::DispatchKey::CPU},
-            {"CUDA", tensorplay::DispatchKey::CUDA},
-            {"Vulkan", tensorplay::DispatchKey::Vulkan},
-            {"SparseCPU", tensorplay::DispatchKey::SparseCPU},
-            {"SparseCUDA", tensorplay::DispatchKey::SparseCUDA},
-            {"Sparse", tensorplay::DispatchKey::Sparse},
-            {"Meta", tensorplay::DispatchKey::Meta},
-            {"MPS", tensorplay::DispatchKey::MPS},
-            {"Python", tensorplay::DispatchKey::Python},
-            {"AutogradCPU", tensorplay::DispatchKey::AutogradCPU},
-            {"AutogradCUDA", tensorplay::DispatchKey::AutogradCUDA},
-            {"AutogradVulkan", tensorplay::DispatchKey::AutogradVulkan},
-            {"AutogradSparseCPU", tensorplay::DispatchKey::AutogradSparseCPU},
-            {"AutogradSparseCUDA", tensorplay::DispatchKey::AutogradSparseCUDA},
-            {"AutogradSparse", tensorplay::DispatchKey::AutogradSparse},
-            {"AutogradMeta", tensorplay::DispatchKey::AutogradMeta},
-            {"AutogradMPS", tensorplay::DispatchKey::AutogradMPS},
-            {"AutocastCPU", tensorplay::DispatchKey::AutocastCPU},
-            {"AutocastCUDA", tensorplay::DispatchKey::AutocastCUDA},
-            {"AutocastVulkan", tensorplay::DispatchKey::AutocastVulkan},
-            {"AutocastSparseCPU", tensorplay::DispatchKey::AutocastSparseCPU},
-            {"AutocastSparseCUDA", tensorplay::DispatchKey::AutocastSparseCUDA},
-            {"AutocastSparse", tensorplay::DispatchKey::AutocastSparse},
-            {"AutocastMeta", tensorplay::DispatchKey::AutocastMeta},
-            {"AutocastMPS", tensorplay::DispatchKey::AutocastMPS},
-            {"VmapCPU", tensorplay::DispatchKey::VmapCPU},
-            {"VmapCUDA", tensorplay::DispatchKey::VmapCUDA},
-            {"VmapVulkan", tensorplay::DispatchKey::VmapVulkan},
-            {"VmapSparseCPU", tensorplay::DispatchKey::VmapSparseCPU},
-            {"VmapSparseCUDA", tensorplay::DispatchKey::VmapSparseCUDA},
-            {"VmapSparse", tensorplay::DispatchKey::VmapSparse},
-            {"VmapMeta", tensorplay::DispatchKey::VmapMeta},
-            {"VmapMPS", tensorplay::DispatchKey::VmapMPS},
-            {"Composite", tensorplay::DispatchKey::Composite},
-            {"VmapMode", tensorplay::DispatchKey::VmapMode},
-            {"DynamicLayerFrontMode", tensorplay::DispatchKey::DynamicLayerFrontMode},
-            {"DynamicLayerBackMode", tensorplay::DispatchKey::DynamicLayerBackMode},
-        };
+        kByName = [] {
+            std::unordered_map<std::string, tensorplay::DispatchKey> out;
+            for (auto key : dump_keys()) out.emplace(tensorplay::toString(key), key);
+            return out;
+        }();
     auto it = kByName.find(name);
     if (it == kByName.end()) {
         TP_THROW(RuntimeError, "unknown dispatch key: ", name);
@@ -133,7 +73,7 @@ void init_dispatch(py::module_& m) {
         auto& dispatcher = tensorplay::Dispatcher::singleton();
         py::dict dump;
         bool any = false;
-        for (auto key : kDumpKeys) {
+        for (auto key : dump_keys()) {
             if (dispatcher.has_kernel(op_name, key)) {
                 any = true;
                 dump[py::str(tensorplay::toString(key))] = py::str("registered");
@@ -159,7 +99,7 @@ void init_dispatch(py::module_& m) {
     // given backend implements an op without dumping the whole table).
     m.def("_dispatch_has_kernel", [](const std::string& op_name) -> bool {
         auto& dispatcher = tensorplay::Dispatcher::singleton();
-        for (auto key : kDumpKeys) {
+        for (auto key : dump_keys()) {
             if (dispatcher.has_kernel(op_name, key)) return true;
         }
         return false;
@@ -188,46 +128,14 @@ void init_dispatch(py::module_& m) {
 
     // Dispatch key <-> name conversions (round trip: the enum exposes the
     // same names, so parse(toString(k)) == k).
-    py::enum_<tensorplay::DispatchKey>(m, "DispatchKey",
-        "Dispatch keys of the runtime, in dispatch-priority order: autocast\n"
-        "keys outrank autograd keys, which outrank backend keys.")
-        .value("CPU", tensorplay::DispatchKey::CPU)
-        .value("CUDA", tensorplay::DispatchKey::CUDA)
-        .value("Vulkan", tensorplay::DispatchKey::Vulkan)
-        .value("SparseCPU", tensorplay::DispatchKey::SparseCPU)
-        .value("SparseCUDA", tensorplay::DispatchKey::SparseCUDA)
-        .value("Sparse", tensorplay::DispatchKey::Sparse)
-        .value("Meta", tensorplay::DispatchKey::Meta)
-        .value("MPS", tensorplay::DispatchKey::MPS)
-        .value("AutogradCPU", tensorplay::DispatchKey::AutogradCPU)
-        .value("AutogradCUDA", tensorplay::DispatchKey::AutogradCUDA)
-        .value("AutogradVulkan", tensorplay::DispatchKey::AutogradVulkan)
-        .value("AutogradSparseCPU", tensorplay::DispatchKey::AutogradSparseCPU)
-        .value("AutogradSparseCUDA", tensorplay::DispatchKey::AutogradSparseCUDA)
-        .value("AutogradSparse", tensorplay::DispatchKey::AutogradSparse)
-        .value("AutogradMeta", tensorplay::DispatchKey::AutogradMeta)
-        .value("AutogradMPS", tensorplay::DispatchKey::AutogradMPS)
-        .value("AutocastCPU", tensorplay::DispatchKey::AutocastCPU)
-        .value("AutocastCUDA", tensorplay::DispatchKey::AutocastCUDA)
-        .value("AutocastVulkan", tensorplay::DispatchKey::AutocastVulkan)
-        .value("AutocastSparseCPU", tensorplay::DispatchKey::AutocastSparseCPU)
-        .value("AutocastSparseCUDA", tensorplay::DispatchKey::AutocastSparseCUDA)
-        .value("AutocastSparse", tensorplay::DispatchKey::AutocastSparse)
-        .value("AutocastMeta", tensorplay::DispatchKey::AutocastMeta)
-        .value("AutocastMPS", tensorplay::DispatchKey::AutocastMPS)
-        .value("VmapCPU", tensorplay::DispatchKey::VmapCPU)
-        .value("VmapCUDA", tensorplay::DispatchKey::VmapCUDA)
-        .value("VmapVulkan", tensorplay::DispatchKey::VmapVulkan)
-        .value("VmapSparseCPU", tensorplay::DispatchKey::VmapSparseCPU)
-        .value("VmapSparseCUDA", tensorplay::DispatchKey::VmapSparseCUDA)
-        .value("VmapSparse", tensorplay::DispatchKey::VmapSparse)
-        .value("VmapMeta", tensorplay::DispatchKey::VmapMeta)
-        .value("VmapMPS", tensorplay::DispatchKey::VmapMPS)
-        .value("Composite", tensorplay::DispatchKey::Composite)
-        .value("VmapMode", tensorplay::DispatchKey::VmapMode)
-        .value("DynamicLayerFrontMode", tensorplay::DispatchKey::DynamicLayerFrontMode)
-        .value("DynamicLayerBackMode", tensorplay::DispatchKey::DynamicLayerBackMode)
-        .value("Python", tensorplay::DispatchKey::Python)
+    py::enum_<tensorplay::DispatchKey> dispatch_key_enum(m, "DispatchKey",
+        "Dispatch keys of the runtime, in dispatch-priority order: vmap keys\n"
+        "outrank autocast keys, which outrank autograd keys, which outrank\n"
+        "backend keys.");
+    for (auto key : dump_keys()) {
+        dispatch_key_enum.value(tensorplay::toString(key).c_str(), key);
+    }
+    dispatch_key_enum
         .export_values();
 
     // Kernels whose registered signature differs from the operator's
@@ -241,7 +149,7 @@ void init_dispatch(py::module_& m) {
             const std::type_info* expected =
                 dispatcher.signature(op, tensorplay::DispatchKey::Python);
             if (expected == nullptr) continue;
-            for (auto key : kDumpKeys) {
+            for (auto key : dump_keys()) {
                 if (key == tensorplay::DispatchKey::Python) continue;
                 if (!dispatcher.has_kernel(op, key)) continue;
                 const std::type_info* registered = dispatcher.signature(op, key);
@@ -273,7 +181,7 @@ void init_dispatch(py::module_& m) {
     m.def("_dispatch_keys", [](const Tensor& t) {
         std::vector<std::string> names;
         if (!t.defined()) return names;
-        for (auto key : kDumpKeys) {
+        for (auto key : dump_keys()) {
             if (key == tensorplay::DispatchKey::Composite) continue;
             if (t.key_set().has(key)) {
                 names.push_back(tensorplay::toString(key));
@@ -288,7 +196,7 @@ void init_dispatch(py::module_& m) {
     // of its own resolves through the composite key.
     m.def("_dispatch_get_backend_keyset_from_composite", []() {
         std::vector<std::string> names;
-        for (auto key : kDumpKeys) {
+        for (auto key : dump_keys()) {
             if (tensorplay::is_backend_key(key)) {
                 names.push_back(tensorplay::toString(key));
             }

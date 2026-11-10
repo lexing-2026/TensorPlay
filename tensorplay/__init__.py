@@ -1465,6 +1465,14 @@ def get_device_module(device=None):
         except ModuleNotFoundError:
             device_module = None
     if device_module is None:
+        # The renamed out-of-tree device without a module of its own is
+        # served by one built on its device hooks.
+        from .utils.backend_registration import _default_device_module
+
+        device_module = _default_device_module(device_module_name)
+        if device_module is not None:
+            _register_device_module(device_module_name, device_module)
+    if device_module is None:
         raise RuntimeError(
             f"Device '{device_module_name}' does not have a corresponding module "
             f"registered as 'tensorplay.{device_module_name}'."
@@ -1594,6 +1602,26 @@ else:
             globals()[name] = value
             return value
         raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
+
+
+def _register_device_module(device_type: str, module) -> None:
+    """Install ``module`` as ``tensorplay.<device_type>``.
+
+    ``device_type`` must name a device this process understands (for the
+    out-of-tree device, the name given to
+    :func:`tensorplay.utils.rename_privateuse1_backend`).  The module then
+    answers :func:`get_device_module` and the ``tensorplay.accelerator``
+    queries for that device.  Each device type takes one module.
+    """
+    device_type = Device(device_type).type
+    package = sys.modules[__name__]
+    if device_type in package.__dict__:
+        raise RuntimeError(
+            f"The runtime module of '{device_type}' has already been "
+            f"registered with '{package.__dict__[device_type]}'"
+        )
+    setattr(package, device_type, module)
+    sys.modules[f"{__name__}.{device_type}"] = module
 
 
 def _import_device_backends():

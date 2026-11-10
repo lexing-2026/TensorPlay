@@ -5,6 +5,11 @@ import weakref
 import tensorplay
 
 from . import data
+from .backend_registration import (
+    generate_methods_for_privateuse1_backend,
+    get_privateuse1_backend_name,
+    rename_privateuse1_backend,
+)
 
 
 def set_module(obj, mod):
@@ -52,6 +57,6 @@ def __getattr__(name):
     # import_module, not ``from . import``: a from-import probes the parent
     # with hasattr, which re-enters this hook before the submodule lands and
     # recurses without bound.
-    if name in ("viz", "tensorboard", "cpp_jit"):
+    if name in ("viz", "tensorboard", "cpp_jit", "cpp_extension"):
         return importlib.import_module(f".{name}", __name__)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

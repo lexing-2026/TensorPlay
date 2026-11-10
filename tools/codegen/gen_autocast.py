@@ -129,7 +129,13 @@ _CPU_POLICIES: dict[str, set[str]] = {
     'promote': set(CPU_PROMOTE),
 }
 
-_DEVICE_POLICIES = {'CPU': _CPU_POLICIES, 'CUDA': _CUDA_POLICIES}
+# The out-of-tree accelerator slot runs the CUDA policy: its lower-precision
+# dtype is float16 unless the backend's user picks another.
+_DEVICE_POLICIES = {
+    'CPU': _CPU_POLICIES,
+    'CUDA': _CUDA_POLICIES,
+    'PrivateUse1': _CUDA_POLICIES,
+}
 
 
 def autocast_policy_of(func_name: str, device_key: str | None = None) -> str | None:
@@ -198,7 +204,7 @@ def generate_autocast_registration(funcs: list[NativeFunction]) -> str:
         # Out/mutable variants are excluded from autocast:
         if any(a.type.is_mutable_ref for a in f.args):
             continue
-        for device_key in ('CPU', 'CUDA'):
+        for device_key in _DEVICE_POLICIES:
             # Overload-aware policy lookup: an explicit full name wins; the
             # bare base name matches only the plain variant so overloaded
             # entries are wrapped individually when both are listed.
@@ -273,6 +279,7 @@ def generate_autocast_registration(funcs: list[NativeFunction]) -> str:
     for device_key, lib_key, lib_name in (
         ('CPU', 'AutocastCPU', 'AutocastKernelsCPU'),
         ('CUDA', 'AutocastCUDA', 'AutocastKernelsCUDA'),
+        ('PrivateUse1', 'AutocastPrivateUse1', 'AutocastKernelsPrivateUse1'),
     ):
         lines.append(f'TENSORPLAY_LIBRARY_IMPL({lib_key}, {lib_name}) {{')
         for name, kernel, key in kernels:

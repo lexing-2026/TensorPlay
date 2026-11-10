@@ -164,14 +164,26 @@ def get_device_capability(device=None) -> dict[str, Any]:
 def current_stream(device=None):
     """The currently selected stream for an accelerator device."""
     index = _resolve_device(device, optional=True)
-    _require_accelerator()
-    return tensorplay.cuda.current_stream(index)
+    return _stream_entry("current_stream")(index)
 
 
 def set_stream(stream) -> None:
     """Select the current stream for the accelerator device."""
-    _require_accelerator()
-    tensorplay.cuda.set_stream(stream)
+    _stream_entry("set_stream")(stream)
+
+
+def _stream_entry(name: str):
+    """``name`` from the accelerator's device module; a backend without
+    streams (the default out-of-tree module) says so instead of failing
+    somewhere inside another device's runtime."""
+    module = _device_module_for_accelerator()
+    entry = getattr(module, name, None)
+    if entry is None:
+        raise RuntimeError(
+            f"the {_require_accelerator().type} device module does not provide "
+            f"{name}; its backend has no stream API"
+        )
+    return entry
 
 
 def synchronize(device=None) -> None:

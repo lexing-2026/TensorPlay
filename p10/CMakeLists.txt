@@ -6,6 +6,8 @@ set(P10_SOURCES
     src/Device.cpp
     src/Dispatcher.cpp
     src/DispatchStub.cpp
+    src/PrivateUse1Hooks.cpp
+    src/HostFallback.cpp
     src/Exception.cpp
     src/FileCheck.cpp
     src/Generator.cpp
@@ -192,6 +194,7 @@ set(P10_SOURCES
     
     # Generated
     ${GEN_CPP}
+    ${GEN_HOST_FALLBACK_CPPS}
 )
 if(USE_CUDA OR USE_ROCM)
     set(TP_CUDA_BACKEND_SOURCES
@@ -721,7 +724,7 @@ if(USE_VULKAN)
         ${TP_VULKAN_GEN_CPP}
     )
 endif()
-set_source_files_properties(${GEN_CPP} ${GEN_TPX_OPS_CPP}
+set_source_files_properties(${GEN_CPP} ${GEN_TPX_OPS_CPP} ${GEN_HOST_FALLBACK_CPPS}
     ${GEN_TPX_AUTOGRAD_REG_CPP} ${GEN_AUTOCAST_CPP}
     PROPERTIES GENERATED TRUE)
 # ------------------------------------------------------------------
@@ -1075,7 +1078,7 @@ if(USE_CUDA)
     target_compile_definitions(p10 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:CCCL_DISABLE_CTK_COMPATIBILITY_CHECK>)
 endif()
 # Exclude generated files from UNITY_BUILD as they might cause conflicts or be too large
-set_source_files_properties(${GEN_CPP} PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
+set_source_files_properties(${GEN_CPP} ${GEN_HOST_FALLBACK_CPPS} PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
 add_dependencies(p10 generate_code)
 target_include_directories(p10 PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

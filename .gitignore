@@ -1,16 +1,9 @@
 # Build and temporary files
 build/
-release_build/
-rebuild_build/
 *.egg-info/
 dist/
-release_site/
 .idea/
-.trae/
 .pytest_cache/
-.zcode/
-data_torch/
-logs_*/
 
 # Compiled binaries
 *.dll
@@ -105,6 +98,4 @@ docs/whitepaper/*.toc
 
 # Autosummary stubs are generated at docs build time, never committed.
 docs/source/generated/
-
-# Standalone book repository, developed and versioned on its own.
 docs/ebook/

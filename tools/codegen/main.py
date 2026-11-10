@@ -179,6 +179,17 @@ def _gen_python_dispatch(ctx: CodegenContext) -> None:
     ctx.write("PythonDispatchGenerated.cpp", source)
 
 
+@register_generator("KernelSignatures")
+def _gen_kernel_signatures(ctx: CodegenContext) -> None:
+    from .gen_kernel_signatures import (
+        generate_host_fallback_tables,
+        generate_kernel_signatures_header,
+    )
+    ctx.write("KernelSignatures.h", generate_kernel_signatures_header(ctx.funcs))
+    for name, source in generate_host_fallback_tables(ctx.funcs).items():
+        ctx.write(name, source)
+
+
 @register_generator("Structured")
 def _gen_structured(ctx: CodegenContext) -> None:
     from .gen_structured import _gen_structured as gen
@@ -217,7 +228,7 @@ def _gen_pyi(ctx: CodegenContext) -> None:
 DEFAULT_TARGETS = ["TensorMethods", "Redispatch", "AutogradNodes", "TPXOps",
                    "AutogradRegistration", "Bindings", "Autocast",
                    "InplaceOrView", "Structured", "PythonFunctional",
-                   "PythonCAPI", "PythonDispatch"]
+                   "PythonCAPI", "PythonDispatch", "KernelSignatures"]
 
 
 def run_gen(ctx: CodegenContext, targets: list[str]) -> None:

@@ -10,13 +10,19 @@
 namespace tensorplay {
 namespace {
 
+// cpu, cuda, mps, or the name the out-of-tree backend registered.
 DeviceType device_type_from_string(const std::string& device_type) {
     if (device_type == "cpu") return DeviceType::CPU;
     if (device_type == "cuda") return DeviceType::CUDA;
     if (device_type == "mps") return DeviceType::MPS;
+    if (is_privateuse1_backend_registered() &&
+        device_type == get_privateuse1_backend(true)) {
+        return DeviceType::PrivateUse1;
+    }
     TP_THROW(ValueError,
-             "Expected one of cpu, cuda or mps device types, but got " +
-                 device_type);
+             "Expected one of cpu, cuda, mps or " +
+                 get_privateuse1_backend(true) +
+                 " device types, but got " + device_type);
 }
 
 } // anonymous namespace
@@ -28,8 +34,10 @@ void init_autocast(py::module_& m) {
 
     // raises) for unsupported device types.
     m.def("_is_autocast_available", [](const std::string& device_type) {
+        const bool privateuse1 = is_privateuse1_backend_registered() &&
+                                 device_type == get_privateuse1_backend(true);
         if (device_type != "cpu" && device_type != "cuda" &&
-            device_type != "mps")
+            device_type != "mps" && !privateuse1)
             return false;
         return autocast::is_autocast_available(device_type_from_string(device_type));
     }, "device_type"_a);

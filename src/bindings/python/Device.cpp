@@ -2,6 +2,7 @@
 #include "tensorplay/ops/Config.h"
 #include "Context.h"
 #include "Device.h" // For Device class and cuda namespace declarations
+#include "PrivateUse1Hooks.h"
 #include "cpu/vec/intrinsics.h"
 
 #include <optional>
@@ -50,6 +51,18 @@ struct CudaDeviceProperties {
 #include "backend/mps/MPSDevice.h"
 #include "backend/mps/MPSRuntime.h"
 #endif
+
+namespace {
+
+// A named out-of-tree backend with device hooks is the process's
+// accelerator, ahead of any in-tree one: installing such a backend is how a
+// process says which device it runs on.
+bool privateuse1_is_accelerator() {
+    return tensorplay::is_privateuse1_backend_registered() &&
+           tensorplay::is_privateuse1_hooks_registered();
+}
+
+} // namespace
 
 void init_device(py::module_& m) {
     py::enum_<DeviceType>(m, "DeviceType")
@@ -129,12 +142,7 @@ void init_device(py::module_& m) {
             new (&self) Device(spelling);
         })
         .def_property_readonly("type", [](const Device& d) {
-            std::string s = d.toString();
-            size_t colon = s.find(':');
-            if (colon != std::string::npos) {
-                return s.substr(0, colon);
-            }
-            return s;
+            return tensorplay::device_type_name(d.type());
         })
         .def_property_readonly("index", &Device::index)
         .def("is_cpu", &Device::is_cpu)
@@ -142,6 +150,7 @@ void init_device(py::module_& m) {
         .def("is_vulkan", &Device::is_vulkan)
         .def("is_meta", &Device::is_meta)
         .def("is_mps", &Device::is_mps)
+        .def("is_privateuse1", &Device::is_privateuse1)
         .def("__repr__", &Device::toString)
         .def("__str__", &Device::toString)
         .def(py::self == py::self)
@@ -728,14 +737,51 @@ void init_device(py::module_& m) {
 #endif
     });
 
+    // Naming and probing the out-of-tree device slot.
+    m.def("_rename_privateuse1_backend", [](const std::string& name) {
+        tensorplay::register_privateuse1_backend(name);
+    }, "backend_name"_a);
+    m.def("_get_privateuse1_backend_name", []() {
+        return tensorplay::get_privateuse1_backend(true);
+    });
+    m.def("_is_privateuse1_backend_registered", []() {
+        return tensorplay::is_privateuse1_backend_registered();
+    });
+    m.def("_is_privateuse1_hooks_registered", []() {
+        return tensorplay::is_privateuse1_hooks_registered();
+    });
+    m.def("_privateuse1_is_available", []() {
+        return tensorplay::is_privateuse1_hooks_registered() &&
+               tensorplay::get_privateuse1_hooks().is_available();
+    });
+    m.def("_privateuse1_device_count", []() -> int64_t {
+        if (!tensorplay::is_privateuse1_hooks_registered()) return 0;
+        return tensorplay::get_privateuse1_hooks().device_count();
+    });
+    m.def("_privateuse1_current_device", []() {
+        return tensorplay::get_privateuse1_hooks().current_device();
+    });
+    m.def("_privateuse1_set_device", [](int64_t index) {
+        tensorplay::get_privateuse1_hooks().set_device(index);
+    }, "index"_a);
+    m.def("_privateuse1_synchronize", [](int64_t index) {
+        tensorplay::get_privateuse1_hooks().synchronize(index);
+    }, "index"_a = -1);
+
     m.def("_accelerator_getAccelerator", []() -> py::object {
+        if (privateuse1_is_accelerator()) {
+            return py::cast(Device(DeviceType::PrivateUse1));
+        }
 #ifdef USE_CUDA
         return py::cast(Device(DeviceType::CUDA));
 #else
         return py::none();
 #endif
     });
-    m.def("_accelerator_getDeviceIndex", []() {
+    m.def("_accelerator_getDeviceIndex", []() -> int64_t {
+        if (privateuse1_is_accelerator()) {
+            return tensorplay::get_privateuse1_hooks().current_device();
+        }
 #ifdef USE_CUDA
         int device = 0;
         cudaError_t err = cudaGetDevice(&device);
@@ -753,6 +799,10 @@ void init_device(py::module_& m) {
         if (index < 0) {
             return;
         }
+        if (privateuse1_is_accelerator()) {
+            tensorplay::get_privateuse1_hooks().set_device(index);
+            return;
+        }
 #ifdef USE_CUDA
         cudaError_t err = cudaSetDevice(static_cast<int>(index));
         if (err != cudaSuccess) {
@@ -764,7 +814,13 @@ void init_device(py::module_& m) {
         throw std::runtime_error("No accelerator device in this build");
 #endif
     });
-    m.def("_accelerator_exchangeDevice", [](int64_t index) {
+    m.def("_accelerator_exchangeDevice", [](int64_t index) -> int64_t {
+        if (privateuse1_is_accelerator()) {
+            auto& hooks = tensorplay::get_privateuse1_hooks();
+            const int64_t current = hooks.current_device();
+            if (index >= 0 && index != current) hooks.set_device(index);
+            return current;
+        }
 #ifdef USE_CUDA
         int current = 0;
         cudaError_t err = cudaGetDevice(&current);
@@ -787,7 +843,13 @@ void init_device(py::module_& m) {
         throw std::runtime_error("No accelerator device in this build");
 #endif
     });
-    m.def("_accelerator_maybeExchangeDevice", [](int64_t index) {
+    m.def("_accelerator_maybeExchangeDevice", [](int64_t index) -> int64_t {
+        if (privateuse1_is_accelerator()) {
+            auto& hooks = tensorplay::get_privateuse1_hooks();
+            const int64_t current = hooks.current_device();
+            if (index >= 0 && index != current) hooks.set_device(index);
+            return current;
+        }
 #ifdef USE_CUDA
         int current = 0;
         cudaError_t err = cudaGetDevice(&current);
@@ -813,6 +875,10 @@ void init_device(py::module_& m) {
     m.def(
         "_accelerator_synchronizeDevice",
         [](int64_t index) {
+            if (privateuse1_is_accelerator()) {
+                tensorplay::get_privateuse1_hooks().synchronize(index);
+                return;
+            }
 #ifdef USE_CUDA
             tensorplay::cuda::CUDAGuard guard(static_cast<int>(index));
             tensorplay::cuda::checkCuda(
@@ -824,7 +890,11 @@ void init_device(py::module_& m) {
         "device_index"_a = -1);
     m.def(
         "_accelerator_getMemoryInfo",
-        [](int64_t index) {
+        [](int64_t index) -> std::pair<size_t, size_t> {
+            if (privateuse1_is_accelerator()) {
+                auto& hooks = tensorplay::get_privateuse1_hooks();
+                return hooks.memory_info(index < 0 ? hooks.current_device() : index);
+            }
 #ifdef USE_CUDA
             int device = static_cast<int>(index);
             if (device < 0) {

@@ -23,14 +23,7 @@ private:
 // execute without recording history, whatever the grad-mode flag says.
 inline bool autograd_dispatch_excluded() {
     const auto excluded = impl::tls_local_dispatch_key_set().excluded;
-    return excluded.has(DispatchKey::AutogradCPU) ||
-           excluded.has(DispatchKey::AutogradCUDA) ||
-           excluded.has(DispatchKey::AutogradVulkan) ||
-           excluded.has(DispatchKey::AutogradSparseCPU) ||
-           excluded.has(DispatchKey::AutogradSparseCUDA) ||
-           excluded.has(DispatchKey::AutogradSparse) ||
-           excluded.has(DispatchKey::AutogradMeta) ||
-           excluded.has(DispatchKey::AutogradMPS);
+    return !(excluded & DispatchKeySet::autograd_keys()).empty();
 }
 
 // RAII helper for C++ call sites.

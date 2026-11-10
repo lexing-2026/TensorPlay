@@ -2935,6 +2935,16 @@ static void bf16_chunk_avx2(VOp op, VParams prm, const uint16_t* src, uint16_t* 
 // tanh is never forwarded: the piecewise form here is about fifteen percent
 // faster than the library kernel.
 //
+// erfcx entered the library in the 2023 release; against an older one it
+// takes the scalar path like the other library-only functions.
+#if __has_include(<mkl_version.h>)
+#include <mkl_version.h>
+#endif
+#if defined(INTEL_MKL_VERSION) && INTEL_MKL_VERSION >= 20230000
+#define TP_MKL_HAS_ERFCX 1
+#else
+#define TP_MKL_HAS_ERFCX 0
+#endif
 // These have to agree with mkl_vml_functions.h and mkl_service.h, which a
 // translation unit may include after this header: the library declares its
 // vector math entry points noexcept except on Windows, where they carry no
@@ -2963,7 +2973,9 @@ void vmsErfc(const int, const float[], float[], const long long) TP_VML_NOTHROW;
 void vmsErfInv(const int, const float[], float[], const long long) TP_VML_NOTHROW;
 void vmsCdfNorm(const int, const float[], float[], const long long) TP_VML_NOTHROW;
 void vmsCdfNormInv(const int, const float[], float[], const long long) TP_VML_NOTHROW;
+#if TP_MKL_HAS_ERFCX
 void vmsErfcx(const int, const float[], float[], const long long) TP_VML_NOTHROW;
+#endif
 void vmdExp(const int, const double[], double[], const long long) TP_VML_NOTHROW;
 void vmdExp2(const int, const double[], double[], const long long) TP_VML_NOTHROW;
 void vmdLn(const int, const double[], double[], const long long) TP_VML_NOTHROW;
@@ -2976,7 +2988,9 @@ void vmdErfc(const int, const double[], double[], const long long) TP_VML_NOTHRO
 void vmdErfInv(const int, const double[], double[], const long long) TP_VML_NOTHROW;
 void vmdCdfNorm(const int, const double[], double[], const long long) TP_VML_NOTHROW;
 void vmdCdfNormInv(const int, const double[], double[], const long long) TP_VML_NOTHROW;
+#if TP_MKL_HAS_ERFCX
 void vmdErfcx(const int, const double[], double[], const long long) TP_VML_NOTHROW;
+#endif
 void vmdSin(const int, const double[], double[], const long long) TP_VML_NOTHROW;
 void vmdCos(const int, const double[], double[], const long long) TP_VML_NOTHROW;
 void vmdTan(const int, const double[], double[], const long long) TP_VML_NOTHROW;
@@ -3022,7 +3036,9 @@ inline Vml32Entry vml32_entry(VOp op) {
         case VOp::ErfInv: return vmsErfInv;
         case VOp::Ndtr:   return vmsCdfNorm;
         case VOp::NdtrI:  return vmsCdfNormInv;
+#if TP_MKL_HAS_ERFCX
         case VOp::Erfcx:  return vmsErfcx;
+#endif
         default:         return nullptr;
     }
 }
@@ -3052,7 +3068,9 @@ inline Vml64Entry vml64_entry(VOp op) {
         case VOp::ErfInv: return vmdErfInv;
         case VOp::Ndtr:   return vmdCdfNorm;
         case VOp::NdtrI:  return vmdCdfNormInv;
+#if TP_MKL_HAS_ERFCX
         case VOp::Erfcx:  return vmdErfcx;
+#endif
         default:         return nullptr;
     }
 }

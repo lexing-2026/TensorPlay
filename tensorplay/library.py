@@ -179,6 +179,31 @@ def _validate_name(name: str) -> tuple[str, str]:
     return namespace, opname
 
 
+# Registry key of the out-of-tree device slot under any of its spellings
+# ("PrivateUse1", "privateuseone").  Tensors on the slot report the name the
+# backend registered; the lookup maps that name back to this key, so a
+# kernel registered before the rename still serves.
+_PRIVATEUSE1_KEY = "privateuseone"
+
+
+def _device_key(device_type: str) -> str:
+    key = device_type.lower()
+    return _PRIVATEUSE1_KEY if key in ("privateuse1", _PRIVATEUSE1_KEY) else key
+
+
+def _privateuse1_slot_of(key: Any) -> Any:
+    """The slot key for a tensor device key naming the renamed device."""
+    names = getattr(tensorplay._C, "_is_privateuse1_backend_registered", None)
+    if (
+        key is not None
+        and names is not None
+        and names()
+        and key == tensorplay._C._get_privateuse1_backend_name()
+    ):
+        return _PRIVATEUSE1_KEY
+    return None
+
+
 def _normalize_device_types(device_types: Any) -> list[str] | None:
     """Normalize ``device_types`` into registry keys.
 
@@ -196,7 +221,7 @@ def _normalize_device_types(device_types: Any) -> list[str] | None:
                 f"device types must be strings, got {item!r}; use None to "
                 "declare one device-agnostic implementation"
             )
-        key = item.lower()
+        key = _device_key(item)
         if key not in keys:
             keys.append(key)
     return keys
@@ -213,7 +238,7 @@ def _bridge_slot_key(device_types: Any) -> Any:
     if device_types is None:
         return None
     if isinstance(device_types, str):
-        return None if device_type_is_composite(device_types) else device_types.lower()
+        return None if device_type_is_composite(device_types) else _device_key(device_types)
     keys = list(device_types)
     if not keys:
         return None
@@ -617,6 +642,10 @@ class CustomOpDef:
         kernels = self._kernels
         if key is not None:
             fn = kernels.get(key)
+            if fn is None:
+                slot = _privateuse1_slot_of(key)
+                if slot is not None:
+                    fn = kernels.get(slot)
             if fn is not None and key not in self._disabled_kernels:
                 cache[key] = fn
                 return fn
@@ -1362,7 +1391,7 @@ def get_kernel(
     key: Any = (
         None
         if lowered in _COMPOSITE_KEYS_LOWERED or lowered in ("default", "composite")
-        else lowered
+        else (_privateuse1_slot_of(lowered) or _device_key(lowered))
     )
     # does NOT satisfy a concrete-device query (use "default" for that).
     fn = op_def._kernels.get(key)
@@ -1882,7 +1911,7 @@ class Library:
         if device_type in _COMPOSITE_KEYS:
             key: Any = None
         else:
-            key = device_type.lower()
+            key = _device_key(device_type)
         target = f"{self.ns}::{op_name}" if "::" not in op_name else op_name
         op_def = _resolve_op(target)
         if fn is not None and not callable(fn):

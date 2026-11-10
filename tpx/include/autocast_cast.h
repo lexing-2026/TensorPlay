@@ -42,7 +42,9 @@ inline bool is_autocast_eligible(const Tensor& tensor, DeviceType device_type) {
         case DeviceType::CPU:
             return dev.is_cpu() && isFloatingType(dt);
         default:
-            return false;
+            // Every other autocast device (MPS, the out-of-tree one) casts
+            // the floating tensors that live on it.
+            return dev.type() == device_type && isFloatingType(dt);
     }
 }
 
