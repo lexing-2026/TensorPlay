@@ -174,11 +174,7 @@ Verified on a MetaX C500 (64 GB, MACA 3.3.0):
 
 - a minimal `cudaMalloc` / kernel / `cudaMemcpy` program compiles and runs;
 - `CopyKernels.cu`, `Convolution.cu`, `TensorFactories.cu` and
-  `ActivationKernels.cu` compile with `mxcc`;
-- the full-library build (415 translation units, device and host) is
-  running on the card server with no failures so far.
-
-Operator and profiler validation on the card is in progress.
+  `ActivationKernels.cu` compile with `mxcc`.
 
 ## Compatibility
 
