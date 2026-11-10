@@ -9,6 +9,7 @@
 #include <string>
 #include <unordered_map>
 
+#include "AscendTensor.h"
 #include "TypePromotion.h"
 
 namespace tensorplay {
