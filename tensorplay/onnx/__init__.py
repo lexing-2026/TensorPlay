@@ -325,6 +325,14 @@ class _Converter:
     @staticmethod
     def _target_id(target: Any) -> tuple[str, str]:
         module = getattr(target, "__module__", "") or ""
+        schema = getattr(target, "_schema", None)
+        qualified = str(getattr(schema, "name", "")) if schema is not None else ""
+        if qualified:
+            # A registered operator spells its overload in the trailing
+            # segment ("add.Tensor"), and the handler tables are keyed on the
+            # operator alone, so read the name off the schema instead of
+            # taking the last dotted segment of the callable.
+            return module, qualified.rsplit("::", 1)[-1].rsplit(".", 1)[-1]
         name = (
             getattr(target, "__qualname__", "")
             or getattr(target, "__name__", "")

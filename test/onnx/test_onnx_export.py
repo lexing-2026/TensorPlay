@@ -1072,6 +1072,26 @@ class TestUnsupported:
             onnx_export(program)
 
 
+class TestOperatorLibrary:
+    def test_registered_operator_targets_lower(self):
+        """Calls written against the operator library lower by operator name."""
+
+        matmul = tp.ops.tp.matmul.default
+        add = tp.ops.tp.add.Tensor
+        relu = tp.ops.tp.relu.default
+        softmax = tp.ops.tp.softmax.default
+
+        class M(tp.nn.Module):
+            def forward(self, x, w, b):
+                return softmax(relu(add(matmul(x, w), b)), 1)
+
+        x = tp.randn((8, 16))
+        w = tp.randn((16, 32))
+        b = tp.randn(32)
+        model = _export(M(), x, w, b)
+        assert _op_types(model) == ["MatMul", "Add", "Relu", "Softmax"]
+
+
 class TestSaveLoad:
     def test_save_to_file(self, tmp_path):
         class M(tp.nn.Module):
