@@ -198,7 +198,7 @@ TensorPlay dispatches to eight backend families — five built in, each with a t
 | **Vulkan** | Any Vulkan 1.0+ GPU — discrete NVIDIA/AMD or integrated Intel/AMD iGPU | `USE_VULKAN=ON` (auto-detected) | `tp.is_vulkan_available()` |
 | **MPS** | Apple GPUs on macOS via Metal Performance Shaders — Apple silicon integrated GPU and supported Mac discrete GPUs | `USE_MPS=ON` (auto-enabled on Apple) | `tp.mps.is_available()` |
 | **Cambricon MLU** | Cambricon MLU accelerators — CNRT driver, CNNL kernels, host fallback for the rest | [`tensorplay-mlu`](https://github.com/ohtensorplay/tensorplay-mlu) plugin, `pip install` from that repo | `device="mlu"` after the plugin loads |
-| **Ascend NPU** | Huawei Ascend NPUs — CANN toolkit, Ascend operator calls, host fallback for the rest | [`tensorplay-npu`](https://github.com/ohtensorplay/tensorplay-npu) plugin (sources also in [`backends/npu/`](backends/npu/)) | `device="npu"` after the plugin loads |
+| **Ascend NPU** | Huawei Ascend NPUs — CANN toolkit, Ascend operator calls, host fallback for the rest | [`tensorplay-npu`](https://github.com/ohtensorplay/tensorplay-npu) plugin, `pip install` from that repo | `device="npu"` after the plugin loads |
 
 ### Why TensorPlay
 
