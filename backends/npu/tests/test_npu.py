@@ -176,6 +176,15 @@ def test_integer_math_runs_on_host_fallback():
     assert tp.equal((x * 3 + 1).cpu(), tp.arange(10) * 3 + 1)
 
 
+def test_conjugate_views():
+    a = rand(5, 9)
+    d = a.to("npu")
+    close(d.conj(), a.conj())
+    close(d.adjoint(), a.adjoint())
+    close(d.t().conj(), a.t().conj())
+    assert d.conj().data_ptr() == d.data_ptr()
+
+
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("name", ["exp", "log", "sqrt", "rsqrt", "neg", "abs", "relu",
                                   "sigmoid", "tanh"])
@@ -260,6 +269,24 @@ def test_training_step_matches_host():
         m = model.to(device)
         m.zero_grad()
         loss = tp.nn.functional.cross_entropy(m(x.to(device)), target.to(device))
+        loss.backward()
+        grads[device] = (loss.detach().cpu(), [p.grad.cpu() for p in m.parameters()])
+    ref_loss, ref_grads = grads["cpu"]
+    loss, got = grads["npu"]
+    assert abs(loss.item() - ref_loss.item()) < 1e-4
+    for g, r in zip(got, ref_grads):
+        assert (g - r).abs().max().item() < 1e-4
+
+
+def test_squared_error_backward_matches_host():
+    tp.manual_seed(0)
+    model = tp.nn.Sequential(tp.nn.Linear(4, 6), tp.nn.GELU(), tp.nn.Linear(6, 3))
+    x, target = tp.randn(5, 4), tp.randn(5, 3)
+    grads = {}
+    for device in ("cpu", "npu"):
+        m = model.to(device)
+        m.zero_grad()
+        loss = ((m(x.to(device)) - target.to(device)) ** 2).mean()
         loss.backward()
         grads[device] = (loss.detach().cpu(), [p.grad.cpu() for p in m.parameters()])
     ref_loss, ref_grads = grads["cpu"]
