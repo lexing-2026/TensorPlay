@@ -285,5 +285,35 @@ TENSORPLAY_LIBRARY_IMPL(CPU, ComplexFactories) {
     m.impl("polar", polar_cpu);
 }
 
+namespace {
+
+// Real values are their own conjugates, so both views only rewrite sizes,
+// strides and the storage offset.  Complex storage has no layout contract
+// on the out-of-tree slot, so it is refused instead of being walked on the
+// host.
+Tensor conj_device_view(const Tensor& self) {
+    TP_CHECK(!is_cplx(self.dtype()),
+             "conj is not supported for complex tensors on this device");
+    return self.as_strided(static_cast<std::vector<int64_t>>(self.shape()),
+                           static_cast<std::vector<int64_t>>(self.strides()));
+}
+
+Tensor adjoint_device_view(const Tensor& self) {
+    TP_CHECK(!is_cplx(self.dtype()),
+             "adjoint is not supported for complex tensors on this device");
+    if (self.dim() <= 1) return conj_device_view(self);
+    return conj_device_view(self.transpose(-2, -1));
+}
+
+}  // namespace
+
+// The out-of-tree device slot shares the conjugate views above: for real
+// dtypes they never read element data, so any device whose tensors carry
+// ordinary strided storage serves them unchanged.
+TENSORPLAY_LIBRARY_IMPL(PrivateUse1, ComplexFactoriesPrivateUse1) {
+    m.impl("conj", conj_device_view);
+    m.impl("adjoint", adjoint_device_view);
+}
+
 }  // namespace cpu
 }  // namespace tensorplay
