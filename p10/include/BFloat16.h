@@ -28,6 +28,18 @@
 #define TP_BIT_CAST(dst_t, src) std::bit_cast<dst_t>(src)
 #endif
 
+// The conversions go through the toolkit intrinsics under nvcc.  The MACA
+// compiler (mxcc) declares its intrinsics device-only, and its device backend
+// aborts in live-variable analysis on kernels that keep many bf16 values live
+// through them (the register-resident softmax rows), so under mxcc both sides
+// take the integer path below, which is a shift one way and a rounding add
+// the other.
+#if (defined(__CUDA_ARCH__) || defined(__CUDACC__)) && !defined(__MXCC__)
+#define TP_BF16_INTRINSIC_CONVERT 1
+#else
+#define TP_BF16_INTRINSIC_CONVERT 0
+#endif
+
 namespace tensorplay {
 
 struct alignas(2) BFloat16 {
@@ -81,8 +93,8 @@ struct alignas(2) BFloat16 {
 
 namespace detail {
 
-// Round-to-nearest-even conversion from f32 to bf16 (host fallback)
-inline uint16_t float_to_bfloat16_bits(float f) {
+// Round-to-nearest-even conversion from f32 to bf16
+inline TP_HOST_DEVICE uint16_t float_to_bfloat16_bits(float f) {
   uint32_t bits = TP_BIT_CAST(uint32_t, f);
   // A not-a-number keeps its standing instead of being rounded: a payload
   // that fills the low bits would carry into the exponent and sign and land
@@ -94,14 +106,14 @@ inline uint16_t float_to_bfloat16_bits(float f) {
   return static_cast<uint16_t>(rounded >> 16);
 }
 
-inline float bfloat16_to_float_bits(uint16_t b) {
+inline TP_HOST_DEVICE float bfloat16_to_float_bits(uint16_t b) {
   return TP_BIT_CAST(float, static_cast<uint32_t>(b) << 16);
 }
 
 } // namespace detail
 
 inline TP_HOST_DEVICE BFloat16::BFloat16(float value) {
-#if defined(__CUDA_ARCH__) || defined(__CUDACC__)
+#if TP_BF16_INTRINSIC_CONVERT
   x = __bfloat16_as_ushort(__float2bfloat16(value));
 #else
   x = detail::float_to_bfloat16_bits(value);
@@ -109,7 +121,7 @@ inline TP_HOST_DEVICE BFloat16::BFloat16(float value) {
 }
 
 inline TP_HOST_DEVICE BFloat16::operator float() const {
-#if defined(__CUDA_ARCH__) || defined(__CUDACC__)
+#if TP_BF16_INTRINSIC_CONVERT
   return __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&x));
 #else
   return detail::bfloat16_to_float_bits(x);

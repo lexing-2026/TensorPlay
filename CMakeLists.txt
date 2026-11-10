@@ -35,7 +35,21 @@ if(NOT DEFINED USE_CUDA)
     endif()
 endif()
 option(USE_CUDA "Enable CUDA support" ${USE_CUDA})
-set(TP_CUDA_ENABLED ${USE_CUDA})
+option(USE_METAX "Enable MetaX GPU (MACA) support" OFF)
+if(USE_METAX AND USE_CUDA)
+    message(FATAL_ERROR
+        "USE_CUDA and USE_METAX are mutually exclusive; pick one GPU backend per build.")
+endif()
+if(USE_METAX)
+    # The MACA build reuses the CUDA backend sources, so the CUDA-language
+    # path stays off while the CUDA-flavoured code paths stay on.
+    set(USE_CUDA OFF)
+endif()
+if(USE_CUDA OR USE_METAX)
+    set(TP_CUDA_ENABLED ON)
+else()
+    set(TP_CUDA_ENABLED OFF)
+endif()
 
 # CMake consumes this variable while enabling the CUDA language.  Accept the
 # conventional project-level spelling as a stable override before that point.
@@ -57,6 +71,18 @@ if(USE_ROCM)
     include(cmake/LoadHIP.cmake)
     if(NOT TP_FOUND_HIP)
         message(FATAL_ERROR "USE_ROCM requested but no usable HIP toolchain was found.")
+    endif()
+endif()
+
+# MetaX GPU support through the MACA SDK.  The device compiler (mxcc) and
+# the CUDA-compatible surface live outside the repository, so the module
+# only resolves paths and compile flags; the backend sources stay the CUDA
+# ones.
+if(USE_METAX)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/backends/metax/tensorplay_metax/cmake/maca.cmake)
+    if(NOT TP_MACA_FOUND)
+        message(FATAL_ERROR
+            "USE_METAX requested but no usable MACA SDK was found. Set MACA_PATH to the SDK root.")
     endif()
 endif()
 
@@ -191,6 +217,12 @@ if(USE_CUDA)
     endif()
     message(STATUS "Found CUDA Toolkit: ${CUDAToolkit_VERSION}")
         string(APPEND CMAKE_CXX_FLAGS " -DUSE_CUDA")
+elseif(USE_METAX)
+    # No CUDA toolkit: the device compiler and the CUDA-spelling headers
+    # come from the MACA SDK, and every device source is compiled by mxcc
+    # through the rules in backends/metax/tensorplay_metax/cmake.
+    string(APPEND CMAKE_CXX_FLAGS " -DUSE_CUDA")
+    message(STATUS "GPU backend: MACA (${TP_MACA_PATH})")
 else()
     message(STATUS "CUDA support disabled by user or not found.")
 endif()
@@ -1323,6 +1355,13 @@ cmake_dependent_option(TP_USE_TENSORPIPE "Use the tensorpipe RPC transport" ON
 cmake_dependent_option(TP_USE_MPI "Enable the MPI process group backend" ON
     "USE_TP_DISTRIBUTED" OFF)
 
+if(USE_METAX AND TP_USE_TENSORPIPE)
+    # tensorpipe probes for a CUDA toolkit of its own and has no MACA
+    # transport; the RPC layer stays out of a MACA build until one exists.
+    set(TP_USE_TENSORPIPE OFF CACHE BOOL "" FORCE)
+    message(STATUS "tensorpipe disabled for the MACA backend")
+endif()
+
 if(TP_USE_GLOO AND NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(WARNING "Gloo can only be used on 64-bit systems.")
     set(TP_USE_GLOO OFF)
@@ -1570,11 +1609,20 @@ if(TP_CUDA_ENABLED AND TARGET tensorpipe_cuda)
     target_link_libraries(_C PRIVATE tensorpipe_cuda)
 endif()
 
-if(TP_CUDA_ENABLED)
+if(TP_CUDA_ENABLED AND NOT USE_METAX)
     target_compile_definitions(_C PRIVATE TENSORPLAY_TENSORPIPE_CUDA)
 endif()
 
-if(TP_CUDA_ENABLED)
+if(USE_METAX)
+    # The bindings call the runtime directly (device queries, byte copies);
+    # the MACA libraries provide the same entry points.  Only the library
+    # headers come along: the template headers carry files named after
+    # system headers and break host compilation.
+    target_include_directories(_C PRIVATE ${TP_MACA_HOST_INCLUDE_DIRS})
+    target_compile_options(_C PRIVATE -include climits)
+    target_link_directories(_C PRIVATE ${TP_MACA_LIBRARY_DIR})
+    target_link_libraries(_C PRIVATE ${TP_MACA_LIBRARIES})
+elseif(TP_CUDA_ENABLED)
     target_link_libraries(_C PRIVATE CUDA::cudart)
 endif()
 

@@ -153,6 +153,13 @@ bool collect_dll_candidates(std::vector<DllCandidate>& out) {
 // Major-line sonames, newest first; the unversioned name catches distros
 // that ship libcupti without a linker-managed version suffix.
 bool collect_dll_candidates(std::vector<DllCandidate>& out) {
+#if defined(USE_METAX)
+    // The MACA tracing library keeps the CUPTI entry-point names (it also
+    // exports the mcpti spellings) under its own file name, so the symbol
+    // table below resolves unchanged once this library is the one loaded.
+    out.push_back({"libmcpti.so", "libmcpti.so"});
+    out.push_back({"/opt/maca/lib64/libmcpti.so", "libmcpti.so"});
+#endif
     for (const char* soname : {"libcupti.so.13", "libcupti.so.12",
                                "libcupti.so.11", "libcupti.so.1",
                                "libcupti.so"}) {

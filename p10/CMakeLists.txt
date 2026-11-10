@@ -186,6 +186,7 @@ set(P10_SOURCES
     src/Einsum.cpp
     src/Profiler.cpp
     src/ProfilerGpu.cpp
+    src/ProfilerDevice.cpp
     src/ProfilerCupti.cpp
     src/ProfilerNvtx.cpp
     src/ProfilerItt.cpp
@@ -196,7 +197,7 @@ set(P10_SOURCES
     ${GEN_CPP}
     ${GEN_HOST_FALLBACK_CPPS}
 )
-if(USE_CUDA OR USE_ROCM)
+if(USE_CUDA OR USE_ROCM OR USE_METAX)
     set(TP_CUDA_BACKEND_SOURCES
         src/backend/cuda/CUDAAllocator.cpp
         src/backend/cuda/CUDAContext.cpp
@@ -513,6 +514,46 @@ if(USE_CUDA OR USE_ROCM)
             src/ProfilerCupti.cpp)
         list(APPEND P10_SOURCES ${TP_P10_SHARED_GPU_SOURCES}
             src/ProfilerCuptiStub.cpp)
+    elseif(USE_METAX)
+        list(APPEND TP_CUDA_BACKEND_SOURCES src/backend/cuda/NCCLContext.cpp)
+        # Sources written against NVIDIA-specific instructions have no
+        # counterpart on this architecture: the quantized GEMM kernels use
+        # inline PTX (mma.sync, lop3, cp.async), and the wide-tiled
+        # attention schedule draws on the same tensor-core surface.  Their
+        # operators fall back to the generic paths.
+        list(REMOVE_ITEM TP_CUDA_BACKEND_SOURCES
+            src/backend/cuda/QuantGemmKernels.cu
+            src/backend/cuda/GroupedGemmKernels.cu
+            src/backend/cuda/cudnn/ConvV8Kernels.cu
+            src/backend/cuda/transformers/AttentionKernels.cu
+            src/backend/cuda/transformers/AttentionGemmKernels.cu
+            src/backend/cuda/transformers/WideTiledAttention.cu
+            src/backend/cuda/transformers/FlashFwdDispatch.cpp)
+        foreach(_tp_src IN LISTS TP_CUDA_BACKEND_SOURCES)
+            if(_tp_src MATCHES "^src/backend/cuda/transformers/flash_")
+                list(REMOVE_ITEM TP_CUDA_BACKEND_SOURCES ${_tp_src})
+            endif()
+        endforeach()
+        # Device translation units go through mxcc; the host-compiled ones
+        # stay in the source list.  The include set matches what a manual
+        # mxcc invocation needs (see backends/metax/tensorplay_metax).
+        set(TP_METAX_CU_INCLUDES
+            ${TP_MACA_INCLUDE_DIRS}
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/backend/cuda
+            ${CMAKE_SOURCE_DIR}/tpx/include
+            ${GEN_BASE_DIR})
+        set(TP_METAX_CU_OBJECTS "")
+        foreach(_tp_src IN LISTS TP_CUDA_BACKEND_SOURCES)
+            if(_tp_src MATCHES "\\.cu$")
+                tp_maca_compile_object(_tp_obj "${_tp_src}" ${TP_METAX_CU_INCLUDES})
+                list(APPEND TP_METAX_CU_OBJECTS "${_tp_obj}")
+            else()
+                list(APPEND P10_SOURCES "${_tp_src}")
+            endif()
+        endforeach()
+        list(APPEND P10_SOURCES ${TP_METAX_CU_OBJECTS})
     else()
         list(APPEND TP_CUDA_BACKEND_SOURCES src/backend/cuda/NCCLContext.cpp)
         list(APPEND P10_SOURCES ${TP_CUDA_BACKEND_SOURCES})
@@ -1021,6 +1062,20 @@ else()
     endforeach()
 endif()
 add_library(p10 ${P10_SOURCES})
+if(USE_METAX)
+    # Host translation units of the device backend include the same
+    # CUDA-spelling headers as the device ones, so the library include set
+    # and the UINT_MAX workaround apply to the whole target.  The template
+    # libraries stay off this path (see maca.cmake).
+    target_include_directories(p10 PRIVATE ${TP_MACA_HOST_INCLUDE_DIRS})
+    target_compile_options(p10 PRIVATE -include climits)
+    target_link_directories(p10 PRIVATE ${TP_MACA_LIBRARY_DIR})
+    target_link_libraries(p10 PRIVATE ${TP_MACA_LIBRARIES})
+    # The mcdnn library serves the descriptor-style cuDNN API through the
+    # compatibility headers; the graph-plan frontend has no counterpart, so
+    # TP_HAS_CUDNN_FRONTEND stays off and the legacy convolution path runs.
+    target_compile_definitions(p10 PRIVATE USE_CUDA USE_CUDNN USE_METAX)
+endif()
 if(APPLE AND USE_MPS)
     add_dependencies(p10 mps_shaders)
     target_include_directories(p10 PRIVATE ${MPS_SHADER_GEN_DIR})

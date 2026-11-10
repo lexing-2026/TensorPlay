@@ -267,7 +267,7 @@ __global__ void make_columns(const X* input, int8_t* columns,
 }
 
 __device__ int dot4(int a, int b, int acc) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 610
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 610 && !defined(__MXCC__)
     return __dp4a(a, b, acc);
 #else
     for (int s = 0; s < 32; s += 8) acc += static_cast<int8_t>(a >> s) * static_cast<int8_t>(b >> s);

@@ -164,7 +164,7 @@ inline float half_to_float_bits(uint16_t h) {
 // frontend rejects a bare __host__ definition overloading a __host__
 // __device__ declaration; nvcc merely tolerates the mismatch).
 inline TP_HOST_DEVICE Half::Half(float value) {
-#if defined(__CUDA_ARCH__) || defined(__CUDACC__)
+#if defined(__CUDA_ARCH__) || (defined(__CUDACC__) && !defined(__MXCC__))
   x = __half_as_short(__float2half(value));
 #else
   x = detail::float_to_half_bits(value);
@@ -172,7 +172,7 @@ inline TP_HOST_DEVICE Half::Half(float value) {
 }
 
 inline TP_HOST_DEVICE Half::operator float() const {
-#if defined(__CUDA_ARCH__) || defined(__CUDACC__)
+#if defined(__CUDA_ARCH__) || (defined(__CUDACC__) && !defined(__MXCC__))
   return __half2float(*reinterpret_cast<const __half*>(&x));
 #else
   return detail::half_to_float_bits(x);
