@@ -2958,6 +2958,7 @@ void init_tensor(py::module_& m) {
         .def("__add__", [](const Tensor& t, double s) { return t.add(Scalar(s)); })
         .def("__sub__", [](const Tensor& t, double s) { return t.sub(Scalar(s)); })
         .def("__mul__", [](const Tensor& t, double s) { return t.mul(Scalar(s)); })
+        .def("__truediv__", [](const Tensor& t, int64_t s) { return t.div(Scalar(s)); })
         .def("__truediv__", [](const Tensor& t, double s) { return t.div(Scalar(s)); })
         // the weak-scalar promotion rules in the kernels.
         .def("__add__", [](const Tensor& t, std::complex<double> s) { return t.add(Scalar(s)); })
@@ -2995,6 +2996,9 @@ void init_tensor(py::module_& m) {
         // pybind tries overloads in registration order and a python float is
         // convertible to complex<double>; otherwise every `1.0 / real_tensor`
         // silently promoted to complex (broke linalg.pinv et al).
+        .def("__rtruediv__", [](const Tensor& t, int64_t s) {
+            return t.reciprocal().mul(Scalar(s));
+        })
         .def("__rtruediv__", [](const Tensor& t, double s) {
             return t.reciprocal().mul(Scalar(s));
         })
