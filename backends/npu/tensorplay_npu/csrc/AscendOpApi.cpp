@@ -137,11 +137,10 @@ Tensor cast_on_device(const Tensor& t, DType dtype) {
     TP_CHECK(api.valid(), "aclnnCast is missing from the operator library");
     aclDataType target = ACL_DT_UNDEFINED;
     TP_CHECK(acl_dtype_of(dtype, &target), "no acl element type for ", dtype);
-    const Tensor source = contiguous_on_device(t);
-    Tensor out = empty_on(source.sizes().vec(), dtype, index_of(t.device()));
+    Tensor out = empty_on(t.sizes().vec(), dtype, index_of(t.device()));
     if (out.numel() == 0) return out;
     AclArgs args;
-    const AclTensorRef self = args.tensor(source);
+    const AclTensorRef self = args.tensor(t);
     const AclTensorRef result = args.tensor(out);
     api.run(index_of(t.device()), self, target, result);
     return out;
@@ -149,7 +148,7 @@ Tensor cast_on_device(const Tensor& t, DType dtype) {
 
 Tensor compute_operand(const Tensor& t, DType dtype) {
     if (t.dtype() != dtype) return cast_on_device(t, dtype);
-    return t.is_contiguous() ? t : contiguous_on_device(t);
+    return t;
 }
 
 AclArgs::~AclArgs() {    for (aclTensor* tensor : tensors_) aclDestroyTensor(tensor);
@@ -159,7 +158,6 @@ AclArgs::~AclArgs() {    for (aclTensor* tensor : tensors_) aclDestroyTensor(ten
 
 AclTensorRef AclArgs::tensor(const Tensor& t) {
     TP_CHECK(t.device().is_privateuse1(), "aclnn operand is not a device tensor");
-    TP_CHECK(t.is_contiguous(), "aclnn operand is not contiguous");
     TP_CHECK(t.dim() <= kMaxAclDims, "rank ", t.dim(), " exceeds the acl tensor limit");
     aclDataType data_type = ACL_DT_UNDEFINED;
     TP_CHECK(acl_dtype_of(t.dtype(), &data_type), "no acl element type for ", t.dtype());
@@ -173,16 +171,22 @@ AclTensorRef AclArgs::tensor(const Tensor& t) {
         strides[0] = 1;
         ndim = 1;
     } else {
-        const std::vector<int64_t> sizes = t.sizes().vec();
-        const std::vector<int64_t> tensor_strides = t.strides();
+        const IntArrayRef sizes = t.sizes();
+        const IntArrayRef tensor_strides = t.stride();
         for (int64_t i = 0; i < ndim; ++i) {
             dims[i] = sizes[static_cast<size_t>(i)];
             strides[i] = tensor_strides[static_cast<size_t>(i)];
+            TP_CHECK(strides[i] >= 0, "aclnn operand has a negative stride on dimension ", i);
         }
     }
-    aclTensor* created =
-        aclCreateTensor(dims, static_cast<uint64_t>(ndim), data_type, strides, 0, ACL_FORMAT_ND,
-                        dims, static_cast<uint64_t>(ndim), const_cast<void*>(t.data_ptr()));
+    // The descriptor addresses the whole storage with the view's offset, so
+    // its bounds cover any slice of that storage.
+    const Storage& storage = t.impl()->storage();
+    const int64_t storage_elems = static_cast<int64_t>(storage.nbytes() / t.itemsize());
+    aclTensor* created = aclCreateTensor(
+        dims, static_cast<uint64_t>(ndim), data_type, strides,
+        static_cast<int64_t>(t.impl()->storage_offset()), ACL_FORMAT_ND, &storage_elems, 1,
+        const_cast<void*>(storage.data()));
     TP_CHECK(created != nullptr, "aclCreateTensor failed for ", t.dtype(), " rank ", t.dim());
     tensors_.push_back(created);
     AclTensorRef view;
@@ -191,6 +195,7 @@ AclTensorRef AclArgs::tensor(const Tensor& t) {
     view.dtype = t.dtype();
     view.ndim = static_cast<int32_t>(ndim);
     std::memcpy(view.sizes, dims, sizeof(int64_t) * static_cast<size_t>(ndim));
+    std::memcpy(view.strides, strides, sizeof(int64_t) * static_cast<size_t>(ndim));
     return view;
 }
 

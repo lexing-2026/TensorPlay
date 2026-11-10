@@ -69,7 +69,7 @@ enum class ReduceMode { Sum, Mean };
 Tensor reduced(const Tensor& self, DType out_dtype, std::vector<int64_t> dims, bool keepdim,
                ReduceMode mode) {
     const int index = index_of(self.device());
-    const Tensor x = contiguous_on_device(self);
+    const Tensor& x = self;
     const int64_t nd = x.dim();
     if (nd == 0) {
         // A single element: the reduction only converts the type.

@@ -47,6 +47,7 @@ struct AclTensorRef {
     const void* data = nullptr;
     DType dtype = DType::Float32;
     int64_t sizes[kMaxAclDims] = {};
+    int64_t strides[kMaxAclDims] = {};
     int32_t ndim = 0;
     operator aclTensor*() const { return ptr; }
 };
@@ -73,7 +74,9 @@ public:
     AclArgs& operator=(const AclArgs&) = delete;
     ~AclArgs();
 
-    // ``t`` must be contiguous, on a device, of a supported rank and type.
+    // ``t`` must live on a device with a supported rank and type.  The view
+    // is described as it is: real strides and storage extent, so an operand
+    // that is a transposed or sliced view is read without a repack.
     AclTensorRef tensor(const Tensor& t);
     // ``value`` narrowed to ``dtype``.
     AclScalarRef scalar(const Scalar& value, DType dtype);
@@ -119,7 +122,10 @@ inline void hash_arg(uint64_t& h, const AclTensorRef& t) {
     hash_mix(h, static_cast<uint64_t>(reinterpret_cast<uintptr_t>(t.data)));
     hash_mix(h, static_cast<uint64_t>(t.dtype));
     hash_mix(h, static_cast<uint64_t>(t.ndim));
-    for (int32_t i = 0; i < t.ndim; ++i) hash_mix(h, static_cast<uint64_t>(t.sizes[i]));
+    for (int32_t i = 0; i < t.ndim; ++i) {
+        hash_mix(h, static_cast<uint64_t>(t.sizes[i]));
+        hash_mix(h, static_cast<uint64_t>(t.strides[i]));
+    }
 }
 
 inline void hash_arg(uint64_t& h, const AclScalarRef& s) {

@@ -57,11 +57,9 @@ Tensor product(const OpApi& api, const Tensor& a, const Tensor& b,
     const int index = index_of(a.device());
     Tensor out = empty_on(shape, a.dtype(), index);
     if (out.numel() == 0) return out;
-    const Tensor x = compute_operand(a, a.dtype());
-    const Tensor y = compute_operand(b, a.dtype());
     AclArgs args;
-    const AclTensorRef xr = args.tensor(x);
-    const AclTensorRef yr = args.tensor(y);
+    const AclTensorRef xr = args.tensor(a);
+    const AclTensorRef yr = args.tensor(b);
     const AclTensorRef outr = args.tensor(out);
     api.run(index, xr, yr, outr, kKeepDtype);
     return out;
@@ -124,13 +122,10 @@ Tensor addmm_kernel(const Tensor& self, const Tensor& mat1, const Tensor& mat2,
     const int index = index_of(mat1.device());
     Tensor out = empty_on(shape, mat1.dtype(), index);
     if (out.numel() == 0) return out;
-    const Tensor bias = compute_operand(self, self.dtype());
-    const Tensor x = compute_operand(mat1, mat1.dtype());
-    const Tensor y = compute_operand(mat2, mat2.dtype());
     AclArgs args;
-    const AclTensorRef biasr = args.tensor(bias);
-    const AclTensorRef xr = args.tensor(x);
-    const AclTensorRef yr = args.tensor(y);
+    const AclTensorRef biasr = args.tensor(self);
+    const AclTensorRef xr = args.tensor(mat1);
+    const AclTensorRef yr = args.tensor(mat2);
     const AclTensorRef outr = args.tensor(out);
     addmm_api().run(index, biasr, xr, yr, args.scalar(beta, self.dtype()),
                     args.scalar(alpha, self.dtype()), outr, kKeepDtype);
