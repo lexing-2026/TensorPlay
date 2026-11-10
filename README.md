@@ -190,14 +190,16 @@ TensorPlay dispatches to eight backend families — five built in, each with a t
 
 | Backend | Target hardware | How to enable | Check availability |
 | ---- | ---- | ---- | ---- |
-| <img src="docs/images/backends/cpu.svg" height="18" alt=""> **CPU** | x86_64 / aarch64 CPUs with SIMD dispatch (AVX2/AVX512/NEON) and optional BLAS, oneDNN, MKL, NNPACK and OpenMP acceleration | always built in | `tp.cpu.is_available()` |
-| <img src="docs/images/backends/nvidia.svg" height="18" alt=""> **CUDA** | NVIDIA GPUs — CUDA 12.x / 13.x, cuBLAS/cuDNN | `USE_CUDA=ON` (auto-detected) | `tp.cuda.is_available()` |
-| <img src="docs/images/backends/amd.svg" height="18" alt=""> **ROCm / HIP** | AMD GPUs — ROCm 7.2, MIOpen | `USE_ROCM=ON` (mutually exclusive with CUDA) | build-time flag |
-| <img src="docs/images/backends/metax.png" height="18" alt=""> [**MetaX (MACA)**](docs/metax.md) | MetaX C500 (曦云) GPUs — MACA SDK, the CUDA-compatible sources compiled by `mxcc` | `USE_METAX=ON` (mutually exclusive with CUDA) | build-time flag |
-| <img src="docs/images/backends/vulkan.svg" height="18" alt=""> **Vulkan** | Any Vulkan 1.0+ GPU — discrete NVIDIA/AMD or integrated Intel/AMD iGPU | `USE_VULKAN=ON` (auto-detected) | `tp.is_vulkan_available()` |
-| <img src="docs/images/backends/apple-mps.svg" height="18" alt=""> **MPS** | Apple GPUs on macOS via Metal Performance Shaders — Apple silicon integrated GPU and supported Mac discrete GPUs | `USE_MPS=ON` (auto-enabled on Apple) | `tp.mps.is_available()` |
-| <picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/backends/cambricon-mlu-dark.png"><img src="docs/images/backends/cambricon-mlu.png" height="18" alt=""></picture> **Cambricon MLU** | Cambricon MLU accelerators — CNRT driver, CNNL kernels, host fallback for the rest | [`tensorplay-mlu`](https://github.com/ohtensorplay/tensorplay-mlu) plugin, `pip install` from that repo | `device="mlu"` after the plugin loads |
-| <img src="docs/images/backends/ascend.svg" height="18" alt=""> **Ascend NPU** | Huawei Ascend NPUs — CANN toolkit, Ascend operator calls, host fallback for the rest | [`tensorplay-npu`](https://github.com/ohtensorplay/tensorplay-npu) plugin, `pip install` from that repo | `device="npu"` after the plugin loads |
+| <img src="docs/images/backends/cpu.svg" height="18" alt="CPU">&nbsp;**CPU** | x86_64 / aarch64 — SIMD, BLAS, oneDNN, MKL | always built in | `tp.cpu.is_available()` |
+| <img src="docs/images/backends/nvidia.svg" height="18" alt="NVIDIA">&nbsp;**CUDA** | NVIDIA GPUs — CUDA 12.x / 13.x, cuBLAS / cuDNN | `USE_CUDA=ON` | `tp.cuda.is_available()` |
+| <img src="docs/images/backends/amd.svg" height="18" alt="AMD">&nbsp;**ROCm&nbsp;/&nbsp;HIP** | AMD GPUs — ROCm 7.2, MIOpen | `USE_ROCM=ON` | build-time flag |
+| <img src="docs/images/backends/metax.png" height="18" alt="MetaX">&nbsp;[**MetaX&nbsp;(MACA)**](docs/metax.md) | MetaX C500 (曦云) — MACA SDK, CUDA via `mxcc` | `USE_METAX=ON` | build-time flag |
+| <img src="docs/images/backends/vulkan.svg" height="18" alt="Vulkan">&nbsp;**Vulkan** | any Vulkan 1.0+ GPU — discrete or integrated | `USE_VULKAN=ON` | `tp.is_vulkan_available()` |
+| <img src="docs/images/backends/apple-mps.svg" height="18" alt="Apple">&nbsp;**MPS** | Apple GPUs — Metal Performance Shaders | `USE_MPS=ON` | `tp.mps.is_available()` |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/backends/cambricon-mlu-dark.png"><img src="docs/images/backends/cambricon-mlu.png" height="18" alt="Cambricon"></picture>&nbsp;**Cambricon&nbsp;MLU** | Cambricon MLU — CNRT / CNNL, host fallback | [`tensorplay-mlu`](https://github.com/ohtensorplay/tensorplay-mlu) | `device="mlu"` |
+| <img src="docs/images/backends/ascend.svg" height="18" alt="Ascend">&nbsp;**Ascend&nbsp;NPU** | Huawei Ascend NPU — CANN, host fallback | [`tensorplay-npu`](https://github.com/ohtensorplay/tensorplay-npu) | `device="npu"` |
+
+One GPU backend per build: `USE_CUDA`, `USE_ROCM` and `USE_METAX` are mutually exclusive. CUDA, Vulkan and MPS are auto-detected where a capable device and toolchain are present; ROCm and MetaX are opt-in flags. The two plugins install with `pip install tensorplay-mlu` / `tensorplay-npu` and fall back to the host for operators they do not implement.
 
 ### Why TensorPlay
 
