@@ -1,5 +1,9 @@
 """TensorPlay on a Cambricon MLU against torch + torch_mlu on the same card.
 
+The TensorPlay side loads the standalone ``tensorplay-mlu`` package
+(https://github.com/ohtensorplay/tensorplay-mlu); make sure it is importable
+(``pip install tensorplay-mlu`` or ``PYTHONPATH`` to a checkout).
+
 Each framework runs in its own process (one framework per process keeps
 allocators, thread pools and driver state from interfering), on identical
 workloads: single operators at a few sizes and dtypes, and a training step
@@ -8,6 +12,13 @@ device synchronized around each measurement.
 
     python benchmark/bench_mlu_vs_torch.py            # both, then compare
     python benchmark/bench_mlu_vs_torch.py --only tp  # one side, JSON out
+
+The frameworks default to different float32 matmul precisions (torch_mlu
+allows TF32, TensorPlay keeps full float32); BENCH_FP32_PRECISION=high (or
+highest) sets the same one on both sides.  A card whose driver reports a
+generic product name needs the name fixed for the other side too
+(TORCH_PYTHON can point at a wrapper that does so); without it that side
+times wrong results or faults, and the MLP cases check against the host.
 """
 
 from __future__ import annotations
@@ -36,6 +47,10 @@ class Framework:
             self.nn = torch.nn
             self.optim = torch.optim
             self.F = torch.nn.functional
+            precision = os.environ.get("BENCH_FP32_PRECISION")
+            if precision:
+                torch.set_float32_matmul_precision(precision)
+                torch.backends.mlu.matmul.allow_tf32 = precision != "highest"
         else:
             import tensorplay as tp
             import tensorplay_mlu
@@ -46,6 +61,9 @@ class Framework:
             self.nn = tp.nn
             self.optim = tp.optim
             self.F = tp.nn.functional
+            precision = os.environ.get("BENCH_FP32_PRECISION")
+            if precision:
+                tp.set_float32_matmul_precision(precision)
         self.device = "mlu"
 
     def dtype(self, name: str):
@@ -68,11 +86,30 @@ def timeit(fx: Framework, fn, warmup=WARMUP, iters=ITERS) -> float:
     return statistics.median(samples)
 
 
+def gemm_size_ok(fx: Framework, n: int, dtype: str) -> bool:
+    """Whether a size-n product gives the right answer on this card.
+
+    A card whose driver reports a generic product name runs CNNL's
+    unknown-device kernels, which return wrong data (unrealistically fast)
+    for some sizes; timing them would only measure the no-op.
+    """
+    try:
+        a = fx.m.ones(n, n, device=fx.device).to(fx.dtype(dtype))
+        y = fx.m.mm(a, a)
+        return abs(float(y[0, 0].cpu()) - n) < 0.5
+    except Exception:
+        return False
+
+
 def op_cases(fx: Framework):
     m, F = fx.m, fx.F
     cases = {}
     for dt in ("fp32", "fp16"):
         for n in (1024, 4096):
+            if not gemm_size_ok(fx, n, dt):
+                print(f"{fx.name}: skipping the {n} products in {dt}: wrong result on this "
+                      f"card", file=sys.stderr)
+                continue
             a, b = fx.randn(n, n, dtype=dt), fx.randn(n, n, dtype=dt)
             cases[f"mm {n} {dt}"] = lambda a=a, b=b: m.mm(a, b)
             cases[f"mm_tn {n} {dt}"] = lambda a=a, b=b: m.mm(a.t(), b)
@@ -101,13 +138,40 @@ def op_cases(fx: Framework):
     return cases
 
 
+class WrongResult(RuntimeError):
+    pass
+
+
 def mlp_step_case(fx: Framework, dtype="fp32", batch=256, width=1024, hidden=4096):
     nn = fx.nn
-    model = nn.Sequential(nn.Linear(width, hidden), nn.GELU(), nn.Linear(hidden, width))
+
+    def build():
+        return nn.Sequential(nn.Linear(width, hidden), nn.GELU(), nn.Linear(hidden, width))
+
+    host_model = build()
+    model = build()
+    model.load_state_dict(host_model.state_dict())
     model = model.to(fx.device).to(fx.dtype(dtype))
     opt = fx.optim.SGD(model.parameters(), lr=1e-3)
     x = fx.randn(batch, width, dtype=dtype)
     target = fx.randn(batch, width, dtype=dtype)
+
+    # A device that returns wrong data would otherwise be timed as fast.
+    try:
+        want = host_model(x.cpu().float())
+        got = model(x).cpu().float()
+        err = float((got - want).abs().max()) / max(float(want.abs().max()), 1e-6)
+        problem = None if err < (1e-2 if dtype == "fp32" else 5e-2) else \
+            f"forward differs from the host by {err:.3g} (relative)"
+    except Exception as exc:  # a device fault while checking
+        problem = f"forward failed: {type(exc).__name__}: {exc}".splitlines()[0][:120]
+    if problem is not None:
+        def wrong():
+            raise WrongResult(problem)
+        return {
+            f"mlp fwd b{batch} {width}-{hidden} {dtype}": wrong,
+            f"mlp train step b{batch} {width}-{hidden} {dtype}": wrong,
+        }
 
     def step():
         opt.zero_grad()
@@ -122,6 +186,20 @@ def mlp_step_case(fx: Framework, dtype="fp32", batch=256, width=1024, hidden=409
         f"mlp fwd b{batch} {width}-{hidden} {dtype}": forward,
         f"mlp train step b{batch} {width}-{hidden} {dtype}": step,
     }
+
+
+def interpreter(name: str) -> str:
+    """The Python that has this framework: each side may live in its own venv."""
+    return os.environ.get("TORCH_PYTHON" if name == "torch" else "TP_PYTHON",
+                          sys.executable)
+
+
+def case_labels(name: str) -> list[str]:
+    fx = Framework(name)
+    cases = op_cases(fx)
+    for dt in ("fp32", "fp16"):
+        cases.update(mlp_step_case(fx, dt))
+    return list(cases)
 
 
 def run_one(name: str, filter_text: str | None) -> dict[str, float]:
@@ -143,15 +221,41 @@ def run_one(name: str, filter_text: str | None) -> dict[str, float]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--only", choices=["tp", "torch"])
+    parser.add_argument("--list", choices=["tp", "torch"], help="print the case labels")
     parser.add_argument("-k", dest="filter", help="run cases whose label contains this text")
+    parser.add_argument("--per-case", action="store_true",
+                        help="run every case in its own process; a device fault in one case "
+                             "then leaves the others measurable")
     args = parser.parse_args()
+    if args.list:
+        print(json.dumps(case_labels(args.list)))
+        return 0
     if args.only:
         print(json.dumps(run_one(args.only, args.filter)))
         return 0
 
     sides = {}
     for name in ("torch", "tp"):
-        cmd = [sys.executable, os.path.abspath(__file__), "--only", name]
+        if args.per_case:
+            py = interpreter(name)
+            listing = subprocess.run([py, os.path.abspath(__file__), "--list", name],
+                                     capture_output=True, text=True)
+            labels = json.loads(listing.stdout.strip().splitlines()[-1])
+            results = {}
+            for label in labels:
+                if args.filter and args.filter not in label:
+                    continue
+                proc = subprocess.run(
+                    [py, os.path.abspath(__file__), "--only", name, "-k", label],
+                    capture_output=True, text=True)
+                lines = proc.stdout.strip().splitlines()
+                if proc.returncode != 0 or not lines:
+                    results[label] = "error: the case process failed"
+                else:
+                    results.update(json.loads(lines[-1]))
+            sides[name] = results
+            continue
+        cmd = [interpreter(name), os.path.abspath(__file__), "--only", name]
         if args.filter:
             cmd += ["-k", args.filter]
         proc = subprocess.run(cmd, capture_output=True, text=True)
