@@ -1185,14 +1185,40 @@ PYBIND11_MODULE(_C, m) {
     m.def("set_mkldnn_enabled", &tensorplay::OneDNNContext::set_enabled);
 
     using tensorplay::prof::Event;
+    // Whether the out-of-tree device backend registered timer hooks, i.e.
+    // whether a session can report device time for its operations.
+    m.def("_profiler_device_timing_available", []() {
+        return tensorplay::prof::privateuse1_timer_hooks() != nullptr;
+    });
+    // Whether the out-of-tree device backend registered an activity
+    // collector (kernel-level device tracing).
+    m.def("_profiler_device_trace_available", []() {
+        return tensorplay::prof::privateuse1_activity_hooks() != nullptr;
+    });
     m.def("_profiler_start", [](bool capture_shapes, bool with_stack,
                                 bool gpu_timing, bool gpu_trace,
-                                bool mem_capture) {
+                                bool mem_capture, bool device_trace) {
         // This is a session option, not a process-global sticky mode.  In
         // particular, a later CPU profile must not arm CUDA events for CPU
         // redispatches after a timed CUDA profile has finished.
         tensorplay::prof::g_mem_capture.store(
             mem_capture, std::memory_order_release);
+        tensorplay::prof::g_device_trace.store(false, std::memory_order_release);
+        if (device_trace) {
+            // The out-of-tree device's collector: records join back to ops
+            // through the slot each device op pushes as its external id.
+            auto* activity = tensorplay::prof::privateuse1_activity_hooks();
+            if (activity != nullptr && activity->start()) {
+                tensorplay::prof::g_device_trace.store(
+                    true, std::memory_order_release);
+            } else {
+                const std::string reason =
+                    activity ? activity->last_error()
+                             : std::string("the device backend has no activity collector");
+                PyErr_WarnEx(PyExc_RuntimeWarning,
+                             ("device trace unavailable: " + reason).c_str(), 1);
+            }
+        }
         tensorplay::prof::g_ext_warmup.store(0, std::memory_order_release);
         if (gpu_trace) {
             // CUPTI owns per-op GPU timing unless the caller explicitly
@@ -1232,7 +1258,7 @@ PYBIND11_MODULE(_C, m) {
         }
     }, "capture_shapes"_a = false, "with_stack"_a = false,
        "gpu_timing"_a = false, "gpu_trace"_a = false,
-       "mem_capture"_a = false);
+       "mem_capture"_a = false, "device_trace"_a = false);
     // Returns (op_events, gpu_activities, mem_events).
     //   op_events: (name, kind, start_ns, end_ns, tid, shapes|None,
     //     dtypes|None, site_str|None, gpu_ms, out_bytes, stack|None,
@@ -1257,9 +1283,17 @@ PYBIND11_MODULE(_C, m) {
         const bool trace_on =
             tensorplay::prof::g_gpu_trace.exchange(false,
                 std::memory_order_acq_rel);
+        const bool device_trace_on =
+            tensorplay::prof::g_device_trace.exchange(false,
+                std::memory_order_acq_rel);
         std::vector<tensorplay::prof::GpuActivity> gpu_acts;
-        if (trace_on) {
-            tensorplay::prof::cupti_stop_and_collect(gpu_acts);
+        if (trace_on) tensorplay::prof::cupti_stop_and_collect(gpu_acts);
+        if (device_trace_on) {
+            if (auto* activity = tensorplay::prof::privateuse1_activity_hooks()) {
+                activity->stop_and_collect(gpu_acts);
+            }
+        }
+        if (trace_on || device_trace_on) {
              // Kernel records join back to ops after the session: a record's
             // launch time comes from its runtime-API record (shared
             // correlation id), and the launch is attributed to
@@ -1431,8 +1465,11 @@ PYBIND11_MODULE(_C, m) {
             for (size_t i = 0; i < gpu_acts.size(); ++i) {
                 const auto& a = gpu_acts[i];
                 if (a.kind == 'r' || a.kind == 'd') continue;
-                if (a.correlation != 0 &&
-                    corr_launch.count(a.correlation) != 0) {
+                // A record that names its op (external id) needs no launch
+                // record; the others are placed by their launch time.
+                if (a.external_id != tensorplay::prof::GpuActivity::kNoExt ||
+                    (a.correlation != 0 &&
+                     corr_launch.count(a.correlation) != 0)) {
                     dev_records.push_back(i);
                 }
             }

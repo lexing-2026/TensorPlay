@@ -56,13 +56,9 @@ TENSORPLAY_API std::atomic<bool> g_gpu_timing{false};
 // kept so generated code and Profiler.h stay backend-agnostic.
 TENSORPLAY_API std::atomic<uint32_t> g_ext_warmup{0};
 
-GpuTimerPair::~GpuTimerPair() {
-    if (!armed_) return;
-    close();
-}
-
-void GpuTimerPair::arm(const Device& device) {
-    if (!rec_.live_ || !device.is_mps()) return;
+void GpuTimerPair::arm_live(const Device& device) {
+    if (arm_device(device)) return;
+    if (!device.is_mps()) return;
     if (!g_gpu_timing.load(std::memory_order_acquire)) return;
     gpu_device_ = static_cast<int>(device.index());
     arm_ns_ = static_cast<uint64_t>(
@@ -70,7 +66,11 @@ void GpuTimerPair::arm(const Device& device) {
     armed_ = true;
 }
 
-void GpuTimerPair::close() {
+void GpuTimerPair::close_live() {
+    if (device_start_ || device_pushed_) {
+        close_device();
+        return;
+    }
     if (!armed_) return;
     armed_ = false;
     const int device = gpu_device_;
@@ -91,6 +91,7 @@ void GpuTimerPair::close() {
 TENSORPLAY_API void gpu_resolve_all(
         std::vector<Event>& events,
         const std::function<void(Event&, float ms)>& emit) {
+    resolve_device_pairs(events, emit);
     // Pairs are pushed synchronously by GpuTimerPair::close with the current
     // epoch, so consume that epoch here and then advance it so a pair that
     // lands after this stop can never write into a later session.
@@ -111,6 +112,7 @@ TENSORPLAY_API void gpu_resolve_all(
 }
 
 TENSORPLAY_API void gpu_drain_pool() {
+    drain_device_pairs();
     std::lock_guard<std::mutex> lock(g_mps_mutex);
     if (g_pending) g_pending->clear();
 }

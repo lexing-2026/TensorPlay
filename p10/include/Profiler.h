@@ -16,6 +16,9 @@
 //     correlation ids (see ProfilerCupti.cpp / ProfilerCuptiStub.cpp);
 //   * MPS GPU durations (USE_MPS builds) are the host dispatch latency
 //     measured around the op (see ProfilerMps.mm);
+//   * out-of-tree device (PrivateUse1) durations come from the event pair
+//     its backend's DeviceTimerHooks record around the op, in every build
+//     (see ProfilerDevice.cpp);
 //   * Python stack sampling runs binding-side (tensorplay/profiler.py);
 //
 // Performance contract: when inactive the only hot-path cost is one
@@ -269,20 +272,42 @@ TENSORPLAY_API void mem_record_free(void* ptr, int64_t bytes,
 // Moves out the collected memory events (binding calls at session stop).
 TENSORPLAY_API std::vector<MemEvent> mem_take();
 
-// ---- GPU timeline (USE_CUDA / USE_ROCM builds; validated on remote sm_89)
-// ----------
+// ---- GPU timeline (USE_CUDA / USE_ROCM builds; validated on remote sm_89;
+// PrivateUse1 devices in every build) ----------
 // A pool-backed cudaEvent/hipEvent pair around dispatched GPU work.
 // arm(device) before the kernel launch, close() after; elapsed times are
 // resolved at session stop by the binding layer.  CPU-device and inactive
 // calls are no-ops.  MPS builds implement the same symbols in ProfilerMps.mm
 // using host dispatch latency.
+//
+// The same pair times operations on the out-of-tree device (PrivateUse1)
+// through the DeviceTimerHooks its backend registers, in every build.
 struct TENSORPLAY_API GpuTimerPair {
     explicit GpuTimerPair(OpRecord& rec) : rec_(rec) {}
-    ~GpuTimerPair();
-    void arm(const Device& device);  // records start on a CUDA op's stream
-    void close();        // records the end event
+    // Inline guards: with no session running, an op pays one load here.
+    ~GpuTimerPair() {
+        if (armed_ || device_start_ || device_pushed_ || rec_.trace_pushed_) close_live();
+    }
+    // Records start on the op's stream / queue.
+    void arm(const Device& device) {
+        if (rec_.live_) arm_live(device);
+    }
+    // Records the end event.
+    void close() {
+        if (armed_ || device_start_ || device_pushed_ || rec_.trace_pushed_) close_live();
+    }
 
 private:
+    // Backend implementations: ProfilerGpu.cpp (CUDA/HIP, and the CPU-build
+    // stubs) or ProfilerMps.mm.  Each hands PrivateUse1 devices to the
+    // *_device pair below first.
+    void arm_live(const Device& device);
+    void close_live();
+    // PrivateUse1 timing through the registered hooks (ProfilerDevice.cpp).
+    // arm_device returns whether ``device`` is such a device.
+    bool arm_device(const Device& device);
+    void close_device();
+
     OpRecord& rec_;
     // Live cudaEvent handle for the armed span; recycled by stop-time drain.
     void* gpu_start_ = nullptr;
@@ -290,7 +315,69 @@ private:
     int gpu_device_ = -1;
     uint64_t arm_ns_ = 0;
     bool armed_ = false;
+    // Start event from the PrivateUse1 hooks, and the device it was taken on.
+    void* device_start_ = nullptr;
+    int device_index_ = -1;
+    // The op's slot is pushed as the device activity collector's external
+    // correlation id.
+    bool device_pushed_ = false;
 };
+
+// ---- Out-of-tree device timing (PrivateUse1) ------------------------------
+// A backend times operations on its device by registering these hooks (from
+// its library initialization).  A session with device timing on records an
+// event on the device before and after every operation dispatched to it; at
+// stop the elapsed time between the two becomes the op's device time
+// (Event::gpu_ms).  Every hook must be safe to call from any thread and must
+// not throw.
+struct TENSORPLAY_API DeviceTimerHooks {
+    // The device the calling thread works on (for an op whose device has no
+    // index).
+    virtual int current_device() const = 0;
+    // An event recorded on ``device``'s current queue, or null on failure.
+    virtual void* record(int device) const = 0;
+    // Milliseconds between two recorded events, waiting for ``end`` to
+    // complete; false when the time is unavailable.
+    virtual bool elapsed_ms(void* start, void* end, float* ms) const = 0;
+    // Returns an event to the backend (each recorded event exactly once).
+    virtual void release(void* event) const = 0;
+    virtual ~DeviceTimerHooks() = default;
+};
+// Installs (or with null removes) the PrivateUse1 hooks; the object must
+// outlive every profiling session.
+TENSORPLAY_API void register_privateuse1_timer_hooks(const DeviceTimerHooks* hooks);
+TENSORPLAY_API const DeviceTimerHooks* privateuse1_timer_hooks();
+
+// Kernel-level tracing of the out-of-tree device: the backend's activity
+// collector (its vendor's counterpart of the CUPTI collector) records the
+// kernels, copies and fills the device ran during a session.  While it
+// runs, every op dispatched to the device pushes its OpRecord slot as the
+// collector's external correlation id, so each record joins back to the op
+// that launched it (GpuActivity::external_id).
+struct TENSORPLAY_API DeviceActivityHooks {
+    // Starts collecting; false (with last_error() saying why) when the
+    // collector cannot run.
+    virtual bool start() = 0;
+    // Stops and appends the records ('k' kernel, 'm' copy, 's' fill), with
+    // times on the steady clock the op events use.  Names must stay valid
+    // until the next start().
+    virtual void stop_and_collect(std::vector<GpuActivity>& out) = 0;
+    virtual void push_external_id(uint64_t id) = 0;
+    virtual void pop_external_id() = 0;
+    virtual std::string last_error() const { return {}; }
+    virtual ~DeviceActivityHooks() = default;
+};
+TENSORPLAY_API void register_privateuse1_activity_hooks(DeviceActivityHooks* hooks);
+TENSORPLAY_API DeviceActivityHooks* privateuse1_activity_hooks();
+// True while the device activity collector runs (set by the binding layer).
+TENSORPLAY_API extern std::atomic<bool> g_device_trace;
+// Resolves (and releases) the PrivateUse1 pairs recorded in the session;
+// called by every gpu_resolve_all implementation.
+TENSORPLAY_API void resolve_device_pairs(
+        std::vector<Event>& events,
+        const std::function<void(Event&, float ms)>& emit);
+TENSORPLAY_API void drain_device_pairs();
+
 TENSORPLAY_API extern std::atomic<bool> g_gpu_timing;
 // Resolves every recorded GPU pair through `emit`; waits only for the final
 // event on each recorded stream, then recycles pool handles for the next

@@ -140,13 +140,9 @@ TENSORPLAY_API std::atomic<uint32_t> g_ext_warmup{0};
 // only trustworthy after the device-activity machinery has warmed up.
 constexpr uint32_t kExtWarmupOps = 32;
 
-GpuTimerPair::~GpuTimerPair() {
-    if (!armed_) return;
-    close();
-}
-
-void GpuTimerPair::arm(const Device& device) {
-    if (!rec_.live_ || !device.is_cuda()) return;
+void GpuTimerPair::arm_live(const Device& device) {
+    if (arm_device(device)) return;
+    if (!device.is_cuda()) return;
     // Every op pushes its OpRecord slot as an external correlation id while a
     // device-activity session runs, which is what pins the join between a kernel
     // record and the op that launched it exactly.  The two library calls are
@@ -176,7 +172,11 @@ void GpuTimerPair::arm(const Device& device) {
     armed_ = true;
 }
 
-void GpuTimerPair::close() {
+void GpuTimerPair::close_live() {
+    if (device_start_ || device_pushed_) {
+        close_device();
+        return;
+    }
     if (rec_.trace_pushed_) {
         rec_.trace_pushed_ = false;
         cupti_pop_ext();
@@ -212,6 +212,7 @@ void GpuTimerPair::close() {
 TENSORPLAY_API void gpu_resolve_all(
         std::vector<Event>& events,
         const std::function<void(Event&, float ms)>& emit) {
+    resolve_device_pairs(events, emit);
     int original_device = -1;
     (void)cudaGetDevice(&original_device);
     std::vector<LivePair> pairs;
@@ -285,6 +286,7 @@ TENSORPLAY_API void gpu_resolve_all(
 }
 
 TENSORPLAY_API void gpu_drain_pool() {
+    drain_device_pairs();
     int original_device = -1;
     (void)cudaGetDevice(&original_device);
     std::unordered_map<int, std::deque<cudaEvent_t>> pool;
@@ -319,17 +321,20 @@ TENSORPLAY_API void gpu_drain_pool() {
 
 namespace tensorplay {
 namespace prof {
-// CPU builds: keep the symbols so generated code links without ifdef noise.
+// CPU builds: no GPU lane, only the out-of-tree device (ProfilerDevice.cpp).
 // MPS builds provide the real implementation from ProfilerMps.mm instead.
-GpuTimerPair::~GpuTimerPair() {}
-void GpuTimerPair::arm(const Device&) {}
-void GpuTimerPair::close() {}
+void GpuTimerPair::arm_live(const Device& device) { (void)arm_device(device); }
+void GpuTimerPair::close_live() {
+    if (device_start_ || device_pushed_) close_device();
+}
 TENSORPLAY_API std::atomic<bool> g_gpu_timing{false};
 TENSORPLAY_API std::atomic<uint32_t> g_ext_warmup{0};
 TENSORPLAY_API void gpu_resolve_all(
-        std::vector<Event>&,
-        const std::function<void(Event&, float)>&) {}
-TENSORPLAY_API void gpu_drain_pool() {}
+        std::vector<Event>& events,
+        const std::function<void(Event&, float)>& emit) {
+    resolve_device_pairs(events, emit);
+}
+TENSORPLAY_API void gpu_drain_pool() { drain_device_pairs(); }
 } // namespace prof
 } // namespace tensorplay
 

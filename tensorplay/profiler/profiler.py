@@ -30,6 +30,8 @@ class ProfilerActivity(str, Enum):
     CPU = "cpu"
     CUDA = "cuda"
     MPS = "mps"
+    # The out-of-tree device (see tensorplay.utils.rename_privateuse1_backend).
+    PrivateUse1 = "privateuse1"
 
 
 def supported_activities():
@@ -42,9 +44,28 @@ def supported_activities():
             activities.add(ProfilerActivity.CUDA)
         if tp.mps.is_available():
             activities.add(ProfilerActivity.MPS)
+        if _C._profiler_device_timing_available():
+            activities.add(ProfilerActivity.PrivateUse1)
     except Exception:
         pass
     return activities
+
+
+def _device_trace_available():
+    try:
+        return bool(_C._profiler_device_trace_available())
+    except Exception:
+        return False
+
+
+def _names_privateuse1(name):
+    """Whether a device name refers to the out-of-tree device."""
+    if name == "privateuse1":
+        return True
+    try:
+        return name == _C._get_privateuse1_backend_name()
+    except Exception:
+        return False
 
 
 def _activity_name(activity):
@@ -185,6 +206,9 @@ class profile:
             "mps" in activity_names
             or (use_device is not None and _activity_name(use_device) == "mps")
         )
+        device_requested = "privateuse1" in activity_names or (
+            use_device is not None and _names_privateuse1(_activity_name(use_device))
+        )
         # GPU durations come from the CUPTI activity stream by default: it
         # collects kernel/memcpy records asynchronously on its own thread,
         # so the dispatch hot path pays no per-op driver calls.  An explicit
@@ -194,13 +218,29 @@ class profile:
         # cannot load.
         # MPS has no kernel-level trace collector: GPU durations always come
         # from the event-pair path, so an MPS request implies gpu_timing.
-        if gpu_timing is None and mps_requested:
+        # The out-of-tree device: with an activity collector, an op's device
+        # time is the time of the kernels it launched (as with the CUDA
+        # collector); without one, the event pair its backend's
+        # DeviceTimerHooks record around the op.
+        device_trace = (
+            device_requested
+            and (gpu_trace is None or bool(gpu_trace))
+            and _device_trace_available()
+        )
+        if gpu_timing is None and (mps_requested or (device_requested and not device_trace)):
             gpu_timing = True
         self.gpu_timing = bool(gpu_timing)
+        # The device a device-time column is titled with (None: inferred).
+        self._device_name = None
+        if device_requested:
+            self._device_name = _C._get_privateuse1_backend_name()
+        elif mps_requested:
+            self._device_name = "mps"
         if gpu_trace is None:
             self.gpu_trace = (cuda_requested or mps_requested) and gpu_timing is None
         else:
             self.gpu_trace = bool(gpu_trace)
+        self.device_trace = bool(device_trace)
 
         self.step_num = 0
         self.events = None
@@ -224,6 +264,7 @@ class profile:
                 gpu_activities=self.gpu_activities,
                 mem_events=self.mem_events,
                 with_stack=self.with_stack,
+                use_device=self._device_name,
             )
             self.events.with_flops = self.with_flops
         return self.events
@@ -262,6 +303,7 @@ class profile:
             self.gpu_timing,
             self.gpu_trace,
             self.profile_memory,
+            self.device_trace,
         )
         self._recording = True
         # Custom operators emit their op spans only while a session is live;
@@ -347,7 +389,8 @@ class profile:
         """
 
         if self._device_results is None:
-            self._device_results = device_activities(self.gpu_activities)
+            self._device_results = device_activities(
+                self.gpu_activities, self._device_name or "cuda")
         return self._device_results
 
     @property

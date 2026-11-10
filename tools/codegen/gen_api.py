@@ -432,13 +432,12 @@ def _emit_redispatch(lines, f, variant, dev_src, helper_name):
             "        __tp_prof_rec.set_io_meta(std::move(__tp_prof_shapes),"
             " std::move(__tp_prof_dtypes));")
         lines.append("    }")
-    # GPU timeline: pool-backed event pair around dispatched GPU work
-    # (CUDA/HIP/MPS builds; resolved at session stop after one sync).  The
-    # backend-specific implementation lives in ProfilerGpu.cpp /
-    # ProfilerMps.mm and is selected by the device type at arm() time.
-    lines.append("#if defined(USE_CUDA) || defined(USE_ROCM) || defined(USE_MPS)")
+    # Device timeline: event pair around dispatched device work (CUDA/HIP/MPS
+    # builds, and the out-of-tree device in every build; resolved at session
+    # stop).  The implementation lives in ProfilerGpu.cpp / ProfilerMps.mm /
+    # ProfilerDevice.cpp and is selected by the device type at arm() time;
+    # arm/close are inline no-ops while no session runs.
     lines.append("    tensorplay::prof::GpuTimerPair __tp_gpu(__tp_prof_rec);")
-    lines.append("#endif")
     if f.device_guard:
         lines.append("#ifdef USE_CUDA")
         # Brace-init: a parenthesized placeholder like Device(DeviceType::CPU)
@@ -466,9 +465,7 @@ def _emit_redispatch(lines, f, variant, dev_src, helper_name):
     lines.append(
         f"    DispatchKey dispatch_key = {key_expr};"
     )
-    lines.append("#if defined(USE_CUDA) || defined(USE_ROCM) || defined(USE_MPS)")
     lines.append(f"    __tp_gpu.arm({rd_dev});")
-    lines.append("#endif")
 
     dispatch_stub = f"DispatchStub<{', '.join(tmpl)}>"
     if rd_call:
@@ -481,9 +478,7 @@ def _emit_redispatch(lines, f, variant, dev_src, helper_name):
             lines.append(f"    {call};")
         else:
             lines.append(f"    auto&& __tp_result = {call};")
-        lines.append("#if defined(USE_CUDA) || defined(USE_ROCM) || defined(USE_MPS)")
         lines.append("    __tp_gpu.close();")
-        lines.append("#endif")
         # Output allocation volume for Tensor-returning ops (memory view).
         if not ret_void and ret == "Tensor":
             lines.append(
@@ -499,9 +494,7 @@ def _emit_redispatch(lines, f, variant, dev_src, helper_name):
     else:
         lines.append(f"    {call};" if ret_void else
                      f"    auto&& __tp_result = {call};")
-        lines.append("#if defined(USE_CUDA) || defined(USE_ROCM) || defined(USE_MPS)")
         lines.append("    __tp_gpu.close();")
-        lines.append("#endif")
         for m in mutable:
             at = f.arg(m).type
             if at.is_mutable_tensor_list:
