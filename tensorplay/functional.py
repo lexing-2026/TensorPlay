@@ -518,7 +518,17 @@ def add(input, other, *, alpha=1, out=None):
 def add_(input, other, alpha=1):
     return input.add_(other=other, alpha=alpha)
 
-def sub(input, other, alpha=1):
+def sub(input, other, alpha=1, *, out=None):
+    if out is not None:
+        if _capturing():
+            _captured = _capture_call(sub, (input, other, alpha), {'out': out})
+            if _captured is not None:
+                return _captured
+        if not isinstance(input, tensorplay.Tensor):
+            input = _as_left_operand(input, other)
+        if isinstance(other, tensorplay.Tensor):
+            return _C.sub(input, other, alpha=alpha, out=out)
+        return input.sub(other=other, alpha=alpha, out=out)
     if _capturing():
         _captured = _capture_call(sub, (input, other, alpha), {})
         if _captured is not None:
@@ -530,7 +540,17 @@ def sub(input, other, alpha=1):
 def sub_(input, other, alpha=1):
     return input.sub_(other=other, alpha=alpha)
 
-def mul(input, other):
+def mul(input, other, *, out=None):
+    if out is not None:
+        if _capturing():
+            _captured = _capture_call(mul, (input, other), {'out': out})
+            if _captured is not None:
+                return _captured
+        if not isinstance(input, tensorplay.Tensor):
+            input = _as_left_operand(input, other)
+        if isinstance(other, tensorplay.Tensor):
+            return _C.mul(input, other, out=out)
+        return input.mul(other=other, out=out)
     if _capturing():
         _captured = _capture_call(mul, (input, other), {})
         if _captured is not None:
@@ -542,7 +562,21 @@ def mul(input, other):
 def mul_(input, other):
     return input.mul_(other=other)
 
-def div(input, other, rounding_mode=None):
+def div(input, other, rounding_mode=None, *, out=None):
+    if out is not None:
+        if _capturing():
+            _captured = _capture_call(div, (input, other, rounding_mode), {'out': out})
+            if _captured is not None:
+                return _captured
+        if not isinstance(input, tensorplay.Tensor):
+            input = _as_left_operand(input, other)
+        if isinstance(other, tensorplay.Tensor):
+            if rounding_mode is None:
+                return _C.div(input, other, out=out)
+            return _C.div(input, other, rounding_mode=rounding_mode, out=out)
+        if rounding_mode is None:
+            return input.div(other=other, out=out)
+        return input.div(other=other, rounding_mode=rounding_mode, out=out)
     if _capturing():
         _captured = _capture_call(div, (input, other), {'rounding_mode': rounding_mode})
         if _captured is not None:
@@ -553,7 +587,22 @@ def div(input, other, rounding_mode=None):
         return input.div(other=other)
     return input.div(other=other, rounding_mode=rounding_mode)
 
-def divide(input, other, rounding_mode=None):
+def divide(input, other, rounding_mode=None, *, out=None):
+    if out is not None:
+        if _capturing():
+            _captured = _capture_call(divide, (input, other, rounding_mode), {'out': out})
+            if _captured is not None:
+                return _captured
+        if not isinstance(input, tensorplay.Tensor):
+            input = _as_left_operand(input, other)
+        if isinstance(other, tensorplay.Tensor):
+            if rounding_mode is None:
+                return _C.divide(input, other, out=out)
+            return _C.divide(input, other, rounding_mode=rounding_mode, out=out)
+        other = tensorplay.as_tensor(other, device=input.device)
+        if rounding_mode is None:
+            return _C.divide(input, other, out=out)
+        return _C.divide(input, other, rounding_mode=rounding_mode, out=out)
     if _capturing():
         _captured = _capture_call(divide, (input, other), {'rounding_mode': rounding_mode})
         if _captured is not None:
@@ -564,7 +613,17 @@ def divide(input, other, rounding_mode=None):
         return input.divide(other=other)
     return input.divide(other=other, rounding_mode=rounding_mode)
 
-def true_divide(input, other):
+def true_divide(input, other, *, out=None):
+    if out is not None:
+        if _capturing():
+            _captured = _capture_call(true_divide, (input, other), {'out': out})
+            if _captured is not None:
+                return _captured
+        if not isinstance(input, tensorplay.Tensor):
+            input = _as_left_operand(input, other)
+        if isinstance(other, tensorplay.Tensor):
+            return _C.true_divide(input, other, out=out)
+        return _C.true_divide(input, tensorplay.as_tensor(other, device=input.device), out=out)
     if _capturing():
         _captured = _capture_call(true_divide, (input, other), {})
         if _captured is not None:
@@ -573,7 +632,17 @@ def true_divide(input, other):
         input = _as_left_operand(input, other)
     return input.true_divide(other=other)
 
-def floor_divide(input, other):
+def floor_divide(input, other, *, out=None):
+    if out is not None:
+        if _capturing():
+            _captured = _capture_call(floor_divide, (input, other), {'out': out})
+            if _captured is not None:
+                return _captured
+        if not isinstance(input, tensorplay.Tensor):
+            input = _as_left_operand(input, other)
+        if isinstance(other, tensorplay.Tensor):
+            return _C.floor_divide(input, other, out=out)
+        return input.floor_divide(other=other, out=out)
     if _capturing():
         _captured = _capture_call(floor_divide, (input, other), {})
         if _captured is not None:
@@ -582,7 +651,17 @@ def floor_divide(input, other):
         input = _as_left_operand(input, other)
     return input.floor_divide(other=other)
 
-def multiply(input, other):
+def multiply(input, other, *, out=None):
+    if out is not None:
+        if _capturing():
+            _captured = _capture_call(multiply, (input, other), {'out': out})
+            if _captured is not None:
+                return _captured
+        if not isinstance(input, tensorplay.Tensor):
+            input = _as_left_operand(input, other)
+        if isinstance(other, tensorplay.Tensor):
+            return _C.multiply(input, other, out=out)
+        return _C.multiply(input, tensorplay.as_tensor(other, device=input.device), out=out)
     if _capturing():
         _captured = _capture_call(multiply, (input, other), {})
         if _captured is not None:
@@ -591,7 +670,17 @@ def multiply(input, other):
         input = _as_left_operand(input, other)
     return input.multiply(other=other)
 
-def subtract(input, other, alpha=1):
+def subtract(input, other, alpha=1, *, out=None):
+    if out is not None:
+        if _capturing():
+            _captured = _capture_call(subtract, (input, other, alpha), {'out': out})
+            if _captured is not None:
+                return _captured
+        if not isinstance(input, tensorplay.Tensor):
+            input = _as_left_operand(input, other)
+        if isinstance(other, tensorplay.Tensor):
+            return _C.subtract(input, other, alpha=alpha, out=out)
+        return _C.subtract(input, tensorplay.as_tensor(other, device=input.device), out=out)
     if _capturing():
         _captured = _capture_call(subtract, (input, other, alpha), {})
         if _captured is not None:
@@ -613,7 +702,15 @@ def remainder(input, other, *, out=None):
             return _captured
     return _C.remainder(input, other)
 
-def fmod(input, other):
+def fmod(input, other, *, out=None):
+    if out is not None:
+        if _capturing():
+            _captured = _capture_call(fmod, (input, other), {'out': out})
+            if _captured is not None:
+                return _captured
+        if not isinstance(input, tensorplay.Tensor):
+            input = _as_left_operand(input, other)
+        return _C.fmod(input, other, out=out)
     if _capturing():
         _captured = _capture_call(fmod, (input, other), {})
         if _captured is not None:
@@ -622,7 +719,15 @@ def fmod(input, other):
         input = _as_left_operand(input, other)
     return input.fmod(other=other)
 
-def copysign(input, other):
+def copysign(input, other, *, out=None):
+    if out is not None:
+        if _capturing():
+            _captured = _capture_call(copysign, (input, other), {'out': out})
+            if _captured is not None:
+                return _captured
+        if not isinstance(input, tensorplay.Tensor):
+            input = _as_left_operand(input, other)
+        return _C.copysign(input, other, out=out)
     if _capturing():
         _captured = _capture_call(copysign, (input, other), {})
         if _captured is not None:
@@ -631,7 +736,15 @@ def copysign(input, other):
         input = _as_left_operand(input, other)
     return input.copysign(other=other)
 
-def clamp_min(input, min):
+def clamp_min(input, min, *, out=None):
+    if out is not None:
+        if _capturing():
+            _captured = _capture_call(clamp_min, (input, min), {'out': out})
+            if _captured is not None:
+                return _captured
+        if not isinstance(input, tensorplay.Tensor):
+            input = _as_left_operand(input, min)
+        return _C.clamp_min(input, min, out=out)
     if _capturing():
         _captured = _capture_call(clamp_min, (input, min), {})
         if _captured is not None:
@@ -640,7 +753,15 @@ def clamp_min(input, min):
         input = _as_left_operand(input, min)
     return input.clamp_min(min=min)
 
-def clamp_max(input, max):
+def clamp_max(input, max, *, out=None):
+    if out is not None:
+        if _capturing():
+            _captured = _capture_call(clamp_max, (input, max), {'out': out})
+            if _captured is not None:
+                return _captured
+        if not isinstance(input, tensorplay.Tensor):
+            input = _as_left_operand(input, max)
+        return _C.clamp_max(input, max, out=out)
     if _capturing():
         _captured = _capture_call(clamp_max, (input, max), {})
         if _captured is not None:
@@ -1054,7 +1175,22 @@ def _foreach_zero_(input, *args, **kwargs):
             return _captured
     return _C._foreach_zero_(input, *args, **kwargs)
 
-def div_(input, other, rounding_mode=None):
+def div_(input, other, rounding_mode=None, *, out=None):
+    if out is not None:
+        if _capturing():
+            _captured = _capture_call(div_, (input, other, rounding_mode), {'out': out})
+            if _captured is not None:
+                return _captured
+        if not isinstance(input, tensorplay.Tensor):
+            input = _as_left_operand(input, other)
+        if isinstance(other, tensorplay.Tensor):
+            if rounding_mode is None:
+                return _C.div_(input, other, out=out)
+            return _C.div_(input, other, rounding_mode=rounding_mode, out=out)
+        other = tensorplay.as_tensor(other, device=input.device)
+        if rounding_mode is None:
+            return _C.div_(input, other, out=out)
+        return _C.div_(input, other, rounding_mode=rounding_mode, out=out)
     if _capturing():
         _captured = _capture_call(div_, (input, other), {'rounding_mode': rounding_mode})
         if _captured is not None:
@@ -10655,7 +10791,22 @@ def ctc_loss(log_probs, targets, input_lengths, target_lengths, blank=0, reducti
 def fill_diagonal_(input, fill_value, wrap=False):
     return input.fill_diagonal_(fill_value=fill_value, wrap=wrap)
 
-def divide_(input, other, rounding_mode=None):
+def divide_(input, other, rounding_mode=None, *, out=None):
+    if out is not None:
+        if _capturing():
+            _captured = _capture_call(divide_, (input, other, rounding_mode), {'out': out})
+            if _captured is not None:
+                return _captured
+        if not isinstance(input, tensorplay.Tensor):
+            input = _as_left_operand(input, other)
+        if isinstance(other, tensorplay.Tensor):
+            if rounding_mode is None:
+                return _C.divide_(input, other, out=out)
+            return _C.divide_(input, other, rounding_mode=rounding_mode, out=out)
+        other = tensorplay.as_tensor(other, device=input.device)
+        if rounding_mode is None:
+            return _C.divide_(input, other, out=out)
+        return _C.divide_(input, other, rounding_mode=rounding_mode, out=out)
     if _capturing():
         _captured = _capture_call(divide_, (input, other), {'rounding_mode': rounding_mode})
         if _captured is not None:

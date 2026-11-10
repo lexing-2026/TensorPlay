@@ -519,8 +519,38 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
         if (any(a.name == 'rounding_mode' for g in group for a in g.args)
                 and not any(a.name == 'rounding_mode' for a in f.args)):
             seen.add(name)
+            # A plain-number right operand cannot ride the tensor destination
+            # overload, so it goes through the receiver's scalar destination
+            # method when one exists, and a promoted tensor otherwise.
+            method_takes_scalar = any(
+                g.out_args and 'method' in g.variants
+                and len(g.args) > 1 and g.args[1].type.kind == 'Scalar'
+                for g in group)
+            scalar_out = [
+                '        if rounding_mode is None:',
+                f'            return input.{name}(other=other, out=out)',
+                f'        return input.{name}(other=other, '
+                'rounding_mode=rounding_mode, out=out)',
+            ] if method_takes_scalar else [
+                '        other = tensorplay.as_tensor(other, device=input.device)',
+                '        if rounding_mode is None:',
+                f'            return _C.{name}(input, other, out=out)',
+                f'        return _C.{name}(input, other, '
+                'rounding_mode=rounding_mode, out=out)',
+            ]
             lines += [
-                f'def {name}(input, other, rounding_mode=None):',
+                f'def {name}(input, other, rounding_mode=None, *, out=None):',
+                '    if out is not None:',
+                *_out_capture_lines(
+                    name, ['input', 'other', 'rounding_mode'], indent='        '),
+                '        if not isinstance(input, tensorplay.Tensor):',
+                '            input = _as_left_operand(input, other)',
+                '        if isinstance(other, tensorplay.Tensor):',
+                '            if rounding_mode is None:',
+                f'                return _C.{name}(input, other, out=out)',
+                f'            return _C.{name}(input, other, '
+                'rounding_mode=rounding_mode, out=out)',
+                *scalar_out,
                 '    if _capturing():',
                 f'        _captured = _capture_call({name}, (input, other), '
                 "{'rounding_mode': rounding_mode})",
@@ -1408,11 +1438,62 @@ def generate_functional_py(funcs: list[NativeFunction]) -> str:
                     s += f'={dft}'
                 elif a.default:
                     s += f'={python_default(a.type, a.default)}'
-                sig_items.append((has_default, s))
+                sig_items.append((has_default, s, pname))
                 call_args.append(f'{pname}={pname}')
             sig_items.sort(key=lambda item: item[0])
-            arg_strs += [s for _, s in sig_items]
+            arg_strs += [s for _, s, _ in sig_items]
+
+            # A destination overload the extension exposes as a plain
+            # function (``_C.<name>``) gives the wrapper an ``out=`` keyword,
+            # matching the ordinary function wrappers.  Method-only
+            # destination overloads (clone, the new_* factories) have no
+            # ``_C.<name>`` entry point and stay reachable through the
+            # receiver alone.
+            out_via_function = (out_variant is not None
+                                and 'function' in out_variant.variants)
+            if out_via_function:
+                arg_strs += ['*', 'out=None']
             lines.append(f'def {name}({", ".join(arg_strs)}):')
+
+            if out_via_function:
+                # The destination overload resolved through ``_C.<name>``
+                # accepts one fixed kind for its right operand.  When that is
+                # a tensor, a plain-number right operand cannot ride the same
+                # call; it goes through the receiver's scalar destination
+                # method when one exists, and a promoted tensor otherwise.
+                func_takes_scalar = any(
+                    g.out_args and 'function' in g.variants
+                    and len(g.args) > 1 and g.args[1].type.kind == 'Scalar'
+                    for g in group)
+                method_takes_scalar = any(
+                    g.out_args and 'method' in g.variants
+                    and len(g.args) > 1 and g.args[1].type.kind == 'Scalar'
+                    for g in group)
+                rhs = args[1].python_name if len(args) > 1 else None
+                cap_names = ['input'] + [p for _, _, p in sig_items]
+                fwd = [a.python_name for a in args[1:] if not a.kwonly]
+                fwd += [f'{a.python_name}={a.python_name}'
+                        for a in args[1:] if a.kwonly]
+                fwd_str = ', '.join(['input'] + fwd)
+                lines.append('    if out is not None:')
+                lines += _out_capture_lines(name, cap_names, indent='        ')
+                if scalar_rhs:
+                    lines.append('        if not isinstance(input, tensorplay.Tensor):')
+                    lines.append(f'            input = _as_left_operand(input, {rhs})')
+                if rhs is not None and not func_takes_scalar:
+                    lines.append(f'        if isinstance({rhs}, tensorplay.Tensor):')
+                    lines.append(f'            return _C.{name}({fwd_str}, out=out)')
+                    if method_takes_scalar:
+                        lines.append(
+                            f'        return input.{name}({", ".join(call_args)}, out=out)')
+                    else:
+                        lines.append(
+                            f'        return _C.{name}(input, '
+                            f'tensorplay.as_tensor({rhs}, device=input.device), '
+                            'out=out)')
+                else:
+                    lines.append(f'        return _C.{name}({fwd_str}, out=out)')
+
             if not name.endswith('_'):
                 _capture_line(lines, name,
                               ['input'] + [a.python_name for a in args[1:]])
