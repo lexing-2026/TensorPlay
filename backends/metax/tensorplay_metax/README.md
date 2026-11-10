@@ -47,7 +47,8 @@ this directory only carries the toolchain module and the notes.
 ```bash
 cmake -S . -B build-metax -G Ninja \
   -DUSE_METAX=ON -DCMAKE_BUILD_TYPE=Release
-ninja -C build-metax -j 4 p10
+ninja -C build-metax -j 6 p10
+ninja -C build-metax -j 6 _C   # the Python bindings; links p10 and the MACA libraries
 ```
 
 `USE_METAX` and `USE_CUDA` are mutually exclusive.  A MACA build keeps the
@@ -57,8 +58,12 @@ turns the CUDA language off, and routes every `.cu` through the
 backend (context, allocator, graph, generator) build with the normal C++
 compiler against the same headers.
 
-Keep the job count low: each `mxcc` device pass peaks around 2.6 GB and the
-SDK does not cap its own parallelism.
+Keep the job count low: device translation units hold several GB while
+`mxcc` optimizes them (the elementwise files, with their full dtype fan-out,
+peak past 10 GB), and the SDK does not cap its own parallelism.  The device
+compiles therefore share one Ninja pool sized from physical memory
+(`TP_MACA_MB_PER_JOB`, default 6000); override the pool directly with
+`TP_MACA_JOBS=<n>`.
 
 ## Compiling one translation unit
 
@@ -76,11 +81,11 @@ mxcc -c -std=c++20 -offload-arch=xcore1000 \
   -I /opt/maca/include/mcdnn -I /opt/maca/include/mccl \
   -I /opt/maca/include/mcrand -I /opt/maca/include/mcfft \
   -I /opt/maca/include/mcsolver -I /opt/maca/include/mcsparse \
-  -DUSE_CUDA \
+  -DUSE_CUDA -DUSE_CUDNN \
   p10/src/backend/cuda/CopyKernels.cu -o /tmp/copy.o
 ```
 
-Three of those flags are not optional:
+Four of those flags do real work:
 
 - `-D__CUDACC__` — the sources mark host/device helpers with
   `__host__ __device__`, and the compatibility headers only enable those
@@ -90,6 +95,9 @@ Three of those flags are not optional:
   architecture-specific branches; the host pass must not see the macro.
 - `-include climits` — `mc_runtime_api.h` uses `UINT_MAX` without including
   the header that declares it.
+- `-DUSE_CUDNN` — the convolution and normalization paths then build against
+  the cuDNN-compatible surface (mcdnn behind the compatibility headers);
+  keep it so a one-off compile follows the same code paths as the full build.
 
 `build/generated` comes from `tools.codegen.main`; run it once before the
 first compile (see the top-level build, which does this automatically).
