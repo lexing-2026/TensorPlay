@@ -1,7 +1,8 @@
-// Elementwise binary arithmetic through the Ascend operator library: add,
-// sub, mul and div with broadcasting, their in-place forms and the scalar
-// forms.  Operands the device cannot compute in (integers, float64, a host
-// operand that is not a 0-d scalar) run through the host fallback.
+// Elementwise arithmetic through the Ascend operator library: add, sub, mul
+// and div with broadcasting, their in-place forms, the scalar forms and a
+// tensor raised to a scalar power.  Operands the device cannot compute in
+// (integers, float64, a host operand that is not a 0-d scalar) run through
+// the host fallback.
 
 #include <optional>
 
@@ -343,6 +344,25 @@ Tensor div_scalar_kernel(const Tensor& self, const Scalar& other) {
     return cpu_fallback::Kernel<"div.Scalar", sig::div__Scalar>::call(self, other);
 }
 
+// self ** exponent, one elementwise entry point in the operand's own type.
+Tensor pow_scalar_kernel(const Tensor& self, const Scalar& exponent) {
+    static const OpApi pow_api("aclnnPowTensorScalar");
+    const bool native = self.device().is_privateuse1() && is_native_float(self.dtype()) &&
+                        self.dim() <= kMaxAclDims && !has_negative_stride(self) && pow_api.valid();
+    if (!native) {
+        return cpu_fallback::Kernel<"pow.Tensor_Scalar",
+                                    sig::pow__Tensor_Scalar>::call(self, exponent);
+    }
+    const int index = index_of(self.device());
+    Tensor out = empty_on(self.sizes().vec(), self.dtype(), index);
+    if (out.numel() == 0) return out;
+    AclArgs args;
+    const AclTensorRef xr = args.tensor(self);
+    const AclTensorRef outr = args.tensor(out);
+    pow_api.run(index, xr, args.scalar(exponent, self.dtype()), outr);
+    return out;
+}
+
 Tensor& add__scalar_kernel(Tensor& self, const Scalar& other, const Scalar& alpha) {
     if (scalar_op(self, other.toDouble(), alpha.toDouble(), BinOp::Add, self)) return self;
     return cpu_fallback::Kernel<"add_.Scalar", sig::add___Scalar>::call(self, other, alpha);
@@ -377,6 +397,7 @@ TENSORPLAY_LIBRARY_IMPL(PrivateUse1, NPUBinaryKernels) {
     m.impl("add_.Scalar", static_cast<sig::add___Scalar*>(&add__scalar_kernel));
     m.impl("mul_.Scalar", static_cast<sig::mul___Scalar*>(&mul__scalar_kernel));
     m.impl("div_.Scalar", static_cast<sig::div___Scalar*>(&div__scalar_kernel));
+    m.impl("pow.Tensor_Scalar", static_cast<sig::pow__Tensor_Scalar*>(&pow_scalar_kernel));
 }
 
 } // namespace npu
