@@ -34,6 +34,8 @@ CASES = [
     "custom_op_kernel_for_the_device",
     "autocast_on_the_device",
     "vmap_over_device_tensors",
+    "profiler_reports_device_time",
+    "host_fallbacks_are_counted",
     "missing_kernel_is_reported",
 ]
 

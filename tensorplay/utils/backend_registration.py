@@ -22,6 +22,9 @@ outside this repository.  Bringing up such a backend takes four steps:
    (:class:`PrivateUse1Module`), so ``tensorplay.accelerator`` queries work
    from step 1 on.
 
+While kernels are being filled in, :func:`count_host_fallbacks` reports
+which operators still run on the host through the generic fallback.
+
 A backend packaged as a wheel can run steps 1-4 from an entry point in the
 ``tensorplay.backends`` group; ``import tensorplay`` loads every such entry
 point unless ``TENSORPLAY_DEVICE_BACKEND_AUTOLOAD=0``.
@@ -29,17 +32,42 @@ point unless ``TENSORPLAY_DEVICE_BACKEND_AUTOLOAD=0``.
 
 from __future__ import annotations
 
-from typing import Any, Optional, Union
+import contextlib
+from typing import Any, Iterator, Optional, Union
 
 import tensorplay
 from tensorplay import _C
 
 __all__ = [
     "PrivateUse1Module",
+    "count_host_fallbacks",
     "generate_methods_for_privateuse1_backend",
     "get_privateuse1_backend_name",
     "rename_privateuse1_backend",
 ]
+
+@contextlib.contextmanager
+def count_host_fallbacks() -> Iterator[dict[str, int]]:
+    """Count the operator calls that run on the host through the generic
+    fallback while the block runs.
+
+    The yielded dict fills in when the block exits, mapping each operator
+    (schema spelling, ``"pow.Tensor_Scalar"``) to its number of calls, most
+    frequent first::
+
+        with tensorplay.utils.count_host_fallbacks() as calls:
+            train_step()
+        print(calls)  # {} once every operator has a device kernel
+    """
+    calls: dict[str, int] = {}
+    _C._reset_host_fallback_counts()
+    _C._set_host_fallback_counting(True)
+    try:
+        yield calls
+    finally:
+        _C._set_host_fallback_counting(False)
+        calls.update(_C._host_fallback_counts())
+
 
 def get_privateuse1_backend_name() -> str:
     """The out-of-tree device's name (``"privateuseone"`` until renamed)."""

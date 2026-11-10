@@ -1,4 +1,5 @@
 #include "python_bindings.h"
+#include "CpuFallback.h"
 #include "Dispatcher.h"
 #include "Tensor.h"
 
@@ -94,6 +95,20 @@ void init_dispatch(py::module_& m) {
         "name has no registration under any key.\n\n"
         "Op names follow the schema spelling: \"add.Tensor\", \"mul.Tensor\",\n"
         "\"sum.dim_IntList\", ...");
+
+    m.def("_set_host_fallback_counting", [](bool enabled) {
+        tensorplay::cpu_fallback::set_host_call_counting(enabled);
+    }, py::arg("enabled"));
+    m.def("_host_fallback_counts", [] {
+        py::dict out;
+        for (const auto& [name, count] : tensorplay::cpu_fallback::host_call_counts()) {
+            out[py::str(name)] = count;
+        }
+        return out;
+    }, "Per-operator calls served by the host fallback since the last reset.");
+    m.def("_reset_host_fallback_counts", [] {
+        tensorplay::cpu_fallback::reset_host_call_counts();
+    });
 
     // Single-point registration queries (used by test suites that assert a
     // given backend implements an op without dumping the whole table).

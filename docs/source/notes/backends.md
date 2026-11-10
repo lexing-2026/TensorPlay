@@ -79,8 +79,8 @@ and the written arguments back:
 #include "CpuFallback.h"
 
 TENSORPLAY_LIBRARY_IMPL(PrivateUse1, NpuHostFallbacks) {
-    m.impl("addmm", &cpu_fallback::kernel<"addmm", sig::addmm>);
-    m.impl("add_.Tensor", &cpu_fallback::kernel<"add_.Tensor", sig::add___Tensor>);
+    m.impl("addmm", cpu_fallback::kernel<"addmm", sig::addmm>);
+    m.impl("add_.Tensor", cpu_fallback::kernel<"add_.Tensor", sig::add___Tensor>);
 }
 ```
 
@@ -90,6 +90,14 @@ per tensor. Use it to get a model running, then replace fallbacks with
 device kernels one operator at a time. It cannot serve operators whose
 result aliases an input (views); the composite view kernels already cover
 those.
+
+To see which operators a workload still runs this way, count them:
+
+```python
+with tp.utils.count_host_fallbacks() as calls:
+    train_step()
+print(calls)  # {"pow.Tensor_Scalar": 2, "ones_like": 1, ...}; {} when none
+```
 
 An operator with no kernel for the device fails loudly with `Kernel not
 found for op: <name> on backend: PrivateUse1`. Set
@@ -130,6 +138,39 @@ A named backend with hooks becomes the process's accelerator, ahead of any
 in-tree one. `tp.accelerator.current_accelerator()`, `device_count()`,
 `set_device_index()`, `device_index(...)` and `synchronize()` then answer
 for it.
+
+## Profiling
+
+`tensorplay.profiler` reports device time for the backend's operations once
+the backend registers timer hooks: an event recorded on the device before
+and after each operation, read back when the session stops.
+
+```cpp
+#include "Profiler.h"
+
+struct NpuTimer final : tensorplay::prof::DeviceTimerHooks {
+    int current_device() const override { return npu_get_device(); }
+    void* record(int device) const override { return npu_event_record(device); }
+    bool elapsed_ms(void* start, void* end, float* ms) const override {
+        return npu_event_elapsed(start, end, ms);  // waits for ``end``
+    }
+    void release(void* event) const override { npu_event_free(event); }
+};
+
+const bool npu_timer = [] {
+    tensorplay::prof::register_privateuse1_timer_hooks(new NpuTimer);
+    return true;
+}();
+```
+
+`profile(activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1])`
+or `profile(use_device="npu")` then fills the device-time columns, titled
+with the device's name. A backend whose vendor has an activity-tracing
+library can also register `DeviceActivityHooks`: the session then collects
+the kernels, copies and fills the device ran, each joined to the operation
+that launched it through the operation's slot, pushed as the collector's
+external correlation id while the operation dispatches. They appear in
+`prof.kineto_results()`, in the kernel counts and in exported traces.
 
 ## Python side
 

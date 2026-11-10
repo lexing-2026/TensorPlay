@@ -14,7 +14,7 @@
 //   #include "tensorplay/ops/KernelSignatures.h"
 //
 //   TENSORPLAY_LIBRARY_IMPL(PrivateUse1, MyBackendFallbacks) {
-//       m.impl("mm", &cpu_fallback::kernel<"mm", kernel_signatures::mm>);
+//       m.impl("mm", cpu_fallback::kernel<"mm", kernel_signatures::mm>);
 //   }
 //
 // or for every operator that is still missing a kernel, once its own
@@ -32,8 +32,11 @@
 // * every call pays two transfers per tensor, so the fallback is a way to
 //   bring a model up, not to run it fast.
 
+#include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <optional>
+#include <string>
 #include <tuple>
 #include <type_traits>
 #include <utility>
@@ -64,7 +67,17 @@ struct OpName {
 // were registered.
 P10_API int register_host_fallbacks(DispatchKey key);
 
+// Per-operator counts of calls that ran on the host through this fallback,
+// for finding the operators a backend still lacks.  Counting is off until
+// enabled; the counts persist until reset.
+P10_API void set_host_call_counting(bool enabled);
+P10_API std::vector<std::pair<std::string, int64_t>> host_call_counts();
+P10_API void reset_host_call_counts();
+
 namespace detail {
+
+P10_API extern std::atomic<bool> host_call_counting;
+P10_API void count_host_call(const char* name);
 
 // Where results go: the device of the first non-host tensor (or device
 // argument) the call names.
@@ -240,6 +253,9 @@ template <OpName Name, typename Ret, typename... Args>
 struct Kernel<Name, Ret(Args...)> {
     static Ret call(Args... args) {
         static const OperatorHandle handle = Dispatcher::singleton().findHandle(Name.value);
+        if (detail::host_call_counting.load(std::memory_order_relaxed)) {
+            detail::count_host_call(Name.value);
+        }
         detail::Home home;
         detail::Written written;
         std::tuple<typename detail::Staged<Args>::Value...> staged{

@@ -12,13 +12,17 @@
 //     (REGISTER_PRIVATEUSE1_HOOKS);
 //   * native kernels for the operators every backend writes itself:
 //     empty, empty.memory_format, copy_ and item;
-//   * host fallbacks (CpuFallback.h) for the arithmetic a small training
-//     step uses.  A real backend replaces these with device kernels one by
-//     one.
+//   * profiler timer hooks (Profiler.h), so a profile reports device time
+//     for operations on the device;
+//   * host fallbacks (CpuFallback.h): a few registered one by one, the way
+//     a backend covers a single operator, and every remaining operator with
+//     a CPU kernel through register_host_fallbacks.  A real backend
+//     replaces these with device kernels one by one.
 //
 // The device name ("openreg") is given from Python with
 // tensorplay.utils.rename_privateuse1_backend.
 
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -28,6 +32,7 @@
 #include "CpuFallback.h"
 #include "Dispatcher.h"
 #include "PrivateUse1Hooks.h"
+#include "Profiler.h"
 #include "Tensor.h"
 #include "tensorplay/ops/KernelSignatures.h"
 
@@ -139,7 +144,7 @@ Tensor host_alias(const Tensor& t) {
     const Storage& storage = impl->storage();
     Storage view(DataPtr(storage.data(), deleteNothing, Device(DeviceType::CPU)),
                  storage.nbytes());
-    return Tensor(std::move(view), t.sizes().vec(), t.strides().vec(), t.dtype(),
+    return Tensor(std::move(view), t.sizes().vec(), t.strides(), t.dtype(),
                   impl->storage_offset());
 }
 
@@ -165,6 +170,27 @@ Scalar item_kernel(const Tensor& self) {
     return host_alias(self).item();
 }
 
+// Profiler device time.  The work of an openreg device is done by the time
+// its kernel returns, so an event is the moment it was recorded.
+struct HostClockTimer final : prof::DeviceTimerHooks {
+    int current_device() const override { return static_cast<int>(current_device_index); }
+    void* record(int) const override {
+        return new uint64_t(static_cast<uint64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count()));
+    }
+    bool elapsed_ms(void* start, void* end, float* ms) const override {
+        const auto s = *static_cast<uint64_t*>(start), e = *static_cast<uint64_t*>(end);
+        *ms = static_cast<float>(static_cast<double>(e - s) * 1e-6);
+        return true;
+    }
+    void release(void* event) const override { delete static_cast<uint64_t*>(event); }
+};
+
+[[maybe_unused]] const bool timer_registered = [] {
+    prof::register_privateuse1_timer_hooks(new HostClockTimer);
+    return true;
+}();
+
 } // namespace openreg
 
 namespace tensorplay {
@@ -181,7 +207,7 @@ TENSORPLAY_LIBRARY_IMPL(PrivateUse1, OpenRegNative) {
 }
 
 #define OPENREG_HOST_FALLBACK(name, symbol) \
-    m.impl(name, &cpu_fallback::kernel<name, sig::symbol>)
+    m.impl(name, cpu_fallback::kernel<name, sig::symbol>)
 
 TENSORPLAY_LIBRARY_IMPL(PrivateUse1, OpenRegHostFallbacks) {
     OPENREG_HOST_FALLBACK("fill_.Scalar", fill___Scalar);
@@ -202,6 +228,13 @@ TENSORPLAY_LIBRARY_IMPL(PrivateUse1, OpenRegHostFallbacks) {
     OPENREG_HOST_FALLBACK("mean", mean);
     OPENREG_HOST_FALLBACK("clone", clone);
 }
+
+// Every other operator with a CPU kernel runs on the host as well.  This
+// runs after the registrations above (static initialization follows the
+// order of definition within a file), so the operators they cover keep
+// their kernels.
+[[maybe_unused]] const int openreg_host_fallbacks =
+    cpu_fallback::register_host_fallbacks(DispatchKey::PrivateUse1);
 
 #undef OPENREG_HOST_FALLBACK
 

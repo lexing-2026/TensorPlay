@@ -129,8 +129,8 @@ def autograd_through_backend_kernels():
     w1, w2 = tp.randn(4, 6), tp.randn(6, 1)
 
     def loss_and_grads(device):
-        p1 = w1.to(device).requires_grad_()
-        p2 = w2.to(device).requires_grad_()
+        p1 = w1.to(device).detach().requires_grad_()
+        p2 = w2.to(device).detach().requires_grad_()
         loss = (tp.relu(x.to(device) @ p1) @ p2).sum()
         loss.backward()
         return loss, p1, p2
@@ -167,7 +167,8 @@ def accelerator_and_device_module():
     tp.accelerator.set_device_index(1)
     try:
         assert tp.accelerator.current_device_index() == 1
-        assert tp.empty(1, device="openreg").device.index == 1
+        index = tp.accelerator.current_device_index()
+        assert tp.empty(1, device=f"openreg:{index}").device.index == 1
         with tp.accelerator.device_index(0):
             assert tp.accelerator.current_device_index() == 0
         assert tp.accelerator.current_device_index() == 1
@@ -229,9 +230,44 @@ def vmap_over_device_tensors():
 
 
 @case
+def profiler_reports_device_time():
+    from tensorplay.profiler import ProfilerActivity, profile, supported_activities
+
+    assert ProfilerActivity.PrivateUse1 in supported_activities()
+    a = tp.randn(64, 64).to("openreg")
+    for request in ({"activities": [ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]},
+                    {"use_device": "openreg"}):
+        with profile(**request) as prof:
+            tp.mm(a, a).relu()
+        rows = {row.key: row for row in prof.key_averages()}
+        assert rows["mm"].device_time_total > 0, request
+        assert rows["relu"].device_time_total > 0, request
+        assert "OPENREG" in prof.key_averages().table(sort_by="device_time_total"), request
+    with profile(activities=[ProfilerActivity.CPU]) as prof:
+        a @ a
+    assert all(row.device_time_total == 0 for row in prof.key_averages())
+
+
+@case
+def host_fallbacks_are_counted():
+    a = tp.randn(3, 4).to("openreg")
+    with tp.utils.count_host_fallbacks() as calls:
+        tp.relu(a + a).sum()
+    assert calls == {"add.Tensor": 1, "relu": 1, "sum": 1}, calls
+    with tp.utils.count_host_fallbacks() as calls:
+        a.t()  # a view: no kernel runs
+    assert calls == {}, calls
+    tp.relu(a)  # outside a counting block
+    assert tp._C._host_fallback_counts() == {}, tp._C._host_fallback_counts()
+
+
+@case
 def missing_kernel_is_reported():
-    y = tp.ones(2, device="openreg")
-    expect_raises(NotImplementedError, lambda: tp.special.erfcx(y), match="PrivateUse1")
+    # An operator with neither a host kernel (which the fallback could run)
+    # nor a composite one.
+    x = tp.ones(1, 1, 2, 2, device="openreg")
+    grid = tp.zeros(1, 2, 2, 2, device="openreg")
+    expect_raises(NotImplementedError, lambda: tp.cudnn_grid_sampler(x, grid), match="PrivateUse1")
 
 
 def main():

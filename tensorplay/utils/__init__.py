@@ -6,6 +6,7 @@ import tensorplay
 
 from . import data
 from .backend_registration import (
+    count_host_fallbacks,
     generate_methods_for_privateuse1_backend,
     get_privateuse1_backend_name,
     rename_privateuse1_backend,

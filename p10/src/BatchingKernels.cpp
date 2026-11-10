@@ -2774,3 +2774,9 @@ TENSORPLAY_LIBRARY_IMPL(VmapCPU, NativeBatchRulesCPU) {
 TENSORPLAY_LIBRARY_IMPL(VmapCUDA, NativeBatchRulesCUDA) {
     register_batch_rules(m);
 }
+
+// The rules only rearrange batch dimensions and call operators on the
+// unwrapped tensors, so they serve the out-of-tree device unchanged.
+TENSORPLAY_LIBRARY_IMPL(VmapPrivateUse1, NativeBatchRulesPrivateUse1) {
+    register_batch_rules(m);
+}

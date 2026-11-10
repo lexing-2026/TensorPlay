@@ -57,8 +57,8 @@ bool prints_index(DeviceType type) {
 
 void register_privateuse1_backend(const std::string& backend_name) {
     const std::string name = lowered(backend_name);
-    TP_CHECK(!name.empty(), "the out-of-tree backend name must not be empty");
-    TP_CHECK(std::all_of(name.begin(), name.end(),
+    TP_CHECK_VALUE(!name.empty(), "the out-of-tree backend name must not be empty");
+    TP_CHECK_VALUE(std::all_of(name.begin(), name.end(),
                          [](unsigned char c) {
                              return std::isalnum(c) || c == '_';
                          }) &&
@@ -68,12 +68,12 @@ void register_privateuse1_backend(const std::string& backend_name) {
              "got '", backend_name, "'");
     bool in_tree = false;
     (void)in_tree_device_type(name, &in_tree);
-    TP_CHECK(!in_tree || name == kPrivateUse1DefaultName,
+    TP_CHECK_VALUE(!in_tree || name == kPrivateUse1DefaultName,
              "cannot name the out-of-tree backend after the in-tree device "
              "type '", name, "'");
     std::lock_guard<std::mutex> guard(privateuse1_lock);
     if (privateuse1_name_set.load(std::memory_order_acquire)) {
-        TP_CHECK(privateuse1_name == name,
+        TP_CHECK_VALUE(privateuse1_name == name,
                  "the out-of-tree backend is already registered as '",
                  privateuse1_name, "'; it cannot be renamed to '", name, "'");
         return;
