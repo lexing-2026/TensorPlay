@@ -284,14 +284,22 @@ private:
     DispatchKey key_;
 };
 
+// The trigger object runs one translation unit's registrations at load time.
+// It sits in an anonymous namespace so that its constructor has internal
+// linkage: a constructor defined inside a class at namespace scope is a single
+// vague-linkage symbol, so when two units name the same library a linker that
+// keeps one copy of it runs that one copy's registrations in place of every
+// other unit's, and the other units' kernels go unregistered.
 #define TENSORPLAY_LIBRARY_IMPL(KEY, NAME) \
     static void TP_CONCAT(tensorplay_library_init_, NAME)(::tensorplay::Library&); \
-    static struct TP_CONCAT(TensorPlayLibraryInit_, NAME) { \
+    namespace { \
+    struct TP_CONCAT(TensorPlayLibraryInit_, NAME) { \
         TP_CONCAT(TensorPlayLibraryInit_, NAME)() { \
             ::tensorplay::Library lib(::tensorplay::DispatchKey::KEY); \
             TP_CONCAT(tensorplay_library_init_, NAME)(lib); \
         } \
     } TP_CONCAT(tensorplay_library_init_instance_, NAME); \
+    } \
     static void TP_CONCAT(tensorplay_library_init_, NAME)(::tensorplay::Library& m)
 
 
