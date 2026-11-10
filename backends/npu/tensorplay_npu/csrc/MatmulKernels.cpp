@@ -24,7 +24,8 @@ namespace sig = kernel_signatures;
 bool native_pair(const Tensor& a, const Tensor& b) {
     return a.device().is_privateuse1() && b.device().is_privateuse1() &&
            a.dtype() == b.dtype() && is_native_float(a.dtype()) && a.dim() >= 1 &&
-           b.dim() >= 1 && a.dim() <= kMaxAclDims && b.dim() <= kMaxAclDims;
+           b.dim() >= 1 && a.dim() <= kMaxAclDims && b.dim() <= kMaxAclDims &&
+           !has_negative_stride(a) && !has_negative_stride(b);
 }
 
 const OpApi& mm_api() {
@@ -112,7 +113,7 @@ Tensor addmm_kernel(const Tensor& self, const Tensor& mat1, const Tensor& mat2,
                     const Scalar& beta, const Scalar& alpha) {
     if (!native_pair(mat1, mat2) || mat1.dim() != 2 || mat2.dim() != 2 ||
         !self.device().is_privateuse1() || self.dtype() != mat1.dtype() ||
-        self.dim() > 2 || !addmm_api().valid()) {
+        self.dim() > 2 || has_negative_stride(self) || !addmm_api().valid()) {
         return cpu_fallback::Kernel<"addmm", sig::addmm>::call(self, mat1, mat2, beta, alpha);
     }
     TP_CHECK(mat1.sizes()[1] == mat2.sizes()[0], "addmm: shapes ", mat1.sizes()[0], "x",

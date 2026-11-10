@@ -18,7 +18,8 @@ namespace {
 namespace sig = kernel_signatures;
 
 bool native_operand(const Tensor& t) {
-    return t.device().is_privateuse1() && is_native_float(t.dtype()) && t.dim() <= kMaxAclDims;
+    return t.device().is_privateuse1() && is_native_float(t.dtype()) &&
+           t.dim() <= kMaxAclDims && !has_negative_stride(t);
 }
 
 // One dense pass from ``self`` into a fresh result; ``extra`` arguments sit

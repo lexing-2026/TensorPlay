@@ -57,7 +57,7 @@ DType reduce_out_dtype(const Tensor& self, DType requested) {
 bool native_reduce(const Tensor& self, DType out_dtype, const OpApi& api) {
     return self.device().is_privateuse1() && self.dim() <= kMaxAclDims &&
            is_native_float(self.dtype()) && is_native_float(out_dtype) &&
-           self.numel() > 0 && api.valid();
+           self.numel() > 0 && !has_negative_stride(self) && api.valid();
 }
 
 enum class ReduceMode { Sum, Mean };
@@ -162,7 +162,7 @@ int64_t softmax_axis(const Tensor& self, int64_t dim) {
 
 bool native_softmax(const Tensor& self) {
     return self.device().is_privateuse1() && is_native_float(self.dtype()) &&
-           self.dim() <= kMaxAclDims;
+           self.dim() <= kMaxAclDims && !has_negative_stride(self);
 }
 
 Tensor softmax_forward(const Tensor& self, int64_t dim, const OpApi& api) {
@@ -197,7 +197,8 @@ bool native_softmax_backward(const Tensor& grad_output, const Tensor& output, DT
            is_native_float(grad_output.dtype()) && output.dtype() == grad_output.dtype() &&
            input_dtype == grad_output.dtype() &&
            grad_output.sizes().vec() == output.sizes().vec() &&
-           grad_output.dim() <= kMaxAclDims;
+           grad_output.dim() <= kMaxAclDims && !has_negative_stride(grad_output) &&
+           !has_negative_stride(output);
 }
 
 Tensor softmax_backward(const Tensor& grad_output, const Tensor& output, int64_t dim,

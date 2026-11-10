@@ -131,6 +131,9 @@ std::optional<Tensor> binary(const Tensor& a, const Tensor& b, double alpha, Bin
     const bool b_device = b.device().is_privateuse1();
     if (!(a_device || is_host_scalar(a)) || !(b_device || is_host_scalar(b))) return std::nullopt;
     if (!a_device && !b_device) return std::nullopt;
+    if ((a_device && has_negative_stride(a)) || (b_device && has_negative_stride(b))) {
+        return std::nullopt;
+    }
     if (op == BinOp::Div && alpha != 1.0) return std::nullopt;
     const DType dtype = binary_result_dtype(a, b);
     if (!is_native_float(dtype)) return std::nullopt;
@@ -221,7 +224,7 @@ std::optional<Tensor> binary(const Tensor& a, const Tensor& b, double alpha, Bin
 std::optional<Tensor> scalar_op(const Tensor& self, double value, double alpha, BinOp op,
                                 const std::optional<Tensor>& out) {
     if (!self.device().is_privateuse1() || !is_native_float(self.dtype())) return std::nullopt;
-    if (self.dim() > kMaxAclDims) return std::nullopt;
+    if (self.dim() > kMaxAclDims || has_negative_stride(self)) return std::nullopt;
     const DType dtype = self.dtype();
     const bool inplace = out.has_value();
     if (inplace && (!out->device().is_privateuse1() || out->dtype() != dtype ||
@@ -253,7 +256,7 @@ std::optional<Tensor> scalar_op(const Tensor& self, double value, double alpha, 
 // value - alpha * self: the device scales, the host constant adds.
 std::optional<Tensor> rsub_scalar(const Tensor& self, double value, double alpha) {
     if (!self.device().is_privateuse1() || !is_native_float(self.dtype())) return std::nullopt;
-    if (self.dim() > kMaxAclDims) return std::nullopt;
+    if (self.dim() > kMaxAclDims || has_negative_stride(self)) return std::nullopt;
     const OpApi& scale = scalar_api(BinOp::Mul);
     const OpApi& shift = scalar_inplace_api(BinOp::Add);
     if (!scale.valid() || !shift.valid()) return std::nullopt;

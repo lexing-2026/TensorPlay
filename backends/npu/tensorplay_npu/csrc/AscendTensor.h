@@ -19,6 +19,16 @@ Tensor empty_on(const std::vector<int64_t>& sizes, DType dtype, int index);
 // ``t`` itself when contiguous, otherwise a contiguous copy on its device.
 Tensor contiguous_on_device(const Tensor& t);
 
+// A view whose elements run backwards through memory cannot be handed to
+// the operator library as a descriptor; operands like that take the host.
+inline bool has_negative_stride(const Tensor& t) {
+    const IntArrayRef strides = t.stride();
+    for (int64_t stride : strides) {
+        if (stride < 0) return true;
+    }
+    return false;
+}
+
 // Copy ``src`` into ``dst`` on one device (same dtype, same shape; either
 // may be strided).
 void strided_copy(const Tensor& dst, const Tensor& src);
