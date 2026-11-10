@@ -13,9 +13,12 @@ device synchronized around each measurement.
     python benchmark/bench_mlu_vs_torch.py            # both, then compare
     python benchmark/bench_mlu_vs_torch.py --only tp  # one side, JSON out
 
-The frameworks default to different float32 matmul precisions (torch_mlu
-allows TF32, TensorPlay keeps full float32); BENCH_FP32_PRECISION=high (or
-highest) sets the same one on both sides.  A card whose driver reports a
+torch_mlu always runs float32 matmuls in TF32: its ``allow_tf32`` setter
+is a no-op in the shipped build (``torch.backends.mlu.matmul.allow_tf32``
+stays true), so the TensorPlay side defaults to TF32 too
+(``BENCH_FP32_PRECISION=high``) for a like-for-like comparison.  Set
+``BENCH_FP32_PRECISION=highest`` to force full float32 on the TensorPlay
+side (torch_mlu will still use TF32).  A card whose driver reports a
 generic product name needs the name fixed for the other side too
 (TORCH_PYTHON can point at a wrapper that does so); without it that side
 times wrong results or faults, and the MLP cases check against the host.
@@ -47,6 +50,7 @@ class Framework:
             self.nn = torch.nn
             self.optim = torch.optim
             self.F = torch.nn.functional
+            # torch_mlu's allow_tf32 setter is a no-op; leave its default.
             precision = os.environ.get("BENCH_FP32_PRECISION")
             if precision:
                 torch.set_float32_matmul_precision(precision)
@@ -61,9 +65,8 @@ class Framework:
             self.nn = tp.nn
             self.optim = tp.optim
             self.F = tp.nn.functional
-            precision = os.environ.get("BENCH_FP32_PRECISION")
-            if precision:
-                tp.set_float32_matmul_precision(precision)
+            precision = os.environ.get("BENCH_FP32_PRECISION", "high")
+            tp.set_float32_matmul_precision(precision)
         self.device = "mlu"
 
     def dtype(self, name: str):
