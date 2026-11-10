@@ -154,6 +154,10 @@ def test_strided_operands():
     d = a.to("npu")
     close(d.t() + d.t(), a.t() * 2)
     close(d[:, :4] * d[:, 1::2][:, :4], a[:, :4] * a[:, 1::2][:, :4])
+    close(d.t().sum(dim=1), a.t().sum(dim=1), scale=5)
+    close(tp.softmax(d.t(), dim=1), tp.softmax(a.t(), dim=1))
+    d.t().add_(1.0)
+    close(d, a + 1.0)
 
 
 def test_integer_math_runs_on_host_fallback():
