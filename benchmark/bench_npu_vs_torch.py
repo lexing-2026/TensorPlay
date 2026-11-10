@@ -52,7 +52,7 @@ class Framework:
         return {"fp32": self.m.float32, "fp16": self.m.float16, "bf16": self.m.bfloat16}[name]
 
     def randn(self, *shape, dtype="fp32"):
-        return self.m.randn(*shape).to(self.device).to(self.dtype(dtype))
+        return self.m.randn(*shape, dtype=self.dtype(dtype), device=self.device)
 
 
 def timeit(fx: Framework, fn, warmup=WARMUP, iters=ITERS) -> float:
