@@ -20,6 +20,7 @@
 #include "Allocator.h"
 #include "AscendAllocator.h"
 #include "AscendRuntime.h"
+#include "Profiler.h"
 
 namespace tensorplay {
 namespace npu {
@@ -40,6 +41,9 @@ struct Block {
     void* ptr;
     size_t size;
     int device;
+    // What the current owner asked for; the pool rounds it.  Memory capture
+    // reports this, so an allocation and its free name the same bytes.
+    size_t requested;
 };
 
 struct DevicePool {
@@ -57,7 +61,9 @@ public:
         const int index = index_of(device);
         const Device placed(DeviceType::PrivateUse1, index);
         if (nbytes == 0) return DataPtr(nullptr, nullptr, &release, placed);
-        Block* block = take(index, round_size(nbytes));
+        Block* block = take(index, round_size(nbytes), nbytes);
+        prof::mem_record_alloc(block->ptr, static_cast<int64_t>(nbytes),
+                               /*cuda=*/true, index, /*stream=*/-1);
         return DataPtr(block->ptr, block, &release, placed);
     }
 
@@ -81,16 +87,20 @@ public:
 private:
     static void release(void* ctx) {
         if (ctx == nullptr) return;
-        instance().give_back(static_cast<Block*>(ctx));
+        Block* block = static_cast<Block*>(ctx);
+        prof::mem_record_free(block->ptr, static_cast<int64_t>(block->requested),
+                              /*cuda=*/true, block->device, /*stream=*/-1);
+        instance().give_back(block);
     }
 
-    Block* take(int index, size_t size) const {
+    Block* take(int index, size_t size, size_t requested) const {
         std::lock_guard<std::mutex> lock(mutex_);
         DevicePool& pool = pools_.at(index);
         auto it = pool.free_blocks.lower_bound(size);
         if (it != pool.free_blocks.end() && it->first <= size + size / 4) {
             Block* block = it->second;
             pool.free_blocks.erase(it);
+            block->requested = requested;
             note_allocated(pool, block->size);
             return block;
         }
@@ -108,7 +118,7 @@ private:
         }
         pool.stats.reserved += static_cast<int64_t>(size);
         pool.stats.peak_reserved = std::max(pool.stats.peak_reserved, pool.stats.reserved);
-        Block* block = new Block{ptr, size, index};
+        Block* block = new Block{ptr, size, index, requested};
         note_allocated(pool, size);
         return block;
     }
