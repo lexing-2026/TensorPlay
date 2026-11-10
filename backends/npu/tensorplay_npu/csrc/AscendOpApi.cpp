@@ -151,7 +151,8 @@ Tensor compute_operand(const Tensor& t, DType dtype) {
     return t;
 }
 
-AclArgs::~AclArgs() {    for (aclTensor* tensor : tensors_) aclDestroyTensor(tensor);
+AclArgs::~AclArgs() {
+    for (aclTensor* tensor : tensors_) aclDestroyTensor(tensor);
     for (aclScalar* scalar : scalars_) aclDestroyScalar(scalar);
     for (aclIntArray* array : arrays_) aclDestroyIntArray(array);
 }

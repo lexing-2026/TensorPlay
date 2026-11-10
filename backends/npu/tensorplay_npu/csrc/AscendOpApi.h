@@ -36,8 +36,8 @@ DType binary_result_dtype(const Tensor& a, const Tensor& b);
 // itself when it already has that dtype.
 Tensor cast_on_device(const Tensor& t, DType dtype);
 
-// ``t`` in the compute type, packed so an operator reads it directly: a
-// contiguous device tensor of ``dtype``.
+// ``t`` in the compute type: the view itself when the types agree,
+// otherwise a cast into a fresh dense tensor.
 Tensor compute_operand(const Tensor& t, DType dtype);
 
 // Views of one launch's arguments.  Each carries what phase one sees, so
@@ -76,7 +76,8 @@ public:
 
     // ``t`` must live on a device with a supported rank and type.  The view
     // is described as it is: real strides and storage extent, so an operand
-    // that is a transposed or sliced view is read without a repack.
+    // that is a transposed or sliced view is read without a repack.  A
+    // negative stride has no such descriptor and is refused.
     AclTensorRef tensor(const Tensor& t);
     // ``value`` narrowed to ``dtype``.
     AclScalarRef scalar(const Scalar& value, DType dtype);
