@@ -583,6 +583,10 @@ if(USE_CUDA OR USE_ROCM OR USE_METAX)
         # configuration as outside its envelope, so that caller keeps the
         # per-group math-library path.
         list(APPEND P10_SOURCES src/backend/cuda/GroupedGemmFallback.cpp)
+        # The attention kernels above are excluded, which leaves the
+        # scaled-dot-product slots without a CUDA entry; the composed schedule
+        # fills them so attention and its backward stay reachable.
+        list(APPEND P10_SOURCES src/backend/cuda/transformers/SdpaComposed.cpp)
     else()
         list(APPEND TP_CUDA_BACKEND_SOURCES src/backend/cuda/NCCLContext.cpp)
         list(APPEND P10_SOURCES ${TP_CUDA_BACKEND_SOURCES})
