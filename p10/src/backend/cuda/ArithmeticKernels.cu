@@ -1013,23 +1013,27 @@ __device__ __forceinline__ void apply_vec_group(
 // One packed group per thread keeps the row sweep at full occupancy. The
 // splat flags are template parameters: a runtime flag forces the load and the
 // branch to serialize, which costs about a percent on this streaming shape.
+// Only the row coordinate is walked: the grid-stride keeps the launch legal
+// when the row count passes the y-limit, and each row's base is one multiply
+// away from the previous one.
 template <typename T, int VecSize, bool ASplat, bool BSplat, typename Op>
 __global__ void binary_row_flat_vec_kernel(
-    int64_t inner, int64_t vec_inner,
+    int64_t rows, int64_t inner, int64_t vec_inner,
     const T* __restrict__ a, int64_t a_row_stride,
     const T* __restrict__ b, int64_t b_row_stride,
     T* __restrict__ y, typename BinaryOpMath<T>::type alpha, Op op) {
-    const int64_t row = blockIdx.y;
     const int64_t group =
         static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (group >= vec_inner) return;
-    const T* __restrict__ a_row = a + row * a_row_stride;
-    const T* __restrict__ b_row = b + row * b_row_stride;
-    T* __restrict__ y_row = y + row * inner;
     const int64_t col = group * VecSize;
-    TPVecPack<T, VecSize> a0 = load_vec_group<T, VecSize, ASplat>(a_row, col);
-    TPVecPack<T, VecSize> b0 = load_vec_group<T, VecSize, BSplat>(b_row, col);
-    apply_vec_group<T, VecSize, Op>(a0, b0, y_row, col, alpha, op);
+    for (int64_t row = blockIdx.y; row < rows; row += gridDim.y) {
+        const T* __restrict__ a_row = a + row * a_row_stride;
+        const T* __restrict__ b_row = b + row * b_row_stride;
+        T* __restrict__ y_row = y + row * inner;
+        TPVecPack<T, VecSize> a0 = load_vec_group<T, VecSize, ASplat>(a_row, col);
+        TPVecPack<T, VecSize> b0 = load_vec_group<T, VecSize, BSplat>(b_row, col);
+        apply_vec_group<T, VecSize, Op>(a0, b0, y_row, col, alpha, op);
+    }
 }
 
 // Scalar companion of the flat kernel, for rows the vector width does not
@@ -1041,37 +1045,41 @@ __global__ void binary_row_flat_vec_kernel(
 // cache, since the operands of a shifted pair overlap almost entirely.
 template <typename T, bool ASplat, bool BSplat, bool Streaming, typename Op>
 __global__ void binary_row_flat_scalar_kernel(
-    int inner,
+    int64_t rows, int inner,
     const T* __restrict__ a, int64_t a_row_stride,
     const T* __restrict__ b, int64_t b_row_stride,
     T* __restrict__ y, typename BinaryOpMath<T>::type alpha, Op op) {
     using M = typename BinaryOpMath<T>::type;
     constexpr int kColsPerThread = 2;
-    const int64_t row = blockIdx.y;
-    const T* __restrict__ a_row = a + row * a_row_stride;
-    const T* __restrict__ b_row = b + row * b_row_stride;
-    T* __restrict__ y_row = y + row * inner;
     // The walk along a row stays 32-bit.  The row base is the only 64-bit
     // offset, and the loop body costs one add and one compare per two columns,
     // which is where a wide counter shows up at the copy roof.
     const int step = blockDim.x * gridDim.x * kColsPerThread;
-    for (int col = (blockIdx.x * blockDim.x + threadIdx.x) * kColsPerThread;
-         col < inner; col += step) {
+    const int col_start = (blockIdx.x * blockDim.x + threadIdx.x) * kColsPerThread;
+    // The row grid-stride keeps the launch legal past the y-limit without
+    // reintroducing the coordinate walk: a row base is still the previous base
+    // plus one multiply.
+    for (int64_t row = blockIdx.y; row < rows; row += gridDim.y) {
+        const T* __restrict__ a_row = a + row * a_row_stride;
+        const T* __restrict__ b_row = b + row * b_row_stride;
+        T* __restrict__ y_row = y + row * inner;
+        for (int col = col_start; col < inner; col += step) {
 #pragma unroll
-        for (int k = 0; k < kColsPerThread; ++k) {
-            const int c = col + k;
-            if (c < inner) {
-                const M av = static_cast<M>(
-                    ASplat ? a_row[0]
-                           : (Streaming ? load_vec_streaming(a_row + c) : a_row[c]));
-                const M bv = static_cast<M>(
-                    BSplat ? b_row[0]
-                           : (Streaming ? load_vec_streaming(b_row + c) : b_row[c]));
-                const T out = static_cast<T>(op(av, bv, alpha));
-                if (Streaming) {
-                    store_val_streaming(y_row + c, out);
-                } else {
-                    y_row[c] = out;
+            for (int k = 0; k < kColsPerThread; ++k) {
+                const int c = col + k;
+                if (c < inner) {
+                    const M av = static_cast<M>(
+                        ASplat ? a_row[0]
+                               : (Streaming ? load_vec_streaming(a_row + c) : a_row[c]));
+                    const M bv = static_cast<M>(
+                        BSplat ? b_row[0]
+                               : (Streaming ? load_vec_streaming(b_row + c) : b_row[c]));
+                    const T out = static_cast<T>(op(av, bv, alpha));
+                    if (Streaming) {
+                        store_val_streaming(y_row + c, out);
+                    } else {
+                        y_row[c] = out;
+                    }
                 }
             }
         }
@@ -1179,7 +1187,7 @@ inline bool try_row_flat(
     // The column walk counts in 32 bits, so a row longer than a quarter of the
     // addressable run is left to the general kernel.
     if (inner > (1 << 30)) return false;
-    if (rows <= 0 || rows > 65535 || a.dim() < 1 || b.dim() < 1) return false;
+    if (rows <= 0 || a.dim() < 1 || b.dim() < 1) return false;
     if (a.dim() > y.dim() || b.dim() > y.dim()) return false;
     // Broadcasting contract, right-aligned: the trailing dim spans the row or
     // repeats one element, and the leading dims of each operand collapse to one
@@ -1214,7 +1222,10 @@ inline bool try_row_flat(
     const int64_t blocks_x = (groups + threads - 1) / threads;
     if (blocks_x > 2147483647) return false;
     if (blocks_x == 0) return false;
-    dim3 grid(static_cast<unsigned>(blocks_x), static_cast<unsigned>(rows));
+    // Rows past the y-limit are picked up by the row grid-stride inside the
+    // kernels, so only the launch size is clamped here.
+    const int64_t grid_rows = rows < 65535 ? rows : 65535;
+    dim3 grid(static_cast<unsigned>(blocks_x), static_cast<unsigned>(grid_rows));
 
     // A column of the walk reads at most one element of each full operand and
     // writes one result, so the run's traffic is known before the launch.  Past
@@ -1232,15 +1243,15 @@ inline bool try_row_flat(
         if (streaming) {                                                     \
             binary_row_flat_scalar_kernel<T, A_SPLAT, B_SPLAT, true, Op>     \
                 <<<grid, threads, 0, stream>>>(                              \
-                    static_cast<int>(inner), a.data_ptr<T>(), a_row_stride,  \
-                    b.data_ptr<T>(), b_row_stride, y.data_ptr<T>(), alpha,   \
-                    op);                                                     \
+                    rows, static_cast<int>(inner), a.data_ptr<T>(),          \
+                    a_row_stride, b.data_ptr<T>(), b_row_stride,             \
+                    y.data_ptr<T>(), alpha, op);                             \
         } else {                                                             \
             binary_row_flat_scalar_kernel<T, A_SPLAT, B_SPLAT, false, Op>    \
                 <<<grid, threads, 0, stream>>>(                              \
-                    static_cast<int>(inner), a.data_ptr<T>(), a_row_stride,  \
-                    b.data_ptr<T>(), b_row_stride, y.data_ptr<T>(), alpha,   \
-                    op);                                                     \
+                    rows, static_cast<int>(inner), a.data_ptr<T>(),          \
+                    a_row_stride, b.data_ptr<T>(), b_row_stride,             \
+                    y.data_ptr<T>(), alpha, op);                             \
         }                                                                    \
     } while (0)
 
@@ -1325,23 +1336,23 @@ inline bool try_row_flat(
         if (b_full) {
             binary_row_flat_vec_kernel<T, kVec, false, false, Op>
                 <<<grid, threads, 0, stream>>>(
-                    inner, vec_inner, a.data_ptr<T>(), a_row_stride,
+                    rows, inner, vec_inner, a.data_ptr<T>(), a_row_stride,
                     b.data_ptr<T>(), b_row_stride, y.data_ptr<T>(), alpha, op);
         } else {
             binary_row_flat_vec_kernel<T, kVec, false, true, Op>
                 <<<grid, threads, 0, stream>>>(
-                    inner, vec_inner, a.data_ptr<T>(), a_row_stride,
+                    rows, inner, vec_inner, a.data_ptr<T>(), a_row_stride,
                     b.data_ptr<T>(), b_row_stride, y.data_ptr<T>(), alpha, op);
         }
     } else if (b_full) {
         binary_row_flat_vec_kernel<T, kVec, true, false, Op>
             <<<grid, threads, 0, stream>>>(
-                inner, vec_inner, a.data_ptr<T>(), a_row_stride,
+                rows, inner, vec_inner, a.data_ptr<T>(), a_row_stride,
                 b.data_ptr<T>(), b_row_stride, y.data_ptr<T>(), alpha, op);
     } else {
         binary_row_flat_vec_kernel<T, kVec, true, true, Op>
             <<<grid, threads, 0, stream>>>(
-                inner, vec_inner, a.data_ptr<T>(), a_row_stride,
+                rows, inner, vec_inner, a.data_ptr<T>(), a_row_stride,
                 b.data_ptr<T>(), b_row_stride, y.data_ptr<T>(), alpha, op);
     }
     return true;
