@@ -11,9 +11,13 @@ block is paying for.
 from __future__ import annotations
 
 import argparse
+import os
+import sys
 import time
 
-import tensorplay as tp
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import tensorplay as tp  # noqa: E402
 
 
 def bench(label, fn, repeat):
@@ -60,6 +64,12 @@ def main():
     print(f"  reference value {float(norm(x).reshape(-1)[0]):.6f} "
           f"vs {float(written_out().reshape(-1)[0]):.6f}")
 
+    print("\nmodule call against calling the body directly")
+    bench("nn.RMSNorm via __call__", lambda: norm(x), args.repeat)
+    bench("nn.RMSNorm via forward", lambda: norm.forward(x), args.repeat)
+    bench("nn.SiLU via __call__", lambda: silu(wide), args.repeat)
+    bench("nn.SiLU via forward", lambda: silu.forward(wide), args.repeat)
+
     print("\nfeed-forward, as the block calls it")
     from qwen3vl.model import Qwen3VLMLP, Qwen3VLTextConfig
 
@@ -70,11 +80,13 @@ def main():
     for module in mlp.modules():
         if isinstance(module, WeightOnlyInt4Linear):
             module._dense_cache = tp.randn(
-                module.in_features, module.out_features, device="mlu", dtype=tp.float16
+                module.out_features, module.in_features, device="mlu", dtype=tp.float16
             )
     tp.mlu.synchronize()
     bench("mlp (module call)", lambda: mlp(x), args.repeat)
+    bench("mlp via forward", lambda: mlp.forward(x), args.repeat)
     bench("gate only", lambda: mlp.gate_proj(x), args.repeat)
+    bench("gate, body only", lambda: x @ mlp.gate_proj._dense_cache.t(), args.repeat)
     bench("down only", lambda: mlp.down_proj(wide), args.repeat)
 
     def parts():

@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import tensorplay as tp  # noqa: E402
 from tensorplay import nn  # noqa: E402
 
+import qwen3vl.model as M  # noqa: E402
 from qwen3vl.model import (  # noqa: E402
     Qwen3VLDecoderLayer,
     Qwen3VLTextConfig,
@@ -53,18 +54,13 @@ def main():
     for module in layer.modules():
         if isinstance(module, WeightOnlyInt4Linear):
             module._dense_cache = tp.randn(
-                module.in_features, module.out_features, device="mlu", dtype=tp.float16
+                module.out_features, module.in_features, device="mlu", dtype=tp.float16
             )
     tp.mlu.synchronize()
 
     x = tp.randn(1, 1, hidden, device="mlu", dtype=tp.float16)
     positions = tp.arange(20, 21, device="mlu").unsqueeze(0)
     mixer = layer.self_attn.mixer
-
-    # A cache warmed to twenty positions so a timed call is a decode step.
-    def warmed():
-        cache = layer.self_attn.mixer.rope and None
-        return cache
 
     from tensorplay.nn.cache import DynamicCache
 
@@ -92,6 +88,7 @@ def main():
     bench("output projection x @ (151936, 4096)", lambda: head(x), args.repeat)
 
     print("\nblock parts (attention cache warmed to 20)")
+    bench("rotary table only", lambda: mixer.rope(x, positions), args.repeat)
     bench("input layernorm", lambda: layer.input_layernorm(x), args.repeat)
     bench("mlp", lambda: layer.mlp(x), args.repeat)
     bench("attention", lambda: mixer(x, position_ids=positions, past_key_values=prefilled()),
@@ -102,6 +99,8 @@ def main():
     whole = prefilled()
     bench("whole block", lambda: layer(x, position_ids=positions,
                                        past_key_values=whole), args.repeat)
+
+    print(f"\nrotary tables held: {len(M._ROTARY_TABLES)}")
 
 
 if __name__ == "__main__":

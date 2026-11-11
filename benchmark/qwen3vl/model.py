@@ -36,7 +36,6 @@ import numpy as np
 
 import tensorplay as tp
 from tensorplay import nn
-from tensorplay.nn.modules.rotary import apply_rotary_emb
 
 from .vision import Qwen3VLVisionConfig, Qwen3VLVisionModel, vision_checkpoint_name
 
@@ -149,14 +148,18 @@ class MultimodalRotaryEmbedding(nn.Module):
         if position_ids is None:
             raise ValueError("a rotary table needs positions")
         cos_table, sin_table = self._tables(x.device)
-        if position_ids.ndim == 2:
-            cos = cos_table[position_ids]
-            sin = sin_table[position_ids]
-        else:
-            table_cos = cos_table[position_ids]
-            table_sin = sin_table[position_ids]
-            cos = table_cos[0]
-            sin = table_sin[0]
+        half = self.head_dim // 2
+        flat = position_ids.reshape(-1)
+        shape = tuple(position_ids.shape) + (half,)
+        cos = tp.nn.functional.embedding(flat, cos_table).reshape(shape)
+        sin = tp.nn.functional.embedding(flat, sin_table).reshape(shape)
+        if position_ids.ndim >= 3:
+            # A gather over an address tensor is the slowest way to read a row
+            # here, so the three streams are gathered into their own tensors
+            # rather than indexed with the whole address at once.
+            table_cos, table_sin = cos, sin
+            cos = table_cos[0].clone()
+            sin = table_sin[0].clone()
             for axis in (1, 2):
                 length = self.mrope_section[axis] * 3
                 cos[..., axis:length:3] = table_cos[axis][..., axis:length:3]
@@ -173,6 +176,35 @@ def _projection(in_features, out_features, weight_only, device, dtype):
     if weight_only:
         return WeightOnlyInt4Linear(in_features, out_features, groupsize=QUANT_GROUP_SIZE)
     return nn.Linear(in_features, out_features, bias=False, **_factory(device, dtype))
+
+
+def _rotary_coefficients(cos, sin):
+    """The factors of the rotation, left at the width of one half of a head.
+
+    Rotating pairs the two halves of a head against themselves, so each output
+    element is its own value scaled by the table entry for its position in the
+    half plus the value one half away scaled by the other factor.  The factors
+    are therefore one half wide and are broadcast across the heads and the step
+    they were built for; the caller scales each half against them directly
+    rather than widening them to the whole head first.
+    """
+    return cos.unsqueeze(2), sin.unsqueeze(2)
+
+
+def _rotate_heads(x, cos, sin):
+    """Rotate the two halves of every head against themselves.
+
+    The work is written against the two halves of the head: each half is a view
+    of the projection's own output, the arithmetic reaches operators the device
+    carries, and the paired value is taken by the second half rather than by
+    rotating the whole head around a wrap-around read.
+    """
+    half = x.shape[-1] // 2
+    first, second = x[..., :half], x[..., half:]
+    out = tp.empty_like(x)
+    out[..., :half].copy_(first * cos - second * sin)
+    out[..., half:].copy_(second * cos + first * sin)
+    return out
 
 
 class WeightOnlyInt4Linear(nn.Module):
@@ -221,15 +253,21 @@ class WeightOnlyInt4Linear(nn.Module):
         return _dequantize_intx(self.weight, scale, zero, self.bits, self.in_features)
 
     def cache_dense_weight(self, dtype=None):
-        """Hold the recovered values transposed, ready for the product."""
+        """Hold the recovered values in the order the product reads them.
+
+        The weight is kept with the output width outermost, one row per
+        output, which is the order a single-row activation streams without
+        striding.  A forward then contracts the activation against the
+        transposed view, so the values are read along the row.
+        """
         dense = self.dense_weight()
         if dtype is not None:
             dense = dense.to(dtype)
-        self._dense_cache = dense.t().contiguous()
+        self._dense_cache = dense.contiguous()
 
     def forward(self, x):
         if self._dense_cache is not None:
-            return x @ self._dense_cache
+            return x @ self._dense_cache.t()
         dense = self.dense_weight().to(x.dtype)
         return x @ dense.t().contiguous()
 
@@ -240,6 +278,63 @@ def cache_dense_weights(model, dtype=None):
     for module in model.modules():
         if isinstance(module, WeightOnlyInt4Linear):
             module.cache_dense_weight(dtype)
+            count += 1
+    return count
+
+
+def written_normalization(x, weight, eps, shape):
+    """Row-wise normalization as elementwise work over the input's own type.
+
+    The kernel the module reaches is a sequence of small launches on this
+    device; the same arithmetic written out issues fewer calls.  The row
+    statistic is accumulated in single precision and only the resulting scale
+    is narrowed.  That widening is not optional: the statistic reads back a
+    square of every row entry, so one entry past the reduced type's range turns
+    its whole row's statistic into an infinity, and the reciprocal square root
+    of an infinity is zero, which flattens the row to nothing.  The per-row
+    weight is applied after the row has been scaled.
+    """
+    compute = tp.float32 if x.dtype in (tp.float16, tp.bfloat16) else x.dtype
+    wide = x.to(compute)
+    inv = ((wide * wide).mean(-1, keepdim=True) + eps).rsqrt()
+    return (x * inv.to(x.dtype)) * weight
+
+
+def fused_normalization(x, weight, eps, shape):
+    """The module's fused kernel, reached through the functional directly."""
+    return tp.nn.functional.rms_norm(x, shape, weight, eps)
+
+
+_NORMALIZATIONS = {
+    "written": written_normalization,
+    "fused": fused_normalization,
+}
+
+
+def bind_normalization(module, mode):
+    """Point one module's forward at a written body of the given style.
+
+    The row weight and the row epsilon are read once, when the body is bound,
+    instead of on every forward: reading a registered tensor or scalar off a
+    module travels through the module's attribute lookup, and a normalization
+    runs often enough for that lookup to be worth this.
+    """
+    body = _NORMALIZATIONS[mode]
+    weight = module.weight
+    eps = module.eps
+    shape = module.normalized_shape
+    return lambda x, _body=body, _w=weight, _e=eps, _s=shape: _body(x, _w, _e, _s)
+
+
+def use_written_normalization(model, mode="written"):
+    """Point the language tower's normalizations at the written body.
+
+    The vision tower keeps the module's kernel, so its output is unchanged.
+    """
+    count = 0
+    for module in model.language_model.modules():
+        if isinstance(module, nn.RMSNorm):
+            module.forward = bind_normalization(module, mode)
             count += 1
     return count
 
@@ -296,7 +391,8 @@ class Qwen3VLMLP(nn.Module):
         self.act_fn = nn.SiLU()
 
     def forward(self, x: tp.Tensor) -> tp.Tensor:
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        gate = tp.nn.functional.silu(self.gate_proj(x))
+        return self.down_proj(gate * self.up_proj(x))
 
 
 class Qwen3VLAttention(nn.Module):
@@ -335,7 +431,7 @@ class Qwen3VLAttention(nn.Module):
                 config.num_attention_heads * config.head_dim, config.hidden_size, True, None, None
             )
 
-    def forward(self, x, position_ids=None, past_key_values=None):
+    def forward(self, x, position_ids=None, past_key_values=None, rotary=None):
         mixer = self.mixer
         batch, length, _ = x.shape
         heads, kv_heads, head_dim = mixer.num_heads, mixer.num_kv_heads, mixer.head_dim
@@ -350,14 +446,22 @@ class Qwen3VLAttention(nn.Module):
                 .unsqueeze(0)
                 .expand(batch, length)
             )
-        q = mixer.q_proj(x).view(batch, length, heads, head_dim).transpose(1, 2)
-        k = mixer.k_proj(x).view(batch, length, kv_heads, head_dim).transpose(1, 2)
-        v = mixer.v_proj(x).view(batch, length, kv_heads, head_dim).transpose(1, 2)
+        q = mixer.q_proj(x).view(batch, length, heads, head_dim)
+        k = mixer.k_proj(x).view(batch, length, kv_heads, head_dim)
+        v = mixer.v_proj(x).view(batch, length, kv_heads, head_dim)
         if mixer.qk_norm:
+            # Normalizing before the heads are moved to their own axis keeps
+            # every row contiguous, which the row statistic reads best.
             q = mixer.q_norm(q)
             k = mixer.k_norm(k)
-        cos, sin = mixer.rope(x, position_ids)
-        q, k = apply_rotary_emb(q, k, cos, sin, mixer.rope.interleaved)
+        if rotary is None:
+            # The table depends only on the positions, so a caller that runs
+            # many blocks at the same positions builds it once and hands the
+            # factors down.
+            rotary = _rotary_coefficients(*mixer.rope(x, position_ids))
+        q = _rotate_heads(q, *rotary).transpose(1, 2)
+        k = _rotate_heads(k, *rotary).transpose(1, 2)
+        v = v.transpose(1, 2)
 
         if past_key_values is not None:
             k, v = past_key_values.update(k, v, mixer.layer_idx)
@@ -366,17 +470,22 @@ class Qwen3VLAttention(nn.Module):
             # A decode step covers the whole cache with a single query per
             # head.  The arithmetic is written out because the fused call
             # takes a path whose cost grows with the cache width, while these
-            # three products stay flat.  The group expansion is explicit,
-            # which is a copy of the cache, not of the weights.
+            # products stay flat.  The query heads are viewed in their groups
+            # so the cached keys and values are read where they lie, instead
+            # of being widened to one copy per query head first.
             group = heads // kv_heads
             if group == 1:
                 keys, values = k, v
+                scores = (q @ keys.transpose(-1, -2)) * mixer.scaling
+                weights = tp.nn.functional.softmax(scores, dim=-1)
+                attn = weights @ values
             else:
-                keys = k.repeat_interleave(group, dim=1)
-                values = v.repeat_interleave(group, dim=1)
-            scores = (q @ keys.transpose(-1, -2)) * mixer.scaling
-            weights = tp.nn.functional.softmax(scores, dim=-1)
-            attn = weights @ values
+                grouped = q.reshape(batch, kv_heads, group, length, head_dim)
+                scores = (grouped @ k.unsqueeze(2).transpose(-1, -2)) * mixer.scaling
+                weights = tp.nn.functional.softmax(scores, dim=-1)
+                attn = (weights @ v.unsqueeze(2)).reshape(
+                    batch, heads, length, head_dim
+                )
         else:
             attn = tp.nn.functional.scaled_dot_product_attention(
                 q,
@@ -407,11 +516,13 @@ class Qwen3VLDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps, **_factory(device, dtype)
         )
 
-    def forward(self, hidden_states, position_ids=None, past_key_values=None):
+    def forward(self, hidden_states, position_ids=None, past_key_values=None,
+                rotary=None):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
-            hidden_states, position_ids=position_ids, past_key_values=past_key_values
+            hidden_states, position_ids=position_ids, past_key_values=past_key_values,
+            rotary=rotary,
         )
         hidden_states = hidden_states + residual
         residual = hidden_states
@@ -453,9 +564,17 @@ class Qwen3VLLanguageModel(nn.Module):
 
     def forward(self, hidden_states, position_ids=None, past_key_values=None,
                 visual_positions=None, deepstack_visual_embeds=None):
+        rotary = None
+        if position_ids is not None:
+            # Every block turns its queries and keys by the same table, which
+            # depends only on the positions, so it is built once here.
+            rotary = _rotary_coefficients(
+                *self.layers[0].self_attn.mixer.rope(hidden_states, position_ids)
+            )
         for index, layer in enumerate(self.layers):
             hidden_states = layer(
-                hidden_states, position_ids=position_ids, past_key_values=past_key_values
+                hidden_states, position_ids=position_ids,
+                past_key_values=past_key_values, rotary=rotary,
             )
             if deepstack_visual_embeds is not None and index < len(deepstack_visual_embeds):
                 hidden_states = self._add_visual_features(

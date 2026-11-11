@@ -86,9 +86,10 @@ def gemm_ceiling(device, sync, layers=36):
           f"(a layer holds 7 such products, 36 layers hold 252)")
 
 
-def decode(device, model, ids, steps, sync):
+def decode(device, model, ids, steps, sync, cache=None):
     """Prefill, then time every single-token step separately."""
-    cache = model.create_empty_cache()
+    if cache is None:
+        cache = model.create_empty_cache()
     length = ids.shape[1]
     sync()
     start = time.time()
@@ -123,6 +124,10 @@ def main():
     ap.add_argument("--dtype", default="float16", choices=["float16", "bfloat16"])
     ap.add_argument("--tokens", type=int, default=5)
     ap.add_argument("--prompt-ids", default="104198,48,16948,3837,67071")
+    ap.add_argument("--written-norm", action="store_true",
+                    help="add a third phase with the normalizations written out")
+    ap.add_argument("--static-cache", type=int, default=0,
+                    help="positions to preallocate for the third phase")
     args = ap.parse_args()
 
     dtypes = {"float16": tp.float16, "bfloat16": tp.bfloat16}
@@ -169,6 +174,26 @@ def main():
     if times:
         print(f"  median {stats.median(times) * 1e3:.1f} ms  "
               f"{1 / stats.median(times):.2f} token/s")
+
+    if args.written_norm or args.static_cache:
+        from qwen3vl.model import use_written_normalization
+
+        print("\nvalues cached, normalizations written out, cache preallocated")
+        if args.written_norm:
+            count = use_written_normalization(model)
+            print(f"  {count} normalizations written out")
+        cache = None
+        if args.static_cache:
+            from tensorplay.nn.cache import StaticCache
+
+            cache = StaticCache(args.static_cache)
+            print(f"  cache preallocated for {args.static_cache} positions")
+        prefill, times = decode(device, model, ids, args.tokens, sync, cache=cache)
+        print(f"  prefill {prefill * 1e3:.1f} ms")
+        print("  steps " + " ".join(f"{v * 1e3:.1f}" for v in times) + " ms")
+        if times:
+            print(f"  median {stats.median(times) * 1e3:.1f} ms  "
+                  f"{1 / stats.median(times):.2f} token/s")
 
 
 if __name__ == "__main__":

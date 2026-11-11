@@ -58,6 +58,26 @@ def main():
         help="keep the four-bit groups resident but recover their values once, "
         "so a forward is one plain product instead of one recovery per forward",
     )
+    ap.add_argument(
+        "--written-norm",
+        action="store_true",
+        help="express the language tower's normalizations as elementwise work "
+        "instead of the module's kernel",
+    )
+    ap.add_argument(
+        "--norm",
+        choices=("module", "written", "fused"),
+        default=None,
+        help="which body the language tower's normalizations run: the module's "
+        "kernel, the written arithmetic in single precision, the written "
+        "arithmetic in the input's type, or the fused kernel directly",
+    )
+    ap.add_argument(
+        "--static-cache",
+        type=int,
+        default=0,
+        help="decode into a preallocated cache of this many positions",
+    )
     args = ap.parse_args()
 
     dtypes = {"float16": tp.float16, "bfloat16": tp.bfloat16, "float32": tp.float32}
@@ -93,6 +113,16 @@ def main():
 
         cached = cache_dense_weights(model, dtypes[args.dtype])
         print(f"recovered {cached} projection weights once")
+    if args.written_norm or (args.norm and args.norm != "module"):
+        from qwen3vl.model import use_written_normalization
+
+        mode = args.norm or "written"
+        count = use_written_normalization(model, mode)
+        print(f"normalizations run through the {mode} body ({count})")
+    if args.static_cache and not args.dense:
+        from tensorplay.nn.cache import StaticCache
+
+        print(f"preallocated cache of {args.static_cache} positions")
     print(f"load {time.time() - t0:.1f}s  {config}")
 
     ids = tp.from_numpy(prompt_ids.astype(np.int64)).to(device=device)
@@ -104,9 +134,21 @@ def main():
         )
     from tensorplay.nn.generation import generate
 
+    if args.static_cache:
+        from tensorplay.nn.cache import StaticCache
+
+        cache = StaticCache(args.static_cache)
+    else:
+        from tensorplay.nn.cache import DynamicCache
+
+        cache = DynamicCache()
+
     t0 = time.time()
     with tp.no_grad():
-        out = generate(model, ids, max_new_tokens=tokens, do_sample=False)
+        out = generate(
+            model, ids, max_new_tokens=tokens, do_sample=False,
+            past_key_values=cache,
+        )
         if device != "cpu":
             tp.mlu.synchronize() if device == "mlu" else tp.cuda.synchronize()
     elapsed = time.time() - t0
