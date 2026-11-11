@@ -193,6 +193,7 @@ records arrive through the same path as on NVIDIA.
 | Path | Role |
 | --- | --- |
 | `cmake/LoadMACA.cmake` | SDK discovery, the `mxcc` compile rule, the device job pool, host/device include separation |
+| `cmake/mc_fatbin_layout.ld` | places the collected device image (`.mc_fatbin`) after the writable segment, so the host code's relocations stay in range |
 | `benchmark/bench_metax_ops.py` | operator benchmark against the reference library, one library per process |
 | root `CMakeLists.txt` | the `USE_METAX` switch, SDK discovery, `_C` linkage |
 | `p10/CMakeLists.txt` | source selection, per-TU `mxcc` objects, the exclusion list |
@@ -208,11 +209,20 @@ All paths are relative to the repository root.
 Verified on a MetaX C500 (64 GB, MACA 3.3.0), Python 3.12:
 
 - `p10` and the `_C` extension build cleanly, and `libp10.so` links with no
-  unresolved backend symbols;
+  unresolved backend symbols.  The collected device image is large enough to
+  push `.got`/`.tbss` beyond the reach of the host code's 32-bit relocations,
+  so it is placed at the end of the image (`cmake/mc_fatbin_layout.ld`); the
+  image is only reached through an absolute pointer, so its position is
+  immaterial to the runtime;
 - `import tensorplay` succeeds and the runtime reports a single device,
   `MetaX C500`;
 - a BLAS matmul, `softmax` and elementwise arithmetic run and produce finite
   results;
+- the reduction path matches the reference library: `sum(1d)` over 127..16M
+  elements lands within 0.91x-1.07x of the reference latency (0.69x-1.39x
+  across the whole reduction bench), and a 1024-element sum costs about 10 us
+  per launch;
+- the reduction regression suites pass on the device (77 passed, 3 skipped);
 - the profiler loads `libmcpti.so` and records per-operation device time and
   kernel-level entries;
 - CUDA Graph capture, instantiate and replay round-trip a matmul node: the
@@ -221,6 +231,13 @@ Verified on a MetaX C500 (64 GB, MACA 3.3.0), Python 3.12:
   11.6, below the 12.4 the gate requires;
 - the sparse-solver handle cannot be created on this device, so sparse solves
   raise when reached (the operation table records the exclusion).
+
+The full `test/` suite is not yet a clean signal here: on the reference box it
+is dominated by a NumPy 2 ABI mismatch and by a sticky illegal-memory-access
+cascade that one device defect starts, so its failure count does not measure
+backend coverage.  One defect reproduces on its own — an out-of-range write in
+the `msort` / `take_along_dim` backward scatter, which leaves the CUDA context
+unusable for the tests that follow it.
 
 ## Compatibility
 
