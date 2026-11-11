@@ -1281,7 +1281,9 @@ def _resolve_load_device(device: int | None, device_type: str) -> int | None:
 
     from .benchmarking import get_interface_for_device
 
-    return get_interface_for_device(device_type.replace("hip", "cuda")).current_device()
+    return get_interface_for_device(
+        device_type.replace("hip", "cuda").replace("maca", "cuda")
+    ).current_device()
 
 
 class CachingAutotuner(KernelInterface):
@@ -2190,9 +2192,17 @@ class CachingAutotuner(KernelInterface):
             if self.device_props.type == "cpu"
             else {"rep": 40, "is_vetted_benchmarking": True}
         )
+        # The kind named here is the one the runtime was told, which is not
+        # always the kind the rest of the program calls the device: a device
+        # driven by a stack that answers through the accelerator interface is
+        # named for that stack inside the runtime, while the program knows it
+        # as an accelerator.  The measurement is taken on whichever device the
+        # program names, so the stack name is translated back to it.
         result = benchmarker.benchmark(
             fn=kernel_call,
-            device=self.device_props.type,
+            device=self.device_props.type.replace("hip", "cuda").replace(
+                "maca", "cuda"
+            ),
             **benchmark_kwargs,
         )
         # The timing reports an unreachable time in exactly one case: a
@@ -2685,7 +2695,9 @@ class CachingAutotuner(KernelInterface):
         # talks to it are not always the same, and what is wanted is the latter.
         from .benchmarking import get_interface_for_device
 
-        return get_interface_for_device(self.device_props.type.replace("hip", "cuda"))
+        return get_interface_for_device(
+            self.device_props.type.replace("hip", "cuda").replace("maca", "cuda")
+        )
 
     def _interpret_args_grid(
         self, args: tuple[Any, ...], cfg: Any

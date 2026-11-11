@@ -270,7 +270,7 @@ def get_device_interface(device_type: str) -> DeviceInterface:
     called and which of them this kind of device answers itself.
     """
 
-    device_type = device_type.replace("hip", "cuda")
+    device_type = device_type.replace("hip", "cuda").replace("maca", "cuda")
     cls = INTERFACES.get(device_type)
     if cls is None:
         raise NotImplementedError(f"there is no device interface for {device_type}")

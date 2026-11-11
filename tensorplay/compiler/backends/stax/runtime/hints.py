@@ -10,6 +10,7 @@ about what is computed rests on them.
 
 import enum
 import functools
+import os
 import typing
 from enum import Enum, auto
 
@@ -41,6 +42,18 @@ class TileHint(enum.Enum):
     DEFAULT = 1
 
 
+def _uses_maca(props) -> bool:
+    """Whether this device is driven by the MetaX stack.
+
+    The stack answers through the CUDA interface, so it is told apart by the
+    name its devices report; the environment its runtime requires is a second
+    signal, for a device that names itself differently.
+    """
+
+    name = (getattr(props, "name", "") or "").lower()
+    return "metax" in name or bool(os.environ.get("MACA_PATH"))
+
+
 class DeviceProperties(typing.NamedTuple):
     """Device properties, held so that reading them needs no device module."""
 
@@ -60,7 +73,7 @@ class DeviceProperties(typing.NamedTuple):
             return self.warp_size
         if self.type in ("cuda", "hip"):
             raise RuntimeError(f"{self.type} device properties must report warp_size")
-        return 32
+        return 64 if self.type == "maca" else 32
 
     @classmethod
     @functools.cache
@@ -76,6 +89,14 @@ class DeviceProperties(typing.NamedTuple):
 
         device_interface = get_interface_for_device(device)
         props = device_interface.get_device_properties(device)
+
+        # The MetaX stack answers through the CUDA interface, but its
+        # kernel-writing runtime registers a device kind of its own, and a
+        # launch has to be compiled for that kind rather than the interface the
+        # stack happens to present.
+        if device_type == "cuda" and _uses_maca(props):
+            device_type = "maca"
+
         try:
             multi_processor_count = props.multi_processor_count
         except AttributeError:
@@ -96,7 +117,13 @@ class DeviceProperties(typing.NamedTuple):
                 props, "max_threads_per_multi_processor", None
             ),
             max_threads_per_block=getattr(props, "max_threads_per_block", 1024),
-            warp_size=getattr(props, "warp_size", None),
+            warp_size=getattr(
+                props,
+                "warp_size",
+                (32 if device_type != "maca" else 64)
+                if device_type != "cpu"
+                else None,
+            ),
         )
 
 

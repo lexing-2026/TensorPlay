@@ -1839,6 +1839,7 @@ GPU_KERNEL_BIN_EXTS = {
     "cuda": ".cubin",
     "hip": ".hsaco",
     "xpu": f".{XPU_KERNEL_FORMAT}",
+    "maca": ".mcfatbin",
 }
 
 GPU_ALIGN_BYTES = 16
