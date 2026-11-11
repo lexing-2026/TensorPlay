@@ -225,6 +225,13 @@ Verified on a MetaX C500 (64 GB, MACA 3.3.0), Python 3.12:
   across the whole reduction bench), and a 1024-element sum costs about 10 us
   per launch;
 - the reduction regression suites pass on the device (77 passed, 3 skipped);
+- broadcast binary arithmetic (`add`/`sub`/`mul`/`div`) uses row kernels instead
+  of a per-element index decomposition: a trailing-dimension broadcast
+  (`(2,8,512,512) - (2,8,512,1)`) runs at about 890 GB/s against 1380 GB/s for
+  the same shape, and a channel broadcast `(N,C,H,W) op (N|1,C,1,1)` reaches
+  about 1.2 TB/s.  A broadcast along a middle dimension
+  (`(2,8,512,512) - (2,1,512,512)`) still walks one coordinate per row and stays
+  the slowest broadcast shape at about 250 GB/s;
 - sorting matches the reference along every dimension: `sort`/`argsort` agree
   with the CPU over 2-D and 3-D shapes, every axis, float32/float64/int32/int64
   and both orders, and `test_sort_native.py` passes (24 passed); the backward
