@@ -35,7 +35,7 @@ constexpr int kDefaultValuesPerThread = 4;
 constexpr int kMaxCachedReduceDevices = 64;
 // Bump when the header-only launch path changes; this also keeps generated
 // CUDA objects from silently reusing an older reduction implementation.
-constexpr int kReductionEngineRevision = 15;
+constexpr int kReductionEngineRevision = 16;
 
 // Load width of one reduction unit: 16-bit elements take eight per
 // instruction (one 16B vector), wider elements four.  The width is a property
@@ -287,22 +287,11 @@ struct ReduceConfig {
     int64_t shape[kInlineReduceDims] = {};
     int64_t input_strides[kInlineReduceDims] = {};
     int64_t output_strides[kInlineReduceDims] = {};
-    // Additional dimensions use device metadata; common launches retain
-    // inline extents and strides for the specialized offset calculations.
+    // Dimensions past the inline bound carry an (extent, input stride,
+    // output stride) triple in this device table.  The offset walks index the
+    // inline arrays and this table in separate loops; a dim-bound ternary in a
+    // single loop forces the arrays into a local frame on this target.
     const int64_t* extra_dimensions = nullptr;
-
-    __host__ __device__ int64_t shape_at(int dim) const {
-        return dim < kInlineReduceDims ? shape[dim]
-            : extra_dimensions[3 * (dim - kInlineReduceDims)];
-    }
-    __host__ __device__ int64_t input_stride_at(int dim) const {
-        return dim < kInlineReduceDims ? input_strides[dim]
-            : extra_dimensions[3 * (dim - kInlineReduceDims) + 1];
-    }
-    __host__ __device__ int64_t output_stride_at(int dim) const {
-        return dim < kInlineReduceDims ? output_strides[dim]
-            : extra_dimensions[3 * (dim - kInlineReduceDims) + 2];
-    }
 
     int64_t num_inputs = 1;
     int64_t num_input_units = 1;
@@ -382,13 +371,27 @@ struct ReduceConfig {
                 default: break;
             }
         }
+        // Split the walk at the inline array bound: the first loop indexes the
+        // per-launch arrays directly and the second reads the overflow table.
+        // Avoiding the dim-bound ternary in the loop keeps the extents and
+        // strides in registers instead of a local frame.
         int64_t offset = 0;
         int64_t rest = output;
-        for (int dim = num_reduce_dims; dim < ndim; ++dim) {
-            const int64_t extent = shape_at(dim);
+        const int inline_dims = ndim < kInlineReduceDims ? ndim : kInlineReduceDims;
+        for (int dim = num_reduce_dims; dim < inline_dims; ++dim) {
+            const int64_t extent = shape[dim];
             const int64_t coordinate = extent > 0 ? rest % extent : 0;
             rest = extent > 0 ? rest / extent : 0;
-            offset += coordinate * input_stride_at(dim);
+            offset += coordinate * input_strides[dim];
+        }
+        for (int dim = kInlineReduceDims > num_reduce_dims ? kInlineReduceDims
+                                                           : num_reduce_dims;
+             dim < ndim; ++dim) {
+            const int base = 3 * (dim - kInlineReduceDims);
+            const int64_t extent = extra_dimensions[base];
+            const int64_t coordinate = extent > 0 ? rest % extent : 0;
+            rest = extent > 0 ? rest / extent : 0;
+            offset += coordinate * extra_dimensions[base + 1];
         }
         return offset;
     }
@@ -412,13 +415,25 @@ struct ReduceConfig {
                 default: break;
             }
         }
+        // Same split as input_base_offset: inline arrays first, overflow table
+        // past the inline bound, so the indexing stays frame-free.
         int64_t offset = 0;
         int64_t rest = output;
-        for (int dim = num_reduce_dims; dim < ndim; ++dim) {
-            const int64_t extent = shape_at(dim);
+        const int inline_dims = ndim < kInlineReduceDims ? ndim : kInlineReduceDims;
+        for (int dim = num_reduce_dims; dim < inline_dims; ++dim) {
+            const int64_t extent = shape[dim];
             const int64_t coordinate = extent > 0 ? rest % extent : 0;
             rest = extent > 0 ? rest / extent : 0;
-            offset += coordinate * output_stride_at(dim);
+            offset += coordinate * output_strides[dim];
+        }
+        for (int dim = kInlineReduceDims > num_reduce_dims ? kInlineReduceDims
+                                                           : num_reduce_dims;
+             dim < ndim; ++dim) {
+            const int base = 3 * (dim - kInlineReduceDims);
+            const int64_t extent = extra_dimensions[base];
+            const int64_t coordinate = extent > 0 ? rest % extent : 0;
+            rest = extent > 0 ? rest / extent : 0;
+            offset += coordinate * extra_dimensions[base + 2];
         }
         return offset;
     }
@@ -459,13 +474,24 @@ struct ReduceConfig {
                 default: break;
             }
         }
+        // Split the reduced-axis walk at the inline bound for the same reason:
+        // direct array indexing keeps the coordinates frame-free.
         int64_t offset = 0;
         int64_t remainder = index;
-        for (int dim = 0; dim < num_reduce_dims; ++dim) {
-            const int64_t extent = shape_at(dim);
+        const int inline_dims = num_reduce_dims < kInlineReduceDims ? num_reduce_dims
+                                                                   : kInlineReduceDims;
+        for (int dim = 0; dim < inline_dims; ++dim) {
+            const int64_t extent = shape[dim];
             const int64_t coordinate = extent > 0 ? remainder % extent : 0;
             remainder = extent > 0 ? remainder / extent : 0;
-            offset += coordinate * input_stride_at(dim);
+            offset += coordinate * input_strides[dim];
+        }
+        for (int dim = kInlineReduceDims; dim < num_reduce_dims; ++dim) {
+            const int base = 3 * (dim - kInlineReduceDims);
+            const int64_t extent = extra_dimensions[base];
+            const int64_t coordinate = extent > 0 ? remainder % extent : 0;
+            remainder = extent > 0 ? remainder / extent : 0;
+            offset += coordinate * extra_dimensions[base + 1];
         }
         return offset;
     }
@@ -1144,16 +1170,25 @@ struct ReduceOp {
         return values[0];
     }
 
+    template <bool Generic>
     __device__ __forceinline__ AccT thread_reduce(int64_t output_index) const {
         // One uniform branch per thread (not per element): the per-element
         // offset math becomes compile-time straight-line for the common dim
         // counts, which lets the unrolled loads hoist together.
-        switch (config.num_reduce_dims) {
-            case 1: return thread_reduce_nt<1>(output_index);
-            case 2: return thread_reduce_nt<2>(output_index);
-            case 3: return thread_reduce_nt<3>(output_index);
-            case 4: return thread_reduce_nt<4>(output_index);
-            default: return thread_reduce_nt<0>(output_index);
+        //
+        // The runtime-decomposition path carries a large local frame, so it
+        // is reached only from the instantiation that handles an arbitrary
+        // reduced-dim count; the common path (1..4 dims) stays frame-free.
+        if constexpr (Generic) {
+            return thread_reduce_nt<0>(output_index);
+        } else {
+            switch (config.num_reduce_dims) {
+                case 1: return thread_reduce_nt<1>(output_index);
+                case 2: return thread_reduce_nt<2>(output_index);
+                case 3: return thread_reduce_nt<3>(output_index);
+                case 4: return thread_reduce_nt<4>(output_index);
+                default: return identity;
+            }
         }
     }
 
@@ -1214,7 +1249,7 @@ struct ReduceOp {
     __device__ __forceinline__ std::array<AccT, OutputVecSize>
     thread_reduce_outputs(int64_t output_index) const {
         if constexpr (OutputVecSize == 1) {
-            return {thread_reduce(output_index)};
+            return {thread_reduce<false>(output_index)};
         } else {
             switch (config.num_reduce_dims) {
                 case 1: return thread_reduce_outputs_nt<1, OutputVecSize>(output_index);
@@ -1226,7 +1261,7 @@ struct ReduceOp {
         }
     }
 
-    template <int OutputVecSize>
+    template <int OutputVecSize, bool Generic = false>
     __device__ __forceinline__ void run() {
         extern __shared__ unsigned char shared_raw[];
         AccT* shared = reinterpret_cast<AccT*>(shared_raw);
@@ -1237,7 +1272,11 @@ struct ReduceOp {
         __shared__ bool is_last_block;
 
         if (output_index < config.num_outputs && config.input_idx() < config.num_input_units) {
-            values = thread_reduce_outputs<OutputVecSize>(output_index);
+            if constexpr (OutputVecSize == 1) {
+                values[0] = thread_reduce<Generic>(output_index);
+            } else {
+                values = thread_reduce_outputs<OutputVecSize>(output_index);
+            }
         }
 
         if constexpr (OutputVecSize == 1) {
@@ -1377,11 +1416,12 @@ struct ReduceOp {
 };
 
 template <typename InputT, typename AccT, typename OutputT, typename Ops,
-          int ValuesPerThread, int InputVecSize, typename SecondOutputT = OutputT>
+          int ValuesPerThread, int InputVecSize, typename SecondOutputT = OutputT,
+          bool Generic = false>
 __global__ void __launch_bounds__(kMaxReduceThreads, 4)
 reduce_kernel(ReduceOp<InputT, AccT, OutputT, Ops, ValuesPerThread,
                     InputVecSize, SecondOutputT> op) {
-    op.template run<1>();
+    op.template run<1, Generic>();
 }
 
 template <int OutputVecSize, typename Reduction>
@@ -1523,6 +1563,11 @@ inline void launch_reduce(
                   "CUDA reduction arrival counters");
     }
 
+    // A reduced-dim count outside 1..4 needs the runtime-decomposition
+    // fallback, which carries a large local frame.  Route those launches to a
+    // separate instantiation so the common launches never pay for it.
+    const bool generic = config.num_reduce_dims < 1 || config.num_reduce_dims > 4;
+
     // Output-side vectorization groups adjacent outputs in one thread.  It
     // applies when the reduction runs along a non-fastest dimension, which is
     // also when the config keeps the input width scalar; the kernel body for
@@ -1531,8 +1576,13 @@ inline void launch_reduce(
         reduce_output_kernel<4><<<grid, block, shared_bytes, stream>>>(reduction);
     } else if (config.output_vec_size == 2) {
         reduce_output_kernel<2><<<grid, block, shared_bytes, stream>>>(reduction);
+    } else if (generic) {
+        reduce_kernel<InputT, AccT, OutputT, Ops, ValuesPerThread, InputVecSize,
+                      SecondOutputT, true>
+            <<<grid, block, shared_bytes, stream>>>(reduction);
     } else {
-        reduce_kernel<InputT, AccT, OutputT, Ops, ValuesPerThread, InputVecSize, SecondOutputT>
+        reduce_kernel<InputT, AccT, OutputT, Ops, ValuesPerThread, InputVecSize,
+                      SecondOutputT, false>
             <<<grid, block, shared_bytes, stream>>>(reduction);
     }
     checkCuda(cudaGetLastError(), "CUDA reduction kernel launch");
