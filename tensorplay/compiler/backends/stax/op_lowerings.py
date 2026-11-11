@@ -3688,6 +3688,23 @@ def _row_kernel(name: str, *args):
     return handler(*args)
 
 
+@functools.cache
+def _row_kernels_loadable() -> bool:
+    """Whether the row kernels can be loaded on this machine.
+
+    They are written in a device language that only a machine which has it
+    installed can load, and a machine without it is not one whose calls they
+    can answer.  Asked once and remembered, since the answer is a property of
+    what is installed rather than of any particular call.
+    """
+
+    try:
+        from .codegen.cutedsl.kernels import _extern  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 def _row_call(x, dim, dtypes=_ROW_KERNEL_DTYPES):
     """The (rows, extent) shape a row kernel can answer this call with, if any.
 
@@ -3699,6 +3716,8 @@ def _row_call(x, dim, dtypes=_ROW_KERNEL_DTYPES):
 
     device = x.get_device()
     if device is None or device.type != "cuda" or not tp.cuda.is_available():
+        return None
+    if not _row_kernels_loadable():
         return None
     if x.get_dtype() not in dtypes:
         return None
