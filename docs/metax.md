@@ -229,6 +229,11 @@ Verified on a MetaX C500 (64 GB, MACA 3.3.0), Python 3.12:
   with the CPU over 2-D and 3-D shapes, every axis, float32/float64/int32/int64
   and both orders, and `test_sort_native.py` passes (24 passed); the backward
   that consumes the permutation (`msort` / `take_along_dim`) passes too;
+- top-k matches the CPU over rows from 2 to 25000 wide, one-dimensional and
+  batched, both directions and with `sorted` set either way; the selection
+  histogram is counted with hardware-width ballots, so the counts stay exact
+  when a hardware warp spans more than one 32-thread group (1120 randomized
+  checks, `test_topk_native.py` 33 passed);
 - a CV training step (three convolutions with batch norm, max pooling, a
   classifier head; 8x3x32x32) and an LLM training step (two transformer
   blocks, `d=256`, 8 heads, sequence 128, batch 4, `scaled_dot_product_attention`)
