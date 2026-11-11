@@ -709,18 +709,33 @@ def compile(
     return optimized
 
 
+@functools.lru_cache(maxsize=1024)
+def _loaded_global_names_of_code(code: types.CodeType) -> frozenset[str]:
+    """The names ``code``, and code defined inside it, loads as globals.
+
+    This is a fixed property of the code itself -- which names it loads does
+    not change when what they resolve to does -- so the walk over it is done
+    once per code object rather than on every call that reads the state a
+    function can reach through its globals.
+    """
+
+    loaded: set[str] = set()
+    pending = [code]
+    while pending:
+        current = pending.pop()
+        for instruction in dis.get_instructions(current):
+            if instruction.opname in ("LOAD_GLOBAL", "LOAD_NAME"):
+                loaded.add(instruction.argval)
+        pending.extend(
+            c for c in current.co_consts if isinstance(c, types.CodeType)
+        )
+    return frozenset(loaded)
+
+
 def _loaded_global_names(function: types.FunctionType) -> set[str]:
     """The names ``function``'s code, and code defined inside it, loads as globals."""
 
-    loaded: set[str] = set()
-    pending = [function.__code__]
-    while pending:
-        code = pending.pop()
-        for instruction in dis.get_instructions(code):
-            if instruction.opname in ("LOAD_GLOBAL", "LOAD_NAME"):
-                loaded.add(instruction.argval)
-        pending.extend(c for c in code.co_consts if isinstance(c, types.CodeType))
-    return loaded
+    return set(_loaded_global_names_of_code(function.__code__))
 
 
 def _modules_reached(program: Any) -> list[Any]:
