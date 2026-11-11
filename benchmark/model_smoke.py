@@ -5,8 +5,10 @@ The same model definitions run against either library, with weights and
 inputs drawn from a fixed NumPy generator, so two processes produce
 comparable numbers:
 
-    python3 benchmark/model_smoke.py torch      --model cv  --out /tmp/cv_torch.json
-    python3 benchmark/model_smoke.py tensorplay --model cv  --out /tmp/cv_tp.json
+    python3 benchmark/model_smoke.py torch      --model cv     --out /tmp/cv_torch.json
+    python3 benchmark/model_smoke.py tensorplay --model cv     --out /tmp/cv_tp.json
+    python3 benchmark/model_smoke.py torch      --model resnet --out /tmp/rn_torch.json
+    python3 benchmark/model_smoke.py tensorplay --model resnet --out /tmp/rn_tp.json
     python3 benchmark/model_smoke.py torch      --model llm --out /tmp/llm_torch.json
     python3 benchmark/model_smoke.py tensorplay --model llm --out /tmp/llm_tp.json
 
@@ -89,7 +91,65 @@ def make_cv(lib):
     return CVNet()
 
 
-def make_llm(lib, vocab=1024, dim=256, heads=8, seq=128, batch=4, attn="sdpa"):
+def make_resnet(lib, width=64, blocks=(2, 2, 2, 2), classes=10):
+    """ResNet-18 shaped network for 32x32 inputs.
+
+    Four stages of two residual blocks each: 3x3 convolutions with a 1x1
+    projection on the shortcuts, batch norm after every convolution, and a
+    stride-2 first block in stages two to four.
+    """
+    nn = lib.nn
+    f = lib.nn.functional
+
+    class BasicBlock(nn.Module):
+        def __init__(self, cin, cout, stride):
+            super().__init__()
+            self.conv1 = nn.Conv2d(cin, cout, 3, stride=stride, padding=1, bias=False)
+            self.bn1 = nn.BatchNorm2d(cout)
+            self.conv2 = nn.Conv2d(cout, cout, 3, padding=1, bias=False)
+            self.bn2 = nn.BatchNorm2d(cout)
+            if stride != 1 or cin != cout:
+                self.short_conv = nn.Conv2d(cin, cout, 1, stride=stride, bias=False)
+                self.short_bn = nn.BatchNorm2d(cout)
+            else:
+                self.short_conv = None
+
+        def forward(self, x):
+            out = f.relu(self.bn1(self.conv1(x)))
+            out = self.bn2(self.conv2(out))
+            if self.short_conv is not None:
+                x = self.short_bn(self.short_conv(x))
+            return f.relu(out + x)
+
+    class ResNet(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.stem = nn.Conv2d(3, width, 3, padding=1, bias=False)
+            self.stem_bn = nn.BatchNorm2d(width)
+            stages = []
+            cin = width
+            for i, n in enumerate(blocks):
+                cout = width * (2 ** i)
+                stride = 1 if i == 0 else 2
+                stages.append(nn.Sequential(
+                    *[BasicBlock(cin if j == 0 else cout, cout,
+                                 stride if j == 0 else 1) for j in range(n)]))
+                cin = cout
+            self.stages = nn.ModuleList(stages)
+            self.fc = nn.Linear(cin, classes)
+
+        def forward(self, x):
+            x = f.relu(self.stem_bn(self.stem(x)))
+            for stage in self.stages:
+                x = stage(x)
+            x = f.adaptive_avg_pool2d(x, 1).flatten(1)
+            return self.fc(x)
+
+    return ResNet()
+
+
+def make_llm(lib, vocab=1024, dim=256, heads=8, seq=128, batch=4, attn="sdpa",
+             n_blocks=2):
     nn = lib.nn
     head_dim = dim // heads
     scale = 1.0 / math.sqrt(head_dim)
@@ -126,7 +186,7 @@ def make_llm(lib, vocab=1024, dim=256, heads=8, seq=128, batch=4, attn="sdpa"):
         def __init__(self):
             super().__init__()
             self.emb = nn.Embedding(vocab, dim)
-            self.blocks = nn.ModuleList([Block(), Block()])
+            self.blocks = nn.ModuleList([Block() for _ in range(n_blocks)])
             self.ln_f = nn.LayerNorm(dim)
             self.head = nn.Linear(dim, vocab, bias=False)
 
@@ -186,16 +246,17 @@ def run(args) -> dict:
     device = args.device
     lib.manual_seed(0)
 
-    if args.model == "cv":
-        model = make_cv(lib).to(device)
-        shape = (args.batch, 3, 32, 32)
+    if args.model in ("cv", "resnet"):
+        model = (make_cv(lib) if args.model == "cv" else make_resnet(lib)).to(device)
+        shape = (args.batch, 3, args.size, args.size)
         x = from_numpy(lib, np.random.default_rng(1).standard_normal(shape).astype(np.float32), device)
         target = from_numpy(
             lib, np.random.default_rng(2).integers(0, 10, size=(args.batch,)).astype(np.int64), device
         )
     else:
         model, shape, vocab = make_llm(lib, batch=args.batch, seq=args.seq,
-                                       attn=args.attn)
+                                       dim=args.dim, heads=args.heads,
+                                       n_blocks=args.blocks, attn=args.attn)
         model = model.to(device)
         x = from_numpy(
             lib,
@@ -212,7 +273,7 @@ def run(args) -> dict:
     opt = lib.optim.SGD(model.parameters(), lr=args.lr)
 
     f = lib.nn.functional
-    if args.model == "cv":
+    if args.model in ("cv", "resnet"):
         loss_fn = lambda out: f.cross_entropy(out, target)
     else:
         loss_fn = lambda out: f.cross_entropy(out.reshape(-1, out.shape[-1]), target.reshape(-1))
@@ -263,10 +324,14 @@ def run(args) -> dict:
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("library", choices=["torch", "tensorplay"])
-    p.add_argument("--model", choices=["cv", "llm"], default="cv")
+    p.add_argument("--model", choices=["cv", "resnet", "llm"], default="cv")
     p.add_argument("--device", default="cuda")
     p.add_argument("--batch", type=int, default=8)
+    p.add_argument("--size", type=int, default=32, help="input resolution for the cv models")
     p.add_argument("--seq", type=int, default=128)
+    p.add_argument("--dim", type=int, default=256)
+    p.add_argument("--heads", type=int, default=8)
+    p.add_argument("--blocks", type=int, default=2)
     p.add_argument("--steps", type=int, default=5)
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument("--attn", choices=["sdpa", "manual"], default="sdpa",
@@ -281,7 +346,7 @@ def main() -> int:
         with open(args.out, "w") as fh:
             fh.write(text)
     print(
-        f"{result['library']:<10} {result['model']:<3} "
+        f"{result['library']:<10} {result['model']:<6} "
         f"loss {result['loss']:.6f} -> {result['loss_after_step']:.6f} "
         f"(after {args.steps} steps {result['loss_final']:.6f})  "
         f"out_sum {result['out_sum']:.4f}  absmax {result['out_absmax']:.4f}  "

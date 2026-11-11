@@ -237,8 +237,10 @@ Verified on a MetaX C500 (64 GB, MACA 3.3.0), Python 3.12:
   decimals, the matmul gradients to 2e-7 relative, and the largest
   per-parameter gradient deviation is 1.6e-3 (CV) and 5.1e-3 (LLM), both on
   small normalization-scale gradients where the reduction order differs;
-- the same steps cost 2.20 ms against 1.72 ms (CV) and 3.74 ms against
-  3.01 ms (LLM), a 1.24x-1.28x gap (`benchmark/model_smoke.py`);
+- the same steps cost 2.20 ms against 1.72 ms (CV), 8.78 ms against 6.46 ms
+  (ResNet-18, 11M parameters) and 12.83 ms against 8.19 ms (four transformer
+  blocks, `d=512`, sequence 512), a 1.24x-1.57x gap that widens with sequence
+  length (`benchmark/model_smoke.py`);
 - the profiler loads `libmcpti.so` and records per-operation device time and
   kernel-level entries;
 - CUDA Graph capture, instantiate and replay round-trip a matmul node: the
