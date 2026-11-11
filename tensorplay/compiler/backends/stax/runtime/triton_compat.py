@@ -178,3 +178,16 @@ else:  # pragma: no cover - the kernel-writing runtime is absent
     def triton_key(*args, **kwargs):
         raise RuntimeError("the kernel-writing runtime is not installed")
 
+    def statically_launched_kernel_by_device(kernel, device_type: str = "cuda"):
+        """The form of a compiled kernel that launches from its binary alone.
+
+        Without the kernel-writing runtime there is no compiled binary to load,
+        so there is nothing to hand back; the caller is told so rather than
+        given something that would fail at its first use.
+        """
+
+        raise NotImplementedError(
+            f"the kernel-writing runtime is not installed, so a {device_type} "
+            f"binary cannot be launched from one"
+        )
+
