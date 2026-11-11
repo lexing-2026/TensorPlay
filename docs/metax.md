@@ -223,6 +223,10 @@ Verified on a MetaX C500 (64 GB, MACA 3.3.0), Python 3.12:
   across the whole reduction bench), and a 1024-element sum costs about 10 us
   per launch;
 - the reduction regression suites pass on the device (77 passed, 3 skipped);
+- sorting matches the reference along every dimension: `sort`/`argsort` agree
+  with the CPU over 2-D and 3-D shapes, every axis, float32/float64/int32/int64
+  and both orders, and `test_sort_native.py` passes (24 passed); the backward
+  that consumes the permutation (`msort` / `take_along_dim`) passes too;
 - the profiler loads `libmcpti.so` and records per-operation device time and
   kernel-level entries;
 - CUDA Graph capture, instantiate and replay round-trip a matmul node: the
@@ -234,10 +238,11 @@ Verified on a MetaX C500 (64 GB, MACA 3.3.0), Python 3.12:
 
 The full `test/` suite is not yet a clean signal here: on the reference box it
 is dominated by a NumPy 2 ABI mismatch and by a sticky illegal-memory-access
-cascade that one device defect starts, so its failure count does not measure
-backend coverage.  One defect reproduces on its own — an out-of-range write in
-the `msort` / `take_along_dim` backward scatter, which leaves the CUDA context
-unusable for the tests that follow it.
+cascade, so its failure count does not measure backend coverage.  The earlier
+`msort` / `take_along_dim` trap was a consequence of the sort kernel rather
+than of the scatter it appeared in: `sort` along a dimension other than the
+last returned zeroed and shuffled rows, and the out-of-range permutation it
+produced then drove the backward scatter past the end of its output buffer.
 
 ## Compatibility
 
