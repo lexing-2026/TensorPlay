@@ -905,30 +905,46 @@ __global__ void binary_row_broadcast_kernel(
 
 // Vectorized variant: each thread owns one vec4 group of columns of one row,
 // so stores issue as single wide transactions and the row-base offsets are
-// computed once per row.  The operand with a unit column stride is loaded as
+// computed once per row.  An operand with a unit column stride is loaded as
 // one vec4 (its row base stays aligned whenever every outer stride is a
-// multiple of the vector width); a size-1 innermost dim is a row-constant
-// splat loaded once.  The other operand is read per column with scalar
-// loads, which coalesce across the warp regardless of its column stride.
+// multiple of the vector width, which the launch checks); a size-1 innermost
+// dim is a row-constant splat loaded once.  An operand with neither shape is
+// read per column with scalar loads, which coalesce across the warp regardless
+// of its column stride.  `a_packed` reports whether the first operand's row
+// base is vector aligned, so a unit column stride can use the packed load.
 template <typename T, int VecSize, typename Op>
 __global__ void binary_row_broadcast_vec_kernel(
     int64_t inner, int64_t rows,
     const T* __restrict__ a, TensorDesc a_desc,
     const T* __restrict__ b, TensorDesc b_desc,
     T* __restrict__ y, TensorDesc y_desc, typename BinaryOpMath<T>::type alpha,
-    Op op) {
+    Op op, bool a_packed) {
     using M = typename BinaryOpMath<T>::type;
     const int64_t vec_inner = inner / VecSize;
     const int64_t col0 = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (col0 >= vec_inner) return;
     const int64_t a_col_stride = a_desc.strides[a_desc.ndim - 1];
     const int64_t b_col_stride = b_desc.strides[b_desc.ndim - 1];
+    const bool a_unit = a_col_stride == 1;
+    const bool a_splat = a_col_stride == 0;
+    const bool a_vec = a_unit && a_packed;
     const bool b_unit = b_col_stride == 1;
     const bool b_splat = b_col_stride == 0;
     for (int64_t row = blockIdx.y; row < rows; row += gridDim.y) {
         const int64_t row_lin = row * inner;
         const int64_t a_base = get_offset(row_lin, a_desc, y_desc);
         const int64_t b_base = get_offset(row_lin, b_desc, y_desc);
+        M av[VecSize];
+        if (a_splat) {
+            const M a0 = static_cast<M>(a[a_base]);
+#pragma unroll
+            for (int v = 0; v < VecSize; ++v) av[v] = a0;
+        } else if (a_vec) {
+            const TPVecPack<T, VecSize> pa =
+                *reinterpret_cast<const TPVecPack<T, VecSize>*>(a + a_base + col0 * VecSize);
+#pragma unroll
+            for (int v = 0; v < VecSize; ++v) av[v] = static_cast<M>(pa.v[v]);
+        }
         M bv[VecSize];
         if (b_splat) {
             const M b0 = static_cast<M>(b[b_base]);
@@ -944,11 +960,13 @@ __global__ void binary_row_broadcast_vec_kernel(
 #pragma unroll
         for (int v = 0; v < VecSize; ++v) {
             const int64_t col = col0 * VecSize + v;
-            const M bval = (b_unit || b_splat) ? bv[v]
-                                               : static_cast<M>(b[b_base + col * b_col_stride]);
-            po.v[v] = static_cast<T>(op(
-                static_cast<M>(a[a_base + col * a_col_stride]),
-                bval, static_cast<M>(alpha)));
+            const M aval = (a_vec || a_splat)
+                ? av[v]
+                : static_cast<M>(a[a_base + col * a_col_stride]);
+            const M bval = (b_unit || b_splat)
+                ? bv[v]
+                : static_cast<M>(b[b_base + col * b_col_stride]);
+            po.v[v] = static_cast<T>(op(aval, bval, static_cast<M>(alpha)));
         }
         *reinterpret_cast<TPVecPack<T, VecSize>*>(y + row_lin + col0 * VecSize) = po;
     }
@@ -1108,39 +1126,76 @@ __global__ void binary_flat_scalar_kernel(
     }
 }
 
-// Launches a flat specialization when the output is a contiguous 2-D tensor
-// and both operands right-align to it with at most one row stride each.  A
-// trailing size-1 dim makes an operand a per-row splat; a trailing dim equal
-// to the row length is read either as packed groups (needs a row length and
-// row bases the vector width divides) or, when the shape is not packable, one
-// scalar column run per thread.  Returns false so the general row kernel (or
-// the per-element kernel) takes the shape instead.
+// A broadcast view of a contiguous block advances the operand by one constant
+// offset per unit of the output row index, so its leading-dim block collapses
+// to a single row stride.  The row index is mixed-radix over the output's outer
+// dimensions, so the operand's stride at every varying dimension has to be the
+// same multiple of that dimension's place value.  Returns false when a
+// broadcast sits below the last dimension: the offset then varies with the row
+// modulo a place value, which is not one stride, and the general kernel keeps
+// the shape.
+inline bool collapse_row_stride(const Tensor& y, const Tensor& operand,
+                                int64_t& row_stride) {
+    const int64_t out_ndim = y.dim();
+    const int64_t lead = out_ndim - operand.dim();
+    int64_t place = 1;  // product of the output sizes below the current dim
+    int64_t unit = -1;  // common offset per output row, once seen
+    for (int64_t d = out_ndim - 2; d >= 0; --d) {
+        const int64_t ysize = y.size(d);
+        int64_t ostride = 0;
+        if (d >= lead) {
+            const int64_t osize = operand.size(d - lead);
+            if (osize != 1 && osize != ysize) return false;
+            if (osize != 1) ostride = operand.stride(d - lead);
+        }
+        if (ysize > 1) {
+            if (unit < 0) {
+                if (place == 0 || ostride % place != 0) return false;
+                unit = ostride / place;
+            } else if (place == 0 || ostride / place != unit ||
+                       ostride % place != 0) {
+                return false;
+            }
+        }
+        place *= ysize;
+    }
+    row_stride = (unit < 0) ? 0 : unit;
+    return true;
+}
+
+// Launches a flat specialization when the output is a contiguous tensor whose
+// leading dims collapse (each operand becomes a constant row stride) and the
+// operands right-align to it.  A trailing size-1 dim makes an operand a per-row
+// splat; a trailing dim equal to the row length is read either as packed groups
+// (needs a row length and row bases the vector width divides) or, when the
+// shape is not packable, one scalar column run per thread.  Returns false so the
+// general row kernel (or the per-element kernel) takes the shape instead.
 template <typename T, typename Op>
 inline bool try_row_flat(
     int64_t inner, int64_t rows, const Tensor& a, const Tensor& b, Tensor& y,
     typename BinaryOpMath<T>::type alpha, Op op, cudaStream_t stream) {
     constexpr int kVec = 4;
     const uintptr_t align_mask = sizeof(T) * kVec - 1;
-    if (y.dim() != 2) return false;
     // The column walk counts in 32 bits, so a row longer than a quarter of the
     // addressable run is left to the general kernel.
     if (inner > (1 << 30)) return false;
     if (rows <= 0 || rows > 65535 || a.dim() < 1 || b.dim() < 1) return false;
-    if (a.dim() > 2 || b.dim() > 2) return false;
+    if (a.dim() > y.dim() || b.dim() > y.dim()) return false;
     // Broadcasting contract, right-aligned: the trailing dim spans the row or
-    // repeats one element, and a rank-2 leading dim spans the rows or repeats.
+    // repeats one element, and the leading dims of each operand collapse to one
+    // constant row stride.
     const bool a_full = a.size(-1) == inner;
     const bool b_full = b.size(-1) == inner;
     if (!a_full && a.size(-1) != 1) return false;
     if (!b_full && b.size(-1) != 1) return false;
-    if (a.dim() == 2 && a.size(0) != 1 && a.size(0) != rows) return false;
-    if (b.dim() == 2 && b.size(0) != 1 && b.size(0) != rows) return false;
-    const int64_t a_row_stride = (a.dim() == 2 && a.size(0) != 1) ? a.stride(0) : 0;
-    const int64_t b_row_stride = (b.dim() == 2 && b.size(0) != 1) ? b.stride(0) : 0;
     // Both kernels walk a row by adding one per column, so a row-spanning
     // operand has to be unit-stride along it.
     if (a_full && a.stride(-1) != 1) return false;
     if (b_full && b.stride(-1) != 1) return false;
+    int64_t a_row_stride = 0;
+    int64_t b_row_stride = 0;
+    if (!collapse_row_stride(y, a, a_row_stride)) return false;
+    if (!collapse_row_stride(y, b, b_row_stride)) return false;
     const bool packed = inner % kVec == 0 &&
         (reinterpret_cast<uintptr_t>(y.data_ptr<T>()) & align_mask) == 0 &&
         (!a_full || (a_row_stride % kVec == 0 &&
@@ -1343,6 +1398,24 @@ inline bool try_binary_row_broadcast(
     if (inner % kVec == 0 && b_vec_ok &&
         (reinterpret_cast<uintptr_t>(b.data_ptr<T>()) & (sizeof(T) * kVec - 1)) == 0 &&
         (reinterpret_cast<uintptr_t>(y.data_ptr<T>()) & (sizeof(T) * kVec - 1)) == 0) {
+        // The first operand takes the packed load when its innermost stride is
+        // unit and every outer stride leaves its row base vector aligned.  A
+        // shape that fails either test is still served here, one scalar load
+        // per column.
+        const int64_t a_col_stride = a_desc.strides[a_desc.ndim - 1];
+        bool a_packed = a_col_stride == 1;
+        if (a_packed) {
+            for (int d = 0; d < a_desc.ndim - 1; ++d) {
+                if (a_desc.sizes[d] != 1 && a_desc.strides[d] % kVec != 0) {
+                    a_packed = false;
+                    break;
+                }
+            }
+            if ((reinterpret_cast<uintptr_t>(a.data_ptr<T>()) &
+                 (sizeof(T) * kVec - 1)) != 0) {
+                a_packed = false;
+            }
+        }
         const int64_t vec_inner = inner / kVec;
         constexpr int threads_x = 128;
         const int64_t blocks_x = (vec_inner + threads_x - 1) / threads_x;
@@ -1355,7 +1428,7 @@ inline bool try_binary_row_broadcast(
                   static_cast<unsigned>(blocks_y));
         binary_row_broadcast_vec_kernel<T, kVec, Op><<<grid, threads_x, 0, stream>>>(
             inner, rows, a.data_ptr<T>(), a_desc, b.data_ptr<T>(), b_desc,
-            y.data_ptr<T>(), y_desc, alpha, op);
+            y.data_ptr<T>(), y_desc, alpha, op, a_packed);
         return true;
     }
 
