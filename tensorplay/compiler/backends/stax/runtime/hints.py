@@ -170,14 +170,17 @@ try:
             equal_to_1=None,
             pointer_range_32=None,
         ):
-            """同一件事，写成属性字典。"""
+            """同一件事，写成每个参数下标的集合。
 
-            kwargs = {
-                "tt.divisibility": divisible_by_16,
-                "tt.equal_to": equal_to_1,
-                "tt.pointer_range": pointer_range_32,
-            }
-            return AttrsDescriptor(tuple(kwargs.items()))
+            这一代的发射器把两种性质各收一张表，表里放参数的下标；表本身
+            就是它要的形式，所以原样传进去，而不是再把性质名包在外面。
+            第三种性质它不认识，所以只由认得的那一代去写。
+            """
+
+            return AttrsDescriptor(
+                divisible_by_16=divisible_by_16,
+                equal_to_1=equal_to_1,
+            )
 
     else:
 

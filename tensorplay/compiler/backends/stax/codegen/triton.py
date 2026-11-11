@@ -546,10 +546,12 @@ class TritonKernel(SIMDKernel):  # type: ignore[misc,valid-type]
         arithmetic says that name, and the runtime's own helpers are imported
         under theirs because the generated launcher says theirs.
 
-        Anything only some launches need -- a tracing profiler, a set of
-        hardware descriptors -- is left out here and written by the code that
-        knows the launch needs it, because a module that imports something it
-        never uses pays for it on every launch.
+        Anything only some launches need -- a tracing profiler -- is left out
+        here and written by the code that knows the launch needs it, because a
+        module that imports something it never uses pays for it on every
+        launch.  The description of the launch's arguments is imported where
+        the runtime has one to import, since the generated launcher writes one
+        whenever it does.
         """
 
         imports = IndentedBuffer()
@@ -579,6 +581,8 @@ class TritonKernel(SIMDKernel):  # type: ignore[misc,valid-type]
             )
         except ImportError:
             pass
+        if attr_desc := gen_attr_descriptor_import():
+            imports.writeline(attr_desc)
         imports.splice(
             """
             from tensorplay.compiler.backends.stax.runtime import (
