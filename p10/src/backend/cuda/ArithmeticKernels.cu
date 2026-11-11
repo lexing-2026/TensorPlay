@@ -2050,6 +2050,11 @@ Tensor sub_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha) 
 
     if (self.device().type() == DeviceType::CUDA &&
         other.device().type() == DeviceType::CUDA) {
+        if (alpha.to<double>() == 1.0 &&
+            try_binary_channel_broadcast(
+                self, other, result, alpha.to<float>(), BinarySubVecOp{})) {
+            return result;
+        }
         Tensor a = (self.dtype() == result_dtype) ? self : self.to(result_dtype);
         Tensor b = (other.dtype() == result_dtype) ? other : other.to(result_dtype);
         if (try_binary_vectorized(n, a, b, result, alpha, BinarySubVecOp{})) {
@@ -2091,6 +2096,11 @@ Tensor& sub_inplace_kernel(Tensor& self, const Tensor& other, const Scalar& alph
     if (n == 0) return self;
 
     if (other.device().type() == DeviceType::CUDA) {
+        if (alpha.to<double>() == 1.0 &&
+            try_binary_channel_broadcast(
+                self, other, self, alpha.to<float>(), BinarySubVecOp{})) {
+            return self;
+        }
         Tensor b = (other.dtype() == self.dtype()) ? other : other.to(self.dtype());
         if (try_binary_vectorized(n, self, b, self, alpha, BinarySubVecOp{})) {
             return self;
@@ -2262,6 +2272,10 @@ Tensor div_kernel(const Tensor& self, const Tensor& other) {
 
     if (self.device().type() == DeviceType::CUDA &&
         other.device().type() == DeviceType::CUDA) {
+        if (try_binary_channel_broadcast(
+                self, other, result, 1.0f, BinaryDivVecOp{})) {
+            return result;
+        }
         Tensor a = (self.dtype() == result_dtype) ? self : self.to(result_dtype);
         Tensor b = (other.dtype() == result_dtype) ? other : other.to(result_dtype);
         if (try_binary_vectorized(n, a, b, result, Scalar(1), BinaryDivVecOp{})) {
@@ -2305,6 +2319,11 @@ Tensor& mul_out_kernel(const Tensor& self, const Tensor& other, Tensor& out) {
 
 Tensor& sub_out_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha,
                        Tensor& out) {
+    if (alpha.to<double>() == 1.0 &&
+        try_binary_channel_broadcast(
+            self, other, out, alpha.to<float>(), BinarySubVecOp{})) {
+        return out;
+    }
     if (try_arithmetic_out<IterSubFunctor>(self, other, alpha, out,
                                            native::result_type(self, other),
                                            BinarySubVecOp{})) {
@@ -2316,6 +2335,9 @@ Tensor& sub_out_kernel(const Tensor& self, const Tensor& other, const Scalar& al
 Tensor& div_out_kernel(const Tensor& self, const Tensor& other, Tensor& out) {
     DType result_dtype = native::result_type(self, other);
     if (isIntegralType(result_dtype)) result_dtype = DType::Float32;  // Div promotes to float
+    if (try_binary_channel_broadcast(self, other, out, 1.0f, BinaryDivVecOp{})) {
+        return out;
+    }
     if (try_arithmetic_out<IterDivFunctor>(self, other, Scalar(1), out, result_dtype,
                                            BinaryDivVecOp{})) {
         return out;
@@ -2328,6 +2350,10 @@ Tensor& div_inplace_kernel(Tensor& self, const Tensor& other) {
     if (n == 0) return self;
 
     if (other.device().type() == DeviceType::CUDA) {
+        if (try_binary_channel_broadcast(
+                self, other, self, 1.0f, BinaryDivVecOp{})) {
+            return self;
+        }
         Tensor b = (other.dtype() == self.dtype()) ? other : other.to(self.dtype());
         if (try_binary_vectorized(n, self, b, self, Scalar(1), BinaryDivVecOp{})) {
             return self;
