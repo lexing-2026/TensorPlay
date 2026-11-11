@@ -181,12 +181,12 @@ __device__ inline Key topk_set_bitfield(Key value, Key field, int pos,
          ((field & mask) << pos);
 }
 
-// One digit of every element counted into a shared histogram.  A warp finds the
-// lanes that hold the same digit with one match-any, so the cost of a pass does
-// not grow with the number of buckets and a wide digit buys a proportionally
-// shorter scan.  Lanes whose value is outside the pattern still take part in the
-// match, so the warp stays converged, and only the lane first in a group adds
-// the group's size.
+// One digit of every element counted into a shared histogram.  For each bucket
+// the warp ballots on the lanes whose value lands in that bucket, so a pass
+// costs one ballot per bucket and the counts are independent of the hardware
+// warp width.  Lanes whose value is outside the pattern do not vote; each warp
+// adds its partial counts, and a wide digit buys a proportionally shorter
+// scan.
 template <typename T, typename IndexType, int RadixBits>
 __device__ inline void topk_count_radix_using_mask(
     IndexType counts[1 << RadixBits], IndexType* smem,
@@ -221,9 +221,13 @@ __device__ inline void topk_count_radix_using_mask(
     }
   }
 #else
-  unsigned active = __ballot_sync(0xffffffffu,
-                                  static_cast<IndexType>(threadIdx.x) <
-                                      slice_size);
+  // Population count per digit: every lane votes for its own digit and the
+  // warp-wide ballot of that vote is summed.  The result follows the hardware
+  // warp width instead of a fixed lane count, and lanes without a matching
+  // value simply do not vote.  `active` carries the participation mask and is
+  // narrowed each pass to the lanes that still hold data.
+  unsigned long long active = __ballot_sync(
+      ~0ull, static_cast<IndexType>(threadIdx.x) < slice_size);
   for (IndexType i = static_cast<IndexType>(threadIdx.x); i < slice_size;) {
     const Key value = TopKRadixTraits<T>::encode(
         topk_load(&data[i * within_slice_stride]));
@@ -232,19 +236,29 @@ __device__ inline void topk_count_radix_using_mask(
         ? static_cast<unsigned>(
               (value >> digit_pos) & static_cast<Key>(radix_size - 1))
         : static_cast<unsigned>(radix_size);
-    const unsigned same = __match_any_sync(active, bucket);
-    const int lane = static_cast<int>(threadIdx.x) & 31;
-    if (has_value && lane == __ffs(same) - 1) {
-      const IndexType group = static_cast<IndexType>(__popc(same));
-      if constexpr (sizeof(IndexType) == sizeof(uint32_t)) {
-        atomicAdd(&smem[bucket], group);
-      } else {
-        atomicAdd(reinterpret_cast<unsigned long long*>(&smem[bucket]),
-                  static_cast<unsigned long long>(group));
-      }
+#pragma unroll
+    for (int j = 0; j < radix_size; ++j) {
+      const bool vote = has_value && bucket == static_cast<unsigned>(j);
+      counts[j] +=
+          static_cast<IndexType>(__popcll(__ballot_sync(active, vote)));
     }
     i += static_cast<IndexType>(blockDim.x);
     active = __ballot_sync(active, i < slice_size);
+  }
+
+  // Each warp folds its partial counts into the shared histogram once.  The
+  // first lane of the warp reads the same ballot totals as the rest of the
+  // warp, so its per-thread counts already hold the warp sum.
+  if ((static_cast<int>(threadIdx.x) % warpSize) == 0) {
+#pragma unroll
+    for (int j = 0; j < radix_size; ++j) {
+      if constexpr (sizeof(IndexType) == sizeof(uint32_t)) {
+        atomicAdd(&smem[j], counts[j]);
+      } else {
+        atomicAdd(reinterpret_cast<unsigned long long*>(&smem[j]),
+                  static_cast<unsigned long long>(counts[j]));
+      }
+    }
   }
 #endif
   __syncthreads();
