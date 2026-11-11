@@ -2818,23 +2818,29 @@ class CachingAutotuner(KernelInterface):
         # argument of it at all -- here it is a value the text was written with,
         # which lives in the module the kernel is defined in -- and passing it
         # to the runtime as though it were an argument would be naming
-        # something the kernel has no parameter for.
-        kernel_arg_names = set(compile_meta["signature"])
-        cfg_kwargs = {
-            key: value
-            for key, value in cfg.kwargs.items()
-            if key in kernel_arg_names
-        }
-        backend_options = {
-            key: value
-            for key, value in cfg.kwargs.items()
-            if key not in kernel_arg_names
-        }
-        if backend_options:
-            compile_meta["backend_options"] = {
-                **compile_meta.get("backend_options", {}),
-                **backend_options,
+        # something the kernel has no parameter for.  Only one kind of device
+        # puts both kinds in the same bag; elsewhere every name a
+        # configuration carries is one the kernel declares, and the signature
+        # -- which lists the arguments that are not constants -- cannot be
+        # used to tell them apart, because a constant is not listed there.
+        cfg_kwargs = {**cfg.kwargs}
+        if self.device_props.type == "hip":
+            kernel_arg_names = set(compile_meta["signature"])
+            backend_options = {
+                key: value
+                for key, value in cfg_kwargs.items()
+                if key not in kernel_arg_names
             }
+            cfg_kwargs = {
+                key: value
+                for key, value in cfg_kwargs.items()
+                if key in kernel_arg_names
+            }
+            if backend_options:
+                compile_meta["backend_options"] = {
+                    **compile_meta.get("backend_options", {}),
+                    **backend_options,
+                }
         compile_meta["constants"].update(cfg_kwargs)
 
         for i in get_constexprs(self.fn):
