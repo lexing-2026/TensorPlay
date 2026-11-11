@@ -912,7 +912,31 @@ __global__ void binary_row_broadcast_kernel(
 // read per column with scalar loads, which coalesce across the warp regardless
 // of its column stride.  `a_packed` reports whether the first operand's row
 // base is vector aligned, so a unit column stride can use the packed load.
-template <typename T, int VecSize, typename Op>
+// Reads the VecSize columns starting at `col` of one row for an operand whose
+// row base is `base` and whose column stride is the runtime `stride`.  A zero
+// stride repeats the single element at the base, a vector-aligned unit stride
+// reads one wide group, and any other stride falls back to one scalar load per
+// column.  Every path writes the whole group, so the compiler can keep it in
+// registers and never needs a local-memory slot for a partially loaded operand.
+template <typename T, int VecSize, bool Splat>
+__device__ __forceinline__ TPVecPack<T, VecSize> load_row_group(
+    const T* __restrict__ ptr, int64_t base, int64_t col, int64_t stride,
+    bool packed) {
+    TPVecPack<T, VecSize> out;
+    if constexpr (Splat) {
+        const T value = ptr[base];
+#pragma unroll
+        for (int v = 0; v < VecSize; ++v) out.v[v] = value;
+    } else if (packed) {
+        out = *reinterpret_cast<const TPVecPack<T, VecSize>*>(ptr + base + col);
+    } else {
+#pragma unroll
+        for (int v = 0; v < VecSize; ++v) out.v[v] = ptr[base + (col + v) * stride];
+    }
+    return out;
+}
+
+template <typename T, int VecSize, bool ASplat, bool BSplat, typename Op>
 __global__ void binary_row_broadcast_vec_kernel(
     int64_t inner, int64_t rows,
     const T* __restrict__ a, TensorDesc a_desc,
@@ -923,52 +947,27 @@ __global__ void binary_row_broadcast_vec_kernel(
     const int64_t vec_inner = inner / VecSize;
     const int64_t col0 = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (col0 >= vec_inner) return;
+    const int64_t col = col0 * VecSize;
     const int64_t a_col_stride = a_desc.strides[a_desc.ndim - 1];
     const int64_t b_col_stride = b_desc.strides[b_desc.ndim - 1];
-    const bool a_unit = a_col_stride == 1;
-    const bool a_splat = a_col_stride == 0;
-    const bool a_vec = a_unit && a_packed;
-    const bool b_unit = b_col_stride == 1;
-    const bool b_splat = b_col_stride == 0;
+    const bool a_packed_load = a_col_stride == 1 && a_packed;
+    const bool b_packed_load = b_col_stride == 1;
     for (int64_t row = blockIdx.y; row < rows; row += gridDim.y) {
         const int64_t row_lin = row * inner;
         const int64_t a_base = get_offset(row_lin, a_desc, y_desc);
         const int64_t b_base = get_offset(row_lin, b_desc, y_desc);
-        M av[VecSize];
-        if (a_splat) {
-            const M a0 = static_cast<M>(a[a_base]);
-#pragma unroll
-            for (int v = 0; v < VecSize; ++v) av[v] = a0;
-        } else if (a_vec) {
-            const TPVecPack<T, VecSize> pa =
-                *reinterpret_cast<const TPVecPack<T, VecSize>*>(a + a_base + col0 * VecSize);
-#pragma unroll
-            for (int v = 0; v < VecSize; ++v) av[v] = static_cast<M>(pa.v[v]);
-        }
-        M bv[VecSize];
-        if (b_splat) {
-            const M b0 = static_cast<M>(b[b_base]);
-#pragma unroll
-            for (int v = 0; v < VecSize; ++v) bv[v] = b0;
-        } else if (b_unit) {
-            const TPVecPack<T, VecSize> pb =
-                *reinterpret_cast<const TPVecPack<T, VecSize>*>(b + b_base + col0 * VecSize);
-#pragma unroll
-            for (int v = 0; v < VecSize; ++v) bv[v] = static_cast<M>(pb.v[v]);
-        }
+        const TPVecPack<T, VecSize> av =
+            load_row_group<T, VecSize, ASplat>(a, a_base, col, a_col_stride, a_packed_load);
+        const TPVecPack<T, VecSize> bv =
+            load_row_group<T, VecSize, BSplat>(b, b_base, col, b_col_stride, b_packed_load);
         TPVecPack<T, VecSize> po;
 #pragma unroll
         for (int v = 0; v < VecSize; ++v) {
-            const int64_t col = col0 * VecSize + v;
-            const M aval = (a_vec || a_splat)
-                ? av[v]
-                : static_cast<M>(a[a_base + col * a_col_stride]);
-            const M bval = (b_unit || b_splat)
-                ? bv[v]
-                : static_cast<M>(b[b_base + col * b_col_stride]);
-            po.v[v] = static_cast<T>(op(aval, bval, static_cast<M>(alpha)));
+            po.v[v] = static_cast<T>(op(static_cast<M>(av.v[v]),
+                                        static_cast<M>(bv.v[v]),
+                                        static_cast<M>(alpha)));
         }
-        *reinterpret_cast<TPVecPack<T, VecSize>*>(y + row_lin + col0 * VecSize) = po;
+        *reinterpret_cast<TPVecPack<T, VecSize>*>(y + row_lin + col) = po;
     }
 }
 
@@ -1437,9 +1436,24 @@ inline bool try_binary_row_broadcast(
         if (blocks_y > 65535) blocks_y = 65535;
         dim3 grid(static_cast<unsigned>(blocks_x < 1 ? 1 : blocks_x),
                   static_cast<unsigned>(blocks_y));
-        binary_row_broadcast_vec_kernel<T, kVec, Op><<<grid, threads_x, 0, stream>>>(
-            inner, rows, a.data_ptr<T>(), a_desc, b.data_ptr<T>(), b_desc,
-            y.data_ptr<T>(), y_desc, alpha, op, a_packed);
+        // A size-1 innermost dim makes that operand a row-constant splat, which
+        // the whole launch shares; picking it here keeps the per-thread load out
+        // of a runtime branch.
+        const bool a_splat = a_col_stride == 0;
+        const bool b_splat = b_desc.strides[b_desc.ndim - 1] == 0;
+#define TP_ROW_BCAST(A_SPLAT, B_SPLAT)                                        \
+        binary_row_broadcast_vec_kernel<T, kVec, A_SPLAT, B_SPLAT, Op>        \
+            <<<grid, threads_x, 0, stream>>>(                                 \
+                inner, rows, a.data_ptr<T>(), a_desc, b.data_ptr<T>(), b_desc, \
+                y.data_ptr<T>(), y_desc, alpha, op, a_packed)
+        if (a_splat) {
+            TP_ROW_BCAST(true, false);
+        } else if (b_splat) {
+            TP_ROW_BCAST(false, true);
+        } else {
+            TP_ROW_BCAST(false, false);
+        }
+#undef TP_ROW_BCAST
         return true;
     }
 
