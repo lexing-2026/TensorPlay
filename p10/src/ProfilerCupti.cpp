@@ -702,6 +702,14 @@ TENSORPLAY_API void cupti_stop_and_collect(std::vector<GpuActivity>& out) {
     {
         std::lock_guard<std::mutex> lock(g_cupti_mutex);
         if (g_fns == nullptr) return;
+    }
+    // A kernel's activity record is written when the kernel completes, so
+    // work still queued at stop would have its record dropped by the disable
+    // below.  Wait the device out first; a device error must not fail the
+    // stop, so the result is deliberately ignored.
+    (void)cudaDeviceSynchronize();
+    {
+        std::lock_guard<std::mutex> lock(g_cupti_mutex);
         disable_kinds_locked();
     }
     // FlushAll delivers every buffered record through buffer_completed
