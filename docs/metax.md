@@ -169,7 +169,7 @@ cannot run:
 | Convolution | the shared, v7 and v8 kernel files build against `mcdnn`; the v8 graph-plan frontend compiles out, so `conv2d` runs the legacy path and the gradient kernels use the descriptor API |
 | Quantized GEMM | excluded — inline PTX (`mma.sync`, `lop3`, `cp.async`); operators fall back to the generic paths |
 | Grouped GEMM | excluded — the grouped tensor-core schedule is not shipped; a fallback entry point reports every configuration as outside its envelope, so callers keep the per-group math-library path |
-| Transformers attention | the flash and wide-tiled schedules are excluded; attention runs the math path, which builds here |
+| Transformers attention | the flash and wide-tiled schedules are excluded; `scaled_dot_product_attention`, its backward and the log-sum-exp variants register the composed schedule instead, so attention, its backward and `TransformerEncoderLayer` run |
 | Sparse linear algebra | the solver library builds, but the sparse-solver handle cannot be created on this device, so the sparse solve entry point raises when reached |
 | CUDA Graph capture and replay | capture, instantiate and replay run against the compatibility runtime's graph entry points; conditional nodes (CUDA >= 12.4) are excluded by the version gate and refused at the API |
 | Profiling | per-operation device time, kernel-level records through `libmcpti` |
@@ -199,6 +199,8 @@ records arrive through the same path as on NVIDIA.
 | `p10/CMakeLists.txt` | source selection, per-TU `mxcc` objects, the exclusion list |
 | `p10/src/backend/cuda/*.cu` | the reused device kernels |
 | `p10/src/backend/cuda/GroupedGemmFallback.cpp` | the grouped-GEMM entry point the excluded kernel file would have defined |
+| `p10/src/backend/cuda/transformers/SdpaComposed.cpp` | the attention entry points the excluded kernel file would have defined, answered by the composed schedule |
+| `benchmark/model_smoke.py` | LLM and CV training steps against the reference library, same weights in both runs |
 | `p10/include/BFloat16.h`, `p10/include/Half.h` | conversion intrinsics take integer paths under `mxcc` |
 | `p10/src/ProfilerCupti.cpp` | `libmcpti.so` as the tracing library in a MACA build |
 
@@ -227,6 +229,16 @@ Verified on a MetaX C500 (64 GB, MACA 3.3.0), Python 3.12:
   with the CPU over 2-D and 3-D shapes, every axis, float32/float64/int32/int64
   and both orders, and `test_sort_native.py` passes (24 passed); the backward
   that consumes the permutation (`msort` / `take_along_dim`) passes too;
+- a CV training step (three convolutions with batch norm, max pooling, a
+  classifier head; 8x3x32x32) and an LLM training step (two transformer
+  blocks, `d=256`, 8 heads, sequence 128, batch 4, `scaled_dot_product_attention`)
+  both run forward, backward and the update.  Fed identical weights and
+  inputs, the two libraries agree: the loss trajectory matches to six
+  decimals, the matmul gradients to 2e-7 relative, and the largest
+  per-parameter gradient deviation is 1.6e-3 (CV) and 5.1e-3 (LLM), both on
+  small normalization-scale gradients where the reduction order differs;
+- the same steps cost 2.20 ms against 1.72 ms (CV) and 3.74 ms against
+  3.01 ms (LLM), a 1.24x-1.28x gap (`benchmark/model_smoke.py`);
 - the profiler loads `libmcpti.so` and records per-operation device time and
   kernel-level entries;
 - CUDA Graph capture, instantiate and replay round-trip a matmul node: the
