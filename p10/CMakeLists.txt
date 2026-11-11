@@ -1104,6 +1104,14 @@ if(USE_METAX)
     # compatibility headers; the graph-plan frontend has no counterpart, so
     # TP_HAS_CUDNN_FRONTEND stays off and the legacy convolution path runs.
     target_compile_definitions(p10 PRIVATE USE_CUDA USE_CUDNN USE_METAX)
+    # The collected device image (.mc_fatbin) is large enough that the
+    # default read-only segment would push .got/.tbss out of reach of the
+    # host code's 32-bit relocations.  Relocate the image to the end of
+    # the library; cmake/mc_fatbin_layout.ld explains why that is safe.
+    target_link_options(p10 PRIVATE
+        "-Wl,--default-script,${CMAKE_SOURCE_DIR}/cmake/mc_fatbin_layout.ld")
+    set_property(TARGET p10 APPEND PROPERTY LINK_DEPENDS
+        "${CMAKE_SOURCE_DIR}/cmake/mc_fatbin_layout.ld")
 endif()
 if(APPLE AND USE_MPS)
     add_dependencies(p10 mps_shaders)
