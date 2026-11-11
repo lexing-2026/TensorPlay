@@ -288,15 +288,19 @@ __global__ void warp_merge_sort_selected_kernel(
     T* __restrict__ values, int64_t* __restrict__ indices, int64_t rows,
     int64_t k, int64_t inner, bool largest) {
   constexpr int items_per_thread = SortSize / 32;
+  // One row per logical warp of 32 threads; the collective load/store
+  // primitives must be told that width explicitly instead of defaulting to the
+  // architecture warp width, which is wider than a row's logical warp on some
+  // devices and would then span several rows inside a single transpose.
   using LoadValues = cub::WarpLoad<
-      T, items_per_thread, cub::WARP_LOAD_TRANSPOSE>;
+      T, items_per_thread, cub::WARP_LOAD_TRANSPOSE, 32>;
   using LoadIndices = cub::WarpLoad<
-      int64_t, items_per_thread, cub::WARP_LOAD_TRANSPOSE>;
+      int64_t, items_per_thread, cub::WARP_LOAD_TRANSPOSE, 32>;
   using Sort = cub::WarpMergeSort<T, items_per_thread, 32, int64_t>;
   using StoreValues = cub::WarpStore<
-      T, items_per_thread, cub::WARP_STORE_TRANSPOSE>;
+      T, items_per_thread, cub::WARP_STORE_TRANSPOSE, 32>;
   using StoreIndices = cub::WarpStore<
-      int64_t, items_per_thread, cub::WARP_STORE_TRANSPOSE>;
+      int64_t, items_per_thread, cub::WARP_STORE_TRANSPOSE, 32>;
   __shared__ union {
     typename LoadValues::TempStorage load_values;
     typename LoadIndices::TempStorage load_indices;

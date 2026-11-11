@@ -129,14 +129,19 @@ __global__ void sort_warp_merge_kernel(
     constexpr int kWarpThreads = 32;
     constexpr int kItemsPerThread = SortSize / kWarpThreads;
     constexpr int kMaxBlockWarps = 16;
+    // Each slice is handled by one logical warp of kWarpThreads, so the
+    // collective load/store primitives have to be told that width rather than
+    // letting it default to the architecture's warp width: a device whose
+    // hardware warp is wider than this logical warp would otherwise spread one
+    // slice's rows over several half-warps and mis-address the transposes.
     using LoadValues = cub::WarpLoad<
-        T, kItemsPerThread, cub::WARP_LOAD_TRANSPOSE>;
+        T, kItemsPerThread, cub::WARP_LOAD_TRANSPOSE, kWarpThreads>;
     using Sort = cub::WarpMergeSort<
         Key, kItemsPerThread, kWarpThreads, int32_t>;
     using StoreValues = cub::WarpStore<
-        T, kItemsPerThread, cub::WARP_STORE_TRANSPOSE>;
+        T, kItemsPerThread, cub::WARP_STORE_TRANSPOSE, kWarpThreads>;
     using StoreIndices = cub::WarpStore<
-        int64_t, kItemsPerThread, cub::WARP_STORE_TRANSPOSE>;
+        int64_t, kItemsPerThread, cub::WARP_STORE_TRANSPOSE, kWarpThreads>;
     __shared__ union {
         typename LoadValues::TempStorage load_values;
         typename Sort::TempStorage sort;
