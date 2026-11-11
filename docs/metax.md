@@ -174,6 +174,61 @@ cannot run:
 | CUDA Graph capture and replay | capture, instantiate and replay run against the compatibility runtime's graph entry points; conditional nodes (CUDA >= 12.4) are excluded by the version gate and refused at the API |
 | Profiling | per-operation device time, kernel-level records through `libmcpti` |
 
+## Graph compilation
+
+`stax`, the default backend of `tp.compile`, lowers a captured graph through the
+kernel-writing runtime MetaX ships as its own fork of Triton.  No other part of
+the framework needs it, and this backend imports it only while a graph is being
+compiled: with it absent, the device is driven exactly as before through the
+kernel library, and the backend reports that there is no runtime rather than
+lowering anything.
+
+Installing that fork is what turns graph compilation on:
+
+```bash
+pip install --break-system-packages --no-deps \
+  "triton==3.0.0+metax3.3.0.2" \
+  -i https://repos.metax-tech.com/r/maca-pypi/simple \
+  --trusted-host repos.metax-tech.com
+```
+
+The version has to be the one built for the installed MACA release (3.3.0 pairs
+with this one); it is a wheel, so no compiler toolchain is needed to install it,
+and it is not needed for anything else.
+
+A device driven by this stack is named for the stack inside the kernel-writing
+runtime (`maca`, 64-wide warps) and is compiled with the warp width and the
+options that stack's backend defines.  The framework still presents the same
+device as an accelerator, so the launch path translates the name where it looks
+a device up, and a precompiled kernel is read from the stack's own image name
+(`.mcfatbin`).
+
+Measured on the C500 above, warm, against eager and against the reference
+framework's own graph compiler running the same function:
+
+| Case | eager | `stax` | reference compiler |
+| --- | --- | --- | --- |
+| `(a+b).relu()*2`, 4M elements | 113 us | 50 us (2.3x) | 47 us (2.2x) |
+| `(a+b).relu()*2`, 16M elements | 361 us | 144 us (2.5x) | 194 us (1.7x) |
+| `(a+b).relu()*2`, 64M elements | 1352 us | 538 us (2.5x) | 751 us (1.7x) |
+| `softmax`, 4096x4096 | 440 us | 240 us (1.8x) |  |
+| `softmax`, 8192x8192 | 1769 us | 1170 us (1.5x) |  |
+| `softmax`, 65536x256 | 653 us | 151 us (4.3x) |  |
+| `matmul`, 4096x4096 | 4.70 ms | 4.70 ms |  |
+
+Every case agrees with eager: the elementwise chain and the matmul exactly, the
+softmax to 6e-8.  The matmul is unchanged because a matrix multiply is taken as
+a library call rather than a generated kernel, so the gain is in the fused
+elementwise and reduction work around it.  A chain that becomes one kernel still
+pays a fixed cost of about 40 us per call, which is more than the kernel itself
+costs below a few million elements -- that is why the 4M row is where `stax` and
+the reference compiler meet rather than pull apart.
+
+`softmax` and its backward are handed to purpose-written row kernels where the
+device language those need is installed; where it is not, the call keeps the
+ordinary reduction lowering, which is what runs here, so the operation still
+compiles rather than being given up on.
+
 ## Profiling
 
 ```python
