@@ -672,7 +672,7 @@ __global__ void softmax_reg_packed_kernel(out_t* __restrict__ out,
                                           int classes, int packets) {
   constexpr int kPack = 16 / static_cast<int>(sizeof(scalar_t));
   constexpr int kWave = 32;
-  __shared__ SoftmaxMS<compute_t> reduce_ms[kWave];
+  __shared__ compute_t reduce_scratch[kWave];
   const int tid = static_cast<int>(threadIdx.x);
   const scalar_t* row = in + static_cast<int64_t>(blockIdx.x) * classes;
   out_t* row_out = out + static_cast<int64_t>(blockIdx.x) * classes;
@@ -693,9 +693,13 @@ __global__ void softmax_reg_packed_kernel(out_t* __restrict__ out,
     }
   }
 
-  // Thread-local moments, then one online pair reduction: every thread's
-  // partial sum is rescaled onto the merged max inside the combine, so a
-  // single tree walk yields the same (max, sum) a two-pass flow would.
+  // The row maximum is reduced first and broadcast back, so the sum pass
+  // scales every element against one shared value.  A single online
+  // (max, sum) walk visits the same registers once, but each combine step
+  // then carries a pair of rescaling exponentials; that overhead outgrew the
+  // shuffles it saves as soon as a thread holds only a handful of elements,
+  // so the cheap max pass runs separately and the sum pass stays a plain
+  // exponential plus add.
   compute_t thread_max = -std::numeric_limits<compute_t>::infinity();
 #pragma unroll
   for (int i = 0; i < PACKS; ++i) {
@@ -705,24 +709,30 @@ __global__ void softmax_reg_packed_kernel(out_t* __restrict__ out,
       thread_max = x > thread_max ? x : thread_max;
     }
   }
-  // A thread whose slots all landed past the row end keeps the -inf fill, and
-  // exp(-inf - -inf) is NaN; such a thread contributes no exponentials, which
-  // leaves an all--inf row with a zero sum exactly as a row of real values
-  // would report a NaN output.
+  const compute_t row_max =
+      softmax_block_reduce<compute_t, true>(thread_max, reduce_scratch);
+
+  // Keep the exponential from the sum pass so the store pass scales instead
+  // of recomputing it.  When the accumulator is the stored type the value
+  // overwrites its input word; a 16-bit row cannot hold it without rounding,
+  // so those rows recompute the exponential on the way out.  Padding slots
+  // carry -inf, whose exponential is a zero that adds nothing; an all--inf row
+  // keeps the NaN output a softmax of no finite element has.
+  constexpr bool kReuse = std::is_same_v<compute_t, scalar_t> && !LOG_MODE;
   compute_t thread_sum = compute_t(0);
-  if (thread_max > -std::numeric_limits<compute_t>::infinity()) {
 #pragma unroll
-    for (int i = 0; i < PACKS; ++i) {
+  for (int i = 0; i < PACKS; ++i) {
 #pragma unroll
-      for (int k = 0; k < kPack; ++k) {
-        thread_sum += std::exp(static_cast<compute_t>(v[i].v[k]) - thread_max);
-      }
+    for (int k = 0; k < kPack; ++k) {
+      const compute_t e =
+          std::exp(static_cast<compute_t>(v[i].v[k]) - row_max);
+      if constexpr (kReuse) v[i].v[k] = static_cast<scalar_t>(e);
+      thread_sum += e;
     }
   }
-  const SoftmaxMS<compute_t> ms =
-      softmax_block_reduce_ms<compute_t>(
-          SoftmaxMS<compute_t>{thread_max, thread_sum}, reduce_ms);
-  const compute_t norm = LOG_MODE ? std::log(ms.s) : compute_t(1) / ms.s;
+  const compute_t row_sum =
+      softmax_block_reduce<compute_t, false>(thread_sum, reduce_scratch);
+  const compute_t norm = LOG_MODE ? std::log(row_sum) : compute_t(1) / row_sum;
 
   if constexpr (std::is_same_v<out_t, scalar_t>) {
     SoftmaxPack<scalar_t, kPack>* dst =
@@ -734,8 +744,13 @@ __global__ void softmax_reg_packed_kernel(out_t* __restrict__ out,
         SoftmaxPack<scalar_t, kPack> r;
 #pragma unroll
         for (int k = 0; k < kPack; ++k) {
-          const compute_t x = static_cast<compute_t>(v[i].v[k]) - ms.m;
-          r.v[k] = static_cast<scalar_t>(LOG_MODE ? x - norm : std::exp(x) * norm);
+          if constexpr (kReuse) {
+            r.v[k] = static_cast<scalar_t>(v[i].v[k] * norm);
+          } else {
+            const compute_t x = static_cast<compute_t>(v[i].v[k]) - row_max;
+            r.v[k] =
+                static_cast<scalar_t>(LOG_MODE ? x - norm : std::exp(x) * norm);
+          }
         }
         softmax_store_stream(dst + slot, r);
       }
@@ -749,9 +764,13 @@ __global__ void softmax_reg_packed_kernel(out_t* __restrict__ out,
       if (slot < packets) {
 #pragma unroll
         for (int k = 0; k < kPack; ++k) {
-          const compute_t x = static_cast<compute_t>(v[i].v[k]) - ms.m;
-          row_out[slot * kPack + k] =
-              static_cast<out_t>(LOG_MODE ? x - norm : std::exp(x) * norm);
+          if constexpr (kReuse) {
+            row_out[slot * kPack + k] = static_cast<out_t>(v[i].v[k] * norm);
+          } else {
+            const compute_t x = static_cast<compute_t>(v[i].v[k]) - row_max;
+            row_out[slot * kPack + k] =
+                static_cast<out_t>(LOG_MODE ? x - norm : std::exp(x) * norm);
+          }
         }
       }
     }
@@ -787,14 +806,18 @@ __global__ void softmax_reg_scalar_kernel(out_t* __restrict__ out,
   }
   thread_max = softmax_block_reduce<compute_t, true>(thread_max, reduce_max);
 
-  // See the packed kernel: an all--inf thread would turn the exponentials
-  // into NaN, so it contributes none.
+  // Same reuse contract as the packed kernel: the exponential from the sum
+  // pass is kept (in place when the accumulator matches the stored type) so
+  // the store pass only scales.  A thread whose padding slots are all past the
+  // row end keeps the -inf fill, whose exponential adds a zero to a finite row
+  // sum.
+  constexpr bool kReuse = std::is_same_v<compute_t, scalar_t> && !LOG_MODE;
   compute_t thread_sum = compute_t(0);
-  if (thread_max > -std::numeric_limits<compute_t>::infinity()) {
 #pragma unroll
-    for (int i = 0; i < REG; ++i) {
-      thread_sum += std::exp(static_cast<compute_t>(v[i]) - thread_max);
-    }
+  for (int i = 0; i < REG; ++i) {
+    const compute_t e = std::exp(static_cast<compute_t>(v[i]) - thread_max);
+    if constexpr (kReuse) v[i] = static_cast<scalar_t>(e);
+    thread_sum += e;
   }
   thread_sum = softmax_block_reduce<compute_t, false>(thread_sum, reduce_sum);
   const compute_t norm =
@@ -804,9 +827,13 @@ __global__ void softmax_reg_scalar_kernel(out_t* __restrict__ out,
   for (int i = 0; i < REG; ++i) {
     const int slot = tid + i * static_cast<int>(blockDim.x);
     if (slot < classes) {
-      const compute_t x = static_cast<compute_t>(v[i]) - thread_max;
-      row_out[slot] =
-          static_cast<out_t>(LOG_MODE ? x - norm : std::exp(x) * norm);
+      if constexpr (kReuse) {
+        row_out[slot] = static_cast<out_t>(v[i] * norm);
+      } else {
+        const compute_t x = static_cast<compute_t>(v[i]) - thread_max;
+        row_out[slot] =
+            static_cast<out_t>(LOG_MODE ? x - norm : std::exp(x) * norm);
+      }
     }
   }
 }
