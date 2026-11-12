@@ -81,6 +81,11 @@ void check_cuda_launch(const char* name) {
 
 }
 
+namespace batch_norm {
+std::tuple<Tensor, Tensor> batch_norm_stats_cuda(const Tensor& input,
+                                                 double epsilon);
+}
+
 Tensor batch_norm_cudnn(
     const Tensor& input,
     const std::optional<Tensor>& weight_opt,
@@ -92,9 +97,18 @@ Tensor batch_norm_cudnn(
     double eps) {
     check_batch_norm_input(input);
 
-    Tensor input_contig = input.is_contiguous() ? input : input.contiguous();
+    // A channel-last operand is read where it lies through the NHWC form, with
+    // the persistent spatial routine the channel-last engines want; a
+    // row-major operand uses the dense routine.  The result keeps the order it
+    // arrived in, so the operators around it keep reading that order.
+    const bool channel_last = is_channel_last_4d(input);
+    Tensor input_contig = (channel_last || input.is_contiguous())
+                              ? input
+                              : input.contiguous();
     Tensor input_bn = batch_norm_view(input_contig);
-    Tensor output = Tensor::empty_like(input_contig, DType::Undefined, input_contig.device());
+    Tensor output = channel_last
+        ? empty_like_preserving_format(input_contig)
+        : Tensor::empty_like(input_contig, DType::Undefined, input_contig.device());
     Tensor output_bn = batch_norm_view(output);
 
     int64_t channels = input.size(1);
@@ -112,9 +126,16 @@ Tensor batch_norm_cudnn(
         : Tensor::ones({channels}, DType::Float32, input.device());
 
     cudnnHandle_t handle = CUDAContext::getCudnnHandle();
-    cudnnTensorDescriptor_t x_desc = createTensorDescriptor(input_bn);
-    cudnnTensorDescriptor_t y_desc = createTensorDescriptor(output_bn);
+    cudnnTensorDescriptor_t x_desc = channel_last
+        ? createTensorDescriptorPreservingFormat(input_bn)
+        : createTensorDescriptor(input_bn);
+    cudnnTensorDescriptor_t y_desc = channel_last
+        ? createTensorDescriptorPreservingFormat(output_bn)
+        : createTensorDescriptor(output_bn);
     cudnnTensorDescriptor_t bn_desc = derive_bn_descriptor(x_desc);
+    const cudnnBatchNormMode_t bn_mode = channel_last
+        ? CUDNN_BATCHNORM_SPATIAL_PERSISTENT
+        : CUDNN_BATCHNORM_SPATIAL;
 
     float alpha = 1.0f;
     float beta = 0.0f;
@@ -124,24 +145,42 @@ Tensor batch_norm_cudnn(
     if (training) {
         saved_mean = Tensor::empty({channels}, DType::Float32, input.device());
         saved_inverse_variance = Tensor::empty({channels}, DType::Float32, input.device());
-        CUDNN_CHECK(cudnnBatchNormalizationForwardTraining(
-            handle,
-            CUDNN_BATCHNORM_SPATIAL,
-            &alpha,
-            &beta,
-            x_desc,
-            input_bn.data_ptr(),
-            y_desc,
-            output_bn.data_ptr(),
-            bn_desc,
-            scale.data_ptr(),
-            bias.data_ptr(),
-            momentum,
-            running_mean.data_ptr(),
-            running_var.data_ptr(),
-            eps,
-            saved_mean.data_ptr(),
-            saved_inverse_variance.data_ptr()));
+        if (channel_last) {
+            // The extended routine carries the persistent spatial mode that
+            // the channel-last engines serve, which takes its own workspace
+            // and reserve buffers.
+            const cudnnBatchNormOps_t ops = CUDNN_BATCHNORM_OPS_BN;
+            size_t workspace_size = 0;
+            CUDNN_CHECK(cudnnGetBatchNormalizationForwardTrainingExWorkspaceSize(
+                handle, bn_mode, ops, x_desc, x_desc, y_desc, bn_desc, nullptr,
+                &workspace_size));
+            size_t reserve_size = 0;
+            CUDNN_CHECK(cudnnGetBatchNormalizationTrainingExReserveSpaceSize(
+                handle, bn_mode, ops, nullptr, x_desc, &reserve_size));
+            Tensor workspace = Tensor::empty({static_cast<int64_t>(workspace_size)},
+                                             DType::UInt8, input.device());
+            Tensor reserve = Tensor::empty({static_cast<int64_t>(reserve_size)},
+                                           DType::UInt8, input.device());
+            CUDNN_CHECK(cudnnBatchNormalizationForwardTrainingEx(
+                handle, bn_mode, ops, &alpha, &beta,
+                x_desc, input_bn.data_ptr(),
+                nullptr, nullptr,
+                y_desc, output_bn.data_ptr(),
+                bn_desc, scale.data_ptr(), bias.data_ptr(),
+                momentum, running_mean.data_ptr(), running_var.data_ptr(),
+                eps, saved_mean.data_ptr(), saved_inverse_variance.data_ptr(),
+                nullptr,
+                workspace_size ? workspace.data_ptr() : nullptr, workspace_size,
+                reserve_size ? reserve.data_ptr() : nullptr, reserve_size));
+        } else {
+            CUDNN_CHECK(cudnnBatchNormalizationForwardTraining(
+                handle, bn_mode, &alpha, &beta,
+                x_desc, input_bn.data_ptr(),
+                y_desc, output_bn.data_ptr(),
+                bn_desc, scale.data_ptr(), bias.data_ptr(),
+                momentum, running_mean.data_ptr(), running_var.data_ptr(),
+                eps, saved_mean.data_ptr(), saved_inverse_variance.data_ptr()));
+        }
     } else {
         CUDNN_CHECK(cudnnBatchNormalizationForwardInference(
             handle,
@@ -179,11 +218,22 @@ std::tuple<Tensor, Tensor, Tensor> batch_norm_backward_cudnn(
         TP_THROW(RuntimeError, "batch_norm_backward CUDA expects a Float32 gradient matching input");
     }
 
-    Tensor input_contig = input.is_contiguous() ? input : input.contiguous();
-    Tensor grad_output_contig = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
+    const bool channel_last = is_channel_last_4d(input);
+    Tensor input_contig = (channel_last || input.is_contiguous())
+                              ? input
+                              : input.contiguous();
+    Tensor grad_output_contig = channel_last
+        ? (grad_output.is_contiguous(MemoryFormat::ChannelsLast)
+               ? grad_output
+               : grad_output.contiguous(
+                     static_cast<int64_t>(MemoryFormat::ChannelsLast)))
+        : (grad_output.is_contiguous() ? grad_output
+                                       : grad_output.contiguous());
     Tensor input_bn = batch_norm_view(input_contig);
     Tensor grad_output_bn = batch_norm_view(grad_output_contig);
-    Tensor grad_input = Tensor::empty_like(input_contig, DType::Undefined, input_contig.device());
+    Tensor grad_input = channel_last
+        ? empty_like_preserving_format(input_contig)
+        : Tensor::empty_like(input_contig, DType::Undefined, input_contig.device());
     Tensor grad_input_bn = batch_norm_view(grad_input);
 
     int64_t channels = input.size(1);
@@ -191,46 +241,20 @@ std::tuple<Tensor, Tensor, Tensor> batch_norm_backward_cudnn(
     Tensor scale = has_weight
         ? *weight_opt
         : Tensor::ones({channels}, DType::Float32, input.device());
-    Tensor grad_scale = Tensor::zeros({channels}, DType::Float32, input.device());
-    Tensor grad_bias = Tensor::zeros({channels}, DType::Float32, input.device());
+    Tensor grad_scale = Tensor::empty({channels}, DType::Float32, input.device());
+    Tensor grad_bias = Tensor::empty({channels}, DType::Float32, input.device());
 
-    Tensor saved_mean = Tensor::empty({channels}, DType::Float32, input.device());
-    Tensor saved_inverse_variance = Tensor::empty({channels}, DType::Float32, input.device());
+    Tensor saved_mean;
+    Tensor saved_inverse_variance;
     if (training) {
-        Tensor forward_output = Tensor::empty_like(input_contig, DType::Undefined, input_contig.device());
-        Tensor forward_output_bn = batch_norm_view(forward_output);
-        Tensor scratch_running_mean = Tensor::zeros({channels}, DType::Float32, input.device());
-        Tensor scratch_running_var = Tensor::ones({channels}, DType::Float32, input.device());
-        Tensor zero_bias = Tensor::zeros({channels}, DType::Float32, input.device());
-
-        cudnnHandle_t handle = CUDAContext::getCudnnHandle();
-        cudnnTensorDescriptor_t x_desc = createTensorDescriptor(input_bn);
-        cudnnTensorDescriptor_t y_desc = createTensorDescriptor(forward_output_bn);
-        cudnnTensorDescriptor_t bn_desc = derive_bn_descriptor(x_desc);
-        float alpha = 1.0f;
-        float beta = 0.0f;
-        CUDNN_CHECK(cudnnBatchNormalizationForwardTraining(
-            handle,
-            CUDNN_BATCHNORM_SPATIAL,
-            &alpha,
-            &beta,
-            x_desc,
-            input_bn.data_ptr(),
-            y_desc,
-            forward_output_bn.data_ptr(),
-            bn_desc,
-            scale.data_ptr(),
-            zero_bias.data_ptr(),
-            1.0,
-            scratch_running_mean.data_ptr(),
-            scratch_running_var.data_ptr(),
-            eps,
-            saved_mean.data_ptr(),
-            saved_inverse_variance.data_ptr()));
-        CUDNN_CHECK(cudnnDestroyTensorDescriptor(bn_desc));
-        CUDNN_CHECK(cudnnDestroyTensorDescriptor(y_desc));
-        CUDNN_CHECK(cudnnDestroyTensorDescriptor(x_desc));
+        // The backward needs only the batch statistics the forward normalized
+        // with; a reduction over the input yields them without replaying the
+        // whole forward pass.
+        std::tie(saved_mean, saved_inverse_variance) =
+            batch_norm::batch_norm_stats_cuda(input_bn, eps);
     } else {
+        saved_mean = Tensor::empty({channels}, DType::Float32, input.device());
+        saved_inverse_variance = Tensor::empty({channels}, DType::Float32, input.device());
         if (!defined(running_mean_opt) || !defined(running_var_opt)) {
             TP_THROW(RuntimeError, "batch_norm_backward CUDA eval mode requires running statistics");
         }
@@ -253,34 +277,69 @@ std::tuple<Tensor, Tensor, Tensor> batch_norm_backward_cudnn(
     }
 
     cudnnHandle_t handle = CUDAContext::getCudnnHandle();
-    cudnnTensorDescriptor_t x_desc = createTensorDescriptor(input_bn);
-    cudnnTensorDescriptor_t dy_desc = createTensorDescriptor(grad_output_bn);
-    cudnnTensorDescriptor_t dx_desc = createTensorDescriptor(grad_input_bn);
+    cudnnTensorDescriptor_t x_desc = channel_last
+        ? createTensorDescriptorPreservingFormat(input_bn)
+        : createTensorDescriptor(input_bn);
+    cudnnTensorDescriptor_t dy_desc = channel_last
+        ? createTensorDescriptorPreservingFormat(grad_output_bn)
+        : createTensorDescriptor(grad_output_bn);
+    cudnnTensorDescriptor_t dx_desc = channel_last
+        ? createTensorDescriptorPreservingFormat(grad_input_bn)
+        : createTensorDescriptor(grad_input_bn);
     cudnnTensorDescriptor_t bn_desc = derive_bn_descriptor(x_desc);
+    const cudnnBatchNormMode_t bn_mode = channel_last
+        ? CUDNN_BATCHNORM_SPATIAL_PERSISTENT
+        : CUDNN_BATCHNORM_SPATIAL;
     float alpha_data = 1.0f;
     float beta_data = 0.0f;
     float alpha_param = 1.0f;
     float beta_param = 0.0f;
-    CUDNN_CHECK(cudnnBatchNormalizationBackward(
-        handle,
-        CUDNN_BATCHNORM_SPATIAL,
-        &alpha_data,
-        &beta_data,
-        &alpha_param,
-        &beta_param,
-        x_desc,
-        input_bn.data_ptr(),
-        dy_desc,
-        grad_output_bn.data_ptr(),
-        dx_desc,
-        grad_input_bn.data_ptr(),
-        bn_desc,
-        scale.data_ptr(),
-        grad_scale.data_ptr(),
-        grad_bias.data_ptr(),
-        eps,
-        saved_mean.data_ptr(),
-        saved_inverse_variance.data_ptr()));
+    if (channel_last) {
+        // The extended routine carries the persistent spatial mode the
+        // channel-last engines serve, so the operands are read where they lie.
+        const cudnnBatchNormOps_t ops = CUDNN_BATCHNORM_OPS_BN;
+        size_t workspace_size = 0;
+        CUDNN_CHECK(cudnnGetBatchNormalizationBackwardExWorkspaceSize(
+            handle, bn_mode, ops, x_desc, x_desc, x_desc, nullptr, dy_desc,
+            bn_desc, nullptr, &workspace_size));
+        Tensor workspace = Tensor::empty({static_cast<int64_t>(workspace_size)},
+                                         DType::UInt8, input.device());
+        CUDNN_CHECK(cudnnBatchNormalizationBackwardEx(
+            handle, bn_mode, ops,
+            &alpha_data, &beta_data, &alpha_param, &beta_param,
+            x_desc, input_bn.data_ptr(),
+            nullptr, nullptr,
+            dy_desc, grad_output_bn.data_ptr(),
+            nullptr, nullptr,
+            dx_desc, grad_input_bn.data_ptr(),
+            bn_desc, scale.data_ptr(), nullptr,
+            grad_scale.data_ptr(), grad_bias.data_ptr(),
+            eps, saved_mean.data_ptr(), saved_inverse_variance.data_ptr(),
+            nullptr,
+            workspace_size ? workspace.data_ptr() : nullptr, workspace_size,
+            nullptr, 0));
+    } else {
+        CUDNN_CHECK(cudnnBatchNormalizationBackward(
+            handle,
+            bn_mode,
+            &alpha_data,
+            &beta_data,
+            &alpha_param,
+            &beta_param,
+            x_desc,
+            input_bn.data_ptr(),
+            dy_desc,
+            grad_output_bn.data_ptr(),
+            dx_desc,
+            grad_input_bn.data_ptr(),
+            bn_desc,
+            scale.data_ptr(),
+            grad_scale.data_ptr(),
+            grad_bias.data_ptr(),
+            eps,
+            saved_mean.data_ptr(),
+            saved_inverse_variance.data_ptr()));
+    }
 
     CUDNN_CHECK(cudnnDestroyTensorDescriptor(bn_desc));
     CUDNN_CHECK(cudnnDestroyTensorDescriptor(dx_desc));

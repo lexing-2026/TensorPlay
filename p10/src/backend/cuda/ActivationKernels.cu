@@ -33,14 +33,16 @@ namespace cuda {
 Tensor cudnn_activation(const Tensor& self_in, cudnnActivationMode_t mode, double coef = 0.0) {
     // cuDNN activation rejects arbitrary strided layouts (e.g. chunk/split
     // views feeding gate math); materialize contiguous first.
-    Tensor self = self_in.is_contiguous() ? self_in : self_in.contiguous();
-    Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
+    Tensor self = (self_in.is_contiguous() || is_channel_last_4d(self_in))
+                      ? self_in
+                      : self_in.contiguous();
+    Tensor result = empty_like_preserving_format(self);
     if (self.numel() == 0) return result;
     
     cudnnHandle_t handle = CUDAContext::getCudnnHandle();
     
-    cudnnTensorDescriptor_t xDesc = createTensorDescriptor(self);
-    cudnnTensorDescriptor_t yDesc = createTensorDescriptor(result);
+    cudnnTensorDescriptor_t xDesc = createTensorDescriptorPreservingFormat(self);
+    cudnnTensorDescriptor_t yDesc = createTensorDescriptorPreservingFormat(result);
     
     cudnnActivationDescriptor_t actDesc;
     CUDNN_CHECK(cudnnCreateActivationDescriptor(&actDesc));
@@ -108,7 +110,7 @@ Tensor silu_kernel_cuda_native(const Tensor& self) {
 Tensor relu_kernel_cudnn(const Tensor& self) {
     if (isQuantizedType(self.dtype())) return quantized::activation(self, 10);
 
-    Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
+    Tensor result = empty_like_preserving_format(self);
     if (self.numel() == 0) return result;
     TensorIterator iter = TensorIteratorConfig()
         .check_all_same_dtype(true)
@@ -136,12 +138,14 @@ Tensor relu_kernel_cudnn(const Tensor& self) {
 }
 
 Tensor& cudnn_activation_inplace(Tensor& self_in, cudnnActivationMode_t mode, double coef = 0.0) {
-    Tensor self = self_in.is_contiguous() ? self_in : self_in.contiguous();
+    Tensor self = (self_in.is_contiguous() || is_channel_last_4d(self_in))
+                      ? self_in
+                      : self_in.contiguous();
     if (self.numel() == 0) return self_in;
     
     cudnnHandle_t handle = CUDAContext::getCudnnHandle();
     
-    cudnnTensorDescriptor_t xDesc = createTensorDescriptor(self);
+    cudnnTensorDescriptor_t xDesc = createTensorDescriptorPreservingFormat(self);
     
     cudnnActivationDescriptor_t actDesc;
     CUDNN_CHECK(cudnnCreateActivationDescriptor(&actDesc));
@@ -163,7 +167,9 @@ Tensor& cudnn_activation_inplace(Tensor& self_in, cudnnActivationMode_t mode, do
     CUDNN_CHECK(cudnnDestroyTensorDescriptor(xDesc));
     CUDNN_CHECK(cudnnDestroyActivationDescriptor(actDesc));
     
-    return self;
+    // The activation ran on the operand's own storage, so the caller's tensor
+    // carries the result.
+    return self_in;
 }
 
 Tensor& relu_inplace_kernel_cudnn(Tensor& self) {

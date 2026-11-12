@@ -1837,6 +1837,13 @@ Tensor add_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha) 
     }
     Tensor result = Tensor::empty(out_shape, result_dtype,
                                   common_result_device(self, other));
+    // An add of two channel-last operands stays channel-last, so the result
+    // feeds the next operator in the order it already reads.
+    if (is_channels_last_4d(self, out_shape) &&
+        is_channels_last_4d(other, out_shape)) {
+        result = empty_channels_last_4d(out_shape, result_dtype,
+                                        common_result_device(self, other));
+    }
     int64_t n = result.numel();
     if (n == 0) return result;
 

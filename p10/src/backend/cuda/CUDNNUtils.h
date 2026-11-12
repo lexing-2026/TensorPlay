@@ -2,6 +2,7 @@
 
 #include "Tensor.h"
 #include "Exception.h"
+#include "MemoryFormat.h"
 #include <vector>
 
 #ifdef USE_CUDNN
@@ -62,6 +63,49 @@ inline cudnnTensorDescriptor_t createTensorDescriptor(const Tensor& t, bool pad_
 
     CUDNN_CHECK(cudnnSetTensorNdDescriptor(desc, dtype, static_cast<int>(dimA.size()), dimA.data(), strideA.data()));
     return desc;
+}
+
+// A contiguous 4-D tensor whose channel dimension is innermost.
+inline bool is_channel_last_4d(const Tensor& t) {
+    return t.dim() == 4 && t.is_contiguous(MemoryFormat::ChannelsLast);
+}
+
+inline cudnnDataType_t tensor_descriptor_dtype(const Tensor& t) {
+    if (t.dtype() == DType::Float16) return CUDNN_DATA_HALF;
+    if (t.dtype() == DType::Float32) return CUDNN_DATA_FLOAT;
+    if (t.dtype() == DType::Float64) return CUDNN_DATA_DOUBLE;
+    TP_THROW(NotImplementedError, "cuDNN: only float/double supported");
+}
+
+// Descriptor that reads the operand where it lies: a channel-last operand is
+// named through the extended form, which carries the order rather than a
+// stride list, so the routine addresses it without a repack.
+inline cudnnTensorDescriptor_t createTensorDescriptorPreservingFormat(
+    const Tensor& t, bool pad_to_4d = true) {
+    if (!is_channel_last_4d(t)) return createTensorDescriptor(t, pad_to_4d);
+    cudnnTensorDescriptor_t desc;
+    CUDNN_CHECK(cudnnCreateTensorDescriptor(&desc));
+    std::vector<int> dims;
+    dims.reserve(static_cast<size_t>(t.dim()));
+    for (int i = 0; i < t.dim(); ++i) {
+        dims.push_back(static_cast<int>(t.size(i)));
+    }
+    CUDNN_CHECK(cudnnSetTensorNdDescriptorEx(
+        desc, CUDNN_TENSOR_NHWC, tensor_descriptor_dtype(t), t.dim(),
+        dims.data()));
+    return desc;
+}
+
+// Uninitialized tensor carrying the same order as `t`.
+inline Tensor empty_like_preserving_format(const Tensor& t) {
+    const std::vector<int64_t> shape =
+        static_cast<std::vector<int64_t>>(t.shape());
+    Tensor out = Tensor::empty(shape, t.dtype(), t.device());
+    if (is_channel_last_4d(t)) {
+        out = out.as_strided(
+            shape, get_strides_for(shape, MemoryFormat::ChannelsLast));
+    }
+    return out;
 }
 
 #endif
