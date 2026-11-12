@@ -11,7 +11,10 @@ from packaging.version import Version
 
 
 UNKNOWN = "Unknown"
-RELEASE_PATTERN = re.compile(r"/v[0-9]+(\.[0-9]+)*(-rc[0-9]+)?/")
+# Bare semver release tags only: "v1.2.0" and "v1.2.0-rc1". The leading "v"
+# is stripped by tag_to_version(); the rc separator is normalized to the PEP
+# 440 form ("1.2.0rc1") the publish workflow uploads under.
+RELEASE_PATTERN = re.compile(r"^v[0-9]+(\.[0-9]+){2}(-rc[0-9]+)?$")
 
 
 def get_sha(tensorplay_root: str | Path) -> str:
@@ -46,6 +49,15 @@ def get_tag(tensorplay_root: str | Path) -> str:
             return UNKNOWN
     except Exception:
         return UNKNOWN
+
+
+def tag_to_version(tag: str) -> str:
+    """Normalize a release tag into a PEP 440 version string.
+
+    "v1.2.0" -> "1.2.0" and "v1.2.0-rc1" -> "1.2.0rc1", the same
+    transformation the publish workflow applies before uploading to PyPI.
+    """
+    return tag[1:].replace("-rc", "rc")
 
 
 def append_build_number(version: str, build_number: int) -> str:
@@ -195,7 +207,13 @@ if __name__ == "__main__":
     if tagged_version == UNKNOWN:
         version = get_tensorplay_version(sha)
     else:
-        version = tagged_version
+        version = tag_to_version(tagged_version)
+        # CI derives TENSORPLAY_BUILD_VERSION from the same tag and may carry
+        # a variant local segment (+cuXXX, +rocmXXX); keep that label when
+        # present so device wheels report their variant at runtime.
+        env_version = os.getenv("TENSORPLAY_BUILD_VERSION")
+        if env_version:
+            version = env_version
 
     with open(version_path, "w") as f:
         f.write("from typing import Optional\n\n")
