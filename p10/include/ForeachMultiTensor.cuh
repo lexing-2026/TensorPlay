@@ -8,6 +8,7 @@
 #include "CUDARuntime.h"
 #include "DType.h"
 #include "Exception.h"
+#include "MemoryFormat.h"
 #include "Tensor.h"
 
 #include <cuda_runtime.h>
@@ -124,15 +125,30 @@ bool dispatch_dtype(DType dtype, F&& fn) {
     }
 }
 
+// The grouped kernels walk each operand as one linear block, so any layout
+// whose elements occupy such a block is served: the pairwise routines only
+// need the operands that line up to share their order.
+inline bool dense_memory_order(const Tensor& t) {
+    return t.is_contiguous() ||
+           t.is_contiguous(MemoryFormat::ChannelsLast) ||
+           t.is_contiguous(MemoryFormat::ChannelsLast3d);
+}
+
+inline bool same_memory_order(const Tensor& a, const Tensor& b) {
+    const std::vector<int64_t> lhs = static_cast<std::vector<int64_t>>(a.strides());
+    const std::vector<int64_t> rhs = static_cast<std::vector<int64_t>>(b.strides());
+    return lhs == rhs;
+}
+
 inline bool eligible_list(const std::vector<Tensor>& values) {
     if (values.empty()) return true;
     const Tensor& first = values.front();
-    if (!first.defined() || first.is_sparse() || !first.is_contiguous() ||
+    if (!first.defined() || first.is_sparse() || !dense_memory_order(first) ||
         !supported_dtype(first.dtype())) {
         return false;
     }
     for (const Tensor& value : values) {
-        if (!value.defined() || value.is_sparse() || !value.is_contiguous() ||
+        if (!value.defined() || value.is_sparse() || !dense_memory_order(value) ||
             value.dtype() != first.dtype() || value.device() != first.device()) {
             return false;
         }
@@ -146,8 +162,9 @@ inline bool eligible_pair(const std::vector<Tensor>& lhs,
     if (lhs.empty()) return true;
     for (size_t i = 0; i < lhs.size(); ++i) {
         if (!rhs[i].defined() || rhs[i].is_sparse() ||
-            !rhs[i].is_contiguous() || rhs[i].dtype() != lhs[0].dtype() ||
-            rhs[i].device() != lhs[0].device() || rhs[i].shape() != lhs[i].shape()) {
+            !dense_memory_order(rhs[i]) || rhs[i].dtype() != lhs[0].dtype() ||
+            rhs[i].device() != lhs[0].device() || rhs[i].shape() != lhs[i].shape() ||
+            !same_memory_order(rhs[i], lhs[i])) {
             return false;
         }
     }
