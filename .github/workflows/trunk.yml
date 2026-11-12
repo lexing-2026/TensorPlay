@@ -175,7 +175,8 @@ jobs:
     outputs:
       open: ${{ steps.gate.outputs.open }}
     steps:
-      - name: Check for an active release run
+      - id: gate
+        name: Check for an active release run
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
