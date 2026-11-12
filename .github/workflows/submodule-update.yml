@@ -1,8 +1,9 @@
 name: submodule-update
 
-# Weekly bot that compares every third_party submodule against its upstream
-# default branch and opens one Conventional-Commit PR per outdated submodule
-# (see tools/submodule_updater.py).
+# Bot that compares every third_party submodule against its upstream default
+# branch and opens one Conventional-Commit PR per outdated submodule (see
+# tools/submodule_updater.py).  It runs on manual dispatch only: the weekly
+# schedule was removed because the bump PRs piled up unmerged and added noise.
 #
 # Two separate things stand between this bot and a green bump PR, and they
 # are fixed in different places.
@@ -20,8 +21,6 @@ name: submodule-update
 # workflow token when present.
 
 on:
-  schedule:
-    - cron: "0 9 * * 1"
   workflow_dispatch:
     inputs:
       submodule:
