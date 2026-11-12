@@ -56,8 +56,27 @@ concurrency:
 permissions: read-all
 
 jobs:
+  build-tags:
+    name: build-tags
+    runs-on: ubuntu-latest
+    outputs:
+      python_tag: ${{ steps.tag.outputs.python_tag }}
+    steps:
+      - id: tag
+        name: Underscore the Python version for the lane names
+        shell: bash
+        env:
+          PYTHON_VERSION: ${{ inputs.python_version }}
+        run: |
+          set -euo pipefail
+          # Workflow expressions cannot rewrite a string, so the lane names
+          # take their tag from a step (dot to underscore, 3.12 -> 3_12).
+          echo "python_tag=${PYTHON_VERSION//./_}" >> "$GITHUB_OUTPUT"
+
   cuda-acceptance:
     name: cuda-acceptance
+    needs:
+      - build-tags
     permissions:
       contents: write
       actions: read
@@ -65,8 +84,8 @@ jobs:
       attestations: write
     uses: ./.github/workflows/_binary-build-test.yml
     with:
-      build_name: ${{ format('tensorplay-linux-x86_64-py{0}-{1}', replace(inputs.python_version, '.', '_'), inputs.cuda_variant) }}
-      build_environment: ${{ format('cuda-acceptance-linux-x86_64-py{0}-{1}', replace(inputs.python_version, '.', '_'), inputs.cuda_variant) }}
+      build_name: ${{ format('tensorplay-linux-x86_64-py{0}-{1}', needs.build-tags.outputs.python_tag, inputs.cuda_variant) }}
+      build_environment: ${{ format('cuda-acceptance-linux-x86_64-py{0}-{1}', needs.build-tags.outputs.python_tag, inputs.cuda_variant) }}
       runs_on: ${{ inputs.runs_on }}
       python_version: ${{ inputs.python_version }}
       cuda: ${{ inputs.cuda_variant }}
