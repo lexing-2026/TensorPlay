@@ -304,6 +304,16 @@ Tensor conv2d_cudnn_legacy(
         TP_THROW(RuntimeError, "conv2d: calculated output size is too small");
     }
 
+    // The channel-last descriptors reach a much faster convolution engine on
+    // this device; the operands are repacked into that order inside the helper
+    // and the result comes back row-major.  A bias rides on the plan below in
+    // the row-major route instead.
+    if (conv_channel_last_eligible(input_c, weight_c, groups) &&
+        !(bias.defined() && bias.numel() != 0)) {
+        return conv_forward_channel_last(input_c, weight_c, stride, padding,
+                                         dilation, fused_relu);
+    }
+
     if (fused_relu && bias.defined() &&
         (input_c.dtype() == DType::Float32 ||
          input_c.dtype() == DType::Float64)) {

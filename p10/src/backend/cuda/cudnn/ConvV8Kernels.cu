@@ -1518,6 +1518,14 @@ Tensor conv2d_grad_input_cuda(const Tensor& grad_output, const Tensor& input, co
     if (is_channels_last_4d(input_c)) input_c = input_c.contiguous();
     if (is_channels_last_4d(weight_c)) weight_c = weight_c.contiguous();
 
+    // Channel-last descriptors reach a much faster backward-data engine on
+    // this device; the helper repacks the operands and returns row-major.
+    if (conv_channel_last_eligible(input_c, weight_c, groups)) {
+        Tensor cl = conv_grad_input_channel_last(
+            grad_output_c, input_c, weight_c, stride, padding, dilation);
+        return cl.dtype() == result_dtype ? cl : cl.to(result_dtype);
+    }
+
     cudnnHandle_t handle = CUDAContext::getCudnnHandle();
 
     auto dx_desc = get_cached_tensor_desc(input_c); // gradient of input has same shape as input
@@ -1687,6 +1695,15 @@ Tensor conv2d_grad_weight_cuda(const Tensor& grad_output, const Tensor& input, c
     if (is_channels_last_4d(grad_output_c)) grad_output_c = grad_output_c.contiguous();
     if (is_channels_last_4d(input_c)) input_c = input_c.contiguous();
     if (is_channels_last_4d(weight_c)) weight_c = weight_c.contiguous();
+
+    // Channel-last descriptors reach a much faster backward-filter engine on
+    // this device; the helper repacks the operands and returns row-major.
+    if (conv_channel_last_eligible(input_c, weight_c, groups)) {
+        Tensor cl = conv_grad_weight_channel_last(
+            grad_output_c, input_c, weight_c, stride, padding, dilation);
+        const DType cl_dtype = weight.dtype();
+        return cl.dtype() == cl_dtype ? cl : cl.to(cl_dtype);
+    }
 
     cudnnHandle_t handle = CUDAContext::getCudnnHandle();
 
