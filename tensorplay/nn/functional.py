@@ -3620,6 +3620,16 @@ def _plain_scaled_dot_product_attention(query, key, value, is_causal):
         and query.numel() != 0
         and key.numel() != 0
     ):
+        # A narrow head layout leaves the blocked kernel with too few
+        # independent tiles to fill the pool, and the composed products win
+        # on those shapes; such a call takes the differentiable public entry
+        # instead.  The operands are materialized first: the composed path
+        # reads a contiguous layout directly, and the copy is cheaper than
+        # the stride walk it replaces.
+        if query.size(1) <= 4 and query.size(-1) <= 64:
+            return tensorplay.scaled_dot_product_attention(
+                query.contiguous(), key.contiguous(), value.contiguous(),
+                is_causal=is_causal)
         output, _ = _C._scaled_dot_product_flash_attention_for_cpu(
             query, key, value, 0.0, is_causal, attn_mask=None, scale=None)
         return output

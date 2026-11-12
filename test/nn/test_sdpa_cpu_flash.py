@@ -146,12 +146,25 @@ def test_fully_closed_row_gives_zero_output_and_zero_gradient():
 
 
 def test_functional_entry_routes_cpu_calls_to_the_fused_kernel():
-    _, q, k, v, grad_out = _inputs(4, 2, 2, 2, 40, 50, 16)
+    _, q, k, v, grad_out = _inputs(4, 2, 6, 6, 40, 50, 16)
     for causal in (False, True):
         tq = tp.tensor(q, requires_grad=True)
         out = F.scaled_dot_product_attention(
             tq, tp.tensor(k), tp.tensor(v), is_causal=causal)
         assert "FlashAttentionForCpu" in out.grad_fn.name()
+        (d_q,) = tp.autograd.grad(out, [tq], grad_outputs=[tp.tensor(grad_out)])
+        want = _reference(q, k, v, grad_out, causal, None, None)
+        assert np.abs(out.detach().numpy() - want[0]).max() < 1e-5
+        assert np.abs(d_q.numpy() - want[1]).max() < 1e-5
+
+
+def test_functional_entry_routes_narrow_head_cpu_calls_to_the_composed_path():
+    _, q, k, v, grad_out = _inputs(4, 2, 2, 2, 40, 50, 16)
+    for causal in (False, True):
+        tq = tp.tensor(q, requires_grad=True)
+        out = F.scaled_dot_product_attention(
+            tq, tp.tensor(k), tp.tensor(v), is_causal=causal)
+        assert "FlashAttentionForCpu" not in out.grad_fn.name()
         (d_q,) = tp.autograd.grad(out, [tq], grad_outputs=[tp.tensor(grad_out)])
         want = _reference(q, k, v, grad_out, causal, None, None)
         assert np.abs(out.detach().numpy() - want[0]).max() < 1e-5
