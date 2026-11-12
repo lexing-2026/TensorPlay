@@ -1514,17 +1514,18 @@ Tensor conv2d_grad_input_cuda(const Tensor& grad_output, const Tensor& input, co
     // filter descriptor, which is always spelled row-major; anything still
     // in the channel-major order here is repacked back so the descriptors
     // name the memory they are handed.
-    if (is_channels_last_4d(grad_output_c)) grad_output_c = grad_output_c.contiguous();
-    if (is_channels_last_4d(input_c)) input_c = input_c.contiguous();
-    if (is_channels_last_4d(weight_c)) weight_c = weight_c.contiguous();
-
     // Channel-last descriptors reach a much faster backward-data engine on
-    // this device; the helper repacks the operands and returns row-major.
-    if (conv_channel_last_eligible(input_c, weight_c, groups)) {
+    // this device; the operands are taken in the order they arrive and the
+    // result comes back in that order.
+    if (conv_channel_last_eligible(grad_output, weight, groups)) {
         Tensor cl = conv_grad_input_channel_last(
             grad_output_c, input_c, weight_c, stride, padding, dilation);
         return cl.dtype() == result_dtype ? cl : cl.to(result_dtype);
     }
+
+    if (is_channels_last_4d(grad_output_c)) grad_output_c = grad_output_c.contiguous();
+    if (is_channels_last_4d(input_c)) input_c = input_c.contiguous();
+    if (is_channels_last_4d(weight_c)) weight_c = weight_c.contiguous();
 
     cudnnHandle_t handle = CUDAContext::getCudnnHandle();
 
@@ -1692,18 +1693,19 @@ Tensor conv2d_grad_weight_cuda(const Tensor& grad_output, const Tensor& input, c
     // filter descriptor, which is always spelled row-major; anything still
     // in the channel-major order here is repacked back so the descriptors
     // name the memory they are handed.
-    if (is_channels_last_4d(grad_output_c)) grad_output_c = grad_output_c.contiguous();
-    if (is_channels_last_4d(input_c)) input_c = input_c.contiguous();
-    if (is_channels_last_4d(weight_c)) weight_c = weight_c.contiguous();
-
     // Channel-last descriptors reach a much faster backward-filter engine on
-    // this device; the helper repacks the operands and returns row-major.
-    if (conv_channel_last_eligible(input_c, weight_c, groups)) {
+    // this device.  The weight gradient stays row-major, where the optimizer
+    // and the parameter it belongs to live.
+    if (conv_channel_last_eligible(input, grad_output, groups)) {
         Tensor cl = conv_grad_weight_channel_last(
             grad_output_c, input_c, weight_c, stride, padding, dilation);
         const DType cl_dtype = weight.dtype();
         return cl.dtype() == cl_dtype ? cl : cl.to(cl_dtype);
     }
+
+    if (is_channels_last_4d(grad_output_c)) grad_output_c = grad_output_c.contiguous();
+    if (is_channels_last_4d(input_c)) input_c = input_c.contiguous();
+    if (is_channels_last_4d(weight_c)) weight_c = weight_c.contiguous();
 
     cudnnHandle_t handle = CUDAContext::getCudnnHandle();
 

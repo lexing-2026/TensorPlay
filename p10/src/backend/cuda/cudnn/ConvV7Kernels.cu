@@ -287,8 +287,10 @@ Tensor conv2d_cudnn_legacy(
     auto stride = expand_param_if_needed(stride_arg, 2, 1);
     auto padding = expand_param_if_needed(padding_arg, 2, 0);
     auto dilation = expand_param_if_needed(dilation_arg, 2, 1);
-    Tensor input_c = input.is_contiguous() ? input : input.contiguous();
-    Tensor weight_c = weight.is_contiguous() ? weight : weight.contiguous();
+    Tensor input_c = (input.is_contiguous() || is_channels_last_4d(input))
+                         ? input : input.contiguous();
+    Tensor weight_c = (weight.is_contiguous() || is_channels_last_4d(weight))
+                          ? weight : weight.contiguous();
 
     const int64_t n = input_c.size(0);
     const int64_t k = weight_c.size(0);

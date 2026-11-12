@@ -230,13 +230,14 @@ std::shared_ptr<CachedFilterDesc> get_cached_filter_desc_channel_last(const Tens
 
 bool conv_channel_last_eligible(const Tensor& input, const Tensor& weight,
                                 int64_t groups) {
-    // The channel-last engines are ungrouped only, and the repacks below cost
-    // one kernel per operand, so a shape whose channels give the engine too
-    // little work per element keeps the row-major route.
-#if !defined(USE_METAX)
-    // The descriptor surface of the other backends has no channel-last
-    // engine distinct from its row-major one, so the repacks would be pure
-    // overhead there.
+    // The layout of the result follows the operands, as the two engines read
+    // different memory: a convolution whose operands arrive row-major keeps
+    // the row-major route, while one that arrives channel-last is served by
+    // the channel-last engines and gives its result back in that order.
+    //
+    // The backend name reaches the host translation units as a define; the
+    // device ones see only the compatibility headers, which mark themselves.
+#if !defined(USE_METAX) && !defined(ENABLE_CUDA_TO_MACA_ADAPTOR)
     (void)input; (void)weight; (void)groups;
     return false;
 #else
@@ -248,8 +249,7 @@ bool conv_channel_last_eligible(const Tensor& input, const Tensor& weight,
         return false;
     }
     if (weight.dtype() != dtype) return false;
-    if (input.size(1) < 16 || weight.size(0) < 16) return false;
-    return true;
+    return is_channels_last_4d(input) || is_channels_last_4d(weight);
 #endif
 }
 
@@ -293,8 +293,11 @@ Tensor conv_forward_channel_last(const Tensor& input, const Tensor& weight,
     const int64_t oh = (h + 2 * padding[0] - dilation[0] * (r - 1) - 1) / stride[0] + 1;
     const int64_t ow = (w + 2 * padding[1] - dilation[1] * (s - 1) - 1) / stride[1] + 1;
 
-    Tensor x = conv_to_channel_major(input);
-    Tensor flt = conv_to_channel_major(weight);
+    // An operand that already carries the channel-last order is read as it
+    // lies; the others are repacked once.  The result keeps that order, so a
+    // channel-last model pays for no conversion between layers.
+    Tensor x = is_channels_last_4d(input) ? input : conv_to_channel_major(input);
+    Tensor flt = is_channels_last_4d(weight) ? weight : conv_to_channel_major(weight);
     Tensor out = empty_conv_output(n, k, oh, ow, input.dtype(), input.device(), true);
 
     auto x_desc = get_cached_tensor_desc(x);
@@ -342,9 +345,8 @@ Tensor conv_forward_channel_last(const Tensor& input, const Tensor& weight,
         handle, &alpha, *x_desc, x.data_ptr(), *w_desc, flt.data_ptr(), *conv_desc,
         algo, workspace.get(), workspace_size, &beta, *y_desc, out.data_ptr()));
 
-    Tensor result = out.contiguous();
-    if (fused_relu) relu_inplace_kernel_cudnn(result);
-    return result;
+    if (fused_relu) relu_inplace_kernel_cudnn(out);
+    return out;
 }
 
 Tensor conv_grad_input_channel_last(const Tensor& grad_output, const Tensor& input,
@@ -357,8 +359,9 @@ Tensor conv_grad_input_channel_last(const Tensor& grad_output, const Tensor& inp
     const int64_t h = input.size(2);
     const int64_t w = input.size(3);
 
-    Tensor dy = conv_to_channel_major(grad_output);
-    Tensor flt = conv_to_channel_major(weight);
+    Tensor dy = is_channels_last_4d(grad_output) ? grad_output
+                                                  : conv_to_channel_major(grad_output);
+    Tensor flt = is_channels_last_4d(weight) ? weight : conv_to_channel_major(weight);
     Tensor grad_input = empty_conv_output(n, c, h, w, input.dtype(), input.device(), true);
 
     auto w_desc = get_cached_filter_desc_channel_last(flt);
@@ -406,7 +409,7 @@ Tensor conv_grad_input_channel_last(const Tensor& grad_output, const Tensor& inp
     CUDNN_CHECK(cudnnConvolutionBackwardData(
         handle, &alpha, *w_desc, flt.data_ptr(), *dy_desc, dy.data_ptr(), *conv_desc,
         algo, workspace.get(), workspace_size, &beta, *dx_desc, grad_input.data_ptr()));
-    return grad_input.contiguous();
+    return grad_input;
 }
 
 Tensor conv_grad_weight_channel_last(const Tensor& grad_output, const Tensor& input,
@@ -419,8 +422,9 @@ Tensor conv_grad_weight_channel_last(const Tensor& grad_output, const Tensor& in
     const int64_t r = weight.size(2);
     const int64_t s = weight.size(3);
 
-    Tensor dy = conv_to_channel_major(grad_output);
-    Tensor x = conv_to_channel_major(input);
+    Tensor dy = is_channels_last_4d(grad_output) ? grad_output
+                                                  : conv_to_channel_major(grad_output);
+    Tensor x = is_channels_last_4d(input) ? input : conv_to_channel_major(input);
     Tensor grad_weight = empty_conv_output(k, c, r, s, weight.dtype(), weight.device(), true);
 
     auto x_desc = get_cached_tensor_desc(x);
