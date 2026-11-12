@@ -19,6 +19,7 @@
 #include <memory>
 #include <cstdint>
 #include <optional>
+#include <utility>
 
 namespace tensorplay {
 namespace cuda {
@@ -199,6 +200,275 @@ std::shared_ptr<CachedConvDesc> get_cached_conv_desc(
     holder->desc = desc;
     g_conv_desc_cache.emplace(key, holder);
     return holder;
+}
+
+std::shared_ptr<CachedFilterDesc> get_cached_filter_desc_channel_last(const Tensor& t) {
+    std::string key = "cl:";
+    key += std::to_string(static_cast<int>(t.dtype()));
+    for (int64_t dim : {t.size(0), t.size(1), t.size(2), t.size(3)}) {
+        key += ":" + std::to_string(dim);
+    }
+    for (int64_t s : {t.stride(0), t.stride(1), t.stride(2), t.stride(3)}) {
+        key += ":" + std::to_string(s);
+    }
+    std::lock_guard<std::mutex> lock(g_conv_desc_cache_mutex);
+    auto it = g_filter_desc_cache.find(key);
+    if (it != g_filter_desc_cache.end()) return it->second;
+    cudnnFilterDescriptor_t desc;
+    CUDNN_CHECK(cudnnCreateFilterDescriptor(&desc));
+    // Channel-last filter: the channel dimension is the fastest-varying one, so
+    // a filter laid out K-R-S-C is named by the NHWC form of the same extents.
+    CUDNN_CHECK(cudnnSetFilter4dDescriptor(
+        desc, to_cudnn_data_type(t.dtype()), CUDNN_TENSOR_NHWC,
+        static_cast<int>(t.size(0)), static_cast<int>(t.size(1)),
+        static_cast<int>(t.size(2)), static_cast<int>(t.size(3))));
+    auto holder = std::make_shared<CachedFilterDesc>();
+    holder->desc = desc;
+    g_filter_desc_cache.emplace(key, holder);
+    return holder;
+}
+
+bool conv_channel_last_eligible(const Tensor& input, const Tensor& weight,
+                                int64_t groups) {
+    // The channel-last engines are ungrouped only, and the repacks below cost
+    // one kernel per operand, so a shape whose channels give the engine too
+    // little work per element keeps the row-major route.
+#if !defined(USE_METAX)
+    // The descriptor surface of the other backends has no channel-last
+    // engine distinct from its row-major one, so the repacks would be pure
+    // overhead there.
+    (void)input; (void)weight; (void)groups;
+    return false;
+#else
+    if (groups != 1) return false;
+    if (input.dim() != 4 || weight.dim() != 4) return false;
+    const DType dtype = input.dtype();
+    if (dtype != DType::Float32 && dtype != DType::Float16 &&
+        dtype != DType::BFloat16) {
+        return false;
+    }
+    if (weight.dtype() != dtype) return false;
+    if (input.size(1) < 16 || weight.size(0) < 16) return false;
+    return true;
+#endif
+}
+
+namespace {
+
+std::mutex g_cl_algo_mutex;
+std::unordered_map<std::string, std::pair<int, size_t>> g_cl_algo_cache;
+
+std::string cl_algo_key(const char* kind, const Tensor& a, const Tensor& b,
+                        const Tensor& out, const std::vector<int64_t>& stride,
+                        const std::vector<int64_t>& padding,
+                        const std::vector<int64_t>& dilation) {
+    std::string key = kind;
+    key += ":" + std::to_string(static_cast<int>(a.dtype()));
+    key += ":" + std::to_string(a.device().index());
+    for (const Tensor* t : {&a, &b, &out}) {
+        for (int64_t d : {t->size(0), t->size(1), t->size(2), t->size(3)}) {
+            key += ":" + std::to_string(d);
+        }
+    }
+    for (int64_t v : {stride[0], stride[1], padding[0], padding[1],
+                      dilation[0], dilation[1]}) {
+        key += ":" + std::to_string(v);
+    }
+    return key;
+}
+
+}  // namespace
+
+Tensor conv_forward_channel_last(const Tensor& input, const Tensor& weight,
+                                 const std::vector<int64_t>& stride,
+                                 const std::vector<int64_t>& padding,
+                                 const std::vector<int64_t>& dilation,
+                                 bool fused_relu) {
+    const int64_t n = input.size(0);
+    const int64_t k = weight.size(0);
+    const int64_t h = input.size(2);
+    const int64_t w = input.size(3);
+    const int64_t r = weight.size(2);
+    const int64_t s = weight.size(3);
+    const int64_t oh = (h + 2 * padding[0] - dilation[0] * (r - 1) - 1) / stride[0] + 1;
+    const int64_t ow = (w + 2 * padding[1] - dilation[1] * (s - 1) - 1) / stride[1] + 1;
+
+    Tensor x = conv_to_channel_major(input);
+    Tensor flt = conv_to_channel_major(weight);
+    Tensor out = empty_conv_output(n, k, oh, ow, input.dtype(), input.device(), true);
+
+    auto x_desc = get_cached_tensor_desc(x);
+    auto w_desc = get_cached_filter_desc_channel_last(flt);
+    auto y_desc = get_cached_tensor_desc(out);
+    auto conv_desc = get_cached_conv_desc(
+        static_cast<int>(padding[0]), static_cast<int>(padding[1]),
+        static_cast<int>(stride[0]), static_cast<int>(stride[1]),
+        static_cast<int>(dilation[0]), static_cast<int>(dilation[1]), 1, input.dtype());
+
+    cudnnHandle_t handle = CUDAContext::getCudnnHandle();
+    cudnnConvolutionFwdAlgo_t algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM;
+    size_t workspace_size = 0;
+    {
+        const std::string key = cl_algo_key("fwd", input, weight, out, stride, padding, dilation);
+        std::lock_guard<std::mutex> lock(g_cl_algo_mutex);
+        auto it = g_cl_algo_cache.find(key);
+        if (it != g_cl_algo_cache.end()) {
+            algo = static_cast<cudnnConvolutionFwdAlgo_t>(it->second.first);
+            workspace_size = it->second.second;
+        } else {
+            cudnnConvolutionFwdAlgoPerf_t perf_results[CUDNN_CONVOLUTION_FWD_ALGO_COUNT];
+            int returned = 0;
+            CUDNN_CHECK(cudnnGetConvolutionForwardAlgorithm_v7(
+                handle, *x_desc, *w_desc, *conv_desc, *y_desc,
+                CUDNN_CONVOLUTION_FWD_ALGO_COUNT, &returned, perf_results));
+            int chosen = -1;
+            for (int i = 0; i < returned; ++i) {
+                if (perf_results[i].status == CUDNN_STATUS_SUCCESS) { chosen = i; break; }
+            }
+            if (chosen < 0) {
+                TP_THROW(RuntimeError, "cuDNN: no channel-last forward convolution algorithm");
+            }
+            algo = perf_results[chosen].algo;
+            CUDNN_CHECK(cudnnGetConvolutionForwardWorkspaceSize(
+                handle, *x_desc, *w_desc, *conv_desc, *y_desc, algo, &workspace_size));
+            g_cl_algo_cache.emplace(key, std::make_pair(static_cast<int>(algo), workspace_size));
+        }
+    }
+
+    auto workspace = getAllocator(DeviceType::CUDA)->allocate(
+        workspace_size ? workspace_size : 1, input.device());
+    float alpha = 1.0f, beta = 0.0f;
+    CUDNN_CHECK(cudnnConvolutionForward(
+        handle, &alpha, *x_desc, x.data_ptr(), *w_desc, flt.data_ptr(), *conv_desc,
+        algo, workspace.get(), workspace_size, &beta, *y_desc, out.data_ptr()));
+
+    Tensor result = out.contiguous();
+    if (fused_relu) relu_inplace_kernel_cudnn(result);
+    return result;
+}
+
+Tensor conv_grad_input_channel_last(const Tensor& grad_output, const Tensor& input,
+                                    const Tensor& weight,
+                                    const std::vector<int64_t>& stride,
+                                    const std::vector<int64_t>& padding,
+                                    const std::vector<int64_t>& dilation) {
+    const int64_t n = input.size(0);
+    const int64_t c = input.size(1);
+    const int64_t h = input.size(2);
+    const int64_t w = input.size(3);
+
+    Tensor dy = conv_to_channel_major(grad_output);
+    Tensor flt = conv_to_channel_major(weight);
+    Tensor grad_input = empty_conv_output(n, c, h, w, input.dtype(), input.device(), true);
+
+    auto w_desc = get_cached_filter_desc_channel_last(flt);
+    auto dy_desc = get_cached_tensor_desc(dy);
+    auto dx_desc = get_cached_tensor_desc(grad_input);
+    auto conv_desc = get_cached_conv_desc(
+        static_cast<int>(padding[0]), static_cast<int>(padding[1]),
+        static_cast<int>(stride[0]), static_cast<int>(stride[1]),
+        static_cast<int>(dilation[0]), static_cast<int>(dilation[1]), 1, input.dtype());
+
+    cudnnHandle_t handle = CUDAContext::getCudnnHandle();
+    cudnnConvolutionBwdDataAlgo_t algo = CUDNN_CONVOLUTION_BWD_DATA_ALGO_1;
+    size_t workspace_size = 0;
+    {
+        const std::string key = cl_algo_key("dgrad", grad_output, weight, grad_input,
+                                            stride, padding, dilation);
+        std::lock_guard<std::mutex> lock(g_cl_algo_mutex);
+        auto it = g_cl_algo_cache.find(key);
+        if (it != g_cl_algo_cache.end()) {
+            algo = static_cast<cudnnConvolutionBwdDataAlgo_t>(it->second.first);
+            workspace_size = it->second.second;
+        } else {
+            cudnnConvolutionBwdDataAlgoPerf_t perf_results[CUDNN_CONVOLUTION_BWD_DATA_ALGO_COUNT];
+            int returned = 0;
+            CUDNN_CHECK(cudnnGetConvolutionBackwardDataAlgorithm_v7(
+                handle, *w_desc, *dy_desc, *conv_desc, *dx_desc,
+                CUDNN_CONVOLUTION_BWD_DATA_ALGO_COUNT, &returned, perf_results));
+            int chosen = -1;
+            for (int i = 0; i < returned; ++i) {
+                if (perf_results[i].status == CUDNN_STATUS_SUCCESS) { chosen = i; break; }
+            }
+            if (chosen < 0) {
+                TP_THROW(RuntimeError, "cuDNN: no channel-last backward-data algorithm");
+            }
+            algo = perf_results[chosen].algo;
+            CUDNN_CHECK(cudnnGetConvolutionBackwardDataWorkspaceSize(
+                handle, *w_desc, *dy_desc, *conv_desc, *dx_desc, algo, &workspace_size));
+            g_cl_algo_cache.emplace(key, std::make_pair(static_cast<int>(algo), workspace_size));
+        }
+    }
+
+    auto workspace = getAllocator(DeviceType::CUDA)->allocate(
+        workspace_size ? workspace_size : 1, input.device());
+    float alpha = 1.0f, beta = 0.0f;
+    CUDNN_CHECK(cudnnConvolutionBackwardData(
+        handle, &alpha, *w_desc, flt.data_ptr(), *dy_desc, dy.data_ptr(), *conv_desc,
+        algo, workspace.get(), workspace_size, &beta, *dx_desc, grad_input.data_ptr()));
+    return grad_input.contiguous();
+}
+
+Tensor conv_grad_weight_channel_last(const Tensor& grad_output, const Tensor& input,
+                                     const Tensor& weight,
+                                     const std::vector<int64_t>& stride,
+                                     const std::vector<int64_t>& padding,
+                                     const std::vector<int64_t>& dilation) {
+    const int64_t k = weight.size(0);
+    const int64_t c = weight.size(1);
+    const int64_t r = weight.size(2);
+    const int64_t s = weight.size(3);
+
+    Tensor dy = conv_to_channel_major(grad_output);
+    Tensor x = conv_to_channel_major(input);
+    Tensor grad_weight = empty_conv_output(k, c, r, s, weight.dtype(), weight.device(), true);
+
+    auto x_desc = get_cached_tensor_desc(x);
+    auto dy_desc = get_cached_tensor_desc(dy);
+    auto dw_desc = get_cached_filter_desc_channel_last(grad_weight);
+    auto conv_desc = get_cached_conv_desc(
+        static_cast<int>(padding[0]), static_cast<int>(padding[1]),
+        static_cast<int>(stride[0]), static_cast<int>(stride[1]),
+        static_cast<int>(dilation[0]), static_cast<int>(dilation[1]), 1, weight.dtype());
+
+    cudnnHandle_t handle = CUDAContext::getCudnnHandle();
+    cudnnConvolutionBwdFilterAlgo_t algo = CUDNN_CONVOLUTION_BWD_FILTER_ALGO_1;
+    size_t workspace_size = 0;
+    {
+        const std::string key = cl_algo_key("wgrad", grad_output, input, grad_weight,
+                                            stride, padding, dilation);
+        std::lock_guard<std::mutex> lock(g_cl_algo_mutex);
+        auto it = g_cl_algo_cache.find(key);
+        if (it != g_cl_algo_cache.end()) {
+            algo = static_cast<cudnnConvolutionBwdFilterAlgo_t>(it->second.first);
+            workspace_size = it->second.second;
+        } else {
+            cudnnConvolutionBwdFilterAlgoPerf_t perf_results[CUDNN_CONVOLUTION_BWD_FILTER_ALGO_COUNT];
+            int returned = 0;
+            CUDNN_CHECK(cudnnGetConvolutionBackwardFilterAlgorithm_v7(
+                handle, *x_desc, *dy_desc, *conv_desc, *dw_desc,
+                CUDNN_CONVOLUTION_BWD_FILTER_ALGO_COUNT, &returned, perf_results));
+            int chosen = -1;
+            for (int i = 0; i < returned; ++i) {
+                if (perf_results[i].status == CUDNN_STATUS_SUCCESS) { chosen = i; break; }
+            }
+            if (chosen < 0) {
+                TP_THROW(RuntimeError, "cuDNN: no channel-last backward-filter algorithm");
+            }
+            algo = perf_results[chosen].algo;
+            CUDNN_CHECK(cudnnGetConvolutionBackwardFilterWorkspaceSize(
+                handle, *x_desc, *dy_desc, *conv_desc, *dw_desc, algo, &workspace_size));
+            g_cl_algo_cache.emplace(key, std::make_pair(static_cast<int>(algo), workspace_size));
+        }
+    }
+
+    auto workspace = getAllocator(DeviceType::CUDA)->allocate(
+        workspace_size ? workspace_size : 1, weight.device());
+    float alpha = 1.0f, beta = 0.0f;
+    CUDNN_CHECK(cudnnConvolutionBackwardFilter(
+        handle, &alpha, *x_desc, x.data_ptr(), *dy_desc, dy.data_ptr(), *conv_desc,
+        algo, workspace.get(), workspace_size, &beta, *dw_desc, grad_weight.data_ptr()));
+    return grad_weight.contiguous();
 }
 
 

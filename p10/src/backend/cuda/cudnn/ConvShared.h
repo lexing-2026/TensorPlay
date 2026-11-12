@@ -265,6 +265,33 @@ Tensor conv2d_cudnn_legacy(const Tensor& input, const Tensor& weight,
                             const std::vector<int64_t>& padding,
                             const std::vector<int64_t>& dilation, int64_t groups,
                             bool fused_relu);
+
+// Channel-last convolution helpers.
+//
+// The convolution engines reached through channel-last descriptors are much
+// faster than the row-major ones on this device, but only when the filter is
+// stored with the channel dimension innermost as well.  These helpers repack
+// the operands into that order, run one convolution, and hand the result back
+// row-major.  ``conv_channel_last_eligible`` reports whether the case is worth
+// the repacks; the runners fall back to the row-major path when it is not.
+bool conv_channel_last_eligible(const Tensor& input, const Tensor& weight,
+                                int64_t groups);
+std::shared_ptr<CachedFilterDesc> get_cached_filter_desc_channel_last(const Tensor& t);
+Tensor conv_forward_channel_last(const Tensor& input, const Tensor& weight,
+                                 const std::vector<int64_t>& stride,
+                                 const std::vector<int64_t>& padding,
+                                 const std::vector<int64_t>& dilation,
+                                 bool fused_relu);
+Tensor conv_grad_input_channel_last(const Tensor& grad_output,
+                                    const Tensor& input, const Tensor& weight,
+                                    const std::vector<int64_t>& stride,
+                                    const std::vector<int64_t>& padding,
+                                    const std::vector<int64_t>& dilation);
+Tensor conv_grad_weight_channel_last(const Tensor& grad_output,
+                                     const Tensor& input, const Tensor& weight,
+                                     const std::vector<int64_t>& stride,
+                                     const std::vector<int64_t>& padding,
+                                     const std::vector<int64_t>& dilation);
 #endif
 
 Tensor conv2d_slow_fp64(const Tensor& input, const Tensor& weight, const Tensor& bias,
