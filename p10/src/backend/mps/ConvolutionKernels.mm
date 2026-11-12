@@ -105,7 +105,14 @@ bool try_mpp_conv2d(const Tensor& input, const Tensor& weight,
   if (!lib.hasFunction(kernel)) {
     return false;
   }
-  auto pso = lib.getPipelineStateForFunc(kernel);
+  MTLComputePipelineState_t pso;
+  try {
+    pso = lib.getPipelineStateForFunc(kernel);
+  } catch (...) {
+    // The cooperative-tensor runtime compiler is unavailable on some
+    // environments (virtualized macOS runners); fall back to MPSGraph.
+    return false;
+  }
 
   // NCHW -> NHWC activation copy.
   const int64_t spatial = static_cast<int64_t>(params.H) * params.W;

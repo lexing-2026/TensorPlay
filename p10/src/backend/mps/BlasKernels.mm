@@ -51,7 +51,14 @@ bool try_mpp_gemm(const Tensor& a, const Tensor& b, Tensor& output,
   if (!lib.hasFunction(kernel)) {
     return false;
   }
-  auto pso = lib.getPipelineStateForFunc(kernel);
+  MTLComputePipelineState_t pso;
+  try {
+    pso = lib.getPipelineStateForFunc(kernel);
+  } catch (...) {
+    // The cooperative-tensor runtime compiler is unavailable on some
+    // environments (virtualized macOS runners); fall back to MPSGraph.
+    return false;
+  }
   constexpr uint32_t kTile = 64;
   const auto grid_x = (static_cast<uint64_t>(n) + kTile - 1) / kTile;
   const auto grid_y = (static_cast<uint64_t>(m) + kTile - 1) / kTile;
