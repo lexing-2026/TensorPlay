@@ -1,0 +1,94 @@
+/*************************************************************************
+ * Does the packed four-bit matmul accept the codes as its first operand?
+ *
+ * Every code is one and every activation is one, so an output element counts
+ * the codes contracted.  The row stride of the packed operand is swept, since
+ * a wider row than the codes need is the usual reason a packed operand reads
+ * the wrong place.
+ *************************************************************************/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+
+#include <bang.h>
+
+#define KGROUP 32
+#define M_MAX 256
+#define SRC0_MAX (M_MAX * 64)
+#define DST_NUM (M_MAX * 1)
+
+__mlu_entry__ void MatmulKernel(half *dst, int4x2_t *src0, int16_t *src1,
+                                uint32_t m, uint32_t k, uint32_t n,
+                                int32_t fix_position) {
+  __nram__ half nram_dst[DST_NUM];
+  __nram__ int4x2_t nram_src0[SRC0_MAX];
+  __wram__ int16_t wram_src1[KGROUP];
+  __memcpy(nram_src0, src0, SRC0_MAX * sizeof(int4x2_t), GDRAM2NRAM);
+  __memcpy(wram_src1, src1, k * sizeof(int16_t), GDRAM2WRAM);
+  __bang_matmul(nram_dst, nram_src0, wram_src1, m, k, n, fix_position);
+  __memcpy(dst, nram_dst, DST_NUM * sizeof(half), NRAM2GDRAM);
+}
+
+static cnrtQueue_t pQueue;
+static cnrtDim3_t dim;
+
+static int8_t src0_raw[SRC0_MAX];
+static int16_t src1[KGROUP];
+
+static void run(int m, int stride, double *out, int ncols) {
+  half *dst = (half *)malloc(DST_NUM * sizeof(half));
+  half *mlu_dst;
+  int4x2_t *mlu_src0;
+  int16_t *mlu_src1;
+  CNRT_CHECK(cnrtMalloc((void **)&mlu_src0, SRC0_MAX * sizeof(int4x2_t)));
+  CNRT_CHECK(cnrtMalloc((void **)&mlu_src1, KGROUP * sizeof(int16_t)));
+  CNRT_CHECK(cnrtMalloc((void **)&mlu_dst, DST_NUM * sizeof(half)));
+  CNRT_CHECK(cnrtMemcpy(mlu_src0, src0_raw, SRC0_MAX * sizeof(int4x2_t),
+                        CNRT_MEM_TRANS_DIR_HOST2DEV));
+  CNRT_CHECK(cnrtMemcpy(mlu_src1, src1, KGROUP * sizeof(int16_t),
+                        CNRT_MEM_TRANS_DIR_HOST2DEV));
+  MatmulKernel<<<dim, CNRT_FUNC_TYPE_BLOCK, pQueue>>>(
+      mlu_dst, mlu_src0, mlu_src1, (uint32_t)m, (uint32_t)KGROUP,
+      (uint32_t)ncols, 0);
+  CNRT_CHECK(cnrtQueueSync(pQueue));
+  CNRT_CHECK(cnrtMemcpy(dst, mlu_dst, DST_NUM * sizeof(half),
+                        CNRT_MEM_TRANS_DIR_DEV2HOST));
+  for (int i = 0; i < m; ++i) out[i] = (double)dst[i];
+  (void)stride;
+  CNRT_CHECK(cnrtFree(mlu_src0));
+  CNRT_CHECK(cnrtFree(mlu_src1));
+  CNRT_CHECK(cnrtFree(mlu_dst));
+  free(dst);
+}
+
+int main() {
+  double out[DST_NUM];
+  CNRT_CHECK(cnrtSetDevice(0));
+  CNRT_CHECK(cnrtQueueCreate(&pQueue));
+  dim.x = 1;
+  dim.y = 1;
+  dim.z = 1;
+
+  for (int i = 0; i < SRC0_MAX; ++i) src0_raw[i] = (int8_t)0x11;  /* code one */
+  for (int k = 0; k < KGROUP; ++k) src1[k] = 1;
+
+  printf("codes one, activations one, inner %d codes\n", KGROUP);
+  printf("an output element reads back the codes that were contracted\n\n");
+
+  const int m = 8;
+  int strides[] = {16, 17, 20, 32, 64};
+  for (unsigned s = 0; s < sizeof(strides) / sizeof(strides[0]); ++s) {
+    /* Lay one row every `stride` bytes by leaving gaps in the operand. */
+    for (int i = 0; i < SRC0_MAX; ++i) src0_raw[i] = 0;
+    for (int i = 0; i < m; ++i)
+      for (int b = 0; b < strides[s] && b < 64; ++b)
+        src0_raw[i * strides[s] + b] = (int8_t)0x11;
+    run(m, strides[s], out, 1);
+    printf("  row stride %2d -> out[0]=%.0f out[1]=%.0f out[2]=%.0f\n",
+           strides[s], out[0], out[1], out[2]);
+  }
+
+  CNRT_CHECK(cnrtQueueDestroy(pQueue));
+  return 0;
+}
