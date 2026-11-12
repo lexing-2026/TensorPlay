@@ -151,6 +151,11 @@ DLDevice to_dlpack_device(Device device) {
     switch (device.type()) {
         case DeviceType::CPU: d.device_type = kDLCPU; break;
         case DeviceType::CUDA: d.device_type = kDLCUDA; break;
+        // A slot filled by an out-of-tree backend has no DLPack code of its
+        // own, so it is exported through the code DLPack reserves for exactly
+        // that.  A peer library filling the same slot reads it back into its
+        // own out-of-tree type, and the memory is shared rather than moved.
+        case DeviceType::PrivateUse1: d.device_type = kDLExtDev; break;
         default: TP_THROW(RuntimeError, "Unsupported Device for DLPack");
     }
     return d;
@@ -162,6 +167,8 @@ Device from_dlpack_device(DLDevice d) {
         case kDLCPU: type = DeviceType::CPU; break;
         case kDLCUDA: type = DeviceType::CUDA; break;
         case kDLCUDAHost: type = DeviceType::CPU; break; // Treat CUDA Host as CPU
+        // The reserved out-of-tree code, read back into this library's slot.
+        case kDLExtDev: type = DeviceType::PrivateUse1; break;
         default: TP_THROW(RuntimeError, "Unsupported DLPack device type");
     }
     return Device(type, d.device_id);
