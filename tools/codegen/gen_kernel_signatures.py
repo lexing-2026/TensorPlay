@@ -40,6 +40,18 @@ _HOST_FALLBACK_EXCLUDED_BASES = frozenset({
 
 _ALIAS_RETURN = re.compile(r"\([a-z]+\)")
 
+# One alias per operator shares a single namespace here. An operator may
+# legitimately be called ``std`` (the standard-deviation op), and the alias it
+# generates would then shadow the standard namespace for every signature that
+# follows, which the targeted compiler rejects instead of resolving outward.
+# Root every emitted spelling at the global namespace so the alias cannot
+# capture it.
+_GLOBAL_STD = re.compile(r"(?<!:)\bstd::")
+
+
+def _global_std(text: str) -> str:
+    return _GLOBAL_STD.sub("::std::", text)
+
 
 def _symbol(func_name: str) -> str:
     return func_name.replace(".", "__")
@@ -126,7 +138,8 @@ def generate_kernel_signatures_header(funcs: list[NativeFunction]) -> str:
             f"{stub_arg_type_for(f.base_name, a)} {a.name}"
             for a in f.args if a.name != "requires_grad")
         out.append(f"// {f.schema}")
-        out.append(f"using {_symbol(f.func_name)} = {cpp_return_type(f)}({params});")
+        out.append(
+            _global_std(f"using {_symbol(f.func_name)} = {cpp_return_type(f)}({params});"))
     out += [
         "",
         "}  // namespace kernel_signatures",
