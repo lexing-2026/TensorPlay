@@ -36,7 +36,7 @@ jobs:
             echo "PROJECT_TOKEN secret is not set; skipping project routing"
           fi
 
-      - uses: actions/add-to-project@v1.0.2
+      - uses: actions/add-to-project@v2.0.1
         if: ${{ steps.check.outputs.enabled == 'true' }}
         with:
           project-url: https://github.com/users/lexing-2026/projects/3
