@@ -229,6 +229,57 @@ device language those need is installed; where it is not, the call keeps the
 ordinary reduction lowering, which is what runs here, so the operation still
 compiles rather than being given up on.
 
+## Convolution
+
+`conv2d` runs on the legacy descriptor API.  mcDNN serves the descriptor-style
+cuDNN surface, but the framework's convolution graph plan is compiled out for
+this backend (see `p10/CMakeLists.txt`), which closes the way to the
+tensor-core engines the reference stack uses.  Through the descriptor surface
+the forward algorithm is not tuned:
+`cudnnGetConvolutionForwardAlgorithm_v7` and
+`cudnnFindConvolutionForwardAlgorithmEx` both return only an implicit
+precomputed GEMM and FFT tiling, each with a unit estimate and no measured
+time, and forcing any other algorithm identifier yields the same kernel.  On a
+3x3 convolution with 32 or more input channels that costs 1.3x-1.7x against
+the reference, which reaches mcDNN's channel-last TF32 tensor-core engines
+through the graph API; a 3-channel input convolution is faster here, and the
+gradient kernels on the same shapes match or beat the reference.  The gap
+therefore sits inside a training step that is also launch-bound rather than in
+one operator.
+
+Asking for the operands in channel-last order does not change the selection:
+the same descriptors with channel-last strides pick the same engine, with
+identical numerics, and only add the repack.  FFT tiling is 1.25x-2.6x faster
+on the affected forward shapes, but it doubles the float32 error and gives no
+end-to-end gain in the training step, so it is not selected.
+
+## Workload benchmarks
+
+One library per process on the same C500, identical weights and inputs, medians
+over repeated runs; the ratio is TensorPlay / reference, so below one is
+faster.
+
+| Workload | TensorPlay | reference | ratio |
+| --- | --- | --- | --- |
+| VL decode, text prompt, bf16 | 16.2 ms/token | 33.4 ms/token | 0.49 |
+| VL decode, image prompt, bf16 | 16.2 ms/token | 29.0 ms/token | 0.56 |
+| VL prefill, text / image | 0.029 / 0.064 s | 0.035 / 0.067 s | 0.83 / 0.96 |
+| LLM prefill, 128 / 512 / 2048 tokens | 2.53 / 6.20 / 30.46 ms | 3.02 / 7.13 / 31.04 ms | 0.84 / 0.87 / 0.98 |
+| LLM decode, 128/1 / 512/4 / 2048/4 | 2.53 / 8.43 / 54.08 ms/token | 3.05 / 7.76 / 42.70 ms/token | 0.83 / 1.09 / 1.27 |
+
+The VL figures decode one token per step after a single prefill, so prefill and
+per-token cost are read separately.  The LLM figures are
+`benchmark/bench_llama_e2e.py`, bf16 without a KV cache; the decode ratio rises
+with sequence length, where the matmul that the tensor-core gap above also
+affects dominates the step.
+
+`softmax` over 4096 rows is 1.04x, 1.12x and 1.17x the reference in float32 at
+widths 2048, 4096 and 8192; 1.62x, 1.39x, 1.24x and 1.21x in float16 at widths
+2048 through 16384; and 1.60x, 1.48x, 1.35x and 1.56x in bfloat16 at the same
+widths.  At width 16384 in float32 it is faster than the reference (0.60x).
+Narrow and 16-bit rows are launch- and bandwidth-bound, which is where the
+deficit remains.
+
 ## Profiling
 
 ```python
