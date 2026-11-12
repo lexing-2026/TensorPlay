@@ -224,6 +224,16 @@ using cudnnConvolutionBwdFilterAlgo_t = miopenConvBwdWeightsAlgorithm_t;
     miopenConvolutionBwdWeightsAlgoWinograd
 #define CUDNN_CONVOLUTION_BWD_FILTER_ALGO_IMPLICIT_GEMM \
     miopenConvolutionBwdWeightsAlgoImplicitGEMM
+// Defaults used by the channel-last convolution paths before their cached
+// algorithm probe lands.  The forward default is the precomputed implicit
+// GEMM; the backward defaults are MIOpen's implicit-GEMM entries, the
+// closest equivalents to the numbered legacy cuDNN choices.
+#define CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM \
+    miopenConvolutionFwdAlgoImplicitGEMM
+#define CUDNN_CONVOLUTION_BWD_DATA_ALGO_1 \
+    miopenConvolutionBwdDataAlgoImplicitGEMM
+#define CUDNN_CONVOLUTION_BWD_FILTER_ALGO_1 \
+    miopenConvolutionBwdWeightsAlgoImplicitGEMM
 
 // The solution queries below report a single solution each, so the bound the
 // callers size their result array with is one on this side.  It is the array
