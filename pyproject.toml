@@ -113,7 +113,10 @@ mode = "redirect"
 rebuild = false
 
 [tool.scikit-build.install]
-# Disable stripping to avoid potential issues with DLLs on Windows.
+# Disable stripping to avoid potential issues with DLLs on Windows.  Linux
+# re-enables it per platform below: the symbol tables there are dead weight
+# in a multi-gigabyte library and stripping them does not touch the device
+# image the kernels live in.
 strip = false
 
 [tool.scikit-build.sdist]
@@ -139,6 +142,14 @@ if.platform-system = "win32"
 cmake.define.CMAKE_GENERATOR = "Ninja"
 env.CC = "cl"
 env.CXX = "cl"
+
+[[tool.scikit-build.overrides]]
+# Strip the installed shared objects on Linux.  A MetaX build carries a
+# 2.07 GB device image inside libp10.so, and the symbol tables next to it
+# are only useful while debugging the build; dropping them takes 28 MB off
+# the installed library and leaves the device image untouched.
+if.platform-system = "linux"
+install.strip = true
 
 [tool.scikit-build.wheel]
 # Python packages to include in the wheel; CMake installs the built
