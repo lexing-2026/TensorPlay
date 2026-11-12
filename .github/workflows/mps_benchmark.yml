@@ -49,8 +49,8 @@ on:
         required: false
         type: choice
         options:
-          - macos-14
           - macos-15
+          - macos-26
         default: macos-15
   schedule:
     - cron: "0 5 * * 1"

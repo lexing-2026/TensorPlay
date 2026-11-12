@@ -16,7 +16,7 @@
     },
     {
       "name": "macos-arm64",
-      "runner": "macos-14"
+      "runner": "macos-15"
     },
     {
       "name": "windows-x86_64",
