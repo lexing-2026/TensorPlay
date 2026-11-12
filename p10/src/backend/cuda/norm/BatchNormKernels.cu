@@ -16,7 +16,9 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <tuple>
@@ -85,6 +87,69 @@ namespace batch_norm {
 std::tuple<Tensor, Tensor> batch_norm_stats_cuda(const Tensor& input,
                                                  double epsilon);
 }
+
+namespace {
+
+// A normalization forward derives the batch statistics its backward needs,
+// and the two calls share the same operand.  Keeping the derived pair until
+// the backward asks for it spares a second reduction of that operand.  The
+// entry holds the operand itself, so its storage cannot be recycled in
+// between, and the version guards an in-place edit of its values.
+struct RememberedStatistics {
+    Tensor operand;
+    Tensor mean;
+    Tensor invstd;
+    uint32_t version = 0;
+    const void* stream = nullptr;
+};
+
+constexpr size_t kStatisticsSlots = 32;
+
+// One instance per program: the extended routine and the dense routine of
+// this file are emitted separately, so the storage lives behind an inline
+// accessor whose local static the linker keeps once.
+struct StatisticsSlots {
+    std::mutex mutex;
+    std::array<RememberedStatistics, kStatisticsSlots> slots;
+    size_t next = 0;
+};
+
+inline StatisticsSlots& statistics_slots() {
+    static StatisticsSlots storage;
+    return storage;
+}
+
+void remember_batch_statistics(const Tensor& operand, const Tensor& mean,
+                               const Tensor& invstd) {
+    StatisticsSlots& cache = statistics_slots();
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    RememberedStatistics& slot =
+        cache.slots[cache.next++ % kStatisticsSlots];
+    slot.operand = operand;
+    slot.mean = mean;
+    slot.invstd = invstd;
+    slot.version = operand._version();
+    slot.stream = getCurrentCUDAStream().stream();
+}
+
+bool recall_batch_statistics(const Tensor& operand, Tensor& mean,
+                             Tensor& invstd) {
+    if (!operand.impl()->version_counter().is_enabled()) return false;
+    const void* stream = getCurrentCUDAStream().stream();
+    StatisticsSlots& cache = statistics_slots();
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    for (RememberedStatistics& slot : cache.slots) {
+        if (slot.operand.defined() && slot.operand.impl() == operand.impl() &&
+            slot.version == operand._version() && slot.stream == stream) {
+            mean = slot.mean;
+            invstd = slot.invstd;
+            return true;
+        }
+    }
+    return false;
+}
+
+}  // namespace
 
 Tensor batch_norm_cudnn(
     const Tensor& input,
@@ -202,6 +267,9 @@ Tensor batch_norm_cudnn(
     CUDNN_CHECK(cudnnDestroyTensorDescriptor(bn_desc));
     CUDNN_CHECK(cudnnDestroyTensorDescriptor(y_desc));
     CUDNN_CHECK(cudnnDestroyTensorDescriptor(x_desc));
+    if (training) {
+        remember_batch_statistics(input_bn, saved_mean, saved_inverse_variance);
+    }
     return output;
 }
 
@@ -247,11 +315,13 @@ std::tuple<Tensor, Tensor, Tensor> batch_norm_backward_cudnn(
     Tensor saved_mean;
     Tensor saved_inverse_variance;
     if (training) {
-        // The backward needs only the batch statistics the forward normalized
-        // with; a reduction over the input yields them without replaying the
-        // whole forward pass.
-        std::tie(saved_mean, saved_inverse_variance) =
-            batch_norm::batch_norm_stats_cuda(input_bn, eps);
+        // The forward derived the batch statistics and left them for this
+        // call; only a miss falls back to reducing the operand again.
+        if (!recall_batch_statistics(input_bn, saved_mean,
+                                     saved_inverse_variance)) {
+            std::tie(saved_mean, saved_inverse_variance) =
+                batch_norm::batch_norm_stats_cuda(input_bn, eps);
+        }
     } else {
         saved_mean = Tensor::empty({channels}, DType::Float32, input.device());
         saved_inverse_variance = Tensor::empty({channels}, DType::Float32, input.device());
