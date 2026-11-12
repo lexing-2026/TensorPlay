@@ -884,12 +884,12 @@ inline cudnnStatus_t cudnnGetBatchNormalizationTrainingExReserveSpaceSize(
 
 inline cudnnStatus_t cudnnBatchNormalizationForwardTrainingEx(
     cudnnHandle_t handle, cudnnBatchNormMode_t mode, cudnnBatchNormOps_t,
-    const void* alpha, const void* beta,
+    void* alpha, void* beta,
     cudnnTensorDescriptor_t xDesc, const void* x,
     cudnnTensorDescriptor_t, const void*,
     cudnnTensorDescriptor_t yDesc, void* y,
     cudnnTensorDescriptor_t bnScaleBiasMeanVarDesc,
-    const void* bnScale, const void* bnBias,
+    void* bnScale, void* bnBias,
     double exponentialAverageFactor,
     void* resultRunningMean, void* resultRunningVariance,
     double epsilon, void* resultSaveMean, void* resultSaveInvVariance,
