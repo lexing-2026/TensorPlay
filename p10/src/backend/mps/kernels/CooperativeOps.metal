@@ -35,8 +35,8 @@ kernel void gemm_mpp(
   const int n = int(sizes.z);
   const int row = int(tgid.y) * BM;
   const int col = int(tgid.x) * BN;
-  const int b = int(tgid.z);
-  if (b >= int(batch)) {
+  const int batch_idx = int(tgid.z);
+  if (batch_idx >= int(batch)) {
     return;
   }
 
@@ -51,9 +51,9 @@ kernel void gemm_mpp(
   mpp::tensor_ops::matmul2d<desc, execution_simdgroups<NSG>> op;
 
   // Contiguous row-major batch layout: A (M x K), B (K x N), C (M x N).
-  device T* Ab = a + (int64_t)b * m * k;
-  device T* Bb = b + (int64_t)b * k * n;
-  device T* Cb = c + (int64_t)b * m * n;
+  device T* Ab = a + (int64_t)batch_idx * m * k;
+  device T* Bb = b + (int64_t)batch_idx * k * n;
+  device T* Cb = c + (int64_t)batch_idx * m * n;
 
   tensor<device T, dextents<int32_t, 2>, tensor_inline> mat1(
       Ab,
@@ -324,25 +324,25 @@ kernel void conv2d_mpp(
 
 #define INSTANTIATE_CONV2D_MPP_KERNEL(KH, KW, CNAME, SRCC)                 \
   INSTANTIATE_CONV2D_MPP_DTYPES(                                           \
-      32, 8, 8, 2, KH, KW, 1, 1, 1, 1, CNAME, SRCC, "bias", true)          \
+      32, 8, 8, 2, KH, KW, 1, 1, 1, 1, CNAME, SRCC, bias, true)           \
   INSTANTIATE_CONV2D_MPP_DTYPES(                                           \
-      32, 8, 8, 2, KH, KW, 1, 1, 1, 1, CNAME, SRCC, "nobias", false);
+      32, 8, 8, 2, KH, KW, 1, 1, 1, 1, CNAME, SRCC, nobias, false);
 
-INSTANTIATE_CONV2D_MPP_KERNEL(1, 1, "c1", 1)
-INSTANTIATE_CONV2D_MPP_KERNEL(1, 1, "c3", 3)
-INSTANTIATE_CONV2D_MPP_KERNEL(1, 1, "c16", 16)
-INSTANTIATE_CONV2D_MPP_KERNEL(1, 1, "c32", 32)
-INSTANTIATE_CONV2D_MPP_KERNEL(1, 1, "c64", 64)
-INSTANTIATE_CONV2D_MPP_KERNEL(2, 2, "c1", 1)
-INSTANTIATE_CONV2D_MPP_KERNEL(2, 2, "c3", 3)
-INSTANTIATE_CONV2D_MPP_KERNEL(2, 2, "c16", 16)
-INSTANTIATE_CONV2D_MPP_KERNEL(2, 2, "c32", 32)
-INSTANTIATE_CONV2D_MPP_KERNEL(2, 2, "c64", 64)
-INSTANTIATE_CONV2D_MPP_KERNEL(3, 3, "c1", 1)
-INSTANTIATE_CONV2D_MPP_KERNEL(3, 3, "c3", 3)
-INSTANTIATE_CONV2D_MPP_KERNEL(3, 3, "c16", 16)
-INSTANTIATE_CONV2D_MPP_KERNEL(3, 3, "c32", 32)
-INSTANTIATE_CONV2D_MPP_KERNEL(3, 3, "c64", 64)
+INSTANTIATE_CONV2D_MPP_KERNEL(1, 1, c1, 1)
+INSTANTIATE_CONV2D_MPP_KERNEL(1, 1, c3, 3)
+INSTANTIATE_CONV2D_MPP_KERNEL(1, 1, c16, 16)
+INSTANTIATE_CONV2D_MPP_KERNEL(1, 1, c32, 32)
+INSTANTIATE_CONV2D_MPP_KERNEL(1, 1, c64, 64)
+INSTANTIATE_CONV2D_MPP_KERNEL(2, 2, c1, 1)
+INSTANTIATE_CONV2D_MPP_KERNEL(2, 2, c3, 3)
+INSTANTIATE_CONV2D_MPP_KERNEL(2, 2, c16, 16)
+INSTANTIATE_CONV2D_MPP_KERNEL(2, 2, c32, 32)
+INSTANTIATE_CONV2D_MPP_KERNEL(2, 2, c64, 64)
+INSTANTIATE_CONV2D_MPP_KERNEL(3, 3, c1, 1)
+INSTANTIATE_CONV2D_MPP_KERNEL(3, 3, c3, 3)
+INSTANTIATE_CONV2D_MPP_KERNEL(3, 3, c16, 16)
+INSTANTIATE_CONV2D_MPP_KERNEL(3, 3, c32, 32)
+INSTANTIATE_CONV2D_MPP_KERNEL(3, 3, c64, 64)
 
 #define REGISTER_CONV_WEIGHT_TO_HWIO(DT)                                   \
   template [[host_name("conv_weight_to_hwio_" #DT)]] kernel void           \
