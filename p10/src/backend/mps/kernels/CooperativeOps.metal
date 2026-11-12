@@ -43,7 +43,7 @@ kernel void gemm_mpp(
   constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
       BM,
       BN,
-      static_cast<int>(dynamic_extent),
+      dynamic_length_v<int>,
       false,
       false,
       false,
