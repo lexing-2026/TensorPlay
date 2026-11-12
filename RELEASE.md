@@ -28,15 +28,25 @@ through three channels.
   nightly.
 - `cz bump` is never used; commitizen only drafts changelogs.
 
-## Nightly (manual preview channel)
+## Nightly (preview channel)
 
-Dispatch `.github/workflows/nightly.yml` (no cron):
+The nightly runs on a daily schedule (02:30 UTC); `workflow_dispatch` stays
+available for off-schedule builds and for retrying a specific commit:
 
-- `build-from-source`: builds the wheel matrix from the current ref with the
-  computed `X.Y.0.dev<date>` version (override with `version`, republish the
-  same day with `build_number > 1`).
-- `upload-wheels`: publishes locally built wheels uploaded beforehand as an
-  Actions artifact named `wheels` (all wheels must share one base version).
+- A scheduled run is skipped when `main` is at the commit the previous nightly
+  already attempted. The comparison is against the last run *whatever its
+  conclusion* — deliberately not the last green one, since that rebuilt a red
+  matrix in full every night while `main` stayed put. One attempt per commit;
+  retry by hand with a dispatch.
+- `prepare` computes the `X.Y.0.dev<date>` base from `version.txt`. The
+  `version` input overrides it, and `build_number > 1` appends `.post<N>` so a
+  same-day republish ships under a distinct, higher version.
+- `define-wheel-matrix` drops every lane whose wheel for the computed version
+  is already on the `nightly` release, so a retry only builds the missing
+  wheels; `cpu_platforms` / `cuda_variants` / `rocm_variants` narrow the
+  matrix further.
+- `cpu-build` / `cuda-build` / `rocm-build` build, test and upload to the
+  rolling `nightly` release.
 
 The nightly index overwrites `whl/nightly/<variant>/` on `pypi-pages` and
 prunes older assets from the rolling release (prune aborts if no wheel of the
