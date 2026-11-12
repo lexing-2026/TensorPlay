@@ -226,22 +226,24 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
           # The trunk runs already publish each smoke-tested main push to the
-          # nightly channel, so the scheduled run only fills gaps. When no
-          # commit has landed on main since the last fully green nightly,
-          # there is nothing new to fill: every wheel for this date is on the
-          # release and the matrix would come back empty anyway.
+          # nightly channel, so the scheduled run only fills gaps. A commit is
+          # attempted once: the comparison is against the last nightly run
+          # whatever its conclusion, not the last green one. Keying on green
+          # meant a red matrix was rebuilt in full every night while main
+          # stayed put, since no run ever turned the old commit green again;
+          # retry a specific commit with workflow_dispatch instead.
           last="$(gh run list \
             --repo "$GITHUB_REPOSITORY" \
             --workflow nightly \
-            --status success \
-            --limit 1 \
-            --json headSha \
-            --jq '.[0].headSha // ""')"
+            --limit 50 \
+            --json databaseId,headSha \
+            --jq "[.[] | select(.databaseId != ($CURRENT_RUN_ID | tonumber))][0].headSha // \"\"")"
           if [[ -n "$last" && "$last" == "${{ github.sha }}" ]]; then
-            echo "main is at ${last#0}, already published by the last green nightly; skipping"
+            echo "main is at ${last#0}, already attempted by the last nightly; skipping"
             echo "unchanged=true" >> "$GITHUB_OUTPUT"
           else
             echo "unchanged=false" >> "$GITHUB_OUTPUT"
