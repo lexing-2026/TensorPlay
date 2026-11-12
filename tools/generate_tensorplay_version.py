@@ -201,19 +201,24 @@ if __name__ == "__main__":
 
     tensorplay_root = Path(__file__).parent.parent
     version_path = tensorplay_root / "tensorplay" / "version.py"
-    # Attempt to get tag first, fall back to sha if a tag was not found
-    tagged_version = get_tag(tensorplay_root)
     sha = get_sha(tensorplay_root)
-    if tagged_version == UNKNOWN:
+    # The CI states the release version for official builds, and the wheel
+    # metadata reads that statement first. Read it in the same order here, so
+    # a tree that is not sitting exactly on the release tag -- a repair build
+    # of a branch commit, a shallow checkout, or a copied source tree without
+    # tags -- cannot write a development identity into the package while its
+    # metadata carries the release one.
+    env_version = os.getenv("TENSORPLAY_BUILD_VERSION")
+    if env_version:
         version = get_tensorplay_version(sha)
     else:
-        version = tag_to_version(tagged_version)
-        # CI derives TENSORPLAY_BUILD_VERSION from the same tag and may carry
-        # a variant local segment (+cuXXX, +rocmXXX); keep that label when
-        # present so device wheels report their variant at runtime.
-        env_version = os.getenv("TENSORPLAY_BUILD_VERSION")
-        if env_version:
-            version = env_version
+        # No statement from the CI: take the tag this tree sits on, and fall
+        # back to version.txt plus the commit when there is none.
+        tagged_version = get_tag(tensorplay_root)
+        if tagged_version == UNKNOWN:
+            version = get_tensorplay_version(sha)
+        else:
+            version = tag_to_version(tagged_version)
 
     with open(version_path, "w") as f:
         f.write("from typing import Optional\n\n")

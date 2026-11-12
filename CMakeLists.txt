@@ -597,21 +597,26 @@ endif()
 
 # Generate tensorplay/version.py from version.txt + git metadata
 set(TP_VERSION_PY "${TP_PACKAGE_DIR}/version.py")
-add_custom_command(
-    OUTPUT ${TP_VERSION_PY}
+# The recorded identity is the version base plus the tag or commit the tree
+# sits on, and neither of those is a file the rule can watch: a checkout that
+# moves between builds changes no dependency of the rule, so a rule keyed on
+# file timestamps ships the identity an earlier build of the same tree wrote.
+# Regenerate on every build instead.
+add_custom_target(
+    gen_tensorplay_version ALL
     COMMAND ${CMAKE_COMMAND} -E env PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
             ${Python_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_tensorplay_version.py
             --is-debug $<IF:$<CONFIG:Debug>,1,0>
             --cuda-version $<IF:$<BOOL:${CUDAToolkit_VERSION}>,${CUDAToolkit_VERSION},>
             --hip-version $<IF:$<BOOL:${TP_HIP_VERSION}>,${TP_HIP_VERSION},>
             --rocm-version $<IF:$<BOOL:${TP_ROCM_VERSION}>,${TP_ROCM_VERSION},>
-    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_tensorplay_version.py
-            ${CMAKE_CURRENT_SOURCE_DIR}/version.txt
-    COMMENT "Generating tensorplay/version.py"
+    BYPRODUCTS ${TP_VERSION_PY}
+    COMMENT "Regenerating tensorplay/version.py"
 )
 
 # Add a custom target to ensure code generation runs before library building
-add_custom_target(generate_code DEPENDS ${GEN_HEADER} ${GEN_CPP} ${GEN_KERNEL_SIGNATURES_H} ${GEN_HOST_FALLBACK_CPPS} ${GEN_TPX_OPS_CPP} ${GEN_TPX_AUTOGRAD_REG_CPP} ${GEN_AUTOCAST_CPP} ${GEN_TPX_REDISPATCH_H} ${GEN_STRUCTURED_H} ${GEN_PYTHON_DISPATCH_CPP} ${TP_VERSION_PY})
+add_custom_target(generate_code DEPENDS ${GEN_HEADER} ${GEN_CPP} ${GEN_KERNEL_SIGNATURES_H} ${GEN_HOST_FALLBACK_CPPS} ${GEN_TPX_OPS_CPP} ${GEN_TPX_AUTOGRAD_REG_CPP} ${GEN_AUTOCAST_CPP} ${GEN_TPX_REDISPATCH_H} ${GEN_STRUCTURED_H} ${GEN_PYTHON_DISPATCH_CPP})
+add_dependencies(generate_code gen_tensorplay_version)
 
 include_directories(${GEN_BASE_DIR})
 
