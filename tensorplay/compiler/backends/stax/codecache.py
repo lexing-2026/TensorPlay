@@ -42,7 +42,12 @@ import tempfile
 import threading
 from pathlib import Path
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, Generic, NotRequired, TypedDict, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, TypedDict, TypeVar
+
+try:  # Python 3.11 and later carry this in the standard library.
+    from typing import NotRequired
+except ImportError:  # pragma: no cover - reached on interpreters older than 3.11
+    from typing_extensions import NotRequired
 
 import tensorplay as tp
 

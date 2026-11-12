@@ -6,7 +6,12 @@ from dataclasses import dataclass, field
 import functools
 import logging
 from collections.abc import Callable, Sequence
-from typing import Any, NotRequired, Optional, Protocol, TypedDict, cast
+from typing import Any, Optional, Protocol, TypedDict, cast
+
+try:  # Python 3.11 and later carry this in the standard library.
+    from typing import NotRequired
+except ImportError:  # pragma: no cover - reached on interpreters older than 3.11
+    from typing_extensions import NotRequired
 
 import sympy
 
