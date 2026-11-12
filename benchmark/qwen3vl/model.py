@@ -40,6 +40,7 @@ from tensorplay import nn
 from .vision import Qwen3VLVisionConfig, Qwen3VLVisionModel, vision_checkpoint_name
 
 __all__ = [
+    "GraphCache",
     "WeightOnlyInt4Linear",
     "Qwen3VLTextConfig",
     "Qwen3VLForCausalLM",
@@ -282,6 +283,123 @@ def cache_dense_weights(model, dtype=None):
     return count
 
 
+class GraphCache:
+    """One fixed window per layer that a recorded decode step can write into.
+
+    A recording holds the addresses of everything it touches, so a cache whose
+    write lands on a different address every step cannot be replayed: the replay
+    would keep writing where it was recorded.  This cache keeps a window of the
+    full length per layer and writes the step's entry by scaling the whole
+    window with a slot-selection buffer instead of indexing a slice.  No address
+    depends on the position, so one recording serves every one of them.
+
+    Three buffers move the position between replays: ``select`` marks the slot
+    the next entry lands in, ``keep`` marks the slots the write leaves alone,
+    and ``mask`` is the additive weight that keeps the slots past the filled
+    prefix out of the attention result.  :meth:`advance` refreshes them and runs
+    outside the recording; inside it the write is a multiply and an add.
+
+    A prompt is written as a slice, which needs no mask over the filled part,
+    and reads back only the prefix, so the causal path a prompt takes is
+    unchanged.  A single-token step reads back the whole window and is given the
+    additive mask instead.
+    """
+
+    def __init__(self, max_seq_len: int) -> None:
+        if max_seq_len <= 0:
+            raise ValueError(f"max_seq_len must be positive, got {max_seq_len}")
+        self.max_seq_len = max_seq_len
+        self.key_cache: list = []
+        self.value_cache: list = []
+        self._cursor: list[int] = []
+        self.select = None
+        self.keep = None
+        self.mask = None
+
+    def __len__(self) -> int:
+        return len(self.key_cache)
+
+    def _orbit(self, dtype, device) -> None:
+        if self.select is not None:
+            return
+        self.select = tp.zeros(1, 1, self.max_seq_len, 1, dtype=dtype, device=device)
+        self.keep = tp.ones(1, 1, self.max_seq_len, 1, dtype=dtype, device=device)
+        self.mask = tp.zeros(1, 1, 1, 1, self.max_seq_len, dtype=dtype, device=device)
+        self._arm(0)
+
+    def _arm(self, position: int) -> None:
+        self.select.zero_()
+        self.keep.fill_(1.0)
+        self.mask.fill_(0.0)
+        self.select[:, :, position : position + 1, :].fill_(1.0)
+        self.keep[:, :, position : position + 1, :].fill_(0.0)
+        if position + 1 < self.max_seq_len:
+            self.mask[:, :, :, :, position + 1 :].fill_(float("-inf"))
+
+    def advance(self, position: int) -> None:
+        """Point the write and the visible prefix at ``position``.
+
+        Runs outside any recording.  The recorded work reads these buffers
+        through the addresses the recording holds, so a replay sees the values
+        they hold when it is queued.
+        """
+        if self.select is None:
+            return
+        self._arm(position)
+        for layer in range(len(self._cursor)):
+            self._cursor[layer] = position
+
+    def update(self, key, value, layer_idx: int = 0):
+        while len(self.key_cache) <= layer_idx:
+            self.key_cache.append(None)
+            self.value_cache.append(None)
+            self._cursor.append(0)
+        self._orbit(key.dtype, key.device)
+        batch, heads = key.shape[0], key.shape[1]
+        if self.key_cache[layer_idx] is None:
+            self.key_cache[layer_idx] = tp.zeros(
+                batch, heads, self.max_seq_len, key.shape[3],
+                dtype=key.dtype, device=key.device,
+            )
+            self.value_cache[layer_idx] = tp.zeros(
+                batch, heads, self.max_seq_len, value.shape[3],
+                dtype=value.dtype, device=value.device,
+            )
+        seq = key.shape[2]
+        if seq == 1:
+            # Scaling the whole window keeps every address, so a recording of
+            # this call replays at whatever slot the buffers point at.
+            self.key_cache[layer_idx].mul_(self.keep).add_(key * self.select)
+            self.value_cache[layer_idx].mul_(self.keep).add_(value * self.select)
+            return self.key_cache[layer_idx], self.value_cache[layer_idx]
+        start = self._cursor[layer_idx]
+        if start + seq > self.max_seq_len:
+            raise RuntimeError(
+                f"GraphCache overflow: cursor {start} + {seq} exceeds "
+                f"max_seq_len {self.max_seq_len}"
+            )
+        self.key_cache[layer_idx][:, :, start : start + seq].copy_(key)
+        self.value_cache[layer_idx][:, :, start : start + seq].copy_(value)
+        self._cursor[layer_idx] = start + seq
+        return (
+            self.key_cache[layer_idx][:, :, : start + seq],
+            self.value_cache[layer_idx][:, :, : start + seq],
+        )
+
+    def get_seq_length(self, layer_idx: int = 0) -> int:
+        if layer_idx >= len(self._cursor):
+            return 0
+        return self._cursor[layer_idx]
+
+    def reset(self) -> None:
+        self.key_cache.clear()
+        self.value_cache.clear()
+        self._cursor.clear()
+        self.select = None
+        self.keep = None
+        self.mask = None
+
+
 def written_normalization(x, weight, eps, shape):
     """Row-wise normalization as elementwise work over the input's own type.
 
@@ -431,7 +549,8 @@ class Qwen3VLAttention(nn.Module):
                 config.num_attention_heads * config.head_dim, config.hidden_size, True, None, None
             )
 
-    def forward(self, x, position_ids=None, past_key_values=None, rotary=None):
+    def forward(self, x, position_ids=None, past_key_values=None, rotary=None,
+                mask=None):
         mixer = self.mixer
         batch, length, _ = x.shape
         heads, kv_heads, head_dim = mixer.num_heads, mixer.num_kv_heads, mixer.head_dim
@@ -475,14 +594,19 @@ class Qwen3VLAttention(nn.Module):
             # of being widened to one copy per query head first.
             group = heads // kv_heads
             if group == 1:
-                keys, values = k, v
-                scores = (q @ keys.transpose(-1, -2)) * mixer.scaling
-                weights = tp.nn.functional.softmax(scores, dim=-1)
-                attn = weights @ values
+                scores = (q @ k.transpose(-1, -2)) * mixer.scaling
             else:
                 grouped = q.reshape(batch, kv_heads, group, length, head_dim)
                 scores = (grouped @ k.unsqueeze(2).transpose(-1, -2)) * mixer.scaling
-                weights = tp.nn.functional.softmax(scores, dim=-1)
+            if mask is not None:
+                # A caller that holds the whole window rather than the filled
+                # prefix hands the slots holding nothing yet a weight that
+                # keeps the scores read over them out of the result.
+                scores = scores + mask
+            weights = tp.nn.functional.softmax(scores, dim=-1)
+            if group == 1:
+                attn = weights @ v
+            else:
                 attn = (weights @ v.unsqueeze(2)).reshape(
                     batch, heads, length, head_dim
                 )
@@ -517,12 +641,12 @@ class Qwen3VLDecoderLayer(nn.Module):
         )
 
     def forward(self, hidden_states, position_ids=None, past_key_values=None,
-                rotary=None):
+                rotary=None, mask=None):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
             hidden_states, position_ids=position_ids, past_key_values=past_key_values,
-            rotary=rotary,
+            rotary=rotary, mask=mask,
         )
         hidden_states = hidden_states + residual
         residual = hidden_states
@@ -563,7 +687,7 @@ class Qwen3VLLanguageModel(nn.Module):
         return flat.reshape(hidden_states.shape)
 
     def forward(self, hidden_states, position_ids=None, past_key_values=None,
-                visual_positions=None, deepstack_visual_embeds=None):
+                visual_positions=None, deepstack_visual_embeds=None, mask=None):
         rotary = None
         if position_ids is not None:
             # Every block turns its queries and keys by the same table, which
@@ -574,7 +698,7 @@ class Qwen3VLLanguageModel(nn.Module):
         for index, layer in enumerate(self.layers):
             hidden_states = layer(
                 hidden_states, position_ids=position_ids,
-                past_key_values=past_key_values, rotary=rotary,
+                past_key_values=past_key_values, rotary=rotary, mask=mask,
             )
             if deepstack_visual_embeds is not None and index < len(deepstack_visual_embeds):
                 hidden_states = self._add_visual_features(
@@ -659,7 +783,8 @@ class Qwen3VLForCausalLM(nn.Module):
         return position_ids, self.rope_delta
 
     def forward(self, input_ids=None, position_ids=None, past_key_values=None,
-                inputs_embeds=None, pixel_values=None, image_grid_thw=None):
+                inputs_embeds=None, pixel_values=None, image_grid_thw=None,
+                mask=None):
         if pixel_values is None and self._pending_image is not None:
             pixel_values, image_grid_thw = self._pending_image
             self._pending_image = None
@@ -680,6 +805,7 @@ class Qwen3VLForCausalLM(nn.Module):
             past_key_values=past_key_values,
             visual_positions=visual_positions,
             deepstack_visual_embeds=deepstack,
+            mask=mask,
         )
         return self.lm_head(hidden)
 

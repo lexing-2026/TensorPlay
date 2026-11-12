@@ -117,6 +117,56 @@ def _arange(start, end, device):
     return tp.arange(start, end, device=device).unsqueeze(0)
 
 
+def graph_decode(device, model, ids, steps, sync):
+    """Prefill, then time a single recorded step replayed at every position.
+
+    A recording holds the addresses of the work it takes in, so the cache it
+    writes through keeps a fixed window and moves the position with buffers
+    instead of a slice (see ``GraphCache``).  The prefill still writes a slice
+    and reads its own prefix back, so the causal path it takes is unchanged.
+    """
+    from tensorplay_mlu.graph import Graph
+
+    from qwen3vl.model import GraphCache
+
+    cache = GraphCache(512)
+    length = ids.shape[1]
+    sync()
+    start = time.time()
+    with tp.no_grad():
+        logits = model(ids, position_ids=_arange(0, length, device), past_key_values=cache)
+        sync()
+    prefill = time.time() - start
+
+    token_buffer = logits[:, -1:].argmax(dim=-1).clone()
+    positions = tp.zeros(1, 1, dtype=tp.int64, device=device)
+    cache.advance(length)
+
+    graph = Graph()
+    with tp.no_grad():
+        recorded = graph.capture(
+            lambda: model(
+                token_buffer, position_ids=positions, past_key_values=cache,
+                mask=cache.mask,
+            )
+        )
+    handed, held = graph.stats()
+
+    times = []
+    with tp.no_grad():
+        for offset in range(steps):
+            positions.fill_(length + offset)
+            cache.advance(length + offset)
+            sync()
+            start = time.time()
+            graph.replay()
+            sync()
+            times.append(time.time() - start)
+            token_buffer.copy_(recorded[:, -1:].argmax(dim=-1))
+    graph.reset()
+    return prefill, times, handed, held
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
@@ -128,6 +178,8 @@ def main():
                     help="add a third phase with the normalizations written out")
     ap.add_argument("--static-cache", type=int, default=0,
                     help="positions to preallocate for the third phase")
+    ap.add_argument("--graph", action="store_true",
+                    help="add a fourth phase that replays one recorded step")
     args = ap.parse_args()
 
     dtypes = {"float16": tp.float16, "bfloat16": tp.bfloat16}
@@ -189,6 +241,16 @@ def main():
             cache = StaticCache(args.static_cache)
             print(f"  cache preallocated for {args.static_cache} positions")
         prefill, times = decode(device, model, ids, args.tokens, sync, cache=cache)
+        print(f"  prefill {prefill * 1e3:.1f} ms")
+        print("  steps " + " ".join(f"{v * 1e3:.1f}" for v in times) + " ms")
+        if times:
+            print(f"  median {stats.median(times) * 1e3:.1f} ms  "
+                  f"{1 / stats.median(times):.2f} token/s")
+
+    if args.graph:
+        print("\none recorded step, replayed at every position")
+        prefill, times, handed, held = graph_decode(device, model, ids, args.tokens, sync)
+        print(f"  recorded ({handed} blocks handed out while recording, {held} now held)")
         print(f"  prefill {prefill * 1e3:.1f} ms")
         print("  steps " + " ".join(f"{v * 1e3:.1f}" for v in times) + " ms")
         if times:

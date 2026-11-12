@@ -42,8 +42,11 @@ CONFIGS = [(4, 64), (4, 128), (8, 64), (8, 128)]
 
 def build(out_width, in_width, rows, bits, group, device="mlu"):
     packed_width = in_width // 2 if bits == 4 else in_width
-    codes = torch.randint(-128, 127, (out_width, packed_width), dtype=torch.int8,
-                          device=device)
+    # The narrow integer kinds have no generator on the device, so the codes
+    # are drawn as bytes on the host and moved over.
+    codes = torch.randint(
+        0, 256, (out_width, packed_width), dtype=torch.int64
+    ).to(torch.int8).to(device)
     scale = (torch.rand(out_width, in_width // group, dtype=torch.float32,
                         device=device) * 0.01 + 0.01).to(torch.float16)
     activation = torch.randn(rows, in_width, dtype=torch.float16, device=device)
