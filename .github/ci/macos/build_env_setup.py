@@ -19,11 +19,11 @@ from pathlib import Path
 
 
 # macOS arm64 build flags. oneDNN is off on Apple silicon; the deployment
-# target matches the oldest runner the matrix builds on.
+# target matches the runner image the matrix builds on (macos-26).
 MACOS_BUILD_ENV: dict[str, str] = {
     "TENSORPLAY_BINARY_BUILD": "1",
     "USE_CUDA": "0",
-    "MACOSX_DEPLOYMENT_TARGET": "14.0",
+    "MACOSX_DEPLOYMENT_TARGET": "26.0",
     "USE_TP_DISTRIBUTED": "0",
     "USE_MKLDNN": "OFF",
 }
