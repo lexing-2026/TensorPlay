@@ -472,7 +472,9 @@ Tensor conv_grad_weight_channel_last(const Tensor& grad_output, const Tensor& in
     CUDNN_CHECK(cudnnConvolutionBackwardFilter(
         handle, &alpha, *x_desc, x.data_ptr(), *dy_desc, dy.data_ptr(), *conv_desc,
         algo, workspace.get(), workspace_size, &beta, *dw_desc, grad_weight.data_ptr()));
-    return grad_weight.contiguous();
+    // The gradient keeps the order the engine wrote it in, which is the order
+    // the parameter it belongs to already carries.
+    return grad_weight;
 }
 
 
