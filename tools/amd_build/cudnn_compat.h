@@ -854,4 +854,82 @@ using cudnnBatchNormMode_t = miopenBatchNormMode_t;
     miopenBatchNormalizationForwardInference
 #define cudnnBatchNormalizationBackward miopenBatchNormalizationBackward
 
+// The extended batch-normalization routines carry a fused activation, an
+// optional output plane and caller-owned workspace, and name a persistent
+// spatial mode.  The AMD DNN library serves none of that: the persistent
+// mode resolves to the plain spatial one, the workspace and reserve-space
+// sizes come back zero because the plain routines need none, and the calls
+// forward to the plain routines with the fused operands dropped.
+#define CUDNN_BATCHNORM_SPATIAL_PERSISTENT miopenBNSpatial
+
+using cudnnBatchNormOps_t = int;
+#define CUDNN_BATCHNORM_OPS_BN 0
+
+inline cudnnStatus_t cudnnGetBatchNormalizationForwardTrainingExWorkspaceSize(
+    cudnnHandle_t, cudnnBatchNormMode_t, cudnnBatchNormOps_t,
+    cudnnTensorDescriptor_t, cudnnTensorDescriptor_t, cudnnTensorDescriptor_t,
+    cudnnTensorDescriptor_t, cudnnActivationDescriptor_t,
+    size_t* sizeInBytes) {
+    *sizeInBytes = 0;
+    return CUDNN_STATUS_SUCCESS;
+}
+
+inline cudnnStatus_t cudnnGetBatchNormalizationTrainingExReserveSpaceSize(
+    cudnnHandle_t, cudnnBatchNormMode_t, cudnnBatchNormOps_t,
+    cudnnActivationDescriptor_t, cudnnTensorDescriptor_t,
+    size_t* sizeInBytes) {
+    *sizeInBytes = 0;
+    return CUDNN_STATUS_SUCCESS;
+}
+
+inline cudnnStatus_t cudnnBatchNormalizationForwardTrainingEx(
+    cudnnHandle_t handle, cudnnBatchNormMode_t mode, cudnnBatchNormOps_t,
+    const void* alpha, const void* beta,
+    cudnnTensorDescriptor_t xDesc, const void* x,
+    cudnnTensorDescriptor_t, const void*,
+    cudnnTensorDescriptor_t yDesc, void* y,
+    cudnnTensorDescriptor_t bnScaleBiasMeanVarDesc,
+    const void* bnScale, const void* bnBias,
+    double exponentialAverageFactor,
+    void* resultRunningMean, void* resultRunningVariance,
+    double epsilon, void* resultSaveMean, void* resultSaveInvVariance,
+    cudnnActivationDescriptor_t, void*, size_t, void*, size_t) {
+    return miopenBatchNormalizationForwardTraining(
+        handle, mode, alpha, beta, xDesc, x, yDesc, y,
+        bnScaleBiasMeanVarDesc, bnScale, bnBias, exponentialAverageFactor,
+        resultRunningMean, resultRunningVariance, epsilon,
+        resultSaveMean, resultSaveInvVariance);
+}
+
+inline cudnnStatus_t cudnnGetBatchNormalizationBackwardExWorkspaceSize(
+    cudnnHandle_t, cudnnBatchNormMode_t, cudnnBatchNormOps_t,
+    cudnnTensorDescriptor_t, cudnnTensorDescriptor_t, cudnnTensorDescriptor_t,
+    cudnnTensorDescriptor_t, cudnnTensorDescriptor_t, cudnnTensorDescriptor_t,
+    cudnnActivationDescriptor_t, size_t* sizeInBytes) {
+    *sizeInBytes = 0;
+    return CUDNN_STATUS_SUCCESS;
+}
+
+inline cudnnStatus_t cudnnBatchNormalizationBackwardEx(
+    cudnnHandle_t handle, cudnnBatchNormMode_t mode, cudnnBatchNormOps_t,
+    const void* alphaDataDiff, const void* betaDataDiff,
+    const void* alphaParamDiff, const void* betaParamDiff,
+    cudnnTensorDescriptor_t xDesc, const void* x,
+    cudnnTensorDescriptor_t, const void*,
+    cudnnTensorDescriptor_t dyDesc, const void* dy,
+    cudnnTensorDescriptor_t, const void*,
+    cudnnTensorDescriptor_t dxDesc, void* dx,
+    cudnnTensorDescriptor_t bnScaleBiasDiffDesc,
+    const void* bnScale, const void* bnBias,
+    void* resultBnScaleDiff, void* resultBnBiasDiff,
+    double epsilon, const void* savedMean, const void* savedInvVariance,
+    cudnnActivationDescriptor_t, void*, size_t, void*, size_t) {
+    return miopenBatchNormalizationBackward(
+        handle, mode, alphaDataDiff, betaDataDiff,
+        alphaParamDiff, betaParamDiff,
+        xDesc, x, dyDesc, dy, dxDesc, dx,
+        bnScaleBiasDiffDesc, bnScale, resultBnScaleDiff, resultBnBiasDiff,
+        epsilon, savedMean, savedInvVariance);
+}
+
 #endif  // USE_CUDNN
