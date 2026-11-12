@@ -79,9 +79,14 @@ inline cudnnDataType_t tensor_descriptor_dtype(const Tensor& t) {
 
 // Descriptor that reads the operand where it lies: a channel-last operand is
 // named through the extended form, which carries the order rather than a
-// stride list, so the routine addresses it without a repack.
+// stride list, so the routine addresses it without a repack. The extended
+// form is absent from the ROCm library surface; the stride list describes the
+// same memory there, so a channel-last operand falls back to it.
 inline cudnnTensorDescriptor_t createTensorDescriptorPreservingFormat(
     const Tensor& t, bool pad_to_4d = true) {
+#if defined(USE_ROCM)
+    return createTensorDescriptor(t, pad_to_4d);
+#else
     if (!is_channel_last_4d(t)) return createTensorDescriptor(t, pad_to_4d);
     cudnnTensorDescriptor_t desc;
     CUDNN_CHECK(cudnnCreateTensorDescriptor(&desc));
@@ -94,6 +99,7 @@ inline cudnnTensorDescriptor_t createTensorDescriptorPreservingFormat(
         desc, CUDNN_TENSOR_NHWC, tensor_descriptor_dtype(t), t.dim(),
         dims.data()));
     return desc;
+#endif
 }
 
 // Uninitialized tensor carrying the same order as `t`.
