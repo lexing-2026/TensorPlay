@@ -564,6 +564,9 @@ Tensor ormqr_composite(const Tensor& self, const Tensor& input2, const Tensor& i
                        bool left, bool transpose) {
     using namespace cpu;
     require_lapack("ormqr");
+    if (self.dim() < 2) {
+        TP_THROW(RuntimeError, "ormqr(): input must have at least 2 dimensions");
+    }
     if (self.dtype() != input2.dtype() || self.dtype() != input3.dtype()) {
         TP_THROW(RuntimeError, "ormqr(): self, tau and other must share the same dtype");
     }
@@ -648,6 +651,9 @@ Tensor ormqr_composite(const Tensor& self, const Tensor& input2, const Tensor& i
 std::tuple<Tensor, Tensor> geqrf_composite(const Tensor& self) {
     using namespace cpu;
     require_lapack("geqrf");
+    if (self.dim() < 2) {
+        TP_THROW(RuntimeError, "geqrf(): input must have at least 2 dimensions");
+    }
     if (self.dtype() != DType::Float32 && self.dtype() != DType::Float64) {
         TP_THROW(RuntimeError, "geqrf(): only float32 and float64 matrices are "
                  "supported on the CPU backend");
