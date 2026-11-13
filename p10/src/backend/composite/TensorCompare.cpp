@@ -7,8 +7,6 @@
 #include "TypePromotion.h"
 #include "tensorplay/ops/TPXOpsGenerated.h"
 
-#include <cmath>
-#include <cstdint>
 #include <tuple>
 #include <utility>
 
@@ -28,11 +26,11 @@ void isin_dtype_check(DType dt) {
 
 } // anonymous namespace
 
-// Membership by one of two routes chosen on the test-set size: a linear scan
-// whose working set stays at O(elements) for a handful of probes, and a
-// sort-based join that never materializes the elements-by-test comparison
-// matrix.  Both are built from dispatcher-visible primitives, so every
-// backend that provides unique/sort/cat/index inherits them.
+// Membership by one of two routes chosen on the comparison-matrix size: a
+// broadcast comparison over a bool matrix capped by a byte budget, and a
+// sort-based join that never materializes the matrix.  Both are built from
+// dispatcher-visible primitives, so every backend that provides
+// unique/sort/cat/index inherits them.
 Tensor isin_tensor_tensor_native(const Tensor& elements,
                                  const Tensor& test_elements,
                                  bool assume_unique, bool invert) {
@@ -50,17 +48,16 @@ Tensor isin_tensor_tensor_native(const Tensor& elements,
     const Tensor elements_flat = ops::reshape(elements_p, {-1});
     const Tensor test_flat = ops::reshape(test_p, {-1});
 
-    // Below this bound the scan wins: the sort-based join would pay a full
-    // sort to resolve a few probes.  The scan keeps one boolean work tensor
-    // alive instead of the broadcast matrix of size elements x test.
-    const int64_t scan_bound = static_cast<int64_t>(
-        10.0 * std::pow(static_cast<double>(elements.numel()), 0.145));
-    if (test_flat.numel() < scan_bound) {
-        Tensor found = ops::full_like(elements_flat, Scalar(false), DType::Bool);
-        for (int64_t j = 0; j < test_flat.numel(); ++j) {
-            found = ops::logical_or(std::move(found),
-                                    ops::eq(elements_flat, ops::select(test_flat, 0, j)));
-        }
+    // Route on the size of the elements-by-test comparison matrix.  Below
+    // the byte budget a single broadcast comparison answers membership in
+    // two passes over a bool matrix; past it the sort-based join keeps the
+    // working set at O(elements + test) no matter how wide the matrix
+    // would grow.
+    const int64_t matrix_elems = elements.numel() * test_flat.numel();
+    if (matrix_elems <= static_cast<int64_t>(1) << 28) {
+        Tensor found = ops::any(ops::eq(ops::unsqueeze(elements_flat, -1),
+                                        test_flat),
+                                -1, false);
         if (invert) found = ops::logical_not(found);
         return ops::reshape(found, static_cast<std::vector<int64_t>>(elements.shape()));
     }
