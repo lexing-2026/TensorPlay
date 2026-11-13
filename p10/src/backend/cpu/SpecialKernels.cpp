@@ -166,7 +166,7 @@ Tensor entr_cpu(const Tensor& self) {
 }
 Tensor xlog1py_cpu(const Tensor& a, const Tensor& b) {
     return binary_float_kernel(a, b,
-                               [](double x, double y) { return calc_xlog1py(x, y); },
+                               [](auto x, auto y) { return calc_xlog1py(x, y); },
                                "xlog1py");
 }
 

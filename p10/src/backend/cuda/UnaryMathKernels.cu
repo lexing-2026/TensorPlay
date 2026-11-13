@@ -237,10 +237,6 @@ Tensor nan_to_num_cuda(const Tensor& self, const Scalar& nan,
     return out;
 }
 
-Tensor xlogy_cuda(const Tensor& a, const Tensor& b) {
-    return binary_float_cuda(a, b, HFn39{}, "xlogy");
-}
-
 Tensor logaddexp_cuda(const Tensor& a, const Tensor& b) {
     return binary_float_cuda(a, b, HFn40{}, "logaddexp");
 }
@@ -328,7 +324,6 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, UnaryMathKernels) {
     m.impl("digamma", digamma_cuda);
     m.impl("i0", i0_cuda);
     m.impl("nan_to_num", nan_to_num_cuda);
-    m.impl("xlogy", xlogy_cuda);
     m.impl("logaddexp", logaddexp_cuda);
     m.impl("logaddexp2", logaddexp2_cuda);
     m.impl("copysign.Tensor", copysign_cuda);

@@ -939,7 +939,8 @@ Tensor nan_to_num_cpu(const Tensor& self, const Scalar& nan,
 // One arithmetic per map, held by both the form that allocates its answer and
 // the form that is handed one, so the two can never answer differently.
 struct XlogyPair {
-    double operator()(double x, double y) const {
+    template <typename T>
+    T operator()(T x, T y) const {
         return tensorplay::special_math::calc_xlogy(x, y);
     }
 };

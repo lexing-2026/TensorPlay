@@ -8,6 +8,7 @@ namespace {
 using special_detail::binary_float_cuda;
 using special_detail::typed_binary_cuda;
 using tensorplay::special_math::calc_xlog1py;
+using tensorplay::special_math::calc_xlogy;
 using tensorplay::special_math::chebyshev_polynomial_t_forward;
 using tensorplay::special_math::chebyshev_polynomial_u_forward;
 using tensorplay::special_math::chebyshev_polynomial_v_forward;
@@ -25,6 +26,11 @@ using tensorplay::special_math::zeta;
 struct XLog1pyFn {
     template <typename T>
     __device__ T operator()(T x, T y) const { return calc_xlog1py(x, y); }
+};
+
+struct XLogyFn {
+    template <typename T>
+    __device__ T operator()(T x, T y) const { return calc_xlogy(x, y); }
 };
 
 Tensor chebyshev_polynomial_t_cuda(const Tensor& x, const Tensor& n) {
@@ -95,6 +101,9 @@ Tensor zeta_cuda(const Tensor& s, const Tensor& q) {
 Tensor xlog1py_cuda(const Tensor& x, const Tensor& y) {
     return typed_binary_cuda(x, y, XLog1pyFn{});
 }
+Tensor xlogy_cuda(const Tensor& x, const Tensor& y) {
+    return typed_binary_cuda(x, y, XLogyFn{});
+}
 
 }  // namespace
 
@@ -113,6 +122,7 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, SpecialBinaryKernels) {
     m.impl("legendre_polynomial_p", legendre_polynomial_p_cuda);
     m.impl("zeta", zeta_cuda);
     m.impl("xlog1py", xlog1py_cuda);
+    m.impl("xlogy", xlogy_cuda);
 }
 
 }  // namespace tensorplay::cuda
