@@ -278,6 +278,83 @@ std::tuple<Tensor, Tensor> cummin_kernel(const Tensor& self, int64_t dim) {
             empty_meta(out, DType::Int64, self.device())};
 }
 
+// ---------------------------------------------------------------------------
+// NaN-aware and accumulate-style reductions.
+// ---------------------------------------------------------------------------
+
+Tensor nansum_kernel(const Tensor& self, const std::vector<int64_t>& dim_in,
+                     bool keepdim) {
+    // A NaN passes through the accumulator untouched, which needs a
+    // floating or integer lane; complex accumulation has no NaN lane here.
+    if (isComplexType(self.dtype())) {
+        TP_THROW(RuntimeError, "nansum does not support complex inputs");
+    }
+    const DType out_dt = isFloatingType(self.dtype()) ? self.dtype() : DType::Int64;
+    std::vector<int64_t> dims = dim_in;
+    if (dims.empty()) {
+        for (int64_t i = 0; i < self.dim(); ++i) dims.push_back(i);
+    }
+    return empty_meta(reduce_out_shape(self, dims, keepdim), out_dt, self.device());
+}
+
+Tensor nanmean_kernel(const Tensor& self, std::optional<int64_t> dim_opt,
+                      bool keepdim, std::optional<DType> dtype) {
+    const DType acc_dt = dtype.value_or(DType::Undefined);
+    if (!isFloatingType(self.dtype()) && !isComplexType(self.dtype())) {
+        TP_THROW(TypeError,
+                 "nanmean(): expected input to have floating point or complex dtype but got ",
+                 toString(self.dtype()));
+    }
+    if (acc_dt != DType::Undefined && !isFloatingType(acc_dt) &&
+        !isComplexType(acc_dt)) {
+        TP_THROW(TypeError,
+                 "nanmean(): could not infer output dtype. Optional dtype must be either a floating point or complex dtype. Got: ",
+                 toString(acc_dt));
+    }
+    // The mean sums the input with the NaN-aware accumulator, so a complex
+    // operand works only after the caller pins a real accumulation type.
+    if (isComplexType(self.dtype()) &&
+        (acc_dt == DType::Undefined || isComplexType(acc_dt))) {
+        TP_THROW(RuntimeError, "nansum does not support complex inputs");
+    }
+    std::vector<int64_t> dims;
+    if (dim_opt.has_value()) {
+        dims.push_back(*dim_opt);
+    } else {
+        for (int64_t i = 0; i < self.dim(); ++i) dims.push_back(i);
+    }
+    // Narrow floating types accumulate in the single-precision lane.
+    const DType out_dt = acc_dt != DType::Undefined
+                             ? acc_dt
+                             : (isReducedFloatingType(self.dtype()) ? DType::Float32
+                                                                    : self.dtype());
+    return empty_meta(reduce_out_shape(self, dims, keepdim), out_dt, self.device());
+}
+
+Tensor logcumsumexp_kernel(const Tensor& self, int64_t dim, std::optional<DType> dtype) {
+    const int64_t nd = self.dim();
+    if (nd == 0) {
+        // A rank-0 tensor has one virtual dimension, addressable as -1 or 0.
+        if (dim != -1 && dim != 0) {
+            TP_THROW(IndexError,
+                     "Dimension out of range for a scalar tensor (expected -1 or 0, but got ",
+                     dim, ")");
+        }
+    } else if (dim < -nd || dim >= nd) {
+        TP_THROW(RuntimeError, "Dimension out of range (expected to be in range of [",
+                 -nd, ", ", nd - 1, "], but got ", dim, ")");
+    }
+    const DType out_dt = dtype.value_or(self.dtype());
+    // The scan accumulates in one of the four floating lanes; complex inputs
+    // accumulate in their own lane.
+    if (!isComplexType(out_dt) && out_dt != DType::Float32 &&
+        out_dt != DType::Float64 && out_dt != DType::Float16 &&
+        out_dt != DType::BFloat16) {
+        TP_THROW(TypeError, "logcumsumexp: unsupported dtype");
+    }
+    return empty_meta(shape_of(self), out_dt, self.device());
+}
+
 } // anonymous namespace
 
 TENSORPLAY_LIBRARY_IMPL(Meta, MetaReduce) {
@@ -302,6 +379,9 @@ TENSORPLAY_LIBRARY_IMPL(Meta, MetaReduce) {
     m.impl("nanmedian.dim", nanmedian_dim_kernel);
     m.impl("cummax", cummax_kernel);
     m.impl("cummin", cummin_kernel);
+    m.impl("nansum", nansum_kernel);
+    m.impl("nanmean", nanmean_kernel);
+    m.impl("logcumsumexp", logcumsumexp_kernel);
 }
 
 } // namespace meta

@@ -182,6 +182,9 @@ set(P10_SOURCES
     src/backend/meta/MetaLogic.cpp
     src/backend/meta/MetaSelection.cpp
     src/backend/meta/MetaIndex.cpp
+    src/backend/meta/MetaComplex.cpp
+    src/backend/meta/MetaPad.cpp
+    src/backend/meta/MetaMisc.cpp
     src/backend/composite/RNN.cpp
     src/backend/composite/TensorAdvancedIndexing.cpp
     src/backend/composite/TensorCompare.cpp

@@ -1937,6 +1937,233 @@ def test_linalg_pinv_diagonal_and_empty():
 
 
 # ---------------------------------------------------------------------------
+# Complex views and factories
+# ---------------------------------------------------------------------------
+
+
+def test_complex_views_and_factories():
+    c = _meta(2, 3, dtype=tp.complex64)
+    assert tuple(tp.real(c).shape) == (2, 3) and tp.real(c).dtype == tp.float32
+    assert tuple(tp.imag(c).shape) == (2, 3) and tp.imag(c).dtype == tp.float32
+    assert tp.real(_meta(2, dtype=tp.complex128)).dtype == tp.float64
+    assert tp.imag(_meta(2, dtype=tp.complex128)).dtype == tp.float64
+    # A real tensor is its own real part; its imaginary part is zeros.
+    x = _meta(2, 3, dtype=tp.float32)
+    assert tuple(tp.real(x).shape) == (2, 3) and tp.real(x).dtype == tp.float32
+    assert tuple(tp.imag(x).shape) == (2, 3) and tp.imag(x).dtype == tp.float32
+    # conj of a real operand is a view with the input's layout; a complex
+    # operand answers the materialized geometry.
+    assert tuple(tp.conj(x).stride()) == tuple(x.stride())
+    assert tuple(tp.conj(c).shape) == (2, 3) and tp.conj(c).dtype == tp.complex64
+    assert tuple(tp.conj(_meta(4)).shape) == (4,)
+    # adjoint is transpose(-2, -1) composed with conj; ndim <= 1 is plain conj.
+    assert tuple(tp.adjoint(_meta(2, 3, 4)).shape) == (2, 4, 3)
+    assert tuple(tp.adjoint(_meta(4)).shape) == (4,)
+    adj = tp.adjoint(c)
+    assert tuple(adj.shape) == (3, 2) and adj.dtype == tp.complex64
+    # factories answer the broadcast in the complex twin dtype.
+    out = tp.complex(_meta(2, 1, dtype=tp.float32), _meta(3, dtype=tp.float32))
+    assert tuple(out.shape) == (2, 3) and out.dtype == tp.complex64
+    pol = tp.polar(_meta(2, 3, dtype=tp.float64), _meta(2, 3, dtype=tp.float64))
+    assert tuple(pol.shape) == (2, 3) and pol.dtype == tp.complex128
+    with pytest.raises(Exception):
+        tp.complex(_meta(2, dtype=tp.int32), _meta(2, dtype=tp.int32))
+    with pytest.raises(Exception):
+        tp.complex(_meta(2, dtype=tp.float32), _meta(2, dtype=tp.float64))
+    with pytest.raises(Exception):
+        tp.complex(_meta(2, dtype=tp.float32), _meta(2, dtype=tp.float32, device="cpu"))
+    with pytest.raises(Exception):
+        tp.polar(_meta(2, dtype=tp.float32), _meta(3, dtype=tp.int32))
+
+
+def test_view_as_real_and_complex():
+    c = _meta(2, 3, dtype=tp.complex64)
+    v = tp.view_as_real(c)
+    assert tuple(v.shape) == (2, 3, 2)
+    assert tuple(v.stride()) == (6, 2, 1)
+    assert v.dtype == tp.float32
+    # every source stride doubles, on non-contiguous layouts too
+    tv = tp.view_as_real(tp.t(c))
+    assert tuple(tv.shape) == (3, 2, 2)
+    assert tuple(tv.stride()) == (2, 6, 1)
+    assert tp.view_as_real(_meta(2, dtype=tp.complex128)).dtype == tp.float64
+    back = tp.view_as_complex(v)
+    assert tuple(back.shape) == (2, 3) and back.dtype == tp.complex64
+    pair = _meta(2, dtype=tp.float32)
+    assert tuple(tp.view_as_complex(pair).shape) == ()
+    with pytest.raises(Exception):
+        tp.view_as_real(_meta(2, dtype=tp.float32))
+    # the last dimension must hold exactly the pair, with unit stride
+    with pytest.raises(Exception):
+        tp.view_as_complex(_meta(2, 3, dtype=tp.float32))
+    with pytest.raises(Exception):
+        tp.view_as_complex(_meta(2, dtype=tp.int32))
+    # an odd outer stride would split a pair
+    transposed = tp.t(_meta(2, 3, dtype=tp.float32))  # strides (1, 2)
+    with pytest.raises(Exception):
+        tp.view_as_complex(transposed)
+    # an odd entry position would start inside a pair
+    odd_offset = tp.narrow(_meta(6, dtype=tp.float32), 0, 1, 2)
+    with pytest.raises(Exception):
+        tp.view_as_complex(odd_offset)
+
+
+# ---------------------------------------------------------------------------
+# Non-constant padding
+# ---------------------------------------------------------------------------
+
+
+def test_nonconstant_padding_shapes():
+    x = _meta(2, 3, 4)
+    assert tuple(tp.reflection_pad1d(x, [1, 2]).shape) == (2, 3, 7)
+    assert tuple(tp.reflection_pad2d(x, [1, 2, 1, 2]).shape) == (2, 6, 7)
+    assert tuple(tp.reflection_pad3d(x, [1, 1, 1, 1, 1, 1]).shape) == (4, 5, 6)
+    assert tuple(tp.reflection_pad_nd(x, [1, 1, 1, 1]).shape) == (2, 5, 6)
+    assert tuple(tp.replication_pad2d(x, [1, 0, 0, 1]).shape) == (2, 4, 5)
+    assert tuple(tp.circular_pad_nd(x, [1, 1, 1, 1]).shape) == (2, 5, 6)
+    g = _meta(2, 5, 7, dtype=tp.float32)
+    assert tuple(tp.reflection_pad2d_backward(g, x, [1, 2, 1, 2]).shape) == (2, 3, 4)
+    assert tuple(tp.replication_pad1d_backward(g, _meta(2, 5), [1, 1]).shape) == (2, 5)
+    assert tuple(tp.circular_pad_nd_backward(g, x, [1, 2, 1, 2]).shape) == (2, 3, 4)
+    assert tp.replication_pad1d(_meta(2, 3, dtype=tp.int32), [1, 1]).dtype == tp.int32
+    # pad-list and mode validations
+    with pytest.raises(Exception):
+        tp.reflection_pad1d(x, [1])
+    with pytest.raises(Exception):
+        tp.reflection_pad2d(_meta(2), [1, 1, 1, 1])
+    with pytest.raises(Exception):
+        tp.reflection_pad1d(_meta(2), [2, 1])
+    with pytest.raises(Exception):
+        tp.circular_pad_nd(_meta(2), [3, 1])
+    # the forward accepts a wider dtype set than the backward
+    with pytest.raises(Exception):
+        tp.reflection_pad1d(_meta(2, 3, dtype=tp.int64), [1, 1])
+    with pytest.raises(Exception):
+        tp.reflection_pad1d_backward(_meta(2, 5, dtype=tp.int32),
+                                     _meta(2, 3, dtype=tp.int32), [1, 1])
+
+
+# ---------------------------------------------------------------------------
+# NaN-aware reductions and the accumulate scan
+# ---------------------------------------------------------------------------
+
+
+def test_nansum_nanmean_logcumsumexp():
+    x = _meta(2, 3)
+    assert tuple(tp.nansum(x, dim=[1]).shape) == (2,)
+    assert tuple(tp.nansum(x, dim=[1], keepdim=True).shape) == (2, 1)
+    assert tuple(tp.nansum(x).shape) == ()
+    assert tp.nansum(x).dtype == tp.float32
+    assert tp.nansum(_meta(2, 3, dtype=tp.int32)).dtype == tp.int64
+    assert tp.nansum(_meta(2, dtype=tp.float64)).dtype == tp.float64
+    with pytest.raises(Exception):
+        tp.nansum(_meta(2, dtype=tp.complex64))
+
+    assert tuple(tp.nanmean(x, dim=0).shape) == (3,)
+    assert tuple(tp.nanmean(x, dim=1, keepdim=True).shape) == (2, 1)
+    assert tuple(tp.nanmean(x).shape) == ()
+    # narrow floating types accumulate at single precision
+    assert tp.nanmean(_meta(2, dtype=tp.float16)).dtype == tp.float32
+    assert tp.nanmean(_meta(2, dtype=tp.float64)).dtype == tp.float64
+    assert tp.nanmean(x, dim=0, dtype=tp.float64).dtype == tp.float64
+    with pytest.raises(Exception):
+        tp.nanmean(_meta(2, dtype=tp.int32))
+    with pytest.raises(Exception):
+        tp.nanmean(x, dim=0, dtype=tp.int32)
+    with pytest.raises(Exception):
+        tp.nanmean(_meta(2, dtype=tp.complex64))
+    # a complex input works once a real accumulation type is pinned
+    assert tp.nanmean(_meta(2, dtype=tp.complex64),
+                      dtype=tp.float32).dtype == tp.float32
+
+    y = _meta(2, 3)
+    assert tuple(tp.logcumsumexp(y, dim=0).shape) == (2, 3)
+    assert tp.logcumsumexp(y, dim=1).dtype == tp.float32
+    assert tp.logcumsumexp(_meta(2, dtype=tp.float16), dim=0).dtype == tp.float16
+    assert tp.logcumsumexp(y, dim=0, dtype=tp.float64).dtype == tp.float64
+    assert tp.logcumsumexp(_meta(2, dtype=tp.complex64), dim=0).dtype == tp.complex64
+    with pytest.raises(Exception):
+        tp.logcumsumexp(tp.empty([], device="meta"), dim=2)
+    with pytest.raises(Exception):
+        tp.logcumsumexp(y, dim=5)
+    with pytest.raises(Exception):
+        tp.logcumsumexp(_meta(2, dtype=tp.int32), dim=0)
+
+
+# ---------------------------------------------------------------------------
+# Tensor-list builders
+# ---------------------------------------------------------------------------
+
+
+def test_block_diag_and_broadcast_tensors():
+    a = _meta(2, 3)
+    b = _meta(3, dtype=tp.float64)
+    out = tp.block_diag(a, b)
+    assert tuple(out.shape) == (3, 6)
+    assert out.dtype == tp.float64
+    # a rank-1 block spans one row; the empty call answers the placeholder
+    assert tuple(tp.block_diag(tp.empty([], device="meta"), a).shape) == (3, 4)
+    assert tuple(tp.block_diag().shape) == (1, 0)
+    assert tp.block_diag().dtype == tp.float32
+    with pytest.raises(Exception):
+        tp.block_diag(a, _meta(2, 2, 2))
+    with pytest.raises(Exception):
+        tp.block_diag(a, _meta(2, 2, device="cpu"))
+
+    t1 = _meta(2, 1)
+    t2 = _meta(3)
+    outs = tp.broadcast_tensors(t1, t2)
+    assert len(outs) == 2
+    assert all(tuple(o.shape) == (2, 3) for o in outs)
+    # the broadcast dimension repeats elements, so its stride is zero
+    assert tuple(outs[0].stride()) == (1, 0)
+    assert tuple(outs[1].stride()) == (0, 1)
+    same = _meta(2, 3)
+    outs2 = tp.broadcast_tensors(same, _meta(2, 3))
+    assert all(tuple(o.shape) == (2, 3) for o in outs2)
+
+
+# ---------------------------------------------------------------------------
+# Assorted value-free kernels
+# ---------------------------------------------------------------------------
+
+
+def test_alpha_dropout_histc_frexp():
+    x = _meta(2, 3)
+    out, mask = tp.native_alpha_dropout(x, 0.5)
+    assert tuple(out.shape) == (2, 3) and out.dtype == tp.float32
+    assert tuple(mask.shape) == (2, 3) and mask.dtype == tp.float32
+    assert tp.native_alpha_dropout(_meta(2, dtype=tp.float64), 0.2)[0].dtype == tp.float64
+    assert tp.native_alpha_dropout(_meta(2, dtype=tp.int32), 0.2)[0].dtype == tp.float32
+    with pytest.raises(Exception):
+        tp.native_alpha_dropout(x, 1.0)
+    with pytest.raises(Exception):
+        tp.native_alpha_dropout(x, -0.1)
+
+    h = tp.histc(x, 10, 0.0, 1.0)
+    assert tuple(h.shape) == (10,) and h.dtype == tp.float32
+    # an equal range derives the span from the data, which meta cannot read;
+    # the shape is still answered
+    assert tuple(tp.histc(x, 5, 2.0, 2.0).shape) == (5,)
+    assert tp.histc(_meta(4, dtype=tp.float64), 3, 0.0, 1.0).dtype == tp.float64
+    with pytest.raises(Exception):
+        tp.histc(x, 0, 0.0, 1.0)
+    with pytest.raises(Exception):
+        tp.histc(_meta(2, dtype=tp.int32), 4, 0.0, 1.0)
+    with pytest.raises(Exception):
+        tp.histc(x, 4, 2.0, 1.0)
+    with pytest.raises(Exception):
+        tp.histc(x, 4, float("nan"), 1.0)
+
+    m, e = tp.frexp(x)
+    assert tuple(m.shape) == (2, 3) and m.dtype == tp.float32
+    assert tuple(e.shape) == (2, 3) and e.dtype == tp.int32
+    assert tp.frexp(_meta(2, dtype=tp.float64))[1].dtype == tp.int32
+    with pytest.raises(Exception):
+        tp.frexp(_meta(2, dtype=tp.int32))
+
+
+# ---------------------------------------------------------------------------
 # Cross-checks against the reference framework when it is installed
 # ---------------------------------------------------------------------------
 

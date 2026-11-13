@@ -719,6 +719,60 @@ Tensor cartesian_prod_kernel(const std::vector<Tensor>& tensors) {
                       tensors[0].device());
 }
 
+// ---------------------------------------------------------------------------
+// Tensor-list builders.
+// ---------------------------------------------------------------------------
+
+Tensor block_diag_kernel(const std::vector<Tensor>& tensors) {
+    // Rectangular blocks laid along the diagonal; the empty call answers a
+    // (1, 0) placeholder in the default floating type and device.  A rank-1
+    // block spans one row and a rank-0 block is the 1x1 cell.
+    if (tensors.empty()) {
+        return empty_meta({1, 0}, DType::Float32, globalContext().defaultDevice());
+    }
+    const Device& device = tensors[0].device();
+    DType out_dtype = tensors[0].dtype();
+    int64_t rows = 0, cols = 0;
+    for (size_t idx = 0; idx < tensors.size(); ++idx) {
+        const Tensor& t = tensors[idx];
+        if (!(t.device() == device)) {
+            TP_THROW(RuntimeError,
+                     "block_diag: input tensors must all be on the same device.");
+        }
+        out_dtype = promoteTypes(out_dtype, t.dtype());
+        const int64_t nd = t.dim();
+        if (nd > 2) {
+            TP_THROW(RuntimeError,
+                     "block_diag: Input tensors must have 2 or fewer dimensions. Input ",
+                     static_cast<int64_t>(idx), " has ", nd, " dimensions");
+        }
+        rows += nd == 2 ? t.size(0) : 1;
+        cols += nd == 2 ? t.size(1) : (nd == 1 ? t.size(0) : 1);
+    }
+    return empty_meta({rows, cols}, out_dtype, device);
+}
+
+std::vector<Tensor> broadcast_tensors_kernel(const std::vector<Tensor>& tensors) {
+    // The common broadcast shape, then a stride-0 view for every operand that
+    // needs one -- the expand view walks the source layout, repeating
+    // dimensions grown from 1 and keeping every other source stride.  An
+    // operand already at the common shape is returned unchanged.
+    std::vector<int64_t> shape;
+    for (const Tensor& t : tensors) {
+        shape = broadcast_shapes(shape, shape_of(t));
+    }
+    std::vector<Tensor> outs;
+    outs.reserve(tensors.size());
+    for (const Tensor& t : tensors) {
+        if (shape_of(t) == shape) {
+            outs.push_back(t);
+            continue;
+        }
+        outs.push_back(t.expand(shape));
+    }
+    return outs;
+}
+
 } // anonymous namespace
 
 TENSORPLAY_LIBRARY_IMPL(Meta, MetaShape) {
@@ -750,6 +804,8 @@ TENSORPLAY_LIBRARY_IMPL(Meta, MetaShape) {
     m.impl("trace", trace_kernel);
     m.impl("upsample_bilinear2d", upsample_bilinear2d_kernel);
     m.impl("pixel_shuffle", pixel_shuffle_kernel);
+    m.impl("block_diag", block_diag_kernel);
+    m.impl("broadcast_tensors", broadcast_tensors_kernel);
 }
 
 } // namespace meta
