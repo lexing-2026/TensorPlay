@@ -466,7 +466,7 @@ def _hardshrink(graph: Graph, node: Node) -> Node:
     lambd = _scalar_arg(node, 1, "lambd", 0.5)
     magnitude = _unop(graph, "abs", x)
     gate = _binop(graph, operator.gt, magnitude, lambd)
-    return _where(graph, gate, x, 0.0)
+    return _where(graph, gate, x, 0)
 
 
 @_method("softshrink")
@@ -477,9 +477,17 @@ def _softshrink(graph: Graph, node: Node) -> Node:
     lambd = _scalar_arg(node, 1, "lambd", 0.5)
     upper_gate = _binop(graph, operator.gt, x, lambd)
     upper_branch = _binop(graph, operator.sub, x, lambd)
-    lower_gate = _binop(graph, operator.lt, x, -lambd)
+    # The lower bound is the negative of the same argument.  When that argument
+    # is a value of the region rather than a Python number, the sign is part of
+    # the graph, so it is spelled as a node.
+    neg_lambd = (
+        graph.create_node("call_function", operator.neg, (lambd,))
+        if isinstance(lambd, Node)
+        else -lambd
+    )
+    lower_gate = _binop(graph, operator.lt, x, neg_lambd)
     lower_branch = _binop(graph, operator.add, x, lambd)
-    inner = _where(graph, lower_gate, lower_branch, 0.0)
+    inner = _where(graph, lower_gate, lower_branch, 0)
     return _where(graph, upper_gate, upper_branch, inner)
 
 
