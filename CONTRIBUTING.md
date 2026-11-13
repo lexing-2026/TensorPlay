@@ -172,6 +172,24 @@ pytest --num-shards 3 --shard-id 1   # run a third of every file
 Tests are assigned by a stable hash of their id, so shards stay balanced
 and adding tests only moves the new ones.
 
+## Isolating a device run
+
+One pytest process shares a single device context and allocator across every
+file, so one illegal access or one leaked allocation makes every later device
+test fail with the same error. Run each file in its own interpreter when you
+need to know which file is actually broken:
+
+```bash
+python tools/run_tests_isolated.py                    # all of test/
+python tools/run_tests_isolated.py test/nn -k sdpa    # a subtree, filtered
+python tools/run_tests_isolated.py --jobs 4           # CPU-only parallel run
+```
+
+Each file gets a fresh process, its own junit report and a per-file verdict
+(`ok`, `fail`, `error`, `crash`, `timeout`); `--json` writes the same data for
+a later diff. Files run one at a time by default because device memory is a
+shared resource — `--jobs` is for runs that do not touch a device.
+
 ## Documentation
 
 Documentation is built using Sphinx.
