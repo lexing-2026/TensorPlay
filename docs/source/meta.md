@@ -43,7 +43,7 @@ modulo, division and two-operand transcendental pairs plus the
 `prod`, `amax`/`amin`, `argmax`/`argmin`, `logsumexp`, `nansum`/`nanmean`, `logcumsumexp`,
 `all`/`any`, `mode`/`kthvalue`, `median`/`nanmedian`, `cummax`/`cummin`), matrix
 products (`matmul` and friends, `dot`/`mv`/`inner`/`ger`, `cross`,
-`baddbmm`/`addbmm`, `conv1d`/`conv2d`/`conv3d`/`conv_transpose2d`), views
+`baddbmm`/`addbmm`, `conv1d`/`conv2d`/`conv3d`/`conv_transpose1d`/`conv_transpose2d`/`conv_transpose3d`), views
 (`reshape`, `transpose`, `slice`, `squeeze`, `unsqueeze`, `chunk`, `unbind`,
 `split_with_sizes`, `cat`, `diff`), the complex views (`real`, `imag`, `conj`,
 `adjoint`, `view_as_real`, `view_as_complex` — the last two re-stride the
