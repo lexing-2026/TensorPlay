@@ -31,7 +31,9 @@ Tensor replay_pivots(const Tensor& pivots, int64_t m, int64_t k) {
         static_cast<std::vector<int64_t>>(source.shape());
     sizes.back() = m;
     Tensor perm = Tensor::empty(sizes, DType::Int64, source.device());
-    const int64_t batch = source.numel() / std::max<int64_t>(k, 1);
+    // Counted from the permutation, not from the pivot tensor: a matrix with
+    // zero columns still has one (identity) permutation per batch member.
+    const int64_t batch = perm.numel() / std::max<int64_t>(m, 1);
     if (perm.numel() == 0) return perm;
 
     const int32_t* pivot_data = source.data_ptr<int32_t>();

@@ -503,8 +503,11 @@ void linalg_check_errors_kernel(const Tensor& infos, const std::string& api_name
     linalg_check_errors(infos, api_name, is_matrix);
 }
 
+// The status planes start at zero for every matrix, including the ones the
+// backend library never sees because their trailing plane is empty; a
+// successful factorization and an empty matrix both report zero.
 Tensor empty_info_like(const Tensor& proto, const std::vector<int64_t>& batch) {
-    return Tensor::empty(batch, DType::Int32, proto.device());
+    return Tensor::zeros(batch, DType::Int32, proto.device());
 }
 
 Tensor empty_pivots(const Tensor& proto, const std::vector<int64_t>& batch, int64_t k) {
@@ -637,7 +640,10 @@ std::tuple<Tensor, Tensor, Tensor> linalg_det_internal_kernel(const Tensor& A) {
     Tensor pivots_tensor;
     std::tie(LU_tensor, pivots_tensor, std::ignore) =
         lu_factor_ex_impl(src, true, false, "linalg.lu_factor");
-    const int64_t batch_size = batch_count_of(LU_tensor);
+    // Counted from the batch shape rather than from the elements: an empty
+    // matrix still has a batch of determinants to write, and every one of them
+    // is the empty product.
+    const int64_t batch_size = linear_batch_size(batch_shape_of(LU_tensor));
     const int64_t n = LU_tensor.size(-1);
     Tensor result = Tensor::empty(batch_shape_of(A), A.dtype(), A.device());
     run_linalg(A.dtype(), [&](auto tag) {
@@ -649,7 +655,9 @@ std::tuple<Tensor, Tensor, Tensor> linalg_det_internal_kernel(const Tensor& A) {
         for (int64_t b = 0; b < batch_size; ++b) {
             T det = T(1);
             for (int64_t i = 0; i < n; ++i) det *= lu[b * ms + i * n + i];
-            out[b] = det * static_cast<T>(lu_perm_sign(&piv[b * n], n));
+            const int64_t perm_sign =
+                n == 0 ? 1 : lu_perm_sign(&piv[b * n], n);
+            out[b] = det * static_cast<T>(perm_sign);
         }
     });
     return {result, LU_tensor, pivots_tensor};
@@ -673,7 +681,7 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> linalg_slogdet_internal_kernel(
     Tensor pivots_tensor;
     std::tie(LU_tensor, pivots_tensor, std::ignore) =
         lu_factor_ex_impl(work, true, false, "linalg.lu_factor");
-    const int64_t batch_size = batch_count_of(LU_tensor);
+    const int64_t batch_size = linear_batch_size(batch_shape_of(LU_tensor));
     const int64_t n = LU_tensor.size(-1);
     const auto batch = batch_shape_of(A);
     Tensor sign = Tensor::empty(batch, A.dtype(), A.device());
@@ -698,7 +706,8 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> linalg_slogdet_internal_kernel(
                 logdet += std::log(linalg_abs(d));
                 det *= d;
             }
-            const int64_t perm_sign = lu_perm_sign(&piv[b * n], n);
+            const int64_t perm_sign =
+                n == 0 ? 1 : lu_perm_sign(&piv[b * n], n);
             if (singular) {
                 s_out[b] = T(0);
                 l_out[b] = neg_inf;
@@ -2051,6 +2060,9 @@ Tensor ldl_solve_impl(const Tensor& LD, const Tensor& pivots, const Tensor& B,
         const auto* a = LD_work.data_ptr<T>();
         auto* b = B_work.data_ptr<T>();
         const auto* piv = piv32.data_ptr<int32_t>();
+        // A zero-size factor has nothing to solve and no legal leading
+        // dimension to hand the library.
+        if (n == 0 || nrhs == 0 || bs == 0) return;
         for (int64_t i = 0; i < bs; ++i) {
             std::vector<int64_t> ipiv(static_cast<size_t>(n));
             for (int64_t j = 0; j < n; ++j) ipiv[j] = piv[i * n + j];

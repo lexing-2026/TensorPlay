@@ -190,3 +190,112 @@ def test_type_as_dtype_only_cast():
     assert str(got.dtype) == "tensorplay.int32"
     back = got.type_as(w)
     np.testing.assert_allclose(back.numpy(), [[1, 2], [3, 4]])
+
+
+# ---------------------------------------------------------------------------
+# Empty matrices
+#
+# A factorization of a matrix with a zero-sized trailing plane has nothing to
+# factor, so every status plane must read zero and the derived quantities must
+# take their empty-product values rather than whatever memory held.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("shape", [(0, 0), (0, 3), (3, 0)])
+def test_empty_factorization_reports_success(shape):
+    a = tp.zeros(*shape)
+    ref = torch.zeros(*shape)
+
+    lu, pivots, info = tp.linalg.lu_factor_ex(a)
+    rlu, rpivots, rinfo = torch.linalg.lu_factor_ex(ref)
+    assert tuple(lu.shape) == tuple(rlu.shape)
+    assert tuple(pivots.shape) == tuple(rpivots.shape)
+    assert info.item() == 0
+    assert rinfo.item() == 0
+
+    P, L, U = tp.linalg.lu(a)
+    rP, rL, rU = torch.linalg.lu(ref)
+    assert (tuple(P.shape), tuple(L.shape), tuple(U.shape)) == (
+        tuple(rP.shape), tuple(rL.shape), tuple(rU.shape))
+    np.testing.assert_allclose(P.numpy(), rP.numpy())
+
+
+def test_empty_square_solves_report_success():
+    a = tp.zeros(0, 0)
+
+    ld, lpivots, linfo = tp.linalg.ldl_factor_ex(a)
+    assert tuple(ld.shape) == tuple(torch.linalg.ldl_factor_ex(torch.zeros(0, 0)).LD.shape)
+    assert linfo.item() == 0
+
+    x, sinfo = tp.linalg.solve_ex(a, tp.zeros(0, 2))
+    assert tuple(x.shape) == (0, 2) and sinfo.item() == 0
+    assert tp.linalg.cholesky(a).shape == a.shape
+    assert tp.linalg.inv(a).shape == a.shape
+
+
+def test_empty_determinant_is_the_empty_product():
+    np.testing.assert_allclose(tp.linalg.det(tp.zeros(0, 0)).numpy(), 1.0)
+    sign, logabsdet = tp.linalg.slogdet(tp.zeros(0, 0))
+    np.testing.assert_allclose(sign.numpy(), 1.0)
+    np.testing.assert_allclose(logabsdet.numpy(), 0.0)
+    # One determinant per batch member, even though no element is stored.
+    np.testing.assert_allclose(tp.linalg.det(tp.zeros(2, 0, 0)).numpy(), [1.0, 1.0])
+    sign, logabsdet = tp.linalg.slogdet(tp.zeros(2, 0, 0))
+    np.testing.assert_allclose(sign.numpy(), [1.0, 1.0])
+    np.testing.assert_allclose(logabsdet.numpy(), [0.0, 0.0])
+
+
+def test_empty_decompositions_match_reference_geometry():
+    for shape in [(0, 0), (0, 3), (3, 0)]:
+        a = tp.zeros(*shape)
+        ref = torch.zeros(*shape)
+        got = tuple(t.shape for t in tp.linalg.svd(a))
+        want = tuple(t.shape for t in torch.linalg.svd(ref))
+        assert got == want
+        got = tuple(t.shape for t in tp.linalg.qr(a))
+        want = tuple(t.shape for t in torch.linalg.qr(ref))
+        assert got == want
+        tau = tp.zeros(shape[:-2] + (min(shape),))
+        if shape[-2] >= shape[-1]:
+            assert tp.linalg.householder_product(a, tau).shape == a.shape
+
+    a = tp.zeros(0, 0)
+    ref = torch.zeros(0, 0)
+    got = tuple(t.shape for t in tp.linalg.eigh(a))
+    want = tuple(t.shape for t in torch.linalg.eigh(ref))
+    assert got == want
+    assert tp.linalg.eigvals(a).shape == torch.linalg.eigvals(ref).shape
+    assert tp.linalg.svdvals(a).shape == torch.linalg.svdvals(ref).shape
+
+    # The empty factors of a non-square matrix are still orthonormal bases.
+    u, _, vh = tp.linalg.svd(tp.zeros(3, 0))
+    np.testing.assert_allclose(u.numpy(), np.eye(3))
+    u, _, vh = tp.linalg.svd(tp.zeros(0, 3))
+    np.testing.assert_allclose(vh.numpy(), np.eye(3))
+
+
+@pytest.mark.parametrize("shape", [(0, 3), (3, 0), (2, 3, 0)])
+def test_triangular_masks_of_empty_matrices(shape):
+    a = tp.zeros(*shape)
+    assert tp.tril(a).shape == a.shape
+    assert tp.triu(a).shape == a.shape
+
+
+def test_empty_least_squares_and_triangular_solve():
+    solution, residuals, rank, singular = tp.linalg.lstsq(
+        tp.zeros(0, 0), tp.zeros(0, 2))
+    ref = torch.linalg.lstsq(torch.zeros(0, 0), torch.zeros(0, 2))
+    assert tuple(solution.shape) == tuple(ref.solution.shape)
+    assert tuple(residuals.shape) == tuple(ref.residuals.shape)
+    assert rank.shape == ref.rank.shape and rank.item() == ref.rank.item()
+    assert tuple(singular.shape) == tuple(ref.singular_values.shape)
+
+    a = tp.zeros(0, 0)
+    tri = tp.linalg.solve_triangular(a, tp.zeros(0, 2), upper=True)
+    assert tri.shape == torch.linalg.solve_triangular(
+        torch.zeros(0, 0), torch.zeros(0, 2), upper=True).shape
+    lu, pivots, _ = tp.linalg.lu_factor_ex(a)
+    assert tp.linalg.lu_solve(lu, pivots, tp.zeros(0, 2)).shape == (0, 2)
+    assert tp.linalg.lu_solve(lu, pivots, tp.zeros(0)).shape == (0,)
+    ld, lpivots, _ = tp.linalg.ldl_factor_ex(a)
+    assert tp.linalg.ldl_solve(ld, lpivots, tp.zeros(0, 2)).shape == (0, 2)

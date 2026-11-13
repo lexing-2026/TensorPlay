@@ -218,7 +218,10 @@ Tensor triangular_mask_kernel(const Tensor& self, int64_t diagonal) {
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
     int64_t rows = self.size(ndim - 2);
     int64_t cols = self.size(ndim - 1);
-    int64_t batch = self.numel() / (rows * cols);
+    // A zero-sized trailing plane has no elements to visit; the division below
+    // would otherwise split by zero.
+    const int64_t plane = rows * cols;
+    int64_t batch = plane == 0 ? 0 : self.numel() / plane;
     int64_t stride_rc = rows * cols;
     // Clamp k into [-rows, cols] so the per-row boundary below cannot
     // overflow, using the saturated keep ranges.
