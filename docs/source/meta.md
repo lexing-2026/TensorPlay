@@ -39,9 +39,13 @@ print(x.sum(dim=0).shape)     # (4,)
 Coverage is broad but not total. Arithmetic and comparisons (including
 `isclose`), the pointwise unary family (functional and in-place, including the
 modulo, division and two-operand transcendental pairs plus the
-`isnan`/`isinf`/`signbit`/`isreal` predicates), reductions (`sum`, `mean`,
-`prod`, `amax`/`amin`, `argmax`/`argmin`, `logsumexp`, `nansum`/`nanmean`, `logcumsumexp`,
-`all`/`any`, `mode`/`kthvalue`, `median`/`nanmedian`, `cummax`/`cummin`), matrix
+`isnan`/`isinf`/`signbit`/`isreal` predicates, the arc-prefixed and word
+spellings of those names, and the `logaddexp`/`logaddexp2` pair), reductions
+(`sum`, `mean`, `prod`, `amax`/`amin`, `argmax`/`argmin`, `logsumexp`,
+`nansum`/`nanmean`, `logcumsumexp`,
+`all`/`any`, `mode`/`kthvalue`, `median`/`nanmedian`, `cummax`/`cummin`,
+`trapezoid`/`cumulative_trapezoid`, `cov`/`corrcoef`, `count_nonzero`, and the
+bin-count `histogram` contract), matrix
 products (`matmul` and friends, `dot`/`mv`/`inner`/`ger`, `cross`,
 `baddbmm`/`addbmm`, `conv1d`/`conv2d`/`conv3d`/`conv_transpose1d`/`conv_transpose2d`/`conv_transpose3d`), views
 (`reshape`, `transpose`, `slice`, `squeeze`, `unsqueeze`, `chunk`, `unbind`,
@@ -53,13 +57,19 @@ indexing (`gather`, `scatter`, `index_select`,
 `_index_put_impl_`), shape builders (`tril`/`triu`, `diag_embed`/`diagflat`,
 `rot90`, `cartesian_prod`, `kron`, `one_hot`, `trace`, `block_diag`,
 `broadcast_tensors`,
-`upsample_bilinear2d`, `pixel_shuffle`), the activations and normalization
+`upsample_bilinear2d`, `pixel_shuffle`/`pixel_unshuffle`, `channel_shuffle`,
+the scatter forms (`select_scatter`/`slice_scatter`/`diagonal_scatter`) and
+`vander`), the activations and normalization
 layers (`softmax`, `threshold`, `layer_norm`, `group_norm`, `instance_norm`,
 `batch_norm`, `rms_norm`), the
-norm and distance family (`dist`, `renorm`), and the losses (`nll_loss`,
-`cross_entropy`, `mse_loss`, Huber, soft-margin, hinge-embedding,
-margin-ranking, cosine-embedding and the multi-class/multi-label margin
-losses) all run on meta tensors. The margin losses still enforce their target
+norm and distance family (`dist`, `renorm`, `pdist`), and the losses
+(`nll_loss`, `cross_entropy`, `mse_loss`, L1, KL, Poisson NLL, Huber,
+binary cross entropy with and without logits, soft-margin,
+multi-label soft-margin, hinge-embedding, margin-ranking, cosine-embedding,
+triplet-margin and the multi-class/multi-label margin
+losses) all run on meta tensors. The plain loss names average to a scalar at
+the double type when their leading operand has one, single precision
+otherwise. The margin losses still enforce their target
 layout (a 1-D index vector for the multi-class form, a rank-2 label table for
 the multi-label one); only the per-entry index range is a value check that
 cannot run.
