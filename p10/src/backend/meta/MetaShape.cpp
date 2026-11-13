@@ -12,6 +12,7 @@
 #include "Exception.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <optional>
@@ -409,18 +410,457 @@ Tensor trace_kernel(const Tensor& self) {
 }
 
 // ---------------------------------------------------------------------------
-// Bilinear upsampling: the two spatial axes are replaced by the requested
-// extents, the leading axes are kept.
+// Resampling.  Every variant keeps the batch and channel planes of its
+// operand and lays the recorded output sizes over the spatial ones.  A zero
+// extent answers an empty tensor; a negative one is rejected the way an
+// allocation rejects it.  The arithmetic runs on floating operands only, and
+// only where values actually flow, so the dtype gate follows that
+// reachability: an empty operand or an empty swept span answers before any
+// arithmetic would run.
 // ---------------------------------------------------------------------------
+
+void check_upsample_extents(const std::vector<int64_t>& extents) {
+    for (const int64_t extent : extents) {
+        if (extent < 0) {
+            TP_THROW(RuntimeError,
+                     "Trying to create tensor with negative dimension ", extent);
+        }
+    }
+}
+
+void gate_upsample_dtype(const Tensor& operand) {
+    if (operand.dtype() != DType::Float32 && operand.dtype() != DType::Float64) {
+        TP_THROW(NotImplementedError, "upsample only supports Float32/Float64");
+    }
+}
+
+// Multiplies extents in a wide accumulator: recorded sizes are caller
+// supplied, so their product can leave the 64-bit range, and anything past
+// that range only ever makes the swept span larger.
+__int128 span_product(const std::vector<int64_t>& extents) {
+    constexpr __int128 cap = static_cast<__int128>(1) << 100;
+    __int128 acc = 1;
+    for (const int64_t extent : extents) {
+        acc *= extent;
+        if (acc > cap) return cap;
+    }
+    return acc;
+}
+
+// Picks the entries a variant reads from a recorded size list: the
+// interpolated 2-D/3-D forms take the leading entries, every other form the
+// trailing ones.
+std::vector<int64_t> recorded_span(const std::vector<int64_t>& sizes,
+                                   size_t count, bool from_front) {
+    const size_t offset = from_front ? 0 : sizes.size() - count;
+    return std::vector<int64_t>(sizes.begin() + static_cast<int64_t>(offset),
+                                sizes.begin() + static_cast<int64_t>(offset + count));
+}
+
+// The shared forward contract, in the order a materializing backend checks
+// it: the answer allocation rejects negative recorded extents first; the
+// operand must carry the batch and channel planes plus every spatial plane
+// the variant reads; the recorded list must reach the entries the variant
+// indexes; and an operand that flows no values answers before the dtype
+// gate.  Longer recorded lists ride along — every entry lands on the answer
+// shape — provided the sweep they imply still fits inside it.
+template <typename ValuesFlow>
+Tensor upsample_forward_answer(const char* name, const Tensor& self,
+                               const std::vector<int64_t>& output_size,
+                               size_t spatial_dims, ValuesFlow&& values_flow) {
+    check_upsample_extents(output_size);
+    const size_t needed_dim = 2 + spatial_dims;
+    if (static_cast<size_t>(self.dim()) < needed_dim) {
+        TP_THROW(RuntimeError, name, ": expected at least a ", needed_dim,
+                 "-D input, got ", self.dim(), "-D");
+    }
+    if (output_size.size() < spatial_dims) {
+        TP_THROW(ValueError, name, ": output_size must have at least ",
+                 spatial_dims, " elements");
+    }
+    std::vector<int64_t> answer{self.size(0), self.size(1)};
+    answer.insert(answer.end(), output_size.begin(), output_size.end());
+    if (!values_flow()) {
+        return empty_meta(answer, self.dtype(), self.device());
+    }
+    gate_upsample_dtype(self);
+    // The sweep fills the leading spatial entries of the answer; recorded
+    // entries past them must not shrink the buffer under the sweep.
+    std::vector<int64_t> swept{self.size(0), self.size(1)};
+    swept.insert(swept.end(), output_size.begin(),
+                 output_size.begin() + static_cast<int64_t>(spatial_dims));
+    if (span_product(swept) > span_product(answer)) {
+        TP_THROW(RuntimeError, name,
+                 ": the recorded output sizes shrink the answer under its sweep");
+    }
+    return empty_meta(answer, self.dtype(), self.device());
+}
+
+// The shared backward contract, in the order a materializing backend checks
+// it: the recorded operand sizes must match the gradient's rank and be
+// allocatable, the gradient must carry the planes the sweep reads, the
+// recorded output list must reach its indexed entries, and a sweep that
+// flows no values answers before the dtype gate.  The sweep reads rows
+// planes of the gradient and writes rows planes of the answer — rows being
+// the channel planes for the 1-D nearest form, the batch-by-channel planes
+// otherwise — so recorded geometry that would reach past either buffer stays
+// an error.  Extra recorded output entries only feed the arithmetic.
+template <typename ValuesFlow>
+Tensor upsample_backward_answer(const char* name, const Tensor& grad_output,
+                                const std::vector<int64_t>& output_size,
+                                const std::vector<int64_t>& input_size,
+                                size_t output_entries, size_t input_entries,
+                                bool output_entries_from_front,
+                                bool rows_span_batches, ValuesFlow&& values_flow) {
+    TP_CHECK(static_cast<int64_t>(input_size.size()) == grad_output.dim(),
+             "It is expected input_size equals to ", grad_output.dim(),
+             ", but got size ", input_size.size());
+    check_upsample_extents(input_size);
+    const size_t needed_rank = std::max<size_t>(2, input_entries);
+    if (static_cast<size_t>(grad_output.dim()) < needed_rank) {
+        TP_THROW(RuntimeError, name, ": expected at least a ", needed_rank,
+                 "-D gradient, got ", grad_output.dim(), "-D");
+    }
+    if (output_size.size() < output_entries) {
+        TP_THROW(ValueError, name, ": output_size must have at least ",
+                 output_entries, " elements");
+    }
+    check_upsample_extents(output_size);
+    const std::vector<int64_t> src = recorded_span(
+        output_size, output_entries, output_entries_from_front);
+    const std::vector<int64_t> dst = recorded_span(input_size, input_entries, false);
+    if (!values_flow(src, dst)) {
+        return empty_meta(input_size, grad_output.dtype(), grad_output.device());
+    }
+    gate_upsample_dtype(grad_output);
+    const __int128 rows = rows_span_batches
+        ? static_cast<__int128>(grad_output.size(0)) * grad_output.size(1)
+        : grad_output.size(1);
+    if (rows * span_product(src) > static_cast<__int128>(grad_output.numel()) ||
+        rows * span_product(dst) > span_product(input_size)) {
+        TP_THROW(RuntimeError, name,
+                 ": the recorded geometry sweeps past the gradient or the answer");
+    }
+    return empty_meta(input_size, grad_output.dtype(), grad_output.device());
+}
 
 Tensor upsample_bilinear2d_kernel(const Tensor& self,
                                   const std::vector<int64_t>& output_size,
                                   bool /*align_corners*/,
                                   std::optional<double> /*scales_h*/,
                                   std::optional<double> /*scales_w*/) {
-    std::vector<int64_t> out{self.size(0), self.size(1)};
-    out.insert(out.end(), output_size.begin(), output_size.end());
-    return empty_meta(out, self.dtype(), self.device());
+    return upsample_forward_answer(
+        "upsample_bilinear2d", self, output_size, 2,
+        [&] { return self.numel() > 0 && output_size[0] > 0 && output_size[1] > 0; });
+}
+
+Tensor upsample_nearest1d_kernel(const Tensor& self,
+                                 const std::vector<int64_t>& output_size,
+                                 std::optional<double> /*scales*/) {
+    return upsample_forward_answer(
+        "upsample_nearest1d", self, output_size, 1,
+        [&] { return self.numel() > 0 && output_size[0] > 0; });
+}
+
+Tensor upsample_nearest3d_kernel(const Tensor& self,
+                                 const std::vector<int64_t>& output_size,
+                                 std::optional<double> /*scales_d*/,
+                                 std::optional<double> /*scales_h*/,
+                                 std::optional<double> /*scales_w*/) {
+    return upsample_forward_answer(
+        "upsample_nearest3d", self, output_size, 3, [&] { return self.numel() > 0; });
+}
+
+Tensor upsample_linear1d_kernel(const Tensor& self,
+                                const std::vector<int64_t>& output_size,
+                                bool /*align_corners*/,
+                                std::optional<double> /*scales*/) {
+    return upsample_forward_answer(
+        "upsample_linear1d", self, output_size, 1,
+        [&] { return self.numel() > 0 && output_size[0] > 0; });
+}
+
+Tensor upsample_bicubic2d_kernel(const Tensor& self,
+                                 const std::vector<int64_t>& output_size,
+                                 bool /*align_corners*/,
+                                 std::optional<double> /*scales_h*/,
+                                 std::optional<double> /*scales_w*/) {
+    return upsample_forward_answer(
+        "upsample_bicubic2d", self, output_size, 2, [&] { return self.numel() > 0; });
+}
+
+Tensor upsample_trilinear3d_kernel(const Tensor& self,
+                                   const std::vector<int64_t>& output_size,
+                                   bool /*align_corners*/,
+                                   std::optional<double> /*scales_d*/,
+                                   std::optional<double> /*scales_h*/,
+                                   std::optional<double> /*scales_w*/) {
+    return upsample_forward_answer(
+        "upsample_trilinear3d", self, output_size, 3, [&] { return self.numel() > 0; });
+}
+
+// The "exact" neighborhood forms share the resampling contract; only the
+// arithmetic differs, which the meta device never runs.
+Tensor _upsample_nearest_exact1d_kernel(const Tensor& self,
+                                        const std::vector<int64_t>& output_size,
+                                        std::optional<double> /*scales*/) {
+    return upsample_forward_answer(
+        "_upsample_nearest_exact1d", self, output_size, 1,
+        [&] { return self.numel() > 0 && output_size[0] > 0; });
+}
+
+Tensor _upsample_nearest_exact2d_kernel(const Tensor& self,
+                                        const std::vector<int64_t>& output_size,
+                                        std::optional<double> /*scales_h*/,
+                                        std::optional<double> /*scales_w*/) {
+    return upsample_forward_answer(
+        "_upsample_nearest_exact2d", self, output_size, 2,
+        [&] { return self.numel() > 0 && output_size[0] > 0 && output_size[1] > 0; });
+}
+
+Tensor _upsample_nearest_exact3d_kernel(const Tensor& self,
+                                        const std::vector<int64_t>& output_size,
+                                        std::optional<double> /*scales_d*/,
+                                        std::optional<double> /*scales_h*/,
+                                        std::optional<double> /*scales_w*/) {
+    return upsample_forward_answer(
+        "_upsample_nearest_exact3d", self, output_size, 3,
+        [&] {
+            return self.numel() > 0 && output_size[0] > 0 && output_size[1] > 0 &&
+                   output_size[2] > 0;
+        });
+}
+
+// The antialiased forms blend a fixed window around each output element; the
+// geometry contract is the bilinear one.
+Tensor _upsample_bilinear2d_aa_kernel(const Tensor& self,
+                                      const std::vector<int64_t>& output_size,
+                                      bool /*align_corners*/,
+                                      std::optional<double> /*scales_h*/,
+                                      std::optional<double> /*scales_w*/) {
+    return upsample_forward_answer(
+        "_upsample_bilinear2d_aa", self, output_size, 2,
+        [&] { return self.numel() > 0 && output_size[0] > 0 && output_size[1] > 0; });
+}
+
+Tensor _upsample_bicubic2d_aa_kernel(const Tensor& self,
+                                     const std::vector<int64_t>& output_size,
+                                     bool /*align_corners*/,
+                                     std::optional<double> /*scales_h*/,
+                                     std::optional<double> /*scales_w*/) {
+    return upsample_forward_answer(
+        "_upsample_bicubic2d_aa", self, output_size, 2,
+        [&] { return self.numel() > 0 && output_size[0] > 0 && output_size[1] > 0; });
+}
+
+// The vec call derives the output extents from scale factors when they are
+// not given outright.
+std::vector<int64_t> aa_vec_output_size(
+    const Tensor& input, const std::optional<std::vector<int64_t>>& output_size,
+    const std::optional<std::vector<double>>& scale_factors) {
+    if (output_size.has_value()) {
+        if (output_size.value().size() != 2) {
+            TP_THROW(RuntimeError, "_upsample_aa: vec output_size must have 2 entries");
+        }
+        return output_size.value();
+    }
+    if (!scale_factors.has_value()) {
+        TP_THROW(RuntimeError, "_upsample_aa: vec form needs output_size or scale_factors");
+    }
+    const std::vector<double>& sf = *scale_factors;
+    if (sf.size() != 2) {
+        TP_THROW(RuntimeError, "_upsample_aa: vec scale_factors must have 2 entries");
+    }
+    if (input.dim() < 4) {
+        TP_THROW(RuntimeError, "_upsample_aa: expected at least a 4-D input, got ",
+                 input.dim(), "-D");
+    }
+    return {static_cast<int64_t>(std::floor(static_cast<double>(input.size(2)) * sf[0])),
+            static_cast<int64_t>(std::floor(static_cast<double>(input.size(3)) * sf[1]))};
+}
+
+Tensor _upsample_bilinear2d_aa_vec_kernel(
+    const Tensor& input, const std::optional<std::vector<int64_t>>& output_size,
+    bool align_corners,
+    const std::optional<std::vector<double>>& scale_factors) {
+    return _upsample_bilinear2d_aa_kernel(
+        input, aa_vec_output_size(input, output_size, scale_factors),
+        align_corners, std::nullopt, std::nullopt);
+}
+
+Tensor _upsample_bicubic2d_aa_vec_kernel(
+    const Tensor& input, const std::optional<std::vector<int64_t>>& output_size,
+    bool align_corners,
+    const std::optional<std::vector<double>>& scale_factors) {
+    return _upsample_bicubic2d_aa_kernel(
+        input, aa_vec_output_size(input, output_size, scale_factors),
+        align_corners, std::nullopt, std::nullopt);
+}
+
+// The backward variants answer the recorded operand geometry.  Which spans
+// must be non-empty for values to flow, whether the recorded output entries
+// are read from the front or the back, and whether the sweep spans the batch
+// planes follow each variant's own arithmetic.
+
+Tensor upsample_nearest1d_backward_kernel(const Tensor& grad_output,
+                                          const std::vector<int64_t>& output_size,
+                                          const std::vector<int64_t>& input_size,
+                                          std::optional<double> /*scales*/) {
+    return upsample_backward_answer(
+        "upsample_nearest1d_backward", grad_output, output_size, input_size,
+        1, 1, /*output_entries_from_front=*/false, /*rows_span_batches=*/false,
+        [&](const std::vector<int64_t>& src, const std::vector<int64_t>& dst) {
+            return grad_output.numel() > 0 && src[0] > 0 && dst[0] > 0;
+        });
+}
+
+Tensor upsample_nearest2d_backward_kernel(const Tensor& grad_output,
+                                          const std::vector<int64_t>& output_size,
+                                          const std::vector<int64_t>& input_size,
+                                          std::optional<double> /*scales_h*/,
+                                          std::optional<double> /*scales_w*/) {
+    return upsample_backward_answer(
+        "upsample_nearest2d_backward", grad_output, output_size, input_size,
+        2, 2, false, true,
+        [&](const std::vector<int64_t>& src, const std::vector<int64_t>& dst) {
+            return grad_output.numel() > 0 && src[0] * src[1] > 0 &&
+                   dst[0] * dst[1] > 0;
+        });
+}
+
+Tensor upsample_nearest3d_backward_kernel(const Tensor& grad_output,
+                                          const std::vector<int64_t>& output_size,
+                                          const std::vector<int64_t>& input_size,
+                                          std::optional<double> /*scales_d*/,
+                                          std::optional<double> /*scales_h*/,
+                                          std::optional<double> /*scales_w*/) {
+    return upsample_backward_answer(
+        "upsample_nearest3d_backward", grad_output, output_size, input_size,
+        3, 3, false, true,
+        [&](const std::vector<int64_t>& src, const std::vector<int64_t>& dst) {
+            return grad_output.numel() > 0 && src[0] * src[1] * src[2] > 0 &&
+                   dst[0] * dst[1] * dst[2] > 0;
+        });
+}
+
+Tensor upsample_linear1d_backward_kernel(const Tensor& grad_output,
+                                         const std::vector<int64_t>& output_size,
+                                         const std::vector<int64_t>& input_size,
+                                         bool /*align_corners*/,
+                                         std::optional<double> /*scales*/) {
+    return upsample_backward_answer(
+        "upsample_linear1d_backward", grad_output, output_size, input_size,
+        1, 1, false, true,
+        [&](const std::vector<int64_t>& src, const std::vector<int64_t>& dst) {
+            return grad_output.numel() > 0 && src[0] > 0 && dst[0] > 0;
+        });
+}
+
+Tensor upsample_bilinear2d_backward_kernel(const Tensor& grad_output,
+                                           const std::vector<int64_t>& output_size,
+                                           const std::vector<int64_t>& input_size,
+                                           bool /*align_corners*/,
+                                           std::optional<double> /*scales_h*/,
+                                           std::optional<double> /*scales_w*/) {
+    return upsample_backward_answer(
+        "upsample_bilinear2d_backward", grad_output, output_size, input_size,
+        2, 2, /*output_entries_from_front=*/true, true,
+        [&](const std::vector<int64_t>& src, const std::vector<int64_t>& dst) {
+            return grad_output.numel() > 0 && src[0] * src[1] > 0 &&
+                   dst[0] * dst[1] > 0;
+        });
+}
+
+Tensor upsample_bicubic2d_backward_kernel(const Tensor& grad_output,
+                                          const std::vector<int64_t>& output_size,
+                                          const std::vector<int64_t>& input_size,
+                                          bool /*align_corners*/,
+                                          std::optional<double> /*scales_h*/,
+                                          std::optional<double> /*scales_w*/) {
+    return upsample_backward_answer(
+        "upsample_bicubic2d_backward", grad_output, output_size, input_size,
+        2, 2, true, true,
+        [&](const std::vector<int64_t>& /*src*/, const std::vector<int64_t>& /*dst*/) {
+            return grad_output.numel() > 0;
+        });
+}
+
+Tensor upsample_trilinear3d_backward_kernel(const Tensor& grad_output,
+                                            const std::vector<int64_t>& output_size,
+                                            const std::vector<int64_t>& input_size,
+                                            bool /*align_corners*/,
+                                            std::optional<double> /*scales_d*/,
+                                            std::optional<double> /*scales_h*/,
+                                            std::optional<double> /*scales_w*/) {
+    return upsample_backward_answer(
+        "upsample_trilinear3d_backward", grad_output, output_size, input_size,
+        3, 3, true, true,
+        [&](const std::vector<int64_t>& /*src*/, const std::vector<int64_t>& /*dst*/) {
+            return grad_output.numel() > 0;
+        });
+}
+
+Tensor _upsample_nearest_exact1d_backward_kernel(
+    const Tensor& grad_output, const std::vector<int64_t>& output_size,
+    const std::vector<int64_t>& input_size, std::optional<double> /*scales*/) {
+    return upsample_backward_answer(
+        "_upsample_nearest_exact1d_backward", grad_output, output_size, input_size,
+        1, 1, false, true,
+        [&](const std::vector<int64_t>& src, const std::vector<int64_t>& dst) {
+            return grad_output.numel() > 0 && src[0] > 0 && dst[0] > 0;
+        });
+}
+
+Tensor _upsample_nearest_exact2d_backward_kernel(
+    const Tensor& grad_output, const std::vector<int64_t>& output_size,
+    const std::vector<int64_t>& input_size, std::optional<double> /*scales_h*/,
+    std::optional<double> /*scales_w*/) {
+    return upsample_backward_answer(
+        "_upsample_nearest_exact2d_backward", grad_output, output_size, input_size,
+        2, 2, false, true,
+        [&](const std::vector<int64_t>& src, const std::vector<int64_t>& dst) {
+            return grad_output.numel() > 0 && src[0] * src[1] > 0 &&
+                   dst[0] * dst[1] > 0;
+        });
+}
+
+Tensor _upsample_nearest_exact3d_backward_kernel(
+    const Tensor& grad_output, const std::vector<int64_t>& output_size,
+    const std::vector<int64_t>& input_size, std::optional<double> /*scales_d*/,
+    std::optional<double> /*scales_h*/, std::optional<double> /*scales_w*/) {
+    return upsample_backward_answer(
+        "_upsample_nearest_exact3d_backward", grad_output, output_size, input_size,
+        3, 3, false, true,
+        [&](const std::vector<int64_t>& src, const std::vector<int64_t>& dst) {
+            return grad_output.numel() > 0 && src[0] * src[1] * src[2] > 0 &&
+                   dst[0] * dst[1] * dst[2] > 0;
+        });
+}
+
+Tensor _upsample_bilinear2d_aa_backward_kernel(
+    const Tensor& grad_output, const std::vector<int64_t>& output_size,
+    const std::vector<int64_t>& input_size, bool /*align_corners*/,
+    std::optional<double> /*scales_h*/, std::optional<double> /*scales_w*/) {
+    return upsample_backward_answer(
+        "_upsample_bilinear2d_aa_backward", grad_output, output_size, input_size,
+        2, 2, false, true,
+        [&](const std::vector<int64_t>& src, const std::vector<int64_t>& dst) {
+            return grad_output.numel() > 0 && src[0] * src[1] > 0 &&
+                   dst[0] * dst[1] > 0;
+        });
+}
+
+Tensor _upsample_bicubic2d_aa_backward_kernel(
+    const Tensor& grad_output, const std::vector<int64_t>& output_size,
+    const std::vector<int64_t>& input_size, bool /*align_corners*/,
+    std::optional<double> /*scales_h*/, std::optional<double> /*scales_w*/) {
+    return upsample_backward_answer(
+        "_upsample_bicubic2d_aa_backward", grad_output, output_size, input_size,
+        2, 2, false, true,
+        [&](const std::vector<int64_t>& src, const std::vector<int64_t>& dst) {
+            return grad_output.numel() > 0 && src[0] * src[1] > 0 &&
+                   dst[0] * dst[1] > 0;
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -1133,21 +1573,9 @@ Tensor upsample_nearest2d_kernel(const Tensor& self,
                                  const std::vector<int64_t>& output_size,
                                  std::optional<double> /*scales_h*/,
                                  std::optional<double> /*scales_w*/) {
-    if (self.dim() != 4) {
-        TP_THROW(RuntimeError, "upsample_nearest2d: expected a 4-D input, got ",
-                 self.dim(), "-D");
-    }
-    if (output_size.size() != 2) {
-        TP_THROW(ValueError, "upsample_nearest2d: output_size must have 2 elements");
-    }
-    for (const int64_t size : output_size) {
-        if (size <= 0) {
-            TP_THROW(ValueError,
-                     "upsample_nearest2d: output size must be positive");
-        }
-    }
-    return empty_meta({self.size(0), self.size(1), output_size[0], output_size[1]},
-                      self.dtype(), self.device());
+    return upsample_forward_answer(
+        "upsample_nearest2d", self, output_size, 2,
+        [&] { return self.numel() > 0 && output_size[0] > 0 && output_size[1] > 0; });
 }
 
 // A tensor carries a quantizer or it does not; nothing about the values
@@ -1361,6 +1789,36 @@ TENSORPLAY_LIBRARY_IMPL(Meta, MetaShape) {
     m.impl("chunk", chunk_kernel);
     m.impl("constant_pad_nd", constant_pad_nd_kernel);
     m.impl("upsample_nearest2d", upsample_nearest2d_kernel);
+    // The remaining resampling family answers the same geometry contract.
+    m.impl("upsample_nearest1d", upsample_nearest1d_kernel);
+    m.impl("upsample_nearest3d", upsample_nearest3d_kernel);
+    m.impl("upsample_linear1d", upsample_linear1d_kernel);
+    m.impl("upsample_bicubic2d", upsample_bicubic2d_kernel);
+    m.impl("upsample_trilinear3d", upsample_trilinear3d_kernel);
+    m.impl("_upsample_nearest_exact1d", _upsample_nearest_exact1d_kernel);
+    m.impl("_upsample_nearest_exact2d", _upsample_nearest_exact2d_kernel);
+    m.impl("_upsample_nearest_exact3d", _upsample_nearest_exact3d_kernel);
+    m.impl("_upsample_bilinear2d_aa", _upsample_bilinear2d_aa_kernel);
+    m.impl("_upsample_bicubic2d_aa", _upsample_bicubic2d_aa_kernel);
+    m.impl("_upsample_bilinear2d_aa.vec", _upsample_bilinear2d_aa_vec_kernel);
+    m.impl("_upsample_bicubic2d_aa.vec", _upsample_bicubic2d_aa_vec_kernel);
+    m.impl("upsample_nearest1d_backward", upsample_nearest1d_backward_kernel);
+    m.impl("upsample_nearest2d_backward", upsample_nearest2d_backward_kernel);
+    m.impl("upsample_nearest3d_backward", upsample_nearest3d_backward_kernel);
+    m.impl("upsample_linear1d_backward", upsample_linear1d_backward_kernel);
+    m.impl("upsample_bilinear2d_backward", upsample_bilinear2d_backward_kernel);
+    m.impl("upsample_bicubic2d_backward", upsample_bicubic2d_backward_kernel);
+    m.impl("upsample_trilinear3d_backward", upsample_trilinear3d_backward_kernel);
+    m.impl("_upsample_nearest_exact1d_backward",
+           _upsample_nearest_exact1d_backward_kernel);
+    m.impl("_upsample_nearest_exact2d_backward",
+           _upsample_nearest_exact2d_backward_kernel);
+    m.impl("_upsample_nearest_exact3d_backward",
+           _upsample_nearest_exact3d_backward_kernel);
+    m.impl("_upsample_bilinear2d_aa_backward",
+           _upsample_bilinear2d_aa_backward_kernel);
+    m.impl("_upsample_bicubic2d_aa_backward",
+           _upsample_bicubic2d_aa_backward_kernel);
     m.impl("is_quantized", is_quantized_kernel);
 }
 
