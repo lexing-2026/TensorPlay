@@ -791,6 +791,18 @@ class CodeGen:
     ) -> PythonCode:
         del include_stride, include_device, colored, record_func, additional_meta
         ordered_nodes = list(nodes)
+        # Which node reads a value for the last time: a value is released right
+        # after its final reader, so a program does not have to hold every
+        # result it has produced until it returns.  Without this a region whose
+        # eager form keeps a couple of activations alive at a time keeps the
+        # whole set alive while its compiled form is being traced.
+        last_reader: dict[Node, Node] = {}
+        readers_last_use: dict[Node, list[Node]] = {}
+        for node in reversed(ordered_nodes):
+            for input_node in node._input_nodes:
+                if input_node not in last_reader:
+                    last_reader[input_node] = node
+                    readers_last_use.setdefault(node, []).append(input_node)
         root = root_module if root_module is not None else "self"
         use_root = root_module is not None or any(
             node.op in {"get_attr", "call_module"} for node in ordered_nodes
@@ -933,10 +945,31 @@ class CodeGen:
                 return [*result, rhs, f"{lhs} = {render(node.args[0])}"]
             return [*result, f"{lhs} = {rhs}"]
 
+        def release_last_uses(user: Node) -> str | None:
+            """One statement that drops the values ``user`` read for the last time.
+
+            A node no later node reads is released here too: it is kept in the
+            graph (an operator with an effect cannot be dropped) but nothing
+            needs its result once it has run, so holding it would only extend
+            its lifetime to the end of the function.
+            """
+
+            if user.op in {"placeholder", "output"}:
+                return None
+            released = list(readers_last_use.get(user, ()))
+            if not len(user.users):
+                released.append(user)
+            if not released:
+                return None
+            return " = ".join(node_ref(item) for item in released) + " = None"
+
         for name, value in self.additional_globals():
             add_global(name, value)
         for index, node in enumerate(ordered_nodes):
             body.extend(emit(node, index))
+            released = release_last_uses(node)
+            if released is not None:
+                body.append(released)
         if not body:
             body = ["pass"]
         if self._body_transformer is not None:
