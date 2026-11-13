@@ -136,6 +136,13 @@ TENSORPLAY_LIBRARY_IMPL(Meta, MetaCompare) {
     m.impl("gt.Scalar", gt_scalar_kernel);
     m.impl("ge.Tensor", ge_tensor_kernel);
     m.impl("ge.Scalar", ge_scalar_kernel);
+    // The word forms of the comparison primitives answer the same boolean
+    // geometry as their symbolic names.
+    m.impl("greater", gt_tensor_kernel);
+    m.impl("greater_equal", ge_tensor_kernel);
+    m.impl("less", lt_tensor_kernel);
+    m.impl("less_equal", le_tensor_kernel);
+    m.impl("not_equal", ne_tensor_kernel);
     m.impl("isclose", isclose_kernel);
     m.impl("where.self", where_cpu);
     m.impl("where.ScalarSelf", where_scalar_self_cpu);

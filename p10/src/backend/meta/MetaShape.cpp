@@ -1156,6 +1156,159 @@ bool is_quantized_kernel(const Tensor& self) {
     return self.defined() && self.unsafeGetTensorImpl() != nullptr &&
            self.unsafeGetTensorImpl()->has_quantizer();
 }
+
+// Channel shuffling permutes the channel axis in blocks of `groups` and
+// answers the operand's own extents; the channel extent must split evenly.
+Tensor channel_shuffle_kernel(const Tensor& self, int64_t groups) {
+    if (self.dim() <= 2) {
+        TP_THROW(RuntimeError,
+                 "channel_shuffle expects input with more than 2 dimensions");
+    }
+    if (groups <= 0) {
+        TP_THROW(RuntimeError, "channel_shuffle: groups must be positive, but got ",
+                 groups);
+    }
+    if (self.size(1) % groups != 0) {
+        TP_THROW(RuntimeError,
+                 "channel_shuffle: channel dim not divisible by groups");
+    }
+    return empty_meta(shape_of(self), self.dtype(), self.device());
+}
+
+// Unshuffling pixels folds each r x r tile back into the channel axis: the
+// spatial extents must divide by r and the channel extent grows by r squared.
+Tensor pixel_unshuffle_kernel(const Tensor& self, int64_t downscale_factor) {
+    if (self.dim() < 3) {
+        TP_THROW(RuntimeError,
+                 "pixel_unshuffle expects input to have at least 3 dimensions, "
+                 "but got input with ", self.dim(), " dimension(s)");
+    }
+    if (downscale_factor <= 0) {
+        TP_THROW(RuntimeError, "pixel_unshuffle expects a positive factor, but got ",
+                 downscale_factor);
+    }
+    const int64_t factor_squared =
+        downscale_factor > std::numeric_limits<int64_t>::max() / downscale_factor
+            ? -1
+            : downscale_factor * downscale_factor;
+    if (factor_squared < 0) {
+        TP_THROW(ValueError, "pixel_unshuffle: factor is too large");
+    }
+    const int64_t channels = self.size(-3);
+    const int64_t height = self.size(-2);
+    const int64_t width = self.size(-1);
+    if (height % downscale_factor != 0 || width % downscale_factor != 0) {
+        TP_THROW(RuntimeError,
+                 "pixel_unshuffle: spatial dims must be divisible by r");
+    }
+    if (channels > std::numeric_limits<int64_t>::max() / factor_squared) {
+        TP_THROW(ValueError, "pixel_unshuffle: output channel dimension is too large");
+    }
+    std::vector<int64_t> out = shape_of(self);
+    out.resize(out.size() - 3);
+    out.push_back(channels * factor_squared);
+    out.push_back(height / downscale_factor);
+    out.push_back(width / downscale_factor);
+    return empty_meta(out, self.dtype(), self.device());
+}
+
+// The scatter forms answer the destination's own extents after checking the
+// source fits the slice it replaces: selecting drops a dimension, slicing
+// keeps it with the span the step leaves, the diagonal keeps every dimension
+// but the pair it walks.
+Tensor select_scatter_kernel(const Tensor& self, const Tensor& src,
+                             int64_t dim, int64_t index) {
+    dim = wrap_dim(dim, self.dim());
+    const int64_t length = self.size(dim);
+    if (index < -length || index >= length) {
+        TP_THROW(IndexError, "select(): index out of range");
+    }
+    if (index < 0) index += length;
+    std::vector<int64_t> target = shape_of(self);
+    target.erase(target.begin() + dim);
+    if (target != shape_of(src)) {
+        TP_THROW(RuntimeError,
+                 "expected src to have a size equal to the target slice");
+    }
+    return empty_meta(shape_of(self), self.dtype(), self.device());
+}
+
+Tensor slice_scatter_kernel(const Tensor& self, const Tensor& src, int64_t dim,
+                            std::optional<int64_t> start,
+                            std::optional<int64_t> end, int64_t step) {
+    if (step <= 0) {
+        TP_THROW(RuntimeError, "slice_scatter: step must be positive");
+    }
+    dim = wrap_dim(dim, self.dim());
+    const int64_t length = self.size(dim);
+    int64_t begin = start.value_or(0);
+    int64_t finish = end.value_or(length);
+    if (begin < 0) begin += length;
+    if (finish < 0) finish += length;
+    begin = std::max<int64_t>(0, std::min<int64_t>(begin, length));
+    finish = std::max<int64_t>(0, std::min<int64_t>(finish, length));
+    if (finish < begin) finish = begin;
+    std::vector<int64_t> target = shape_of(self);
+    target[static_cast<size_t>(dim)] =
+        (finish - begin + step - 1) / step;
+    if (target != shape_of(src)) {
+        TP_THROW(RuntimeError,
+                 "expected src to have a size equal to the target slice");
+    }
+    return empty_meta(shape_of(self), self.dtype(), self.device());
+}
+
+Tensor diagonal_scatter_kernel(const Tensor& self, const Tensor& src,
+                               int64_t offset, int64_t dim1, int64_t dim2) {
+    const int64_t ndim = self.dim();
+    const int64_t dim1_ = dim1, dim2_ = dim2;
+    dim1 = wrap_dim(dim1, ndim);
+    dim2 = wrap_dim(dim2, ndim);
+    if (dim1 == dim2) {
+        TP_THROW(RuntimeError, "diagonal dimensions cannot be identical ",
+                 dim1_, ", ", dim2_);
+    }
+    const int64_t size1 = self.size(dim1);
+    const int64_t size2 = self.size(dim2);
+    int64_t diag_size;
+    if (offset >= 0) {
+        diag_size = offset < size2 ? std::min(size1, size2 - offset) : 0;
+    } else if (offset == std::numeric_limits<int64_t>::min()) {
+        diag_size = 0;
+    } else {
+        const int64_t offset_abs = -offset;
+        diag_size =
+            offset_abs < size1 ? std::min(size1 - offset_abs, size2) : 0;
+    }
+    std::vector<int64_t> target;
+    target.reserve(static_cast<size_t>(ndim - 1));
+    for (int64_t i = 0; i < ndim; ++i) {
+        if (i != dim1 && i != dim2) {
+            target.push_back(self.size(i));
+        }
+    }
+    target.push_back(diag_size);
+    if (target != shape_of(src)) {
+        TP_THROW(RuntimeError,
+                 "expected src to have a size equal to the target slice");
+    }
+    return empty_meta(shape_of(self), self.dtype(), self.device());
+}
+
+// The Vandermonde layout carries one row per element and `N` columns of
+// successive powers; the element type gains the width the powers need.
+Tensor vander_kernel(const Tensor& x, std::optional<int64_t> n,
+                     bool /*increasing*/) {
+    if (x.dim() != 1) {
+        TP_THROW(RuntimeError, "x must be a one-dimensional tensor.");
+    }
+    const int64_t columns = n.value_or(x.size(0));
+    if (columns < 0) {
+        TP_THROW(RuntimeError, "N must be non-negative.");
+    }
+    return empty_meta({x.size(0), columns},
+                      promoteTypes(x.dtype(), DType::Int64), x.device());
+}
 } // anonymous namespace
 
 TENSORPLAY_LIBRARY_IMPL(Meta, MetaShape) {
@@ -1187,6 +1340,12 @@ TENSORPLAY_LIBRARY_IMPL(Meta, MetaShape) {
     m.impl("trace", trace_kernel);
     m.impl("upsample_bilinear2d", upsample_bilinear2d_kernel);
     m.impl("pixel_shuffle", pixel_shuffle_kernel);
+    m.impl("pixel_unshuffle", pixel_unshuffle_kernel);
+    m.impl("channel_shuffle", channel_shuffle_kernel);
+    m.impl("select_scatter", select_scatter_kernel);
+    m.impl("slice_scatter", slice_scatter_kernel);
+    m.impl("diagonal_scatter", diagonal_scatter_kernel);
+    m.impl("vander", vander_kernel);
     m.impl("block_diag", block_diag_kernel);
     m.impl("broadcast_tensors", broadcast_tensors_kernel);
     m.impl("cat", cat_kernel);

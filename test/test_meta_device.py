@@ -2213,6 +2213,208 @@ def test_alpha_dropout_histc_frexp():
         tp.frexp(_meta(2, dtype=tp.int32))
 
 
+def test_pointwise_alias_and_pair_names():
+    x = _meta(3, 4)
+    for name in ("arcsin", "arccos", "arctan", "arcsinh", "arccosh", "arctanh"):
+        f = getattr(tp.functional, name)
+        assert tuple(f(x).shape) == (3, 4)
+        assert f(_meta(3, 4, dtype=tp.float64)).dtype == tp.float64
+        assert f(_meta(3, 4, dtype=tp.int64)).dtype == tp.float32
+    assert tuple(tp.functional.negative(x).shape) == (3, 4)
+    assert tp.functional.negative(_meta(3, dtype=tp.int64)).dtype == tp.int64
+    y = _meta(3, 4, dtype=tp.int64)
+    for name in ("multiply", "subtract", "divide"):
+        f = getattr(tp.functional, name)
+        assert tuple(f(x, x).shape) == (3, 4)
+        assert f(x, y).dtype == tp.float32
+    for name in ("logaddexp", "logaddexp2"):
+        f = getattr(tp.functional, name)
+        assert tuple(f(x, x).shape) == (3, 4)
+        assert f(x, y).dtype == tp.float32
+    for name in ("greater", "greater_equal", "less", "less_equal", "not_equal"):
+        f = getattr(tp.functional, name)
+        out = f(_meta(3, 4), _meta(1, 4))
+        assert tuple(out.shape) == (3, 4) and out.dtype == tp.bool
+
+
+def test_pixel_unshuffle_and_channel_shuffle():
+    out = tp.functional.pixel_unshuffle(_meta(1, 8, 4, 4), 2)
+    assert tuple(out.shape) == (1, 32, 2, 2)
+    with pytest.raises(Exception):
+        tp.functional.pixel_unshuffle(_meta(1, 8, 5, 4), 2)
+    with pytest.raises(Exception):
+        tp.functional.pixel_unshuffle(_meta(1, 8, 4, 4), 0)
+    with pytest.raises(Exception):
+        tp.functional.pixel_unshuffle(_meta(1, 8, 4, 4), 2**40)
+    with pytest.raises(Exception):
+        tp.functional.pixel_unshuffle(_meta(8), 2)
+
+    assert tuple(tp.functional.channel_shuffle(_meta(2, 8, 4, 4), 2).shape) == (2, 8, 4, 4)
+    with pytest.raises(Exception):
+        tp.functional.channel_shuffle(_meta(2, 8, 4, 4), 3)
+    with pytest.raises(Exception):
+        tp.functional.channel_shuffle(_meta(2, 8, 4, 4), 0)
+    with pytest.raises(Exception):
+        tp.functional.channel_shuffle(_meta(2, 8), 2)
+
+
+def test_scatter_forms_check_their_slices():
+    self_ = _meta(2, 3, 4)
+    assert tuple(tp.functional.select_scatter(self_, _meta(2, 4), 1, 1).shape) == (2, 3, 4)
+    with pytest.raises(Exception):
+        tp.functional.select_scatter(self_, _meta(2, 4), 1, 5)
+    with pytest.raises(Exception):
+        tp.functional.select_scatter(self_, _meta(2, 3), 1, 1)
+
+    assert tuple(tp.functional.slice_scatter(self_, _meta(2, 2, 4), 1, 0, 2).shape) == (2, 3, 4)
+    with pytest.raises(Exception):
+        tp.functional.slice_scatter(self_, _meta(2, 2, 4), 1, 0, 2, 0)
+    with pytest.raises(Exception):
+        tp.functional.slice_scatter(self_, _meta(2, 1, 4), 1, 0, 2)
+
+    cube = _meta(3, 4, 4)
+    assert tuple(tp.functional.diagonal_scatter(cube, _meta(4, 3), 0).shape) == (3, 4, 4)
+    assert tuple(tp.functional.diagonal_scatter(_meta(3, 5, 5), _meta(5, 3), 2).shape) == (3, 5, 5)
+    with pytest.raises(Exception):
+        tp.functional.diagonal_scatter(cube, _meta(3, 4), 0)
+    with pytest.raises(Exception):
+        tp.functional.diagonal_scatter(_meta(3, 5, 5), _meta(3, 3), 2)
+    with pytest.raises(Exception):
+        tp.functional.diagonal_scatter(cube, _meta(4, 3), 0, 1, 1)
+
+
+def test_vander_extents_and_dtype():
+    x = _meta(4)
+    assert tuple(tp.functional.vander(x).shape) == (4, 4)
+    assert tuple(tp.functional.vander(x, 3).shape) == (4, 3)
+    assert tp.functional.vander(_meta(4, dtype=tp.int64)).dtype == tp.int64
+    assert tp.functional.vander(x, 3).dtype == tp.float32
+    with pytest.raises(Exception):
+        tp.functional.vander(x, -1)
+    with pytest.raises(Exception):
+        tp.functional.vander(_meta(2, 4))
+
+
+def test_trapezoid_family_shapes():
+    y = _meta(5)
+    assert tuple(tp.functional.trapezoid(y).shape) == ()
+    assert tuple(tp.functional.trapezoid(y, _meta(5)).shape) == ()
+    assert tuple(tp.functional.trapezoid(_meta(2, 5), dim=1).shape) == (2,)
+    assert tp.functional.trapezoid(_meta(2, 5), dim=1).dtype == tp.float32
+    with pytest.raises(Exception):
+        tp.functional.trapezoid(y, _meta(3))
+    with pytest.raises(Exception):
+        tp.functional.trapezoid(_meta(2, 5), _meta(3), dim=1)
+
+    assert tuple(tp.functional.cumulative_trapezoid(y).shape) == (4,)
+    assert tuple(tp.functional.cumulative_trapezoid(_meta(2, 5), _meta(2, 5), dim=1).shape) == (2, 4)
+    with pytest.raises(Exception):
+        tp.functional.cumulative_trapezoid(y, _meta(3))
+
+
+def test_cov_corrcoef_count_nonzero_shapes():
+    m = _meta(3, 5)
+    assert tuple(tp.functional.cov(m).shape) == (3, 3)
+    assert tuple(tp.functional.cov(_meta(5)).shape) == ()
+    with pytest.raises(Exception):
+        tp.functional.cov(_meta(2, 3, 5))
+    with pytest.raises(NotImplementedError):
+        tp.functional.cov(_meta(3, 5, dtype=tp.bool))
+    with pytest.raises(Exception):
+        tp.functional.cov(m, fweights=_meta(3, 1))
+    with pytest.raises(Exception):
+        tp.functional.cov(m, fweights=_meta(4))
+    assert tuple(tp.functional.corrcoef(m).shape) == (3, 3)
+    with pytest.raises(Exception):
+        tp.functional.corrcoef(_meta(2, 3, 5))
+
+    assert tuple(tp.functional.count_nonzero(_meta(2, 3)).shape) == ()
+    assert tuple(tp.functional.count_nonzero(_meta(2, 3), dim=[1]).shape) == (2,)
+    assert tp.functional.count_nonzero(_meta(2, 3)).dtype == tp.int64
+
+
+def test_histogram_bin_contract():
+    hist, edges = tp.functional.histogram(_meta(10), 4)
+    assert tuple(hist.shape) == (4,) and hist.dtype == tp.float32
+    assert tuple(edges.shape) == (5,) and edges.dtype == tp.float32
+    with pytest.raises(Exception):
+        tp.functional.histogram(_meta(10), 0)
+    with pytest.raises(Exception):
+        tp.functional.histogram(_meta(10, dtype=tp.int64), 4)
+    with pytest.raises(Exception):
+        tp.functional.histogram(_meta(10), 4, weight=_meta(5))
+    with pytest.raises(Exception):
+        tp._C.histogram(_meta(10), 4, range=[0.0, 1.0, 2.0])
+    with pytest.raises(Exception):
+        tp._C.histogram(_meta(10), 4, range=[1.0, 0.0])
+    with pytest.raises(Exception):
+        tp._C.histogram(_meta(10), 4, range=[float("nan"), 1.0])
+
+
+def test_pdist_and_matrix_power():
+    out = tp.functional.pdist(_meta(5, 3))
+    assert tuple(out.shape) == (10,) and out.dtype == tp.float32
+    assert tuple(tp.functional.pdist(_meta(1, 3)).shape) == (0,)
+    with pytest.raises(Exception):
+        tp.functional.pdist(_meta(5))
+    with pytest.raises(Exception):
+        tp.functional.pdist(_meta(5, 3, dtype=tp.int64))
+    with pytest.raises(Exception):
+        tp.functional.pdist(_meta(5, 3), p=-1.0)
+
+    assert tuple(tp.functional.matrix_power(_meta(3, 3), 2).shape) == (3, 3)
+    assert tuple(tp.functional.matrix_power(_meta(3, 3), -1).shape) == (3, 3)
+    assert tuple(tp.functional.matrix_power(_meta(2, 3, 3), 2).shape) == (2, 3, 3)
+    assert tp.functional.matrix_power(_meta(3, 3, dtype=tp.int64), 2).dtype == tp.int64
+    with pytest.raises(Exception):
+        tp.functional.matrix_power(_meta(3, 4), 2)
+
+
+def test_fixed_mean_losses_answer_scalars():
+    x, z = _meta(3, 4), _meta(3, 4)
+    zi = _meta(3, 4, dtype=tp.int64)
+    f = tp.functional
+    cases = [
+        ("l1_loss", lambda: f.l1_loss(x, z)),
+        ("kl_div", lambda: f.kl_div(x, z)),
+        ("poisson_nll_loss", lambda: f.poisson_nll_loss(x, z)),
+        ("soft_margin_loss", lambda: f.soft_margin_loss(x, z)),
+        ("multilabel_soft_margin_loss", lambda: f.multilabel_soft_margin_loss(x, z)),
+        ("cosine_embedding_loss", lambda: f.cosine_embedding_loss(_meta(3, 4), _meta(3, 4), _meta(3))),
+        ("margin_ranking_loss", lambda: f.margin_ranking_loss(x, z, _meta(3, 4))),
+        ("hinge_embedding_loss", lambda: f.hinge_embedding_loss(x, z)),
+        ("triplet_margin_loss", lambda: f.triplet_margin_loss(_meta(3, 4), _meta(3, 4), _meta(3, 4))),
+        ("binary_cross_entropy_with_logits", lambda: f.binary_cross_entropy_with_logits(x, z)),
+    ]
+    for _, call in cases:
+        out = call()
+        assert tuple(out.shape) == () and out.dtype == tp.float32
+    assert f.l1_loss(_meta(3, 4, dtype=tp.float64), z).dtype == tp.float64
+    assert f.l1_loss(zi, zi).dtype == tp.float32
+    assert f.binary_cross_entropy_with_logits(zi, z).dtype == tp.float32
+    assert f.binary_cross_entropy_with_logits(x, z, weight=_meta(3, 4)).dtype == tp.float32
+    assert f.binary_cross_entropy_with_logits(x, z, weight=_meta(0)).dtype == tp.float32
+
+    with pytest.raises(Exception):
+        f.l1_loss(x, _meta(5))
+    with pytest.raises(Exception):
+        f.kl_div(x, _meta(5))
+    with pytest.raises(Exception):
+        f.soft_margin_loss(x, _meta(5))
+    with pytest.raises(Exception):
+        f.multilabel_soft_margin_loss(x, _meta(5))
+    with pytest.raises(Exception):
+        f.margin_ranking_loss(x, _meta(5), _meta(3, 4))
+    with pytest.raises(Exception):
+        f.margin_ranking_loss(x, z, _meta(5))
+    with pytest.raises(Exception):
+        f.hinge_embedding_loss(x, _meta(5))
+    with pytest.raises(Exception):
+        f.binary_cross_entropy_with_logits(x, _meta(5))
+    with pytest.raises(Exception):
+        f.binary_cross_entropy_with_logits(x, z, weight=_meta(5))
+
+
 # ---------------------------------------------------------------------------
 # Cross-checks against the reference framework when it is installed
 # ---------------------------------------------------------------------------

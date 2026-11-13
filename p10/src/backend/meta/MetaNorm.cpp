@@ -92,6 +92,24 @@ Tensor& renorm_inplace_kernel(Tensor& self, const Scalar& p, int64_t dim,
     return self;
 }
 
+// The pairwise distances condense a matrix of points into one distance per
+// unordered pair: the upper triangle holds N * (N - 1) / 2 entries, which is
+// also the answer for the empty and single-row inputs where it is zero.
+Tensor pdist_kernel(const Tensor& self, double p) {
+    if (!isFloatingType(self.dtype())) {
+        TP_THROW(TypeError, "pdist: only floating-point tensors are supported");
+    }
+    if (self.dim() != 2) {
+        TP_THROW(RuntimeError, "pdist only supports 2D tensors, got: ",
+                 self.dim(), "D");
+    }
+    if (p < 0.0) {
+        TP_THROW(RuntimeError, "pdist only supports non-negative p values");
+    }
+    const int64_t n = self.size(0);
+    return empty_meta({n * (n - 1) / 2}, self.dtype(), self.device());
+}
+
 } // anonymous namespace
 
 TENSORPLAY_LIBRARY_IMPL(Meta, MetaNorm) {
@@ -100,6 +118,7 @@ TENSORPLAY_LIBRARY_IMPL(Meta, MetaNorm) {
     m.impl("dist", dist_kernel);
     m.impl("renorm", renorm_kernel);
     m.impl("renorm_", renorm_inplace_kernel);
+    m.impl("pdist", pdist_kernel);
 }
 
 } // namespace meta

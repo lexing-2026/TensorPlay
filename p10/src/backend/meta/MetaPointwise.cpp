@@ -669,6 +669,20 @@ TENSORPLAY_LIBRARY_IMPL(Meta, MetaPointwise) {
     m.impl("asinh", asinh_kernel);
     m.impl("acosh", acosh_kernel);
     m.impl("atanh", atanh_kernel);
+    // The arc-prefixed spellings and the word forms of the arithmetic
+    // primitives answer the same geometry as their base names.
+    m.impl("arcsin", asin_kernel);
+    m.impl("arccos", acos_kernel);
+    m.impl("arctan", atan_kernel);
+    m.impl("arcsinh", asinh_kernel);
+    m.impl("arccosh", acosh_kernel);
+    m.impl("arctanh", atanh_kernel);
+    m.impl("negative", neg_kernel);
+    m.impl("multiply.Tensor", mul_kernel);
+    m.impl("subtract.Tensor", sub_kernel);
+    m.impl("divide.Tensor", div_kernel);
+    m.impl("logaddexp", float_pair_kernel);
+    m.impl("logaddexp2", float_pair_kernel);
     m.impl("tan_", tan_inplace_kernel);
     m.impl("asin_", asin_inplace_kernel);
     m.impl("acos_", acos_inplace_kernel);

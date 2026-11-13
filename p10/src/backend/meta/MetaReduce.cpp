@@ -499,6 +499,200 @@ std::tuple<Tensor, Tensor> var_mean_kernel(const Tensor& self,
     const DType dtype = mean_like_dtype(self, DType::Undefined);
     return {empty_meta(out, dtype, self.device()), empty_meta(out, dtype, self.device())};
 }
+
+// The trapezoid rule pairs neighbouring samples, so it consumes one fewer
+// segment than the sampled axis has points: the plain form drops the axis,
+// the cumulative form keeps it with one fewer extent.  Fewer than two
+// samples leave nothing to pair -- the axis vanishes or holds nothing -- and
+// a coordinate tensor shorter than the sampled axis cannot pair.  The mean
+// of neighbours leaves the integral types behind, since the operation has
+// no integral form to answer in.
+void check_trapezoid_axis(const Tensor& y, const std::optional<Tensor>& x,
+                          int64_t dim, int64_t n) {
+    if (!x.has_value() || !x->defined()) {
+        return;
+    }
+    if (x->dim() == 1 && y.dim() > 1) {
+        // The coordinate vector is viewed along the sampled axis and grown
+        // to the operand's extents, which only fits at the same length.
+        if (x->size(0) != n) {
+            TP_THROW(RuntimeError,
+                     "The expanded size of the tensor must match the existing "
+                     "size at existing dimensions");
+        }
+        return;
+    }
+    // Neighbouring coordinates are sliced one past the first, so the
+    // coordinate extent has to reach the last paired sample, and the
+    // remaining extents must broadcast against the operand's.
+    if (x->size(dim) < n) {
+        TP_THROW(RuntimeError, "coordinate extent ", x->size(dim),
+                 " is shorter than the sampled axis of ", n);
+    }
+    broadcast_shapes(shape_of(y), shape_of(*x));
+}
+
+Tensor trapezoid_kernel(const Tensor& y, const std::optional<Tensor>& x,
+                        const Scalar& /*dx*/, int64_t dim) {
+    const int64_t nd = y.dim();
+    if (dim < 0) dim += nd;
+    if (dim < 0 || dim >= nd) {
+        TP_THROW(IndexError, "Dimension out of range");
+    }
+    const int64_t n = y.size(dim);
+    if (n >= 2) {
+        check_trapezoid_axis(y, x, dim, n);
+    }
+    std::vector<int64_t> out = shape_of(y);
+    out.erase(out.begin() + dim);
+    return empty_meta(out, unary_float_dtype(y.dtype()), y.device());
+}
+
+Tensor cumulative_trapezoid_kernel(const Tensor& y,
+                                   const std::optional<Tensor>& x,
+                                   const Scalar& /*dx*/, int64_t dim) {
+    const int64_t nd = y.dim();
+    if (dim < 0) dim += nd;
+    if (dim < 0 || dim >= nd) {
+        TP_THROW(IndexError, "Dimension out of range");
+    }
+    const int64_t n = y.size(dim);
+    if (n >= 2) {
+        check_trapezoid_axis(y, x, dim, n);
+    }
+    std::vector<int64_t> out = shape_of(y);
+    out[static_cast<size_t>(dim)] = n >= 2 ? n - 1 : 0;
+    return empty_meta(out, unary_float_dtype(y.dtype()), y.device());
+}
+
+// The covariance answers one row per variable: a rank-one operand measures a
+// single variable and collapses to a scalar, a matrix answers its variable
+// count squared, and singleton extents squeeze away.  Frequencies must count
+// whole observations, reliabilities must weight them fractionally.
+Tensor cov_kernel(const Tensor& self, int64_t /*correction*/,
+                  const std::optional<Tensor>& fweights,
+                  const std::optional<Tensor>& aweights) {
+    if (self.dim() > 2) {
+        TP_THROW(RuntimeError,
+                 "cov(): expected input to have two or fewer dimensions but got "
+                 "an input with ", self.dim(), " dimensions");
+    }
+    TP_CHECK_NOT_IMPLEMENTED(self.dtype() != DType::Bool,
+                             "cov(): bool dtype is not supported for input");
+    const int64_t observations = self.dim() < 2 ? self.numel() : self.size(1);
+    if (fweights.has_value()) {
+        if (fweights->dim() > 1) {
+            TP_THROW(RuntimeError,
+                     "cov(): expected fweights to have one or fewer dimensions "
+                     "but got fweights with ", fweights->dim(), " dimensions");
+        }
+        TP_CHECK(isIntegralType(fweights->dtype(), /*includeBool=*/false),
+                 "cov(): expected fweights to have integral dtype but got "
+                 "fweights with dtype ", static_cast<int>(fweights->dtype()));
+        TP_CHECK(fweights->numel() == observations,
+                 "cov(): expected fweights to have the same numel as there are "
+                 "observations in the input but got ", fweights->numel(),
+                 " != ", observations);
+    }
+    if (aweights.has_value()) {
+        if (aweights->dim() > 1) {
+            TP_THROW(RuntimeError,
+                     "cov(): expected aweights to have one or fewer dimensions "
+                     "but got aweights with ", aweights->dim(), " dimensions");
+        }
+        TP_CHECK(isFloatingType(aweights->dtype()),
+                 "cov(): expected aweights to have floating point dtype but got "
+                 "aweights with dtype ", static_cast<int>(aweights->dtype()));
+        TP_CHECK(aweights->numel() == observations,
+                 "cov(): expected aweights to have the same numel as there are "
+                 "observations in the input but got ", aweights->numel(),
+                 " != ", observations);
+    }
+    const int64_t vars = self.dim() < 2 ? 1 : self.size(0);
+    // The matrix form squeezes its singleton extents away.
+    std::vector<int64_t> out;
+    if (vars != 1) {
+        out = {vars, vars};
+    }
+    return empty_meta(out, unary_float_dtype(self.dtype()), self.device());
+}
+
+Tensor corrcoef_kernel(const Tensor& self) {
+    if (self.dim() > 2) {
+        TP_THROW(RuntimeError,
+                 "corrcoef(): expected input to have two or fewer dimensions but got "
+                 "an input with ", self.dim(), " dimensions");
+    }
+    const int64_t vars = self.dim() < 2 ? 1 : self.size(0);
+    std::vector<int64_t> out;
+    if (vars != 1) {
+        out = {vars, vars};
+    }
+    return empty_meta(out, unary_float_dtype(self.dtype()), self.device());
+}
+
+// Counting non-zero entries reduces like a sum over a boolean map: no axis
+// named collapses to a scalar, every named axis drops, and the count is an
+// integer.
+Tensor count_nonzero_kernel(const Tensor& self,
+                            const std::vector<int64_t>& dim) {
+    if (dim.empty()) {
+        return empty_meta({}, DType::Int64, self.device());
+    }
+    return empty_meta(reduce_out_shape(self, dim, /*keepdim=*/false),
+                      DType::Int64, self.device());
+}
+
+// A fixed bin count fixes both answers: one count per bin beside one edge
+// per bin boundary.  Without an explicit range the span comes from the
+// stored extrema, which a metadata-only device cannot read, so that
+// validation is left to a materializing backend.
+std::tuple<Tensor, Tensor> histogram_bin_ct_kernel(
+    const Tensor& self, int64_t bins,
+    const std::optional<std::vector<double>>& range,
+    const std::optional<Tensor>& weight, bool /*density*/) {
+    if (self.dtype() != DType::Float16 && self.dtype() != DType::BFloat16 &&
+        self.dtype() != DType::Float32 && self.dtype() != DType::Float64) {
+        TP_THROW(TypeError,
+                 "histogram(): input tensor must have a floating-point dtype");
+    }
+    if (bins < 1) {
+        TP_THROW(ValueError, "histogram(): bins must be > 0, but got ", bins,
+                 " for dimension 0");
+    }
+    if (weight.has_value()) {
+        if (weight->dtype() != self.dtype()) {
+            TP_THROW(ValueError,
+                     "histogramdd: if weight tensor is provided, input "
+                     "tensor and weight tensor should have the same dtype");
+        }
+        if (weight->numel() != self.numel()) {
+            TP_THROW(ValueError,
+                     "histogramdd: if weight tensor is provided, it should have "
+                     "the same number of elements as the input tensor");
+        }
+    }
+    if (range.has_value()) {
+        if (range->size() != 2) {
+            TP_THROW(ValueError,
+                     "histogramdd: for a 1-dimensional histogram range "
+                     "should have 2 elements, but got ", range->size());
+        }
+        const double leftmost = (*range)[0];
+        const double rightmost = (*range)[1];
+        if (!std::isfinite(leftmost) || !std::isfinite(rightmost)) {
+            TP_THROW(ValueError, "histogramdd: dimension 0's range [",
+                     leftmost, ", ", rightmost, "] is not finite");
+        }
+        if (leftmost > rightmost) {
+            TP_THROW(ValueError,
+                     "histogramdd: dimension 0's lower bound ", leftmost,
+                     " is larger than the upper bound ", rightmost);
+        }
+    }
+    return {empty_meta({bins}, self.dtype(), self.device()),
+            empty_meta({bins + 1}, self.dtype(), self.device())};
+}
 } // anonymous namespace
 
 TENSORPLAY_LIBRARY_IMPL(Meta, MetaReduce) {
@@ -540,6 +734,12 @@ TENSORPLAY_LIBRARY_IMPL(Meta, MetaReduce) {
     m.impl("_aminmax", aminmax_all_kernel);
     m.impl("_aminmax.dim", aminmax_dim_kernel);
     m.impl("var_mean", var_mean_kernel);
+    m.impl("trapezoid", trapezoid_kernel);
+    m.impl("cumulative_trapezoid", cumulative_trapezoid_kernel);
+    m.impl("cov", cov_kernel);
+    m.impl("corrcoef", corrcoef_kernel);
+    m.impl("count_nonzero", count_nonzero_kernel);
+    m.impl("histogram.bin_ct", histogram_bin_ct_kernel);
 }
 
 } // namespace meta

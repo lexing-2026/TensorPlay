@@ -316,6 +316,128 @@ std::tuple<Tensor, Tensor> multilabel_margin_loss_forward_kernel(
     }
     return {empty_meta({}, self.dtype(), self.device()), mask};
 }
+
+// ---------------------------------------------------------------------------
+// Fixed-mean losses.  The plain loss names average their elementwise term
+// over the whole broadcast geometry: the answer is always a scalar.  The
+// arithmetic runs in double precision internally, so the answer comes back
+// at the double type when the leading operand already has it and at single
+// precision otherwise.
+// ---------------------------------------------------------------------------
+
+DType scalar_loss_dtype(DType dtype) {
+    return dtype == DType::Float64 ? DType::Float64 : DType::Float32;
+}
+
+// Expanding a side operand onto the leading operand's geometry is validated
+// even though no values are read: the side shape must broadcast onto the
+// leading shape exactly.
+void check_expandable_to(const Tensor& side,
+                         const std::vector<int64_t>& target_shape,
+                         const char* loss) {
+    if (broadcast_shapes(shape_of(side), target_shape) != target_shape) {
+        TP_THROW(RuntimeError, loss, ": operand of shape ",
+                 side.shape().toString(),
+                 " cannot be expanded to the leading operand's shape");
+    }
+}
+
+// These losses pair their two operands under one broadcast before reducing.
+Tensor l1_loss_scalar_kernel(const Tensor& input, const Tensor& target) {
+    check_all_meta(input, target);
+    broadcast2(input, target);
+    return empty_meta({}, scalar_loss_dtype(input.dtype()), input.device());
+}
+
+Tensor kl_div_scalar_kernel(const Tensor& input, const Tensor& target) {
+    check_all_meta(input, target);
+    broadcast2(input, target);
+    return empty_meta({}, scalar_loss_dtype(input.dtype()), input.device());
+}
+
+Tensor poisson_nll_loss_scalar_kernel(const Tensor& input, const Tensor& target,
+                                      bool /*log_input*/, bool /*full*/,
+                                      double /*eps*/) {
+    check_all_meta(input, target);
+    broadcast2(input, target);
+    return empty_meta({}, scalar_loss_dtype(input.dtype()), input.device());
+}
+
+Tensor soft_margin_loss_scalar_kernel(const Tensor& input,
+                                      const Tensor& target) {
+    check_all_meta(input, target);
+    broadcast2(input, target);
+    return empty_meta({}, scalar_loss_dtype(input.dtype()), input.device());
+}
+
+Tensor multilabel_soft_margin_loss_scalar_kernel(const Tensor& input,
+                                                 const Tensor& target) {
+    check_all_meta(input, target);
+    broadcast2(input, target);
+    return empty_meta({}, scalar_loss_dtype(input.dtype()), input.device());
+}
+
+// These losses expand their side operands onto the leading operand's
+// geometry, which is the validated step.
+Tensor margin_ranking_loss_scalar_kernel(const Tensor& input1,
+                                         const Tensor& input2,
+                                         const Tensor& target,
+                                         const Scalar& /*margin*/) {
+    check_all_meta(input1, input2);
+    check_all_meta(input1, target);
+    check_expandable_to(input2, shape_of(input1), "margin_ranking_loss");
+    check_expandable_to(target, shape_of(input1), "margin_ranking_loss");
+    return empty_meta({}, scalar_loss_dtype(input1.dtype()), input1.device());
+}
+
+Tensor hinge_embedding_loss_scalar_kernel(const Tensor& input,
+                                          const Tensor& target,
+                                          const Scalar& /*margin*/) {
+    check_all_meta(input, target);
+    check_expandable_to(target, shape_of(input), "hinge_embedding_loss");
+    return empty_meta({}, scalar_loss_dtype(input.dtype()), input.device());
+}
+
+Tensor binary_cross_entropy_with_logits_scalar_kernel(
+    const Tensor& self, const Tensor& target,
+    const std::optional<Tensor>& weight,
+    const std::optional<Tensor>& pos_weight) {
+    check_all_meta(self, target);
+    check_expandable_to(target, shape_of(self),
+                        "binary_cross_entropy_with_logits");
+    // A defined-but-empty weighting tensor takes no part in the loss, so it
+    // escapes the expansion check the same way it escapes the arithmetic.
+    for (const std::optional<Tensor>* w : {&weight, &pos_weight}) {
+        if (w->has_value() && (*w)->defined() && (*w)->numel() > 0) {
+            check_all_meta(self, **w);
+            check_expandable_to(**w, shape_of(self),
+                                "binary_cross_entropy_with_logits");
+        }
+    }
+    return empty_meta({}, scalar_loss_dtype(self.dtype()), self.device());
+}
+
+// The embedding losses read their row geometry straight off the leading
+// operand and index the side operands positionally, so no cross-operand
+// broadcast is validated.
+Tensor cosine_embedding_loss_scalar_kernel(const Tensor& x1, const Tensor& x2,
+                                           const Tensor& target,
+                                           const Scalar& /*margin*/) {
+    check_all_meta(x1, x2);
+    check_all_meta(x1, target);
+    return empty_meta({}, scalar_loss_dtype(x1.dtype()), x1.device());
+}
+
+Tensor triplet_margin_loss_scalar_kernel(const Tensor& anchor,
+                                         const Tensor& positive,
+                                         const Tensor& negative,
+                                         const Scalar& /*margin*/,
+                                         double /*p*/) {
+    check_all_meta(anchor, positive);
+    check_all_meta(anchor, negative);
+    return empty_meta({}, scalar_loss_dtype(anchor.dtype()), anchor.device());
+}
+
 } // anonymous namespace
 
 TENSORPLAY_LIBRARY_IMPL(Meta, MetaLoss) {
@@ -334,6 +456,20 @@ TENSORPLAY_LIBRARY_IMPL(Meta, MetaLoss) {
     m.impl("multi_margin_loss", multi_margin_loss_kernel);
     m.impl("multilabel_margin_loss_forward",
            multilabel_margin_loss_forward_kernel);
+    // The plain loss names always average: their registrations carry no
+    // reduction argument and answer a scalar.
+    m.impl("l1_loss", l1_loss_scalar_kernel);
+    m.impl("kl_div", kl_div_scalar_kernel);
+    m.impl("poisson_nll_loss", poisson_nll_loss_scalar_kernel);
+    m.impl("soft_margin_loss", soft_margin_loss_scalar_kernel);
+    m.impl("multilabel_soft_margin_loss",
+           multilabel_soft_margin_loss_scalar_kernel);
+    m.impl("margin_ranking_loss", margin_ranking_loss_scalar_kernel);
+    m.impl("hinge_embedding_loss", hinge_embedding_loss_scalar_kernel);
+    m.impl("binary_cross_entropy_with_logits",
+           binary_cross_entropy_with_logits_scalar_kernel);
+    m.impl("cosine_embedding_loss", cosine_embedding_loss_scalar_kernel);
+    m.impl("triplet_margin_loss", triplet_margin_loss_scalar_kernel);
 }
 
 } // namespace meta

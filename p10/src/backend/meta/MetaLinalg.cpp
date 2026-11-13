@@ -686,6 +686,16 @@ Tensor pinv_tensor_kernel(const Tensor& self,
         {self.size(-1), self.size(-2)});
     return empty_meta(out, self.dtype(), self.device());
 }
+
+Tensor matrix_power_kernel(const Tensor& self, int64_t n) {
+    if (self.dim() < 2 || self.size(-2) != self.size(-1)) {
+        TP_THROW(RuntimeError, "matrix_power(): expected a square matrix");
+    }
+    if (n == std::numeric_limits<int64_t>::min()) {
+        TP_THROW(RuntimeError, "matrix_power(): exponent is too small");
+    }
+    return empty_meta(shape_of(self), self.dtype(), self.device());
+}
 } // anonymous namespace
 TENSORPLAY_LIBRARY_IMPL(Meta, MetaLinalg) {
     m.impl("_linalg_check_errors", linalg_check_errors_kernel);
@@ -711,6 +721,12 @@ TENSORPLAY_LIBRARY_IMPL(Meta, MetaLinalg) {
     m.impl("linalg_diagonal", diagonal_kernel);
     m.impl("linalg_pinv.atol_rtol_tensor", pinv_tensor_kernel);
     m.impl("lu_unpack", lu_unpack_kernel);
+    // Every power multiplies square matrices with themselves, so the batch
+    // geometry and the matrix plane are the operand's own; the exponent
+    // never changes them, and the zeroth power answers an identity of the
+    // same width.
+    m.impl("matrix_power", matrix_power_kernel);
+    m.impl("linalg_matrix_power", matrix_power_kernel);
 }
 
 } // namespace meta
