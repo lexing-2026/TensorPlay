@@ -2428,13 +2428,18 @@ def lower_clone(x, *args, **kwargs):
 
 
 def make_view(x: TensorBox, size, reindex) -> TensorBox:
-    # The boxes stay on: a value that has nowhere to live yet can only be
-    # given memory by the box that holds it, and a reader that needs this
-    # view in memory realizes down through those boxes.  Peeling them would
-    # leave an unwritten body that has no way to be asked for memory, and
-    # every later realize through this view would fail.
     if reindex is None:
         return View.create(x, size)
+    # A value that is already in memory can be held by the view directly, so
+    # the boxes come off and the scheduler sees this view exactly as one built
+    # over the buffer itself.  A value with nowhere to live yet can only be
+    # given memory by the box that holds it: there the boxes stay on, and a
+    # reader that needs this view in memory realizes down through them.
+    # Peeling those would leave an unwritten body that has no way to be asked
+    # for memory, and every later realize through this view would fail.
+    body = _underlying(x)
+    if IRNode.is_realized_node(body):
+        return TensorBox(View(data=body, size=size, reindex=reindex))
     return TensorBox(View(data=x, size=size, reindex=reindex))
 
 
