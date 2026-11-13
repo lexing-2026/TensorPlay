@@ -60,6 +60,17 @@ layout (a 1-D index vector for the multi-class form, a rank-2 label table for
 the multi-label one); only the per-entry index range is a value check that
 cannot run.
 
+Linear algebra reports the full result geometry: `cholesky`/`cholesky_ex`,
+`inv`/`inv_ex`, `det`/`slogdet`, the LU family (`lu`, `lu_factor_ex`,
+`lu_solve`, `lu_unpack`), `ldl_factor`/`ldl_factor_ex`/`ldl_solve`,
+`solve`/`solve_ex`/`solve_triangular`, `eigh`/`eigvalsh`/`eig`/`eigvals`,
+`svd`/`svdvals`, `qr`, `householder_product`, `lstsq`, `pinv` and `diagonal`,
+including the integer `info`, pivot and rank planes and the dtype changes
+(a real input's `eig` answers complex tensors). Argument contracts are
+enforced as on a materialized tensor: square and matrix requirements, the
+floating-point dtype gate, and the `driver`/`mode` names. Composed helpers
+(`matrix_power`, `matrix_rank`, `cond`, `norm`, `polar`) build on those.
+
 The random fills (`uniform_`, `normal_`, `cauchy_`, `exponential_`,
 `geometric_`, `log_normal_`, `bernoulli_` and the `random_` family) accept a
 meta tensor and leave its metadata unchanged — there is no data to sample into,
@@ -98,6 +109,14 @@ A meta tensor has no data, so anything that must read a value fails with
 Value-dependent checks inside the random fills are skipped on meta: bounds and
 probability scalars are validated, but a probability or bound *tensor* is never
 read, so a draw that would fail on stored values passes here.
+
+Factorization failures that depend on the stored numbers cannot fire either.
+`cholesky` returns the factor shape instead of rejecting a matrix that is not
+positive definite, and a singular `inv` answers its shape rather than raising;
+the `_ex` forms answer an `info` plane without evaluating any entry, so a later
+consumer that inspects `info` has nothing meaningful to read. `matrix_sqrth`
+and `matrix_exp` fail outright because their scaling decisions read stored
+values (an `item` call and a copy out of the tensor respectively).
 
 ## Idioms
 
