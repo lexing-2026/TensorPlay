@@ -52,6 +52,20 @@ products (`matmul` and friends, `dot`/`mv`/`inner`/`ger`,
 layers (`softmax`, `layer_norm`, `group_norm`, `batch_norm`, `rms_norm`), the
 norm and distance family (`dist`, `renorm`) all run on meta tensors.
 
+The random fills (`uniform_`, `normal_`, `cauchy_`, `exponential_`,
+`geometric_`, `log_normal_`, `bernoulli_` and the `random_` family) accept a
+meta tensor and leave its metadata unchanged — there is no data to sample into,
+so only the argument checks run. That is enough for default initialization:
+building a module inside a meta context produces meta parameters, and a forward
+pass on meta inputs answers shapes without computing.
+
+```python
+with tp.device("meta"):
+    model = tp.nn.Linear(4, 3)
+print(model.weight.shape)              # (3, 4)
+print(model(tp.randn(2, 4)).shape)     # (2, 3)
+```
+
 What remains missing is genuinely value-dependent — `nonzero`, `masked_select`,
 `unique`, `bincount`, `count_nonzero`, `item` — and raises the same
 `NotImplementedError` as the cases below. When a trace hits such a gap, rewrite the
@@ -73,10 +87,9 @@ A meta tensor has no data, so anything that must read a value fails with
 - `tp.load(..., map_location="meta")` — the deserializer only supports the `cpu` and
   CUDA map targets and refuses `meta` outright.
 
-Module construction under a meta context hits the same wall in this build: layers
-initialize their parameters by drawing random numbers (`uniform_` and friends), and
-those kernels have no meta implementation. Build the module on a real device and reason
-about shapes with meta *tensors* rather than moving whole modules to meta.
+Value-dependent checks inside the random fills are skipped on meta: bounds and
+probability scalars are validated, but a probability or bound *tensor* is never
+read, so a draw that would fail on stored values passes here.
 
 ## Idioms
 
