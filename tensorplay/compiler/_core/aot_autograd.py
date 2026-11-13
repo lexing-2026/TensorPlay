@@ -197,7 +197,12 @@ def _trace_inputs(primals: Sequence[Any]) -> list[Any]:
 
 
 def _trace_forward(fn: Callable[..., Any], primals: Sequence[Any], decompositions):
-    tracer = DispatchTracer(record_values=True)
+    # What is recorded is the operation and a description of each result, not
+    # the result itself: the run that produces them holds them while it needs
+    # them, and the graph they are written onto outlives that run. Keeping the
+    # values on the nodes would leave a whole activation set reachable from a
+    # graph that only ever gets asked about shapes, dtypes and strides.
+    tracer = DispatchTracer(record_values=False)
     trace_primals = _trace_inputs(primals)
     _placeholders(tracer, trace_primals, "primals")
     with tensorplay.random.fork_rng(devices=_trace_devices(primals)):

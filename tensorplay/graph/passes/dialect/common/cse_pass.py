@@ -112,6 +112,8 @@ class CSEPass(PassBase):
         self.banned_ops = set() if banned_ops is None else banned_ops
 
     def call(self, graph_module: GraphModule) -> PassResult:
+        from tensorplay.compiler._core.api import _release_recorded_values_of
+
         # Two calls with the same arguments give the same value only while
         # nothing writes into a value: merged, a later write to one result
         # would show through the other, and a write to an argument between
@@ -176,4 +178,13 @@ class CSEPass(PassBase):
         )
         cse_graph_module.meta.update(graph_module.meta)
         cse_graph_module._graph_attrs.update(graph_module._graph_attrs)
+        # Every node of the rebuilt graph carries a copy of what the node it
+        # stands for recorded, so both graphs hold the same values.  The
+        # input graph is not read again, and nothing it holds goes away by
+        # reference count alone -- a node keeps the nodes it reads and every
+        # node keeps its readers, which is a cycle -- so leaving it as it is
+        # would hold a whole activation set until a cycle collection happened
+        # to run.  What each node recorded becomes a description of it, the
+        # same thing the lowering pipeline is left with elsewhere.
+        _release_recorded_values_of(graph_module.graph.nodes)
         return PassResult(cse_graph_module, True)

@@ -1426,35 +1426,57 @@ def _release_recorded_values(graph_module: Any) -> None:
     later compile of the same region regenerates whatever values the
     pipeline consumes.
     """
-    from tensorplay import Tensor
-
     try:
         nodes = graph_module.graph.nodes
     except AttributeError:
         return
 
-    def strip(value: Any) -> Any:
-        if isinstance(value, Tensor):
-            return _RecordedTensorMetadata(value)
-        if isinstance(value, tuple):
-            return tuple(strip(item) for item in value)
-        if isinstance(value, list):
-            return [strip(item) for item in value]
-        if isinstance(value, dict):
-            return {key: strip(item) for key, item in value.items()}
-        return value
-
-    for node in nodes:
-        meta = getattr(node, "meta", None)
-        if not meta:
-            continue
-        meta.pop("widened_source", None)
-        value = meta.get("val")
-        if value is not None:
-            meta["val"] = strip(value)
+    _release_recorded_values_of(nodes)
     samples = getattr(graph_module, "meta", {}).get("sample_inputs")
     if samples is not None:
-        graph_module.meta["sample_inputs"] = strip(samples)
+        graph_module.meta["sample_inputs"] = _strip_recorded_value(samples)
+
+
+def _release_recorded_values_of(nodes: Any) -> None:
+    """Drop the execution artifacts parked on a set of nodes.
+
+    A graph a transformation replaced is not the graph a later step reads,
+    and the nodes it dropped are reachable through the references each node
+    keeps to the nodes it reads and to its readers -- a cycle, which
+    reference counting alone never breaks.  What those nodes recorded would
+    therefore stay in device memory until the next cycle collection happened
+    to run, so a caller that knows a graph is no longer read names its nodes
+    here.
+    """
+    for node in nodes:
+        _release_node_recorded_value(node)
+
+
+def _release_node_recorded_value(node: Any) -> None:
+    """Replace what a node recorded for one run with a description of it."""
+
+    meta = getattr(node, "meta", None)
+    if not meta:
+        return
+    meta.pop("widened_source", None)
+    value = meta.get("val")
+    if value is None:
+        return
+    meta["val"] = _strip_recorded_value(value)
+
+
+def _strip_recorded_value(value: Any) -> Any:
+    from tensorplay import Tensor
+
+    if isinstance(value, Tensor):
+        return _RecordedTensorMetadata(value)
+    if isinstance(value, tuple):
+        return tuple(_strip_recorded_value(item) for item in value)
+    if isinstance(value, list):
+        return [_strip_recorded_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _strip_recorded_value(item) for key, item in value.items()}
+    return value
 
 
 _SHAPE_GUARD_ATTRS = frozenset({"shape", "len", "ndim"})

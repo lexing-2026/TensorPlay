@@ -369,6 +369,25 @@ class _InsertPoint:
         self.graph._insert = self.orig_insert
 
 
+def _forget_recorded_value(node: Node) -> None:
+    """A node the graph has stopped containing gives up what it recorded.
+
+    Running a graph records each result on the node that produced it, so a
+    graph holds device memory for everything it computed.  A node the graph
+    no longer contains is not read again: it is kept alive only by the
+    references between nodes, which is a cycle that reference counting alone
+    never breaks, so what it recorded would wait for a cycle collection that
+    a compile need never run.  Letting the value describe itself instead of
+    holding itself keeps the shape, type and stride that later steps ask for.
+    """
+
+    try:
+        from ..compiler._core.api import _release_node_recorded_value
+    except ImportError:  # a graph without a compiler is a graph all the same
+        return
+    _release_node_recorded_value(node)
+
+
 class _NodeList(list[Node]):
     """List view with graph bookkeeping for direct list mutations."""
 
@@ -419,6 +438,7 @@ class _NodeList(list[Node]):
         for node in values:
             if node.graph is not graph:
                 continue
+            _forget_recorded_value(node)
             node.graph = None
             node._erased = True
             graph._index.pop(node, None)
@@ -1107,6 +1127,7 @@ class Graph:
         current_set = set(current)
         for node in old:
             if node not in current_set and node.graph is self:
+                _forget_recorded_value(node)
                 node.graph = None
                 node._erased = True
                 self._live_names.discard(node.name)
