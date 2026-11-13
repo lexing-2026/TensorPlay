@@ -628,6 +628,126 @@ def test_loss_shapes():
     assert tuple(total.shape) == ()
 
 
+def test_rsub_shapes_and_dtypes():
+    i = _meta(3, dtype=tp.int32)
+    f16 = _meta(3, dtype=tp.float16)
+    z = _meta(3, dtype=tp.complex64)
+    # A whole-number scalar leaves the tensor dtype alone; a floating scalar
+    # answers an integral tensor (truth values included) at single precision.
+    assert tp.functional.rsub(i, 1).dtype == tp.int32
+    assert tp.functional.rsub(i, 1.0).dtype == tp.float32
+    assert tp.functional.rsub(f16, 1).dtype == tp.float16
+    assert tp.functional.rsub(f16, 1.0).dtype == tp.float16
+    assert tp.functional.rsub(_meta(2, dtype=tp.bool), 1.0).dtype == tp.float32
+    # The scalar path has no complex loop: a complex tensor is refused against
+    # a whole-number scalar but narrowed to single precision against a float.
+    with pytest.raises(TypeError):
+        tp.functional.rsub(z, 1)
+    assert tp.functional.rsub(z, 1.0).dtype == tp.float32
+    # The tensor form broadcasts and promotes both operands, complex included.
+    assert tuple(tp.functional.rsub(_meta(2, 1), _meta(2, 4)).shape) == (2, 4)
+    assert tp.functional.rsub(f16, i).dtype == tp.float16
+    assert tp.functional.rsub(z, i).dtype == tp.complex64
+
+
+def test_extended_loss_shapes_and_dtypes():
+    x = _meta(2, 3)
+    y = _meta(2, 3)
+    assert tuple(tp.nn.functional.huber_loss(x, y).shape) == ()
+    assert tuple(tp.nn.functional.huber_loss(x, y, reduction="none").shape) == (2, 3)
+    assert tuple(tp._C.huber_loss(_meta(2, 1), y, 0, 1.0).shape) == (2, 3)
+    assert tp.nn.functional.huber_loss(x, y).dtype == tp.float32
+    # Whole-number operands answer at single precision because the loss
+    # arithmetic blends in floating literals; a half input stays half.
+    i = _meta(2, 3, dtype=tp.int32)
+    assert tp.nn.functional.huber_loss(i, i, reduction="none").dtype == tp.float32
+    half = _meta(2, 3, dtype=tp.float16)
+    assert tp.nn.functional.huber_loss(half, half, reduction="none").dtype == tp.float16
+    assert tp.nn.functional.huber_loss(half, x, reduction="none").dtype == tp.float32
+    with pytest.raises(ValueError):
+        tp.nn.functional.huber_loss(x, y, delta=0.0)
+
+    assert tuple(tp.nn.functional.soft_margin_loss(x, y).shape) == ()
+    assert tuple(tp.nn.functional.soft_margin_loss(x, y, reduction="none").shape) == (2, 3)
+    assert tp.nn.functional.soft_margin_loss(i, i).dtype == tp.float32
+
+    # The hinge loss follows the input dtype; the target only broadcasts.
+    assert tp.nn.functional.hinge_embedding_loss(
+        x, _meta(2, 3, dtype=tp.int64)).dtype == tp.float32
+    assert tp.nn.functional.hinge_embedding_loss(
+        _meta(2, 3, dtype=tp.float64), x).dtype == tp.float64
+
+    assert tuple(tp.nn.functional.margin_ranking_loss(
+        _meta(2, 1), _meta(2, 3), _meta(3), reduction="none").shape) == (2, 3)
+    assert tp.nn.functional.margin_ranking_loss(i, i, i).dtype == tp.float32
+
+
+def test_cosine_embedding_shapes_and_checks():
+    x = _meta(3, 4)
+    assert tuple(tp.nn.functional.cosine_embedding_loss(x, x, _meta(3)).shape) == ()
+    assert tuple(tp.nn.functional.cosine_embedding_loss(
+        x, x, _meta(3, 1), reduction="none").shape) == (3, 3)
+    assert tuple(tp.nn.functional.cosine_embedding_loss(
+        _meta(), _meta(), _meta(4), reduction="none").shape) == (4,)
+    with pytest.raises(IndexError):
+        tp.nn.functional.cosine_embedding_loss(_meta(4), _meta(4), _meta(4))
+    assert tp.nn.functional.cosine_embedding_loss(
+        _meta(3, 4, dtype=tp.int32), _meta(3, 4, dtype=tp.int32),
+        _meta(3)).dtype == tp.float32
+
+
+def test_margin_loss_shapes_and_checks():
+    x = _meta(4, 5)
+    target = _meta(4, dtype=tp.int64)
+    assert tuple(tp.nn.functional.multi_margin_loss(x, target).shape) == ()
+    assert tuple(tp.nn.functional.multi_margin_loss(
+        x, target, reduction="none").shape) == (4,)
+    # A vector input counts as one frame, so the unreduced answer keeps the
+    # frame axis of length one.
+    assert tuple(tp.nn.functional.multi_margin_loss(
+        _meta(5), _meta(1, dtype=tp.int64), reduction="none").shape) == (1,)
+    assert tp.nn.functional.multi_margin_loss(
+        _meta(4, 5, dtype=tp.float64), target).dtype == tp.float64
+    with pytest.raises(NotImplementedError):
+        tp.nn.functional.multi_margin_loss(_meta(4, 5, dtype=tp.float16), target)
+    with pytest.raises(RuntimeError):
+        tp.nn.functional.multi_margin_loss(x, _meta(3, dtype=tp.int64))
+    with pytest.raises(RuntimeError):
+        tp.nn.functional.multi_margin_loss(_meta(4, 0), target)
+    with pytest.raises(RuntimeError):
+        tp.nn.functional.multi_margin_loss(x, target, weight=_meta(2))
+    with pytest.raises(RuntimeError):
+        tp._C.multi_margin_loss(x, target, 3, 1.0, None, 1)
+
+    labels = _meta(4, 5, dtype=tp.int64)
+    assert tuple(tp.nn.functional.multilabel_margin_loss(x, labels).shape) == ()
+    assert tuple(tp.nn.functional.multilabel_margin_loss(
+        x, labels, reduction="none").shape) == (4,)
+    assert tuple(tp.nn.functional.multilabel_margin_loss(
+        _meta(5), _meta(5, dtype=tp.int64), reduction="none").shape) == ()
+    output, is_target = tp._C.multilabel_margin_loss_forward(x, labels, 1)
+    assert tuple(output.shape) == ()
+    assert tuple(is_target.shape) == (4, 5)
+    assert is_target.dtype == tp.float32
+    with pytest.raises(NotImplementedError):
+        tp.nn.functional.multilabel_margin_loss(
+            _meta(4, 5, dtype=tp.float16), labels)
+    with pytest.raises(RuntimeError):
+        tp.nn.functional.multilabel_margin_loss(x, _meta(4, 2, dtype=tp.int64))
+
+
+def test_logit_losses_run_on_meta():
+    # Both losses subtract the target from one, which is the reversed scalar
+    # subtraction the pointwise frontend offers.
+    x = _meta(2, 3)
+    y = _meta(2, 3)
+    assert tuple(tp.nn.functional.binary_cross_entropy_with_logits(x, y).shape) == ()
+    assert tuple(tp.nn.functional.binary_cross_entropy_with_logits(
+        x, y, reduction="none").shape) == (2, 3)
+    assert tuple(tp.nn.functional.multilabel_soft_margin_loss(
+        _meta(4, 5), _meta(4, 5)).shape) == ()
+
+
 def test_norm_and_normalize():
     t = _meta(2, 3)
     assert tuple(t.norm().shape) == ()
