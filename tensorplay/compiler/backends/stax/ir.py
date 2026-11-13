@@ -279,17 +279,15 @@ def aggregate_origins(node_schedule) -> list:
 
     if not isinstance(node_schedule, (list, tuple)):
         node_schedule = [node_schedule]
-    origins = []
+    origins: OrderedSet = OrderedSet()
     for node in node_schedule:
         if node is None:
             continue
-        for origin in getattr(node, "get_origins", lambda: [])():
-            if origin not in origins:
-                origins.append(origin)
+        origins.update(getattr(node, "get_origins", lambda: [])() or ())
         own = getattr(node, "origin_node", None)
-        if own is not None and own not in origins:
-            origins.append(own)
-    return origins
+        if own is not None:
+            origins.add(own)
+    return list(origins)
 
 
 def resolve_unbacked_bindings(shape_env, unbacked_bindings):
