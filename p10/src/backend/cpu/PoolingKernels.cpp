@@ -63,6 +63,20 @@ static std::pair<int64_t, int64_t> get_pair_from_kernel(const std::vector<int64_
     return get_pair(list);
 }
 
+// A fixed-arity pooling parameter: one value repeats across the axes, an
+// empty list takes the default, and any other count is rejected.
+static std::vector<int64_t> expand_pool_param(const std::vector<int64_t>& list,
+                                              const char* name, int64_t n,
+                                              int64_t default_val) {
+    if (list.empty()) return std::vector<int64_t>(n, default_val);
+    if (list.size() == 1) return std::vector<int64_t>(n, list[0]);
+    if (static_cast<int64_t>(list.size()) != n) {
+        TP_THROW(ValueError, std::string(name) + ": expected " +
+                                 std::to_string(n) + " values");
+    }
+    return list;
+}
+
 // invoked lambda, scalar_t hint inside, Double before Float, and the exact
 // '"kernel" not implemented for '<Type>'' wording on the default branch.
 #define TP_DISPATCH_FLOATING_TYPES(TYPE, NAME, ...)                        \
@@ -171,12 +185,22 @@ Tensor avg_pool3d_cpu(const Tensor& input, const std::vector<int64_t>& kernel_si
     if (input.dim() != 5) TP_THROW(RuntimeError, "avg_pool3d: Expected 5D input");
     const int64_t N = input.size(0), C = input.size(1);
     const int64_t D = input.size(2), H = input.size(3), W = input.size(4);
-    const int64_t kd = kernel_size[0], kh = kernel_size[1], kw = kernel_size[2];
-    const int64_t sd = stride[0], sh = stride[1], sw = stride[2];
-    const int64_t pd_ = padding[0], ph = padding[1], pw = padding[2];
+    const auto ks = expand_pool_param(kernel_size, "avg_pool3d kernel_size", 3, 1);
+    const auto st = expand_pool_param(stride.empty() ? ks : stride,
+                                      "avg_pool3d stride", 3, ks[0]);
+    const auto pd = expand_pool_param(padding, "avg_pool3d padding", 3, 0);
+    const int64_t kd = ks[0], kh = ks[1], kw = ks[2];
+    const int64_t sd = st[0], sh = st[1], sw = st[2];
+    const int64_t pd_ = pd[0], ph = pd[1], pw = pd[2];
+    if (sd == 0 || sh == 0 || sw == 0)
+        TP_THROW(RuntimeError, "stride should not be zero");
     auto out_size = [&](int64_t in, int64_t k, int64_t s, int64_t p) {
-        return ceil_mode ? (in + 2 * p - k + s - 1) / s + 1
-                         : (in + 2 * p - k) / s + 1;
+        int64_t num = in + 2 * p - k + (ceil_mode ? s - 1 : 0);
+        int64_t out = num / s;
+        if (num % s != 0 && (num < 0) != (s < 0)) --out;
+        out += 1;
+        if (ceil_mode && (out - 1) * s >= in + p) --out;
+        return out;
     };
     const int64_t oD = out_size(D, kd, sd, pd_);
     const int64_t oH = out_size(H, kh, sh, ph);
@@ -354,7 +378,9 @@ Tensor avg_pool2d_cpu(const Tensor& input, const std::vector<int64_t>& kernel_si
     std::tie(sH, sW) = get_pair_from_kernel(stride, kernel_size);
     int64_t pH, pW;
     std::tie(pH, pW) = get_pair(padding, 0);
-    
+    if (sH == 0 || sW == 0)
+        TP_THROW(RuntimeError, "stride should not be zero");
+
     int64_t H_out, W_out;
     if (ceil_mode) {
         H_out = (int64_t)(std::ceil((float)(H_in + 2 * pH - kH) / sH)) + 1;
@@ -672,6 +698,8 @@ Tensor avg_pool2d_backward_cpu(const Tensor& grad_output, const Tensor& input, c
     std::tie(sH, sW) = get_pair_from_kernel(stride, kernel_size);
     int64_t pH, pW;
     std::tie(pH, pW) = get_pair(padding, 0);
+    if (sH == 0 || sW == 0)
+        TP_THROW(RuntimeError, "stride should not be zero");
 
     if (input.is_contiguous(MemoryFormat::ChannelsLast) &&
         grad_output.is_contiguous(MemoryFormat::ChannelsLast) &&
@@ -1022,9 +1050,15 @@ Tensor avg_pool3d_backward_cpu(const Tensor& grad_output, const Tensor& input,
     const int64_t N = input.size(0), C = input.size(1);
     const int64_t D = input.size(2), H = input.size(3), W = input.size(4);
     const int64_t oD = grad_output.size(2), oH = grad_output.size(3), oW = grad_output.size(4);
-    const int64_t kd = kernel_size[0], kh = kernel_size[1], kw = kernel_size[2];
-    const int64_t sd = stride[0], sh = stride[1], sw = stride[2];
-    const int64_t pd_ = padding[0], ph = padding[1], pw = padding[2];
+    const auto ks = expand_pool_param(kernel_size, "avg_pool3d_backward kernel_size", 3, 1);
+    const auto st = expand_pool_param(stride.empty() ? ks : stride,
+                                      "avg_pool3d_backward stride", 3, ks[0]);
+    const auto pd = expand_pool_param(padding, "avg_pool3d_backward padding", 3, 0);
+    const int64_t kd = ks[0], kh = ks[1], kw = ks[2];
+    const int64_t sd = st[0], sh = st[1], sw = st[2];
+    const int64_t pd_ = pd[0], ph = pd[1], pw = pd[2];
+    if (sd == 0 || sh == 0 || sw == 0)
+        TP_THROW(RuntimeError, "stride should not be zero");
     if (grad_output.is_contiguous(MemoryFormat::ChannelsLast3d) &&
         input.is_contiguous(MemoryFormat::ChannelsLast3d) &&
         (input.dtype() == DType::Float32 || input.dtype() == DType::Float64) &&
@@ -1085,9 +1119,15 @@ Tensor adaptive_avg_pool3d_cpu(const Tensor& input, const std::vector<int64_t>& 
     if (input.dim() == 4)
         return adaptive_avg_pool3d_cpu(input.unsqueeze(0), output_size).squeeze(0);
     if (input.dim() != 5) TP_THROW(RuntimeError, "adaptive_avg_pool3d: Expected 5D input");
+    if (output_size.size() != 3)
+        TP_THROW(RuntimeError, "adaptive_avg_pool3d: output_size must be 3");
     const int64_t N = input.size(0), C = input.size(1);
     const int64_t D = input.size(2), H = input.size(3), W = input.size(4);
     const int64_t oD = output_size[0], oH = output_size[1], oW = output_size[2];
+    if (oD < 0 || oH < 0 || oW < 0)
+        TP_THROW(RuntimeError,
+                 "adaptive_avg_pool3d: elements of output_size must be greater "
+                 "than or equal to 0 but received {", oD, ", ", oH, ", ", oW, "}");
     if (input.is_contiguous(MemoryFormat::ChannelsLast3d) &&
         (input.dtype() == DType::Float32 || input.dtype() == DType::Float64)) {
         const std::vector<int64_t> out_sizes = {N, C, oD, oH, oW};
@@ -1209,16 +1249,6 @@ static int64_t pooling_output_shape_aten(int64_t in, int64_t k, int64_t pad,
                               (ceil_mode ? stride - 1 : 0), stride) + 1;
     if (ceil_mode && (out - 1) * stride >= in + pad) --out;
     return out;
-}
-
-static std::vector<int64_t> expand_pool_param(const std::vector<int64_t>& list,
-                                              const char* name, int64_t n,
-                                              int64_t default_val) {
-    if (list.empty()) return std::vector<int64_t>(n, default_val);
-    if (list.size() == 1) return std::vector<int64_t>(n, list[0]);
-    if ((int64_t)list.size() != n)
-        TP_THROW(ValueError, std::string(name) + ": expected " + std::to_string(n) + " values");
-    return list;
 }
 
 std::tuple<Tensor, Tensor> max_pool2d_with_indices_cpu(
@@ -1766,6 +1796,10 @@ Tensor adaptive_max_pool3d_impl(const Tensor& input,
         return out.squeeze(0);
     }
     if (input.dim() != 5) TP_THROW(RuntimeError, "adaptive_max_pool3d: Expected 5D input");
+    if (output_size.size() != 3)
+        TP_THROW(RuntimeError,
+                 "adaptive_max_pool3d(): internal error: output_size.size() "
+                 "must be 3");
     const int64_t N = input.size(0), C = input.size(1);
     const int64_t D = input.size(2), H = input.size(3), W = input.size(4);
     const int64_t oD = output_size[0], oH = output_size[1], oW = output_size[2];
