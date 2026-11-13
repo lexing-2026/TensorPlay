@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import os as _os
 import sys as _sys
+import weakref
 from typing import Any, Callable, Dict, Optional, Tuple
 
 import tensorplay as tp
@@ -115,6 +116,13 @@ class Tracer:
         self.node_to_qualname: Dict[Node, str] = {}
         self._recorded_qualnames: set[str] = set()
         self._proxy_mode: Any = None
+        # node.name -> number of stand-ins still alive that name its example,
+        # and the node each of them names.  The example a run produced is kept
+        # only while the program can still reach it (see ``_track_proxy``).
+        self._live_samples: Dict[str, int] = {}
+        self._sampled_nodes: Dict[str, Node] = {}
+        self._kept_samples: set[str] = set()
+        self._sample_refs: list[Any] = []
 
     @property
     def proxy_mode(self) -> Any:
@@ -188,6 +196,65 @@ class Tracer:
         self.node_to_qualname[node] = candidate
 
     # -- hybrid execution (sample propagation) -------------------------------
+
+    def _track_proxy(self, proxy: "Proxy") -> None:
+        """Keep an example only while the program can still reach it.
+
+        Capture runs the program on example values so that Python control flow
+        can be decided and so that a shape read has something to answer from.
+        Such a value has to be kept only while the program can still name it:
+        once every stand-in that names its node is gone, no later operation can
+        read it, and holding it would keep a whole activation set alive for the
+        rest of the trace.  The example is dropped with the last stand-in,
+        which makes the eager pass hold what the eager program would hold.
+
+        A placeholder is left out because the example bound to it outlives the
+        stand-ins made for it, and a ``get_attr`` node because a weight it
+        names belongs to the module rather than being a value this run made.
+        """
+
+        node = proxy.node
+        if node.op in {"placeholder", "output", "get_attr"}:
+            return
+        # Only a run that holds examples needs their lifetimes watched; a tracer
+        # that records none leaves its own bookkeeping alone.
+        if not self.execute:
+            return
+        name = node.name
+        self._live_samples[name] = self._live_samples.get(name, 0) + 1
+        self._sampled_nodes.setdefault(name, node)
+
+        def _dropped(_reference: Any, name: str = name) -> None:
+            remaining = self._live_samples.get(name, 0) - 1
+            if remaining > 0:
+                self._live_samples[name] = remaining
+                return
+            self._live_samples.pop(name, None)
+            node = self._sampled_nodes.pop(name, None)
+            # A value consumed by Python control flow is answered again at the
+            # end of the trace, so it is kept whatever the program does with
+            # the stand-ins for it.
+            if name in self._kept_samples:
+                return
+            # A value this run never produced is not this table's to release:
+            # a trace that records no samples must leave node metadata alone.
+            if name not in self._node_samples:
+                return
+            self._node_samples.pop(name, None)
+            if node is not None:
+                node.meta.pop("val", None)
+
+        self._sample_refs.append(weakref.ref(proxy, _dropped))
+
+    def _keep_sample(self, name: str) -> None:
+        """Keep a node's example until the trace ends, stand-ins or not.
+
+        A value read by Python control flow is replayed once the trace is over
+        to answer the same branch again, so it must survive the stand-ins that
+        named it.
+        """
+
+        self._kept_samples.add(name)
 
     def resolve_sample(self, value: Any) -> Any:
         """Resolve the concrete sample behind a captured value.
@@ -506,6 +573,13 @@ class Tracer:
         finally:
             _utils._TRACE_DEPTH -= 1
             _active_tracer.reset(tracer_token)
+            # The liveness table only serves the run that built it; the stand-in
+            # lifetimes it watched are over and its references must not keep a
+            # finished trace's examples reachable.
+            self._sample_refs.clear()
+            self._live_samples.clear()
+            self._sampled_nodes.clear()
+            self._kept_samples.clear()
 
     def _trace_impl(self, root: Any) -> "GraphModule":
         if _is_module(root):

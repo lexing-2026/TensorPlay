@@ -383,6 +383,9 @@ class Proxy:
             tracer = GraphAppendingTracer(node.graph)
         self.node = node
         self.tracer = tracer
+        track = getattr(tracer, "_track_proxy", None)
+        if track is not None:
+            track(self)
 
     def _binary(self, target: Any, other: Any) -> "Proxy":
         return self.tracer.create_proxy("call_function", target, (self, other), {})
@@ -509,6 +512,9 @@ class Proxy:
         # outcome-keyed per branch.  Runtime-parametric scalars need a
         # bytecode/frame-level frontend (plan L1-D2/D3).
         self.tracer.data_specializations.append((self.node.name, kind))
+        keep = getattr(self.tracer, "_keep_sample", None)
+        if keep is not None:
+            keep(self.node.name)
         return value
 
     def _scalar_sample(self) -> Any:
@@ -756,6 +762,9 @@ class Proxy:
             if sample and any(_is_tp_tensor(item) for item in sample):
                 return (self[index] for index in range(len(sample)))
             self.tracer.data_specializations.append((self.node.name, "iter"))
+            keep = getattr(self.tracer, "_keep_sample", None)
+            if keep is not None:
+                keep(self.node.name)
             return iter(sample)
         frame = inspect.currentframe()
         calling_frame = None if frame is None else frame.f_back
