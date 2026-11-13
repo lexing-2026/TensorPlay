@@ -290,10 +290,13 @@ def _lower_stax_region(
         # caller that did not ask for a built form gets the region run as it was
         # written, and a caller that did asks for the failure instead.
         if os.environ.get("TP_STAX_LOWER_DEBUG"):
+            import traceback as _tb
+
             print(
                 f"[stax-lower] uncovered: {type(exc).__name__}: {exc}",
                 file=sys.stderr,
             )
+            _tb.print_exc(limit=30, file=sys.stderr)
         if strict:
             raise RuntimeError(
                 "strict_native Stax lowering failed: captured graph has no built form"
