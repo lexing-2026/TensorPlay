@@ -360,6 +360,13 @@ class Tracer:
                         value = _run()
             finally:
                 _utils._executing_sample.reset(sample_token)
+        except NotImplementedError:
+            # An operator that has no meaning for the example's operand is not
+            # merely unsupported on this run: it cannot do what the program
+            # asks of it at all, and the same operand type reaches the compiled
+            # program.  Capture fails here rather than recording an operator
+            # that could never run.
+            raise
         except Exception:
             # Advisory: an op that fails eagerly simply stays symbolic.
             if _os.environ.get("TP_DEBUG_SAMPLE"):
