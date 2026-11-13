@@ -97,30 +97,44 @@ inline uint64_t unbounded_top() {
 inline void check_random_from_to_bounds(int64_t low, int64_t high, DType dtype) {
     dispatch_dtype(dtype, [&](auto tag) {
         using scalar_t = decltype(tag);
-        int64_t min;
-        int64_t max;
-        if constexpr (std::is_same_v<scalar_t, bool>) {
-            min = 0;
-            max = 1;
-        } else if constexpr (std::is_same_v<scalar_t, uint64_t>) {
-            min = 0;
-            max = std::numeric_limits<int64_t>::max();
-        } else if constexpr (std::is_unsigned_v<scalar_t>) {
-            min = 0;
-            max = static_cast<int64_t>(std::numeric_limits<scalar_t>::max());
-        } else if constexpr (std::is_floating_point_v<scalar_t> ||
-                             std::is_same_v<scalar_t, Half> ||
-                             std::is_same_v<scalar_t, BFloat16>) {
-            min = static_cast<int64_t>(-fp_dtype_max<scalar_t>());
-            max = static_cast<int64_t>(fp_dtype_max<scalar_t>());
+        const int64_t to_inc = high - 1;
+        if constexpr (std::is_floating_point_v<scalar_t> ||
+                      std::is_same_v<scalar_t, Half> ||
+                      std::is_same_v<scalar_t, BFloat16>) {
+            // A float dtype's extremes do not fit in int64_t, so the bounds
+            // widen to double; narrowing the extremes instead leaves the
+            // conversion out of range.
+            const double min = -fp_dtype_max<scalar_t>();
+            const double max = fp_dtype_max<scalar_t>();
+            TP_THROW_IF(static_cast<double>(low) < min ||
+                            static_cast<double>(low) > max,
+                        RuntimeError, "from is out of bounds for ",
+                        bounds_dtype_name(dtype));
+            TP_THROW_IF(static_cast<double>(to_inc) < min ||
+                            static_cast<double>(to_inc) > max,
+                        RuntimeError, "to - 1 is out of bounds for ",
+                        bounds_dtype_name(dtype));
         } else {
-            min = std::numeric_limits<scalar_t>::lowest();
-            max = std::numeric_limits<scalar_t>::max();
+            int64_t min;
+            int64_t max;
+            if constexpr (std::is_same_v<scalar_t, bool>) {
+                min = 0;
+                max = 1;
+            } else if constexpr (std::is_same_v<scalar_t, uint64_t>) {
+                min = 0;
+                max = std::numeric_limits<int64_t>::max();
+            } else if constexpr (std::is_unsigned_v<scalar_t>) {
+                min = 0;
+                max = static_cast<int64_t>(std::numeric_limits<scalar_t>::max());
+            } else {
+                min = std::numeric_limits<scalar_t>::lowest();
+                max = std::numeric_limits<scalar_t>::max();
+            }
+            TP_THROW_IF(low < min || low > max, RuntimeError,
+                        "from is out of bounds for ", bounds_dtype_name(dtype));
+            TP_THROW_IF(to_inc < min || to_inc > max, RuntimeError,
+                        "to - 1 is out of bounds for ", bounds_dtype_name(dtype));
         }
-        TP_THROW_IF(low < min || low > max, RuntimeError,
-                    "from is out of bounds for ", bounds_dtype_name(dtype));
-        TP_THROW_IF(high - 1 < min || high - 1 > max, RuntimeError,
-                    "to - 1 is out of bounds for ", bounds_dtype_name(dtype));
     });
 }
 
