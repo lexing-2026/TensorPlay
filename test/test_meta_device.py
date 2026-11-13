@@ -2700,6 +2700,221 @@ def test_fixed_mean_losses_answer_scalars():
 
 
 # ---------------------------------------------------------------------------
+# Special functions, polygamma, out= forms and resize_
+# ---------------------------------------------------------------------------
+
+
+SPECIAL_UNARY = (
+    "airy_ai", "bessel_j0", "bessel_j1", "bessel_y0", "bessel_y1",
+    "spherical_bessel_j0", "modified_bessel_i0", "modified_bessel_i1",
+    "modified_bessel_k0", "modified_bessel_k1", "scaled_modified_bessel_k0",
+    "scaled_modified_bessel_k1", "erfcx", "ndtr", "ndtri", "log_ndtr",
+    "i0e", "i1", "i1e",
+)
+
+SPECIAL_BINARY = (
+    "zeta", "gammainc", "gammaincc", "igamma", "igammac", "xlog1py",
+    "chebyshev_polynomial_t", "chebyshev_polynomial_u",
+    "chebyshev_polynomial_v", "chebyshev_polynomial_w",
+    "shifted_chebyshev_polynomial_t", "shifted_chebyshev_polynomial_u",
+    "shifted_chebyshev_polynomial_v", "shifted_chebyshev_polynomial_w",
+    "hermite_polynomial_h", "hermite_polynomial_he",
+    "laguerre_polynomial_l", "legendre_polynomial_p",
+)
+
+
+def test_special_unary_family():
+    t = _meta(2, 3)
+    for name in SPECIAL_UNARY:
+        f = getattr(tp._C, name)
+        out = f(t)
+        assert tuple(out.shape) == (2, 3)
+        assert out.dtype == tp.float32
+        assert f(_meta(2, 3, dtype=tp.float64)).dtype == tp.float64
+        # integers, booleans and complex planes are answered in single
+        # precision
+        assert f(_meta(2, 3, dtype=tp.int64)).dtype == tp.float32
+        assert f(_meta(2, 3, dtype=tp.bool)).dtype == tp.float32
+        assert f(_meta(2, 3, dtype=tp.complex128)).dtype == tp.float32
+        assert f(_meta(0)).shape == (0,)
+        assert f(_meta(2, 3, dtype=tp.float16)).dtype == tp.float16
+
+
+def test_special_binary_family():
+    for name in SPECIAL_BINARY:
+        f = getattr(tp._C, name)
+        out = f(_meta(2, 3), _meta(2, 3))
+        assert tuple(out.shape) == (2, 3)
+        assert out.dtype == tp.float32
+        assert f(_meta(2, 3, dtype=tp.float64),
+                 _meta(2, 3, dtype=tp.float64)).dtype == tp.float64
+        # the promoted pair is lifted to single precision when no floating
+        # width survives
+        assert f(_meta(2, 3, dtype=tp.int64),
+                 _meta(2, 3, dtype=tp.int64)).dtype == tp.float32
+        assert f(_meta(2, 3, dtype=tp.complex64),
+                 _meta(2, 3, dtype=tp.complex64)).dtype == tp.float32
+        assert f(_meta(2, 1, 4), _meta(3, 4)).shape == (2, 3, 4)
+        assert f(_meta(0), _meta(0)).shape == (0,)
+        with pytest.raises(RuntimeError):
+            f(_meta(2, 3), tp.zeros(2, 3))
+
+
+def test_polygamma_orders():
+    for n in (0, 1, 2, 7):
+        out = tp._C.polygamma(n, _meta(2, 3))
+        assert tuple(out.shape) == (2, 3)
+        assert out.dtype == tp.float32
+    assert tp._C.polygamma(3, _meta(2, 3, dtype=tp.float64)).dtype == tp.float64
+    assert tp._C.polygamma(2, _meta(2, 3, dtype=tp.int64)).dtype == tp.float32
+    assert tp._C.polygamma(2, _meta(2, 3, dtype=tp.complex128)).dtype == tp.float32
+    with pytest.raises(RuntimeError):
+        tp._C.polygamma(-1, _meta(2, 3))
+    with pytest.raises(RuntimeError):
+        tp._C.polygamma(2**40, _meta(2, 3))
+    with pytest.raises(RuntimeError):
+        tp._C.special_polygamma(-2, _meta(2, 3))
+
+
+def test_incomplete_gamma_answers_on_meta():
+    # the incomplete-gamma pair is answered directly on the meta device
+    for name in ("igamma", "igammac", "gammainc", "gammaincc"):
+        f = getattr(tp._C, name)
+        assert tuple(f(_meta(2, 3), _meta(2, 3)).shape) == (2, 3)
+        assert f(_meta(2, 3), _meta(1, 3)).shape == (2, 3)
+        assert f(_meta(2, 3, dtype=tp.float64),
+                 _meta(2, 3)).dtype == tp.float64
+
+
+def test_special_aliases_on_meta():
+    x = _meta(2, 3)
+    assert tuple(tp._C.special_xlogy(x, x).shape) == (2, 3)
+    assert tp._C.special_xlogy(x, x).dtype == tp.float32
+    assert tp._C.special_xlogy(2.0, _meta(2, 3, dtype=tp.int64)).shape == (2, 3)
+    assert tp._C.special_xlogy(_meta(2, 3), 3.0).dtype == tp.float32
+    assert tp._C.special_xlog1py(x, x).dtype == tp.float32
+    assert tp._C.special_zeta(2.0, _meta(2, 3, dtype=tp.float64)).dtype == tp.float64
+    assert tp._C.special_chebyshev_polynomial_t(2.0, x).shape == (2, 3)
+    assert tp._C.special_chebyshev_polynomial_t(x, 2.0).shape == (2, 3)
+    assert tp._C.special_hermite_polynomial_he(x, 2.0).shape == (2, 3)
+    assert tuple(tp._C.special_multigammaln(x, 3).shape) == (2, 3)
+    assert tp._C.special_multigammaln(_meta(2, 3, dtype=tp.float64), 2).dtype == tp.float64
+    with pytest.raises(RuntimeError):
+        tp._C.special_multigammaln(x, 0)
+    with pytest.raises(RuntimeError):
+        tp._C.mvlgamma(x, -1)
+    assert tuple(tp._C.special_softmax(x, 1).shape) == (2, 3)
+    assert tuple(tp._C.special_log_softmax(x, -1).shape) == (2, 3)
+    assert tuple(tp._C.special_logsumexp(x, [1], False).shape) == (2,)
+    assert tp._C.special_digamma(_meta(2, 3, dtype=tp.int64)).dtype == tp.float32
+    assert tp._C.special_psi(x).shape == (2, 3)
+    assert tp._C.special_expit(x).dtype == tp.float32
+    assert tp._C.special_gammaln(_meta(2, 3, dtype=tp.int64)).dtype == tp.float32
+    assert tp._C.special_sinc(_meta(2, 3, dtype=tp.complex64)).dtype == tp.float32
+
+
+def test_special_out_overloads():
+    assert tuple(tp._C.digamma(_meta(2, 3), out=_meta(2, 3)).shape) == (2, 3)
+    # a destination that names another geometry is resized by the write
+    small = _meta(4)
+    tp._C.digamma(_meta(2, 3), out=small)
+    assert tuple(small.shape) == (2, 3)
+    # a widened destination is filled from the cast answer
+    wide = _meta(2, 3, dtype=tp.float64)
+    tp._C.digamma(_meta(2, 3), out=wide)
+    assert wide.dtype == tp.float64
+    assert tuple(tp._C.i0(_meta(2, 3), out=_meta(2, 3)).shape) == (2, 3)
+    assert tuple(tp._C.polygamma(2, _meta(2, 3), out=_meta(3, 3)).shape) == (2, 3)
+    assert tuple(tp._C.igamma(_meta(2, 3), _meta(2, 3), out=_meta(5)).shape) == (2, 3)
+    assert tuple(tp._C.igammac(_meta(2, 3), _meta(2, 3), out=_meta(5)).shape) == (2, 3)
+    # an order that cannot be run is refused before any write
+    with pytest.raises(RuntimeError):
+        tp._C.polygamma(-1, _meta(2, 3), out=_meta(2, 3))
+    # an integral destination cannot be cast to safely
+    with pytest.raises(TypeError):
+        tp._C.i0(_meta(2, 3), out=_meta(2, 3, dtype=tp.int64))
+    with pytest.raises(TypeError):
+        tp._C.igamma(_meta(2, 3), _meta(2, 3), out=_meta(2, 3, dtype=tp.bool))
+
+
+def test_resize_on_meta():
+    # growing and shrinking rewrites the sizes contiguously
+    t = _meta(4)
+    assert t.resize_((2, 3)) is t
+    assert tuple(t.shape) == (2, 3)
+    assert tuple(t.stride()) == (3, 1)
+    t.resize_((4,))
+    assert tuple(t.shape) == (4,)
+
+    # a call that keeps the current sizes is a no-op for the strides
+    t = _meta(3, 4)
+    assert tuple(t.stride()) == (4, 1)
+    t.resize_((3, 4))
+    assert tuple(t.stride()) == (4, 1)
+
+    # a same-size call on an expanded tensor keeps its broadcast strides
+    e = _meta(1, 4).expand(3, 4)
+    assert tuple(e.stride()) == (0, 1)
+    e.resize_((3, 4))
+    assert tuple(e.stride()) == (0, 1)
+    assert tuple(e.shape) == (3, 4)
+
+    assert tuple(_meta(2, 3).resize_((0,)).shape) == (0,)
+    assert tuple(_meta(2, 3).resize_(tuple()).shape) == ()
+
+    with pytest.raises(ValueError):
+        _meta(2, 3).resize_((2, -3))
+    with pytest.raises(RuntimeError):
+        _meta(2).resize_((2**61, 2**61))
+
+
+def test_special_float_math_dtype_contracts():
+    # the float-math sweeps refuse complex and boolean operands for the
+    # members that have no single-precision pass over those planes
+    for name in ("erf", "erfc", "lgamma"):
+        f = getattr(tp._C, name)
+        with pytest.raises(TypeError):
+            f(_meta(2, 3, dtype=tp.complex128))
+        with pytest.raises(TypeError):
+            f(_meta(2, 3, dtype=tp.bool))
+        assert f(_meta(2, 3, dtype=tp.int64)).dtype == tp.float32
+    for name in ("round", "floor", "ceil", "trunc", "frac"):
+        with pytest.raises(TypeError):
+            getattr(tp._C, name)(_meta(2, 3, dtype=tp.complex128))
+    assert tp._C.round(_meta(2, 3, dtype=tp.bool)).dtype == tp.bool
+    assert tp._C.round(_meta(2, 3, dtype=tp.int64)).dtype == tp.int64
+    # the remaining sweeps answer every non-floating plane in single precision
+    for name in ("exp2", "sinc", "erfinv", "digamma", "i0", "entr", "logit"):
+        assert getattr(tp._C, name)(
+            _meta(2, 3, dtype=tp.complex128)).dtype == tp.float32
+        assert getattr(tp._C, name)(_meta(2, 3, dtype=tp.bool)).dtype == tp.float32
+    # the pair forms of the product family follow the same lift
+    assert tp._C.xlogy(_meta(2, 3, dtype=tp.complex128),
+                       _meta(2, 3, dtype=tp.complex128)).dtype == tp.float32
+    assert tp._C.xlog1py(_meta(2, 3, dtype=tp.complex128),
+                         _meta(2, 3, dtype=tp.complex128)).dtype == tp.float32
+
+
+def test_softmax_and_complex_passthrough_contracts():
+    # the normalization runs on real numbers only, after the axis is named
+    for f in (tp._C.softmax, tp._C.log_softmax):
+        with pytest.raises(TypeError):
+            f(_meta(2, 3, dtype=tp.complex128), 1)
+        with pytest.raises(TypeError):
+            f(_meta(2, 3, dtype=tp.bool), 1)
+    # a bad axis is named before the dtype is policed
+    with pytest.raises(IndexError):
+        tp._C.softmax(_meta(2, 3, dtype=tp.complex128), 99)
+    # the complex-capable activations keep their own planes
+    for name in ("sigmoid", "tanh", "expm1", "log1p"):
+        assert getattr(tp._C, name)(
+            _meta(2, 3, dtype=tp.complex128)).dtype == tp.complex128
+    # the reduction refuses complex planes outright
+    with pytest.raises(RuntimeError):
+        tp._C.logsumexp(_meta(2, 3, dtype=tp.complex128), [1])
+
+
+# ---------------------------------------------------------------------------
 # Cross-checks against the reference framework when it is installed
 # ---------------------------------------------------------------------------
 
