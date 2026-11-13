@@ -1621,6 +1621,159 @@ def test_upsample_bilinear2d_and_pixel_shuffle():
         tp.pixel_shuffle(_meta(2, 5, 3, 4), 2)
 
 
+def test_upsample_forward_family_shapes_and_gates():
+    plain = [
+        ("upsample_nearest1d", (2, 3, 4), [8], ()),
+        ("upsample_linear1d", (2, 3, 4), [8], (False,)),
+        ("upsample_nearest2d", (2, 3, 4, 5), [6, 7], ()),
+        ("upsample_bilinear2d", (2, 3, 4, 5), [6, 7], (False,)),
+        ("upsample_bicubic2d", (2, 3, 4, 5), [6, 7], (False,)),
+        ("upsample_nearest3d", (1, 2, 2, 3, 4), [5, 6, 7], ()),
+        ("upsample_trilinear3d", (1, 2, 2, 3, 4), [5, 6, 7], (False,)),
+    ]
+    for name, shape, size, extra in plain:
+        out = getattr(tp, name)(_meta(*shape), size, *extra)
+        assert tuple(out.shape) == tuple(shape[:2]) + tuple(size)
+        assert out.dtype == tp.float32 and out.is_meta
+        assert getattr(tp, name)(_meta(*shape, dtype=tp.float64), size,
+                                 *extra).dtype == tp.float64
+        with pytest.raises(NotImplementedError):
+            getattr(tp, name)(_meta(*shape, dtype=tp.int64), size, *extra)
+    # negative extents are rejected while the answer is being sized
+    with pytest.raises(RuntimeError):
+        tp.upsample_nearest1d(_meta(2, 3, 4), [-1])
+    # extra recorded entries ride along in the answer
+    assert tuple(tp.upsample_nearest2d(_meta(2, 3, 4, 5), [6, 7, 8]).shape) == (2, 3, 6, 7, 8)
+    # empty operands and zero extents return before any values are needed
+    assert tuple(tp.upsample_nearest2d(_meta(0, 3, 4, 5), [6, 7]).shape) == (0, 3, 6, 7)
+    assert tuple(tp.upsample_bilinear2d(_meta(2, 3, 4, 5), [0, 7],
+                                        align_corners=False).shape) == (2, 3, 0, 7)
+    assert tuple(tp.upsample_nearest2d(_meta(2, 3, 4, 5, dtype=tp.int64),
+                                       [0, 0]).shape) == (2, 3, 0, 0)
+    # every output size entry lands in the answer, so a trailing zero shrinks
+    # it under the sweep the kernel would perform
+    with pytest.raises(RuntimeError):
+        tp.upsample_nearest1d(_meta(2, 3, 4), [8, 0])
+    with pytest.raises(RuntimeError):
+        tp.upsample_nearest2d(_meta(2, 3, 4, 5), [6, 7, 0])
+    # sizes below the spatial rank cannot be read at all
+    with pytest.raises(ValueError):
+        tp.upsample_nearest1d(_meta(2, 3, 4), [])
+    with pytest.raises(ValueError):
+        tp.upsample_nearest2d(_meta(2, 3, 4, 5), [6])
+    with pytest.raises(RuntimeError):
+        tp.upsample_nearest1d(_meta(3, 4), [8])
+    with pytest.raises(RuntimeError):
+        tp.upsample_nearest2d(_meta(2, 3, 4), [6, 7])
+
+
+def test_upsample_private_forward_names():
+    f = tp.functional
+    assert tuple(f._upsample_nearest_exact1d(_meta(2, 3, 4), [8], None).shape) == (2, 3, 8)
+    assert tuple(f._upsample_nearest_exact2d(_meta(2, 3, 4, 5), [6, 7], None).shape) == (2, 3, 6, 7)
+    assert tuple(f._upsample_nearest_exact3d(_meta(1, 2, 2, 3, 4), [5, 6, 7],
+                                             None).shape) == (1, 2, 5, 6, 7)
+    assert tuple(f._upsample_bilinear2d_aa(_meta(2, 3, 4, 5), [6, 7], False,
+                                           None).shape) == (2, 3, 6, 7)
+    assert tuple(f._upsample_bicubic2d_aa(_meta(2, 3, 4, 5), [6, 7], False,
+                                          None).shape) == (2, 3, 6, 7)
+    with pytest.raises(NotImplementedError):
+        f._upsample_bilinear2d_aa(_meta(2, 3, 4, 5, dtype=tp.int64), [6, 7],
+                                  False, None)
+
+
+def test_upsample_aa_vec_forms():
+    f = tp.functional
+    x = _meta(2, 3, 4, 5)
+    # an explicit output size wins over scale factors
+    assert tuple(f._upsample_bilinear2d_aa(x, [6, 7], False,
+                                           [2.0, 2.0]).shape) == (2, 3, 6, 7)
+    # scale factors floor to the output extents
+    assert tuple(f._upsample_bilinear2d_aa(x, None, False,
+                                           [2.0, 2.0]).shape) == (2, 3, 8, 10)
+    assert tuple(f._upsample_bicubic2d_aa(x, None, False,
+                                          [0.5, 0.5]).shape) == (2, 3, 2, 2)
+    # with neither argument the call is rejected outright
+    with pytest.raises(RuntimeError):
+        f._upsample_bilinear2d_aa(x, None, False, None)
+    # both lists must carry exactly two entries; a valid output size answers
+    # before scale factors are ever inspected
+    with pytest.raises(RuntimeError):
+        f._upsample_bilinear2d_aa(x, [6], False, [2.0, 2.0])
+    with pytest.raises(RuntimeError):
+        f._upsample_bicubic2d_aa(x, None, False, [2.0])
+    assert tuple(f._upsample_bicubic2d_aa(x, [6, 7], False,
+                                          [2.0]).shape) == (2, 3, 6, 7)
+    # scale factors below one floor the extents to zero through the plain path
+    with pytest.raises(RuntimeError):
+        f._upsample_bilinear2d_aa(x, None, False, [-1.0, -1.0])
+
+
+def test_upsample_backward_family_shapes_and_checks():
+    cases = [
+        ("upsample_nearest1d_backward", (2, 3, 8), [8], (2, 3, 4), ()),
+        ("upsample_linear1d_backward", (2, 3, 8), [8], (2, 3, 4), (False,)),
+        ("upsample_nearest2d_backward", (2, 3, 8, 9), [8, 9], (2, 3, 4, 5), ()),
+        ("upsample_bilinear2d_backward", (2, 3, 8, 9), [8, 9], (2, 3, 4, 5), (False,)),
+        ("upsample_bicubic2d_backward", (2, 3, 8, 9), [8, 9], (2, 3, 4, 5), (False,)),
+        ("upsample_nearest3d_backward", (1, 2, 5, 6, 7), [5, 6, 7], (1, 2, 2, 3, 4), ()),
+        ("upsample_trilinear3d_backward", (1, 2, 5, 6, 7), [5, 6, 7],
+         (1, 2, 2, 3, 4), (False,)),
+    ]
+    for name, goshape, size, insize, extra in cases:
+        out = getattr(tp, name)(_meta(*goshape), size, list(insize), *extra)
+        assert tuple(out.shape) == tuple(insize)
+        assert out.dtype == tp.float32 and out.is_meta
+        with pytest.raises(NotImplementedError):
+            getattr(tp, name)(_meta(*goshape, dtype=tp.int64), size,
+                              list(insize), *extra)
+        with pytest.raises(RuntimeError):
+            getattr(tp, name)(_meta(*goshape[:-1]), size, list(insize), *extra)
+    with pytest.raises(RuntimeError):
+        tp.upsample_nearest2d_backward(_meta(2, 3, 8, 9), [8, 9], [2, 3, -1, 5])
+    # empty gradients and zero extents skip straight to the zero answer
+    assert tuple(tp.upsample_nearest2d_backward(_meta(0, 3, 8, 9), [8, 9],
+                                                [2, 3, 4, 5]).shape) == (2, 3, 4, 5)
+    assert tuple(tp.upsample_bilinear2d_backward(_meta(2, 3, 8, 9), [0, 9],
+                                                 [2, 3, 4, 5],
+                                                 align_corners=False).shape) == (2, 3, 4, 5)
+    f = tp.functional
+    assert tuple(f._upsample_bilinear2d_aa_backward(_meta(2, 3, 8, 9), [8, 9],
+                                                    [2, 3, 4, 5],
+                                                    False).shape) == (2, 3, 4, 5)
+    assert tuple(f._upsample_bicubic2d_aa_backward(_meta(2, 3, 8, 9), [8, 9],
+                                                   [2, 3, 4, 5],
+                                                   False).shape) == (2, 3, 4, 5)
+    assert tuple(f._upsample_nearest_exact1d_backward(_meta(2, 3, 8), [8],
+                                                      [2, 3, 4],
+                                                      None).shape) == (2, 3, 4)
+    with pytest.raises(NotImplementedError):
+        f._upsample_bilinear2d_aa_backward(_meta(2, 3, 8, 9, dtype=tp.int64),
+                                           [8, 9], [2, 3, 4, 5], False)
+
+
+def test_upsample_backward_polices_recorded_geometry():
+    # a gradient sweep that would read past the recorded gradient, or write
+    # past the recorded answer, is refused on meta
+    with pytest.raises(RuntimeError):
+        tp.upsample_nearest2d_backward(_meta(2, 3, 8, 9), [100, 100],
+                                       [2, 3, 4, 5])
+    with pytest.raises(RuntimeError):
+        tp.upsample_bilinear2d_backward(_meta(2, 6, 8, 9), [8, 9],
+                                        [2, 3, 4, 5], align_corners=False)
+    # output sizes below the spatial rank cannot be read
+    with pytest.raises(ValueError):
+        tp.upsample_nearest2d_backward(_meta(2, 3, 8, 9), [8], [2, 3, 4, 5])
+    with pytest.raises(ValueError):
+        tp.upsample_bilinear2d_backward(_meta(2, 3, 8, 9), [8], [2, 3, 4, 5],
+                                        align_corners=False)
+    # gradients below rank 2 read out of bounds on a materialized device
+    with pytest.raises(RuntimeError):
+        tp.upsample_nearest2d_backward(_meta(8), [], [])
+    with pytest.raises(RuntimeError):
+        tp.upsample_nearest1d_backward(_meta(8), [8], [4])
+
+
 def test_dist_renorm_and_rms_norm():
     distance = tp.dist(_meta(3, dtype=tp.int32), _meta(3, dtype=tp.int32))
     assert tuple(distance.shape) == ()
