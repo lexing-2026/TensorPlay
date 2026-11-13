@@ -2428,11 +2428,14 @@ def lower_clone(x, *args, **kwargs):
 
 
 def make_view(x: TensorBox, size, reindex) -> TensorBox:
-    # A view reads the value it looks at, not the box that value happens to be
-    # held in, so the box is unwrapped here.
+    # The boxes stay on: a value that has nowhere to live yet can only be
+    # given memory by the box that holds it, and a reader that needs this
+    # view in memory realizes down through those boxes.  Peeling them would
+    # leave an unwritten body that has no way to be asked for memory, and
+    # every later realize through this view would fail.
     if reindex is None:
         return View.create(x, size)
-    return TensorBox(View(data=_underlying(x), size=size, reindex=reindex))
+    return TensorBox(View(data=x, size=size, reindex=reindex))
 
 
 def _underlying(box):
