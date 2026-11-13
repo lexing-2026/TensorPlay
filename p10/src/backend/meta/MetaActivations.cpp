@@ -384,6 +384,203 @@ Tensor glu_kernel(const Tensor& self, int64_t dim) {
 }
 
 // ---------------------------------------------------------------------------
+// Saved-activation backwards.  Every gradient of this family is a per-element
+// map over the saved forward plane, and the two pairing styles split the
+// family in two.
+//
+// The pair forms pair the two planes as a broadcast at the promoted width, so
+// their answer is that broadcast.
+//
+// The saved-activation forms read both planes linearly at the gradient's own
+// width and answer the gradient's own geometry.  The linear read turns into
+// two reachability requirements the sweep imposes: the saved plane must carry
+// the gradient's dtype, and it must hold at least as many values as the
+// gradient -- anything shorter or differently typed would have the reads run
+// past it.  An empty gradient answers before either plane is inspected.
+// ---------------------------------------------------------------------------
+
+Tensor binary_same_answer(const Tensor& grad_output, const Tensor& self) {
+    check_all_meta(grad_output, self);
+    return empty_meta(broadcast2(grad_output, self),
+                      promoteTypes(grad_output.dtype(), self.dtype()),
+                      grad_output.device());
+}
+
+Tensor activation_backward_answer(const char* name, const Tensor& grad_output,
+                                  const Tensor& self) {
+    check_all_meta(grad_output, self);
+    const Tensor result = empty_meta(shape_of(grad_output), grad_output.dtype(),
+                                     grad_output.device());
+    if (grad_output.numel() == 0) {
+        return result;
+    }
+    if (self.dtype() != grad_output.dtype()) {
+        TP_THROW(RuntimeError, name, ": the saved plane is read at the gradient's ",
+                 toString(grad_output.dtype()), " width, but carries ",
+                 toString(self.dtype()));
+    }
+    if (self.numel() < grad_output.numel()) {
+        TP_THROW(RuntimeError, name, ": the sweep reads ", grad_output.numel(),
+                 " values but the saved plane holds ", self.numel());
+    }
+    return result;
+}
+
+Tensor sigmoid_backward_kernel(const Tensor& grad_output, const Tensor& output) {
+    return binary_same_answer(grad_output, output);
+}
+
+Tensor tanh_backward_kernel(const Tensor& grad_output, const Tensor& output) {
+    return binary_same_answer(grad_output, output);
+}
+
+Tensor logit_backward_kernel(const Tensor& grad_output, const Tensor& self,
+                             const std::optional<Scalar>& /*eps*/) {
+    return binary_same_answer(grad_output, self);
+}
+
+Tensor hardshrink_backward_kernel(const Tensor& grad_out, const Tensor& self,
+                                  const Scalar& /*lambd*/) {
+    check_shrink_dtype(self, "hardshrink_backward");
+    return binary_same_answer(grad_out, self);
+}
+
+Tensor softshrink_backward_kernel(const Tensor& grad_output, const Tensor& self,
+                                  const Scalar& /*lambd*/) {
+    check_shrink_dtype(self, "softshrink_backward");
+    return binary_same_answer(grad_output, self);
+}
+
+Tensor gelu_backward_kernel(const Tensor& grad_output, const Tensor& self,
+                            const std::string& approximate) {
+    if (approximate != "none" && approximate != "tanh") {
+        TP_THROW(ValueError, "approximate argument must be either none or tanh, but got ",
+                 approximate);
+    }
+    return activation_backward_answer("gelu_backward", grad_output, self);
+}
+
+Tensor hardtanh_backward_kernel(const Tensor& grad_output, const Tensor& self,
+                                const Scalar& /*min_val*/, const Scalar& /*max_val*/) {
+    return activation_backward_answer("hardtanh_backward", grad_output, self);
+}
+
+Tensor hardswish_backward_kernel(const Tensor& grad_output, const Tensor& self) {
+    return activation_backward_answer("hardswish_backward", grad_output, self);
+}
+
+Tensor silu_backward_kernel(const Tensor& grad_output, const Tensor& self) {
+    return activation_backward_answer("silu_backward", grad_output, self);
+}
+
+Tensor hardsigmoid_backward_kernel(const Tensor& grad_output, const Tensor& self) {
+    return activation_backward_answer("hardsigmoid_backward", grad_output, self);
+}
+
+Tensor leaky_relu_backward_kernel(const Tensor& grad_output, const Tensor& self,
+                                  const Scalar& /*negative_slope*/,
+                                  bool /*self_is_result*/) {
+    return activation_backward_answer("leaky_relu_backward", grad_output, self);
+}
+
+Tensor elu_backward_kernel(const Tensor& grad_output, const Scalar& /*alpha*/,
+                           const Scalar& /*scale*/, const Scalar& /*input_scale*/,
+                           bool /*is_result*/, const Tensor& self_or_result) {
+    return activation_backward_answer("elu_backward", grad_output, self_or_result);
+}
+
+Tensor softplus_backward_kernel(const Tensor& grad_output, const Tensor& self,
+                                const Scalar& /*beta*/, const Scalar& /*threshold*/) {
+    return activation_backward_answer("softplus_backward", grad_output, self);
+}
+
+Tensor mish_backward_kernel(const Tensor& grad_output, const Tensor& self) {
+    return activation_backward_answer("mish_backward", grad_output, self);
+}
+
+Tensor log_sigmoid_backward_kernel(const Tensor& grad_output, const Tensor& self) {
+    check_all_meta(grad_output, self);
+    const Tensor result = empty_meta(shape_of(grad_output), grad_output.dtype(),
+                                     grad_output.device());
+    if (grad_output.numel() == 0) {
+        return result;
+    }
+    const DType dt = grad_output.dtype();
+    if (dt != DType::Float32 && dt != DType::Float64 && dt != DType::Float16 &&
+        dt != DType::BFloat16) {
+        TP_THROW(TypeError, "Unsupported dtype for log_sigmoid_backward");
+    }
+    if (self.dtype() != grad_output.dtype()) {
+        TP_THROW(RuntimeError, "log_sigmoid_backward: the saved plane is read at the gradient's ",
+                 toString(grad_output.dtype()), " width, but carries ",
+                 toString(self.dtype()));
+    }
+    if (self.numel() < grad_output.numel()) {
+        TP_THROW(RuntimeError, "log_sigmoid_backward: the sweep reads ", grad_output.numel(),
+                 " values but the saved plane holds ", self.numel());
+    }
+    return result;
+}
+
+Tensor threshold_backward_kernel(const Tensor& grad_output, const Tensor& self,
+                                 const Scalar& /*threshold*/) {
+    return activation_backward_answer("threshold_backward", grad_output, self);
+}
+
+Tensor rrelu_with_noise_backward_kernel(const Tensor& grad_output, const Tensor& self,
+                                        const Tensor& noise, const Scalar& /*lower*/,
+                                        const Scalar& /*upper*/, bool training,
+                                        bool /*self_is_result*/) {
+    check_all_meta(grad_output, self);
+    check_all_meta(grad_output, noise);
+    if (training) {
+        if (shape_of(grad_output) != shape_of(self) ||
+            shape_of(grad_output) != shape_of(noise)) {
+            TP_THROW(RuntimeError, "rrelu_with_noise_backward: shape mismatch");
+        }
+    } else if (shape_of(grad_output) != shape_of(self)) {
+        TP_THROW(RuntimeError,
+                 "rrelu_with_noise: expected noise to have the same shape as input");
+    }
+    const Tensor result = empty_meta(shape_of(grad_output), grad_output.dtype(),
+                                     grad_output.device());
+    if (grad_output.numel() == 0) {
+        return result;
+    }
+    if (self.dtype() != grad_output.dtype() ||
+        (training && noise.dtype() != grad_output.dtype())) {
+        TP_THROW(RuntimeError, "rrelu_with_noise_backward: the saved planes are read at the gradient's ",
+                 toString(grad_output.dtype()), " width but carry a different one");
+    }
+    return result;
+}
+
+Tensor glu_backward_kernel(const Tensor& grad_output, const Tensor& self, int64_t dim) {
+    check_all_meta(grad_output, self);
+    if (self.dim() == 0) {
+        TP_THROW(RuntimeError, "glu does not support 0-dimensional tensors");
+    }
+    const int64_t lo = -self.dim(), hi = self.dim() - 1;
+    if (dim < lo || dim > hi) {
+        TP_THROW(IndexError, "Dimension out of range (expected to be in range of [",
+                 lo, ", ", hi, "], but got ", dim, ")");
+    }
+    if (dim < 0) dim += self.dim();
+    const int64_t n_in = self.size(dim);
+    if (n_in % 2 != 0) {
+        TP_THROW(RuntimeError, "Halving dimension must be even, but dimension ",
+                 dim, " is size ", n_in);
+    }
+    const int64_t half = n_in / 2;
+    Tensor first_half = self.slice(dim, 0, half);
+    Tensor second_half = self.slice(dim, half, n_in);
+    Tensor sig_second = second_half.sigmoid();
+    Tensor grad_first = grad_output * sig_second;
+    Tensor grad_second = grad_output * first_half * sig_second * (1 - sig_second);
+    return Tensor::cat({grad_first, grad_second}, dim);
+}
+
+// ---------------------------------------------------------------------------
 // PReLU: one slope per channel, but the output keeps the input's geometry
 // and element type (the weight is cast to the input's dtype when used).
 // ---------------------------------------------------------------------------
@@ -539,6 +736,24 @@ TENSORPLAY_LIBRARY_IMPL(Meta, MetaActivations) {
 
     // Gated linear unit and PReLU.
     m.impl("glu", glu_kernel);
+    m.impl("glu_backward", glu_backward_kernel);
+    m.impl("sigmoid_backward", sigmoid_backward_kernel);
+    m.impl("tanh_backward", tanh_backward_kernel);
+    m.impl("logit_backward", logit_backward_kernel);
+    m.impl("hardshrink_backward", hardshrink_backward_kernel);
+    m.impl("softshrink_backward", softshrink_backward_kernel);
+    m.impl("gelu_backward", gelu_backward_kernel);
+    m.impl("hardtanh_backward", hardtanh_backward_kernel);
+    m.impl("hardswish_backward", hardswish_backward_kernel);
+    m.impl("silu_backward", silu_backward_kernel);
+    m.impl("hardsigmoid_backward", hardsigmoid_backward_kernel);
+    m.impl("leaky_relu_backward", leaky_relu_backward_kernel);
+    m.impl("elu_backward", elu_backward_kernel);
+    m.impl("softplus_backward", softplus_backward_kernel);
+    m.impl("mish_backward", mish_backward_kernel);
+    m.impl("log_sigmoid_backward", log_sigmoid_backward_kernel);
+    m.impl("threshold_backward", threshold_backward_kernel);
+    m.impl("rrelu_with_noise_backward", rrelu_with_noise_backward_kernel);
     m.impl("prelu", prelu_kernel);
 
     // Scans and the outer product.

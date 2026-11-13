@@ -1217,45 +1217,84 @@ std::vector<Tensor> broadcast_tensors_kernel(const std::vector<Tensor>& tensors)
 // ---------------------------------------------------------------------------
 // Concatenation.
 // ---------------------------------------------------------------------------
+namespace {
+
+// Size-[0] 1-d tensors are excluded from the wrap and shape checks (legacy
+// joining behavior); zero-valued higher-rank inputs still describe geometry
+// and contribute their length along the joined dimension.
+bool cat_should_skip(const Tensor& t) {
+    return t.numel() == 0 && t.dim() == 1;
+}
+
+} // namespace
+
 Tensor cat_kernel(const std::vector<Tensor>& tensors, int64_t dim) {
-    if (tensors.empty()) {
-        TP_THROW(ValueError, "cat(): expected a non-empty list of Tensors");
-    }
     for (size_t i = 0; i < tensors.size(); ++i) {
         if (tensors[i].dim() == 0) {
             TP_THROW(RuntimeError, "zero-dimensional tensor (at position ", i,
                      ") cannot be concatenated");
         }
+    }
+    for (const auto& t : tensors) {
+        if (!cat_should_skip(t)) {
+            const int64_t lo = -t.dim(), hi = t.dim() - 1;
+            if (dim < lo || dim > hi) {
+                TP_THROW(IndexError, "Dimension out of range (expected to be in "
+                                     "range of [", lo, ", ", hi, "], but got ", dim,
+                         ")");
+            }
+            if (dim < 0) dim += t.dim();
+            break;
+        }
+    }
+    if (tensors.empty()) {
+        TP_THROW(ValueError, "cat(): expected a non-empty list of Tensors");
+    }
+    for (size_t i = 0; i < tensors.size(); ++i) {
         if (tensors[i].device() != tensors[0].device()) {
             TP_THROW(DeviceMismatchError,
                      "cat(): all tensors must be on the same device");
         }
     }
-    const int64_t nd = tensors[0].dim();
-    if (dim < 0) dim += nd;
-    if (dim < 0 || dim >= nd) {
-        TP_THROW(IndexError, "cat(): dimension ", dim, " out of range");
-    }
 
     DType out_dtype = tensors[0].dtype();
-    int64_t size_at_dim = 0;
-    for (const auto& t : tensors) {
-        if (t.numel() == 0) continue;
-        if (t.dim() != nd) {
-            TP_THROW(RuntimeError, "cat(): tensors must have the same number of dims");
-        }
-        for (int64_t d = 0; d < nd; ++d) {
-            if (d != dim && t.size(d) != tensors[0].size(d)) {
-                TP_THROW(RuntimeError, "cat(): sizes of tensors must match except in ",
-                         "dimension ", dim);
-            }
-        }
-        size_at_dim += t.size(dim);
-        out_dtype = promoteTypes(out_dtype, t.dtype());
+    for (size_t i = 1; i < tensors.size(); ++i) {
+        out_dtype = promoteTypes(out_dtype, tensors[i].dtype());
     }
 
-    std::vector<int64_t> out_shape = shape_of(tensors[0]);
-    out_shape[static_cast<size_t>(dim)] = size_at_dim;
+    int64_t valid = -1;
+    for (size_t i = 0; i < tensors.size(); ++i) {
+        if (!cat_should_skip(tensors[i])) { valid = static_cast<int64_t>(i); break; }
+    }
+
+    std::vector<int64_t> out_shape{0};
+    if (valid >= 0) {
+        const Tensor& first = tensors[static_cast<size_t>(valid)];
+        if (dim > first.dim()) {
+            TP_THROW(IndexError, "cat(): dimension ", dim, " out of range");
+        }
+        int64_t size_at_dim = 0;
+        for (size_t i = 0; i < tensors.size(); ++i) {
+            const Tensor& t = tensors[i];
+            if (cat_should_skip(t)) continue;
+            if (t.dim() != first.dim()) {
+                TP_THROW(RuntimeError, "Tensors must have same number of dimensions: ",
+                         "got ", first.dim(), " and ", t.dim());
+            }
+            for (int64_t d = 0; d < first.dim(); ++d) {
+                if (d == dim) continue;
+                if (t.size(d) != first.size(d)) {
+                    TP_THROW(RuntimeError, "Sizes of tensors must match except in ",
+                             "dimension ", dim, ". Expected size ", first.size(d),
+                             " but got size ", t.size(d), " for tensor number ", i,
+                             " in the list.");
+                }
+            }
+            size_at_dim += t.size(dim);
+        }
+        out_shape = shape_of(first);
+        out_shape[static_cast<size_t>(dim)] = size_at_dim;
+    }
     return empty_meta(out_shape, out_dtype, tensors[0].device());
 }
 // ---------------------------------------------------------------------------
