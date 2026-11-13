@@ -45,6 +45,23 @@ inline void check_all_meta(const Tensor& a, const Tensor& b) {
     }
 }
 
+// An in-place operand must fit the target: right-aligned, every source
+// dimension is either 1 or matches the destination.
+inline void check_inplace_fits(const Tensor& self, const Tensor& other) {
+    const int64_t nd = self.dim();
+    const int64_t od = other.dim();
+    for (int64_t i = 1; i <= od; ++i) {
+        const int64_t src = other.size(od - i);
+        const int64_t dst = i <= nd ? self.size(nd - i) : 1;
+        if (src != 1 && src != dst) {
+            TP_THROW(RuntimeError, "the shape of the operand (",
+                     other.size(od - i), " at position ", od - i,
+                     ") cannot be applied in place to a destination of size ",
+                     dst);
+        }
+    }
+}
+
 // Whether an element type takes part in the elementwise kernels' dispatch:
 // every integral, boolean and non-fp8 floating type.
 inline bool is_scalar_dtype(DType dtype) {

@@ -922,6 +922,16 @@ def test_logical_and_bitwise():
     with pytest.raises(Exception):
         tp.bitwise_and(_meta(4), _meta(4))
     assert tp.bitwise_left_shift(_meta(4, dtype=tp.bool), 1).dtype == tp.int64
+
+    target = _meta(3, 3, dtype=tp.bool)
+    assert target.logical_and_(_meta(3, 1, dtype=tp.bool)).shape == (3, 3)
+    assert target.logical_or_(_meta(3, 3, dtype=tp.bool)).shape == (3, 3)
+    assert target.logical_xor_(_meta(1, 3, dtype=tp.bool)).shape == (3, 3)
+    # An operand that widens the result cannot be applied in place.
+    with pytest.raises(RuntimeError):
+        _meta(3, 1, dtype=tp.bool).logical_and_(_meta(3, 3, dtype=tp.bool))
+    with pytest.raises(RuntimeError):
+        _meta(3, 3, dtype=tp.bool).logical_or_(_meta(2, 3, dtype=tp.bool))
     with pytest.raises(Exception):
         tp.bitwise_left_shift(_meta(4, dtype=tp.bool), _meta(4, dtype=tp.bool))
 

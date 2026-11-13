@@ -31,6 +31,12 @@ Tensor& logical_inplace_kernel(Tensor& self) {
     return self;
 }
 
+Tensor& logical_inplace_binary_kernel(Tensor& self, const Tensor& other) {
+    check_all_meta(self, other);
+    check_inplace_fits(self, other);
+    return self;
+}
+
 // ---------------------------------------------------------------------------
 // Bitwise operators.
 // ---------------------------------------------------------------------------
@@ -119,9 +125,9 @@ TENSORPLAY_LIBRARY_IMPL(Meta, MetaLogic) {
     m.impl("logical_or", logical_binary_kernel);
     m.impl("logical_xor", logical_binary_kernel);
     m.impl("logical_not_", logical_inplace_kernel);
-    m.impl("logical_and_", logical_inplace_kernel);
-    m.impl("logical_or_", logical_inplace_kernel);
-    m.impl("logical_xor_", logical_inplace_kernel);
+    m.impl("logical_and_", logical_inplace_binary_kernel);
+    m.impl("logical_or_", logical_inplace_binary_kernel);
+    m.impl("logical_xor_", logical_inplace_binary_kernel);
 
     // Bitwise operators promote their operands to an integer (or boolean)
     // type and keep that type.
