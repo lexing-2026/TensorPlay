@@ -215,6 +215,19 @@ P10_API void check_conv_geometry(const Tensor& input, const Tensor& weight,
                                  const std::vector<int64_t>& dilation,
                                  const char* name);
 
+// The output extent of a direct convolution, one value per spatial dimension:
+//
+//     (input + total padding - dilation * (kernel - 1) - 1) / stride + 1
+//
+// with integer division.  The padding argument is read the same way
+// :func:`check_conv_geometry` reads it, so a caller that validated the
+// geometry first cannot disagree with it about how much was padded.
+P10_API std::vector<int64_t> conv_output_spatial_sizes(
+    const Tensor& input, const Tensor& weight,
+    const std::vector<int64_t>& stride,
+    const std::vector<int64_t>& padding,
+    const std::vector<int64_t>& dilation);
+
 // Agreement of the operands with `groups`, checked before a kernel indexes
 // anything: the weight's leading dimension must split into the groups, the
 // input must carry the channels the weight reads, and a bias must hold one

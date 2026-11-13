@@ -127,6 +127,26 @@ void check_conv_geometry(const Tensor& input, const Tensor& weight,
              "). Kernel size can't be greater than actual input size");
 }
 
+std::vector<int64_t> conv_output_spatial_sizes(
+    const Tensor& input, const Tensor& weight,
+    const std::vector<int64_t>& stride,
+    const std::vector<int64_t>& padding,
+    const std::vector<int64_t>& dilation) {
+    const int64_t dims = spatial_dims(input, weight, "conv2d");
+    const std::vector<int64_t> s = per_dim_values(stride, dims, 1, "conv2d", "stride");
+    const std::vector<int64_t> d = per_dim_values(dilation, dims, 1, "conv2d", "dilation");
+    const std::vector<int64_t> p = per_dim_padding(padding, dims, "conv2d");
+
+    std::vector<int64_t> extents(static_cast<size_t>(dims));
+    for (int64_t i = 0; i < dims; ++i) {
+        const int64_t extent = input.size(2 + i);
+        const int64_t kernel = weight.size(2 + i);
+        extents[static_cast<size_t>(i)] =
+            (extent + p[i] - d[i] * (kernel - 1) - 1) / s[i] + 1;
+    }
+    return extents;
+}
+
 namespace {
 
 std::string sizes_text(const Tensor& t) {

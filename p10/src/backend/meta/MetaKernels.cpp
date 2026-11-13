@@ -12,6 +12,7 @@
 
 #include "Tensor.h"
 #include "TensorImpl.h"
+#include "Convolution.h"
 #include "Dispatcher.h"
 #include "Exception.h"
 #include "Utils.h"
@@ -26,6 +27,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <string>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -492,6 +494,18 @@ std::vector<int64_t> reduce_out_shape(const Tensor& self,
                                       bool keepdim) {
     const int64_t nd = self.dim();
     std::vector<bool> reduced(static_cast<size_t>(nd), false);
+    // An empty list names no dimension, and a reduction that names no
+    // dimension is a reduction over all of them; a rank-0 operand has its one
+    // virtual dimension reduced.
+    if (dims.empty()) {
+        if (nd == 0) {
+            reduced.push_back(true);
+        } else {
+            for (int64_t i = 0; i < nd; ++i) {
+                reduced[static_cast<size_t>(i)] = true;
+            }
+        }
+    }
     for (int64_t d : dims) {
         int64_t dim = d;
         if (nd == 0) {
@@ -820,6 +834,391 @@ Tensor slice_kernel(const Tensor& self, int64_t dim,
 }
 
 // ---------------------------------------------------------------------------
+// Convolution. The result carries the weight's output channels and, per
+// spatial dimension, the extent the direct-convolution formula gives for the
+// padded input and the dilated kernel; the geometry is validated by the same
+// shared rules the computing backends use, so a call they would reject is
+// rejected here too.
+// ---------------------------------------------------------------------------
+
+Tensor conv2d_kernel(const Tensor& input, const Tensor& weight, const Tensor& bias,
+                     const std::vector<int64_t>& stride,
+                     const std::vector<int64_t>& padding,
+                     const std::vector<int64_t>& dilation, int64_t groups) {
+    if (input.dim() != 4 || weight.dim() != 4) {
+        TP_THROW(RuntimeError, "conv2d: Expected 4D input and weight");
+    }
+    convolution::check_conv_shapes(input, weight, bias, groups, /*transposed=*/false);
+    convolution::check_conv_geometry(input, weight, stride, padding, dilation, "conv2d");
+    const std::vector<int64_t> spatial =
+        convolution::conv_output_spatial_sizes(input, weight, stride, padding, dilation);
+    std::vector<int64_t> out{input.size(0), weight.size(0)};
+    out.insert(out.end(), spatial.begin(), spatial.end());
+    return empty_meta(out, input.dtype(), input.device());
+}
+
+// ---------------------------------------------------------------------------
+// Normalization. Group norm normalizes per (sample, group) over the channels
+// and the spatial extents together, so its result has the input's geometry
+// and its per-group statistics hold one value per group.
+// ---------------------------------------------------------------------------
+
+// The statistics of a reduced-precision input are accumulated in single
+// precision and come back as such; every other input keeps its own type.
+DType group_norm_stat_dtype(const Tensor& input) {
+    if (input.dtype() == DType::Float16 || input.dtype() == DType::BFloat16) {
+        return DType::Float32;
+    }
+    return input.dtype();
+}
+
+Tensor group_norm_kernel(const Tensor& input, int64_t num_groups,
+                         const std::optional<Tensor>& weight,
+                         const std::optional<Tensor>& bias, double /*eps*/) {
+    if (input.dim() < 2) {
+        TP_THROW(RuntimeError, "group_norm requires at least 2 dims");
+    }
+    const int64_t channels = input.size(1);
+    if (channels <= 0 || num_groups <= 0 || channels % num_groups != 0) {
+        TP_THROW(RuntimeError,
+                 "group_norm: num_channels must be divisible by num_groups");
+    }
+    (void)weight;
+    (void)bias;
+    return empty_meta(shape_of(input), input.dtype(), input.device());
+}
+
+std::tuple<Tensor, Tensor, Tensor> native_group_norm_kernel(
+    const Tensor& input, const std::optional<Tensor>& weight,
+    const std::optional<Tensor>& bias, int64_t N, int64_t C, int64_t HxW,
+    int64_t group, double /*eps*/) {
+    if (input.dim() < 2) {
+        TP_THROW(RuntimeError, "native_group_norm requires at least 2 dims");
+    }
+    int64_t spatial = 1;
+    for (int64_t dim = 2; dim < input.dim(); ++dim) {
+        spatial *= input.size(dim);
+    }
+    if (N != input.size(0) || C != input.size(1) || HxW != spatial) {
+        TP_THROW(RuntimeError, "native_group_norm dimensions do not match input");
+    }
+    if (C <= 0 || spatial <= 0 || group <= 0 || C % group != 0) {
+        TP_THROW(RuntimeError, "native_group_norm has invalid group dimensions");
+    }
+    // One scale and one shift per channel, when either is given.
+    const auto check_parameter = [C](const std::optional<Tensor>& parameter,
+                                     const char* name) {
+        if (!parameter.has_value() || !parameter->defined()) return;
+        if (parameter->dim() != 1 || parameter->numel() != C) {
+            TP_THROW(RuntimeError, std::string("native_group_norm ") + name +
+                                     " must have one value per channel");
+        }
+    };
+    check_parameter(weight, "weight");
+    check_parameter(bias, "bias");
+    const DType stat = group_norm_stat_dtype(input);
+    return {empty_meta(shape_of(input), input.dtype(), input.device()),
+            empty_meta({N, group}, stat, input.device()),
+            empty_meta({N, group}, stat, input.device())};
+}
+
+// ---------------------------------------------------------------------------
+// Activation and root pointwise operations. Every one of them maps an
+// element to an element, so the result repeats the operand's geometry and
+// type.
+// ---------------------------------------------------------------------------
+
+#define META_UNARY_KERNEL(NAME)                                               \
+    Tensor NAME##_kernel(const Tensor& self) {                                \
+        return empty_meta(shape_of(self), self.dtype(), self.device());       \
+    }
+
+META_UNARY_KERNEL(silu)
+META_UNARY_KERNEL(rsqrt)
+META_UNARY_KERNEL(cos)
+META_UNARY_KERNEL(sin)
+#undef META_UNARY_KERNEL
+
+// ---------------------------------------------------------------------------
+// Dropout. Dropping elements changes values, not the geometry, and the mask
+// that says which were kept has the same geometry as a boolean tensor.
+// ---------------------------------------------------------------------------
+
+std::tuple<Tensor, Tensor> native_dropout_kernel(const Tensor& input, double p,
+                                                 std::optional<bool> /*train*/) {
+    if (p < 0 || p > 1) {
+        TP_THROW(ValueError, "native_dropout: p must be in [0, 1]");
+    }
+    return {empty_meta(shape_of(input), input.dtype(), input.device()),
+            empty_meta(shape_of(input), DType::Bool, input.device())};
+}
+
+// ---------------------------------------------------------------------------
+// Moments. The variance and the mean reduce over the same dimensions, so they
+// share a shape and a type.
+// ---------------------------------------------------------------------------
+
+std::tuple<Tensor, Tensor> var_mean_kernel(const Tensor& self,
+                                           const std::vector<int64_t>& dims,
+                                           bool /*unbiased*/, bool keepdim) {
+    const std::vector<int64_t> out = reduce_out_shape(self, dims, keepdim);
+    const DType dtype = mean_like_dtype(self, DType::Undefined);
+    return {empty_meta(out, dtype, self.device()), empty_meta(out, dtype, self.device())};
+}
+
+// ---------------------------------------------------------------------------
+// Attention. The result keeps the query's leading extents and takes its last
+// one from the value; the attention weights themselves are summed out, so the
+// log-sum-exp term drops that last extent and is reported in single precision.
+// ---------------------------------------------------------------------------
+
+std::vector<int64_t> attention_out_shape(const Tensor& query, const Tensor& value) {
+    if (query.dim() < 1 || value.dim() < 1) {
+        TP_THROW(ValueError, "scaled_dot_product_attention: query and value must "
+                             "have at least one dimension");
+    }
+    std::vector<int64_t> out = shape_of(query);
+    out.back() = value.size(-1);
+    return out;
+}
+
+// What the attention the call describes requires of its operands: one head
+// dimension read from both sides, a key and a value that describe the same
+// weights, and head counts that differ only by whole groups when grouped
+// attention is asked for.
+void check_attention_shapes(const Tensor& query, const Tensor& key,
+                            const Tensor& value, bool enable_gqa) {
+    if (key.dim() < 1 || key.size(-1) != query.size(-1)) {
+        TP_THROW(ValueError, "scaled_dot_product_attention: query and key head "
+                             "dims must match");
+    }
+    if (shape_of(key) != shape_of(value)) {
+        TP_THROW(ValueError, "scaled_dot_product_attention: key and value shapes "
+                             "must match");
+    }
+    if (enable_gqa && query.dim() >= 3) {
+        const int64_t heads = query.size(-3);
+        const int64_t key_heads = key.size(-3);
+        if (heads != key_heads && (key_heads == 0 || heads % key_heads != 0)) {
+            TP_THROW(ValueError,
+                     "scaled_dot_product_attention: enable_gqa requires the query "
+                     "head count to be divisible by the key/value head count");
+        }
+    }
+}
+
+Tensor sdpa_kernel(const Tensor& query, const Tensor& key, const Tensor& value,
+                   const std::optional<Tensor>& /*attn_mask*/, double /*dropout_p*/,
+                   bool /*is_causal*/, std::optional<double> /*scale*/,
+                   bool enable_gqa) {
+    check_attention_shapes(query, key, value, enable_gqa);
+    return empty_meta(attention_out_shape(query, value), query.dtype(),
+                      query.device());
+}
+
+std::tuple<Tensor, Tensor> sdpa_with_lse_kernel(const Tensor& query,
+                                                const Tensor& key,
+                                                const Tensor& value,
+                                                bool /*is_causal*/,
+                                                int64_t /*impl*/) {
+    check_attention_shapes(query, key, value, /*enable_gqa=*/false);
+    std::vector<int64_t> out = attention_out_shape(query, value);
+    std::vector<int64_t> lse(out.begin(), out.end() - 1);
+    return {empty_meta(out, query.dtype(), query.device()),
+            empty_meta(lse, DType::Float32, query.device())};
+}
+
+// ---------------------------------------------------------------------------
+// Shapes that move extents around. These are views of their operand, so they
+// go through the storage-sharing path and only the sizes and strides are
+// computed here.
+// ---------------------------------------------------------------------------
+
+Tensor squeeze_kernel(const Tensor& self) {
+    std::vector<int64_t> sizes;
+    std::vector<int64_t> strides;
+    for (int64_t i = 0; i < self.dim(); ++i) {
+        if (self.size(i) == 1) continue;
+        sizes.push_back(self.size(i));
+        strides.push_back(self.stride(i));
+    }
+    return self.as_strided(sizes, strides,
+                           static_cast<int64_t>(self.storage_offset()));
+}
+
+Tensor squeeze_dim_kernel(const Tensor& self, int64_t dim) {
+    const int64_t ndim = self.dim();
+    if (ndim == 0) {
+        if (dim != 0 && dim != -1) {
+            TP_THROW(IndexError, "Dimension out of range (expected to be in range "
+                                 "of [-1, 0], but got ", dim, ")");
+        }
+        return self.as_strided(shape_of(self), self.strides(),
+                               static_cast<int64_t>(self.storage_offset()));
+    }
+    if (dim < 0) dim += ndim;
+    if (dim < 0 || dim >= ndim) {
+        TP_THROW(IndexError, "Dimension out of range (expected to be in range of [",
+                 -ndim, ", ", ndim - 1, "], but got ", dim, ")");
+    }
+    if (self.size(dim) != 1) {
+        return self.as_strided(shape_of(self), self.strides(),
+                               static_cast<int64_t>(self.storage_offset()));
+    }
+    std::vector<int64_t> sizes;
+    std::vector<int64_t> strides;
+    for (int64_t i = 0; i < ndim; ++i) {
+        if (i == dim) continue;
+        sizes.push_back(self.size(i));
+        strides.push_back(self.stride(i));
+    }
+    return self.as_strided(sizes, strides,
+                           static_cast<int64_t>(self.storage_offset()));
+}
+
+Tensor squeeze_dims_kernel(const Tensor& self, const std::vector<int64_t>& dims) {
+    const int64_t ndim = self.dim();
+    std::vector<bool> drop(static_cast<size_t>(ndim), false);
+    std::vector<bool> seen(static_cast<size_t>(ndim > 0 ? ndim : 1), false);
+    for (int64_t d : dims) {
+        int64_t wrapped = d < 0 ? d + ndim : d;
+        if (ndim <= 0 || wrapped < 0 || wrapped >= ndim) {
+            TP_THROW(IndexError, "Dimension out of range (expected to be in range "
+                                 "of [", -ndim, ", ", ndim - 1, "], but got ", d, ")");
+        }
+        if (seen[static_cast<size_t>(wrapped)]) {
+            TP_THROW(RuntimeError, "dim ", wrapped,
+                     " appears multiple times in the list of dims");
+        }
+        seen[static_cast<size_t>(wrapped)] = true;
+        drop[static_cast<size_t>(wrapped)] = true;
+    }
+    std::vector<int64_t> sizes;
+    std::vector<int64_t> strides;
+    for (int64_t i = 0; i < ndim; ++i) {
+        if (drop[static_cast<size_t>(i)] && self.size(i) == 1) continue;
+        sizes.push_back(self.size(i));
+        strides.push_back(self.stride(i));
+    }
+    return self.as_strided(sizes, strides,
+                           static_cast<int64_t>(self.storage_offset()));
+}
+
+Tensor unsqueeze_kernel(const Tensor& self, int64_t dim) {
+    const int64_t ndim = self.dim();
+    if (dim < 0) dim += ndim + 1;
+    if (dim < 0 || dim > ndim) {
+        TP_THROW(IndexError, "Dimension out of range (expected to be in range of [",
+                 -(ndim + 1), ", ", ndim, "], but got ", dim, ")");
+    }
+    std::vector<int64_t> sizes = shape_of(self);
+    std::vector<int64_t> strides = self.strides();
+    // The inserted axis spans nothing, so its stride is whatever the axis
+    // after it is worth in memory; appending one has nothing after it.
+    const int64_t stride = dim == ndim ? 1 : self.size(dim) * self.stride(dim);
+    sizes.insert(sizes.begin() + dim, 1);
+    strides.insert(strides.begin() + dim, stride);
+    return self.as_strided(sizes, strides,
+                           static_cast<int64_t>(self.storage_offset()));
+}
+
+std::vector<Tensor> chunk_kernel(const Tensor& self, int64_t chunks, int64_t dim) {
+    if (self.dim() == 0) {
+        TP_THROW(RuntimeError, "chunk expects at least a 1-dimensional tensor");
+    }
+    if (chunks <= 0) {
+        TP_THROW(RuntimeError, "chunk expects `chunks` to be greater than 0, got: ",
+                 chunks);
+    }
+    const int64_t ndim = self.dim();
+    if (dim < 0) dim += ndim;
+    if (dim < 0 || dim >= ndim) {
+        TP_THROW(IndexError, "chunk(): dimension out of range");
+    }
+    const int64_t size = self.size(dim);
+    const int64_t split = size / chunks + (size % chunks != 0 ? 1 : 0);
+    std::vector<Tensor> out;
+    if (split == 0) {
+        // Splitting an empty dimension yields the requested number of empty
+        // parts rather than none.
+        out.reserve(static_cast<size_t>(chunks));
+        for (int64_t i = 0; i < chunks; ++i) {
+            out.push_back(self.slice(dim, 0, 0));
+        }
+        return out;
+    }
+    for (int64_t start = 0; start < size; start += split) {
+        const int64_t end = start + split < size ? start + split : size;
+        out.push_back(self.slice(dim, start, end));
+    }
+    return out;
+}
+
+// Padding extends the trailing dimensions; the pad vector lists the two sides
+// of each of them, the last dimension first.  Negative sides narrow instead.
+Tensor constant_pad_nd_kernel(const Tensor& self, const std::vector<int64_t>& pad,
+                              const Scalar& /*value*/) {
+    if (pad.size() % 2 != 0) {
+        TP_THROW(ValueError, "Length of pad must be even but instead it equals ",
+                 pad.size());
+    }
+    const int64_t rank = self.dim();
+    const int64_t padded = static_cast<int64_t>(pad.size()) / 2;
+    if (rank < padded) {
+        TP_THROW(ValueError,
+                 "Length of pad should be no more than twice the number of "
+                 "dimensions of the input. Pad length is ", pad.size(),
+                 " while the input has ", rank, " dimensions.");
+    }
+    std::vector<int64_t> out = shape_of(self);
+    for (int64_t k = 0; k < padded; ++k) {
+        const int64_t dim = rank - padded + k;
+        const size_t pair = static_cast<size_t>(padded - 1 - k);
+        const int64_t total = pad[2 * pair] + pad[2 * pair + 1];
+        const int64_t extent = out[static_cast<size_t>(dim)] + total;
+        if (extent < 0) {
+            TP_THROW(RuntimeError,
+                     "The input size ", out[static_cast<size_t>(dim)],
+                     " plus negative padding ", total,
+                     " resulted in a negative output size, which is invalid. "
+                     "Check dimension ", dim, " of your input.");
+        }
+        out[static_cast<size_t>(dim)] = extent;
+    }
+    return empty_meta(out, self.dtype(), self.device());
+}
+
+// Resampling rearranges existing elements; only the requested output extent
+// is observable, and the batch and channel extents pass through.
+Tensor upsample_nearest2d_kernel(const Tensor& self,
+                                 const std::vector<int64_t>& output_size,
+                                 std::optional<double> /*scales_h*/,
+                                 std::optional<double> /*scales_w*/) {
+    if (self.dim() != 4) {
+        TP_THROW(RuntimeError, "upsample_nearest2d: expected a 4-D input, got ",
+                 self.dim(), "-D");
+    }
+    if (output_size.size() != 2) {
+        TP_THROW(ValueError, "upsample_nearest2d: output_size must have 2 elements");
+    }
+    for (const int64_t size : output_size) {
+        if (size <= 0) {
+            TP_THROW(ValueError,
+                     "upsample_nearest2d: output size must be positive");
+        }
+    }
+    return empty_meta({self.size(0), self.size(1), output_size[0], output_size[1]},
+                      self.dtype(), self.device());
+}
+
+// A tensor carries a quantizer or it does not; nothing about the values
+// decides it, so the answer is available without reading any.
+bool is_quantized_kernel(const Tensor& self) {
+    return self.defined() && self.unsafeGetTensorImpl() != nullptr &&
+           self.unsafeGetTensorImpl()->has_quantizer();
+}
+
+// ---------------------------------------------------------------------------
 // Copy. A meta destination accepts any source and stays metadata-only; a
 // real destination cannot be filled from a tensor that owns no data.
 // ---------------------------------------------------------------------------
@@ -939,6 +1338,35 @@ TENSORPLAY_LIBRARY_IMPL(Meta, MetaKernels) {
     // Views.
     m.impl("transpose", transpose_kernel);
     m.impl("slice.Tensor", slice_kernel);
+    m.impl("squeeze", squeeze_kernel);
+    m.impl("squeeze.dim", squeeze_dim_kernel);
+    m.impl("squeeze.dims", squeeze_dims_kernel);
+    m.impl("unsqueeze", unsqueeze_kernel);
+    m.impl("chunk", chunk_kernel);
+
+    // Convolution and normalization.
+    m.impl("conv2d", conv2d_kernel);
+    m.impl("group_norm", group_norm_kernel);
+    m.impl("native_group_norm", native_group_norm_kernel);
+
+    // Pointwise activations and roots.
+    m.impl("silu", silu_kernel);
+    m.impl("rsqrt", rsqrt_kernel);
+    m.impl("cos", cos_kernel);
+    m.impl("sin", sin_kernel);
+
+    // Dropout and moments.
+    m.impl("native_dropout", native_dropout_kernel);
+    m.impl("var_mean", var_mean_kernel);
+
+    // Attention.
+    m.impl("scaled_dot_product_attention", sdpa_kernel);
+    m.impl("_scaled_dot_product_attention_with_lse", sdpa_with_lse_kernel);
+
+    // Padding, resampling and dtype queries.
+    m.impl("constant_pad_nd", constant_pad_nd_kernel);
+    m.impl("upsample_nearest2d", upsample_nearest2d_kernel);
+    m.impl("is_quantized", is_quantized_kernel);
 
     // Copy.
     m.impl("copy_", copy_kernel);
