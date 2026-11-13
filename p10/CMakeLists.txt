@@ -169,7 +169,13 @@ set(P10_SOURCES
     src/backend/composite/Pointwise.cpp
     src/backend/composite/Reduction.cpp
     src/backend/composite/Spectral.cpp
-    src/backend/meta/MetaKernels.cpp
+    src/backend/meta/MetaFactory.cpp
+    src/backend/meta/MetaPointwise.cpp
+    src/backend/meta/MetaCompare.cpp
+    src/backend/meta/MetaBlas.cpp
+    src/backend/meta/MetaConv.cpp
+    src/backend/meta/MetaAttention.cpp
+    src/backend/meta/MetaLinalg.cpp
     src/backend/meta/MetaActivations.cpp
     src/backend/meta/MetaSoftmax.cpp
     src/backend/meta/MetaNormalization.cpp

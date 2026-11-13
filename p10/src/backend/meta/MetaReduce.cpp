@@ -355,6 +355,150 @@ Tensor logcumsumexp_kernel(const Tensor& self, int64_t dim, std::optional<DType>
     return empty_meta(shape_of(self), out_dt, self.device());
 }
 
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Reductions.
+// ---------------------------------------------------------------------------
+std::vector<int64_t> reduce_out_shape(const Tensor& self,
+                                      const std::vector<int64_t>& dims,
+                                      bool keepdim) {
+    const int64_t nd = self.dim();
+    std::vector<bool> reduced(static_cast<size_t>(nd), false);
+    // An empty list names no dimension, and a reduction that names no
+    // dimension is a reduction over all of them; a rank-0 operand has its one
+    // virtual dimension reduced.
+    if (dims.empty()) {
+        if (nd == 0) {
+            reduced.push_back(true);
+        } else {
+            for (int64_t i = 0; i < nd; ++i) {
+                reduced[static_cast<size_t>(i)] = true;
+            }
+        }
+    }
+    for (int64_t d : dims) {
+        int64_t dim = d;
+        if (nd == 0) {
+            // A 0-d tensor accepts -1 and 0 as its single (virtual) dimension.
+            if (dim != 0 && dim != -1) {
+                TP_THROW(IndexError, "reduction dimension ", dim,
+                         " out of range for a rank-", nd, " tensor");
+            }
+            reduced.push_back(true);
+            continue;
+        }
+        if (dim < 0) dim += nd;
+        if (dim < 0 || dim >= nd) {
+            TP_THROW(IndexError, "reduction dimension ", dim,
+                     " out of range for a rank-", nd, " tensor");
+        }
+        reduced[static_cast<size_t>(dim)] = true;
+    }
+    std::vector<int64_t> out;
+    out.reserve(reduced.size());
+    for (size_t i = 0; i < reduced.size(); ++i) {
+        if (!reduced[i]) {
+            out.push_back(nd == 0 ? 0 : self.size(static_cast<int64_t>(i)));
+        } else if (keepdim) {
+            out.push_back(1);
+        }
+    }
+    return out;
+}
+
+// Reductions widen narrow integers and booleans to Int64 unless a dtype is
+// requested explicitly.
+DType sum_like_dtype(const Tensor& self, DType dtype) {
+    if (dtype != DType::Undefined) return dtype;
+    if (isIntegralType(self.dtype(), /*include_bool=*/true)) return DType::Int64;
+    return self.dtype();
+}
+
+// Means keep the input dtype for float and complex inputs and fall back to
+// float for everything else.
+DType mean_like_dtype(const Tensor& self, DType dtype) {
+    if (dtype != DType::Undefined) return dtype;
+    return isFloatingOrComplexType(self.dtype()) ? self.dtype() : DType::Float32;
+}
+
+Tensor sum_kernel(const Tensor& self, DType dtype) {
+    return empty_meta({}, sum_like_dtype(self, dtype), self.device());
+}
+
+Tensor sum_dim_kernel(const Tensor& self, const std::vector<int64_t>& dims,
+                      bool keepdim, DType dtype) {
+    return empty_meta(reduce_out_shape(self, dims, keepdim),
+                      sum_like_dtype(self, dtype), self.device());
+}
+
+Tensor mean_kernel(const Tensor& self, DType dtype) {
+    return empty_meta({}, mean_like_dtype(self, dtype), self.device());
+}
+
+Tensor mean_dim_kernel(const Tensor& self, const std::vector<int64_t>& dims,
+                       bool keepdim, DType dtype) {
+    return empty_meta(reduce_out_shape(self, dims, keepdim),
+                      mean_like_dtype(self, dtype), self.device());
+}
+
+Tensor prod_kernel(const Tensor& self, DType dtype) {
+    return empty_meta({}, sum_like_dtype(self, dtype), self.device());
+}
+
+Tensor prod_dim_kernel(const Tensor& self, const std::vector<int64_t>& dims,
+                       bool keepdim, DType dtype) {
+    return empty_meta(reduce_out_shape(self, dims, keepdim),
+                      sum_like_dtype(self, dtype), self.device());
+}
+
+// Index reductions return Int64 coordinates; a missing dim reduces
+// everything to a scalar.
+Tensor arg_kernel(const Tensor& self, std::optional<int64_t> dim, bool keepdim) {
+    if (!dim.has_value()) {
+        return empty_meta({}, DType::Int64, self.device());
+    }
+    return empty_meta(reduce_out_shape(self, {*dim}, keepdim), DType::Int64,
+                      self.device());
+}
+
+Tensor amax_cpu(const Tensor& self, const std::vector<int64_t>& dim, bool keepdim) {
+    return empty_meta(reduce_out_shape(self, dim, keepdim), self.dtype(),
+                      self.device());
+}
+
+Tensor amin_cpu(const Tensor& self, const std::vector<int64_t>& dim, bool keepdim) {
+    return empty_meta(reduce_out_shape(self, dim, keepdim), self.dtype(),
+                      self.device());
+}
+
+std::tuple<Tensor, Tensor> aminmax_cpu(const Tensor& self,
+                                       const std::vector<int64_t>& dim,
+                                       bool keepdim) {
+    const auto out_shape = reduce_out_shape(self, dim, keepdim);
+    return {empty_meta(out_shape, self.dtype(), self.device()),
+            empty_meta(out_shape, self.dtype(), self.device())};
+}
+
+std::tuple<Tensor, Tensor> aminmax_all_kernel(const Tensor& self) {
+    return aminmax_cpu(self, {}, false);
+}
+
+std::tuple<Tensor, Tensor> aminmax_dim_kernel(const Tensor& self, int64_t dim,
+                                              bool keepdim) {
+    return aminmax_cpu(self, {dim}, keepdim);
+}
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Moments. The variance and the mean reduce over the same dimensions, so they
+// share a shape and a type.
+// ---------------------------------------------------------------------------
+std::tuple<Tensor, Tensor> var_mean_kernel(const Tensor& self,
+                                           const std::vector<int64_t>& dims,
+                                           bool /*unbiased*/, bool keepdim) {
+    const std::vector<int64_t> out = reduce_out_shape(self, dims, keepdim);
+    const DType dtype = mean_like_dtype(self, DType::Undefined);
+    return {empty_meta(out, dtype, self.device()), empty_meta(out, dtype, self.device())};
+}
 } // anonymous namespace
 
 TENSORPLAY_LIBRARY_IMPL(Meta, MetaReduce) {
@@ -382,6 +526,20 @@ TENSORPLAY_LIBRARY_IMPL(Meta, MetaReduce) {
     m.impl("nansum", nansum_kernel);
     m.impl("nanmean", nanmean_kernel);
     m.impl("logcumsumexp", logcumsumexp_kernel);
+    m.impl("sum", sum_kernel);
+    m.impl("sum.dim_IntList", sum_dim_kernel);
+    m.impl("mean", mean_kernel);
+    m.impl("mean.dim", mean_dim_kernel);
+    m.impl("prod", prod_kernel);
+    m.impl("prod.dim_IntList", prod_dim_kernel);
+    m.impl("argmax", arg_kernel);
+    m.impl("argmin", arg_kernel);
+    m.impl("amax", amax_cpu);
+    m.impl("amin", amin_cpu);
+    m.impl("aminmax", aminmax_cpu);
+    m.impl("_aminmax", aminmax_all_kernel);
+    m.impl("_aminmax.dim", aminmax_dim_kernel);
+    m.impl("var_mean", var_mean_kernel);
 }
 
 } // namespace meta

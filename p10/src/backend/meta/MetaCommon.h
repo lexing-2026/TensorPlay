@@ -13,6 +13,7 @@
 #include "TensorImpl.h"
 #include "Context.h"
 #include "DType.h"
+#include "Scalar.h"
 #include "TypePromotion.h"
 #include "TypeProperties.h"
 #include "Utils.h"
@@ -95,6 +96,45 @@ inline DType resolve_like_dtype(DType dtype, const Tensor& self) {
 inline Device resolve_like_device(const std::optional<Device>& device,
                                   const Tensor& self) {
     return device.has_value() ? *device : self.device();
+}
+
+// A float-only pointwise op answers an integral or boolean operand in the
+// default floating type, because the operation has no integral form to answer
+// in; a floating or complex operand keeps its own type.
+inline DType unary_float_dtype(DType dtype) {
+    if (isIntegralType(dtype, /*includeBool=*/true)) {
+        return globalContext().defaultDType();
+    }
+    return dtype;
+}
+
+// Result dtype for add/sub-style arithmetic: promote the operands, and a
+// floating alpha lifts an integer pair to at least float.
+inline DType add_like_dtype(DType self_dtype, DType other_dtype,
+                            const Scalar& alpha) {
+    DType result = promoteTypes(self_dtype, other_dtype);
+    if (alpha.isFloatingPoint() && !isFloatingType(result)) {
+        result = promoteTypes(result, DType::Float32);
+    }
+    return result;
+}
+
+inline DType add_like_scalar_dtype(DType self_dtype, const Scalar& other,
+                                   const Scalar& alpha) {
+    return add_like_dtype(self_dtype, result_type(other, self_dtype), alpha);
+}
+
+// True division always falls back to float when the promoted pair is integral.
+inline DType div_like_dtype(DType self_dtype, DType other_dtype) {
+    DType result = promoteTypes(self_dtype, other_dtype);
+    if (isIntegralType(result, /*include_bool=*/true)) {
+        result = DType::Float32;
+    }
+    return result;
+}
+
+inline DType div_like_scalar_dtype(DType self_dtype, const Scalar& other) {
+    return div_like_dtype(self_dtype, result_type(other, self_dtype));
 }
 
 // The extents kept by a reduction over `dims` with keepdim, shared by sum,

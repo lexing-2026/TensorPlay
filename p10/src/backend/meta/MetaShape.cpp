@@ -773,6 +773,389 @@ std::vector<Tensor> broadcast_tensors_kernel(const std::vector<Tensor>& tensors)
     return outs;
 }
 
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Concatenation.
+// ---------------------------------------------------------------------------
+Tensor cat_kernel(const std::vector<Tensor>& tensors, int64_t dim) {
+    if (tensors.empty()) {
+        TP_THROW(ValueError, "cat(): expected a non-empty list of Tensors");
+    }
+    for (size_t i = 0; i < tensors.size(); ++i) {
+        if (tensors[i].dim() == 0) {
+            TP_THROW(RuntimeError, "zero-dimensional tensor (at position ", i,
+                     ") cannot be concatenated");
+        }
+        if (tensors[i].device() != tensors[0].device()) {
+            TP_THROW(DeviceMismatchError,
+                     "cat(): all tensors must be on the same device");
+        }
+    }
+    const int64_t nd = tensors[0].dim();
+    if (dim < 0) dim += nd;
+    if (dim < 0 || dim >= nd) {
+        TP_THROW(IndexError, "cat(): dimension ", dim, " out of range");
+    }
+
+    DType out_dtype = tensors[0].dtype();
+    int64_t size_at_dim = 0;
+    for (const auto& t : tensors) {
+        if (t.numel() == 0) continue;
+        if (t.dim() != nd) {
+            TP_THROW(RuntimeError, "cat(): tensors must have the same number of dims");
+        }
+        for (int64_t d = 0; d < nd; ++d) {
+            if (d != dim && t.size(d) != tensors[0].size(d)) {
+                TP_THROW(RuntimeError, "cat(): sizes of tensors must match except in ",
+                         "dimension ", dim);
+            }
+        }
+        size_at_dim += t.size(dim);
+        out_dtype = promoteTypes(out_dtype, t.dtype());
+    }
+
+    std::vector<int64_t> out_shape = shape_of(tensors[0]);
+    out_shape[static_cast<size_t>(dim)] = size_at_dim;
+    return empty_meta(out_shape, out_dtype, tensors[0].device());
+}
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Finite differences and the cross product. diff folds the optional boundary
+// rows through the concatenation rules and then peels one slice per order,
+// while cross broadcasts every axis but the length-three one.
+// ---------------------------------------------------------------------------
+int64_t wrap_diff_dim(int64_t dim, int64_t ndim) {
+    const int64_t min = -ndim;
+    const int64_t max = ndim - 1;
+    if (dim < min || dim > max) {
+        TP_THROW(IndexError, "Dimension out of range (expected to be in range "
+                             "of [", min, ", ", max, "], but got ", dim, ")");
+    }
+    return dim < 0 ? dim + ndim : dim;
+}
+
+Tensor diff_kernel(const Tensor& self, int64_t n, int64_t dim,
+                   const std::optional<Tensor>& prepend,
+                   const std::optional<Tensor>& append) {
+    const int64_t d = wrap_diff_dim(dim, self.dim());
+    const bool has_prepend = prepend.has_value() && prepend->defined();
+    const bool has_append = append.has_value() && append->defined();
+    Tensor base = self;
+    // A zero order answers the operand untouched, so the boundary rows are
+    // neither joined nor validated.
+    if ((has_prepend || has_append) && n != 0) {
+        std::vector<Tensor> pieces;
+        if (has_prepend) pieces.push_back(*prepend);
+        pieces.push_back(self);
+        if (has_append) pieces.push_back(*append);
+        base = cat_kernel(pieces, d);
+    }
+    int64_t orders = n;
+    if (orders > base.size(d)) orders = base.size(d);
+    if (orders <= 0) {
+        return empty_meta(shape_of(base), base.dtype(), base.device());
+    }
+    if (base.dtype() == DType::Bool) {
+        TP_THROW(RuntimeError,
+                 "Subtraction, the `-` operator, with two bool tensors is not "
+                 "supported. Use the `^` or `logical_xor()` operator instead.");
+    }
+    std::vector<int64_t> out = shape_of(base);
+    out[static_cast<size_t>(d)] -= orders;
+    return empty_meta(out, base.dtype(), base.device());
+}
+
+int64_t wrap_cross_dim(int64_t dim, int64_t ndim) {
+    if (dim < -ndim || dim >= ndim) {
+        TP_THROW(IndexError, "Dimension out of range (expected to be in range "
+                             "of [", -ndim, ", ", ndim - 1, "], but got ", dim,
+                 ")");
+    }
+    return dim < 0 ? dim + ndim : dim;
+}
+
+std::vector<int64_t> cross_output_shape(const Tensor& self,
+                                        const Tensor& other, int64_t& dim) {
+    if (self.dim() != other.dim()) {
+        TP_THROW(RuntimeError,
+                 "linalg.cross: inputs must have the same number of "
+                 "dimensions.");
+    }
+    if (self.dim() == 0) {
+        TP_THROW(IndexError, "Dimension out of range (expected to be in range "
+                             "of [-1, 0], but got -1)");
+    }
+    dim = wrap_cross_dim(dim, self.dim());
+    if (self.size(dim) != 3 || other.size(dim) != 3) {
+        TP_THROW(RuntimeError, "linalg.cross: inputs dimension ", dim,
+                 " must have length 3. Got ", self.size(dim), " and ",
+                 other.size(dim));
+    }
+    if (self.dtype() != other.dtype()) {
+        TP_THROW(RuntimeError, "expected scalar type ", toString(self.dtype()),
+                 " but found ", toString(other.dtype()));
+    }
+    if (self.device() != other.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "Expected all tensors to be on the same device, but got ",
+                 self.device().toString(), " and ",
+                 other.device().toString());
+    }
+    if (self.dtype() == DType::Bool) {
+        TP_THROW(NotImplementedError, "\"cross\" not implemented for 'Bool'");
+    }
+    if (self.dtype() == DType::ComplexHalf ||
+        self.dtype() == DType::BComplex32) {
+        TP_THROW(NotImplementedError,
+                 "\"cross\" not implemented for reduced complex dtype ",
+                 toString(self.dtype()));
+    }
+    return broadcast_shapes(shape_of(self), shape_of(other));
+}
+
+Tensor linalg_cross_kernel(const Tensor& self, const Tensor& other,
+                           int64_t dim) {
+    return empty_meta(cross_output_shape(self, other, dim), self.dtype(),
+                      self.device());
+}
+
+Tensor cross_kernel(const Tensor& self, const Tensor& other,
+                    std::optional<int64_t> dim) {
+    int64_t d = -1;
+    if (dim.has_value()) {
+        d = *dim;
+    } else {
+        for (int64_t axis = 0; axis < self.dim(); ++axis) {
+            if (self.size(axis) == 3) {
+                d = axis;
+                break;
+            }
+        }
+        if (d < 0) {
+            TP_THROW(RuntimeError, "no dimension of size 3 in input");
+        }
+    }
+    return empty_meta(cross_output_shape(self, other, d), self.dtype(),
+                      self.device());
+}
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// View kernels. These ops are backend-dispatched, so the meta device needs
+// its own registrations; they reuse the storage-sharing as_strided path,
+// which is metadata-only and therefore device-independent.
+// ---------------------------------------------------------------------------
+Tensor transpose_kernel(const Tensor& self, int64_t dim0, int64_t dim1) {
+    const int64_t ndim = self.dim();
+    if (dim0 < 0) dim0 += ndim;
+    if (dim1 < 0) dim1 += ndim;
+    if (dim0 < 0 || dim0 >= ndim || dim1 < 0 || dim1 >= ndim) {
+        TP_THROW(IndexError, "transpose: dimension out of range for a rank-",
+                 ndim, " tensor");
+    }
+    std::vector<int64_t> sizes = shape_of(self);
+    const std::vector<int64_t> strides = self.strides();
+    std::vector<int64_t> new_strides(strides);
+    std::swap(sizes[static_cast<size_t>(dim0)], sizes[static_cast<size_t>(dim1)]);
+    std::swap(new_strides[static_cast<size_t>(dim0)], new_strides[static_cast<size_t>(dim1)]);
+    return self.as_strided(sizes, new_strides,
+                           static_cast<int64_t>(self.storage_offset()));
+}
+
+Tensor slice_kernel(const Tensor& self, int64_t dim,
+                    std::optional<int64_t> start, std::optional<int64_t> end,
+                    int64_t step) {
+    return self.slice(dim, start.value_or(0),
+                      end.value_or(std::numeric_limits<int64_t>::max()), step);
+}
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Shapes that move extents around. These are views of their operand, so they
+// go through the storage-sharing path and only the sizes and strides are
+// computed here.
+// ---------------------------------------------------------------------------
+Tensor squeeze_kernel(const Tensor& self) {
+    std::vector<int64_t> sizes;
+    std::vector<int64_t> strides;
+    for (int64_t i = 0; i < self.dim(); ++i) {
+        if (self.size(i) == 1) continue;
+        sizes.push_back(self.size(i));
+        strides.push_back(self.stride(i));
+    }
+    return self.as_strided(sizes, strides,
+                           static_cast<int64_t>(self.storage_offset()));
+}
+
+Tensor squeeze_dim_kernel(const Tensor& self, int64_t dim) {
+    const int64_t ndim = self.dim();
+    if (ndim == 0) {
+        if (dim != 0 && dim != -1) {
+            TP_THROW(IndexError, "Dimension out of range (expected to be in range "
+                                 "of [-1, 0], but got ", dim, ")");
+        }
+        return self.as_strided(shape_of(self), self.strides(),
+                               static_cast<int64_t>(self.storage_offset()));
+    }
+    if (dim < 0) dim += ndim;
+    if (dim < 0 || dim >= ndim) {
+        TP_THROW(IndexError, "Dimension out of range (expected to be in range of [",
+                 -ndim, ", ", ndim - 1, "], but got ", dim, ")");
+    }
+    if (self.size(dim) != 1) {
+        return self.as_strided(shape_of(self), self.strides(),
+                               static_cast<int64_t>(self.storage_offset()));
+    }
+    std::vector<int64_t> sizes;
+    std::vector<int64_t> strides;
+    for (int64_t i = 0; i < ndim; ++i) {
+        if (i == dim) continue;
+        sizes.push_back(self.size(i));
+        strides.push_back(self.stride(i));
+    }
+    return self.as_strided(sizes, strides,
+                           static_cast<int64_t>(self.storage_offset()));
+}
+
+Tensor squeeze_dims_kernel(const Tensor& self, const std::vector<int64_t>& dims) {
+    const int64_t ndim = self.dim();
+    std::vector<bool> drop(static_cast<size_t>(ndim), false);
+    std::vector<bool> seen(static_cast<size_t>(ndim > 0 ? ndim : 1), false);
+    for (int64_t d : dims) {
+        int64_t wrapped = d < 0 ? d + ndim : d;
+        if (ndim <= 0 || wrapped < 0 || wrapped >= ndim) {
+            TP_THROW(IndexError, "Dimension out of range (expected to be in range "
+                                 "of [", -ndim, ", ", ndim - 1, "], but got ", d, ")");
+        }
+        if (seen[static_cast<size_t>(wrapped)]) {
+            TP_THROW(RuntimeError, "dim ", wrapped,
+                     " appears multiple times in the list of dims");
+        }
+        seen[static_cast<size_t>(wrapped)] = true;
+        drop[static_cast<size_t>(wrapped)] = true;
+    }
+    std::vector<int64_t> sizes;
+    std::vector<int64_t> strides;
+    for (int64_t i = 0; i < ndim; ++i) {
+        if (drop[static_cast<size_t>(i)] && self.size(i) == 1) continue;
+        sizes.push_back(self.size(i));
+        strides.push_back(self.stride(i));
+    }
+    return self.as_strided(sizes, strides,
+                           static_cast<int64_t>(self.storage_offset()));
+}
+
+Tensor unsqueeze_kernel(const Tensor& self, int64_t dim) {
+    const int64_t ndim = self.dim();
+    if (dim < 0) dim += ndim + 1;
+    if (dim < 0 || dim > ndim) {
+        TP_THROW(IndexError, "Dimension out of range (expected to be in range of [",
+                 -(ndim + 1), ", ", ndim, "], but got ", dim, ")");
+    }
+    std::vector<int64_t> sizes = shape_of(self);
+    std::vector<int64_t> strides = self.strides();
+    // The inserted axis spans nothing, so its stride is whatever the axis
+    // after it is worth in memory; appending one has nothing after it.
+    const int64_t stride = dim == ndim ? 1 : self.size(dim) * self.stride(dim);
+    sizes.insert(sizes.begin() + dim, 1);
+    strides.insert(strides.begin() + dim, stride);
+    return self.as_strided(sizes, strides,
+                           static_cast<int64_t>(self.storage_offset()));
+}
+
+std::vector<Tensor> chunk_kernel(const Tensor& self, int64_t chunks, int64_t dim) {
+    if (self.dim() == 0) {
+        TP_THROW(RuntimeError, "chunk expects at least a 1-dimensional tensor");
+    }
+    if (chunks <= 0) {
+        TP_THROW(RuntimeError, "chunk expects `chunks` to be greater than 0, got: ",
+                 chunks);
+    }
+    const int64_t ndim = self.dim();
+    if (dim < 0) dim += ndim;
+    if (dim < 0 || dim >= ndim) {
+        TP_THROW(IndexError, "chunk(): dimension out of range");
+    }
+    const int64_t size = self.size(dim);
+    const int64_t split = size / chunks + (size % chunks != 0 ? 1 : 0);
+    std::vector<Tensor> out;
+    if (split == 0) {
+        // Splitting an empty dimension yields the requested number of empty
+        // parts rather than none.
+        out.reserve(static_cast<size_t>(chunks));
+        for (int64_t i = 0; i < chunks; ++i) {
+            out.push_back(self.slice(dim, 0, 0));
+        }
+        return out;
+    }
+    for (int64_t start = 0; start < size; start += split) {
+        const int64_t end = start + split < size ? start + split : size;
+        out.push_back(self.slice(dim, start, end));
+    }
+    return out;
+}
+
+// Padding extends the trailing dimensions; the pad vector lists the two sides
+// of each of them, the last dimension first.  Negative sides narrow instead.
+Tensor constant_pad_nd_kernel(const Tensor& self, const std::vector<int64_t>& pad,
+                              const Scalar& /*value*/) {
+    if (pad.size() % 2 != 0) {
+        TP_THROW(ValueError, "Length of pad must be even but instead it equals ",
+                 pad.size());
+    }
+    const int64_t rank = self.dim();
+    const int64_t padded = static_cast<int64_t>(pad.size()) / 2;
+    if (rank < padded) {
+        TP_THROW(ValueError,
+                 "Length of pad should be no more than twice the number of "
+                 "dimensions of the input. Pad length is ", pad.size(),
+                 " while the input has ", rank, " dimensions.");
+    }
+    std::vector<int64_t> out = shape_of(self);
+    for (int64_t k = 0; k < padded; ++k) {
+        const int64_t dim = rank - padded + k;
+        const size_t pair = static_cast<size_t>(padded - 1 - k);
+        const int64_t total = pad[2 * pair] + pad[2 * pair + 1];
+        const int64_t extent = out[static_cast<size_t>(dim)] + total;
+        if (extent < 0) {
+            TP_THROW(RuntimeError,
+                     "The input size ", out[static_cast<size_t>(dim)],
+                     " plus negative padding ", total,
+                     " resulted in a negative output size, which is invalid. "
+                     "Check dimension ", dim, " of your input.");
+        }
+        out[static_cast<size_t>(dim)] = extent;
+    }
+    return empty_meta(out, self.dtype(), self.device());
+}
+
+// Resampling rearranges existing elements; only the requested output extent
+// is observable, and the batch and channel extents pass through.
+Tensor upsample_nearest2d_kernel(const Tensor& self,
+                                 const std::vector<int64_t>& output_size,
+                                 std::optional<double> /*scales_h*/,
+                                 std::optional<double> /*scales_w*/) {
+    if (self.dim() != 4) {
+        TP_THROW(RuntimeError, "upsample_nearest2d: expected a 4-D input, got ",
+                 self.dim(), "-D");
+    }
+    if (output_size.size() != 2) {
+        TP_THROW(ValueError, "upsample_nearest2d: output_size must have 2 elements");
+    }
+    for (const int64_t size : output_size) {
+        if (size <= 0) {
+            TP_THROW(ValueError,
+                     "upsample_nearest2d: output size must be positive");
+        }
+    }
+    return empty_meta({self.size(0), self.size(1), output_size[0], output_size[1]},
+                      self.dtype(), self.device());
+}
+
+// A tensor carries a quantizer or it does not; nothing about the values
+// decides it, so the answer is available without reading any.
+bool is_quantized_kernel(const Tensor& self) {
+    return self.defined() && self.unsafeGetTensorImpl() != nullptr &&
+           self.unsafeGetTensorImpl()->has_quantizer();
+}
 } // anonymous namespace
 
 TENSORPLAY_LIBRARY_IMPL(Meta, MetaShape) {
@@ -806,6 +1189,20 @@ TENSORPLAY_LIBRARY_IMPL(Meta, MetaShape) {
     m.impl("pixel_shuffle", pixel_shuffle_kernel);
     m.impl("block_diag", block_diag_kernel);
     m.impl("broadcast_tensors", broadcast_tensors_kernel);
+    m.impl("cat", cat_kernel);
+    m.impl("diff", diff_kernel);
+    m.impl("cross", cross_kernel);
+    m.impl("linalg_cross", linalg_cross_kernel);
+    m.impl("transpose", transpose_kernel);
+    m.impl("slice.Tensor", slice_kernel);
+    m.impl("squeeze", squeeze_kernel);
+    m.impl("squeeze.dim", squeeze_dim_kernel);
+    m.impl("squeeze.dims", squeeze_dims_kernel);
+    m.impl("unsqueeze", unsqueeze_kernel);
+    m.impl("chunk", chunk_kernel);
+    m.impl("constant_pad_nd", constant_pad_nd_kernel);
+    m.impl("upsample_nearest2d", upsample_nearest2d_kernel);
+    m.impl("is_quantized", is_quantized_kernel);
 }
 
 } // namespace meta

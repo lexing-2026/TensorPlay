@@ -10,6 +10,7 @@
 #include "MetaCommon.h"
 
 #include "DType.h"
+#include "DTypeNames.h"
 #include "Scalar.h"
 #include "TypePromotion.h"
 
@@ -123,6 +124,198 @@ std::tuple<Tensor, Tensor> nll_loss_kernel(
             empty_meta({}, self.dtype(), self.device())};
 }
 
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Losses.
+//
+// The per-element loss is computed elsewhere; only the reduction decides the
+// result shape, and a whole-number or truth-value promotion answers at single
+// precision because the loss arithmetic blends in floating literals.
+// ---------------------------------------------------------------------------
+Tensor reduce_loss_meta(const std::vector<int64_t>& shape, DType dtype,
+                        const Device& device, int64_t reduction) {
+    if (reduction == 0) return empty_meta(shape, dtype, device);
+    if (reduction == 1 || reduction == 2) return empty_meta({}, dtype, device);
+    TP_THROW(ValueError, "Invalid reduction mode");
+}
+
+DType float_loss_dtype(DType dtype) {
+    return isIntegralType(dtype, /*include_bool=*/true) ? DType::Float32 : dtype;
+}
+
+void check_reduction_mode(int64_t reduction, const char* name) {
+    if (reduction != 0 && reduction != 1 && reduction != 2) {
+        TP_THROW(ValueError, name, ": invalid reduction, expected 0 (none), 1 "
+                                   "(mean) or 2 (sum) but got ", reduction);
+    }
+}
+
+void check_float_loss_dtype(DType dtype, const char* impl) {
+    if (dtype != DType::Float32 && dtype != DType::Float64) {
+        TP_THROW(NotImplementedError, impl,
+                 ": only supports Float32/Float64, got ",
+                 scalarTypeName(dtype));
+    }
+}
+
+Tensor huber_loss_kernel(const Tensor& self, const Tensor& target,
+                         int64_t reduction, double delta) {
+    if (delta <= 0) {
+        TP_THROW(ValueError,
+                 "huber_loss does not support non-positive values for delta.");
+    }
+    return reduce_loss_meta(
+        broadcast2(self, target),
+        float_loss_dtype(promoteTypes(self.dtype(), target.dtype())),
+        self.device(), reduction);
+}
+
+Tensor soft_margin_loss_kernel(const Tensor& self, const Tensor& target,
+                               int64_t reduction) {
+    return reduce_loss_meta(
+        broadcast2(self, target),
+        float_loss_dtype(promoteTypes(self.dtype(), target.dtype())),
+        self.device(), reduction);
+}
+
+Tensor hinge_embedding_loss_kernel(const Tensor& self, const Tensor& target,
+                                   double /*margin*/, int64_t reduction) {
+    // Both branches carry the input dtype, so the target only broadcasts.
+    return reduce_loss_meta(broadcast2(self, target),
+                            float_loss_dtype(self.dtype()), self.device(),
+                            reduction);
+}
+
+Tensor margin_ranking_loss_kernel(const Tensor& input1, const Tensor& input2,
+                                  const Tensor& target, double /*margin*/,
+                                  int64_t reduction) {
+    return reduce_loss_meta(
+        broadcast_shapes(shape_of(input1), shape_of(input2), shape_of(target)),
+        float_loss_dtype(promoteTypes(
+            promoteTypes(input1.dtype(), input2.dtype()), target.dtype())),
+        input1.device(), reduction);
+}
+
+Tensor cosine_embedding_loss_kernel(const Tensor& input1,
+                                    const Tensor& input2,
+                                    const Tensor& target, double /*margin*/,
+                                    int64_t reduction) {
+    const std::vector<int64_t> pair = broadcast2(input1, input2);
+    std::vector<int64_t> cos_shape;
+    if (pair.size() == 1) {
+        TP_THROW(IndexError,
+                 "Dimension out of range (expected to be in range of [-1, 0], "
+                 "but got 1)");
+    }
+    if (pair.size() > 1) {
+        cos_shape.assign(pair.begin(), pair.end());
+        cos_shape.erase(cos_shape.begin() + 1);
+    }
+    return reduce_loss_meta(
+        broadcast_shapes(cos_shape, shape_of(target)),
+        float_loss_dtype(promoteTypes(input1.dtype(), input2.dtype())),
+        input1.device(), reduction);
+}
+
+void multi_margin_shape_check(int64_t& nframe, int64_t& dim,
+                              const Tensor& input, const Tensor& target,
+                              const std::optional<Tensor>& weight) {
+    const int64_t ndims = input.dim();
+    if (!((ndims == 2 && input.size(1) != 0) ||
+          (ndims == 1 && input.size(0) != 0) || ndims == 0)) {
+        TP_THROW(RuntimeError,
+                 "multi_margin_loss: Expected non-empty vector or matrix with "
+                 "optional 0-dim batch size, but got: ",
+                 input.shape().toString());
+    }
+    if (ndims <= 1) {
+        nframe = 1;
+        dim = ndims == 0 ? 1 : input.size(0);
+    } else {
+        nframe = input.size(0);
+        dim = input.size(1);
+    }
+    if (!(target.dim() <= 1 && target.numel() == nframe)) {
+        TP_THROW(RuntimeError,
+                 "multi_margin_loss: target tensor should be 1-D with size "
+                 "equal to the number of input samples (batch size). Expected "
+                 "target size [", nframe, "], but got ",
+                 target.shape().toString(), ". Input has shape ",
+                 input.shape().toString(), ".");
+    }
+    if (weight.has_value() && weight->defined()) {
+        if (!(weight->dim() <= 1 && weight->numel() == dim)) {
+            TP_THROW(RuntimeError,
+                     "multi_margin_loss: inconsistent weight size, expected ",
+                     dim, " but got ", weight->shape().toString());
+        }
+    }
+}
+
+Tensor multi_margin_loss_kernel(const Tensor& self, const Tensor& target,
+                                const Scalar& p, const Scalar& /*margin*/,
+                                const std::optional<Tensor>& weight,
+                                int64_t reduction) {
+    check_reduction_mode(reduction, "multi_margin_loss");
+    const int64_t power = p.to<int64_t>();
+    if (power != 1 && power != 2) {
+        TP_THROW(RuntimeError,
+                 "multi_margin_loss: only p == 1 and p == 2 supported");
+    }
+    check_float_loss_dtype(self.dtype(), "multi_margin_loss_impl");
+    int64_t nframe = 0, dim = 0;
+    multi_margin_shape_check(nframe, dim, self, target, weight);
+    if (reduction == 0 && target.dim() > 0) {
+        return empty_meta({nframe}, self.dtype(), self.device());
+    }
+    return empty_meta({}, self.dtype(), self.device());
+}
+
+void multilabel_shape_check(int64_t& nframe, int64_t& dim,
+                            const Tensor& input, const Tensor& target) {
+    const int64_t ndims = input.dim();
+    if (!((ndims == 2 && input.size(1) != 0) ||
+          (ndims == 1 && input.size(0) != 0) || ndims == 0)) {
+        TP_THROW(RuntimeError,
+                 "multilabel_margin_loss: Expected non-empty vector or matrix "
+                 "with optional 0-dim batch size, but got: ",
+                 input.shape().toString());
+    }
+    if (ndims <= 1) {
+        nframe = 1;
+        dim = ndims == 0 ? 1 : input.size(0);
+        if (!(target.dim() <= 1 && target.numel() == dim)) {
+            TP_THROW(RuntimeError,
+                     "multilabel_margin_loss: inconsistent target size: ",
+                     target.shape().toString(), " for input of size: ",
+                     input.shape().toString());
+        }
+    } else {
+        nframe = input.size(0);
+        dim = input.size(1);
+        if (!(target.dim() == 2 && target.size(0) == nframe &&
+              target.size(1) == dim)) {
+            TP_THROW(RuntimeError,
+                     "multilabel_margin_loss: inconsistent target size: ",
+                     target.shape().toString(), " for input of size: ",
+                     input.shape().toString());
+        }
+    }
+}
+
+std::tuple<Tensor, Tensor> multilabel_margin_loss_forward_kernel(
+    const Tensor& self, const Tensor& target, int64_t reduction) {
+    check_reduction_mode(reduction, "multilabel_margin_loss_forward");
+    check_float_loss_dtype(self.dtype(), "multilabel_margin_loss_forward");
+    int64_t nframe = 0, dim = 0;
+    multilabel_shape_check(nframe, dim, self, target);
+    const Tensor mask =
+        empty_meta(shape_of(target), self.dtype(), self.device());
+    if (reduction == 0 && target.dim() > 1) {
+        return {empty_meta({nframe}, self.dtype(), self.device()), mask};
+    }
+    return {empty_meta({}, self.dtype(), self.device()), mask};
+}
 } // anonymous namespace
 
 TENSORPLAY_LIBRARY_IMPL(Meta, MetaLoss) {
@@ -133,6 +326,14 @@ TENSORPLAY_LIBRARY_IMPL(Meta, MetaLoss) {
     m.impl("tp_kl_div", kl_div_kernel);
     m.impl("tp_poisson_nll_loss", poisson_nll_loss_kernel);
     m.impl("nll_loss", nll_loss_kernel);
+    m.impl("huber_loss", huber_loss_kernel);
+    m.impl("tp_soft_margin_loss", soft_margin_loss_kernel);
+    m.impl("tp_hinge_embedding_loss", hinge_embedding_loss_kernel);
+    m.impl("tp_margin_ranking_loss", margin_ranking_loss_kernel);
+    m.impl("tp_cosine_embedding_loss", cosine_embedding_loss_kernel);
+    m.impl("multi_margin_loss", multi_margin_loss_kernel);
+    m.impl("multilabel_margin_loss_forward",
+           multilabel_margin_loss_forward_kernel);
 }
 
 } // namespace meta
