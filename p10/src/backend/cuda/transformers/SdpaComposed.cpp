@@ -48,7 +48,7 @@ std::tuple<Tensor, Tensor> sdpa_composed_with_lse(
 std::tuple<Tensor, Tensor, Tensor> sdpa_composed_backward(
     const Tensor& grad_output, const Tensor& query, const Tensor& key,
     const Tensor& value, const std::optional<Tensor>& attn_mask,
-    double dropout_p, bool is_causal, const std::optional<double>& scale,
+    double dropout_p, bool is_causal, std::optional<double> scale,
     bool enable_gqa) {
   return composite::sdpa_math_backward_composite(
       grad_output, query, key, value, attn_mask, dropout_p, is_causal, scale,
