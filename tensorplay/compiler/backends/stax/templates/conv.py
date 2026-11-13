@@ -872,7 +872,7 @@ CONV_BWD_WEIGHT = ConvBwdWeightTemplate()
 
 framework_convolution = ExternKernelChoice(
     tp.ops.tp.convolution, "convolution",
-    has_out_variant=False,
+    has_out_variant=True,
     op_overload=tp.ops.tp.convolution.default,
 )
 
