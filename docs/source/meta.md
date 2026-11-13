@@ -50,7 +50,13 @@ products (`matmul` and friends, `dot`/`mv`/`inner`/`ger`,
 `rot90`, `cartesian_prod`, `kron`, `one_hot`, `trace`,
 `upsample_bilinear2d`, `pixel_shuffle`), the activations and normalization
 layers (`softmax`, `layer_norm`, `group_norm`, `batch_norm`, `rms_norm`), the
-norm and distance family (`dist`, `renorm`) all run on meta tensors.
+norm and distance family (`dist`, `renorm`), and the losses (`nll_loss`,
+`cross_entropy`, `mse_loss`, Huber, soft-margin, hinge-embedding,
+margin-ranking, cosine-embedding and the multi-class/multi-label margin
+losses) all run on meta tensors. The margin losses still enforce their target
+layout (a 1-D index vector for the multi-class form, a rank-2 label table for
+the multi-label one); only the per-entry index range is a value check that
+cannot run.
 
 The random fills (`uniform_`, `normal_`, `cauchy_`, `exponential_`,
 `geometric_`, `log_normal_`, `bernoulli_` and the `random_` family) accept a
