@@ -247,6 +247,18 @@ Tensor& hypot_inplace_kernel(Tensor& self, const Tensor& other) {
     return self;
 }
 
+Tensor& xlogy_inplace_kernel(Tensor& self, const Tensor& other) {
+    NoGradGuard __tp_nograd;
+    self.copy_(self.xlogy(other));
+    return self;
+}
+
+Tensor& xlog1py_inplace_kernel(Tensor& self, const Tensor& other) {
+    NoGradGuard __tp_nograd;
+    self.copy_(self.xlog1py(other));
+    return self;
+}
+
 Tensor& index_reduce_inplace_kernel(Tensor& self, int64_t dim, const Tensor& index, const Tensor& source, const std::string& reduce, bool include_self) {
     NoGradGuard __tp_nograd;
     self.copy_(self.index_reduce(dim, index, source, reduce, include_self));
@@ -581,6 +593,9 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, InplaceCompletionKernels) {
     m.impl("pow_.Tensor", pow_tensor_inplace_kernel);
     m.impl("float_power_.Scalar", float_power_scalar_inplace_kernel);
     m.impl("float_power_.Tensor", float_power_tensor_inplace_kernel);
+    m.impl("xlogy_", xlogy_inplace_kernel);
+    m.impl("xlogy_.Tensor", xlogy_inplace_kernel);
+    m.impl("xlog1py_", xlog1py_inplace_kernel);
 }
 
 } // namespace cuda
