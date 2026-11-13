@@ -56,10 +56,12 @@ indexing (`gather`, `scatter`, `index_select`,
 `take`, `searchsorted`, `bucketize`, `masked_fill`, `masked_scatter`,
 `_index_put_impl_`), shape builders (`tril`/`triu`, `diag_embed`/`diagflat`,
 `rot90`, `cartesian_prod`, `kron`, `one_hot`, `trace`, `block_diag`,
-`broadcast_tensors`,
-`upsample_bilinear2d`, `pixel_shuffle`/`pixel_unshuffle`, `channel_shuffle`,
+`broadcast_tensors`, `pixel_shuffle`/`pixel_unshuffle`, `channel_shuffle`,
 the scatter forms (`select_scatter`/`slice_scatter`/`diagonal_scatter`) and
-`vander`), the activations and normalization
+`vander`), resampling (`upsample_nearest1d/2d/3d`, `upsample_linear1d`,
+`upsample_bilinear2d`, `upsample_bicubic2d`, `upsample_trilinear3d`, the
+nearest-exact variants, the antialiasing pair with their scale-factor forms,
+and the matching backwards), the activations and normalization
 layers (`softmax`, `threshold`, `layer_norm`, `group_norm`, `instance_norm`,
 `batch_norm`, `rms_norm`), the
 norm and distance family (`dist`, `renorm`, `pdist`), and the losses
@@ -67,7 +69,10 @@ norm and distance family (`dist`, `renorm`, `pdist`), and the losses
 binary cross entropy with and without logits, soft-margin,
 multi-label soft-margin, hinge-embedding, margin-ranking, cosine-embedding,
 triplet-margin and the multi-class/multi-label margin
-losses) all run on meta tensors. The plain loss names average to a scalar at
+losses) all run on meta tensors. The resampling entries police the geometry
+they are handed: a recorded sweep that would reach outside the gradient or
+the answer it names, and recorded lists shorter than the spatial rank they
+describe, are refused as errors instead of left undefined. The plain loss names average to a scalar at
 the double type when their leading operand has one, single precision
 otherwise. The margin losses still enforce their target
 layout (a 1-D index vector for the multi-class form, a rank-2 label table for
