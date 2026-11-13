@@ -40,15 +40,19 @@ Coverage is broad but not total. Arithmetic and comparisons (including
 `isclose`), the pointwise unary family (functional and in-place, including the
 modulo, division and two-operand transcendental pairs plus the
 `isnan`/`isinf`/`signbit`/`isreal` predicates), reductions (`sum`, `mean`,
-`prod`, `amax`/`amin`, `argmax`/`argmin`, `logsumexp`,
+`prod`, `amax`/`amin`, `argmax`/`argmin`, `logsumexp`, `nansum`/`nanmean`, `logcumsumexp`,
 `all`/`any`, `mode`/`kthvalue`, `median`/`nanmedian`, `cummax`/`cummin`), matrix
 products (`matmul` and friends, `dot`/`mv`/`inner`/`ger`, `cross`,
 `baddbmm`/`addbmm`, `conv1d`/`conv2d`/`conv3d`/`conv_transpose2d`), views
 (`reshape`, `transpose`, `slice`, `squeeze`, `unsqueeze`, `chunk`, `unbind`,
-`split_with_sizes`, `cat`, `diff`), indexing (`gather`, `scatter`, `index_select`,
+`split_with_sizes`, `cat`, `diff`), the complex views (`real`, `imag`, `conj`,
+`adjoint`, `view_as_real`, `view_as_complex` — the last two re-stride the
+source's storage, so writes through the view and the source stay in sync),
+indexing (`gather`, `scatter`, `index_select`,
 `take`, `searchsorted`, `bucketize`, `masked_fill`, `masked_scatter`,
 `_index_put_impl_`), shape builders (`tril`/`triu`, `diag_embed`/`diagflat`,
-`rot90`, `cartesian_prod`, `kron`, `one_hot`, `trace`,
+`rot90`, `cartesian_prod`, `kron`, `one_hot`, `trace`, `block_diag`,
+`broadcast_tensors`,
 `upsample_bilinear2d`, `pixel_shuffle`), the activations and normalization
 layers (`softmax`, `threshold`, `layer_norm`, `group_norm`, `instance_norm`,
 `batch_norm`, `rms_norm`), the
@@ -70,6 +74,25 @@ including the integer `info`, pivot and rank planes and the dtype changes
 enforced as on a materialized tensor: square and matrix requirements, the
 floating-point dtype gate, and the `driver`/`mode` names. Composed helpers
 (`matrix_power`, `matrix_rank`, `cond`, `norm`, `polar`) build on those.
+
+The complex factories answer their broadcast geometry and promote to the
+matching complex type: `complex` pairs a real and an imaginary plane, `polar`
+combines magnitudes and angles; both require floating inputs of one dtype on
+one device. The non-constant padding family (`reflection_pad1d/2d/3d/nd`,
+`replication_pad1d/2d/3d/nd`, `circular_pad_nd` and their `_backward` forms)
+adds the pad amounts to the padded dimensions and enforces the same
+constraints as a materialized backend: even-length pad lists, pad amounts
+that fit the dimensionality, mode-specific bounds (a reflection may not reach
+past one traversal of the dimension, a circular wrap may not go around more
+than once), and the floating dtype gate — the forward accepts a few narrow
+integers, the backward is float-only.
+
+The assorted entries behave as their shapes dictate: `native_alpha_dropout`
+samples its keep mask in single precision and rescales at the promoted type,
+`histc` answers the bin count (when the range endpoints coincide the span is
+normally derived from the stored extrema, which a metadata-only device cannot
+read, so that validation is left to a materializing backend), and `frexp`
+returns the mantissa in the input dtype beside a 32-bit exponent plane.
 
 The random fills (`uniform_`, `normal_`, `cauchy_`, `exponential_`,
 `geometric_`, `log_normal_`, `bernoulli_` and the `random_` family) accept a
