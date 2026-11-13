@@ -37,14 +37,20 @@ print(x.sum(dim=0).shape)     # (4,)
 ```
 
 Coverage is broad but not total. Arithmetic and comparisons, the pointwise unary
-family (functional and in-place), reductions (`sum`, `mean`, `prod`, `amax`/`amin`,
-`argmax`/`argmin`, `logsumexp`, `all`/`any`, `mode`/`kthvalue`), matrix products and
-`conv2d`, views (`reshape`, `transpose`, `slice`, `squeeze`, `unsqueeze`, `chunk`,
-`cat`), indexing (`gather`, `scatter`, `index_select`, `take`, `searchsorted`,
-`bucketize`, `masked_fill`, `_index_put_impl_`), shape builders (`tril`/`triu`,
-`diag_embed`/`diagflat`, `rot90`, `cartesian_prod`), the activations and
-normalization layers (`softmax`, `layer_norm`, `group_norm`, `batch_norm`) all run
-on meta tensors.
+family (functional and in-place, including the modulo, division and two-operand
+transcendental pairs plus the `isnan`/`isinf`/`signbit`/`isreal` predicates),
+reductions (`sum`, `mean`, `prod`, `amax`/`amin`, `argmax`/`argmin`, `logsumexp`,
+`all`/`any`, `mode`/`kthvalue`, `median`/`nanmedian`, `cummax`/`cummin`), matrix
+products (`matmul` and friends, `dot`/`mv`/`inner`/`ger`,
+`baddbmm`/`addbmm`, `conv1d`/`conv2d`/`conv3d`/`conv_transpose2d`), views
+(`reshape`, `transpose`, `slice`, `squeeze`, `unsqueeze`, `chunk`, `unbind`,
+`split_with_sizes`, `cat`), indexing (`gather`, `scatter`, `index_select`,
+`take`, `searchsorted`, `bucketize`, `masked_fill`, `masked_scatter`,
+`_index_put_impl_`), shape builders (`tril`/`triu`, `diag_embed`/`diagflat`,
+`rot90`, `cartesian_prod`, `kron`, `one_hot`, `trace`,
+`upsample_bilinear2d`, `pixel_shuffle`), the activations and normalization
+layers (`softmax`, `layer_norm`, `group_norm`, `batch_norm`, `rms_norm`), the
+norm and distance family (`dist`, `renorm`) all run on meta tensors.
 
 What remains missing is genuinely value-dependent — `nonzero`, `masked_select`,
 `unique`, `bincount`, `count_nonzero`, `item` — and raises the same
