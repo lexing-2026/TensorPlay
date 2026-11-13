@@ -207,13 +207,13 @@ Tensor atanh_kernel_cuda(const Tensor& self) {
     if (isComplexType(self.dtype())) return complex_math_kernel_cuda(self, CxAtanh{});
     return unary_float_op_kernel_v2(self, AtanhFunctor());
 }
-Tensor ceil_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, CeilFunctor()); }
+Tensor ceil_kernel_cuda(const Tensor& self) { return unary_op_kernel_v2(self, CeilFunctor()); }
 Tensor cosh_kernel_cuda(const Tensor& self) {
     if (isComplexType(self.dtype())) return complex_math_kernel_cuda(self, CxCosh{});
     return unary_float_op_kernel_v2(self, CoshFunctor());
 }
-Tensor floor_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, FloorFunctor()); }
-Tensor round_kernel_cuda(const Tensor& self) { return unary_float_op_kernel_v2(self, RoundFunctor()); }
+Tensor floor_kernel_cuda(const Tensor& self) { return unary_op_kernel_v2(self, FloorFunctor()); }
+Tensor round_kernel_cuda(const Tensor& self) { return unary_op_kernel_v2(self, RoundFunctor()); }
 Tensor sinh_kernel_cuda(const Tensor& self) {
     if (isComplexType(self.dtype())) return complex_math_kernel_cuda(self, CxSinh{});
     return unary_float_op_kernel_v2(self, SinhFunctor());
@@ -272,10 +272,10 @@ TP_FLOAT_UNARY_OUT(asin, AsinFunctor)
 TP_FLOAT_UNARY_OUT(asinh, AsinhFunctor)
 TP_FLOAT_UNARY_OUT(atan, AtanFunctor)
 TP_FLOAT_UNARY_OUT(atanh, AtanhFunctor)
-TP_FLOAT_UNARY_OUT(ceil, CeilFunctor)
+TP_KEEP_UNARY_OUT(ceil, CeilFunctor)
 TP_FLOAT_UNARY_OUT(cosh, CoshFunctor)
-TP_FLOAT_UNARY_OUT(floor, FloorFunctor)
-TP_FLOAT_UNARY_OUT(round, RoundFunctor)
+TP_KEEP_UNARY_OUT(floor, FloorFunctor)
+TP_KEEP_UNARY_OUT(round, RoundFunctor)
 TP_FLOAT_UNARY_OUT(sinh, SinhFunctor)
 TP_FLOAT_UNARY_OUT(tan, TanFunctor)
 TP_FLOAT_UNARY_OUT(exp, ExpFunctor)
