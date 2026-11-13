@@ -63,7 +63,9 @@ the scatter forms (`select_scatter`/`slice_scatter`/`diagonal_scatter`) and
 nearest-exact variants, the antialiasing pair with their scale-factor forms,
 and the matching backwards), the activations and normalization
 layers (`softmax`, `threshold`, `layer_norm`, `group_norm`, `instance_norm`,
-`batch_norm`, `rms_norm`), the
+`batch_norm`, `rms_norm`) together with the activation
+backwards (`gelu_backward`, `silu_backward`, `tanh_backward`, `glu_backward`,
+the shrink pair, `rrelu_with_noise_backward` and the rest of the family), the
 norm and distance family (`dist`, `renorm`, `pdist`), and the losses
 (`nll_loss`, `cross_entropy`, `mse_loss`, L1, KL, Poisson NLL, Huber,
 binary cross entropy with and without logits, soft-margin,
@@ -72,7 +74,13 @@ triplet-margin and the multi-class/multi-label margin
 losses) all run on meta tensors. The resampling entries police the geometry
 they are handed: a recorded sweep that would reach outside the gradient or
 the answer it names, and recorded lists shorter than the spatial rank they
-describe, are refused as errors instead of left undefined. The plain loss names average to a scalar at
+describe, are refused as errors instead of left undefined. The activation
+backwards police the saved plane their sweep reads: a plane of a different
+width than the gradient, or one smaller than the gradient's element count,
+is refused as an error, and `log_sigmoid_backward` sweeps in floating widths
+only. Concatenation keeps a zero-valued plane's geometry: its length along
+the joined dimension counts, and only size-[0] 1-d inputs are exempt from
+the wrap and shape checks. The plain loss names average to a scalar at
 the double type when their leading operand has one, single precision
 otherwise. The margin losses still enforce their target
 layout (a 1-D index vector for the multi-class form, a rank-2 label table for
