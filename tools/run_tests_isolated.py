@@ -134,6 +134,10 @@ def verdict(result):
         return "ok"
     if result["code"] == -1:
         return "timeout"
+    # The test runner's "nothing was collected" exit status: no cases ran, so
+    # the file has no result to report rather than a broken one.
+    if result["code"] == 5:
+        return "empty"
     counts = result["counts"]
     if counts is None:
         return "error"
@@ -223,11 +227,13 @@ def main(argv=None):
     for result in results:
         for key, value in (result["counts"] or {}).items():
             totals[key] += value
-    bad = [r for r in results if verdict(r) != "ok"]
+    bad = [r for r in results if verdict(r) not in ("ok", "empty")]
+    empty = [r for r in results if verdict(r) == "empty"]
     print()
     print(f"{len(results)} files in {elapsed / 60:.1f} min: "
           f"{totals['passed']} passed, {totals['failed']} failed, "
-          f"{totals['errored']} errored, {totals['skipped']} skipped")
+          f"{totals['errored']} errored, {totals['skipped']} skipped, "
+          f"{len(empty)} collected nothing")
     if bad:
         print(f"{len(bad)} file(s) did not pass:")
         for result in sorted(bad, key=lambda r: r["file"]):
