@@ -97,6 +97,32 @@ compiles therefore share one Ninja pool sized from physical memory
 (`TP_MACA_MB_PER_JOB`, default 6000); override the pool directly with
 `TP_MACA_JOBS=<n>`.
 
+## Publishing a wheel
+
+There is no CI lane: the MACA SDK is not publicly downloadable and the
+acceptance run needs a real card, so a MetaX wheel is built by hand on a
+C500 and attached to a GitHub pre-release.  Reuse the build tree from the
+sections above so the wheel does not recompile the device image:
+
+```bash
+export MACA_PATH=/opt/maca PATH=/opt/maca/mxgpu_llvm/bin:$PATH
+export TENSORPLAY_BUILD_VERSION=1.3.0a0+maca330
+export SKBUILD_BUILD_DIR=build-metax
+export SKBUILD_CMAKE_DEFINE="USE_CUDA=OFF;USE_METAX=ON;USE_MPI=OFF"
+python -m build --wheel --no-isolation --outdir dist
+```
+
+The `+maca330` local label keeps the wheel off the `cuXXX` and `rocmXXX`
+indexes; `tools/generate_tensorplay_version.py` only knows the CUDA, ROCm
+and CPU variants, so the label is passed in whole.  Upload with
+`gh release upload <tag> dist/*.whl`; the release notes must state the
+MACA SDK version and that the SDK is a runtime requirement, not a bundled
+one.
+
+Verify the artifact before uploading: install it into a throwaway target
+directory and run `benchmark/validate_metax_backend.py --device cuda`,
+which reports a verdict per case and exits non-zero on any failure.
+
 ## Compiling one translation unit
 
 The flags below are what `cmake/LoadMACA.cmake` produces; they are also the
