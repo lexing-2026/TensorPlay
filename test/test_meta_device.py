@@ -1252,6 +1252,88 @@ def test_angle_arange_start_and_private_aminmax():
 
 
 # ---------------------------------------------------------------------------
+# Random fills and module construction
+# ---------------------------------------------------------------------------
+
+
+def test_random_fills_keep_metadata():
+    t = _meta(4, 5)
+    assert t.uniform_(0.0, 1.0) is t
+    assert t.normal_(0.0, 1.0) is t
+    assert t.normal_() is t
+    assert t.exponential_(1.5) is t
+    assert t.log_normal_(0.0, 0.5) is t
+    assert t.cauchy_(0.0, 1.0) is t
+    assert t.bernoulli_(0.5) is t
+    assert t.bernoulli_(_meta(4, 5)) is t
+    assert tuple(t.shape) == (4, 5)
+    assert t.dtype == tp.float32
+    assert t.is_meta
+
+    whole = _meta(3, 4, dtype=tp.int32)
+    assert whole.random_() is whole
+    assert whole.random_(10) is whole
+    assert whole.random_(1, 10) is whole
+    assert tuple(whole.shape) == (3, 4)
+    assert whole.dtype == tp.int32
+    assert tuple(_meta(3, dtype=tp.int64).geometric_(0.5).shape) == (3,)
+    assert tuple(_meta(2, 2, dtype=tp.float64).uniform_(1.0, 2.0).shape) == (2, 2)
+
+
+def test_random_fill_checks():
+    t = _meta(2, 3)
+    with pytest.raises(Exception):
+        _meta(2, 3, dtype=tp.int32).uniform_(0.0, 1.0)
+    with pytest.raises(Exception):
+        t.uniform_(1.0, 0.0)
+    with pytest.raises(Exception):
+        t.uniform_(0.0, 1e300)
+    with pytest.raises(Exception):
+        t.normal_(0.0, -1.0)
+    with pytest.raises(Exception):
+        t.exponential_(0.0)
+    with pytest.raises(Exception):
+        t.log_normal_(0.0, 0.0)
+    with pytest.raises(Exception):
+        t.cauchy_(0.0, 0.0)
+    with pytest.raises(Exception):
+        t.geometric_(1.0)
+    with pytest.raises(Exception):
+        t.bernoulli_(1.5)
+    with pytest.raises(Exception):
+        t.bernoulli_(_meta(2, 3, dtype=tp.bool))
+    with pytest.raises(Exception):
+        _meta(2, 3, dtype=tp.int32).normal_(0.0, 1.0)
+    with pytest.raises(Exception):
+        _meta(2, 3, dtype=tp.int32).random_(10, 10)
+    with pytest.raises(Exception):
+        _meta(2, 3, dtype=tp.int8).random_(0, 1000)
+    expanded = _meta(1, 3).expand(2, 3)
+    with pytest.raises(Exception):
+        expanded.normal_()
+
+
+def test_module_construction_on_meta():
+    with tp.device("meta"):
+        linear = tp.nn.Linear(4, 3)
+        conv = tp.nn.Conv2d(3, 8, 3, padding=1)
+        embedding = tp.nn.Embedding(10, 5)
+        norm = tp.nn.LayerNorm(6)
+        batchnorm = tp.nn.BatchNorm1d(6)
+    assert linear.weight.is_meta
+    assert tuple(linear.weight.shape) == (3, 4)
+    assert tuple(linear.bias.shape) == (3,)
+    assert tuple(conv.weight.shape) == (8, 3, 3, 3)
+    assert tuple(embedding.weight.shape) == (10, 5)
+    assert tuple(norm.weight.shape) == (6,)
+    assert tuple(batchnorm.running_mean.shape) == (6,)
+    with tp.device("meta"):
+        y = linear(tp.randn(2, 4))
+    assert y.is_meta
+    assert tuple(y.shape) == (2, 3)
+
+
+# ---------------------------------------------------------------------------
 # Convolutions, resampling and renormalization
 # ---------------------------------------------------------------------------
 

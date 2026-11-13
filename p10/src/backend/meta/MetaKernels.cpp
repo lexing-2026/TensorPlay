@@ -21,6 +21,7 @@
 #include "Scalar.h"
 #include "DType.h"
 #include "DTypeNames.h"
+#include "DistributionDispatch.h"
 #include "TypePromotion.h"
 #include "TypeProperties.h"
 #include "../BlasComposite.h"
@@ -368,6 +369,199 @@ Tensor& fill_kernel(Tensor& self, const Scalar& /*value*/) {
 
 Tensor& zero_kernel(Tensor& self) {
     return self;
+}
+
+// ---------------------------------------------------------------------------
+// Random fills.
+//
+// A fill writes values the meta device does not hold, so the tensor itself is
+// the result, with unchanged metadata.  Arguments whose validity does not
+// depend on stored data are still checked, so a call the computing backends
+// would reject is rejected here too.  Probability and bound tensors carry
+// their data elsewhere and are not read.
+// ---------------------------------------------------------------------------
+
+void check_random_writable(const Tensor& t) {
+    const auto sizes = static_cast<std::vector<int64_t>>(t.shape());
+    const auto strides = t.strides();
+    for (size_t i = 0; i < sizes.size(); ++i) {
+        if (strides[i] == 0 && sizes[i] > 1) {
+            TP_THROW(RuntimeError,
+                     "unsupported operation: more than one element of the "
+                     "written-to tensor refers to a single memory location. "
+                     "Please clone() the tensor before performing the "
+                     "operation.");
+        }
+    }
+}
+
+void check_floating_fill_dtype(const Tensor& self) {
+    if (!isFloatingType(self.dtype())) {
+        TP_THROW(NotImplementedError,
+                 "distribution only supports floating dtypes");
+    }
+}
+
+Tensor& uniform_inplace_kernel(Tensor& self, double from, double to,
+                               std::optional<Generator> /*generator*/) {
+    const DType value_dtype = isComplexType(self.dtype())
+                                  ? toRealValueType(self.dtype())
+                                  : self.dtype();
+    if (!isFloatingType(value_dtype)) {
+        TP_THROW(NotImplementedError,
+                 "\"check_uniform_bounds\" not implemented for '",
+                 toString(self.dtype()), "'");
+    }
+    const char* dtype_name = distribution::bounds_dtype_name(value_dtype);
+    distribution::dispatch_dtype(value_dtype, [&](auto tag) {
+        using scalar_t = decltype(tag);
+        const double min = distribution::fp_dtype_lowest<scalar_t>();
+        const double max = distribution::fp_dtype_max<scalar_t>();
+        if (!(from >= min && from <= max)) {
+            TP_THROW(RuntimeError, "from is out of bounds for ", dtype_name);
+        }
+        if (!(to >= min && to <= max)) {
+            TP_THROW(RuntimeError, "to is out of bounds for ", dtype_name);
+        }
+        if (from > to) {
+            TP_THROW(RuntimeError,
+                     "uniform_ expects to return a [from, to) range, but "
+                     "found from=", from, " > to=", to);
+        }
+        if ((to - from) > max) {
+            TP_THROW(RuntimeError,
+                     "uniform_ expects to-from <= std::numeric_limits<",
+                     dtype_name, ">::max(), but found to=", to, " and from=",
+                     from, " which result in to-from to exceed the limit");
+        }
+    });
+    if (self.numel() == 0) return self;
+    check_random_writable(self);
+    return self;
+}
+
+Tensor& normal_inplace_kernel(Tensor& self, double /*mean*/, double std,
+                              std::optional<Generator> /*generator*/) {
+    if (!(std >= 0.0)) {
+        TP_THROW(RuntimeError, "normal expects std >= 0.0, but found std ", std);
+    }
+    if (self.numel() == 0) return self;
+    check_random_writable(self);
+    check_floating_fill_dtype(self);
+    return self;
+}
+
+Tensor& cauchy_inplace_kernel(Tensor& self, double /*median*/, double sigma,
+                              std::optional<Generator> /*generator*/) {
+    if (!(sigma > 0.0)) {
+        TP_THROW(RuntimeError,
+                 "cauchy_ expects sigma > 0.0, but found sigma=", sigma);
+    }
+    if (self.numel() == 0) return self;
+    check_random_writable(self);
+    check_floating_fill_dtype(self);
+    return self;
+}
+
+Tensor& exponential_inplace_kernel(Tensor& self, double lambd,
+                                   std::optional<Generator> /*generator*/) {
+    if (!(lambd > 0.0)) {
+        TP_THROW(RuntimeError,
+                 "exponential_ expects lambda > 0.0, but found lambda=", lambd);
+    }
+    if (self.numel() == 0) return self;
+    check_random_writable(self);
+    check_floating_fill_dtype(self);
+    return self;
+}
+
+Tensor& log_normal_inplace_kernel(Tensor& self, double /*mean*/, double std,
+                                  std::optional<Generator> /*generator*/) {
+    if (!(std > 0.0)) {
+        TP_THROW(RuntimeError,
+                 "log_normal_ expects std > 0.0, but found std=", std);
+    }
+    if (self.numel() == 0) return self;
+    check_random_writable(self);
+    check_floating_fill_dtype(self);
+    return self;
+}
+
+Tensor& geometric_inplace_kernel(Tensor& self, double p,
+                                 std::optional<Generator> /*generator*/) {
+    if (!(0.0 < p && p < 1.0)) {
+        TP_THROW(RuntimeError,
+                 "geometric_ expects p to be in (0, 1), but got p=", p);
+    }
+    if (self.numel() == 0) return self;
+    check_random_writable(self);
+    return self;
+}
+
+Tensor& bernoulli_float_inplace_kernel(Tensor& self, double p,
+                                       std::optional<Generator> /*generator*/) {
+    if (!(p >= 0.0 && p <= 1.0)) {
+        TP_THROW(ValueError, "bernoulli_ expects p to be in [0, 1]");
+    }
+    if (self.numel() == 0) return self;
+    check_random_writable(self);
+    return self;
+}
+
+Tensor& bernoulli_tensor_inplace_kernel(
+        Tensor& self, const Tensor& probabilities,
+        std::optional<Generator> /*generator*/) {
+    if (self.device() != probabilities.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "bernoulli_: probability tensor must be on the same device");
+    }
+    if (self.numel() == 0) return self;
+    check_random_writable(self);
+    if (!isFloatingType(probabilities.dtype())) {
+        TP_THROW(TypeError,
+                 "bernoulli_ probability tensor must have a floating dtype");
+    }
+    return self;
+}
+
+Tensor& random_inplace_kernel(Tensor& self,
+                              std::optional<Generator> /*generator*/) {
+    if (self.numel() == 0) return self;
+    check_random_writable(self);
+    return self;
+}
+
+Tensor& random_from_inplace_kernel(Tensor& self, int64_t from,
+                                   std::optional<int64_t> to,
+                                   std::optional<Generator> /*generator*/) {
+    if (to.has_value()) {
+        if (*to <= from) {
+            TP_THROW(RuntimeError,
+                     "random_ expects 'from' to be less than 'to', but got "
+                     "from=", from, " >= to=", *to);
+        }
+        distribution::check_random_from_to_bounds(from, *to, self.dtype());
+        if (self.numel() == 0) return self;
+        check_random_writable(self);
+        return self;
+    }
+    if (self.numel() == 0) return self;
+    check_random_writable(self);
+    distribution::dispatch_dtype(self.dtype(), [&](auto tag) {
+        using scalar_t = decltype(tag);
+        const uint64_t top = distribution::unbounded_top<scalar_t>();
+        if (from >= 0 && static_cast<uint64_t>(from) > top) {
+            TP_THROW(RuntimeError,
+                     "random_ expects 'from' to be at most ", top, " for ",
+                     self.dtype(), ", but got from=", from);
+        }
+    });
+    return self;
+}
+
+Tensor& random_to_inplace_kernel(Tensor& self, int64_t to,
+                                 std::optional<Generator> generator) {
+    return random_from_inplace_kernel(self, 0, to, std::move(generator));
 }
 
 // ---------------------------------------------------------------------------
@@ -2224,6 +2418,17 @@ TENSORPLAY_LIBRARY_IMPL(Meta, MetaKernels) {
     m.impl("to.dtype_layout", to_dtype_layout_kernel);
     m.impl("fill_.Scalar", fill_kernel);
     m.impl("zero_", zero_kernel);
+    m.impl("uniform_", uniform_inplace_kernel);
+    m.impl("normal_", normal_inplace_kernel);
+    m.impl("cauchy_", cauchy_inplace_kernel);
+    m.impl("exponential_", exponential_inplace_kernel);
+    m.impl("geometric_", geometric_inplace_kernel);
+    m.impl("log_normal_", log_normal_inplace_kernel);
+    m.impl("bernoulli_.float", bernoulli_float_inplace_kernel);
+    m.impl("bernoulli_.Tensor", bernoulli_tensor_inplace_kernel);
+    m.impl("random_", random_inplace_kernel);
+    m.impl("random_.from", random_from_inplace_kernel);
+    m.impl("random_.to", random_to_inplace_kernel);
 
     // Pointwise arithmetic.
     m.impl("add.Tensor", add_kernel);
