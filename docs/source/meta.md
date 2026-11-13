@@ -117,6 +117,28 @@ normally derived from the stored extrema, which a metadata-only device cannot
 read, so that validation is left to a materializing backend), and `frexp`
 returns the mantissa in the input dtype beside a 32-bit exponent plane.
 
+The special-function families answer their shape arithmetic directly: the
+Bessel and Airy tables (`bessel_j0`/`j1`, `bessel_y0`/`y1`, `airy_ai`,
+`spherical_bessel_j0`, the `modified_bessel_i/k` pair and the scaled K pair),
+the error-function tail and normal-distribution maps (`erfcx`, `ndtr`,
+`ndtri`, `log_ndtr`), the Bessel error companions (`i0e`, `i1`, `i1e`), the
+orthogonal polynomials (the four Chebyshev degrees, their shifted variants,
+Hermite, Laguerre and Legendre), the zeta and incomplete-gamma pairs (`zeta`,
+`igamma`, `igammac`, `gammainc`, `gammaincc`) and the `xlog1py` product form,
+together with the `special_` spellings of every one of these names. Every
+sweep in these families computes at floating precision and reads no values, so
+a floating operand keeps its width and every other operand — integers,
+booleans, complex planes — is answered in single precision. The members with
+no floating-width pass over those planes (`erf`, `erfc`, `lgamma`, the
+rounding family, the softmax pair) refuse them outright, and `polygamma`
+refuses orders the recurrence cannot be run for before any geometry is
+answered. The `out=` forms of `digamma`, `i0`, `polygamma`, `igamma` and
+`igammac` write through the same rules: a destination naming another geometry
+is resized by the write, and an integral destination that cannot be cast to
+safely is refused. `resize_` itself rewrites the sizes and grows the recorded
+storage length in place — a call that keeps the current sizes is a no-op for
+the strides, and negative or overflowing sizes are refused.
+
 The random fills (`uniform_`, `normal_`, `cauchy_`, `exponential_`,
 `geometric_`, `log_normal_`, `bernoulli_` and the `random_` family) accept a
 meta tensor and leave its metadata unchanged — there is no data to sample into,
