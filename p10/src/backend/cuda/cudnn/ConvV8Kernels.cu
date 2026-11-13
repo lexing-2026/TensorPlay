@@ -722,11 +722,24 @@ static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const 
         if (!added) {
             auto bias_desc = get_cached_tensor_desc(bias_4d);
             auto out_desc = get_cached_tensor_desc(out);
-            float alpha = 1.0f;
-            float beta = 1.0f;
-            CUDNN_CHECK(cudnnAddTensor(
-                handle, &alpha, *bias_desc, bias_4d.data_ptr(), &beta,
-                *out_desc, out.data_ptr()));
+            // The scaling factors a cuDNN call reads must be of the operand's
+            // own type (a half operand is the one exception, which the faster
+            // path above already covers).  A double operand read through a
+            // float factor makes the add read past the factor and scale the
+            // result by whatever bytes follow it.
+            if (out.dtype() == DType::Float64) {
+                double alpha = 1.0;
+                double beta = 1.0;
+                CUDNN_CHECK(cudnnAddTensor(
+                    handle, &alpha, *bias_desc, bias_4d.data_ptr(), &beta,
+                    *out_desc, out.data_ptr()));
+            } else {
+                float alpha = 1.0f;
+                float beta = 1.0f;
+                CUDNN_CHECK(cudnnAddTensor(
+                    handle, &alpha, *bias_desc, bias_4d.data_ptr(), &beta,
+                    *out_desc, out.data_ptr()));
+            }
         }
     }
 
@@ -978,9 +991,17 @@ Tensor conv_transpose2d_cudnn_v8(const Tensor& input, const Tensor& weight,
     if (bias_c.defined() && !add_channel_broadcast_inplace_cuda(out, bias_c)) {
         auto bias_desc = get_cached_tensor_desc(bias_c);
         auto out_desc = get_cached_tensor_desc(out);
-        float one = 1.0f;
-        CUDNN_CHECK(cudnnAddTensor(handle, &one, *bias_desc, bias_c.data_ptr(),
-                                   &one, *out_desc, out.data_ptr()));
+        // The factor's type must match the operand's; see the note above the
+        // plain conv2d bias add.
+        if (out.dtype() == DType::Float64) {
+            double one = 1.0;
+            CUDNN_CHECK(cudnnAddTensor(handle, &one, *bias_desc, bias_c.data_ptr(),
+                                       &one, *out_desc, out.data_ptr()));
+        } else {
+            float one = 1.0f;
+            CUDNN_CHECK(cudnnAddTensor(handle, &one, *bias_desc, bias_c.data_ptr(),
+                                       &one, *out_desc, out.data_ptr()));
+        }
     }
     return out;
 #else
