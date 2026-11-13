@@ -47,25 +47,28 @@ def discover(paths):
 
 
 def parse_junit(path):
-    """Return (passed, failed, skipped, errored) from a junit report."""
+    """Return (counts, failing test names) from a junit report."""
     try:
         root = ET.parse(path).getroot()
     except (OSError, ET.ParseError):
-        return None
+        return None, []
     suites = [root] if root.tag == "testsuite" else root.findall("testsuite")
     counts = {"passed": 0, "failed": 0, "skipped": 0, "errored": 0}
+    failing = []
     for suite in suites:
         for case in suite.findall("testcase"):
             outcomes = [child.tag for child in case]
             if "failure" in outcomes:
                 counts["failed"] += 1
+                failing.append(case.get("name", "?"))
             elif "error" in outcomes:
                 counts["errored"] += 1
+                failing.append(case.get("name", "?"))
             elif "skipped" in outcomes:
                 counts["skipped"] += 1
             else:
                 counts["passed"] += 1
-    return counts
+    return counts, failing
 
 
 def run_file(path, extra, timeout):
@@ -85,12 +88,13 @@ def run_file(path, extra, timeout):
             output = output.decode("utf-8", "replace")
         code = -1
         output += f"\n[runner] timed out after {timeout}s\n"
-    counts = parse_junit(report)
+    counts, failing = parse_junit(report)
     shutil.rmtree(tmpdir, ignore_errors=True)
     return {
         "file": path,
         "code": code,
         "counts": counts,
+        "failing": failing,
         "seconds": round(time.monotonic() - started, 1),
         "tail": output.strip().splitlines()[-1] if output.strip() else "",
     }
@@ -176,6 +180,10 @@ def main(argv=None):
         print(f"{len(bad)} file(s) did not pass:")
         for result in sorted(bad, key=lambda r: r["file"]):
             print(f"  {verdict(result):<8} {result['file']}  {result['tail']}")
+            for name in result["failing"][:5]:
+                print(f"      {name}")
+            if len(result["failing"]) > 5:
+                print(f"      ... {len(result['failing']) - 5} more")
 
     if args.json:
         import json
