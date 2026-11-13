@@ -524,8 +524,21 @@ Tensor silu_and_mul_cuda(const Tensor& input) {
 
 
 
+// The shrink maps are defined on the half, bfloat16, float and double
+// elements.  A reduced-precision float has no band to compare against, and an
+// integral, boolean or complex element has none either, so every other element
+// is refused rather than answered in kind.
+inline void check_shrink_dtype(const Tensor& self, const char* name) {
+    const DType dtype = self.dtype();
+    if (!isFloatingType(dtype) || isFloat8Type(dtype)) {
+        TP_THROW(NotImplementedError, name, " not implemented for '",
+                 toString(dtype), "'");
+    }
+}
+
 // Activation operators carried over from the pointwise families:
 Tensor hardshrink_cuda(const Tensor& self, const Scalar& lambd) {
+    check_shrink_dtype(self, "hardshrink");
     double l = lambd.toDouble();
     // lambd.to<scalar_t>(), so float32 boundary values compare exactly.
     return dtype_unary_cuda(self,
@@ -533,6 +546,7 @@ Tensor hardshrink_cuda(const Tensor& self, const Scalar& lambd) {
                             "hardshrink");
 }
 Tensor softshrink_cuda(const Tensor& self, const Scalar& lambd) {
+    check_shrink_dtype(self, "softshrink");
     double l = lambd.toDouble();
     // (a < -l ? a+l : 0)); the v*0 middle branch keeps NaN propagating.
     return dtype_unary_cuda(self,
@@ -542,12 +556,14 @@ Tensor softshrink_cuda(const Tensor& self, const Scalar& lambd) {
 // hard/soft): grad passes through where self is outside the inclusive
 // [-lambd, lambd] band.
 Tensor hardshrink_backward_cuda(const Tensor& grad_out, const Tensor& self, const Scalar& lambd) {
+    check_shrink_dtype(self, "hardshrink_backward");
     double l = lambd.toDouble();
     return binary_same_cuda(grad_out, self,
                             HFn56{l},
                             "hardshrink_backward");
 }
 Tensor softshrink_backward_cuda(const Tensor& grad_output, const Tensor& self, const Scalar& lambd) {
+    check_shrink_dtype(self, "softshrink_backward");
     double l = lambd.toDouble();
     return binary_same_cuda(grad_output, self,
                             HFn57{l},

@@ -1688,30 +1688,48 @@ struct ShrinkBandGrad {
     }
 };
 
+// The shrink maps are defined on the half, bfloat16, float and double
+// elements.  A reduced-precision float has no band to compare against, and an
+// integral, boolean or complex element has none either, so every other element
+// is refused rather than answered in kind.
+inline void check_shrink_dtype(const Tensor& self, const char* name) {
+    const DType dtype = self.dtype();
+    if (!isFloatingType(dtype) || isFloat8Type(dtype)) {
+        TP_THROW(NotImplementedError, name, " not implemented for '",
+                 toString(dtype), "'");
+    }
+}
+
 Tensor hardshrink_cpu(const Tensor& self, const Scalar& lambd) {
+    check_shrink_dtype(self, "hardshrink");
     return dtype_unary_kernel(self, HardshrinkBand{lambd.toDouble()}, "hardshrink");
 }
 Tensor& hardshrink_out_cpu(const Tensor& self, const Scalar& lambd, Tensor& out) {
+    check_shrink_dtype(self, "hardshrink");
     double l = lambd.toDouble();
     return dtype_unary_out_kernel(
         self, out, [l](const Tensor& v) { return hardshrink_cpu(v, Scalar(l)); },
         HardshrinkBand{l}, "hardshrink");
 }
 Tensor softshrink_cpu(const Tensor& self, const Scalar& lambd) {
+    check_shrink_dtype(self, "softshrink");
     return dtype_unary_kernel(self, SoftshrinkBand{lambd.toDouble()}, "softshrink");
 }
 Tensor& softshrink_out_cpu(const Tensor& self, const Scalar& lambd, Tensor& out) {
+    check_shrink_dtype(self, "softshrink");
     double l = lambd.toDouble();
     return dtype_unary_out_kernel(
         self, out, [l](const Tensor& v) { return softshrink_cpu(v, Scalar(l)); },
         SoftshrinkBand{l}, "softshrink");
 }
 Tensor hardshrink_backward_cpu(const Tensor& grad_out, const Tensor& self, const Scalar& lambd) {
+    check_shrink_dtype(self, "hardshrink_backward");
     return binary_same_kernel(grad_out, self,
                               ShrinkBandGrad{lambd.toDouble()}, "hardshrink_backward");
 }
 Tensor& hardshrink_backward_out_cpu(const Tensor& grad_out, const Tensor& self,
                                    const Scalar& lambd, Tensor& grad_input) {
+    check_shrink_dtype(self, "hardshrink_backward");
     double l = lambd.toDouble();
     return binary_same_out_kernel(
         grad_out, self, grad_input,
@@ -1721,11 +1739,13 @@ Tensor& hardshrink_backward_out_cpu(const Tensor& grad_out, const Tensor& self,
         ShrinkBandGrad{l});
 }
 Tensor softshrink_backward_cpu(const Tensor& grad_output, const Tensor& self, const Scalar& lambd) {
+    check_shrink_dtype(self, "softshrink_backward");
     return binary_same_kernel(grad_output, self,
                               ShrinkBandGrad{lambd.toDouble()}, "softshrink_backward");
 }
 Tensor& softshrink_backward_out_cpu(const Tensor& grad_output, const Tensor& self,
                                     const Scalar& lambd, Tensor& grad_input) {
+    check_shrink_dtype(self, "softshrink_backward");
     double l = lambd.toDouble();
     return binary_same_out_kernel(
         grad_output, self, grad_input,

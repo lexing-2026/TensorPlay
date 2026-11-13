@@ -39,6 +39,19 @@ Tensor float_unary_meta(const Tensor& self) {
     return empty_meta(shape_of(self), dtype, self.device());
 }
 
+// The shrink maps are defined on the half, bfloat16, float and double
+// elements.  A reduced-precision float has no band to compare against, and an
+// integral, boolean or complex element has none either, so every other element
+// is refused.  The check lives here as well as in the running kernels so a
+// traced graph is refused where its eager form would be.
+void check_shrink_dtype(const Tensor& self, const char* name) {
+    const DType dtype = self.dtype();
+    if (!isFloatingType(dtype) || isFloat8Type(dtype)) {
+        TP_THROW(NotImplementedError, name, " not implemented for '",
+                 toString(dtype), "'");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Activations.
 // ---------------------------------------------------------------------------
@@ -167,10 +180,12 @@ Tensor tanhshrink_kernel(const Tensor& self) {
 }
 
 Tensor softshrink_kernel(const Tensor& self, const Scalar& /*lambd*/) {
+    check_shrink_dtype(self, "softshrink");
     return unary_meta(self);
 }
 
 Tensor hardshrink_kernel(const Tensor& self, const Scalar& /*lambd*/) {
+    check_shrink_dtype(self, "hardshrink");
     return unary_meta(self);
 }
 
