@@ -759,6 +759,78 @@ def test_norm_and_normalize():
     assert z.norm().dtype == tp.float32
 
 
+def test_threshold_and_isclose():
+    t = _meta(2, 3)
+    assert tuple(tp.threshold(t, 0.0, 1.0).shape) == (2, 3)
+    assert tp.threshold(t, 0.0, 1.0).dtype == tp.float32
+    assert tp.threshold(_meta(3, dtype=tp.float16), 0.0, 1.0).dtype == tp.float16
+    assert tp.threshold(_meta(3, dtype=tp.bool), 0.0, 1.0).dtype == tp.bool
+    with pytest.raises(TypeError):
+        tp.threshold(_meta(3, dtype=tp.complex64), 0.0, 1.0)
+
+    assert tp.isclose(t, t).dtype == tp.bool
+    assert tuple(tp.isclose(_meta(2, 1), _meta(2, 4)).shape) == (2, 4)
+    with pytest.raises(RuntimeError):
+        tp.isclose(t, _meta(2, 3, dtype=tp.float16))
+    with pytest.raises(RuntimeError):
+        tp.isclose(t, t, rtol=-1.0)
+    with pytest.raises(RuntimeError):
+        tp.isclose(t, t, atol=-1.0)
+
+
+def test_diff_shapes_and_checks():
+    t = _meta(2, 3)
+    assert tuple(tp.diff(t).shape) == (2, 2)
+    assert tuple(tp.diff(t, 0).shape) == (2, 3)
+    assert tuple(tp.diff(t, 5, 1).shape) == (2, 0)
+    assert tuple(tp.diff(t, -1).shape) == (2, 3)
+    assert tuple(tp.diff(t, 1, 1, prepend=_meta(2, 1)).shape) == (2, 3)
+    assert tuple(tp.diff(t, -1, 1, prepend=_meta(2, 1)).shape) == (2, 4)
+    assert tp.diff(t, 1, 1, prepend=_meta(2, 1, dtype=tp.float64)).dtype == tp.float64
+    # A zero order answers the operand untouched, so a boundary row of the
+    # wrong shape is never inspected.
+    assert tuple(tp.diff(t, 0, prepend=_meta(3, 3)).shape) == (2, 3)
+    with pytest.raises(IndexError):
+        tp.diff(t, 1, 2)
+    with pytest.raises(RuntimeError):
+        tp.diff(_meta(3, dtype=tp.bool), 1)
+    assert tuple(tp.diff(_meta(3, dtype=tp.bool), -1).shape) == (3,)
+
+
+def test_cross_shapes_and_checks():
+    a = _meta(2, 3)
+    assert tuple(tp.cross(a, a, dim=1).shape) == (2, 3)
+    assert tuple(tp.cross(_meta(2, 1, 3), _meta(2, 4, 3), dim=2).shape) == (2, 4, 3)
+    with pytest.raises(RuntimeError):
+        tp.cross(_meta(4), _meta(4))
+    with pytest.raises(RuntimeError):
+        tp.cross(a, _meta(2, 4), dim=1)
+    with pytest.raises(RuntimeError):
+        tp.cross(_meta(1, 3), _meta(3))
+    with pytest.raises(RuntimeError):
+        tp.cross(a, _meta(2, 3, dtype=tp.float64), dim=1)
+    with pytest.raises(NotImplementedError):
+        tp.cross(_meta(3, dtype=tp.bool), _meta(3, dtype=tp.bool))
+    assert tuple(tp.linalg.cross(a, a).shape) == (2, 3)
+    with pytest.raises(IndexError):
+        tp.linalg.cross(_meta(3), _meta(3), dim=2)
+
+
+def test_instance_norm_shapes_and_checks():
+    x = _meta(2, 3, 4)
+    assert tuple(tp.nn.functional.instance_norm(x).shape) == (2, 3, 4)
+    half = tp.nn.functional.instance_norm(_meta(2, 3, 4, dtype=tp.float16))
+    assert half.dtype == tp.float16
+    assert tuple(tp.nn.functional.instance_norm(
+        x, _meta(3), _meta(3), use_input_stats=False).shape) == (2, 3, 4)
+    with pytest.raises(RuntimeError):
+        tp.nn.functional.instance_norm(_meta(3, 4))
+    with pytest.raises(NotImplementedError):
+        tp.nn.functional.instance_norm(_meta(2, 3, 4, dtype=tp.int64))
+    with pytest.raises(RuntimeError):
+        tp.nn.functional.instance_norm(x, use_input_stats=False)
+
+
 # ---------------------------------------------------------------------------
 # Moments, extrema and ordering
 # ---------------------------------------------------------------------------

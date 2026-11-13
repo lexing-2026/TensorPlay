@@ -868,6 +868,16 @@ Tensor clamp_kernel(const Tensor& self, const std::optional<Scalar>& /*min*/,
     return empty_meta(shape_of(self), self.dtype(), self.device());
 }
 
+Tensor threshold_kernel(const Tensor& self, const Scalar& /*threshold*/,
+                        const Scalar& /*value*/) {
+    // The elementwise scan has no complex form, every other dtype keeps its
+    // own type and geometry.
+    if (isComplexType(self.dtype())) {
+        TP_THROW(TypeError, "threshold: unsupported dtype");
+    }
+    return empty_meta(shape_of(self), self.dtype(), self.device());
+}
+
 // ---------------------------------------------------------------------------
 // Comparisons and selection.
 // ---------------------------------------------------------------------------
@@ -888,6 +898,23 @@ META_COMPARISON_KERNEL(le)
 META_COMPARISON_KERNEL(gt)
 META_COMPARISON_KERNEL(ge)
 #undef META_COMPARISON_KERNEL
+
+Tensor isclose_kernel(const Tensor& self, const Tensor& other, double rtol,
+                      double atol, bool /*equal_nan*/) {
+    if (self.dtype() != other.dtype()) {
+        TP_THROW(RuntimeError, toString(self.dtype()), " did not match ",
+                 toString(other.dtype()));
+    }
+    if (rtol < 0) {
+        TP_THROW(RuntimeError,
+                 "rtol must be greater than or equal to zero, but got ", rtol);
+    }
+    if (atol < 0) {
+        TP_THROW(RuntimeError,
+                 "atol must be greater than or equal to zero, but got ", atol);
+    }
+    return empty_meta(broadcast2(self, other), DType::Bool, self.device());
+}
 
 Tensor where_cpu(const Tensor& condition, const Tensor& self, const Tensor& other) {
     const std::vector<int64_t> out =
@@ -1860,6 +1887,127 @@ Tensor cat_kernel(const std::vector<Tensor>& tensors, int64_t dim) {
 }
 
 // ---------------------------------------------------------------------------
+// Finite differences and the cross product. diff folds the optional boundary
+// rows through the concatenation rules and then peels one slice per order,
+// while cross broadcasts every axis but the length-three one.
+// ---------------------------------------------------------------------------
+
+int64_t wrap_diff_dim(int64_t dim, int64_t ndim) {
+    const int64_t min = -ndim;
+    const int64_t max = ndim - 1;
+    if (dim < min || dim > max) {
+        TP_THROW(IndexError, "Dimension out of range (expected to be in range "
+                             "of [", min, ", ", max, "], but got ", dim, ")");
+    }
+    return dim < 0 ? dim + ndim : dim;
+}
+
+Tensor diff_kernel(const Tensor& self, int64_t n, int64_t dim,
+                   const std::optional<Tensor>& prepend,
+                   const std::optional<Tensor>& append) {
+    const int64_t d = wrap_diff_dim(dim, self.dim());
+    const bool has_prepend = prepend.has_value() && prepend->defined();
+    const bool has_append = append.has_value() && append->defined();
+    Tensor base = self;
+    // A zero order answers the operand untouched, so the boundary rows are
+    // neither joined nor validated.
+    if ((has_prepend || has_append) && n != 0) {
+        std::vector<Tensor> pieces;
+        if (has_prepend) pieces.push_back(*prepend);
+        pieces.push_back(self);
+        if (has_append) pieces.push_back(*append);
+        base = cat_kernel(pieces, d);
+    }
+    int64_t orders = n;
+    if (orders > base.size(d)) orders = base.size(d);
+    if (orders <= 0) {
+        return empty_meta(shape_of(base), base.dtype(), base.device());
+    }
+    if (base.dtype() == DType::Bool) {
+        TP_THROW(RuntimeError,
+                 "Subtraction, the `-` operator, with two bool tensors is not "
+                 "supported. Use the `^` or `logical_xor()` operator instead.");
+    }
+    std::vector<int64_t> out = shape_of(base);
+    out[static_cast<size_t>(d)] -= orders;
+    return empty_meta(out, base.dtype(), base.device());
+}
+
+int64_t wrap_cross_dim(int64_t dim, int64_t ndim) {
+    if (dim < -ndim || dim >= ndim) {
+        TP_THROW(IndexError, "Dimension out of range (expected to be in range "
+                             "of [", -ndim, ", ", ndim - 1, "], but got ", dim,
+                 ")");
+    }
+    return dim < 0 ? dim + ndim : dim;
+}
+
+std::vector<int64_t> cross_output_shape(const Tensor& self,
+                                        const Tensor& other, int64_t& dim) {
+    if (self.dim() != other.dim()) {
+        TP_THROW(RuntimeError,
+                 "linalg.cross: inputs must have the same number of "
+                 "dimensions.");
+    }
+    if (self.dim() == 0) {
+        TP_THROW(IndexError, "Dimension out of range (expected to be in range "
+                             "of [-1, 0], but got -1)");
+    }
+    dim = wrap_cross_dim(dim, self.dim());
+    if (self.size(dim) != 3 || other.size(dim) != 3) {
+        TP_THROW(RuntimeError, "linalg.cross: inputs dimension ", dim,
+                 " must have length 3. Got ", self.size(dim), " and ",
+                 other.size(dim));
+    }
+    if (self.dtype() != other.dtype()) {
+        TP_THROW(RuntimeError, "expected scalar type ", toString(self.dtype()),
+                 " but found ", toString(other.dtype()));
+    }
+    if (self.device() != other.device()) {
+        TP_THROW(DeviceMismatchError,
+                 "Expected all tensors to be on the same device, but got ",
+                 self.device().toString(), " and ",
+                 other.device().toString());
+    }
+    if (self.dtype() == DType::Bool) {
+        TP_THROW(NotImplementedError, "\"cross\" not implemented for 'Bool'");
+    }
+    if (self.dtype() == DType::ComplexHalf ||
+        self.dtype() == DType::BComplex32) {
+        TP_THROW(NotImplementedError,
+                 "\"cross\" not implemented for reduced complex dtype ",
+                 toString(self.dtype()));
+    }
+    return broadcast_shapes(shape_of(self), shape_of(other));
+}
+
+Tensor linalg_cross_kernel(const Tensor& self, const Tensor& other,
+                           int64_t dim) {
+    return empty_meta(cross_output_shape(self, other, dim), self.dtype(),
+                      self.device());
+}
+
+Tensor cross_kernel(const Tensor& self, const Tensor& other,
+                    std::optional<int64_t> dim) {
+    int64_t d = -1;
+    if (dim.has_value()) {
+        d = *dim;
+    } else {
+        for (int64_t axis = 0; axis < self.dim(); ++axis) {
+            if (self.size(axis) == 3) {
+                d = axis;
+                break;
+            }
+        }
+        if (d < 0) {
+            TP_THROW(RuntimeError, "no dimension of size 3 in input");
+        }
+    }
+    return empty_meta(cross_output_shape(self, other, d), self.dtype(),
+                      self.device());
+}
+
+// ---------------------------------------------------------------------------
 // View kernels. These ops are backend-dispatched, so the meta device needs
 // its own registrations; they reuse the storage-sharing as_strided path,
 // which is metadata-only and therefore device-independent.
@@ -2067,6 +2215,34 @@ std::tuple<Tensor, Tensor, Tensor> native_group_norm_kernel(
     return {empty_meta(shape_of(input), input.dtype(), input.device()),
             empty_meta({N, group}, stat, input.device()),
             empty_meta({N, group}, stat, input.device())};
+}
+
+// Instance norm normalizes each (sample, channel) plane, so the result keeps
+// the input geometry. It requires a spatial axis, a floating input and, when
+// the input statistics are not used, both running statistics.
+Tensor instance_norm_kernel(const Tensor& input,
+                            const std::optional<Tensor>& /*weight*/,
+                            const std::optional<Tensor>& /*bias*/,
+                            const std::optional<Tensor>& running_mean,
+                            const std::optional<Tensor>& running_var,
+                            bool use_input_stats, double /*momentum*/,
+                            double /*eps*/) {
+    if (input.dim() < 3) {
+        TP_THROW(RuntimeError,
+                 "instance_norm: input must have at least 3 dimensions");
+    }
+    if (!isFloatingType(input.dtype())) {
+        TP_THROW(NotImplementedError,
+                 "instance_norm: only floating point dtypes are supported "
+                 "(got ", toString(input.dtype()), ")");
+    }
+    if (!use_input_stats &&
+        !(running_mean.has_value() && running_mean->defined() &&
+          running_var.has_value() && running_var->defined())) {
+        TP_THROW(RuntimeError, "instance_norm: running_mean and running_var "
+                               "must be defined when use_input_stats is false");
+    }
+    return empty_meta(shape_of(input), input.dtype(), input.device());
 }
 
 // ---------------------------------------------------------------------------
@@ -2764,6 +2940,7 @@ TENSORPLAY_LIBRARY_IMPL(Meta, MetaKernels) {
     m.impl("floor_", floor_inplace_kernel);
     m.impl("round_", round_inplace_kernel);
     m.impl("clamp", clamp_kernel);
+    m.impl("threshold", threshold_kernel);
 
     // Predicates and the maps that keep the operand's own geometry.
     m.impl("isnan", isnan_kernel);
@@ -2800,6 +2977,7 @@ TENSORPLAY_LIBRARY_IMPL(Meta, MetaKernels) {
     m.impl("gt.Scalar", gt_scalar_kernel);
     m.impl("ge.Tensor", ge_tensor_kernel);
     m.impl("ge.Scalar", ge_scalar_kernel);
+    m.impl("isclose", isclose_kernel);
     m.impl("where.self", where_cpu);
     m.impl("where.ScalarSelf", where_scalar_self_cpu);
     m.impl("where.ScalarOther", where_scalar_other_cpu);
@@ -2856,6 +3034,9 @@ TENSORPLAY_LIBRARY_IMPL(Meta, MetaKernels) {
     m.impl("addcdiv", addcdiv_kernel);
     m.impl("addcdiv_", addcdiv_inplace_kernel);
     m.impl("cat", cat_kernel);
+    m.impl("diff", diff_kernel);
+    m.impl("cross", cross_kernel);
+    m.impl("linalg_cross", linalg_cross_kernel);
 
     // Views.
     m.impl("transpose", transpose_kernel);
@@ -2873,6 +3054,7 @@ TENSORPLAY_LIBRARY_IMPL(Meta, MetaKernels) {
     m.impl("conv_transpose2d", conv_transpose2d_kernel);
     m.impl("group_norm", group_norm_kernel);
     m.impl("native_group_norm", native_group_norm_kernel);
+    m.impl("instance_norm", instance_norm_kernel);
 
     // Pointwise activations and roots.
     m.impl("silu", silu_kernel);
