@@ -1558,6 +1558,56 @@ def test_conv1d_conv3d_conv_transpose2d():
         tp.conv3d(_meta(1, 2, 4, 4), _meta(3, 2, 2, 2, 2))
 
 
+def test_conv_transpose1d_and_3d():
+    # (in - 1) * stride - 2 * padding + dilation * (kernel - 1) + op + 1
+    assert tuple(tp.conv_transpose1d(_meta(2, 3, 8),
+                                     _meta(3, 2, 3)).shape) == (2, 2, 10)
+    assert tuple(tp.conv_transpose1d(_meta(2, 3, 8), _meta(3, 2, 3), _meta(2),
+                                     stride=2, padding=1, dilation=2).shape) == \
+        (2, 2, 17)
+    assert tuple(tp.conv_transpose3d(_meta(1, 2, 4, 4, 4),
+                                     _meta(2, 3, 2, 2, 2),
+                                     stride=2).shape) == (1, 3, 8, 8, 8)
+    assert tuple(tp.conv_transpose3d(_meta(1, 2, 4, 4, 4),
+                                     _meta(2, 3, 3, 3, 3),
+                                     stride=[2, 1, 1], padding=1,
+                                     output_padding=[1, 0, 0]).shape) == \
+        (1, 3, 8, 4, 4)
+    # groups split the weight's trailing channel extent
+    assert tuple(tp.conv_transpose1d(_meta(1, 4, 8), _meta(4, 2, 3),
+                                     groups=2).shape) == (1, 4, 10)
+    # a zero output extent is an empty tensor, a negative one cannot exist
+    assert tuple(tp.conv_transpose1d(_meta(2, 3, 0),
+                                     _meta(3, 2, 1)).shape) == (2, 2, 0)
+    with pytest.raises(Exception):
+        tp.conv_transpose1d(_meta(2, 8), _meta(3, 2, 3))
+    with pytest.raises(Exception):
+        tp.conv_transpose1d(_meta(2, 3, 8), _meta(2, 3, 3))
+    with pytest.raises(Exception):
+        tp.conv_transpose3d(_meta(1, 2, 4, 4), _meta(2, 3, 2, 2, 2))
+    with pytest.raises(Exception):
+        tp.conv_transpose3d(_meta(1, 2, 4, 4, 4), _meta(2, 3, 2, 2, 2),
+                            stride=[1, 2])
+
+
+def test_conv_transpose2d_list_shapes():
+    # the per-side form of a parameter list keeps its axis entries
+    assert tuple(tp.conv_transpose2d(_meta(1, 2, 4, 4), _meta(2, 3, 3, 3),
+                                     stride=[2, 1, 2, 1]).shape) == (1, 3, 9, 6)
+    # no extent is policed beyond the formula: what a materialized backend
+    # computes, meta names
+    assert tuple(tp.conv_transpose2d(_meta(1, 2, 4, 4), _meta(2, 3, 3, 3),
+                                     stride=2, output_padding=3).shape) == \
+        (1, 3, 12, 12)
+    with pytest.raises(RuntimeError):
+        tp.conv_transpose2d(_meta(2, 3, 8, 8), _meta(3, 2, 3, 3), padding=10)
+    with pytest.raises(RuntimeError):
+        tp.conv_transpose2d(_meta(2, 3, 8, 8), _meta(3, 2, 3, 3),
+                            stride=[1, 2, 3])
+    with pytest.raises(RuntimeError):
+        tp.conv_transpose2d(_meta(2, 3, 8, 8), _meta(3, 2, 3, 3), stride=[])
+
+
 def test_upsample_bilinear2d_and_pixel_shuffle():
     assert tuple(tp.upsample_bilinear2d(_meta(2, 3, 4, 5), [8, 10],
                                         align_corners=False).shape) == (2, 3, 8, 10)
