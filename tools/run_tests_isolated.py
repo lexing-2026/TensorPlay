@@ -23,11 +23,13 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import xml.etree.ElementTree as ET
 
@@ -71,6 +73,35 @@ def parse_junit(path):
     return counts, failing
 
 
+def _text(value):
+    """TimeoutExpired hands back bytes even when the run asked for text."""
+    if value is None:
+        return ""
+    return value.decode("utf-8", "replace") if isinstance(value, bytes) else value
+
+
+def load_partial(path):
+    """Read results recorded by an earlier run of this script.
+
+    Each finished file is one JSON object per line; malformed trailing lines
+    (a write interrupted mid-record) are ignored so a partial file never
+    prevents resuming.
+    """
+    results = []
+    if not path or not os.path.exists(path):
+        return results
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                results.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return results
+
+
 def run_file(path, extra, timeout):
     started = time.monotonic()
     tmpdir = tempfile.mkdtemp(prefix="tpi-")
@@ -80,12 +111,10 @@ def run_file(path, extra, timeout):
     try:
         proc = subprocess.run(command, capture_output=True, text=True,
                               timeout=timeout)
-        output = proc.stdout + proc.stderr
+        output = _text(proc.stdout) + _text(proc.stderr)
         code = proc.returncode
     except subprocess.TimeoutExpired as exc:
-        output = (exc.stdout or "") + (exc.stderr or "")
-        if isinstance(output, bytes):
-            output = output.decode("utf-8", "replace")
+        output = _text(exc.stdout) + _text(exc.stderr)
         code = -1
         output += f"\n[runner] timed out after {timeout}s\n"
     counts, failing = parse_junit(report)
@@ -127,6 +156,8 @@ def main(argv=None):
                         help="per-file timeout in seconds (default 3600)")
     parser.add_argument("--json", default=None,
                         help="write the per-file results to this path")
+    parser.add_argument("--resume", action="store_true",
+                        help="skip files already recorded in <json>.partial")
     argv = sys.argv[1:] if argv is None else list(argv)
     if "--" in argv:
         split = argv.index("--")
@@ -134,21 +165,42 @@ def main(argv=None):
     else:
         extra = []
     args = parser.parse_args(argv)
+    if args.resume and not args.json:
+        parser.error("--resume needs --json to know where the partial run lives")
 
     files = discover(args.paths or ["test"])
     if not files:
         print("no test files found", file=sys.stderr)
         return 2
 
-    print(f"{len(files)} files, jobs={args.jobs}, timeout={args.timeout}s")
-    results = []
+    # Each finished file is appended to <json>.partial as it completes, so a
+    # long run that dies (device fault, timeout, Ctrl-C) can pick up where it
+    # stopped instead of repeating hours of work.
+    partial = f"{args.json}.partial" if args.json else None
+    results = load_partial(partial) if args.resume else []
+    finished = {result["file"] for result in results}
+    todo = [path for path in files if path not in finished]
+    if results:
+        print(f"resuming: {len(results)} files already recorded, "
+              f"{len(todo)} left")
+    print(f"{len(todo)} files, jobs={args.jobs}, timeout={args.timeout}s")
+
+    lock = threading.Lock()
+
+    def record(result):
+        with lock:
+            results.append(result)
+            if partial:
+                with open(partial, "a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(result) + "\n")
+
     started = time.monotonic()
     if args.jobs == 1:
-        for index, path in enumerate(files, 1):
+        for index, path in enumerate(todo, 1):
             result = run_file(path, extra, args.timeout)
-            results.append(result)
+            record(result)
             counts = result["counts"] or {}
-            print(f"[{index:>3}/{len(files)}] {verdict(result):<8} "
+            print(f"[{index:>3}/{len(todo)}] {verdict(result):<8} "
                   f"{result['seconds']:>7.1f}s  {path}  "
                   f"({counts.get('passed', 0)}p/{counts.get('failed', 0)}f/"
                   f"{counts.get('skipped', 0)}s/{counts.get('errored', 0)}e)",
@@ -156,10 +208,10 @@ def main(argv=None):
     else:
         with concurrent.futures.ThreadPoolExecutor(args.jobs) as pool:
             futures = {pool.submit(run_file, path, extra, args.timeout): path
-                       for path in files}
+                       for path in todo}
             for future in concurrent.futures.as_completed(futures):
                 result = future.result()
-                results.append(result)
+                record(result)
                 counts = result["counts"] or {}
                 print(f"{verdict(result):<8} {result['seconds']:>7.1f}s  "
                       f"{result['file']}  ({counts.get('passed', 0)}p/"
@@ -186,13 +238,15 @@ def main(argv=None):
                 print(f"      ... {len(result['failing']) - 5} more")
 
     if args.json:
-        import json
         with open(args.json, "w", encoding="utf-8") as handle:
             json.dump({"elapsed_seconds": round(elapsed, 1),
                        "totals": totals,
                        "files": sorted(results, key=lambda r: r["file"])},
                       handle, indent=2)
         print(f"wrote {args.json}")
+        if partial and os.path.exists(partial):
+            os.remove(partial)
+            print(f"removed {partial}")
 
     return 1 if bad else 0
 
