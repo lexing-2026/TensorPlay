@@ -2813,12 +2813,13 @@ class OrderedSet(MutableSet[T], Reversible[T]):
         return OrderedSet._from_dict(self._dict.copy())
 
     def difference(self, *others: Iterable[T]) -> "OrderedSet":
-        cls = type(self)
-        containers = [list(other) for other in others]
-        diff = cls(self)
+        diff = OrderedSet._from_dict(self._dict.copy())
+        lookups = [other._dict if isinstance(other, OrderedSet) else
+                   other if isinstance(other, (set, frozenset, dict)) else list(other)
+                   for other in others]
         for item in list(diff):
-            for other in containers:
-                if item in other:
+            for lookup in lookups:
+                if item in lookup:
                     diff.discard(item)
                     break
         return diff
@@ -2842,7 +2843,7 @@ class OrderedSet(MutableSet[T], Reversible[T]):
 
     def union(self, *others: Iterable[T]) -> "OrderedSet":
         containers = map(list, others)
-        return OrderedSet._from_dict(self._dict).update(*containers)
+        return OrderedSet._from_dict(self._dict.copy()).update(*containers)
 
     def __or__(self, other: Iterable[T]) -> "OrderedSet":
         return self.union(other)
@@ -2857,17 +2858,17 @@ class OrderedSet(MutableSet[T], Reversible[T]):
         return self.symmetric_difference(other)
 
     def symmetric_difference(self, other: Iterable[T]) -> "OrderedSet":
-        diff1 = OrderedSet._from_dict(self._dict.copy())
-        diff2 = OrderedSet(other)
-        diff1.difference_update(diff2)
-        diff2.difference_update(diff1)
+        diff1 = self.difference(other)
+        diff2 = OrderedSet(other).difference(self)
         return diff1.union(diff2)
 
     def difference_update(self, *others: Iterable[T]) -> "OrderedSet":
-        containers = [list(other) for other in others]
+        lookups = [other._dict if isinstance(other, OrderedSet) else
+                   other if isinstance(other, (set, frozenset, dict)) else list(other)
+                   for other in others]
         for item in list(self):
-            for other in containers:
-                if item in other:
+            for lookup in lookups:
+                if item in lookup:
                     self.discard(item)
                     break
         return self
