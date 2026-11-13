@@ -263,6 +263,71 @@ Tensor randint_like_kernel(const Tensor& self, int64_t /*low*/, int64_t /*high*/
     return empty_like_kernel(self, dtype, device);
 }
 
+// A copy is a value of its own: the same geometry and element type, and none
+// of the source's memory.  When no arrangement is asked for, the source's is
+// kept, which is what a copy that shares nothing still preserves.
+Tensor clone_kernel(const Tensor& self, std::optional<int64_t> /*memory_format*/) {
+    Tensor result = empty_meta(shape_of(self), self.dtype(), self.device());
+    const std::vector<int64_t> strides = self.strides();
+    if (strides != result.strides()) {
+        result = result.as_strided(shape_of(self), strides, 0);
+    }
+    return result;
+}
+
+// A copy between devices reads the elements it moves, and a tensor on the
+// meta device has none: it models shape and dtype only.  So a copy that would
+// move one is refused where it is asked for, rather than being left to a
+// kernel that would read a null pointer.  A copy that stays where the value
+// is changes only its element type, and that is described like any other
+// result.
+[[noreturn]] void refuse_meta_move(const Device& device) {
+    TP_THROW(RuntimeError,
+             "cannot copy a tensor on the meta device to ", device.toString(),
+             ": the meta device models shape and dtype only, so it holds no "
+             "elements to move");
+}
+
+Tensor describe_copy(const Tensor& self, std::optional<DType> dtype,
+                     std::optional<Device> device) {
+    const Device target = device.value_or(self.device());
+    if (target != self.device()) {
+        refuse_meta_move(target);
+    }
+    return empty_meta(
+        shape_of(self),
+        resolve_like_dtype(dtype.value_or(DType::Undefined), self), self.device());
+}
+
+Tensor to_device_kernel(const Tensor& self, Device device, DType dtype,
+                        bool /*non_blocking*/, bool /*copy*/,
+                        std::optional<int64_t> /*memory_format*/) {
+    return describe_copy(self, dtype, device);
+}
+
+Tensor to_other_kernel(const Tensor& self, const Tensor& other,
+                       bool /*non_blocking*/, bool /*copy*/,
+                       std::optional<int64_t> /*memory_format*/) {
+    return describe_copy(self, other.dtype(), other.device());
+}
+
+Tensor to_copy_kernel(const Tensor& self, std::optional<DType> dtype,
+                      std::optional<int64_t> /*layout*/,
+                      std::optional<Device> device,
+                      std::optional<bool> /*pin_memory*/, bool /*non_blocking*/,
+                      std::optional<int64_t> /*memory_format*/) {
+    return describe_copy(self, dtype, device);
+}
+
+Tensor to_dtype_layout_kernel(const Tensor& self, std::optional<DType> dtype,
+                              std::optional<int64_t> /*layout*/,
+                              std::optional<Device> device,
+                              std::optional<bool> /*pin_memory*/,
+                              bool /*non_blocking*/, bool /*copy*/,
+                              std::optional<int64_t> /*memory_format*/) {
+    return describe_copy(self, dtype, device);
+}
+
 // In-place writes change element data only; the metadata is already final.
 Tensor& fill_kernel(Tensor& self, const Scalar& /*value*/) {
     return self;
@@ -1263,6 +1328,11 @@ TENSORPLAY_LIBRARY_IMPL(Meta, MetaKernels) {
     m.impl("rand_like", rand_like_kernel);
     m.impl("randn_like", randn_like_kernel);
     m.impl("randint_like", randint_like_kernel);
+    m.impl("clone", clone_kernel);
+    m.impl("to.device", to_device_kernel);
+    m.impl("to.other", to_other_kernel);
+    m.impl("_to_copy", to_copy_kernel);
+    m.impl("to.dtype_layout", to_dtype_layout_kernel);
     m.impl("fill_.Scalar", fill_kernel);
     m.impl("zero_", zero_kernel);
 
