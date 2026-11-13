@@ -16,6 +16,7 @@
 #include <mutex>
 #include <memory>
 #include <cstdint>
+#include <cstdlib>
 #include <array>
 
 #ifdef USE_CUDNN
@@ -78,6 +79,25 @@ inline cudnnDataType_t to_cudnn_compute_type(DType d) {
 #endif
 
 static constexpr size_t kConvAutotuneWorkspaceCap = 512ULL * 1024 * 1024;
+
+// Upper bound on the scratch space one convolution plan may request.  The
+// leading heuristic engine occasionally asks for a workspace many times the
+// size of the output; such a plan raises peak memory far more than it saves.
+// The bound can be raised on machines with more headroom.
+inline size_t conv_workspace_limit() {
+    static const size_t limit = [] {
+        const char* env = std::getenv("TP_CONV_WORKSPACE_MB");
+        if (env != nullptr) {
+            char* end = nullptr;
+            long long mb = std::strtoll(env, &end, 10);
+            if (end != env && mb > 0) {
+                return static_cast<size_t>(mb) * 1024 * 1024;
+            }
+        }
+        return kConvAutotuneWorkspaceCap;
+    }();
+    return limit;
+}
 
 struct CachedTensorDesc {
     cudnnTensorDescriptor_t desc = nullptr;

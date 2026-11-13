@@ -304,10 +304,14 @@ static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const 
     };
 
     const bool use_channels_last = is_channels_last_4d(input);
+    // Keep bias out of the plan graph.  Fusing it changes the engine list the
+    // heuristics rank, and for some wide-channel shapes the leading plan asks
+    // for a workspace many times the size of the output itself.  A broadcast
+    // add afterwards costs one small kernel and keeps the plan's scratch
+    // bounded.
     const bool post_bias_add =
         bias.defined() && bias.numel() != 0 && !fused_relu &&
-        !use_channels_last &&
-        (input.dtype() == DType::Float16 || input.dtype() == DType::BFloat16);
+        !use_channels_last;
     const std::array<int64_t, 4> x_stride{
         input.stride(0), input.stride(1), input.stride(2), input.stride(3)};
     const std::array<int64_t, 4> w_stride{
@@ -428,30 +432,56 @@ static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const 
             filtered = usable_engine_configs(plain, deterministic, allow_tf32, dtype);
         }
         if (filtered.empty()) filtered = engine_configs;
+        const size_t workspace_limit = conv_workspace_limit();
+        auto build_plan = [&](const auto& ec) {
+            return std::make_shared<fe::ExecutionPlan>(
+                fe::ExecutionPlanBuilder()
+                    .setHandle(handle)
+                    .setEngineConfig(ec)
+                    .build());
+        };
+        // A plan whose scratch space exceeds the bound is skipped even when
+        // the heuristic ranks it first: peak memory matters more here than
+        // the last few percent of convolution time.  The smallest plan that
+        // did build is kept as a last resort for shapes where every engine
+        // needs a large scratch buffer.
+        std::shared_ptr<fe::ExecutionPlan> smallest;
+        auto remember_smallest = [&](std::shared_ptr<fe::ExecutionPlan> plan) {
+            if (!smallest ||
+                plan->getWorkspaceSize() < smallest->getWorkspaceSize()) {
+                smallest = std::move(plan);
+            }
+        };
         if (!autotune || filtered.size() == 1) {
             for (auto& ec : filtered) {
                 try {
-                    return std::make_shared<fe::ExecutionPlan>(
-                        fe::ExecutionPlanBuilder()
-                            .setHandle(handle)
-                            .setEngineConfig(ec)
-                            .build());
+                    auto candidate = build_plan(ec);
+                    if (candidate->getWorkspaceSize() <= workspace_limit) {
+                        return candidate;
+                    }
+                    remember_smallest(std::move(candidate));
                 } catch (...) {
                     // Config cannot be realized on this device; try the next.
                 }
             }
+            if (smallest) return smallest;
             TP_THROW(RuntimeError, "cuDNN: no executable engine configs for conv2d");
         }
         std::vector<std::shared_ptr<fe::ExecutionPlan>> candidates;
         for (auto& ec : filtered) {
             try {
-                candidates.push_back(std::make_shared<fe::ExecutionPlan>(
-                    fe::ExecutionPlanBuilder().setHandle(handle).setEngineConfig(ec).build()));
+                auto candidate = build_plan(ec);
+                if (candidate->getWorkspaceSize() <= workspace_limit) {
+                    candidates.push_back(std::move(candidate));
+                } else {
+                    remember_smallest(std::move(candidate));
+                }
             } catch (...) {
                 // Config failed to build an executable plan; skip it.
             }
         }
         if (candidates.empty()) {
+            if (smallest) return smallest;
             TP_THROW(RuntimeError, "cuDNN: no executable engine configs for conv2d");
         }
         if (candidates.size() == 1) return candidates[0];
