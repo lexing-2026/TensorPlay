@@ -24,15 +24,6 @@ namespace meta {
 
 namespace {
 
-int64_t wrap_dim(int64_t dim, int64_t ndim) {
-    if (dim < 0) dim += ndim;
-    if (dim < 0 || dim >= ndim) {
-        TP_THROW(IndexError, "Dimension out of range (expected to be in range of [",
-                 -ndim, ", ", ndim - 1, "], but got ", dim, ")");
-    }
-    return dim;
-}
-
 // ---------------------------------------------------------------------------
 // Permute / movedim.
 // ---------------------------------------------------------------------------
@@ -389,9 +380,191 @@ Tensor repeat_kernel(const Tensor& self, const std::vector<int64_t>& repeats) {
     return empty_meta(target, self.dtype(), self.device());
 }
 
+// ---------------------------------------------------------------------------
+// Transpose a matrix, and unfold a window over one axis.
+// ---------------------------------------------------------------------------
+
+Tensor t_kernel(const Tensor& self) {
+    if (self.dim() > 2) {
+        TP_THROW(RuntimeError,
+                 "t() expects a tensor with <= 2 dimensions, but self is ",
+                 self.dim(), "D");
+    }
+    if (self.dim() < 2) return self;
+    return self.as_strided({self.size(1), self.size(0)},
+                           {self.stride(1), self.stride(0)});
+}
+
+Tensor unfold_kernel(const Tensor& self, int64_t dimension, int64_t size,
+                     int64_t step) {
+    const int64_t nd = self.dim();
+    dimension = wrap_dim(dimension, nd == 0 ? 1 : nd);
+    std::vector<int64_t> sizes = shape_of(self);
+    std::vector<int64_t> strides = self.strides();
+    const int64_t max_size =
+        nd == 0 ? 1 : sizes[static_cast<size_t>(dimension)];
+    if (size < 0) {
+        TP_THROW(RuntimeError, "size is ", size, " but must be >= 0");
+    }
+    if (size > max_size) {
+        TP_THROW(RuntimeError, "maximum size for tensor at dimension ",
+                 dimension, " is ", max_size, " but size is ", size);
+    }
+    if (step <= 0) {
+        TP_THROW(RuntimeError, "step is ", step, " but must be > 0");
+    }
+    sizes.push_back(size);
+    strides.push_back(nd == 0 ? 1 : strides[static_cast<size_t>(dimension)]);
+    if (dimension < nd) {
+        const size_t axis = static_cast<size_t>(dimension);
+        sizes[axis] = (sizes[axis] - size) / step + 1;
+        strides[axis] *= step;
+    }
+    return self.as_strided(sizes, strides);
+}
+
+// ---------------------------------------------------------------------------
+// Triangular masks: the answer keeps the operand's geometry and type; only
+// the entries below or above a diagonal survive.
+// ---------------------------------------------------------------------------
+
+Tensor triangular_kernel(const Tensor& self, int64_t /*diagonal*/) {
+    if (self.dim() < 2) {
+        TP_THROW(RuntimeError,
+                 "tril/triu requires tensor with at least 2 dimensions");
+    }
+    if (!is_scalar_dtype(self.dtype())) {
+        TP_THROW(TypeError, "tril/triu: unsupported dtype");
+    }
+    return empty_meta(shape_of(self), self.dtype(), self.device());
+}
+
+Tensor& triangular_inplace_kernel(Tensor& self, int64_t diagonal) {
+    triangular_kernel(self, diagonal);
+    return self;
+}
+
+// ---------------------------------------------------------------------------
+// Diagonal embedding: each element of the last axis is laid on one diagonal
+// of a new square plane, and the two new axes hold that diagonal's extent.
+// ---------------------------------------------------------------------------
+
+std::vector<int64_t> contiguous_strides(const std::vector<int64_t>& sizes) {
+    std::vector<int64_t> strides(sizes.size(), 1);
+    for (int64_t i = static_cast<int64_t>(sizes.size()) - 2; i >= 0; --i) {
+        strides[static_cast<size_t>(i)] =
+            strides[static_cast<size_t>(i + 1)] * sizes[static_cast<size_t>(i + 1)];
+    }
+    return strides;
+}
+
+int64_t diagonal_extent(int64_t base, int64_t offset, const char* op) {
+    if (offset == std::numeric_limits<int64_t>::min()) {
+        TP_THROW(ValueError, op, ": diagonal offset is too small");
+    }
+    const int64_t magnitude = offset < 0 ? -offset : offset;
+    if (base > std::numeric_limits<int64_t>::max() - magnitude) {
+        TP_THROW(ValueError, op, ": diagonal output dimension is too large");
+    }
+    return base + magnitude;
+}
+
+Tensor diag_embed_kernel(const Tensor& self, int64_t offset, int64_t dim1_,
+                         int64_t dim2_) {
+    const int64_t nDims = self.dim() + 1;
+    const int64_t dim1 = wrap_dim(dim1_, nDims);
+    const int64_t dim2 = wrap_dim(dim2_, nDims);
+    if (dim1 == dim2) {
+        TP_THROW(RuntimeError, "diagonal dimensions cannot be identical");
+    }
+    const int64_t extent = diagonal_extent(self.size(-1), offset, "diag_embed");
+    std::vector<int64_t> sizes = shape_of(self);
+    sizes.pop_back();
+    sizes.insert(sizes.begin() + std::min(dim1, dim2), extent);
+    sizes.insert(sizes.begin() + std::max(dim1, dim2), extent);
+    return empty_meta(sizes, self.dtype(), self.device());
+}
+
+Tensor diagflat_kernel(const Tensor& self, int64_t offset) {
+    const int64_t extent = diagonal_extent(self.numel(), offset, "diag_embed");
+    return empty_meta({extent, extent}, self.dtype(), self.device());
+}
+
+// ---------------------------------------------------------------------------
+// Quarter turns: a rotation swaps the two plane axes for odd k and keeps the
+// shape for even k.  The odd turns answer in the layout of a transposed
+// contiguous plane, so their strides swap with the extents.
+// ---------------------------------------------------------------------------
+
+Tensor rot90_kernel(const Tensor& self, int64_t k,
+                    const std::vector<int64_t>& dims) {
+    if (dims.size() != 2) {
+        TP_THROW(RuntimeError, "expected total rotation dims == 2, but got dims = ",
+                 dims.size());
+    }
+    const int64_t nd = self.dim();
+    if (nd < 2) {
+        TP_THROW(RuntimeError, "expected total dims >= 2, but got total dims = ",
+                 nd);
+    }
+    const int64_t dim0 = wrap_dim(dims[0], nd);
+    const int64_t dim1 = wrap_dim(dims[1], nd);
+    if (dim0 == dim1) {
+        TP_THROW(RuntimeError,
+                 "expected rotation dims to be different, but got dim0 = ",
+                 dims[0], " and dim1 = ", dims[1]);
+    }
+    k = (4 + (k % 4)) % 4;
+    if (k == 1 || k == 3) {
+        std::vector<int64_t> sizes = shape_of(self);
+        std::vector<int64_t> strides = contiguous_strides(sizes);
+        std::swap(sizes[static_cast<size_t>(dim0)],
+                  sizes[static_cast<size_t>(dim1)]);
+        std::swap(strides[static_cast<size_t>(dim0)],
+                  strides[static_cast<size_t>(dim1)]);
+        return self.as_strided(sizes, strides);
+    }
+    return empty_meta(shape_of(self), self.dtype(), self.device());
+}
+
+// ---------------------------------------------------------------------------
+// Cartesian product: every combination of one value from each 1-D operand,
+// one combination per row, typed by the promoted operand type.
+// ---------------------------------------------------------------------------
+
+Tensor cartesian_prod_kernel(const std::vector<Tensor>& tensors) {
+    if (tensors.empty()) {
+        TP_THROW(RuntimeError,
+                 "cartesian_prod expects a non-empty TensorList");
+    }
+    DType dtype = tensors[0].dtype();
+    int64_t rows = 1;
+    for (const Tensor& tensor : tensors) {
+        if (tensor.dim() != 1) {
+            TP_THROW(RuntimeError, "Expect a 1D vector, but got shape ",
+                     tensor.shape().toString());
+        }
+        rows *= tensor.numel();
+        dtype = promoteTypes(dtype, tensor.dtype());
+    }
+    if (tensors.size() == 1) return tensors[0];
+    return empty_meta({rows, static_cast<int64_t>(tensors.size())}, dtype,
+                      tensors[0].device());
+}
+
 } // anonymous namespace
 
 TENSORPLAY_LIBRARY_IMPL(Meta, MetaShape) {
+    m.impl("t", t_kernel);
+    m.impl("unfold", unfold_kernel);
+    m.impl("tril", triangular_kernel);
+    m.impl("tril_", triangular_inplace_kernel);
+    m.impl("triu", triangular_kernel);
+    m.impl("triu_", triangular_inplace_kernel);
+    m.impl("diag_embed", diag_embed_kernel);
+    m.impl("diagflat", diagflat_kernel);
+    m.impl("rot90", rot90_kernel);
+    m.impl("cartesian_prod", cartesian_prod_kernel);
     m.impl("permute", permute_kernel);
     m.impl("movedim", movedim_kernel);
     m.impl("diagonal", diagonal_kernel);

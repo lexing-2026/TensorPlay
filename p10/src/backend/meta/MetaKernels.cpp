@@ -1002,7 +1002,130 @@ META_UNARY_KERNEL(silu)
 META_UNARY_KERNEL(rsqrt)
 META_UNARY_KERNEL(cos)
 META_UNARY_KERNEL(sin)
+META_UNARY_KERNEL(exp2)
+META_UNARY_KERNEL(expm1)
+META_UNARY_KERNEL(log2)
+META_UNARY_KERNEL(log10)
+META_UNARY_KERNEL(log1p)
+META_UNARY_KERNEL(tan)
+META_UNARY_KERNEL(asin)
+META_UNARY_KERNEL(acos)
+META_UNARY_KERNEL(atan)
+META_UNARY_KERNEL(sinh)
+META_UNARY_KERNEL(cosh)
+META_UNARY_KERNEL(asinh)
+META_UNARY_KERNEL(acosh)
+META_UNARY_KERNEL(atanh)
+META_UNARY_KERNEL(reciprocal)
+META_UNARY_KERNEL(square)
+META_UNARY_KERNEL(sinc)
+META_UNARY_KERNEL(erf)
+META_UNARY_KERNEL(erfc)
+META_UNARY_KERNEL(erfinv)
+META_UNARY_KERNEL(lgamma)
+META_UNARY_KERNEL(digamma)
+META_UNARY_KERNEL(i0)
+META_UNARY_KERNEL(deg2rad)
+META_UNARY_KERNEL(rad2deg)
 #undef META_UNARY_KERNEL
+
+Tensor absolute_kernel(const Tensor& self) {
+    return abs_kernel(self);
+}
+
+// An in-place pointwise operation overwrites the operand's own bytes, so the
+// geometry and the value type both stay as they were.
+#define META_UNARY_INPLACE_KERNEL(NAME)                                       \
+    Tensor& NAME##_inplace_kernel(Tensor& self) { return self; }
+
+META_UNARY_INPLACE_KERNEL(abs)
+META_UNARY_INPLACE_KERNEL(absolute)
+META_UNARY_INPLACE_KERNEL(sqrt)
+META_UNARY_INPLACE_KERNEL(rsqrt)
+META_UNARY_INPLACE_KERNEL(exp)
+META_UNARY_INPLACE_KERNEL(exp2)
+META_UNARY_INPLACE_KERNEL(expm1)
+META_UNARY_INPLACE_KERNEL(log)
+META_UNARY_INPLACE_KERNEL(log2)
+META_UNARY_INPLACE_KERNEL(log10)
+META_UNARY_INPLACE_KERNEL(log1p)
+META_UNARY_INPLACE_KERNEL(sin)
+META_UNARY_INPLACE_KERNEL(cos)
+META_UNARY_INPLACE_KERNEL(tan)
+META_UNARY_INPLACE_KERNEL(asin)
+META_UNARY_INPLACE_KERNEL(acos)
+META_UNARY_INPLACE_KERNEL(atan)
+META_UNARY_INPLACE_KERNEL(sinh)
+META_UNARY_INPLACE_KERNEL(cosh)
+META_UNARY_INPLACE_KERNEL(asinh)
+META_UNARY_INPLACE_KERNEL(acosh)
+META_UNARY_INPLACE_KERNEL(atanh)
+META_UNARY_INPLACE_KERNEL(ceil)
+META_UNARY_INPLACE_KERNEL(floor)
+META_UNARY_INPLACE_KERNEL(round)
+META_UNARY_INPLACE_KERNEL(reciprocal)
+META_UNARY_INPLACE_KERNEL(square)
+META_UNARY_INPLACE_KERNEL(sinc)
+META_UNARY_INPLACE_KERNEL(erf)
+META_UNARY_INPLACE_KERNEL(erfc)
+META_UNARY_INPLACE_KERNEL(erfinv)
+META_UNARY_INPLACE_KERNEL(lgamma)
+META_UNARY_INPLACE_KERNEL(digamma)
+META_UNARY_INPLACE_KERNEL(i0)
+META_UNARY_INPLACE_KERNEL(deg2rad)
+META_UNARY_INPLACE_KERNEL(rad2deg)
+#undef META_UNARY_INPLACE_KERNEL
+
+// ---------------------------------------------------------------------------
+// Linear interpolation: both endpoints take part in the broadcast, and the
+// weight adds its own type when it is a tensor.  A whole-numbered promotion
+// answers at single precision, and a floating scalar weight lifts it too.
+// ---------------------------------------------------------------------------
+
+Tensor lerp_scalar_kernel(const Tensor& self, const Tensor& end,
+                          const Scalar& weight) {
+    check_all_meta(self, end);
+    DType out = promoteTypes(self.dtype(), end.dtype());
+    if (weight.isFloatingPoint()) out = promoteTypes(out, DType::Float32);
+    if (isIntegralType(out)) out = DType::Float32;
+    return empty_meta(broadcast2(self, end), out, self.device());
+}
+
+Tensor lerp_tensor_kernel(const Tensor& self, const Tensor& end,
+                          const Tensor& weight) {
+    check_all_meta(self, end);
+    check_all_meta(self, weight);
+    DType out = promoteTypes(promoteTypes(self.dtype(), end.dtype()),
+                             weight.dtype());
+    if (isIntegralType(out)) out = DType::Float32;
+    return empty_meta(
+        broadcast_shapes(broadcast2(self, end), shape_of(weight)), out,
+        self.device());
+}
+
+void check_lerp_destination(const Tensor& self,
+                            const std::vector<int64_t>& out, const char* op) {
+    if (out != shape_of(self)) {
+        TP_THROW(RuntimeError, op,
+                 ": the broadcast result does not take the destination's shape");
+    }
+}
+
+Tensor& lerp_scalar_inplace_kernel(Tensor& self, const Tensor& end,
+                                   const Scalar& weight) {
+    check_lerp_destination(self, broadcast2(self, end), "lerp_");
+    (void)weight;
+    return self;
+}
+
+Tensor& lerp_tensor_inplace_kernel(Tensor& self, const Tensor& end,
+                                   const Tensor& weight) {
+    check_lerp_destination(self,
+                           broadcast_shapes(broadcast2(self, end),
+                                            shape_of(weight)),
+                           "lerp_");
+    return self;
+}
 
 // ---------------------------------------------------------------------------
 // Dropout. Dropping elements changes values, not the geometry, and the mask
@@ -1357,12 +1480,79 @@ TENSORPLAY_LIBRARY_IMPL(Meta, MetaKernels) {
 
     // Pointwise unary.
     m.impl("abs", abs_kernel);
+    m.impl("absolute", absolute_kernel);
+    m.impl("abs_", abs_inplace_kernel);
+    m.impl("absolute_", absolute_inplace_kernel);
     m.impl("neg", neg_kernel);
     m.impl("neg_", neg_inplace_kernel);
     m.impl("exp", exp_kernel);
+    m.impl("exp2", exp2_kernel);
+    m.impl("expm1", expm1_kernel);
+    m.impl("exp_", exp_inplace_kernel);
+    m.impl("exp2_", exp2_inplace_kernel);
+    m.impl("expm1_", expm1_inplace_kernel);
     m.impl("log", log_kernel);
+    m.impl("log2", log2_kernel);
+    m.impl("log10", log10_kernel);
+    m.impl("log1p", log1p_kernel);
+    m.impl("log_", log_inplace_kernel);
+    m.impl("log2_", log2_inplace_kernel);
+    m.impl("log10_", log10_inplace_kernel);
+    m.impl("log1p_", log1p_inplace_kernel);
     m.impl("sqrt", sqrt_kernel);
+    m.impl("rsqrt", rsqrt_kernel);
+    m.impl("sqrt_", sqrt_inplace_kernel);
+    m.impl("rsqrt_", rsqrt_inplace_kernel);
+    m.impl("tan", tan_kernel);
+    m.impl("asin", asin_kernel);
+    m.impl("acos", acos_kernel);
+    m.impl("atan", atan_kernel);
+    m.impl("sinh", sinh_kernel);
+    m.impl("cosh", cosh_kernel);
+    m.impl("asinh", asinh_kernel);
+    m.impl("acosh", acosh_kernel);
+    m.impl("atanh", atanh_kernel);
+    m.impl("tan_", tan_inplace_kernel);
+    m.impl("asin_", asin_inplace_kernel);
+    m.impl("acos_", acos_inplace_kernel);
+    m.impl("atan_", atan_inplace_kernel);
+    m.impl("sinh_", sinh_inplace_kernel);
+    m.impl("cosh_", cosh_inplace_kernel);
+    m.impl("asinh_", asinh_inplace_kernel);
+    m.impl("acosh_", acosh_inplace_kernel);
+    m.impl("atanh_", atanh_inplace_kernel);
+    m.impl("reciprocal", reciprocal_kernel);
+    m.impl("square", square_kernel);
+    m.impl("sinc", sinc_kernel);
+    m.impl("reciprocal_", reciprocal_inplace_kernel);
+    m.impl("square_", square_inplace_kernel);
+    m.impl("sinc_", sinc_inplace_kernel);
+    m.impl("erf", erf_kernel);
+    m.impl("erfc", erfc_kernel);
+    m.impl("erfinv", erfinv_kernel);
+    m.impl("lgamma", lgamma_kernel);
+    m.impl("digamma", digamma_kernel);
+    m.impl("i0", i0_kernel);
+    m.impl("erf_", erf_inplace_kernel);
+    m.impl("erfc_", erfc_inplace_kernel);
+    m.impl("erfinv_", erfinv_inplace_kernel);
+    m.impl("lgamma_", lgamma_inplace_kernel);
+    m.impl("digamma_", digamma_inplace_kernel);
+    m.impl("i0_", i0_inplace_kernel);
+    m.impl("deg2rad", deg2rad_kernel);
+    m.impl("rad2deg", rad2deg_kernel);
+    m.impl("deg2rad_", deg2rad_inplace_kernel);
+    m.impl("rad2deg_", rad2deg_inplace_kernel);
+    m.impl("ceil_", ceil_inplace_kernel);
+    m.impl("floor_", floor_inplace_kernel);
+    m.impl("round_", round_inplace_kernel);
     m.impl("clamp", clamp_kernel);
+
+    // Linear interpolation.
+    m.impl("lerp", lerp_scalar_kernel);
+    m.impl("lerp.Tensor", lerp_tensor_kernel);
+    m.impl("lerp_.Scalar", lerp_scalar_inplace_kernel);
+    m.impl("lerp_.Tensor", lerp_tensor_inplace_kernel);
 
     // Comparisons and selection.
     m.impl("eq.Tensor", eq_tensor_kernel);
@@ -1421,9 +1611,10 @@ TENSORPLAY_LIBRARY_IMPL(Meta, MetaKernels) {
 
     // Pointwise activations and roots.
     m.impl("silu", silu_kernel);
-    m.impl("rsqrt", rsqrt_kernel);
     m.impl("cos", cos_kernel);
     m.impl("sin", sin_kernel);
+    m.impl("cos_", cos_inplace_kernel);
+    m.impl("sin_", sin_inplace_kernel);
 
     // Dropout and moments.
     m.impl("native_dropout", native_dropout_kernel);

@@ -45,6 +45,22 @@ inline void check_all_meta(const Tensor& a, const Tensor& b) {
     }
 }
 
+// Whether an element type takes part in the elementwise kernels' dispatch:
+// every integral, boolean and non-fp8 floating type.
+inline bool is_scalar_dtype(DType dtype) {
+    return dtype == DType::Bool || isIntegralType(dtype) ||
+           (isFloatingType(dtype) && !isFloat8Type(dtype));
+}
+
+inline int64_t wrap_dim(int64_t dim, int64_t ndim) {
+    if (dim < 0) dim += ndim;
+    if (dim < 0 || dim >= ndim) {
+        TP_THROW(IndexError, "Dimension out of range (expected to be in range of [",
+                 -ndim, ", ", ndim - 1, "], but got ", dim, ")");
+    }
+    return dim;
+}
+
 inline Device resolve_device(const std::optional<Device>& device) {
     return device.has_value() ? *device : globalContext().defaultDevice();
 }

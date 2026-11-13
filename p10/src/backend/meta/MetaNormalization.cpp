@@ -69,6 +69,16 @@ std::tuple<Tensor, Tensor, Tensor> native_layer_norm_kernel(
             empty_meta({outer_size}, stats_dtype, input.device())};
 }
 
+// The public spelling returns only the normalized output; the per-row
+// statistics are requested through the native op separately.
+Tensor layer_norm_kernel(const Tensor& input,
+                         const std::vector<int64_t>& normalized_shape,
+                         const std::optional<Tensor>& weight,
+                         const std::optional<Tensor>& bias, double eps) {
+    return std::get<0>(
+        native_layer_norm_kernel(input, normalized_shape, weight, bias, eps));
+}
+
 // ---------------------------------------------------------------------------
 // Batch norm.
 // ---------------------------------------------------------------------------
@@ -140,6 +150,7 @@ Tensor batch_norm_kernel(const Tensor& input,
 
 TENSORPLAY_LIBRARY_IMPL(Meta, MetaNormalization) {
     m.impl("native_layer_norm", native_layer_norm_kernel);
+    m.impl("layer_norm", layer_norm_kernel);
     m.impl("native_batch_norm", native_batch_norm_kernel);
     m.impl("batch_norm", batch_norm_kernel);
 }

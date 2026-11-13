@@ -178,6 +178,10 @@ set(P10_SOURCES
     src/backend/meta/MetaLoss.cpp
     src/backend/meta/MetaEmbedding.cpp
     src/backend/meta/MetaNorm.cpp
+    src/backend/meta/MetaReduce.cpp
+    src/backend/meta/MetaLogic.cpp
+    src/backend/meta/MetaSelection.cpp
+    src/backend/meta/MetaIndex.cpp
     src/backend/composite/RNN.cpp
     src/backend/composite/TensorAdvancedIndexing.cpp
     src/backend/composite/TensorCompare.cpp

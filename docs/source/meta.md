@@ -36,11 +36,21 @@ print((x @ w.T).shape)        # (8, 2)
 print(x.sum(dim=0).shape)     # (4,)
 ```
 
-Coverage is not total: some operations whose results are shape-only in principle still
-lack a meta kernel in this build — `softmax`, `stack`, `unsqueeze`, `chunk` among them —
-and raise the same `NotImplementedError` as the data-dependent ones below. When a trace
-hits such a gap, rewrite the step in terms of the primitives that do work (slicing and
-`reshape` cover most reshaping needs).
+Coverage is broad but not total. Arithmetic and comparisons, the pointwise unary
+family (functional and in-place), reductions (`sum`, `mean`, `prod`, `amax`/`amin`,
+`argmax`/`argmin`, `logsumexp`, `all`/`any`, `mode`/`kthvalue`), matrix products and
+`conv2d`, views (`reshape`, `transpose`, `slice`, `squeeze`, `unsqueeze`, `chunk`,
+`cat`), indexing (`gather`, `scatter`, `index_select`, `take`, `searchsorted`,
+`bucketize`, `masked_fill`, `_index_put_impl_`), shape builders (`tril`/`triu`,
+`diag_embed`/`diagflat`, `rot90`, `cartesian_prod`), the activations and
+normalization layers (`softmax`, `layer_norm`, `group_norm`, `batch_norm`) all run
+on meta tensors.
+
+What remains missing is genuinely value-dependent — `nonzero`, `masked_select`,
+`unique`, `bincount`, `count_nonzero`, `item` — and raises the same
+`NotImplementedError` as the cases below. When a trace hits such a gap, rewrite the
+step in terms of the primitives that do work (slicing and `reshape` cover most
+reshaping needs).
 
 `tensorplay.zeros_like` / `empty_like` on a meta tensor stay on meta, so a shape-tracing
 pass can build its intermediates the way real code would.

@@ -366,6 +366,75 @@ Tensor prelu_kernel(const Tensor& self, const Tensor& /*weight*/) {
     return unary_meta(self);
 }
 
+// ---------------------------------------------------------------------------
+// Scans: each slice along `dim` is folded left to right, so the answer keeps
+// the input geometry.  An integral input (booleans included) answers in Int64
+// unless the caller names a dtype; floating and complex inputs keep their own.
+// ---------------------------------------------------------------------------
+
+int64_t wrap_scan_dim(int64_t dim, int64_t ndim) {
+    if (ndim == 0) {
+        if (dim == -1 || dim == 0) return 0;
+        TP_THROW(IndexError,
+                 "Dimension out of range for a scalar tensor (expected -1 or "
+                 "0, but got ", dim, ")");
+    }
+    return wrap_dim(dim, ndim);
+}
+
+DType scan_out_dtype(const Tensor& self, const std::optional<DType>& dtype) {
+    return dtype.value_or(isIntegralType(self.dtype(), true) ? DType::Int64
+                                                             : self.dtype());
+}
+
+void check_scan_dtype(DType out_dtype, const char* op) {
+    if (!is_scalar_dtype(out_dtype) && !isComplexType(out_dtype)) {
+        TP_THROW(TypeError, op, ": unsupported dtype");
+    }
+}
+
+Tensor cumsum_kernel(const Tensor& self, int64_t dim,
+                     std::optional<DType> dtype) {
+    wrap_scan_dim(dim, self.dim());
+    const DType out_dtype = scan_out_dtype(self, dtype);
+    check_scan_dtype(out_dtype, "cumsum");
+    return empty_meta(shape_of(self), out_dtype, self.device());
+}
+
+Tensor& cumsum_inplace_kernel(Tensor& self, int64_t dim,
+                              std::optional<DType> dtype) {
+    cumsum_kernel(self, dim, dtype);
+    return self;
+}
+
+Tensor cumprod_kernel(const Tensor& self, int64_t dim,
+                      std::optional<DType> dtype) {
+    wrap_scan_dim(dim, self.dim());
+    const DType out_dtype = scan_out_dtype(self, dtype);
+    check_scan_dtype(out_dtype, "cumprod");
+    return empty_meta(shape_of(self), out_dtype, self.device());
+}
+
+Tensor& cumprod_inplace_kernel(Tensor& self, int64_t dim,
+                               std::optional<DType> dtype) {
+    cumprod_kernel(self, dim, dtype);
+    return self;
+}
+
+// ---------------------------------------------------------------------------
+// Outer product: two vectors multiply into a matrix whose types promote.
+// ---------------------------------------------------------------------------
+
+Tensor outer_kernel(const Tensor& self, const Tensor& vec2) {
+    if (self.dim() != 1 || vec2.dim() != 1) {
+        TP_THROW(RuntimeError, "1D tensors expected, but got ", self.dim(),
+                 "D and ", vec2.dim(), "D tensors");
+    }
+    return empty_meta({self.numel(), vec2.numel()},
+                      promoteTypes(self.dtype(), vec2.dtype()),
+                      self.device());
+}
+
 } // anonymous namespace
 
 TENSORPLAY_LIBRARY_IMPL(Meta, MetaActivations) {
@@ -445,6 +514,13 @@ TENSORPLAY_LIBRARY_IMPL(Meta, MetaActivations) {
     // Gated linear unit and PReLU.
     m.impl("glu", glu_kernel);
     m.impl("prelu", prelu_kernel);
+
+    // Scans and the outer product.
+    m.impl("cumsum", cumsum_kernel);
+    m.impl("cumsum_", cumsum_inplace_kernel);
+    m.impl("cumprod", cumprod_kernel);
+    m.impl("cumprod_", cumprod_inplace_kernel);
+    m.impl("outer", outer_kernel);
 }
 
 } // namespace meta

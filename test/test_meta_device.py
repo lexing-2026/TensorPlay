@@ -552,6 +552,395 @@ def test_norm_and_normalize():
 
 
 # ---------------------------------------------------------------------------
+# Moments, extrema and ordering
+# ---------------------------------------------------------------------------
+
+
+def test_var_std_shapes_and_dtypes():
+    t = _meta(3, 4)
+    assert tuple(tp.var(t).shape) == ()
+    assert tuple(tp.std(t).shape) == ()
+    assert tuple(tp.var(t, [1], correction=0).shape) == (3,)
+    assert tuple(tp.std(t, [1], keepdim=True).shape) == (3, 1)
+    var, mean = tp.std_mean(t, [0], keepdim=True)
+    assert tuple(var.shape) == (1, 4)
+    assert tuple(mean.shape) == (1, 4)
+    assert tp.var(t).dtype == tp.float32
+    assert tp.var(_meta(3, dtype=tp.int32)).dtype == tp.float32
+    assert tp.std(_meta(3, dtype=tp.float64)).dtype == tp.float64
+    assert tp.var(_meta(3, dtype=tp.complex64)).dtype == tp.float32
+
+
+def test_extrema_shapes():
+    t = _meta(3, 4)
+    assert tuple(tp.max(t).shape) == ()
+    assert tuple(tp.min(t).shape) == ()
+    values, indices = tp.max(t, 1)
+    assert tuple(values.shape) == (3,)
+    assert values.dtype == t.dtype
+    assert indices.dtype == tp.int64
+    values, indices = tp.min(t, 0, keepdim=True)
+    assert tuple(values.shape) == (1, 4)
+    assert indices.dtype == tp.int64
+
+
+def test_sort_and_topk_shapes():
+    t = _meta(3, 5)
+    values, indices = tp.sort(t, 1, descending=True)
+    assert tuple(values.shape) == (3, 5)
+    assert tuple(indices.shape) == (3, 5)
+    assert values.dtype == t.dtype
+    assert indices.dtype == tp.int64
+    assert tuple(tp.argsort(t).shape) == (3, 5)
+    assert tp.argsort(t).dtype == tp.int64
+    top, top_indices = tp.topk(t, 2, dim=1)
+    assert tuple(top.shape) == (3, 2)
+    assert tuple(top_indices.shape) == (3, 2)
+    assert top_indices.dtype == tp.int64
+    with pytest.raises(Exception):
+        tp.sort(_meta())
+    with pytest.raises(Exception):
+        tp.topk(t, 6, dim=1)
+    with pytest.raises(Exception):
+        tp.topk(_meta(4, dtype=tp.bool), 2)
+
+
+def test_scan_and_outer_shapes():
+    t = _meta(2, 3)
+    assert tuple(tp.cumsum(t, 1).shape) == (2, 3)
+    assert tp.cumsum(t, 1).dtype == tp.float32
+    assert tp.cumsum(_meta(4, dtype=tp.int32), 0).dtype == tp.int64
+    assert tp.cumsum(_meta(4, dtype=tp.bool), 0).dtype == tp.int64
+    assert tp.cumsum(t, 1, dtype=tp.float64).dtype == tp.float64
+    assert tuple(tp.cumprod(_meta(), 0).shape) == ()
+    assert tuple(tp.cumprod(t, 0).shape) == (2, 3)
+    assert tuple(tp.cumsum_(t, 1).shape) == (2, 3)
+    assert tuple(tp.cumprod_(_meta(2, 3, dtype=tp.int32), 0).shape) == (2, 3)
+    assert tuple(tp.outer(_meta(3), _meta(4)).shape) == (3, 4)
+    assert tp.outer(_meta(3), _meta(4, dtype=tp.int32)).dtype == tp.float32
+    assert tp.outer(_meta(3, dtype=tp.int32), _meta(4, dtype=tp.int32)).dtype == tp.int32
+    with pytest.raises(Exception):
+        tp.outer(_meta(2, 3), _meta(4))
+    with pytest.raises(Exception):
+        tp.cumsum(_meta(), 1)
+
+
+def test_logical_and_bitwise():
+    a = _meta(3, 1, dtype=tp.int32)
+    b = _meta(1, 4, dtype=tp.int64)
+    assert tuple(tp.logical_and(a, b).shape) == (3, 4)
+    assert tp.logical_and(a, b).dtype == tp.bool
+    assert tp.logical_not(a).dtype == tp.bool
+    assert tuple(tp.logical_or(a, b).shape) == (3, 4)
+    assert tp.bitwise_and(a, b).dtype == tp.int64
+    assert tuple(tp.bitwise_xor(a, b).shape) == (3, 4)
+    assert tp.bitwise_and(a, 3).dtype == tp.int32
+    assert tuple(tp.bitwise_or(3, a).shape) == (3, 1)
+    assert tp.bitwise_left_shift(a, 1).dtype == tp.int32
+    assert tp.bitwise_right_shift(a, b).dtype == tp.int64
+    assert tp.bitwise_not(_meta(4, dtype=tp.bool)).dtype == tp.bool
+    with pytest.raises(Exception):
+        tp.bitwise_and(_meta(4), _meta(4))
+    assert tp.bitwise_left_shift(_meta(4, dtype=tp.bool), 1).dtype == tp.int64
+    with pytest.raises(Exception):
+        tp.bitwise_left_shift(_meta(4, dtype=tp.bool), _meta(4, dtype=tp.bool))
+
+
+# ---------------------------------------------------------------------------
+# Indexed access
+# ---------------------------------------------------------------------------
+
+
+def test_gather_and_index_select_shapes():
+    t = _meta(2, 3)
+    idx = _meta(2, 4, dtype=tp.int64)
+    assert tuple(tp.gather(t, 1, idx).shape) == (2, 4)
+    assert tp.gather(t, 1, idx).dtype == t.dtype
+    assert tuple(tp.index_select(t, 1, _meta(5, dtype=tp.int64)).shape) == (2, 5)
+    assert tuple(tp.index_select(t, 0, _meta(dtype=tp.int64)).shape) == (1, 3)
+    with pytest.raises(Exception):
+        tp.gather(t, 1, _meta(2, 4, 1, dtype=tp.int64))
+    with pytest.raises(Exception):
+        tp.gather(t, 0, _meta(2, 5, dtype=tp.int64))
+    with pytest.raises(Exception):
+        tp.index_select(t, 0, _meta(2, 2, dtype=tp.int64))
+
+
+def test_scatter_and_index_write_shapes():
+    t = _meta(2, 3)
+    idx = _meta(2, 3, dtype=tp.int64)
+    src = _meta(2, 3)
+    assert tuple(tp.scatter(t, 1, idx, src).shape) == (2, 3)
+    assert tuple(tp.scatter(t, 1, idx, 0.5).shape) == (2, 3)
+    assert tuple(tp.scatter_add(t, 1, idx, src).shape) == (2, 3)
+    assert tuple(tp.scatter_reduce(t, 1, idx, src, "mean").shape) == (2, 3)
+    assert tuple(tp.scatter_(t, 0, idx, src).shape) == (2, 3)
+    wide = _meta(1, 3, dtype=tp.int64)
+    assert tuple(tp.scatter(t, 0, wide, _meta(1, 3)).shape) == (2, 3)
+    assert tuple(tp.index_add(t, 1, _meta(3, dtype=tp.int64), src).shape) == (2, 3)
+    assert tuple(tp.index_copy(t, 1, _meta(3, dtype=tp.int64), src).shape) == (2, 3)
+    assert tuple(tp.index_fill(t, 1, _meta(2, dtype=tp.int64), 1.0).shape) == (2, 3)
+    filled = tp.index_fill_(t, 1, _meta(2, dtype=tp.int64),
+                            tp.empty((), dtype=tp.float32, device="meta"))
+    assert tuple(filled.shape) == (2, 3)
+    assert tuple(tp.index_reduce(t, 1, _meta(3, dtype=tp.int64), src, "prod").shape) == (2, 3)
+    with pytest.raises(Exception):
+        tp.scatter(t, 1, idx, _meta(2, 2))
+    with pytest.raises(Exception):
+        tp.scatter_reduce(t, 1, idx, src, "median")
+    with pytest.raises(Exception):
+        tp.index_add(t, 1, _meta(3, dtype=tp.int64), _meta(2, 2))
+    with pytest.raises(Exception):
+        tp.index_reduce(t, 1, _meta(4, dtype=tp.int64), src, "sum")
+
+
+def test_masked_fill_shapes():
+    t = _meta(2, 3)
+    mask = _meta(3, dtype=tp.bool)
+    assert tuple(tp.masked_fill(t, mask, 0.0).shape) == (2, 3)
+    assert tuple(tp.masked_fill_(t, mask, 0.0).shape) == (2, 3)
+    scalar = tp.empty((), dtype=tp.float32, device="meta")
+    assert tuple(tp.masked_fill(t, mask, scalar).shape) == (2, 3)
+    with pytest.raises(Exception):
+        tp.masked_fill(t, _meta(3), 0.0)
+    with pytest.raises(Exception):
+        tp.masked_fill(t, mask, _meta(1))
+
+
+# ---------------------------------------------------------------------------
+# Transpose and unfold
+# ---------------------------------------------------------------------------
+
+
+def test_t_and_unfold():
+    t = _meta(2, 3)
+    assert tuple(tp.t(t).shape) == (3, 2)
+    assert tuple(tp.t(t).stride()) == (1, 3)
+    assert tuple(tp.t(_meta(4)).shape) == (4,)
+    with pytest.raises(Exception):
+        tp.t(_meta(2, 3, 4))
+    windowed = tp.unfold(_meta(2, 6), 1, 3, 2)
+    assert tuple(windowed.shape) == (2, 2, 3)
+    assert tuple(windowed.stride()) == (6, 2, 1)
+    assert tuple(tp.unfold(_meta(2, 6), 0, 2, 1).shape) == (1, 6, 2)
+    scalar = tp.unfold(_meta(), 0, 1, 1)
+    assert tuple(scalar.shape) == (1,)
+    assert tuple(scalar.stride()) == (1,)
+    with pytest.raises(Exception):
+        tp.unfold(_meta(2, 6), 1, 7, 1)
+    with pytest.raises(Exception):
+        tp.unfold(_meta(2, 6), 1, 2, 0)
+
+
+# ---------------------------------------------------------------------------
+# Pointwise unary family, in-place forms and interpolation
+# ---------------------------------------------------------------------------
+
+
+def test_pointwise_unary_family():
+    t = _meta(2, 3)
+    for name in ("exp2", "expm1", "log2", "log10", "log1p", "tan", "asin",
+                 "acos", "atan", "sinh", "cosh", "asinh", "acosh", "atanh",
+                 "reciprocal", "square", "sinc", "erf", "erfc", "erfinv",
+                 "lgamma", "digamma", "i0", "deg2rad", "rad2deg",
+                 "absolute"):
+        out = getattr(tp, name)(t)
+        assert tuple(out.shape) == (2, 3)
+        assert out.dtype == t.dtype
+    assert tp.abs(_meta(2, dtype=tp.complex64)).dtype == tp.float32
+    assert tp.absolute(_meta(2, dtype=tp.complex64)).dtype == tp.float32
+
+    x = _meta(2, 3)
+    for name in ("abs_", "sqrt_", "rsqrt_", "exp_", "exp2_", "expm1_",
+                 "log_", "log2_", "log10_", "log1p_", "sin_", "cos_", "tan_",
+                 "asin_", "acos_", "atan_", "sinh_", "cosh_", "asinh_",
+                 "acosh_", "atanh_", "ceil_", "floor_", "round_",
+                 "reciprocal_", "square_", "sinc_", "erf_", "erfc_",
+                 "erfinv_", "lgamma_", "digamma_", "i0_", "deg2rad_",
+                 "rad2deg_"):
+        assert getattr(x, name)() is x
+
+
+def test_lerp_shapes_and_dtypes():
+    t = _meta(2, 3)
+    assert tuple(tp.lerp(t, _meta(2, 3), 0.5).shape) == (2, 3)
+    assert tp.lerp(t, _meta(3), 0.5).dtype == tp.float32
+    assert tp.lerp(_meta(2, 3, dtype=tp.int32),
+                   _meta(3, dtype=tp.int32), 2).dtype == tp.float32
+    assert tp.lerp(_meta(2, 3, dtype=tp.int32),
+                   _meta(3, dtype=tp.int32), 0.5).dtype == tp.float32
+    assert tuple(tp.lerp(t, _meta(3), _meta(3)).shape) == (2, 3)
+    assert tp.lerp(t, t, _meta(3)).dtype == tp.float32
+    assert tp.lerp(t, t, _meta(3, dtype=tp.float64)).dtype == tp.float64
+    assert tp.lerp_(t, _meta(3), 0.5) is t
+    assert tp.lerp_(t, _meta(3), _meta(3)) is t
+    with pytest.raises(Exception):
+        tp.lerp(t, t, _meta(2, 4))
+    with pytest.raises(Exception):
+        tp.lerp_(_meta(3), _meta(2, 3), 0.5)
+    with pytest.raises(Exception):
+        tp.lerp_(_meta(3), _meta(2, 3), _meta(2, 3))
+
+
+# ---------------------------------------------------------------------------
+# Triangular masks, diagonal embedding and plane rotations
+# ---------------------------------------------------------------------------
+
+
+def test_tril_triu_and_diagonals():
+    t = _meta(2, 4)
+    assert tuple(tp.tril(t).shape) == (2, 4)
+    assert tuple(tp.triu(t, 1).shape) == (2, 4)
+    assert tp.tril_(t) is t
+    assert tp.triu_(t, -1) is t
+    with pytest.raises(Exception):
+        tp.tril(_meta(4))
+
+    assert tuple(tp.diag_embed(_meta(3)).shape) == (3, 3)
+    assert tuple(tp.diag_embed(_meta(3), 1).shape) == (4, 4)
+    assert tuple(tp.diag_embed(_meta(2, 3)).shape) == (2, 3, 3)
+    assert tuple(tp.diag_embed(_meta(3), 0, 0, 1).shape) == (3, 3)
+    with pytest.raises(Exception):
+        tp.diag_embed(_meta(3), 0, 1, 1)
+    assert tuple(tp.diagflat(_meta(2, 2)).shape) == (4, 4)
+    assert tuple(tp.diagflat(_meta(2, 2), -1).shape) == (5, 5)
+    assert tuple(tp.diag(_meta(3)).shape) == (3, 3)
+    assert tuple(tp.diag(_meta(2, 4)).shape) == (2,)
+    with pytest.raises(Exception):
+        tp.diag(_meta(2, 3, 4))
+
+
+def test_rot90_and_cartesian_prod():
+    t = _meta(2, 3, 4)
+    turned = tp.rot90(t)
+    assert tuple(turned.shape) == (3, 2, 4)
+    assert tuple(turned.stride()) == (4, 12, 1)
+    assert tuple(tp.rot90(t, 2).shape) == (2, 3, 4)
+    assert tuple(tp.rot90(t, 3).shape) == (3, 2, 4)
+    assert tuple(tp.rot90(t, 4).shape) == (2, 3, 4)
+    assert tuple(tp.rot90(t, 1, [0, 2]).shape) == (4, 3, 2)
+    with pytest.raises(Exception):
+        tp.rot90(t, 0, [0, 0])
+    with pytest.raises(Exception):
+        tp.rot90(t, 0, [0])
+    with pytest.raises(Exception):
+        tp.rot90(_meta(3), 0)
+
+    assert tuple(tp.cartesian_prod(_meta(3), _meta(4)).shape) == (12, 2)
+    assert tp.cartesian_prod(_meta(3, dtype=tp.int32),
+                             _meta(4)).dtype == tp.float32
+    assert tuple(tp.cartesian_prod(_meta(3)).shape) == (3,)
+    with pytest.raises(Exception):
+        tp.cartesian_prod(_meta(2, 3), _meta(4))
+    with pytest.raises(Exception):
+        tp.cartesian_prod()
+
+
+# ---------------------------------------------------------------------------
+# Predicates and positional summaries
+# ---------------------------------------------------------------------------
+
+
+def test_all_any_and_logsumexp():
+    t = _meta(2, 3)
+    assert tuple(tp.all(t).shape) == ()
+    assert tp.all(t).dtype == tp.bool
+    assert tuple(tp.all(t, 1).shape) == (2,)
+    assert tuple(tp.all(t, 1, True).shape) == (2, 1)
+    assert tuple(tp.any(t).shape) == ()
+    assert tuple(tp.any(t, 0).shape) == (3,)
+    assert tp.any(t, 0).dtype == tp.bool
+
+    assert tuple(tp.logsumexp(t, 1).shape) == (2,)
+    assert tp.logsumexp(t, 1).dtype == tp.float32
+    assert tp.logsumexp(_meta(2, 3, dtype=tp.int32), 1).dtype == tp.float32
+    assert tp.logsumexp(_meta(2, 3, dtype=tp.float64), 1).dtype == tp.float64
+    assert tuple(tp.logsumexp(t, (0, 1)).shape) == ()
+    assert tuple(tp.logsumexp(_meta(), (0,)).shape) == ()
+    with pytest.raises(Exception):
+        tp.logsumexp(t, [0, 0])
+    with pytest.raises(Exception):
+        tp.logsumexp(_meta(2, dtype=tp.complex64), 0)
+
+
+def test_mode_and_kthvalue():
+    t = _meta(2, 3)
+    values, indices = tp.mode(t, 1)
+    assert tuple(values.shape) == (2,)
+    assert values.dtype == t.dtype
+    assert tuple(indices.shape) == (2,)
+    assert indices.dtype == tp.int64
+    values, indices = tp.mode(t, -1, True)
+    assert tuple(values.shape) == (2, 1)
+    assert tuple(tp.mode(_meta(), 0)[0].shape) == ()
+    with pytest.raises(Exception):
+        tp.mode(_meta(2, 0), 1)
+
+    values, indices = tp.kthvalue(t, 2, 1)
+    assert tuple(values.shape) == (2,)
+    assert values.dtype == t.dtype
+    assert indices.dtype == tp.int64
+    assert tuple(tp.kthvalue(t, 1, 0, True)[0].shape) == (1, 3)
+    assert tuple(tp.kthvalue(_meta(), 1, 0)[0].shape) == ()
+    with pytest.raises(Exception):
+        tp.kthvalue(t, 4, 1)
+    with pytest.raises(Exception):
+        tp.kthvalue(t, 0, 1)
+
+
+# ---------------------------------------------------------------------------
+# Flat gather, lookup tables and whole-tensor writes
+# ---------------------------------------------------------------------------
+
+
+def test_take_searchsorted_and_bucketize():
+    t = _meta(2, 3)
+    assert tuple(tp.take(t, _meta(4, dtype=tp.int64)).shape) == (4,)
+    assert tuple(tp.take(t, _meta(2, 2, dtype=tp.int64)).shape) == (2, 2)
+    assert tuple(tp.take(t, _meta(2, 2, 2, dtype=tp.int64)).shape) == (2, 2, 2)
+    assert tuple(tp.take(t, _meta(dtype=tp.int64)).shape) == ()
+
+    seq = _meta(5)
+    query = _meta(2, 3)
+    assert tuple(tp.searchsorted(seq, query).shape) == (2, 3)
+    assert tp.searchsorted(seq, query).dtype == tp.int64
+    assert tp.searchsorted(seq, query, out_int32=True).dtype == tp.int32
+    assert tuple(tp.searchsorted(seq, 2.0).shape) == ()
+    assert tuple(tp.searchsorted(_meta(2, 5), _meta(2, 4)).shape) == (2, 4)
+    with pytest.raises(Exception):
+        tp.searchsorted(_meta(1, 2), _meta(2, 2))
+    with pytest.raises(Exception):
+        tp.searchsorted(seq, query, side="middle")
+
+    assert tuple(tp.bucketize(query, seq).shape) == (2, 3)
+    assert tp.bucketize(query, seq, out_int32=True, right=True).dtype == tp.int32
+    assert tuple(tp.bucketize(1.0, seq).shape) == ()
+    with pytest.raises(Exception):
+        tp.bucketize(query, _meta(2, 3))
+
+
+def test_index_put_shapes():
+    t = _meta(4, 3)
+    rows = (_meta(2, dtype=tp.int64),)
+    written = tp.index_put(t, rows, _meta(2, 3))
+    assert tuple(written.shape) == (4, 3)
+    assert written.dtype == t.dtype
+    assert tuple(tp.index_put(t, rows, _meta(1, 3)).shape) == (4, 3)
+    assert tuple(tp.index_put(t, (_meta(4, 3, dtype=tp.bool),),
+                              tp.empty((), dtype=tp.float32, device="meta")).shape) == (4, 3)
+    assert tuple(tp.index_put_(t, rows, _meta(2, 3)).shape) == (4, 3)
+    with pytest.raises(Exception):
+        tp.index_put(t, rows, _meta(3, 3))
+    with pytest.raises(Exception):
+        tp.index_put(t, rows, _meta(2, 3, dtype=tp.int32))
+    with pytest.raises(Exception):
+        tp.index_put(t, (_meta(2, dtype=tp.int64),
+                         _meta(2, dtype=tp.int64),
+                         _meta(2, dtype=tp.int64),
+                         _meta(2, dtype=tp.int64)), _meta(2))
+
+
+# ---------------------------------------------------------------------------
 # Cross-checks against the reference framework when it is installed
 # ---------------------------------------------------------------------------
 
