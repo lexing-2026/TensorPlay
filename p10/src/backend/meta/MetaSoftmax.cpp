@@ -47,14 +47,24 @@ int64_t normalize_softmax_dim(int64_t dim, int64_t ndim) {
     return dim;
 }
 
+// The normalization runs on real numbers only: complex planes and booleans
+// have no form here and are refused after the axis is named.
+void require_softmax_dtype(DType dt) {
+    if (isComplexType(dt) || dt == DType::Bool) {
+        TP_THROW(TypeError, "softmax: unsupported dtype");
+    }
+}
+
 Tensor softmax_kernel(const Tensor& self, int64_t dim, DType dtype) {
     (void)normalize_softmax_dim(dim, self.dim());
+    require_softmax_dtype(self.dtype());
     return empty_meta(shape_of(self), softmax_answer_dtype(self.dtype(), dtype),
                       self.device());
 }
 
 Tensor log_softmax_kernel(const Tensor& self, int64_t dim, DType dtype) {
     (void)normalize_softmax_dim(dim, self.dim());
+    require_softmax_dtype(self.dtype());
     return empty_meta(shape_of(self), softmax_answer_dtype(self.dtype(), dtype),
                       self.device());
 }

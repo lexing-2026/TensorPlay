@@ -1776,9 +1776,47 @@ Tensor vander_kernel(const Tensor& x, std::optional<int64_t> n,
     return empty_meta({x.size(0), columns},
                       promoteTypes(x.dtype(), DType::Int64), x.device());
 }
+// Resizing a shape-only tensor touches metadata alone: the sizes are
+// rewritten contiguously and the recorded storage length grows with them,
+// never an allocation.  A call that keeps the current sizes is a no-op that
+// preserves the strides.
+Tensor& resize__kernel(Tensor& self, const std::vector<int64_t>& size) {
+    auto* impl = self.unsafeGetTensorImpl().get();
+    if (static_cast<std::vector<int64_t>>(impl->sizes()) == size) {
+        return self;
+    }
+    bool has_zero = false;
+    for (int64_t s : size) {
+        if (s < 0) {
+            TP_THROW(ValueError, "resize_: negative sizes are not allowed");
+        }
+        has_zero = has_zero || s == 0;
+    }
+    size_t new_numel = has_zero ? 0 : 1;
+    for (int64_t s : size) {
+        if (new_numel != 0 &&
+            static_cast<size_t>(s) >
+                std::numeric_limits<size_t>::max() / new_numel) {
+            TP_THROW(RuntimeError, "resize_: requested size is too large");
+        }
+        new_numel *= static_cast<size_t>(s);
+    }
+    if (impl->itemsize() != 0 &&
+        new_numel > std::numeric_limits<size_t>::max() / impl->itemsize()) {
+        TP_THROW(RuntimeError, "resize_: requested storage is too large");
+    }
+    const size_t new_bytes = new_numel * impl->itemsize();
+    if (impl->has_storage() && new_bytes > impl->storage().nbytes()) {
+        Storage storage = impl->storage();
+        storage.set_nbytes(new_bytes);
+    }
+    impl->set_sizes_contiguous(size);
+    return self;
+}
 } // anonymous namespace
 
 TENSORPLAY_LIBRARY_IMPL(Meta, MetaShape) {
+    m.impl("resize_", resize__kernel);
     m.impl("t", t_kernel);
     m.impl("unfold", unfold_kernel);
     m.impl("tril", triangular_kernel);

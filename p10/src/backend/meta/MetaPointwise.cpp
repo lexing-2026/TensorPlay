@@ -358,19 +358,56 @@ Tensor threshold_kernel(const Tensor& self, const Scalar& /*threshold*/,
         return empty_meta(shape_of(self), self.dtype(), self.device());       \
     }
 
-// A float-only unary op answers an integral operand in the default floating
-// type; see ``unary_float_dtype``.
+// A float-only unary op answers an integral operand in single precision; see
+// ``unary_float_dtype``.
 #define META_UNARY_FLOAT_KERNEL(NAME)                                         \
     Tensor NAME##_kernel(const Tensor& self) {                                \
         return empty_meta(shape_of(self), unary_float_dtype(self.dtype()),     \
                           self.device());                                     \
     }
 
+// A float-math sweep accepts operands of any width: the computation runs in
+// floating precision, so a floating operand keeps its width and everything
+// else -- integers, booleans, complex planes -- is answered in single
+// precision; see ``float_math_dtype``.
+#define META_UNARY_FLOAT_MATH_KERNEL(NAME)                                    \
+    Tensor NAME##_kernel(const Tensor& self) {                                \
+        return empty_meta(shape_of(self), float_math_dtype(self.dtype()),     \
+                          self.device());                                     \
+    }
+
+// The error-function maps have a real-number form only: integers answer in
+// single precision, every other operand -- complex planes, booleans, the
+// 8-bit floats -- is refused.
+Tensor erf_kernel(const Tensor& self) {
+    const DType dt = self.dtype();
+    if (!isIntegralType(dt) && !isFloatingType(dt)) {
+        TP_THROW(TypeError, "Unsupported dtype (expected float)");
+    }
+    return empty_meta(shape_of(self), float_math_dtype(dt), self.device());
+}
+
+Tensor erfc_kernel(const Tensor& self) {
+    const DType dt = self.dtype();
+    if (!isIntegralType(dt) && !isFloatingType(dt)) {
+        TP_THROW(TypeError, "Unsupported dtype (expected float)");
+    }
+    return empty_meta(shape_of(self), float_math_dtype(dt), self.device());
+}
+
+Tensor lgamma_kernel(const Tensor& self) {
+    const DType dt = self.dtype();
+    if (!isIntegralType(dt) && !isFloatingType(dt)) {
+        TP_THROW(TypeError, "Unsupported dtype (expected float)");
+    }
+    return empty_meta(shape_of(self), float_math_dtype(dt), self.device());
+}
+
 META_UNARY_FLOAT_KERNEL(silu)
 META_UNARY_FLOAT_KERNEL(rsqrt)
 META_UNARY_FLOAT_KERNEL(cos)
 META_UNARY_FLOAT_KERNEL(sin)
-META_UNARY_FLOAT_KERNEL(exp2)
+META_UNARY_FLOAT_MATH_KERNEL(exp2)
 META_UNARY_FLOAT_KERNEL(expm1)
 META_UNARY_FLOAT_KERNEL(log2)
 META_UNARY_FLOAT_KERNEL(log10)
@@ -386,17 +423,15 @@ META_UNARY_FLOAT_KERNEL(acosh)
 META_UNARY_FLOAT_KERNEL(atanh)
 META_UNARY_FLOAT_KERNEL(reciprocal)
 META_UNARY_KERNEL(square)
-META_UNARY_FLOAT_KERNEL(sinc)
-META_UNARY_FLOAT_KERNEL(erf)
-META_UNARY_FLOAT_KERNEL(erfc)
-META_UNARY_FLOAT_KERNEL(erfinv)
-META_UNARY_FLOAT_KERNEL(lgamma)
-META_UNARY_FLOAT_KERNEL(digamma)
-META_UNARY_FLOAT_KERNEL(i0)
+META_UNARY_FLOAT_MATH_KERNEL(sinc)
+META_UNARY_FLOAT_MATH_KERNEL(erfinv)
+META_UNARY_FLOAT_MATH_KERNEL(digamma)
+META_UNARY_FLOAT_MATH_KERNEL(i0)
 META_UNARY_FLOAT_KERNEL(deg2rad)
 META_UNARY_FLOAT_KERNEL(rad2deg)
 #undef META_UNARY_KERNEL
 #undef META_UNARY_FLOAT_KERNEL
+#undef META_UNARY_FLOAT_MATH_KERNEL
 
 Tensor absolute_kernel(const Tensor& self) {
     return abs_kernel(self);
@@ -500,12 +535,12 @@ Tensor positive_kernel(const Tensor& self) {
 }
 
 Tensor entr_kernel(const Tensor& self) {
-    return empty_meta(shape_of(self), float_unary_dtype(self.dtype()),
+    return empty_meta(shape_of(self), float_math_dtype(self.dtype()),
                       self.device());
 }
 
 Tensor logit_kernel(const Tensor& self, const std::optional<Scalar>& /*eps*/) {
-    return empty_meta(shape_of(self), float_unary_dtype(self.dtype()),
+    return empty_meta(shape_of(self), float_math_dtype(self.dtype()),
                       self.device());
 }
 

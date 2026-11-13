@@ -207,28 +207,30 @@ Tensor log_sigmoid_kernel(const Tensor& self) {
 
 Tensor floor_kernel(const Tensor& self) {
     if (isComplexType(self.dtype())) {
-        TP_THROW(NotImplementedError,
-                 "floor is not supported for complex inputs");
+        TP_THROW(TypeError, "Unsupported dtype");
     }
     return unary_meta(self);
 }
 
 Tensor ceil_kernel(const Tensor& self) {
     if (isComplexType(self.dtype())) {
-        TP_THROW(NotImplementedError,
-                 "ceil is not supported for complex inputs");
+        TP_THROW(TypeError, "Unsupported dtype");
     }
     return unary_meta(self);
 }
 
 Tensor round_kernel(const Tensor& self) {
+    // The rounding sweep keeps every real operand's own width and has no
+    // complex form.
+    if (isComplexType(self.dtype())) {
+        TP_THROW(TypeError, "Unsupported dtype");
+    }
     return unary_meta(self);
 }
 
 Tensor trunc_kernel(const Tensor& self) {
     if (isComplexType(self.dtype())) {
-        TP_THROW(NotImplementedError,
-                 "trunc is not supported for complex inputs");
+        TP_THROW(TypeError, "Unsupported dtype");
     }
     return unary_meta(self);
 }
@@ -238,6 +240,9 @@ Tensor& trunc_inplace_kernel(Tensor& self) {
 }
 
 Tensor frac_kernel(const Tensor& self) {
+    if (isComplexType(self.dtype())) {
+        TP_THROW(TypeError, "Unsupported dtype");
+    }
     return unary_meta(self);
 }
 

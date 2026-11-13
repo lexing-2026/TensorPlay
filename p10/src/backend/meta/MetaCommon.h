@@ -98,14 +98,21 @@ inline Device resolve_like_device(const std::optional<Device>& device,
     return device.has_value() ? *device : self.device();
 }
 
-// A float-only pointwise op answers an integral or boolean operand in the
-// default floating type, because the operation has no integral form to answer
-// in; a floating or complex operand keeps its own type.
+// A float-only pointwise op answers an integral or boolean operand in single
+// precision, because the operation has no integral form to answer in; a
+// floating or complex operand keeps its own type.
 inline DType unary_float_dtype(DType dtype) {
     if (isIntegralType(dtype, /*includeBool=*/true)) {
-        return globalContext().defaultDType();
+        return DType::Float32;
     }
     return dtype;
+}
+
+// The float-math sweeps compute at floating precision and have no complex
+// form anywhere: a floating operand keeps its width, every other operand --
+// integers, booleans, complex planes -- is answered in single precision.
+inline DType float_math_dtype(DType dtype) {
+    return isFloatingType(dtype) ? dtype : DType::Float32;
 }
 
 // Result dtype for add/sub-style arithmetic: promote the operands, and a
