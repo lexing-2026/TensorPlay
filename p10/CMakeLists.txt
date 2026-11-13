@@ -170,6 +170,14 @@ set(P10_SOURCES
     src/backend/composite/Reduction.cpp
     src/backend/composite/Spectral.cpp
     src/backend/meta/MetaKernels.cpp
+    src/backend/meta/MetaActivations.cpp
+    src/backend/meta/MetaSoftmax.cpp
+    src/backend/meta/MetaNormalization.cpp
+    src/backend/meta/MetaPooling.cpp
+    src/backend/meta/MetaShape.cpp
+    src/backend/meta/MetaLoss.cpp
+    src/backend/meta/MetaEmbedding.cpp
+    src/backend/meta/MetaNorm.cpp
     src/backend/composite/RNN.cpp
     src/backend/composite/TensorAdvancedIndexing.cpp
     src/backend/composite/TensorCompare.cpp
