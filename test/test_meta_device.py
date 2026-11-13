@@ -1700,6 +1700,243 @@ def test_median_nanmedian_and_running_extrema():
 
 
 # ---------------------------------------------------------------------------
+# Linear algebra
+#
+# Every factorization and solve reports the geometry of its result plus the
+# integer status planes that describe the value-dependent outcome.  Failures
+# that depend on the stored numbers cannot fire here; argument errors do.
+# ---------------------------------------------------------------------------
+
+
+def test_linalg_factorization_shapes_and_info():
+    a = _meta(2, 3, 3)
+    assert tuple(tp.linalg.cholesky(a).shape) == (2, 3, 3)
+    lower, info = tp.linalg.cholesky_ex(a)
+    assert tuple(lower.shape) == (2, 3, 3)
+    assert info.dtype == tp.int32 and tuple(info.shape) == (2,)
+    assert tuple(tp.linalg.inv(a).shape) == (2, 3, 3)
+    inverse, inv_info = tp.linalg.inv_ex(a)
+    assert tuple(inverse.shape) == (2, 3, 3)
+    assert inv_info.dtype == tp.int32 and tuple(inv_info.shape) == (2,)
+
+    det = tp.linalg.det(a)
+    assert tuple(det.shape) == (2,) and det.dtype == tp.float32
+    assert tuple(tp.linalg.det(_meta(3, 3)).shape) == ()
+    sign, logabsdet = tp.linalg.slogdet(a)
+    assert tuple(sign.shape) == (2,)
+    assert tuple(logabsdet.shape) == (2,)
+    sign, logabsdet = tp.linalg.slogdet(_meta(4, 4, dtype=tp.complex64))
+    assert sign.dtype == tp.complex64
+    assert logabsdet.dtype == tp.float32
+
+    with pytest.raises(Exception):
+        tp.linalg.det(_meta(3, 4))
+    with pytest.raises(Exception):
+        tp.linalg.det(_meta(3))
+    with pytest.raises(Exception):
+        tp.linalg.cholesky(_meta(3, 3, dtype=tp.int32))
+    with pytest.raises(Exception):
+        tp.linalg.inv(_meta(2, 4))
+
+
+def test_linalg_lu_family():
+    a = _meta(2, 4, 5)
+    lu, pivots, info = tp.linalg.lu_factor_ex(a)
+    assert tuple(lu.shape) == (2, 4, 5)
+    assert pivots.dtype == tp.int32 and tuple(pivots.shape) == (2, 4)
+    assert info.dtype == tp.int32 and tuple(info.shape) == (2,)
+
+    P, L, U = tp.linalg.lu(a)
+    assert (tuple(P.shape), tuple(L.shape), tuple(U.shape)) == (
+        (2, 4, 4), (2, 4, 4), (2, 4, 5))
+    with pytest.raises(Exception):
+        tp.linalg.lu(a, pivot=False)
+
+    # Only a square factorization can be solved against.
+    with pytest.raises(Exception):
+        tp.linalg.lu_solve(lu, pivots, _meta(2, 5, 4))
+    square = _meta(2, 3, 3)
+    slu, spivots, _ = tp.linalg.lu_factor_ex(square)
+    assert tuple(tp.linalg.lu_solve(slu, spivots, _meta(2, 3, 4)).shape) == (2, 3, 4)
+    unbatched, unbatched_pivots, _ = tp.linalg.lu_factor_ex(_meta(3, 3))
+    assert tuple(tp.linalg.lu_solve(unbatched, unbatched_pivots,
+                                    _meta(3)).shape) == (3,)
+    with pytest.raises(Exception):
+        tp.linalg.lu_solve(slu, _meta(2, 3, dtype=tp.int64), _meta(3))
+    p, l, u = tp.lu_unpack(lu, pivots)
+    assert (tuple(p.shape), tuple(l.shape), tuple(u.shape)) == (
+        (2, 4, 4), (2, 4, 4), (2, 4, 5))
+    p, l, u = tp.lu_unpack(lu, pivots, unpack_pivots=False)
+    assert tuple(p.shape) == (0,) and tuple(l.shape) == (2, 4, 4)
+    p, l, u = tp.lu_unpack(lu, pivots, unpack_data=False)
+    assert tuple(l.shape) == (0,) and tuple(u.shape) == (0,)
+    with pytest.raises(Exception):
+        tp.lu_unpack(lu, _meta(2, 4, dtype=tp.int64))
+
+
+def test_linalg_solves():
+    a = _meta(2, 3, 3)
+    x, info = tp.linalg.solve_ex(a, _meta(2, 3, 4))
+    assert tuple(x.shape) == (2, 3, 4)
+    assert info.dtype == tp.int32 and tuple(info.shape) == (2,)
+    x, _ = tp.linalg.solve_ex(a, _meta(2, 3))
+    assert tuple(x.shape) == (2, 3)
+    assert tuple(tp.linalg.solve(a, _meta(2, 3, 4)).shape) == (2, 3, 4)
+    assert tuple(tp.linalg.solve(a, _meta(2, 3)).shape) == (2, 3)
+
+    tri = tp.linalg.solve_triangular(a, _meta(2, 3, 4), upper=True)
+    assert tuple(tri.shape) == (2, 3, 4)
+    tri = tp.linalg.solve_triangular(a, _meta(2, 4, 3), upper=False, left=False)
+    assert tuple(tri.shape) == (2, 4, 3)
+
+    with pytest.raises(Exception):
+        tp.linalg.solve(_meta(3, 4), _meta(3))
+    with pytest.raises(Exception):
+        tp.linalg.solve(a, _meta(2, 4, 2))
+    with pytest.raises(Exception):
+        tp.linalg.solve_ex(a, _meta(2, 3), left=False)
+    with pytest.raises(Exception):
+        tp.linalg.solve_triangular(a, _meta(2, 3), upper=True)
+
+
+def test_linalg_least_squares_and_ldl():
+    # The default driver is the rank-revealing one: it reports a batch of
+    # ranks and no residuals.
+    solution, residuals, rank, singular = tp.linalg.lstsq(
+        _meta(2, 5, 3), _meta(2, 5, 2))
+    assert tuple(solution.shape) == (2, 3, 2)
+    assert tuple(residuals.shape) == (0,)
+    assert rank.dtype == tp.int64 and tuple(rank.shape) == (2,)
+    assert tuple(singular.shape) == (0,)
+
+    solution, residuals, rank, singular = tp.linalg.lstsq(
+        _meta(2, 5, 3), _meta(2, 5, 2), driver="gels")
+    assert tuple(solution.shape) == (2, 3, 2)
+    assert tuple(residuals.shape) == (2, 2)
+    assert tuple(rank.shape) == (0,)
+    assert tuple(singular.shape) == (0,)
+
+    _, _, rank, singular = tp.linalg.lstsq(
+        _meta(2, 5, 3), _meta(2, 5, 2), driver="gelsd")
+    assert tuple(rank.shape) == (2,)
+    assert tuple(singular.shape) == (2, 3)
+
+    solution, residuals, rank, _ = tp.linalg.lstsq(_meta(5, 3), _meta(5))
+    assert tuple(solution.shape) == (3,)
+    assert tuple(residuals.shape) == (0,)
+    assert tuple(rank.shape) == ()
+    # An underdetermined system reports the wide solution plane.
+    solution, *_ = tp.linalg.lstsq(_meta(3, 5), _meta(3, 2))
+    assert tuple(solution.shape) == (5, 2)
+
+    with pytest.raises(Exception):
+        tp.linalg.lstsq(_meta(3, 3), _meta(4, 2))
+    with pytest.raises(Exception):
+        tp.linalg.lstsq(_meta(3, 3), _meta(3, 2), driver="bogus")
+
+    a = _meta(2, 3, 3)
+    ld, pivots = tp.linalg.ldl_factor(a)
+    assert tuple(ld.shape) == (2, 3, 3)
+    assert pivots.dtype == tp.int32 and tuple(pivots.shape) == (2, 3)
+    ld, pivots, info = tp.linalg.ldl_factor_ex(a)
+    assert info.dtype == tp.int32 and tuple(info.shape) == (2,)
+    assert tuple(tp.linalg.ldl_solve(ld, pivots, _meta(2, 3, 4)).shape) == (2, 3, 4)
+
+
+def test_linalg_eigen_and_svd():
+    values, vectors = tp.linalg.eigh(_meta(2, 3, 3))
+    assert tuple(values.shape) == (2, 3) and values.dtype == tp.float32
+    assert tuple(vectors.shape) == (2, 3, 3) and vectors.dtype == tp.float32
+    values, vectors = tp.linalg.eigh(_meta(2, 3, 3, dtype=tp.complex64))
+    assert values.dtype == tp.float32
+    assert vectors.dtype == tp.complex64
+    assert tuple(tp.linalg.eigvalsh(_meta(2, 3, 3, dtype=tp.float64)).shape) == (2, 3)
+
+    values, vectors = tp.linalg.eig(_meta(2, 3, 3))
+    assert tuple(values.shape) == (2, 3) and values.dtype == tp.complex64
+    assert tuple(vectors.shape) == (2, 3, 3) and vectors.dtype == tp.complex64
+    assert tp.linalg.eigvals(_meta(3, 3, dtype=tp.float64)).dtype == tp.complex128
+
+    u, s, vh = tp.linalg.svd(_meta(2, 4, 3), full_matrices=True)
+    assert (tuple(u.shape), tuple(s.shape), tuple(vh.shape)) == (
+        (2, 4, 4), (2, 3), (2, 3, 3))
+    u, s, vh = tp.linalg.svd(_meta(2, 4, 3), full_matrices=False)
+    assert (tuple(u.shape), tuple(s.shape), tuple(vh.shape)) == (
+        (2, 4, 3), (2, 3), (2, 3, 3))
+    u, s, vh = tp.linalg.svd(_meta(4, 3, dtype=tp.complex64), full_matrices=False)
+    assert u.dtype == tp.complex64 and s.dtype == tp.float32
+    assert vh.dtype == tp.complex64
+    assert tuple(tp.linalg.svdvals(_meta(2, 4, 3)).shape) == (2, 3)
+
+    # An empty matrix has nothing to factor, so the integer gate is skipped
+    # and the empty factors keep the input dtype.
+    u, s, vh = tp.linalg.svd(_meta(0, 3, dtype=tp.int64))
+    assert (tuple(u.shape), tuple(s.shape), tuple(vh.shape)) == (
+        (0, 0), (0,), (3, 3))
+    assert u.dtype == tp.int64 and vh.dtype == tp.int64
+    assert tuple(tp.linalg.svdvals(_meta(0, 0)).shape) == (0,)
+
+    with pytest.raises(Exception):
+        tp.linalg.eigh(_meta(3, 4))
+    with pytest.raises(Exception):
+        tp.linalg.eigh(_meta(3, 3), UPLO="X")
+    with pytest.raises(Exception):
+        tp.linalg.eig(_meta(3, 3, dtype=tp.int32))
+    with pytest.raises(Exception):
+        tp.linalg.svd(_meta(3, 3), driver="gesvdj")
+    with pytest.raises(Exception):
+        tp.linalg.svd(_meta(3, 3, dtype=tp.int32))
+
+
+def test_linalg_qr_and_householder():
+    a = _meta(2, 4, 3)
+    q, r = tp.linalg.qr(a)
+    assert (tuple(q.shape), tuple(r.shape)) == ((2, 4, 3), (2, 3, 3))
+    q, r = tp.linalg.qr(a, mode="complete")
+    assert (tuple(q.shape), tuple(r.shape)) == ((2, 4, 4), (2, 4, 3))
+    q, r = tp.linalg.qr(a, mode="r")
+    assert (tuple(q.shape), tuple(r.shape)) == ((2, 4, 0), (2, 3, 3))
+    with pytest.raises(Exception):
+        tp.linalg.qr(a, mode="bogus")
+    with pytest.raises(Exception):
+        tp.linalg.qr(_meta(3))
+
+    # The product replaces the reflectors of an m x n input with n <= m.
+    assert tuple(tp.linalg.householder_product(a, _meta(2, 3)).shape) == (2, 4, 3)
+    with pytest.raises(Exception):
+        tp.linalg.householder_product(_meta(3, 4), _meta(3))
+    with pytest.raises(Exception):
+        tp.linalg.householder_product(a, _meta(2, 2))
+
+
+def test_linalg_pinv_diagonal_and_empty():
+    assert tuple(tp.linalg.pinv(_meta(2, 4, 3)).shape) == (2, 3, 4)
+    assert tuple(tp.linalg.pinv(_meta(3, 4)).shape) == (4, 3)
+    assert tuple(tp.linalg.pinv(_meta(2, 3, 3), hermitian=True).shape) == (2, 3, 3)
+
+    # A tolerance that carries a batch broadcasts into the result batch; a
+    # tolerance without one leaves the input batch alone.
+    a = _meta(2, 4, 3)
+    assert tuple(tp.linalg.pinv(a, rtol=_meta(2, 1)).shape) == (2, 2, 3, 4)
+    assert tuple(tp.linalg.pinv(a, atol=_meta(2, 1)).shape) == (2, 2, 3, 4)
+    assert tuple(tp.linalg.pinv(a, rtol=_meta(2)).shape) == (2, 3, 4)
+    # An empty input short-circuits before any tolerance batch is merged.
+    assert tuple(tp.linalg.pinv(_meta(3, 0), rtol=_meta(2, 1)).shape) == (0, 3)
+    with pytest.raises(Exception):
+        tp.linalg.pinv(_meta(2, 3, dtype=tp.int32))
+    with pytest.raises(Exception):
+        tp.linalg.pinv(_meta(2, 4, 3), hermitian=True)
+
+    assert tuple(tp.linalg.diagonal(_meta(2, 3, 4)).shape) == (2, 3)
+    assert tuple(tp.linalg.diagonal(_meta(2, 3, 4), offset=1).shape) == (2, 3)
+    assert tuple(tp.linalg.diagonal(_meta(2, 3, 4), offset=-2).shape) == (2, 1)
+    with pytest.raises(Exception):
+        tp.linalg.diagonal(_meta(2, 3, 4), dim1=1, dim2=1)
+    with pytest.raises(Exception):
+        tp.linalg.diagonal(_meta(2, 3, 4), dim1=0, dim2=5)
+
+
+# ---------------------------------------------------------------------------
 # Cross-checks against the reference framework when it is installed
 # ---------------------------------------------------------------------------
 
