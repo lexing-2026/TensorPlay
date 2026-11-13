@@ -559,6 +559,12 @@ def get_device_properties(device: Any = None) -> "_CudaDeviceProperties":
     device = _get_device_index(device, optional=True)
     if device < 0 or device >= device_count():
         raise AssertionError("Invalid device id")
+    return _cached_device_properties(device)
+
+
+@lru_cache(maxsize=None)
+def _cached_device_properties(device: int) -> "_CudaDeviceProperties":
+    """Properties are fixed hardware facts, so one query per device is enough."""
     return _lcuda.get_device_properties(device)
 
 

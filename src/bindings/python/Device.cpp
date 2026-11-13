@@ -6,6 +6,8 @@
 #include "cpu/vec/intrinsics.h"
 
 #include <optional>
+#include <mutex>
+#include <vector>
 
 #if defined(__linux__) && defined(__x86_64__) && !defined(__ANDROID__)
 #include <sys/syscall.h>
@@ -44,6 +46,52 @@ struct CudaDeviceProperties {
     int clock_rate;
     size_t L2_cache_size;
 };
+
+// The runtime query behind these figures costs more than a kernel launch, and
+// codegen asks for them per kernel it colors.  A device's figures never change
+// while the process runs, so each device is queried once and the answer is
+// handed out afterwards.
+static const CudaDeviceProperties& cached_device_properties(int device) {
+    static std::mutex cache_mutex;
+    static std::vector<std::optional<CudaDeviceProperties>> cache(16);
+    std::lock_guard<std::mutex> guard(cache_mutex);
+    if (device < 0 || device >= static_cast<int>(cache.size())) {
+        throw std::runtime_error("Invalid device id");
+    }
+    std::optional<CudaDeviceProperties>& slot = cache[device];
+    if (!slot) {
+        cudaDeviceProp prop;
+        cudaError_t err = cudaGetDeviceProperties(&prop, device);
+        if (err != cudaSuccess) {
+            throw std::runtime_error("CUDA error: " + std::string(cudaGetErrorString(err)));
+        }
+        CudaDeviceProperties p;
+        p.name = prop.name;
+        p.major = prop.major;
+        p.minor = prop.minor;
+        p.total_memory = prop.totalGlobalMem;
+        p.multi_processor_count = prop.multiProcessorCount;
+        p.warp_size = prop.warpSize;
+        p.max_threads_per_multi_processor = prop.maxThreadsPerMultiProcessor;
+        p.max_threads_per_block = prop.maxThreadsPerBlock;
+        p.regs_per_multiprocessor = prop.regsPerMultiprocessor;
+        p.shared_memory_per_block = prop.sharedMemPerBlock;
+        p.shared_memory_per_block_optin = prop.sharedMemPerBlockOptin;
+        p.shared_memory_per_multiprocessor = prop.sharedMemPerMultiprocessor;
+        p.memory_bus_width = prop.memoryBusWidth;
+        // Clock fields moved out of cudaDeviceProp in CUDA 12; read them
+        // through the device attribute interface instead.
+        int memory_clock_khz = 0;
+        int clock_khz = 0;
+        cudaDeviceGetAttribute(&memory_clock_khz, cudaDevAttrMemoryClockRate, device);
+        cudaDeviceGetAttribute(&clock_khz, cudaDevAttrClockRate, device);
+        p.memory_clock_rate = memory_clock_khz * 1000;
+        p.clock_rate = clock_khz * 1000;
+        p.L2_cache_size = prop.l2CacheSize;
+        slot = std::move(p);
+    }
+    return *slot;
+}
 #endif
 
 #ifdef USE_MPS
@@ -375,12 +423,7 @@ void init_device(py::module_& m) {
 
     cuda.def("get_device_name", [](int device) {
 #ifdef USE_CUDA
-        cudaDeviceProp prop;
-        cudaError_t err = cudaGetDeviceProperties(&prop, device);
-        if (err != cudaSuccess) {
-            throw std::runtime_error("CUDA error: " + std::string(cudaGetErrorString(err)));
-        }
-        return std::string(prop.name);
+        return cached_device_properties(device).name;
 #else
         throw std::runtime_error("CUDA is not available");
 #endif
@@ -388,12 +431,8 @@ void init_device(py::module_& m) {
 
     cuda.def("get_device_capability", [](int device) {
 #ifdef USE_CUDA
-        cudaDeviceProp prop;
-        cudaError_t err = cudaGetDeviceProperties(&prop, device);
-        if (err != cudaSuccess) {
-            throw std::runtime_error("CUDA error: " + std::string(cudaGetErrorString(err)));
-        }
-        return std::make_pair(prop.major, prop.minor);
+        return std::make_pair(cached_device_properties(device).major,
+                              cached_device_properties(device).minor);
 #else
         throw std::runtime_error("CUDA is not available");
 #endif
@@ -401,35 +440,7 @@ void init_device(py::module_& m) {
 
     cuda.def("get_device_properties", [](int device) {
 #ifdef USE_CUDA
-        cudaDeviceProp prop;
-        cudaError_t err = cudaGetDeviceProperties(&prop, device);
-        if (err != cudaSuccess) {
-            throw std::runtime_error("CUDA error: " + std::string(cudaGetErrorString(err)));
-        }
-        CudaDeviceProperties p;
-        p.name = prop.name;
-        p.major = prop.major;
-        p.minor = prop.minor;
-        p.total_memory = prop.totalGlobalMem;
-        p.multi_processor_count = prop.multiProcessorCount;
-        p.warp_size = prop.warpSize;
-        p.max_threads_per_multi_processor = prop.maxThreadsPerMultiProcessor;
-        p.max_threads_per_block = prop.maxThreadsPerBlock;
-        p.regs_per_multiprocessor = prop.regsPerMultiprocessor;
-        p.shared_memory_per_block = prop.sharedMemPerBlock;
-        p.shared_memory_per_block_optin = prop.sharedMemPerBlockOptin;
-        p.shared_memory_per_multiprocessor = prop.sharedMemPerMultiprocessor;
-        p.memory_bus_width = prop.memoryBusWidth;
-        // Clock fields moved out of cudaDeviceProp in CUDA 12; read them
-        // through the device attribute interface instead.
-        int memory_clock_khz = 0;
-        int clock_khz = 0;
-        cudaDeviceGetAttribute(&memory_clock_khz, cudaDevAttrMemoryClockRate, device);
-        cudaDeviceGetAttribute(&clock_khz, cudaDevAttrClockRate, device);
-        p.memory_clock_rate = memory_clock_khz * 1000;
-        p.clock_rate = clock_khz * 1000;
-        p.L2_cache_size = prop.l2CacheSize;
-        return p;
+        return cached_device_properties(device);
 #else
         throw std::runtime_error("CUDA is not available");
 #endif
