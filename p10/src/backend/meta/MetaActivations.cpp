@@ -264,6 +264,36 @@ Tensor clamp_max_tensor_kernel(const Tensor& self, const Tensor& max) {
     return empty_meta(broadcast2(self, max), self.dtype(), self.device());
 }
 
+// An in-place clamp writes element data a meta tensor does not own, so the
+// result is the operand itself: its geometry and type are already the ones
+// the write would leave behind.
+Tensor& clamp_inplace_kernel(Tensor& self, const std::optional<Scalar>& /*min*/,
+                             const std::optional<Scalar>& /*max*/) {
+    return self;
+}
+
+Tensor& clamp_tensor_inplace_kernel(Tensor& self,
+                                    const std::optional<Tensor>& /*min*/,
+                                    const std::optional<Tensor>& /*max*/) {
+    return self;
+}
+
+Tensor& clamp_min_scalar_inplace_kernel(Tensor& self, const Scalar& /*min*/) {
+    return self;
+}
+
+Tensor& clamp_max_scalar_inplace_kernel(Tensor& self, const Scalar& /*max*/) {
+    return self;
+}
+
+Tensor& clamp_min_tensor_inplace_kernel(Tensor& self, const Tensor& /*min*/) {
+    return self;
+}
+
+Tensor& clamp_max_tensor_inplace_kernel(Tensor& self, const Tensor& /*max*/) {
+    return self;
+}
+
 // ---------------------------------------------------------------------------
 // Power.
 // ---------------------------------------------------------------------------
@@ -397,6 +427,15 @@ TENSORPLAY_LIBRARY_IMPL(Meta, MetaActivations) {
     m.impl("clamp_max.Scalar", clamp_max_scalar_kernel);
     m.impl("clamp_min.Tensor", clamp_min_tensor_kernel);
     m.impl("clamp_max.Tensor", clamp_max_tensor_kernel);
+    m.impl("clamp_", clamp_inplace_kernel);
+    m.impl("clamp_.Scalar", clamp_inplace_kernel);
+    m.impl("clamp_.Tensor", clamp_tensor_inplace_kernel);
+    m.impl("clamp_min_", clamp_min_scalar_inplace_kernel);
+    m.impl("clamp_min_.Scalar", clamp_min_scalar_inplace_kernel);
+    m.impl("clamp_max_", clamp_max_scalar_inplace_kernel);
+    m.impl("clamp_max_.Scalar", clamp_max_scalar_inplace_kernel);
+    m.impl("clamp_min_.Tensor", clamp_min_tensor_inplace_kernel);
+    m.impl("clamp_max_.Tensor", clamp_max_tensor_inplace_kernel);
 
     // Power.
     m.impl("pow.Tensor_Scalar", pow_tensor_scalar_kernel);
