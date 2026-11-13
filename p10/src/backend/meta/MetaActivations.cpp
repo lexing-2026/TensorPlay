@@ -28,6 +28,17 @@ Tensor unary_meta(const Tensor& self) {
     return empty_meta(shape_of(self), self.dtype(), self.device());
 }
 
+// A float-only activation answers an integral or boolean operand in the
+// default floating type, having no integral form to answer in; a floating or
+// complex operand keeps its own type.
+Tensor float_unary_meta(const Tensor& self) {
+    DType dtype = self.dtype();
+    if (isIntegralType(dtype, /*includeBool=*/true)) {
+        dtype = globalContext().defaultDType();
+    }
+    return empty_meta(shape_of(self), dtype, self.device());
+}
+
 // ---------------------------------------------------------------------------
 // Activations.
 // ---------------------------------------------------------------------------
@@ -41,7 +52,7 @@ Tensor& relu_inplace_kernel(Tensor& self) {
 }
 
 Tensor gelu_kernel(const Tensor& self, const std::string& /*approximate*/) {
-    return unary_meta(self);
+    return float_unary_meta(self);
 }
 
 Tensor& gelu_inplace_kernel(Tensor& self, const std::string& /*approximate*/) {
@@ -49,7 +60,7 @@ Tensor& gelu_inplace_kernel(Tensor& self, const std::string& /*approximate*/) {
 }
 
 Tensor tanh_kernel(const Tensor& self) {
-    return unary_meta(self);
+    return float_unary_meta(self);
 }
 
 Tensor& tanh_inplace_kernel(Tensor& self) {
@@ -57,7 +68,7 @@ Tensor& tanh_inplace_kernel(Tensor& self) {
 }
 
 Tensor sigmoid_kernel(const Tensor& self) {
-    return unary_meta(self);
+    return float_unary_meta(self);
 }
 
 Tensor& sigmoid_inplace_kernel(Tensor& self) {
@@ -73,7 +84,7 @@ Tensor& silu_inplace_kernel(Tensor& self) {
 }
 
 Tensor mish_kernel(const Tensor& self) {
-    return unary_meta(self);
+    return float_unary_meta(self);
 }
 
 Tensor& mish_inplace_kernel(Tensor& self) {
@@ -82,7 +93,7 @@ Tensor& mish_inplace_kernel(Tensor& self) {
 
 Tensor softplus_kernel(const Tensor& self, const Scalar& /*beta*/,
                        const Scalar& /*threshold*/) {
-    return unary_meta(self);
+    return float_unary_meta(self);
 }
 
 Tensor& softplus_inplace_kernel(Tensor& self, const Scalar& /*beta*/,
@@ -92,7 +103,7 @@ Tensor& softplus_inplace_kernel(Tensor& self, const Scalar& /*beta*/,
 
 Tensor elu_kernel(const Tensor& self, const Scalar& /*alpha*/,
                   const Scalar& /*scale*/, const Scalar& /*input_scale*/) {
-    return unary_meta(self);
+    return float_unary_meta(self);
 }
 
 Tensor& elu_inplace_kernel(Tensor& self, const Scalar& /*alpha*/,
@@ -102,7 +113,7 @@ Tensor& elu_inplace_kernel(Tensor& self, const Scalar& /*alpha*/,
 }
 
 Tensor selu_kernel(const Tensor& self) {
-    return unary_meta(self);
+    return float_unary_meta(self);
 }
 
 Tensor& selu_inplace_kernel(Tensor& self) {
@@ -110,7 +121,7 @@ Tensor& selu_inplace_kernel(Tensor& self) {
 }
 
 Tensor celu_kernel(const Tensor& self, const Scalar& /*alpha*/) {
-    return unary_meta(self);
+    return float_unary_meta(self);
 }
 
 Tensor& celu_inplace_kernel(Tensor& self, const Scalar& /*alpha*/) {
@@ -118,7 +129,7 @@ Tensor& celu_inplace_kernel(Tensor& self, const Scalar& /*alpha*/) {
 }
 
 Tensor leaky_relu_kernel(const Tensor& self, const Scalar& /*negative_slope*/) {
-    return unary_meta(self);
+    return float_unary_meta(self);
 }
 
 Tensor& leaky_relu_inplace_kernel(Tensor& self, const Scalar& /*negative_slope*/) {
@@ -126,7 +137,7 @@ Tensor& leaky_relu_inplace_kernel(Tensor& self, const Scalar& /*negative_slope*/
 }
 
 Tensor hardsigmoid_kernel(const Tensor& self) {
-    return unary_meta(self);
+    return float_unary_meta(self);
 }
 
 Tensor& hardsigmoid_inplace_kernel(Tensor& self) {
@@ -134,7 +145,7 @@ Tensor& hardsigmoid_inplace_kernel(Tensor& self) {
 }
 
 Tensor hardswish_kernel(const Tensor& self) {
-    return unary_meta(self);
+    return float_unary_meta(self);
 }
 
 Tensor& hardswish_inplace_kernel(Tensor& self) {
@@ -143,7 +154,7 @@ Tensor& hardswish_inplace_kernel(Tensor& self) {
 
 Tensor hardtanh_kernel(const Tensor& self, const Scalar& /*min_val*/,
                        const Scalar& /*max_val*/) {
-    return unary_meta(self);
+    return float_unary_meta(self);
 }
 
 Tensor& hardtanh_inplace_kernel(Tensor& self, const Scalar& /*min_val*/,
@@ -152,7 +163,7 @@ Tensor& hardtanh_inplace_kernel(Tensor& self, const Scalar& /*min_val*/,
 }
 
 Tensor tanhshrink_kernel(const Tensor& self) {
-    return unary_meta(self);
+    return float_unary_meta(self);
 }
 
 Tensor softshrink_kernel(const Tensor& self, const Scalar& /*lambd*/) {
@@ -164,7 +175,7 @@ Tensor hardshrink_kernel(const Tensor& self, const Scalar& /*lambd*/) {
 }
 
 Tensor relu6_kernel(const Tensor& self) {
-    return unary_meta(self);
+    return float_unary_meta(self);
 }
 
 Tensor& relu6_inplace_kernel(Tensor& self) {
@@ -172,7 +183,7 @@ Tensor& relu6_inplace_kernel(Tensor& self) {
 }
 
 Tensor log_sigmoid_kernel(const Tensor& self) {
-    return unary_meta(self);
+    return float_unary_meta(self);
 }
 
 // ---------------------------------------------------------------------------
