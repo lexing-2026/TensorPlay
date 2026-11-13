@@ -3620,13 +3620,29 @@ def _plain_scaled_dot_product_attention(query, key, value, is_causal):
         and query.numel() != 0
         and key.numel() != 0
     ):
-        # A narrow head layout leaves the blocked kernel with too few
-        # independent tiles to fill the pool, and the composed products win
-        # on those shapes; such a call takes the differentiable public entry
-        # instead.  The operands are materialized first: the composed path
-        # reads a contiguous layout directly, and the copy is cheaper than
-        # the stride walk it replaces.
-        if query.size(1) <= 4 and query.size(-1) <= 64:
+        # The blocked kernel needs enough independent tiles to fill the pool,
+        # while the composed products pay for a materialized attention matrix;
+        # which one wins therefore turns on the head count and the token count.
+        # Measured on eight cores through this entry: up to seven heads at a
+        # head width of at most 64 win on the composed path through 768 tokens,
+        # and a layout of four or fewer heads keeps winning through 1024.
+        # Beyond that the kernel's linear memory use takes over, and a head
+        # width of 128 already favors the kernel at six heads.  A float64 call
+        # of more than four heads stays on the kernel even in the short range:
+        # the composed path moves twice the bytes there and loses by about a
+        # tenth.  The operands are materialized first because the composed path
+        # reads a contiguous layout directly, and the copy is cheaper than the
+        # stride walk it replaces.
+        heads = query.size(1)
+        # The matrix the composed path materializes is query-by-key, and the
+        # kernel's causal bound is the top-left corner, so the longer side
+        # decides which side of the crossover the call falls on.
+        tokens = max(query.size(-2), key.size(-2))
+        if query.size(-1) <= 64 and (
+            (heads <= 4 and tokens <= 1024)
+            or (heads <= 7 and tokens <= 768
+                and query.dtype != tensorplay.float64)
+        ):
             return tensorplay.scaled_dot_product_attention(
                 query.contiguous(), key.contiguous(), value.contiguous(),
                 is_causal=is_causal)

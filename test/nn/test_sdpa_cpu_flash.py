@@ -146,7 +146,7 @@ def test_fully_closed_row_gives_zero_output_and_zero_gradient():
 
 
 def test_functional_entry_routes_cpu_calls_to_the_fused_kernel():
-    _, q, k, v, grad_out = _inputs(4, 2, 6, 6, 40, 50, 16)
+    _, q, k, v, grad_out = _inputs(4, 2, 16, 16, 40, 50, 16)
     for causal in (False, True):
         tq = tp.tensor(q, requires_grad=True)
         out = F.scaled_dot_product_attention(
@@ -169,6 +169,21 @@ def test_functional_entry_routes_narrow_head_cpu_calls_to_the_composed_path():
         want = _reference(q, k, v, grad_out, causal, None, None)
         assert np.abs(out.detach().numpy() - want[0]).max() < 1e-5
         assert np.abs(d_q.numpy() - want[1]).max() < 1e-5
+
+
+def test_functional_entry_routes_by_head_and_token_count():
+    # Six heads at a short context still leave the kernel underfed, so the
+    # composed path takes the call; the same layout at a longer context keeps
+    # the kernel, whose memory use is linear in the token count.  A wide head
+    # layout favors the kernel at any context.
+    for heads, tokens, dim, fused in ((6, 577, 64, False), (3, 1024, 64, False),
+                                      (6, 1024, 64, True), (8, 577, 64, True),
+                                      (6, 577, 128, True), (16, 512, 64, True)):
+        _, q, k, v, _ = _inputs(4, 1, heads, heads, tokens, tokens, dim)
+        out = F.scaled_dot_product_attention(
+            tp.tensor(q, requires_grad=True), tp.tensor(k), tp.tensor(v))
+        assert ("FlashAttentionForCpu" in out.grad_fn.name()) == fused, (
+            heads, tokens, dim)
 
 
 def test_empty_sequence_returns_zeros():
