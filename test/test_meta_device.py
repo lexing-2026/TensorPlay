@@ -236,6 +236,22 @@ def test_bmm_and_addmm_shapes():
     bias = _meta(2, 4)
     out = tp.addmm(bias, m1, m2)
     assert tuple(out.shape) == (2, 4)
+    # The operands must agree on the dtype.
+    with pytest.raises(Exception):
+        tp.addmm(bias, m1, _meta(3, 4, dtype=tp.float64))
+    # A bias outside the result's shape is rejected unless its weight is zero.
+    with pytest.raises(Exception):
+        tp.addmm(_meta(5, 4), m1, m2)
+    assert tuple(tp.addmm(_meta(5, 4), m1, m2, beta=0).shape) == (2, 4)
+    assert tuple(tp.addmm_(_meta(2, 4), m1, m2).shape) == (2, 4)
+    with pytest.raises(Exception):
+        tp.addmm_(_meta(3, 4), m1, m2)
+    # Whole-number operands accumulate in single precision.
+    assert tp.addmm(_meta(2, 4, dtype=tp.int32), _meta(2, 3, dtype=tp.int32),
+                    _meta(3, 4, dtype=tp.int32)).dtype == tp.float32
+    with pytest.raises(Exception):
+        tp.addmm(_meta(2, 4, dtype=tp.bool), _meta(2, 3, dtype=tp.bool),
+                 _meta(3, 4, dtype=tp.bool))
 
 
 def test_cat_shapes():
@@ -478,6 +494,78 @@ def test_avg_pool2d_shapes():
     assert tuple(tp.nn.functional.avg_pool2d(x, 2, ceil_mode=True).shape) == (1, 3, 4, 4)
     assert tuple(tp.nn.functional.adaptive_avg_pool2d(x, (1, 1)).shape) == (1, 3, 1, 1)
     assert tuple(tp.nn.functional.adaptive_max_pool2d(x, (1, 1)).shape) == (1, 3, 1, 1)
+    assert tuple(tp.adaptive_max_pool2d(x, [2, 3]).shape) == (1, 3, 2, 3)
+    with pytest.raises(Exception):
+        tp.adaptive_max_pool2d(x, [0, 1])
+    with pytest.raises(Exception):
+        tp.nn.functional.avg_pool2d(x, 2, stride=0)
+
+
+def test_pool1d_shapes_and_checks():
+    x = _meta(2, 3, 16)
+    assert tuple(tp.max_pool1d(x, 2).shape) == (2, 3, 8)
+    assert tuple(tp.max_pool1d(_meta(3, 16), 2).shape) == (3, 8)
+    values, indices = tp.max_pool1d_with_indices(x, 2)
+    assert tuple(values.shape) == (2, 3, 8)
+    assert values.dtype == tp.float32
+    assert indices.dtype == tp.int64
+    assert tuple(tp.avg_pool1d(x, 3, 2).shape) == (2, 3, 7)
+    assert tuple(tp.adaptive_avg_pool1d(x, 5).shape) == (2, 3, 5)
+    values, indices = tp.adaptive_max_pool1d(x, 5)
+    assert tuple(values.shape) == (2, 3, 5)
+    assert indices.dtype == tp.int64
+
+    with pytest.raises(Exception):
+        tp.max_pool1d(_meta(16), 2)
+    with pytest.raises(Exception):
+        tp.max_pool1d_with_indices(_meta(16), 2)
+    with pytest.raises(Exception):
+        tp.max_pool1d(x, [2, 2])
+    with pytest.raises(Exception):
+        tp.avg_pool1d(x, [2, 2])
+    with pytest.raises(Exception):
+        tp.avg_pool1d(x, 3, 0)
+    with pytest.raises(Exception):
+        tp.adaptive_max_pool1d(_meta(2, 0, 4), 2)
+
+
+def test_pool3d_shapes_and_checks():
+    x = _meta(1, 2, 8, 8, 8)
+    assert tuple(tp.max_pool3d(x, 2).shape) == (1, 2, 4, 4, 4)
+    values, indices = tp.max_pool3d_with_indices(x, 2)
+    assert tuple(values.shape) == (1, 2, 4, 4, 4)
+    assert values.dtype == tp.float32
+    assert indices.dtype == tp.int64
+    assert tuple(tp.max_pool3d(_meta(2, 8, 8, 8), 2).shape) == (2, 4, 4, 4)
+
+    assert tuple(tp.avg_pool3d(x, 2).shape) == (1, 2, 4, 4, 4)
+    assert tuple(tp.avg_pool3d(_meta(2, 8, 8, 8), 2).shape) == (2, 4, 4, 4)
+    assert tuple(tp.avg_pool3d(x, 3, 2, 0, True).shape) == (1, 2, 4, 4, 4)
+    assert tuple(tp.avg_pool3d(x, 3, 2, 0, False).shape) == (1, 2, 3, 3, 3)
+
+    assert tuple(tp.adaptive_avg_pool3d(x, [2, 3, 4]).shape) == (1, 2, 2, 3, 4)
+    assert tuple(tp.adaptive_avg_pool3d(_meta(2, 8, 8, 8), [2, 2, 2]).shape) == (
+        2, 2, 2, 2)
+    values, indices = tp.adaptive_max_pool3d(x, [2, 3, 4])
+    assert tuple(values.shape) == (1, 2, 2, 3, 4)
+    assert indices.dtype == tp.int64
+    assert tuple(tp.adaptive_max_pool3d(_meta(2, 8, 8, 8), [2, 2, 2])[0].shape) == (
+        2, 2, 2, 2)
+
+    with pytest.raises(Exception):
+        tp.max_pool3d(_meta(1, 2, 3, 8, 8, 8, 8), 2)
+    with pytest.raises(Exception):
+        tp.avg_pool3d(x, 2, 0)
+    with pytest.raises(Exception):
+        tp.avg_pool3d(x, [2, 2])
+    with pytest.raises(Exception):
+        tp.adaptive_avg_pool3d(x, [2, 2])
+    with pytest.raises(Exception):
+        tp.adaptive_avg_pool3d(x, [2, -1, 2])
+    with pytest.raises(Exception):
+        tp.adaptive_max_pool3d(x, [2, 2])
+    with pytest.raises(Exception):
+        tp.adaptive_max_pool3d(x, [0, 2, 2])
 
 
 # ---------------------------------------------------------------------------
@@ -1069,6 +1157,98 @@ def test_baddbmm_and_addbmm_shapes():
         tp.addbmm(_meta(3, 6, dtype=tp.int32),
                   _meta(4, 3, 5, dtype=tp.int32),
                   _meta(4, 5, 6, dtype=tp.int32), beta=0.5)
+
+
+def test_addr_and_addmv_shapes():
+    assert tuple(tp.addr(_meta(2, 3), _meta(2), _meta(3)).shape) == (2, 3)
+    assert tuple(tp.addr(_meta(), _meta(2), _meta(3)).shape) == (2, 3)
+    assert tp.addr(_meta(2, 3, dtype=tp.bool), _meta(2, dtype=tp.bool),
+                   _meta(3, dtype=tp.bool)).dtype == tp.bool
+    with pytest.raises(Exception):
+        tp.addr(_meta(4, 4), _meta(2), _meta(3))
+    with pytest.raises(Exception):
+        tp.addr(_meta(2, 1, dtype=tp.int32), _meta(2, 1, dtype=tp.int32),
+                _meta(3, dtype=tp.int32))
+    # An integral addend with a zero weight skips the broadcast check.
+    assert tuple(tp.addr(_meta(4, 4, dtype=tp.int32),
+                         _meta(2, dtype=tp.int32),
+                         _meta(3, dtype=tp.int32), beta=0).shape) == (2, 3)
+    assert tuple(tp.addr_(_meta(2, 3), _meta(2), _meta(3)).shape) == (2, 3)
+    with pytest.raises(Exception):
+        tp.addr_(_meta(4, 4), _meta(2), _meta(3))
+
+    assert tuple(tp.addmv(_meta(2), _meta(2, 3), _meta(3)).shape) == (2,)
+    assert tuple(tp.addmv(_meta(), _meta(2, 3), _meta(3)).shape) == (2,)
+    assert tp.addmv(_meta(2, dtype=tp.int32), _meta(2, 3, dtype=tp.int32),
+                    _meta(3, dtype=tp.int32)).dtype == tp.int32
+    assert tuple(tp.addmv(_meta(4, 4, dtype=tp.int32),
+                          _meta(2, 3, dtype=tp.int32),
+                          _meta(3, dtype=tp.int32), beta=0).shape) == (2,)
+    assert tuple(tp.addmv_(_meta(2), _meta(2, 3), _meta(3)).shape) == (2,)
+    with pytest.raises(Exception):
+        tp.addmv_(_meta(3), _meta(2, 3), _meta(3))
+    with pytest.raises(Exception):
+        tp.addmv(_meta(2), _meta(3, 3), _meta(3))
+    with pytest.raises(Exception):
+        tp.addmv(_meta(2), _meta(2, 3), _meta(2))
+    with pytest.raises(Exception):
+        tp.addmv(_meta(2, dtype=tp.bool), _meta(2, 3, dtype=tp.bool),
+                 _meta(3, dtype=tp.bool))
+
+
+def test_addcmul_addcdiv_shapes():
+    assert tuple(tp.addcmul(_meta(2, 1), _meta(1, 3), _meta(2, 3)).shape) == (2, 3)
+    assert tp.addcmul(_meta(2, 3, dtype=tp.int32), _meta(2, 3, dtype=tp.int32),
+                      _meta(2, 3, dtype=tp.int32)).dtype == tp.int32
+    assert tp.addcmul(_meta(2, dtype=tp.int32), _meta(2, dtype=tp.float32),
+                      _meta(2, dtype=tp.int32)).dtype == tp.float32
+    assert tp.addcmul_(_meta(2, 3, dtype=tp.int32),
+                       _meta(2, 3, dtype=tp.float32),
+                       _meta(2, 3, dtype=tp.int32)).dtype == tp.int32
+    with pytest.raises(Exception):
+        tp.addcmul_(_meta(2, 1), _meta(2, 3), _meta(2, 3))
+
+    with pytest.raises(Exception):
+        tp.addcdiv(_meta(2, 3, dtype=tp.int32), _meta(2, 3, dtype=tp.int32),
+                   _meta(2, 3, dtype=tp.int32))
+    assert tp.addcdiv(_meta(2, 3, dtype=tp.int32), _meta(2, 3, dtype=tp.int32),
+                      _meta(2, 3, dtype=tp.float32)).dtype == tp.float32
+    assert tuple(tp.addcdiv(_meta(2, 1), _meta(1, 3), _meta(2, 3)).shape) == (2, 3)
+    assert tuple(tp.addcdiv_(_meta(2, 3), _meta(2, 3), _meta(2, 3)).shape) == (2, 3)
+    with pytest.raises(Exception):
+        tp.addcdiv_(_meta(2, 1), _meta(2, 3), _meta(2, 3))
+
+
+def test_angle_arange_start_and_private_aminmax():
+    assert tp.angle(_meta(2, 3)).dtype == tp.float32
+    assert tp.angle(_meta(2, 3, dtype=tp.float64)).dtype == tp.float64
+    assert tp.angle(_meta(2, 3, dtype=tp.int32)).dtype == tp.float32
+    assert tp.angle(_meta(2, 3, dtype=tp.complex64)).dtype == tp.float32
+    assert tuple(tp.angle(_meta(2, 3)).shape) == (2, 3)
+    with pytest.raises(Exception):
+        tp.angle(_meta(2, dtype=tp.bool))
+
+    assert tuple(tp.arange(2, 9).shape) == (7,)
+    assert tp.arange(2, 9).dtype == tp.int64
+    assert tuple(tp.arange(2, 9, 2).shape) == (4,)
+    assert tuple(tp.arange(5, 2).shape) == (0,)
+    steps = tp.arange(0.5, 2.0, 0.5)
+    assert tuple(steps.shape) == (3,)
+    assert steps.dtype == tp.float32
+    with pytest.raises(Exception):
+        tp.arange(0, 5, 0)
+
+    low, high = tp._C._aminmax(_meta(3, 4))
+    assert tuple(low.shape) == ()
+    assert high.dtype == tp.float32
+    low, high = tp._C._aminmax(_meta(3, 4), 1, True)
+    assert tuple(low.shape) == (3, 1)
+    assert tuple(high.shape) == (3, 1)
+    low, high = tp._C._aminmax(_meta(3, 4, dtype=tp.int32))
+    assert low.dtype == tp.int32
+    assert high.dtype == tp.int32
+    with pytest.raises(Exception):
+        tp._C._aminmax(_meta(3, 4), 2, False)
 
 
 # ---------------------------------------------------------------------------
