@@ -738,8 +738,12 @@ nan_asserts = os.environ.get("TP_NAN_ASSERTS") == "1"
 allow_buffer_reuse = True
 
 #: Work out the order values are allocated in, rather than allocating each as
-#: it is asked for.  It is what lets two values share one buffer.
-memory_planning = os.environ.get("TP_MEMORY_PLANNING", "1") == "1"
+#: it is asked for.  It is what lets two values share one buffer.  Off by
+#: default: the single slab a pool hands out stays alive for the whole call,
+#: so every allocation made outside the pool (extern kernels allocate their
+#: outputs themselves) lands on top of it, and the measured peak comes out
+#: higher than the incremental release it replaces.
+memory_planning = os.environ.get("TP_MEMORY_PLANNING", "0") == "1"
 
 #: Which pool the values live in.  "intermediates" is the pool for values that
 #: exist only between two launches; "cudagraphs" is for a graph captured whole,
