@@ -1774,6 +1774,137 @@ def test_upsample_backward_polices_recorded_geometry():
         tp.upsample_nearest1d_backward(_meta(8), [8], [4])
 
 
+def test_activation_backward_family_shapes():
+    grad = _meta(2, 3, 4)
+    # gradient-shaped answers at the gradient's dtype, for every scalar family
+    plain = [
+        lambda dt: tp.gelu_backward(_meta(2, 3, 4, dtype=dt), _meta(2, 3, 4, dtype=dt)),
+        lambda dt: tp.hardtanh_backward(_meta(2, 3, 4, dtype=dt),
+                                        _meta(2, 3, 4, dtype=dt), -1.0, 1.0),
+        lambda dt: tp.hardswish_backward(_meta(2, 3, 4, dtype=dt),
+                                         _meta(2, 3, 4, dtype=dt)),
+        lambda dt: tp.silu_backward(_meta(2, 3, 4, dtype=dt), _meta(2, 3, 4, dtype=dt)),
+        lambda dt: tp.hardsigmoid_backward(_meta(2, 3, 4, dtype=dt),
+                                           _meta(2, 3, 4, dtype=dt)),
+        lambda dt: tp.leaky_relu_backward(_meta(2, 3, 4, dtype=dt),
+                                          _meta(2, 3, 4, dtype=dt), 0.01, False),
+        lambda dt: tp.elu_backward(_meta(2, 3, 4, dtype=dt), 1.0, 1.25, 1.0, False,
+                                   _meta(2, 3, 4, dtype=dt)),
+        lambda dt: tp.softplus_backward(_meta(2, 3, 4, dtype=dt),
+                                        _meta(2, 3, 4, dtype=dt), 1.0, 20.0),
+        lambda dt: tp.mish_backward(_meta(2, 3, 4, dtype=dt), _meta(2, 3, 4, dtype=dt)),
+        lambda dt: tp.threshold_backward(_meta(2, 3, 4, dtype=dt),
+                                         _meta(2, 3, 4, dtype=dt), 0.5),
+    ]
+    for call in plain:
+        out = call(tp.float32)
+        assert tuple(out.shape) == (2, 3, 4) and out.dtype == tp.float32
+        assert call(tp.float64).dtype == tp.float64
+        assert call(tp.int64).dtype == tp.int64
+    # an empty gradient returns before the saved plane is ever touched
+    empty = _meta(0)
+    assert tuple(tp.gelu_backward(empty, _meta(2, 3, 4, dtype=tp.float64)).shape) == (0,)
+    assert tuple(tp.silu_backward(empty, empty).shape) == (0,)
+    assert tuple(tp.threshold_backward(_meta(2, 0, 3), _meta(2, 0, 3), 0.5).shape) == (2, 0, 3)
+    # gelu's approximation name is validated before anything else
+    assert tp.gelu_backward(grad, _meta(2, 3, 4), "tanh").dtype == tp.float32
+    with pytest.raises(ValueError):
+        tp.gelu_backward(grad, _meta(2, 3, 4), "relu")
+    # the saved plane feeds a linear read at the gradient's width: an
+    # empty gradient returns before any of that happens
+    assert tuple(tp.gelu_backward(_meta(0), _meta(2, 3, 4, dtype=tp.float64)).shape) == (0,)
+    with pytest.raises(RuntimeError):
+        tp.silu_backward(grad, _meta(2, 3, 4, dtype=tp.float64))
+    with pytest.raises(RuntimeError):
+        tp.hardtanh_backward(grad, _meta(2, 2), -1.0, 1.0)
+
+
+def test_broadcasting_and_gated_activation_backwards():
+    grad = _meta(2, 3)
+    # sigmoid/tanh/logit backwards broadcast and promote like any binary op
+    out = tp.sigmoid_backward(_meta(2, 1, 4), _meta(3, 4))
+    assert tuple(out.shape) == (2, 3, 4) and out.dtype == tp.float32
+    out = tp.tanh_backward(_meta(2, 3, dtype=tp.float64), _meta(3))
+    assert tuple(out.shape) == (2, 3) and out.dtype == tp.float64
+    assert tp.logit_backward(grad, _meta(2, 3, dtype=tp.float64), 0.1).dtype == tp.float64
+    with pytest.raises(RuntimeError):
+        tp.logit_backward(grad, _meta(2, 2))
+    # the shrink pair gates the saved plane's dtype first
+    assert tuple(tp.hardshrink_backward(grad, _meta(2, 3), 0.5).shape) == (2, 3)
+    assert tp.softshrink_backward(_meta(2, 3, dtype=tp.float16),
+                                  _meta(2, 3, dtype=tp.float16), 0.5).dtype == tp.float16
+    with pytest.raises(NotImplementedError):
+        tp.hardshrink_backward(grad, _meta(2, 3, dtype=tp.int64), 0.5)
+    with pytest.raises(NotImplementedError):
+        tp.softshrink_backward(grad, _meta(2, 3, dtype=tp.bool), 0.5)
+    # log_sigmoid's sweep runs in floating widths only, after empty inputs pass
+    assert tuple(tp.log_sigmoid_backward(_meta(0, dtype=tp.int64),
+                                         _meta(0, dtype=tp.int64)).shape) == (0,)
+    with pytest.raises(TypeError):
+        tp.log_sigmoid_backward(_meta(2, 3, dtype=tp.int64),
+                                _meta(2, 3, dtype=tp.int64))
+    with pytest.raises(RuntimeError):
+        tp.log_sigmoid_backward(grad, _meta(2, 3, dtype=tp.int64))
+
+
+def test_glu_backward_composition_checks():
+    out = tp.glu_backward(_meta(2, 3, 2), _meta(2, 3, 4))
+    assert tuple(out.shape) == (2, 3, 4) and out.dtype == tp.float32
+    assert tuple(tp.glu_backward(_meta(4, 3), _meta(8, 3), 0).shape) == (8, 3)
+    assert tuple(tp.glu_backward(_meta(2, 2, 3), _meta(2, 4, 3), -2).shape) == (2, 4, 3)
+    with pytest.raises(RuntimeError):
+        tp.glu_backward(_meta(2, 3, 2), _meta(2, 3, 3))
+    with pytest.raises(RuntimeError):
+        tp.glu_backward(_meta(), _meta())
+    with pytest.raises(IndexError):
+        tp.glu_backward(_meta(2, 2), _meta(2, 4), 2)
+    with pytest.raises(IndexError):
+        tp.glu_backward(_meta(2, 2), _meta(2, 4), -3)
+
+
+def test_rrelu_with_noise_backward_layout():
+    noise = _meta(2, 3, 4)
+    out = tp.rrelu_with_noise_backward(_meta(2, 3, 4), _meta(2, 3, 4), noise,
+                                       0.125, 0.334, True, False)
+    assert tuple(out.shape) == (2, 3, 4) and out.dtype == tp.float32
+    # eval mode leaves the noise plane unread: only the gradient and the input
+    # must agree
+    assert tuple(tp.rrelu_with_noise_backward(_meta(2, 3), _meta(2, 3), _meta(5, 5),
+                                              0.0, 1.0, False, False).shape) == (2, 3)
+    with pytest.raises(RuntimeError):
+        tp.rrelu_with_noise_backward(_meta(2, 3, 4), _meta(2, 3, 4), _meta(2, 3, 5),
+                                     0.125, 0.334, True, False)
+    with pytest.raises(RuntimeError):
+        tp.rrelu_with_noise_backward(_meta(2, 3, 4), _meta(2, 3, 5), _meta(2, 3, 4),
+                                     0.125, 0.334, False, False)
+    with pytest.raises(RuntimeError):
+        tp.rrelu_with_noise_backward(_meta(2, 3), _meta(2, 3, dtype=tp.float64),
+                                     _meta(2, 3), 0.0, 1.0, False, False)
+
+
+def test_cat_zero_sized_geometry():
+    # a zero-valued plane still describes geometry: its length along the
+    # joined dimension counts, and only size-[0] 1-d inputs are exempt from
+    # the wrap and shape checks
+    a = _meta(2, 0, 3)
+    assert tuple(tp.cat([a, a], -1).shape) == (2, 0, 6)
+    assert tuple(tp.cat([a, a], 0).shape) == (4, 0, 3)
+    # the wrap dimension is taken from the first non-exempt input
+    assert tuple(tp.cat([_meta(0), _meta(2, 3)], -1).shape) == (2, 3)
+    assert tuple(tp.cat([_meta(0), _meta(0)], 0).shape) == (0,)
+    # promotion covers every operand, exempt ones included
+    assert tp.cat([_meta(3, dtype=tp.float64), _meta(2, dtype=tp.float32)],
+                  0).dtype == tp.float64
+    with pytest.raises(RuntimeError):
+        tp.cat([_meta(2, 3), _meta(3, 4)], 0)
+    with pytest.raises(RuntimeError):
+        tp.cat([_meta(2, 3), _meta(2, 2)], 0)
+    with pytest.raises(RuntimeError):
+        tp.cat([_meta(2, 3), _meta(2, 0, 3)], 0)
+    with pytest.raises(IndexError):
+        tp.cat([_meta(2, 3)], -3)
+
+
 def test_dist_renorm_and_rms_norm():
     distance = tp.dist(_meta(3, dtype=tp.int32), _meta(3, dtype=tp.int32))
     assert tuple(distance.shape) == ()
