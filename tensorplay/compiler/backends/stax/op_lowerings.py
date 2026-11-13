@@ -49,6 +49,10 @@ from tensorplay.primitives.common import (
 )
 from .dtype_propagation import promoted_dtype_of_values
 from tensorplay.graph import Node
+from tensorplay._higher_order_ops._hop_base import (
+    is_fake_tensor,
+    value_device as _value_device,
+)
 from tensorplay.utils._pytree import arg_tree_leaves, tree_leaves, tree_map
 
 from . import ir
@@ -405,6 +409,13 @@ def unsupported_input_tensor(t, node=None) -> bool:
     a meta value has no memory, and a sparse one has its elements somewhere
     other than its positions.
     """
+
+    # A stand-in is a value described rather than carried: it holds nothing
+    # itself, but what it describes is an ordinary value in memory, so a
+    # kernel can read and write it.  A value really on the meta device, which
+    # holds nothing and describes nothing, cannot be.
+    if t.is_meta and is_fake_tensor(t):
+        return bool(t.is_complex() or t.is_sparse)
 
     return bool(t.is_complex() or t.is_meta or t.is_sparse)
 
@@ -1251,7 +1262,7 @@ def val_info(val):
     return (
         tuple(int(s) for s in val.shape),
         val.dtype,
-        val.device,
+        _value_device(val),
     )
 
 

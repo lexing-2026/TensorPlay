@@ -476,11 +476,13 @@ def find_input_mutations(gm: Any) -> set[int]:
 
 
 def get_device_node_mapping(gm: Any) -> dict[str, Any]:
+    from ..._higher_order_ops._hop_base import value_device
+
     mapping: dict[str, Any] = {}
     for node in gm.graph.nodes:
         value = node.meta.get("val")
         if _is_tensor(value):
-            mapping.setdefault(str(value.device), node)
+            mapping.setdefault(str(value_device(value)), node)
     return mapping
 
 

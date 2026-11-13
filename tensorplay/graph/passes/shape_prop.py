@@ -13,6 +13,24 @@ from .base import PassBase, PassResult
 __all__ = ["ShapeProp", "TensorMetadata"]
 
 
+def _stand_in(value: Any, fake_mode: Any) -> Any:
+    """Replace the tensors in a computed value with stand-ins for them.
+
+    A value computed by a graph is one tensor, or a structure of them; every
+    one of them is described rather than carried, so what the nodes after it
+    read is the same shape, type and layout without the memory.
+    """
+
+    if isinstance(value, tuple):
+        return tuple(_stand_in(item, fake_mode) for item in value)
+    if isinstance(value, list):
+        return [_stand_in(item, fake_mode) for item in value]
+    if isinstance(value, dict):
+        return {key: _stand_in(item, fake_mode) for key, item in value.items()}
+    converter = getattr(fake_mode, "stand_in", None) or fake_mode.from_tensor
+    return converter(value)
+
+
 def _value_or_call(value: Any, default: Any = None) -> Any:
     if value is None:
         return default
@@ -95,13 +113,22 @@ class _ShapePropInterpreter(Interpreter):
                 f"ShapeProp error for: node={node.format_node()} with meta={node.meta}"
             ) from exc
 
+        # A value is stood in for as soon as it has been computed, so every
+        # node after this one reads a description of it rather than the value
+        # itself.  Doing it here rather than at the operators is what makes it
+        # reach what a node reads off the module and what it allocates for
+        # itself as well as what it was handed.
+        if self.fake_mode is not None:
+            value = _stand_in(value, self.fake_mode)
+        recorded = value
+
         if self.record_values:
-            node.meta["val"] = value
+            node.meta["val"] = recorded
         else:
             from tensorplay.compiler._core.api import _RecordedTensorMetadata
 
             node.meta["val"] = map_aggregate(
-                value,
+                recorded,
                 lambda item: _RecordedTensorMetadata(item) if _is_tensor(item) else item,
             )
         node.meta["type"] = type(value)
@@ -116,7 +143,7 @@ class _ShapePropInterpreter(Interpreter):
                 return _extract_tensor_metadata(item)
             return item
 
-        metadata = map_aggregate(value, extract)
+        metadata = map_aggregate(recorded, extract)
         if found_tensor:
             node.meta["tensor_meta"] = metadata
             if _is_tensor(value):

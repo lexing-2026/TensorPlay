@@ -38,6 +38,7 @@ from .utils import (
     ValueWithLineMap,
 )
 from ....graph.interpreter import Interpreter
+from tensorplay._higher_order_ops._hop_base import value_device as _value_device
 from .codegen.common import FileBackedGraphModule, get_device_op_overrides
 from .codegen.cpp_wrapper import CppWrapperCode, CppWrapperModule
 from .sizevars import SizeVarAllocator
@@ -927,7 +928,7 @@ class GraphLowering(Interpreter):
             tp.backends.mkldnn.enabled
             and tp.backends.mkldnn.is_available()
             and all(
-                n.args[idx].meta["val"].device.type in SUPPORTED_MKLDNN_DEVICES
+                _value_device(n.args[idx].meta["val"]).type in SUPPORTED_MKLDNN_DEVICES
                 for n in conv_nodes
                 for idx in [0, 1]
             )
@@ -1584,7 +1585,7 @@ class GraphLowering(Interpreter):
         """
 
         return FixedLayout(
-            val.device, val.dtype,
+            _value_device(val), val.dtype,
             tuple(int(s) for s in val.shape),
             tuple(int(s) for s in (val.stride() if strides is None else strides)),
             0,
@@ -1712,7 +1713,7 @@ class GraphLowering(Interpreter):
             # given no result of its own and each result is a buffer naming the
             # path through the returned structure at which it sits.
             layout = MultiOutputLayout(
-                device=tensor_outputs[0].device,
+                device=_value_device(tensor_outputs[0]),
             )
         else:
             layout = self._layout_of(
@@ -2155,7 +2156,7 @@ class GraphLowering(Interpreter):
             sizes, strides, offset = self.symbolic_sizes_strides_storage_offset(example, name)
         buffer = InputBuffer(
             name=name,
-            layout=FixedLayout(example.device, example.dtype, sizes, strides),
+            layout=FixedLayout(_value_device(example), example.dtype, sizes, strides),
         )
         # A value is made out of a box that decides what to do with it, over
         # storage that decides where the bytes are.  An input is not computed,
@@ -2385,7 +2386,11 @@ class GraphLowering(Interpreter):
         if not _is_tensor(val) or not val.defined():
             return None
         try:
-            return val.untyped_storage().data_ptr()
+            # The storage is the memory, so its identity is asked for rather
+            # than the address of an element of it: two values over one
+            # storage are that memory however they are offset into it, and a
+            # value that describes one instead of holding it still names it.
+            return val.untyped_storage()._cdata
         except (RuntimeError, AttributeError):
             return None
 

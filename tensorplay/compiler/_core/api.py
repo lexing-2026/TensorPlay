@@ -1292,11 +1292,29 @@ def _compile_region(
             # Advisory shape/value metadata for backends and visualization; never a
             # reason to reject an otherwise compilable region.
             # Propagation executes the graph: it must not count as a call either.
+            # It is also the second time the region runs before the backend has
+            # looked at it, and the whole of that run is what it records, so it
+            # is run against stand-ins that carry the geometry and hold nothing.
+            # A region whose stand-ins cannot carry it is answered by running it
+            # as written rather than being handed over undecided.
+            advisory_device = next(
+                (value.device for value in backend_inputs
+                 if isinstance(value, tensorplay.Tensor)),
+                None,
+            )
+            from tensorplay._subclasses import FakeTensorMode
+
             try:
                 with _preserve_module_state(model), tensorplay.no_grad():
-                    ShapeProp(backend_inputs)(graph_module)
-            except (GraphCaptureError, RuntimeError):
-                pass
+                    ShapeProp(backend_inputs, FakeTensorMode(advisory_device))(
+                        graph_module
+                    )
+            except Exception:  # noqa: BLE001 - the run below is the fallback
+                try:
+                    with _preserve_module_state(model), tensorplay.no_grad():
+                        ShapeProp(backend_inputs)(graph_module)
+                except (GraphCaptureError, RuntimeError):
+                    pass
 
             compiler_fn = _adapt_backend_to_region(
                 compiler_fn,

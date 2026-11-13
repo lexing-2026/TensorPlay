@@ -2,6 +2,7 @@
 
 from .fake_tensor import (
     extract_tensor_metadata,
+    FakeTensorMode,
     is_sparse_any,
     is_sparse_coo,
     Layout,
@@ -11,6 +12,7 @@ from .schema_check_mode import SchemaCheckMode
 
 __all__ = [
     "extract_tensor_metadata",
+    "FakeTensorMode",
     "is_sparse_any",
     "is_sparse_coo",
     "Layout",

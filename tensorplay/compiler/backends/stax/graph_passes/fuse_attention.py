@@ -4,6 +4,7 @@ import logging
 
 import tensorplay as tp
 from tensorplay.graph.experimental.sympy_functions import OrderedSet
+from tensorplay._higher_order_ops._hop_base import value_device as _value_device
 
 from ..utils import counters
 from ..pattern_matcher import (
@@ -1039,7 +1040,7 @@ def _sfdp_extra_check(scale_factor_op=None, disable_cuda=False):
         if (
             disable_cuda
             and "query" in match.kwargs
-            and "cuda" in str(match.kwargs["query"].meta["val"].device)
+            and "cuda" in str(_value_device(match.kwargs["query"].meta["val"]))
         ):
             return False
         if scale_factor_op is not None:

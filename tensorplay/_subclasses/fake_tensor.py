@@ -163,3 +163,70 @@ def extract_tensor_metadata(t) -> TensorMetadata:
         t.dense_dim() if sparse else None,
         t.sparse_dim() if sparse else None,
     )
+
+
+class FakeTensorMode:
+    """A region in which a value is described by a stand-in that holds no data.
+
+    Propagation exists to answer what a computation is shaped like, and
+    answering by computing it on real values costs the memory those values
+    take -- one region's worth of activations, kept alive for as long as the
+    graph that recorded them is read.  Inside this region a value is replaced,
+    as soon as it has been computed, by one allocated on the meta device: the
+    stand-in carries the geometry, the type and the layout of the value it
+    stands for, and no element of it can be read.  A graph propagated here
+    therefore describes a computation without ever having held one of its
+    results.
+
+    Standing in for what is computed rather than for what is handed in is
+    what reaches every value a graph reads: what it reads off its module,
+    what it allocates for itself, and what it makes out of a call.  A value
+    that is already a stand-in stands for itself.
+
+    Nothing here is allocated where the computation would run, so a caller
+    that needs to say where a result would live has to be told: ``device``
+    names the device the stand-ins stand for.
+    """
+
+    def __init__(self, device: Any = None) -> None:
+        self.device = device
+
+    def stand_in(self, value: Any) -> Any:
+        """A stand-in for a value the region computed, or for one it was given.
+
+        A value computed out of stand-ins is already on the meta device; it is
+        still a description of a value rather than one, and saying so is what
+        lets a reader tell it apart from a tensor that really has no memory to
+        be read out of.  Anything else is described the way an input is.
+        """
+
+        if isinstance(value, tp.Tensor) and value.device.type == "meta":
+            from tensorplay._higher_order_ops._hop_base import mark_fake_tensor
+
+            return mark_fake_tensor(value, self.device)
+        return self.from_tensor(value)
+
+    def from_tensor(self, value: Any) -> Any:
+        """A stand-in for ``value``, or ``value`` itself if it is not a tensor.
+
+        The layout is carried over as well as the geometry: whether a value
+        is contiguous decides whether reshaping it needs a copy, and which
+        strides it has decides what reads it satisfy without one.
+        """
+
+        if not isinstance(value, tp.Tensor):
+            return value
+        if value.device.type == "meta":
+            return value
+        from tensorplay._higher_order_ops._hop_base import mark_fake_tensor
+
+        shape = [int(size) for size in value.shape]
+        stand_in = tp.empty(list(shape), dtype=value.dtype, device="meta")
+        strides = [int(stride) for stride in value.stride()]
+        if strides != list(stand_in.stride()) or value.storage_offset() != 0:
+            stand_in = stand_in.as_strided(
+                list(shape), list(strides), int(value.storage_offset())
+            )
+        # Recorded as a stand-in, so that what reads it can tell it apart from a
+        # value that is really on the meta device and holds nothing to describe.
+        return mark_fake_tensor(stand_in, self.device)

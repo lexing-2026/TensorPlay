@@ -21,6 +21,7 @@ from tensorplay.graph.experimental.symbolic_shapes import (
     sym_eq,
 )
 from tensorplay.graph.experimental.sympy_functions import OrderedSet
+from tensorplay._higher_order_ops._hop_base import value_device as _value_device
 
 from .. import config
 from ..custom_graph_pass import get_custom_graph_passes
@@ -824,7 +825,7 @@ def fix_iota_device(match: Match, length, start, step, dtype, device, requires_g
             and user.target in (tp_ops.index.Tensor, tp_ops.index_put.default)
             and hasattr(user.meta.get("val"), "device")
         ):
-            user_devices.add(user.meta["val"].device)  # type: ignore[union-attr]
+            user_devices.add(_value_device(user.meta["val"]))  # type: ignore[union-attr]
         else:
             return  # bail out
 

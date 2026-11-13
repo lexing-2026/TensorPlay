@@ -331,12 +331,7 @@ class FakeTensorMode:
     def mark(self, tensor: Any) -> Any:
         """Record ``tensor`` as standing for the value it was made from."""
 
-        if isinstance(tensor, Tensor):
-            _FAKE_CONSTANTS[id(tensor)] = tensor
-        elif isinstance(tensor, (tuple, list)):
-            for value in tensor:
-                self.mark(value)
-        return tensor
+        return mark_fake_tensor(tensor)
 
     def __tensorplay_dispatch__(self, func, types, args=(), kwargs=None):
         """Run the operation here, and record what it made.
@@ -374,6 +369,13 @@ _ACTIVE_FAKE_MODE: contextvars.ContextVar[Optional["FakeTensorMode"]] = (
 #: not extend the lifetime of its storage.
 _FAKE_CONSTANTS: weakref.WeakValueDictionary[int, Any] = weakref.WeakValueDictionary()
 
+#: Where the value each stand-in describes would live, for the stand-ins the
+#: region was told the answer about.  Held beside the stand-ins rather than on
+#: them, for the same reason what they stand for is: a tensor carries no room
+#: of its own for such a note.
+_FAKE_DEVICES: dict[int, Any] = {}
+_FAKE_DEVICE_REFS: dict[int, Any] = {}
+
 
 def is_fake_tensor(t: Any) -> bool:
     """Whether this value is standing in for another rather than being one.
@@ -385,6 +387,62 @@ def is_fake_tensor(t: Any) -> bool:
     """
 
     return isinstance(t, Tensor) and id(t) in _FAKE_CONSTANTS
+
+
+def mark_fake_tensor(tensor: Any, device: Any = None) -> Any:
+    """Record ``tensor``, or every tensor in it, as standing for something.
+
+    A stand-in is a value that describes another one: it answers what that
+    value is like without holding it.  Saying so is what lets a reader tell it
+    apart from a value that holds nothing to describe -- a tensor really on the
+    meta device -- since the two look alike and mean different things.
+
+    ``device`` is where the value described would live, for the stand-ins that
+    cannot say it about themselves: one is made where nothing is allocated, so
+    where it is is not where its value would be.  A reader that has to place a
+    kernel or choose a route asks for it here.
+    """
+
+    if isinstance(tensor, Tensor):
+        key = id(tensor)
+        _FAKE_CONSTANTS[key] = tensor
+        if device is not None:
+            _FAKE_DEVICES[key] = device
+            # The note lives as long as the stand-in does, so a long run of
+            # compiles leaves nothing behind.
+            _FAKE_DEVICE_REFS[key] = weakref.ref(
+                tensor, lambda _ref, key=key: _forget_fake_device(key)
+            )
+    elif isinstance(tensor, (tuple, list)):
+        for item in tensor:
+            mark_fake_tensor(item, device)
+    return tensor
+
+
+def _forget_fake_device(key: int) -> None:
+    _FAKE_DEVICES.pop(key, None)
+    _FAKE_DEVICE_REFS.pop(key, None)
+
+
+def stand_in_device(t: Any) -> Any | None:
+    """Where the value ``t`` stands for would live, or nothing if it is not a
+    stand-in, or the region did not say."""
+
+    if is_fake_tensor(t):
+        return _FAKE_DEVICES.get(id(t))
+    return None
+
+
+def value_device(t: Any) -> Any:
+    """Where ``t`` lives, whether it holds its value or describes one.
+
+    A stand-in is made where nothing is allocated, so it lives somewhere the
+    value it stands for does not; a reader placing a kernel or choosing a
+    route wants the latter.
+    """
+
+    device = stand_in_device(t)
+    return t.device if device is None else device
 
 
 def maybe_get_fake_constant(t: Any) -> Any | None:

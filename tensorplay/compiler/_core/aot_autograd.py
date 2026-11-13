@@ -315,6 +315,7 @@ def _functionalize(gm: GraphModule, example_inputs: Sequence[Any]) -> GraphModul
 
     from tensorplay.graph.passes.functionalize import functionalize
     from tensorplay.graph.passes.shape_prop import ShapeProp
+    from tensorplay._subclasses import FakeTensorMode
     from .api import _release_recorded_values
 
     functional = functionalize(gm)
@@ -325,8 +326,29 @@ def _functionalize(gm: GraphModule, example_inputs: Sequence[Any]) -> GraphModul
         getattr(node.target, "_opname", None) == "copy_"
         for node in functional.graph.nodes
     )
+    # The pass answers with geometry, and it is already the second time this
+    # region is executed to get it.  Running it on the values themselves would
+    # hold another whole activation set for as long as the backend spends
+    # planning its own, so the inputs are handed in as stand-ins that carry the
+    # geometry and hold nothing.  Anything the stand-ins cannot carry -- a
+    # value read out of a tensor, an operator with no meta form -- is answered
+    # by running the graph the way it was written rather than failing here.
+    device = next(
+        (value.device for value in example_inputs
+         if isinstance(value, tensorplay.Tensor)),
+        None,
+    )
     with tensorplay.no_grad():
-        ShapeProp(list(example_inputs), record_values=not joint_graph or mutations)(functional)
+        try:
+            ShapeProp(
+                list(example_inputs),
+                FakeTensorMode(device),
+                record_values=not joint_graph or mutations,
+            )(functional)
+        except Exception:  # noqa: BLE001 - the run below is the fallback
+            ShapeProp(
+                list(example_inputs), record_values=not joint_graph or mutations
+            )(functional)
     return functional
 
 
