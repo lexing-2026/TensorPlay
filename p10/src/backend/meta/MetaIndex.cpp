@@ -421,6 +421,35 @@ Tensor& masked_fill_tensor_inplace_kernel(Tensor& self, const Tensor& mask,
 }
 
 // ---------------------------------------------------------------------------
+// Masked scatter: the answer keeps the receiver's geometry and type; the
+// source only has to agree with the receiver's type, and the mask has to
+// broadcast against it.
+// ---------------------------------------------------------------------------
+
+Tensor masked_scatter_kernel(const Tensor& self, const Tensor& mask,
+                             const Tensor& source) {
+    if (source.dtype() != self.dtype()) {
+        TP_THROW(TypeError,
+                 "masked_scatter: self and source must have the same dtype");
+    }
+    require_meta_devices(self, mask, source,
+                         "masked_scatter: self, mask, and source must be on the "
+                         "same device");
+    if (broadcast2(self, mask) != shape_of(self)) {
+        TP_THROW(RuntimeError,
+                 "masked_scatter: the mask must be broadcastable to the "
+                 "receiver's shape");
+    }
+    return empty_meta(shape_of(self), self.dtype(), self.device());
+}
+
+Tensor& masked_scatter_inplace_kernel(Tensor& self, const Tensor& mask,
+                                      const Tensor& source) {
+    masked_scatter_kernel(self, mask, source);
+    return self;
+}
+
+// ---------------------------------------------------------------------------
 // Flat gather: take reads the flattened operand at each position the index
 // names and answers in the index's geometry.
 // ---------------------------------------------------------------------------
@@ -653,6 +682,9 @@ TENSORPLAY_LIBRARY_IMPL(Meta, MetaIndex) {
     m.impl("masked_fill_", masked_fill_inplace_kernel);
     m.impl("masked_fill.Tensor", masked_fill_tensor_kernel);
     m.impl("masked_fill_.Tensor", masked_fill_tensor_inplace_kernel);
+
+    m.impl("masked_scatter", masked_scatter_kernel);
+    m.impl("masked_scatter_", masked_scatter_inplace_kernel);
 }
 
 } // namespace meta

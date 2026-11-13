@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <string>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -262,6 +263,16 @@ std::vector<Tensor> split_kernel(const Tensor& self, int64_t split_size,
     return result;
 }
 
+std::string format_sizes(const std::vector<int64_t>& sizes) {
+    std::string text = "[";
+    for (size_t i = 0; i < sizes.size(); ++i) {
+        if (i != 0) text += ", ";
+        text += std::to_string(sizes[i]);
+    }
+    text += "]";
+    return text;
+}
+
 std::vector<Tensor> split_sizes_kernel(const Tensor& self,
                                        const std::vector<int64_t>& split_sizes,
                                        int64_t dim) {
@@ -277,22 +288,178 @@ std::vector<Tensor> split_sizes_kernel(const Tensor& self,
         if (len < 0) {
             TP_THROW(RuntimeError,
                      "split_with_sizes expects split_sizes have only "
-                     "non-negative entries");
+                     "non-negative entries, but got split_sizes=",
+                     format_sizes(split_sizes));
         }
-        if (start + len > dim_size) {
+        if (len > dim_size - start) {
             TP_THROW(RuntimeError,
-                     "split_with_sizes: split_sizes add up to more than the "
-                     "dimension size");
+                     "split_with_sizes expects split_sizes to sum exactly to ",
+                     dim_size, " (input tensor's size at dimension ", dim, ")");
         }
         outs.push_back(self.slice(dim, start, start + len));
         start += len;
     }
     if (start != dim_size) {
         TP_THROW(RuntimeError,
-                 "split_with_sizes: split_sizes add up to less than the "
-                 "dimension size");
+                 "split_with_sizes expects split_sizes to sum exactly to ",
+                 dim_size, " (input tensor's size at dimension ", dim,
+                 "), but got split_sizes=", format_sizes(split_sizes));
     }
     return outs;
+}
+
+// ---------------------------------------------------------------------------
+// Unbind: one view per position along the axis, each dropping that axis.
+// ---------------------------------------------------------------------------
+
+std::vector<Tensor> unbind_kernel(const Tensor& self, int64_t dim) {
+    const int64_t nd = self.dim();
+    if (nd == 0) {
+        if (dim < -1 || dim > 0) {
+            TP_THROW(IndexError,
+                     "Dimension out of range (expected to be in range of [-1, "
+                     "0], but got ", dim, ")");
+        }
+        TP_THROW(IndexError,
+                 "Dimension specified as 0 but tensor has no dimensions");
+    }
+    dim = wrap_dim(dim, nd);
+    std::vector<int64_t> sizes = shape_of(self);
+    std::vector<int64_t> strides = self.strides();
+    sizes.erase(sizes.begin() + dim);
+    strides.erase(strides.begin() + dim);
+    const int64_t extent = self.size(dim);
+    const int64_t step = self.stride(dim);
+    const int64_t base = static_cast<int64_t>(
+        self.unsafeGetTensorImpl()->storage_offset());
+    std::vector<Tensor> outs;
+    outs.reserve(static_cast<size_t>(extent));
+    for (int64_t i = 0; i < extent; ++i) {
+        outs.push_back(self.as_strided(sizes, strides, base + i * step));
+    }
+    return outs;
+}
+
+// ---------------------------------------------------------------------------
+// One-hot: append a class axis; the element type stays Int64.
+// ---------------------------------------------------------------------------
+
+Tensor one_hot_kernel(const Tensor& self, int64_t num_classes) {
+    if (self.dtype() != DType::Int64) {
+        TP_THROW(RuntimeError,
+                 "one_hot is only applicable to index tensor of type "
+                 "LongTensor.");
+    }
+    if (self.numel() == 0) {
+        if (num_classes <= 0) {
+            TP_THROW(RuntimeError,
+                     "Can not infer total number of classes from empty tensor.");
+        }
+        std::vector<int64_t> out = shape_of(self);
+        out.push_back(num_classes);
+        return empty_meta(out, self.dtype(), self.device());
+    }
+    if (num_classes == -1) {
+        TP_THROW(NotImplementedError,
+                 "one_hot: num_classes = -1 needs the tensor's largest value, "
+                 "which the meta device does not hold");
+    }
+    if (num_classes <= 0) {
+        TP_THROW(RuntimeError, "Class values must be smaller than num_classes.");
+    }
+    std::vector<int64_t> out = shape_of(self);
+    out.push_back(num_classes);
+    return empty_meta(out, self.dtype(), self.device());
+}
+
+// ---------------------------------------------------------------------------
+// Kronecker product: pad both operands to the longer rank, then multiply the
+// paired extents; the element type is the promoted operand type.
+// ---------------------------------------------------------------------------
+
+Tensor kron_kernel(const Tensor& self, const Tensor& other) {
+    check_all_meta(self, other);
+    const int64_t maxdim = std::max(self.dim(), other.dim());
+    const int64_t pad_self = maxdim - self.dim();
+    const int64_t pad_other = maxdim - other.dim();
+    std::vector<int64_t> out(static_cast<size_t>(maxdim));
+    for (int64_t i = 0; i < maxdim; ++i) {
+        const int64_t a = i >= pad_self ? self.size(i - pad_self) : 1;
+        const int64_t b = i >= pad_other ? other.size(i - pad_other) : 1;
+        out[static_cast<size_t>(i)] = a * b;
+    }
+    return empty_meta(out, promoteTypes(self.dtype(), other.dtype()),
+                      self.device());
+}
+
+// ---------------------------------------------------------------------------
+// Trace: the sum along the main diagonal of a matrix, answered as a scalar.
+// Integral (and boolean) operands widen to Int64.
+// ---------------------------------------------------------------------------
+
+Tensor trace_kernel(const Tensor& self) {
+    if (self.dim() != 2) {
+        TP_THROW(RuntimeError, "trace: expected a matrix, but got tensor with "
+                 "dim ", self.dim());
+    }
+    const DType out_dtype =
+        isIntegralType(self.dtype(), /*includeBool=*/true) ? DType::Int64
+                                                           : self.dtype();
+    return empty_meta({}, out_dtype, self.device());
+}
+
+// ---------------------------------------------------------------------------
+// Bilinear upsampling: the two spatial axes are replaced by the requested
+// extents, the leading axes are kept.
+// ---------------------------------------------------------------------------
+
+Tensor upsample_bilinear2d_kernel(const Tensor& self,
+                                  const std::vector<int64_t>& output_size,
+                                  bool /*align_corners*/,
+                                  std::optional<double> /*scales_h*/,
+                                  std::optional<double> /*scales_w*/) {
+    std::vector<int64_t> out{self.size(0), self.size(1)};
+    out.insert(out.end(), output_size.begin(), output_size.end());
+    return empty_meta(out, self.dtype(), self.device());
+}
+
+// ---------------------------------------------------------------------------
+// Pixel shuffle: split the channel axis into the square of the upscale factor
+// and move those sub-channels into two new trailing axes.
+// ---------------------------------------------------------------------------
+
+Tensor pixel_shuffle_kernel(const Tensor& self, int64_t upscale_factor) {
+    if (self.dim() < 3) {
+        TP_THROW(RuntimeError,
+                 "pixel_shuffle expects input to have at least 3 dimensions, "
+                 "but got input with ", self.dim(), " dimension(s)");
+    }
+    if (upscale_factor <= 0) {
+        TP_THROW(RuntimeError, "pixel_shuffle expects a positive factor, but "
+                 "got ", upscale_factor);
+    }
+    if (upscale_factor >
+        std::numeric_limits<int64_t>::max() / upscale_factor) {
+        TP_THROW(ValueError, "pixel_shuffle: factor is too large");
+    }
+    const int64_t factor_squared = upscale_factor * upscale_factor;
+    const int64_t channels = self.size(-3);
+    if (channels % factor_squared != 0) {
+        TP_THROW(RuntimeError,
+                 "pixel_shuffle: channel dim must be divisible by r^2");
+    }
+    const auto scale_extent = [&](int64_t extent) {
+        if (extent > std::numeric_limits<int64_t>::max() / upscale_factor) {
+            TP_THROW(ValueError, "pixel_shuffle: output dimension is too large");
+        }
+        return extent * upscale_factor;
+    };
+    std::vector<int64_t> out = shape_of(self);
+    out.resize(out.size() - 3);
+    out.push_back(channels / factor_squared);
+    out.push_back(scale_extent(self.size(-2)));
+    out.push_back(scale_extent(self.size(-1)));
+    return empty_meta(out, self.dtype(), self.device());
 }
 
 // ---------------------------------------------------------------------------
@@ -572,10 +739,17 @@ TENSORPLAY_LIBRARY_IMPL(Meta, MetaShape) {
     m.impl("narrow", narrow_kernel);
     m.impl("split", split_kernel);
     m.impl("split.sizes", split_sizes_kernel);
+    m.impl("split_with_sizes", split_sizes_kernel);
     m.impl("stack", stack_kernel);
     m.impl("flip", flip_kernel);
     m.impl("roll", roll_kernel);
     m.impl("repeat", repeat_kernel);
+    m.impl("unbind", unbind_kernel);
+    m.impl("one_hot", one_hot_kernel);
+    m.impl("kron", kron_kernel);
+    m.impl("trace", trace_kernel);
+    m.impl("upsample_bilinear2d", upsample_bilinear2d_kernel);
+    m.impl("pixel_shuffle", pixel_shuffle_kernel);
 }
 
 } // namespace meta

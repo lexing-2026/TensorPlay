@@ -146,6 +146,32 @@ Tensor batch_norm_kernel(const Tensor& input,
         input, weight, bias, running_mean, running_var, training, momentum, eps));
 }
 
+// Root-mean-square normalization scales each trailing block by the root mean
+// square of its entries, so the answer keeps the input's geometry.  The
+// normalized shape must match the input's trailing extents.
+Tensor rms_norm_kernel(const Tensor& input,
+                       const std::vector<int64_t>& normalized_shape,
+                       const std::optional<Tensor>& weight,
+                       std::optional<double> /*eps*/) {
+    const int64_t norm_ndim = static_cast<int64_t>(normalized_shape.size());
+    const int64_t input_ndim = input.dim();
+    if (norm_ndim > input_ndim) {
+        TP_THROW(RuntimeError,
+                 "rms_norm: normalized_shape dim larger than input dim");
+    }
+    for (int64_t i = 0; i < norm_ndim; ++i) {
+        if (input.size(input_ndim - norm_ndim + i) != normalized_shape[i]) {
+            TP_THROW(RuntimeError,
+                     "rms_norm: Input shape mismatch with normalized_shape");
+        }
+    }
+    if (!isFloatingType(input.dtype())) {
+        TP_THROW(NotImplementedError, "rms_norm: unsupported dtype");
+    }
+    (void)weight;
+    return empty_meta(shape_of(input), input.dtype(), input.device());
+}
+
 } // anonymous namespace
 
 TENSORPLAY_LIBRARY_IMPL(Meta, MetaNormalization) {
@@ -153,6 +179,7 @@ TENSORPLAY_LIBRARY_IMPL(Meta, MetaNormalization) {
     m.impl("layer_norm", layer_norm_kernel);
     m.impl("native_batch_norm", native_batch_norm_kernel);
     m.impl("batch_norm", batch_norm_kernel);
+    m.impl("rms_norm", rms_norm_kernel);
 }
 
 } // namespace meta

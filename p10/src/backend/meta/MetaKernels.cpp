@@ -20,6 +20,7 @@
 #include "Generator.h"
 #include "Scalar.h"
 #include "DType.h"
+#include "DTypeNames.h"
 #include "TypePromotion.h"
 #include "TypeProperties.h"
 
@@ -443,6 +444,139 @@ Tensor& div_scalar_inplace_kernel(Tensor& self, const Scalar& other) {
 }
 
 // ---------------------------------------------------------------------------
+// Pointwise maps beyond the four arithmetic ones.  The pair maps that compute
+// at floating precision answer whole-number inputs at the default real type;
+// the modulo and division families keep an integral pair integral, and true
+// division lifts every integral pair to a real type.
+// ---------------------------------------------------------------------------
+
+DType float_pair_dtype(DType a, DType b) {
+    const DType out = promoteTypes(a, b);
+    return isFloatingType(out) ? out : DType::Float32;
+}
+
+Tensor float_pair_kernel(const Tensor& self, const Tensor& other) {
+    check_all_meta(self, other);
+    return empty_meta(broadcast2(self, other),
+                      float_pair_dtype(self.dtype(), other.dtype()),
+                      self.device());
+}
+
+Tensor float_pair_scalar_kernel(const Tensor& self, const Scalar& other) {
+    return empty_meta(shape_of(self),
+                      float_pair_dtype(self.dtype(),
+                                       result_type(other, self.dtype())),
+                      self.device());
+}
+
+Tensor same_pair_kernel(const Tensor& self, const Tensor& other) {
+    check_all_meta(self, other);
+    return empty_meta(broadcast2(self, other),
+                      promoteTypes(self.dtype(), other.dtype()), self.device());
+}
+
+// A complex scalar carries no lane in the whole-number maps, so it answers
+// at the operand's own type instead of widening the result.
+Tensor same_pair_scalar_kernel(const Tensor& self, const Scalar& other) {
+    const DType out = other.isComplex()
+                          ? self.dtype()
+                          : promoteTypes(self.dtype(),
+                                         result_type(other, self.dtype()));
+    return empty_meta(shape_of(self), out, self.device());
+}
+
+void reject_complex_pair(const Tensor& a, const Tensor& b, const char* op) {
+    if (isComplexType(a.dtype()) || isComplexType(b.dtype())) {
+        TP_THROW(TypeError, op, ": unsupported dtype for complex operands");
+    }
+}
+
+void reject_complex_scalar(const Tensor& self, const Scalar& other,
+                           const char* op) {
+    if (isComplexType(self.dtype()) || other.isComplex()) {
+        TP_THROW(TypeError, op, ": unsupported dtype for complex operands");
+    }
+}
+
+Tensor fmod_pair_kernel(const Tensor& self, const Tensor& other) {
+    reject_complex_pair(self, other, "fmod");
+    return same_pair_kernel(self, other);
+}
+
+Tensor fmod_scalar_kernel(const Tensor& self, const Scalar& other) {
+    reject_complex_scalar(self, other, "fmod");
+    return same_pair_scalar_kernel(self, other);
+}
+
+Tensor remainder_pair_kernel(const Tensor& self, const Tensor& other) {
+    reject_complex_pair(self, other, "remainder");
+    return same_pair_kernel(self, other);
+}
+
+Tensor remainder_scalar_kernel(const Tensor& self, const Scalar& other) {
+    reject_complex_scalar(self, other, "remainder");
+    return same_pair_scalar_kernel(self, other);
+}
+
+Tensor remainder_scalar_tensor_kernel(const Scalar& self, const Tensor& other) {
+    if (isComplexType(other.dtype()) || self.isComplex()) {
+        TP_THROW(TypeError,
+                 "remainder: unsupported dtype for complex operands");
+    }
+    const DType out = self.isComplex()
+                          ? other.dtype()
+                          : promoteTypes(result_type(self, other.dtype()),
+                                         other.dtype());
+    return empty_meta(shape_of(other), out, other.device());
+}
+
+Tensor floor_divide_pair_kernel(const Tensor& self, const Tensor& other) {
+    reject_complex_pair(self, other, "floor_divide");
+    return same_pair_kernel(self, other);
+}
+
+Tensor floor_divide_scalar_kernel(const Tensor& self, const Scalar& other) {
+    reject_complex_scalar(self, other, "floor_divide");
+    return same_pair_scalar_kernel(self, other);
+}
+
+Tensor heaviside_kernel(const Tensor& self, const Tensor& other) {
+    reject_complex_pair(self, other, "heaviside");
+    return same_pair_kernel(self, other);
+}
+
+Tensor copysign_scalar_kernel(const Tensor& self, const Scalar& other) {
+    (void)other;
+    // The sign is carried at single precision and never widens the answer.
+    return empty_meta(shape_of(self),
+                      float_pair_dtype(self.dtype(), DType::Float32),
+                      self.device());
+}
+
+Tensor true_divide_kernel(const Tensor& self, const Tensor& other) {
+    check_all_meta(self, other);
+    return empty_meta(broadcast2(self, other),
+                      div_like_dtype(self.dtype(), other.dtype()), self.device());
+}
+
+Tensor true_divide_scalar_kernel(const Tensor& self, const Scalar& other) {
+    return empty_meta(shape_of(self), div_like_scalar_dtype(self.dtype(), other),
+                      self.device());
+}
+
+// An in-place pair map writes element data only, so the operand's geometry
+// and value type are already the ones the write would leave behind.
+Tensor& pair_inplace_kernel(Tensor& self, const Tensor& other) {
+    check_inplace_fits(self, other);
+    return self;
+}
+
+Tensor& pair_scalar_inplace_kernel(Tensor& self, const Scalar& other) {
+    (void)other;
+    return self;
+}
+
+// ---------------------------------------------------------------------------
 // Pointwise unary. abs of a complex input produces the matching real value
 // type; every other unary keeps dtype and shape.
 // ---------------------------------------------------------------------------
@@ -823,6 +957,213 @@ Tensor addmm_kernel(const Tensor& input, const Tensor& mat1, const Tensor& mat2,
 }
 
 // ---------------------------------------------------------------------------
+// Vector products and the batch accumulators.  dot and mv require equal value
+// types, inner contracts the last axes and stacks the leading ones, and the
+// accumulators seed a broadcast addend with the product.
+// ---------------------------------------------------------------------------
+
+void check_matmul_value_dtype(DType dtype, const char* op) {
+    switch (dtype) {
+        case DType::Bool:
+        case DType::UInt16:
+        case DType::UInt32:
+        case DType::UInt64:
+        case DType::ComplexHalf:
+        case DType::BComplex32:
+            TP_THROW(NotImplementedError, op, ": unsupported dtype ",
+                     scalarTypeName(dtype));
+        default:
+            return;
+    }
+}
+
+bool scalar_is_zero(const Scalar& s) {
+    if (s.isComplex()) {
+        return s.to<complex<double>>() == complex<double>(0.0, 0.0);
+    }
+    return s.toDouble() == 0.0;
+}
+
+void require_expandable_to(const Tensor& self,
+                           const std::vector<int64_t>& target,
+                           const char* op) {
+    if (self.dim() > static_cast<int64_t>(target.size()) ||
+        broadcast_shapes(shape_of(self), target) != target) {
+        TP_THROW(RuntimeError,
+                 op, ": the addend's shape cannot be expanded to the result's "
+                 "shape");
+    }
+}
+
+Tensor dot_kernel(const Tensor& self, const Tensor& other) {
+    if (self.dim() != 1 || other.dim() != 1) {
+        TP_THROW(RuntimeError, "1D tensors expected, but got ", self.dim(),
+                 "D and ", other.dim(), "D tensors");
+    }
+    if (self.size(0) != other.size(0)) {
+        TP_THROW(RuntimeError, "inconsistent tensor size, expected tensor [",
+                 self.size(0), "] and src [", other.size(0),
+                 "] to have the same number of elements, but got ",
+                 self.size(0), " and ", other.size(0),
+                 " elements respectively");
+    }
+    if (self.dtype() != other.dtype()) {
+        TP_THROW(RuntimeError,
+                 "dot : expected both vectors to have same dtype, but found ",
+                 scalarTypeName(self.dtype()), " and ",
+                 scalarTypeName(other.dtype()));
+    }
+    check_matmul_value_dtype(self.dtype(), "dot");
+    return empty_meta({}, self.dtype(), self.device());
+}
+
+Tensor mv_kernel(const Tensor& self, const Tensor& vec) {
+    if (self.dim() != 2 || vec.dim() != 1) {
+        TP_THROW(RuntimeError, "vector + matrix @ vector expected, got ", 1,
+                 ", ", self.dim(), ", ", vec.dim());
+    }
+    if (self.size(1) != vec.size(0)) {
+        TP_THROW(RuntimeError, "size mismatch, got input (", self.size(0),
+                 "), mat (", self.size(0), "x", self.size(1), "), vec (",
+                 vec.size(0), ")");
+    }
+    if (self.dtype() != vec.dtype()) {
+        // The leading slot is the accumulator's; a matrix-vector product
+        // carries the vector's type there.
+        TP_THROW(RuntimeError,
+                 "addmv input tensors must have the same dtype, but got ",
+                 scalarTypeName(vec.dtype()), ", ",
+                 scalarTypeName(self.dtype()), ", and ",
+                 scalarTypeName(vec.dtype()));
+    }
+    check_matmul_value_dtype(self.dtype(), "mv");
+    return empty_meta({self.size(0)}, self.dtype(), self.device());
+}
+
+Tensor inner_kernel(const Tensor& self, const Tensor& other) {
+    check_all_meta(self, other);
+    if (self.dim() == 0 || other.dim() == 0) {
+        return empty_meta(broadcast2(self, other),
+                          promoteTypes(self.dtype(), other.dtype()),
+                          self.device());
+    }
+    if (self.size(-1) != other.size(-1)) {
+        TP_THROW(RuntimeError,
+                 "inner() the last dimension must match on both input tensors "
+                 "but got shapes ",
+                 Size(shape_of(self)).toString(), " and ",
+                 Size(shape_of(other)).toString());
+    }
+    if (self.dtype() != other.dtype()) {
+        TP_THROW(RuntimeError,
+                 "expected m1 and m2 to have the same dtype, but got: ",
+                 elementTypeName(self.dtype()), " != ",
+                 elementTypeName(other.dtype()));
+    }
+    if (self.dim() == 1 && other.dim() == 1) {
+        return dot_kernel(self, other);
+    }
+    check_matmul_value_dtype(self.dtype(), "inner");
+    const std::vector<int64_t> self_shape = shape_of(self);
+    const std::vector<int64_t> other_shape = shape_of(other);
+    std::vector<int64_t> out(self_shape.begin(), self_shape.end() - 1);
+    out.insert(out.end(), other_shape.begin(), other_shape.end() - 1);
+    return empty_meta(out, self.dtype(), self.device());
+}
+
+Tensor ger_kernel(const Tensor& self, const Tensor& vec2) {
+    if (self.dim() != 1 || vec2.dim() != 1) {
+        TP_THROW(RuntimeError, "1D tensors expected, but got ", self.dim(),
+                 "D and ", vec2.dim(), "D tensors");
+    }
+    return empty_meta({self.numel(), vec2.numel()},
+                      promoteTypes(self.dtype(), vec2.dtype()),
+                      self.device());
+}
+
+Tensor baddbmm_kernel(const Tensor& self, const Tensor& batch1,
+                      const Tensor& batch2, const Scalar& beta,
+                      const Scalar& /*alpha*/) {
+    if (batch1.dim() != 3) TP_THROW(RuntimeError, "batch1 must be a 3D tensor");
+    if (batch2.dim() != 3) TP_THROW(RuntimeError, "batch2 must be a 3D tensor");
+    if (batch1.size(0) != batch2.size(0) || batch1.size(2) != batch2.size(1)) {
+        TP_THROW(RuntimeError,
+                 "Expected size for first two dimensions of batch2 tensor to "
+                 "be: [", batch1.size(0), ", ", batch1.size(2), "] but got: [",
+                 batch2.size(0), ", ", batch2.size(1), "].");
+    }
+    if (self.dtype() != batch1.dtype() || batch1.dtype() != batch2.dtype()) {
+        TP_THROW(RuntimeError, "Input dtypes must be the same, got: input ",
+                 elementTypeName(self.dtype()), ", batch1: ",
+                 elementTypeName(batch1.dtype()), ", batch2: ",
+                 elementTypeName(batch2.dtype()));
+    }
+    check_matmul_value_dtype(self.dtype(), "baddbmm");
+    const std::vector<int64_t> target{batch1.size(0), batch1.size(1),
+                                      batch2.size(2)};
+    // A zero weight leaves the addend unread, so only a weighted seed has to
+    // reach the product's shape.
+    if (!scalar_is_zero(beta)) {
+        require_expandable_to(self, target, "baddbmm");
+    }
+    // The product is blended back through an add whose weight carries single
+    // precision, which lifts a whole-number result to a real type.
+    const DType out =
+        add_like_dtype(self.dtype(), self.dtype(), Scalar(1.0));
+    return empty_meta(target, out, self.device());
+}
+
+Tensor addbmm_kernel(const Tensor& self, const Tensor& batch1,
+                     const Tensor& batch2, const Scalar& beta,
+                     const Scalar& alpha) {
+    if (batch1.dim() != 3) TP_THROW(RuntimeError, "batch1 must be a 3D tensor");
+    if (batch2.dim() != 3) TP_THROW(RuntimeError, "batch2 must be a 3D tensor");
+    if (batch1.size(0) != batch2.size(0) || batch1.size(2) != batch2.size(1)) {
+        TP_THROW(RuntimeError, "Incompatible matrix sizes for bmm (",
+                 batch1.size(1), "x", batch1.size(2), " and ",
+                 batch2.size(1), "x", batch2.size(2), ")");
+    }
+    const DType out = promoteTypes(promoteTypes(batch1.dtype(), batch2.dtype()),
+                                   self.dtype());
+    if (out == DType::Bool) {
+        TP_THROW(NotImplementedError, "\"addbmm\" not implemented for 'Bool'");
+    }
+    if (!isFloatingType(out) && !isComplexType(out)) {
+        if (!beta.isIntegral(/*includeBool=*/true)) {
+            TP_THROW(RuntimeError,
+                     "For integral input tensors, argument beta must not be a "
+                     "floating point number.");
+        }
+        if (!alpha.isIntegral(/*includeBool=*/true)) {
+            TP_THROW(RuntimeError,
+                     "For integral input tensors, argument alpha must not be a "
+                     "floating point number.");
+        }
+    }
+    const std::vector<int64_t> target{batch1.size(1), batch2.size(2)};
+    // A zero weight on a whole-number addend leaves it unread, and that route
+    // skips the broadcast check.
+    if (!(scalar_is_zero(beta) && !isFloatingType(out))) {
+        require_expandable_to(self, target, "addbmm");
+    }
+    return empty_meta(target, out, self.device());
+}
+
+Tensor& baddbmm_inplace_kernel(Tensor& self, const Tensor& batch1,
+                               const Tensor& batch2, const Scalar& /*beta*/,
+                               const Scalar& /*alpha*/) {
+    baddbmm_kernel(self, batch1, batch2, Scalar(1), Scalar(1));
+    return self;
+}
+
+Tensor& addbmm_inplace_kernel(Tensor& self, const Tensor& batch1,
+                              const Tensor& batch2, const Scalar& /*beta*/,
+                              const Scalar& /*alpha*/) {
+    addbmm_kernel(self, batch1, batch2, Scalar(1), Scalar(1));
+    return self;
+}
+
+// ---------------------------------------------------------------------------
 // Concatenation.
 // ---------------------------------------------------------------------------
 
@@ -920,6 +1261,97 @@ Tensor conv2d_kernel(const Tensor& input, const Tensor& weight, const Tensor& bi
     std::vector<int64_t> out{input.size(0), weight.size(0)};
     out.insert(out.end(), spatial.begin(), spatial.end());
     return empty_meta(out, input.dtype(), input.device());
+}
+
+Tensor conv1d_kernel(const Tensor& input, const Tensor& weight, const Tensor& bias,
+                     const std::vector<int64_t>& stride,
+                     const std::vector<int64_t>& padding,
+                     const std::vector<int64_t>& dilation, int64_t groups) {
+    if (input.dim() != 3 || weight.dim() != 3) {
+        TP_THROW(RuntimeError, "conv1d: Expected 3D input and weight");
+    }
+    convolution::check_conv_shapes(input, weight, bias, groups, /*transposed=*/false);
+    convolution::check_conv_geometry(input, weight, stride, padding, dilation, "conv1d");
+    const std::vector<int64_t> spatial =
+        convolution::conv_output_spatial_sizes(input, weight, stride, padding, dilation);
+    std::vector<int64_t> out{input.size(0), weight.size(0)};
+    out.insert(out.end(), spatial.begin(), spatial.end());
+    return empty_meta(out, input.dtype(), input.device());
+}
+
+Tensor conv3d_kernel(const Tensor& input, const Tensor& weight, const Tensor& bias,
+                     const std::vector<int64_t>& stride,
+                     const std::vector<int64_t>& padding,
+                     const std::vector<int64_t>& dilation, int64_t groups) {
+    if (input.dim() != 5 || weight.dim() != 5) {
+        TP_THROW(RuntimeError, "conv3d: Expected 5D input and weight");
+    }
+    convolution::check_conv_shapes(input, weight, bias, groups, /*transposed=*/false);
+    convolution::check_conv_geometry(input, weight, stride, padding, dilation, "conv3d");
+    const std::vector<int64_t> spatial =
+        convolution::conv_output_spatial_sizes(input, weight, stride, padding, dilation);
+    std::vector<int64_t> out{input.size(0), weight.size(0)};
+    out.insert(out.end(), spatial.begin(), spatial.end());
+    return empty_meta(out, input.dtype(), input.device());
+}
+
+// A transposed convolution scatters each input element through the kernel, so
+// its output grows with the stride and the dilation and shrinks by the
+// cropping padding: (in - 1) * stride - 2 * padding + dilation * (kernel - 1)
+// + output_padding + 1.  The weight's first channel dimension is the input's.
+Tensor conv_transpose2d_kernel(const Tensor& input, const Tensor& weight,
+                               const Tensor& bias,
+                               const std::vector<int64_t>& stride,
+                               const std::vector<int64_t>& padding,
+                               const std::vector<int64_t>& output_padding,
+                               int64_t groups,
+                               const std::vector<int64_t>& dilation) {
+    if (input.dim() != 4 || weight.dim() != 4) {
+        TP_THROW(RuntimeError, "conv_transpose2d: Expected 4D input and weight");
+    }
+    convolution::check_conv_shapes(input, weight, bias, groups, /*transposed=*/true);
+    const auto expand = [](const std::vector<int64_t>& list, const char* name) {
+        if (list.empty()) return std::vector<int64_t>{1, 1};
+        if (list.size() == 1) return std::vector<int64_t>{list[0], list[0]};
+        if (list.size() != 2) {
+            TP_THROW(ValueError, "conv_transpose2d: ", name, " needs two values");
+        }
+        return list;
+    };
+    const std::vector<int64_t> st = expand(stride, "stride");
+    const std::vector<int64_t> pd = expand(padding, "padding");
+    const std::vector<int64_t> op = expand(output_padding, "output_padding");
+    const std::vector<int64_t> dl = expand(dilation, "dilation");
+    if (st[0] <= 0 || st[1] <= 0) {
+        TP_THROW(RuntimeError, "conv_transpose2d: stride must be positive");
+    }
+    if (dl[0] <= 0 || dl[1] <= 0) {
+        TP_THROW(RuntimeError, "conv_transpose2d: dilation must be positive");
+    }
+    if (pd[0] < 0 || pd[1] < 0 || op[0] < 0 || op[1] < 0) {
+        TP_THROW(RuntimeError,
+                 "conv_transpose2d: padding and output_padding must be "
+                 "non-negative");
+    }
+    if ((op[0] >= st[0] && op[0] >= dl[0]) ||
+        (op[1] >= st[1] && op[1] >= dl[1])) {
+        TP_THROW(RuntimeError,
+                 "conv_transpose2d: output_padding must be smaller than either "
+                 "stride or dilation");
+    }
+    const int64_t out_channels = weight.size(1) * groups;
+    const int64_t h_out =
+        (input.size(2) - 1) * st[0] - 2 * pd[0] + dl[0] * (weight.size(2) - 1) +
+        op[0] + 1;
+    const int64_t w_out =
+        (input.size(3) - 1) * st[1] - 2 * pd[1] + dl[1] * (weight.size(3) - 1) +
+        op[1] + 1;
+    if (h_out <= 0 || w_out <= 0) {
+        TP_THROW(RuntimeError,
+                 "conv_transpose2d: Calculated output size is too small");
+    }
+    return empty_meta({input.size(0), out_channels, h_out, w_out},
+                      input.dtype(), input.device());
 }
 
 // ---------------------------------------------------------------------------
@@ -1075,6 +1507,85 @@ META_UNARY_INPLACE_KERNEL(i0)
 META_UNARY_INPLACE_KERNEL(deg2rad)
 META_UNARY_INPLACE_KERNEL(rad2deg)
 #undef META_UNARY_INPLACE_KERNEL
+
+// ---------------------------------------------------------------------------
+// Predicates and the maps that answer beside the operand's own type.  A
+// predicate reports element data, so its answer is Bool in the operand's
+// geometry; the floating predicates have no complex lane, while isreal and
+// is_complex inspect only the value type.  The remaining maps compute in real
+// arithmetic: a complex operand answers at its real width and a whole-number
+// operand at the default real type.
+// ---------------------------------------------------------------------------
+
+Tensor bool_answer(const Tensor& self, const char* op) {
+    const DType dtype = self.dtype();
+    const bool has_real_lane = dtype == DType::Bool || isIntegralType(dtype) ||
+                               (isFloatingType(dtype) && !isFloat8Type(dtype));
+    if (!has_real_lane) {
+        TP_THROW(TypeError, op, ": unsupported dtype");
+    }
+    return empty_meta(shape_of(self), DType::Bool, self.device());
+}
+
+#define META_BOOL_PREDICATE(NAME)                                             \
+    Tensor NAME##_kernel(const Tensor& self) { return bool_answer(self, #NAME); }
+
+META_BOOL_PREDICATE(isnan)
+META_BOOL_PREDICATE(isinf)
+META_BOOL_PREDICATE(isfinite)
+META_BOOL_PREDICATE(isneginf)
+META_BOOL_PREDICATE(isposinf)
+META_BOOL_PREDICATE(signbit)
+#undef META_BOOL_PREDICATE
+
+Tensor isreal_kernel(const Tensor& self) {
+    return empty_meta(shape_of(self), DType::Bool, self.device());
+}
+
+bool is_complex_kernel(const Tensor& self) {
+    return isComplexType(self.dtype());
+}
+
+DType float_unary_dtype(DType in) {
+    if (isComplexType(in)) return toRealValueType(in);
+    return isFloatingType(in) ? in : DType::Float32;
+}
+
+Tensor positive_kernel(const Tensor& self) {
+    return empty_meta(shape_of(self), self.dtype(), self.device());
+}
+
+Tensor entr_kernel(const Tensor& self) {
+    return empty_meta(shape_of(self), float_unary_dtype(self.dtype()),
+                      self.device());
+}
+
+Tensor logit_kernel(const Tensor& self, const std::optional<Scalar>& /*eps*/) {
+    return empty_meta(shape_of(self), float_unary_dtype(self.dtype()),
+                      self.device());
+}
+
+Tensor& logit_inplace_kernel(Tensor& self, const std::optional<Scalar>& /*eps*/) {
+    return self;
+}
+
+Tensor nan_to_num_kernel(const Tensor& self, const Scalar& /*nan*/,
+                         const std::optional<Scalar>& /*posinf*/,
+                         const std::optional<Scalar>& /*neginf*/) {
+    if (isComplexType(self.dtype())) {
+        TP_THROW(TypeError, "nan_to_num: unsupported dtype");
+    }
+    return empty_meta(shape_of(self), self.dtype(), self.device());
+}
+
+Tensor& nan_to_num_inplace_kernel(Tensor& self, const Scalar& /*nan*/,
+                                  const std::optional<Scalar>& /*posinf*/,
+                                  const std::optional<Scalar>& /*neginf*/) {
+    if (isComplexType(self.dtype())) {
+        TP_THROW(TypeError, "nan_to_num: unsupported dtype");
+    }
+    return self;
+}
 
 // ---------------------------------------------------------------------------
 // Linear interpolation: both endpoints take part in the broadcast, and the
@@ -1478,6 +1989,29 @@ TENSORPLAY_LIBRARY_IMPL(Meta, MetaKernels) {
     m.impl("div_.Tensor", div_inplace_kernel);
     m.impl("div_.Scalar", div_scalar_inplace_kernel);
 
+    // Pointwise pair maps: modulo, division, sign transfer and the maps that
+    // compute at floating precision.
+    m.impl("fmod.Tensor", fmod_pair_kernel);
+    m.impl("fmod.Scalar", fmod_scalar_kernel);
+    m.impl("remainder.Tensor", remainder_pair_kernel);
+    m.impl("remainder.Scalar", remainder_scalar_kernel);
+    m.impl("remainder.Scalar_Tensor", remainder_scalar_tensor_kernel);
+    m.impl("floor_divide", floor_divide_pair_kernel);
+    m.impl("floor_divide.Scalar", floor_divide_scalar_kernel);
+    m.impl("true_divide.Tensor", true_divide_kernel);
+    m.impl("true_divide.Scalar", true_divide_scalar_kernel);
+    m.impl("copysign.Tensor", float_pair_kernel);
+    m.impl("copysign.Scalar", copysign_scalar_kernel);
+    m.impl("nextafter", float_pair_kernel);
+    m.impl("hypot", float_pair_kernel);
+    m.impl("atan2", float_pair_kernel);
+    m.impl("heaviside", heaviside_kernel);
+    m.impl("xlogy", float_pair_kernel);
+    m.impl("atan2_", pair_inplace_kernel);
+    m.impl("heaviside_", pair_inplace_kernel);
+    m.impl("hypot_", pair_inplace_kernel);
+    m.impl("nextafter_", pair_inplace_kernel);
+
     // Pointwise unary.
     m.impl("abs", abs_kernel);
     m.impl("absolute", absolute_kernel);
@@ -1548,6 +2082,22 @@ TENSORPLAY_LIBRARY_IMPL(Meta, MetaKernels) {
     m.impl("round_", round_inplace_kernel);
     m.impl("clamp", clamp_kernel);
 
+    // Predicates and the maps that keep the operand's own geometry.
+    m.impl("isnan", isnan_kernel);
+    m.impl("isinf", isinf_kernel);
+    m.impl("isfinite", isfinite_kernel);
+    m.impl("isneginf", isneginf_kernel);
+    m.impl("isposinf", isposinf_kernel);
+    m.impl("signbit", signbit_kernel);
+    m.impl("isreal", isreal_kernel);
+    m.impl("is_complex", is_complex_kernel);
+    m.impl("positive", positive_kernel);
+    m.impl("entr", entr_kernel);
+    m.impl("logit", logit_kernel);
+    m.impl("logit_", logit_inplace_kernel);
+    m.impl("nan_to_num", nan_to_num_kernel);
+    m.impl("nan_to_num_", nan_to_num_inplace_kernel);
+
     // Linear interpolation.
     m.impl("lerp", lerp_scalar_kernel);
     m.impl("lerp.Tensor", lerp_tensor_kernel);
@@ -1593,6 +2143,14 @@ TENSORPLAY_LIBRARY_IMPL(Meta, MetaKernels) {
     m.impl("reshape", reshape_kernel);
     m.impl("bmm", bmm_kernel);
     m.impl("addmm", addmm_kernel);
+    m.impl("dot", dot_kernel);
+    m.impl("mv", mv_kernel);
+    m.impl("inner", inner_kernel);
+    m.impl("ger", ger_kernel);
+    m.impl("baddbmm", baddbmm_kernel);
+    m.impl("baddbmm_", baddbmm_inplace_kernel);
+    m.impl("addbmm", addbmm_kernel);
+    m.impl("addbmm_", addbmm_inplace_kernel);
     m.impl("cat", cat_kernel);
 
     // Views.
@@ -1606,6 +2164,9 @@ TENSORPLAY_LIBRARY_IMPL(Meta, MetaKernels) {
 
     // Convolution and normalization.
     m.impl("conv2d", conv2d_kernel);
+    m.impl("conv1d", conv1d_kernel);
+    m.impl("conv3d", conv3d_kernel);
+    m.impl("conv_transpose2d", conv_transpose2d_kernel);
     m.impl("group_norm", group_norm_kernel);
     m.impl("native_group_norm", native_group_norm_kernel);
 

@@ -213,6 +213,71 @@ std::tuple<Tensor, Tensor> kthvalue_kernel(const Tensor& self, int64_t k,
             empty_meta(out, DType::Int64, self.device())};
 }
 
+// ---------------------------------------------------------------------------
+// Order statistics: the median over the whole operand answers a scalar, the
+// nan-aware form treats a whole-number operand as Int64, and the running
+// extrema report a position per element beside the values.
+// ---------------------------------------------------------------------------
+
+Tensor median_flat_kernel(const Tensor& self) {
+    require_scalar_elements(self, "median");
+    return empty_meta({}, self.dtype(), self.device());
+}
+
+Tensor nanmedian_flat_kernel(const Tensor& self) {
+    require_scalar_elements(self, "nanmedian");
+    const DType out = isFloatingType(self.dtype()) ? self.dtype() : DType::Int64;
+    return empty_meta({}, out, self.device());
+}
+
+std::tuple<Tensor, Tensor> nanmedian_dim_kernel(const Tensor& self, int64_t dim,
+                                                bool keepdim) {
+    const int64_t nd = self.dim();
+    if (nd == 0) {
+        TP_THROW(RuntimeError,
+                 "nanmedian(): expects a tensor with at least one dimension");
+    }
+    dim = wrap_dim(dim, nd);
+    if (!isFloatingType(self.dtype())) {
+        TP_THROW(RuntimeError,
+                 "nanmedian(): only floating point dtypes are supported");
+    }
+    if (self.size(dim) == 0) {
+        TP_THROW(RuntimeError, "nanmedian(): Expected reduction dim ", dim,
+                 " to have non-zero size");
+    }
+    const std::vector<int64_t> out = positional_out_shape(self, dim, keepdim);
+    return {empty_meta(out, self.dtype(), self.device()),
+            empty_meta(out, DType::Int64, self.device())};
+}
+
+int64_t wrap_running_dim(int64_t dim, int64_t ndim, const char* op) {
+    if (ndim == 0) {
+        if (dim != 0 && dim != -1) {
+            TP_THROW(IndexError, "Dimension out of range for a scalar ", op,
+                     " input: ", dim);
+        }
+        return 0;
+    }
+    return wrap_dim(dim, ndim);
+}
+
+std::tuple<Tensor, Tensor> cummax_kernel(const Tensor& self, int64_t dim) {
+    wrap_running_dim(dim, self.dim(), "cummax");
+    require_scalar_elements(self, "cummax");
+    const std::vector<int64_t> out = shape_of(self);
+    return {empty_meta(out, self.dtype(), self.device()),
+            empty_meta(out, DType::Int64, self.device())};
+}
+
+std::tuple<Tensor, Tensor> cummin_kernel(const Tensor& self, int64_t dim) {
+    wrap_running_dim(dim, self.dim(), "cummin");
+    require_scalar_elements(self, "cummin");
+    const std::vector<int64_t> out = shape_of(self);
+    return {empty_meta(out, self.dtype(), self.device()),
+            empty_meta(out, DType::Int64, self.device())};
+}
+
 } // anonymous namespace
 
 TENSORPLAY_LIBRARY_IMPL(Meta, MetaReduce) {
@@ -232,6 +297,11 @@ TENSORPLAY_LIBRARY_IMPL(Meta, MetaReduce) {
     m.impl("logsumexp", logsumexp_kernel);
     m.impl("mode", mode_kernel);
     m.impl("kthvalue", kthvalue_kernel);
+    m.impl("median", median_flat_kernel);
+    m.impl("nanmedian", nanmedian_flat_kernel);
+    m.impl("nanmedian.dim", nanmedian_dim_kernel);
+    m.impl("cummax", cummax_kernel);
+    m.impl("cummin", cummin_kernel);
 }
 
 } // namespace meta

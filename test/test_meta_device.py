@@ -941,6 +941,301 @@ def test_index_put_shapes():
 
 
 # ---------------------------------------------------------------------------
+# Pointwise maps beside the arithmetic family
+# ---------------------------------------------------------------------------
+
+
+def test_modulo_and_division_family():
+    a = _meta(2, 3, dtype=tp.int32)
+    b = _meta(2, 3, dtype=tp.int64)
+    assert tp.fmod(a, b).dtype == tp.int64
+    assert tuple(tp.fmod(a, _meta(3, dtype=tp.float32)).shape) == (2, 3)
+    assert tp.fmod(a, _meta(3, dtype=tp.float32)).dtype == tp.float32
+    assert tp.remainder(a, 2.5).dtype == tp.float32
+    assert tuple(tp.remainder(2.5, a).shape) == (2, 3)
+    assert tp.floor_divide(a, b).dtype == tp.int64
+    assert tp.floor_divide(a, 2.5).dtype == tp.float32
+    assert tp.true_divide(a, b).dtype == tp.float32
+    assert tp.true_divide(a, 2.0).dtype == tp.float32
+    with pytest.raises(Exception):
+        tp.fmod(_meta(3, dtype=tp.complex64), _meta(3, dtype=tp.complex64))
+    with pytest.raises(Exception):
+        tp.floor_divide(a, tp.tensor(1 + 2j, device="meta"))
+
+
+def test_predicate_family_shapes():
+    t = _meta(2, 3)
+    for predicate in (tp.isnan, tp.isinf, tp.isfinite, tp.isneginf,
+                      tp.isposinf, tp.signbit):
+        answer = predicate(t)
+        assert tuple(answer.shape) == (2, 3)
+        assert answer.dtype == tp.bool
+    assert tp.isreal(_meta(2, dtype=tp.complex64)).dtype == tp.bool
+    assert tp.isreal(t).dtype == tp.bool
+    assert tp.is_complex(t) is False
+    assert tp.is_complex(_meta(2, dtype=tp.complex64)) is True
+    with pytest.raises(Exception):
+        tp.isnan(_meta(2, dtype=tp.complex64))
+
+
+def test_positive_entr_logit_nan_to_num():
+    t = _meta(2, 3, dtype=tp.int32)
+    assert tp.positive(t).dtype == tp.int32
+    assert tuple(tp.positive(t).shape) == (2, 3)
+    assert tp.entr(t).dtype == tp.float32
+    assert tp.entr(_meta(2, dtype=tp.float64)).dtype == tp.float64
+    assert tp.entr(_meta(2, dtype=tp.complex64)).dtype == tp.float32
+    assert tp.logit(t).dtype == tp.float32
+    assert tp.logit(_meta(2, dtype=tp.float64), eps=1e-6).dtype == tp.float64
+    assert tp.nan_to_num(t).dtype == tp.int32
+    assert tuple(tp.nan_to_num(_meta(2), nan=0.0, posinf=1.0).shape) == (2,)
+    with pytest.raises(Exception):
+        tp.nan_to_num(_meta(2, dtype=tp.complex64))
+
+
+def test_sign_and_transcendental_pairs():
+    a = _meta(2, 3, dtype=tp.int32)
+    b = _meta(2, 3, dtype=tp.int64)
+    assert tp.copysign(a, b).dtype == tp.float32
+    assert tp.nextafter(a, b).dtype == tp.float32
+    assert tp.hypot(a, b).dtype == tp.float32
+    assert tp.atan2(a, b).dtype == tp.float32
+    assert tp.heaviside(a, b).dtype == tp.int64
+    assert tp.xlogy(_meta(3, dtype=tp.float64),
+                    _meta(3, dtype=tp.float64)).dtype == tp.float64
+    assert tp.copysign(_meta(3, dtype=tp.float32), 1.0).dtype == tp.float32
+    assert tuple(tp.hypot(_meta(2, 1), _meta(1, 4)).shape) == (2, 4)
+    assert tuple(tp.atan2_(_meta(2, 3), _meta(2, 3)).shape) == (2, 3)
+    assert tuple(tp.heaviside_(_meta(2, 3), _meta(2, 3)).shape) == (2, 3)
+
+
+# ---------------------------------------------------------------------------
+# Vector products and the batch accumulators
+# ---------------------------------------------------------------------------
+
+
+def test_dot_mv_inner_ger():
+    assert tuple(tp.dot(_meta(3), _meta(3)).shape) == ()
+    assert tp.dot(_meta(3, dtype=tp.int32),
+                  _meta(3, dtype=tp.int32)).dtype == tp.int32
+    with pytest.raises(Exception):
+        tp.dot(_meta(3), _meta(3, dtype=tp.int32))
+    with pytest.raises(Exception):
+        tp.dot(_meta(2, 3), _meta(2, 3))
+
+    assert tuple(tp.mv(_meta(2, 3), _meta(3)).shape) == (2,)
+    with pytest.raises(Exception):
+        tp.mv(_meta(2, 3), _meta(2))
+    with pytest.raises(Exception):
+        tp.mv(_meta(2, 3), _meta(3, dtype=tp.float64))
+
+    assert tuple(tp.inner(_meta(2, 3), _meta(4, 3)).shape) == (2, 4)
+    assert tuple(tp.inner(_meta(2, 3), _meta(3)).shape) == (2,)
+    assert tp.inner(_meta(2, 3), _meta(3)).dtype == tp.float32
+    with pytest.raises(Exception):
+        tp.inner(_meta(2, 3, dtype=tp.float32),
+                 _meta(4, 3, dtype=tp.float64))
+    with pytest.raises(Exception):
+        tp.inner(_meta(2, 3), _meta(4, 5))
+
+    assert tuple(tp.ger(_meta(2), _meta(4)).shape) == (2, 4)
+    assert tp.ger(_meta(2, dtype=tp.bool),
+                  _meta(3, dtype=tp.bool)).dtype == tp.bool
+
+
+def test_baddbmm_and_addbmm_shapes():
+    batch1 = _meta(4, 3, 5, dtype=tp.float32)
+    batch2 = _meta(4, 5, 6, dtype=tp.float32)
+    seed = _meta(4, 3, 6, dtype=tp.float32)
+    assert tuple(tp.baddbmm(seed, batch1, batch2).shape) == (4, 3, 6)
+    # The addend may broadcast into the batch.
+    assert tuple(tp.baddbmm(_meta(3, 6), batch1, batch2).shape) == (4, 3, 6)
+    whole = tp.baddbmm(_meta(4, 3, 6, dtype=tp.int32),
+                       _meta(4, 3, 5, dtype=tp.int32),
+                       _meta(4, 5, 6, dtype=tp.int32))
+    assert whole.dtype == tp.float32
+    with pytest.raises(Exception):
+        tp.baddbmm(seed, batch1, _meta(4, 5, 6, dtype=tp.float64))
+    with pytest.raises(Exception):
+        tp.baddbmm(_meta(4, 2, 6), batch1, batch2)
+
+    assert tuple(tp.addbmm(_meta(3, 6), batch1, batch2).shape) == (3, 6)
+    assert tp.addbmm(_meta(3, 6, dtype=tp.int32),
+                     _meta(4, 3, 5, dtype=tp.int32),
+                     _meta(4, 5, 6, dtype=tp.int32)).dtype == tp.int32
+    with pytest.raises(Exception):
+        tp.addbmm(_meta(1, 3, 6), batch1, batch2)
+    with pytest.raises(Exception):
+        tp.addbmm(_meta(3, 6, dtype=tp.int32),
+                  _meta(4, 3, 5, dtype=tp.int32),
+                  _meta(4, 5, 6, dtype=tp.int32), beta=0.5)
+
+
+# ---------------------------------------------------------------------------
+# Convolutions, resampling and renormalization
+# ---------------------------------------------------------------------------
+
+
+def test_conv1d_conv3d_conv_transpose2d():
+    assert tuple(tp.conv1d(_meta(1, 2, 8), _meta(3, 2, 3)).shape) == (1, 3, 6)
+    assert tuple(tp.conv1d(_meta(1, 2, 8), _meta(3, 2, 3), _meta(3),
+                           stride=2, padding=1).shape) == (1, 3, 4)
+    assert tuple(tp.conv3d(_meta(1, 2, 4, 4, 4),
+                           _meta(3, 2, 2, 2, 2)).shape) == (1, 3, 3, 3, 3)
+    assert tuple(tp.conv_transpose2d(_meta(1, 2, 4, 4),
+                                     _meta(2, 3, 3, 3),
+                                     stride=2).shape) == (1, 3, 9, 9)
+    assert tuple(tp.conv_transpose2d(_meta(1, 2, 4, 4),
+                                     _meta(2, 3, 3, 3), stride=1,
+                                     padding=1).shape) == (1, 3, 4, 4)
+    with pytest.raises(Exception):
+        tp.conv1d(_meta(1, 2, 8), _meta(3, 3, 3))
+    with pytest.raises(Exception):
+        tp.conv3d(_meta(1, 2, 4, 4), _meta(3, 2, 2, 2, 2))
+
+
+def test_upsample_bilinear2d_and_pixel_shuffle():
+    assert tuple(tp.upsample_bilinear2d(_meta(2, 3, 4, 5), [8, 10],
+                                        align_corners=False).shape) == (2, 3, 8, 10)
+    with pytest.raises(Exception):
+        tp.upsample_bilinear2d(_meta(2, 3, 4, 5), [-2, 10],
+                               align_corners=False)
+    assert tuple(tp.pixel_shuffle(_meta(2, 8, 3, 4), 2).shape) == (2, 2, 6, 8)
+    with pytest.raises(Exception):
+        tp.pixel_shuffle(_meta(2, 2), 2)
+    with pytest.raises(Exception):
+        tp.pixel_shuffle(_meta(2, 5, 3, 4), 2)
+
+
+def test_dist_renorm_and_rms_norm():
+    distance = tp.dist(_meta(3, dtype=tp.int32), _meta(3, dtype=tp.int32))
+    assert tuple(distance.shape) == ()
+    assert distance.dtype == tp.float32
+    assert tp.dist(_meta(3), _meta(3), p=1.0).dtype == tp.float32
+    assert tp.dist(_meta(3, dtype=tp.complex64),
+                   _meta(3, dtype=tp.complex64)).dtype == tp.float32
+    with pytest.raises(Exception):
+        tp.dist(_meta(3, dtype=tp.bool), _meta(3, dtype=tp.bool))
+
+    t = _meta(2, 3)
+    assert tuple(tp.renorm(t, 2.0, 0, 5.0).shape) == (2, 3)
+    assert tuple(t.renorm_(2.0, 0, 5.0).shape) == (2, 3)
+    with pytest.raises(Exception):
+        tp.renorm(_meta(2, 3, dtype=tp.int32), 2.0, 0, 5.0)
+    with pytest.raises(Exception):
+        tp.renorm(t, 0.0, 0, 5.0)
+    with pytest.raises(Exception):
+        tp.renorm(_meta(3), 2.0, 0, 5.0)
+
+    assert tuple(tp.rms_norm(_meta(2, 3), [3]).shape) == (2, 3)
+    assert tp.rms_norm(_meta(2, 3), [3]).dtype == tp.float32
+    with pytest.raises(Exception):
+        tp.rms_norm(_meta(2, 3), [4])
+    with pytest.raises(Exception):
+        tp.rms_norm(_meta(2, 3), [3, 3])
+    with pytest.raises(Exception):
+        tp.rms_norm(_meta(2, 3, dtype=tp.int32), [3])
+
+
+# ---------------------------------------------------------------------------
+# Splitting, label encodings and diagonal products
+# ---------------------------------------------------------------------------
+
+
+def test_unbind_and_split_with_sizes():
+    t = _meta(2, 3, 4)
+    parts = tp.unbind(t, 1)
+    assert len(parts) == 3
+    assert tuple(parts[0].shape) == (2, 4)
+    assert len(tp.unbind(t, -1)) == 4
+    assert tp.unbind(t, 0)[0].dtype == t.dtype
+    with pytest.raises(Exception):
+        tp.unbind(_meta(()), 0)
+
+    splits = tp.split_with_sizes(t, [1, 2], 1)
+    assert [tuple(p.shape) for p in splits] == [(2, 1, 4), (2, 2, 4)]
+    with pytest.raises(Exception):
+        tp.split_with_sizes(t, [4], 1)
+    with pytest.raises(Exception):
+        tp.split_with_sizes(t, [1, 1], 1)
+    with pytest.raises(Exception):
+        tp.split_with_sizes(t, [-1, 4], 1)
+
+
+def test_one_hot_kron_and_trace():
+    index = _meta(2, 3, dtype=tp.int64)
+    encoded = tp.one_hot(index, 5)
+    assert tuple(encoded.shape) == (2, 3, 5)
+    assert encoded.dtype == tp.int64
+    assert tuple(tp.one_hot(_meta(0, dtype=tp.int64), 4).shape) == (0, 4)
+    with pytest.raises(Exception):
+        tp.one_hot(_meta(0, dtype=tp.int64), -1)
+    with pytest.raises(Exception):
+        tp.one_hot(index, -1)
+    with pytest.raises(Exception):
+        tp.one_hot(_meta(2, dtype=tp.float32), 3)
+
+    assert tuple(tp.kron(_meta(2, 3), _meta(4)).shape) == (2, 12)
+    assert tuple(tp.kron(_meta(2, 3), _meta(4, 5)).shape) == (8, 15)
+    assert tp.kron(_meta(2, dtype=tp.int32),
+                   _meta(3, dtype=tp.float32)).dtype == tp.float32
+
+    traced = tp.trace(_meta(3, 4, dtype=tp.int32))
+    assert tuple(traced.shape) == ()
+    assert traced.dtype == tp.int64
+    assert tp.trace(_meta(3, 4)).dtype == tp.float32
+    with pytest.raises(Exception):
+        tp.trace(_meta(3))
+
+
+def test_masked_scatter_shapes():
+    t = _meta(3, 4)
+    mask = _meta(3, 4, dtype=tp.bool)
+    source = _meta(5)
+    scattered = tp.masked_scatter(t, mask, source)
+    assert tuple(scattered.shape) == (3, 4)
+    assert scattered.dtype == t.dtype
+    assert tuple(tp.masked_scatter(t, _meta(1, 4, dtype=tp.bool),
+                                   source).shape) == (3, 4)
+    assert tuple(tp.masked_scatter_(t, mask, source).shape) == (3, 4)
+    with pytest.raises(Exception):
+        tp.masked_scatter(t, mask, _meta(5, dtype=tp.int32))
+    with pytest.raises(Exception):
+        tp.masked_scatter(t, _meta(5, 4, dtype=tp.bool), source)
+
+
+# ---------------------------------------------------------------------------
+# Order statistics and running extrema
+# ---------------------------------------------------------------------------
+
+
+def test_median_nanmedian_and_running_extrema():
+    t = _meta(3, 4, dtype=tp.float32)
+    assert tuple(tp.median(t).shape) == ()
+    assert tp.median(_meta(3, 4, dtype=tp.int32)).dtype == tp.int32
+    assert tp.nanmedian(_meta(3, 4, dtype=tp.int32)).dtype == tp.int64
+
+    values, indices = tp.nanmedian(t, dim=1, keepdim=True)
+    assert tuple(values.shape) == (3, 1)
+    assert values.dtype == tp.float32
+    assert tuple(indices.shape) == (3, 1)
+    assert indices.dtype == tp.int64
+    with pytest.raises(Exception):
+        tp.nanmedian(_meta(3, 4, dtype=tp.int32), dim=1)
+
+    running, positions = tp.cummax(t, dim=0)
+    assert tuple(running.shape) == (3, 4)
+    assert running.dtype == tp.float32
+    assert tuple(positions.shape) == (3, 4)
+    assert positions.dtype == tp.int64
+    running, positions = tp.cummin(_meta(2, 3, dtype=tp.int32), dim=-1)
+    assert running.dtype == tp.int32
+    assert positions.dtype == tp.int64
+    with pytest.raises(Exception):
+        tp.cummax(_meta(2, dtype=tp.complex64), dim=0)
+
+
+# ---------------------------------------------------------------------------
 # Cross-checks against the reference framework when it is installed
 # ---------------------------------------------------------------------------
 
