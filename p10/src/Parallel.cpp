@@ -81,6 +81,83 @@ int physical_core_count() {
   return logical;
 }
 
+// CPU allowance of the enclosing cgroup, in whole CPUs; zero when the process
+// runs without a quota.  A container commonly reports the host's processor
+// count while a quota bounds how much of it is schedulable, so a team sized
+// from the reported count leaves most workers without a core and every
+// region's closing barrier waits on them.  Quotas round up: a 1.5-CPU share
+// can still keep two runnable threads busy.
+int cgroup_cpu_quota() {
+#ifdef __linux__
+  // Nested cgroups keep the same file names below the controller root; the
+  // process's own path comes from /proc/self/cgroup.
+  std::string v1_path;
+  std::string v2_path;
+  if (FILE* f = std::fopen("/proc/self/cgroup", "re")) {
+    char line[512];
+    while (std::fgets(line, sizeof(line), f)) {
+      char* first = std::strchr(line, ':');
+      if (!first) continue;
+      char* second = std::strchr(first + 1, ':');
+      if (!second) continue;
+      *second = '\0';
+      const std::string controllers(first + 1);
+      std::string path(second + 1);
+      while (!path.empty() &&
+             (path.back() == '\n' || path.back() == '\r')) {
+        path.pop_back();
+      }
+      if (path == "/") path.clear();
+      if (controllers == "cpu" || controllers == "cpu,cpuacct" ||
+          controllers == "cpuacct,cpu") {
+        v1_path = path;
+      } else if (controllers.empty()) {
+        v2_path = path;  // unified hierarchy
+      }
+    }
+    std::fclose(f);
+  }
+
+  auto v2_quota = [](const std::string& dir) -> int {
+    FILE* f = std::fopen((dir + "/cpu.max").c_str(), "re");
+    if (!f) return 0;
+    char quota[64] = {0};
+    long long period = 0;
+    const int fields = std::fscanf(f, "%63s %lld", quota, &period);
+    std::fclose(f);
+    if (fields != 2 || period <= 0 || quota[0] < '0' || quota[0] > '9') {
+      return 0;  // "max" means unlimited
+    }
+    const long long q = std::atoll(quota);
+    if (q <= 0) return 0;
+    return static_cast<int>((q + period - 1) / period);
+  };
+  auto v1_quota = [](const std::string& dir) -> int {
+    FILE* fq = std::fopen((dir + "/cpu.cfs_quota_us").c_str(), "re");
+    FILE* fp = std::fopen((dir + "/cpu.cfs_period_us").c_str(), "re");
+    long long quota = -1;
+    long long period = 0;
+    const bool ok = fq && fp && std::fscanf(fq, "%lld", &quota) == 1 &&
+                    std::fscanf(fp, "%lld", &period) == 1;
+    if (fq) std::fclose(fq);
+    if (fp) std::fclose(fp);
+    if (!ok || quota <= 0 || period <= 0) return 0;
+    return static_cast<int>((quota + period - 1) / period);
+  };
+
+  for (const std::string& dir : {std::string("/sys/fs/cgroup") + v2_path,
+                                 std::string("/sys/fs/cgroup")}) {
+    if (const int n = v2_quota(dir)) return n;
+  }
+  for (const char* root : {"/sys/fs/cgroup/cpu", "/sys/fs/cgroup/cpu,cpuacct"}) {
+    const std::string base(root);
+    if (const int n = v1_quota(base + v1_path)) return n;
+    if (const int n = v1_quota(base)) return n;
+  }
+#endif
+  return 0;
+}
+
 int intraop_default_num_threads() {
   // Computed once: the default path parses /proc/cpuinfo, which costs
   // ~100us+ per call on many-core machines -- fatal for per-op hot paths.
@@ -108,6 +185,11 @@ int intraop_default_num_threads() {
     const int cap = internal::hybrid_thread_cap();
     if (cap > 0 && cap < n) {
       n = cap;
+    }
+    // What the scheduler can actually run, not what the host reports.
+    const int quota = cgroup_cpu_quota();
+    if (quota > 0 && quota < n) {
+      n = quota;
     }
     return n;
   }();
