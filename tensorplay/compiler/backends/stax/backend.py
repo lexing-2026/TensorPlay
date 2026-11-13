@@ -202,7 +202,17 @@ def _lower_stax_region(
     strict = bool(strict_native)
     dynamic_shapes = bool(dynamic is True)
     is_backward = bool(graph_module.meta.get("aot_backward", False))
-    training = is_backward or getattr(graph_module.root, "training", False) or any(
+    # A synthetic root that only carries the region's tensor constants says
+    # nothing about the region: the training flag it reports is the base
+    # module default, not the traced program's.  A region's mode is decided
+    # by the backward marker and by the operands that require grad, which is
+    # also where the parameters of a module region appear.
+    from tensorplay.graph.experimental._dispatch_trace import _ConstantHolder
+
+    root_training = getattr(graph_module.root, "training", False)
+    if isinstance(graph_module.root, _ConstantHolder):
+        root_training = False
+    training = is_backward or root_training or any(
         getattr(value, "requires_grad", False) for value in example_inputs
     )
     try:
