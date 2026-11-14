@@ -3069,6 +3069,157 @@ def test_pair_and_clamp_dtype_edges():
     assert tp._C.rad2deg(_meta(2, 3, dtype=tp.complex128)).dtype == tp.float32
 
 
+def test_where_condition_must_be_boolean():
+    # every selection form reads the condition element by element, so a
+    # non-boolean condition is refused before the geometry is answered
+    for cond_dt in (tp.float32, tp.int64):
+        cond = _meta(2, 3, dtype=cond_dt)
+        with pytest.raises(TypeError):
+            tp._C.where(cond, _meta(2, 3), _meta(2, 3))
+        with pytest.raises(TypeError):
+            tp._C.where(cond, _meta(2, 3), 1.0)
+        with pytest.raises(TypeError):
+            tp._C.where(cond, 1.0, _meta(2, 3))
+        with pytest.raises(TypeError):
+            tp._C.where(cond, 1.0, 2.0)
+    # a boolean condition selects over the promoted operand types
+    cond = _meta(2, 3, dtype=tp.bool)
+    assert tp._C.where(cond, _meta(2, 3, dtype=tp.int64), 1.0).dtype == \
+        tp.float32
+    assert tp._C.where(cond, 1.0, 2.0).dtype == tp.float64
+
+
+def test_extrema_and_median_refuse_complex():
+    # the pairwise extrema have no complex form, and the shape checks run
+    # before the dtype is policed
+    for name, args in (("max", ()), ("min", ()), ("max", (1,)), ("min", (1,)),
+                       ("argmax", ()), ("argmax", (1,)), ("argmin", (1,)),
+                       ("median", ()), ("median", (1,))):
+        # median carries a flat form that refuses complex as unimplemented
+        # and a dim form with no kernel at all, which surfaces as a type
+        # error; the rest refuse complex as unimplemented everywhere
+        expected = TypeError if name == "median" and args == (1,) \
+            else NotImplementedError
+        with pytest.raises(expected):
+            getattr(tp._C, name)(_meta(2, 3, dtype=tp.complex64), *args)
+    for name in ("amax", "amin"):
+        with pytest.raises(TypeError):
+            getattr(tp._C, name)(_meta(2, 3, dtype=tp.complex64), [1])
+    with pytest.raises(TypeError):
+        tp._C.aminmax(_meta(2, 3, dtype=tp.complex64), 1)
+    # an out-of-range dimension is named before the dtype is policed
+    with pytest.raises(IndexError):
+        tp._C.amax(_meta(2, 3, dtype=tp.complex64), [5])
+    with pytest.raises(IndexError):
+        tp._C.aminmax(_meta(2, 3, dtype=tp.complex64), 5)
+    # whole-number and boolean planes keep their extrema forms
+    for dt in (tp.int64, tp.bool):
+        t = _meta(2, 3, dtype=dt)
+        assert tp._C.max(t).dtype == dt
+        assert tp._C.min(t, 1)[0].dtype == dt
+        assert tp._C.amax(t, [1]).dtype == dt
+        assert tp._C.aminmax(t, 1)[0].dtype == dt
+        assert tp._C.argmax(t).dtype == tp.int64
+
+
+def test_nanmedian_dtype_contract():
+    # the flat form answers every operand in a comparable type: a floating
+    # plane keeps its own width, anything else answers as a whole-number
+    # scalar
+    for dt in (tp.complex64, tp.int64, tp.bool):
+        r = tp._C.nanmedian(_meta(2, 3, dtype=dt))
+        assert r.dtype == tp.int64
+        assert tuple(r.shape) == ()
+    for dt in (tp.float16, tp.bfloat16, tp.float32, tp.float64):
+        assert tp._C.nanmedian(_meta(2, 3, dtype=dt)).dtype == dt
+    # the dim form computes over floating planes only: whole-number planes
+    # are refused as unrunnable and the half-width planes have no kernel
+    with pytest.raises(RuntimeError):
+        tp._C.nanmedian(_meta(2, 3, dtype=tp.int64), 1)
+    with pytest.raises(TypeError):
+        tp._C.nanmedian(_meta(2, 3, dtype=tp.float16), 1)
+    with pytest.raises(TypeError):
+        tp._C.nanmedian(_meta(2, 3, dtype=tp.bfloat16), 1)
+    assert tp._C.nanmedian(_meta(2, 3, dtype=tp.float32), 1)[0].dtype == \
+        tp.float32
+
+
+def test_norm_dtype_contract():
+    # a whole-number operand runs the norm as a chain of powers: order 1
+    # keeps the operand type, any other finite order answers in single
+    # precision, an infinite order short-circuits to the largest element and
+    # keeps the operand type, and a negative order has no whole-number power
+    i64 = _meta(2, 3, dtype=tp.int64)
+    assert tp._C.norm(i64, 1.0).dtype == tp.int64
+    assert tp._C.norm(i64, 2.0).dtype == tp.float32
+    assert tp._C.norm(i64, float("inf")).dtype == tp.int64
+    assert tp._C.norm(i64, float("-inf")).dtype == tp.int64
+    assert tp._C.norm(i64, [1], float("inf"), True).dtype == tp.int64
+    assert tp._C.norm(i64, [1], 2.0, True).dtype == tp.float32
+    with pytest.raises(RuntimeError):
+        tp._C.norm(i64, -2.0)
+    # a boolean operand has no power form: only the infinite orders run
+    with pytest.raises(TypeError):
+        tp._C.norm(_meta(2, 3, dtype=tp.bool), 2.0)
+    assert tp._C.norm(_meta(2, 3, dtype=tp.bool),
+                      float("inf")).dtype == tp.bool
+    assert tp._C.norm(_meta(2, 3, dtype=tp.bool), [1], float("inf"),
+                      True).dtype == tp.bool
+    # floating planes keep their width and complex planes answer in their
+    # real component type
+    assert tp._C.norm(_meta(2, 3, dtype=tp.float16)).dtype == tp.float16
+    assert tp._C.norm(_meta(2, 3, dtype=tp.float64), 2.0).dtype == tp.float64
+    assert tp._C.norm(_meta(2, 3, dtype=tp.complex64)).dtype == tp.float32
+    assert tp._C.norm(_meta(2, 3, dtype=tp.complex128)).dtype == tp.float64
+
+
+def test_pdist_dtype_contract():
+    # the pairwise distances accumulate at single precision, so a half-width
+    # operand answers in single precision and wider planes keep their width
+    assert tp._C.pdist(_meta(4, 3, dtype=tp.float16)).dtype == tp.float32
+    assert tp._C.pdist(_meta(4, 3, dtype=tp.bfloat16)).dtype == tp.float32
+    assert tp._C.pdist(_meta(4, 3, dtype=tp.float32)).dtype == tp.float32
+    assert tp._C.pdist(_meta(4, 3, dtype=tp.float64)).dtype == tp.float64
+    # a distance has no whole-number or complex form
+    for dt in (tp.int64, tp.bool, tp.complex64):
+        with pytest.raises(TypeError):
+            tp._C.pdist(_meta(4, 3, dtype=dt))
+
+
+def test_var_std_answer_real_and_mean_keeps_plane():
+    # the spread measures square real deviations, so a complex operand
+    # answers its spread in the real component type while the mean keeps
+    # the complex plane
+    for dt, real in ((tp.complex64, tp.float32),
+                     (tp.complex128, tp.float64)):
+        v, m = tp._C.var_mean(_meta(2, 3, dtype=dt), [1])
+        assert v.dtype == real
+        assert m.dtype == dt
+        s, m2 = tp._C.std_mean(_meta(2, 3, dtype=dt), [1])
+        assert s.dtype == real
+        assert m2.dtype == dt
+    # a floating operand answers both members in its own type
+    v, m = tp._C.var_mean(_meta(2, 3, dtype=tp.float32), [1])
+    assert v.dtype == tp.float32
+    assert m.dtype == tp.float32
+
+
+def test_ordered_comparisons_refuse_complex():
+    # an ordering is undefined over complex planes: the tensor forms refuse
+    # a complex operand outright while equality keeps one
+    for name in ("lt", "le", "gt", "ge"):
+        f = getattr(tp._C, name)
+        with pytest.raises(NotImplementedError):
+            f(_meta(2, 3, dtype=tp.complex64), _meta(2, 3, dtype=tp.complex64))
+        with pytest.raises(NotImplementedError):
+            f(_meta(2, 3, dtype=tp.complex64), _meta(2, 3, dtype=tp.float32))
+        # the scalar forms compare element-wise against a real value
+        assert f(_meta(2, 3, dtype=tp.complex64), 0.5).dtype == tp.bool
+    assert tp._C.eq(_meta(2, 3, dtype=tp.complex64),
+                    _meta(2, 3, dtype=tp.complex64)).dtype == tp.bool
+    assert tp._C.ne(_meta(2, 3, dtype=tp.complex64), 0.5).dtype == tp.bool
+
+
 # ---------------------------------------------------------------------------
 # Cross-checks against the reference framework when it is installed
 # ---------------------------------------------------------------------------
