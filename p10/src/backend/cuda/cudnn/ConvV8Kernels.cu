@@ -199,7 +199,7 @@ __global__ void conv2d_grad_bias_strided_kernel(
 }
 
 
-static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const Tensor& bias, const std::vector<int64_t>& stride_arg, const std::vector<int64_t>& padding_arg, const std::vector<int64_t>& dilation_arg, int64_t groups, bool fused_relu) {
+static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const Tensor& bias, const std::vector<int64_t>& stride_arg, const std::vector<int64_t>& padding_arg, const std::vector<int64_t>& dilation_arg, int64_t groups, bool fused_relu, Tensor out_provided = {}) {
     convolution::check_conv_shapes(input, weight, bias, groups, false);
     convolution::check_conv_geometry(input, weight, stride_arg, padding_arg,
                                      dilation_arg, "conv2d");
@@ -319,8 +319,23 @@ static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const 
     const std::array<int64_t, 4> y_stride = use_channels_last
         ? channels_last_strides(K, OH, OW)
         : std::array<int64_t, 4>{K * OH * OW, OH * OW, OW, 1};
-    Tensor out = empty_conv_output(
-        N, K, OH, OW, input.dtype(), input.device(), use_channels_last);
+    // A caller handing over its own output buffer spares the plan a fresh
+    // allocation and the copy into it, but only when the buffer's geometry is
+    // the one this plan is built around; anything else keeps the old path of
+    // a fresh output the caller copies from.
+    Tensor out;
+    if (out_provided.defined() && out_provided.dtype() == input.dtype() &&
+        out_provided.device() == input.device() &&
+        static_cast<std::vector<int64_t>>(out_provided.shape()) ==
+            std::vector<int64_t>{N, K, OH, OW} &&
+        std::array<int64_t, 4>{out_provided.stride(0), out_provided.stride(1),
+                               out_provided.stride(2),
+                               out_provided.stride(3)} == y_stride) {
+        out = out_provided;
+    } else {
+        out = empty_conv_output(
+            N, K, OH, OW, input.dtype(), input.device(), use_channels_last);
+    }
 
     ConvKey key{dtype, N, C, H, W, K, R, S, groups,
                 padding[0], padding[1], stride[0], stride[1], dilation[0], dilation[1],
@@ -1493,6 +1508,29 @@ Tensor conv2d_cuda(const Tensor& input, const Tensor& weight, const Tensor& bias
     }
 #endif
     return conv2d_cuda_impl(input, weight, bias, stride, padding, dilation, groups, false);
+}
+
+// Writes a 2-D convolution into the caller's buffer.  Returns whether the
+// buffer was used in place; a false answer leaves the buffer untouched and
+// the caller fills it from a fresh result instead.
+bool conv2d_into_cuda(const Tensor& input, const Tensor& weight, const Tensor& bias,
+                      const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
+                      const std::vector<int64_t>& dilation, int64_t groups, Tensor& out) {
+#if defined(USE_CUDNN) && defined(TP_HAS_CUDNN_FRONTEND)
+    // The channel-major reduced-precision order produces a layout of its own,
+    // so an outside buffer does not fit there and the caller copies instead.
+    if (groups == 1 && conv_operand_repackable(input, false) &&
+        conv_operand_repackable(weight, true)) {
+        return false;
+    }
+    Tensor result = conv2d_cuda_impl(input, weight, bias, stride, padding, dilation,
+                                     groups, false, out);
+    return result.data_ptr() == out.data_ptr();
+#else
+    (void)input; (void)weight; (void)bias; (void)stride; (void)padding;
+    (void)dilation; (void)groups; (void)out;
+    return false;
+#endif
 }
 
 // Keep the fused IR contract shared with CPU.  The cuDNN frontend plan owns

@@ -109,6 +109,11 @@ Tensor conv1d_cuda(const Tensor& input, const Tensor& weight, const Tensor& bias
 Tensor conv2d_cuda(const Tensor& input, const Tensor& weight, const Tensor& bias,
                    const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
                    const std::vector<int64_t>& dilation, int64_t groups);
+// Writes a 2-D convolution into an existing buffer; true when the buffer was
+// used in place, false when the caller has to fill it from a fresh result.
+bool conv2d_into_cuda(const Tensor& input, const Tensor& weight, const Tensor& bias,
+                      const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
+                      const std::vector<int64_t>& dilation, int64_t groups, Tensor& out);
 Tensor conv3d_cuda(const Tensor& input, const Tensor& weight, const Tensor& bias,
                    const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
                    const std::vector<int64_t>& dilation, int64_t groups);

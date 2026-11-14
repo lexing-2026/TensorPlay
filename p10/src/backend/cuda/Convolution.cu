@@ -30,10 +30,43 @@ Tensor convolution_cuda(const Tensor& input, const Tensor& weight,
         case 1: return conv_transpose1d_cuda(input, weight, bias_t, stride, padding,
                                             output_padding, groups, dilation);
         case 2: return conv_transpose2d_cuda(input, weight, bias_t, stride, padding,
-                                            output_padding, groups, dilation);
-        default: return conv_transpose3d_cuda(input, weight, bias_t, stride, padding,
                                              output_padding, groups, dilation);
+        default: return conv_transpose3d_cuda(input, weight, bias_t, stride, padding,
+                                              output_padding, groups, dilation);
     }
+}
+
+// out= hands the computation an existing buffer: a 2-D forward convolution
+// writes into it directly when its geometry is the one the plan is built
+// around, and every other shape computes a fresh result the buffer copies
+// from.
+Tensor& convolution_out_cuda(const Tensor& input, const Tensor& weight,
+                             const std::optional<Tensor>& bias,
+                             const std::vector<int64_t>& stride,
+                             const std::vector<int64_t>& padding,
+                             const std::vector<int64_t>& dilation,
+                             bool transposed,
+                             const std::vector<int64_t>& output_padding,
+                             int64_t groups, Tensor& out) {
+    const int64_t k = convolution::spatial_dims(input, weight, "convolution");
+    Tensor result;
+    if (!transposed && k == 2) {
+        const Tensor bias_t = bias.has_value() ? *bias : Tensor();
+        if (conv2d_into_cuda(input, weight, bias_t, stride, padding, dilation,
+                             groups, out)) {
+            return out;
+        }
+        result = conv2d_cuda(input, weight, bias_t, stride, padding, dilation, groups);
+    } else {
+        result = convolution_cuda(input, weight, bias, stride, padding, dilation,
+                                  transposed, output_padding, groups);
+    }
+    const auto target = static_cast<std::vector<int64_t>>(result.shape());
+    if (static_cast<std::vector<int64_t>>(out.shape()) != target) {
+        out.resize_(target);
+    }
+    out.copy_(result);
+    return out;
 }
 
 std::tuple<Tensor, Tensor, Tensor> convolution_backward_cuda(
@@ -120,6 +153,7 @@ std::tuple<Tensor, Tensor, Tensor> convolution_backward_overrideable_cuda(
 
 TENSORPLAY_LIBRARY_IMPL(CUDA, Convolution) {
     m.impl("convolution", convolution_cuda);
+    m.impl("convolution.out", convolution_out_cuda);
     m.impl("convolution_backward", convolution_backward_cuda);
     m.impl("convolution_overrideable", convolution_overrideable_cuda);
     m.impl("convolution_backward_overrideable", convolution_backward_overrideable_cuda);
