@@ -34,10 +34,12 @@ void clamp_tensor_loop(TensorIterator& iter, bool has_min, bool has_max) {
 }
 
 Tensor clamp_tensor_cuda(const Tensor& self, const std::optional<Tensor>& min,
-                         const std::optional<Tensor>& max) {
-    if (!min.has_value() && !max.has_value()) {
-        return self;
-    }
+                         const std::optional<Tensor>& max);
+
+// clamp.Tensor plan: the promoted width and the broadcast answer shape the
+// allocating form produces.
+static std::pair<DType, std::vector<int64_t>> clamp_tensor_plan(
+        const Tensor& self, const std::optional<Tensor>& min, const std::optional<Tensor>& max) {
     DType common_dtype = self.dtype();
     if (min.has_value()) common_dtype = promoteTypes(common_dtype, min->dtype());
     if (max.has_value()) common_dtype = promoteTypes(common_dtype, max->dtype());
@@ -53,8 +55,14 @@ Tensor clamp_tensor_cuda(const Tensor& self, const std::optional<Tensor>& min,
         out_shape = broadcast_shapes(out_shape,
             static_cast<std::vector<int64_t>>(max->shape()));
     }
-    Tensor result = Tensor::empty(out_shape, common_dtype, self.device());
-    if (result.numel() == 0) return result;
+    return {common_dtype, out_shape};
+}
+
+// Destination form: the buffer already carries the planned dtype and shape.
+void clamp_tensor_into_cuda(const Tensor& self, const std::optional<Tensor>& min,
+                            const std::optional<Tensor>& max, Tensor& result) {
+    if (result.numel() == 0) return;
+    DType common_dtype = result.dtype();
     Tensor a = self.dtype() == common_dtype ? self : self.to(common_dtype);
     Tensor lo = a;
     Tensor hi = a;
@@ -81,20 +89,51 @@ Tensor clamp_tensor_cuda(const Tensor& self, const std::optional<Tensor>& min,
         default: TP_THROW(NotImplementedError, "CUDA clamp.Tensor: unsupported dtype");
     }
     #undef CLAMP_T_CASE
+}
+
+Tensor clamp_tensor_cuda(const Tensor& self, const std::optional<Tensor>& min,
+                         const std::optional<Tensor>& max) {
+    if (!min.has_value() && !max.has_value()) {
+        return self;
+    }
+    auto [common_dtype, out_shape] = clamp_tensor_plan(self, min, max);
+    Tensor result = Tensor::empty(out_shape, common_dtype, self.device());
+    clamp_tensor_into_cuda(self, min, max, result);
     return result;
+}
+
+// The bounds are read-only inputs; aliasing with self only blocks the direct
+// pass when an element could be rewritten before it is read.
+static bool clamp_bounds_safe(const std::optional<Tensor>& min,
+                              const std::optional<Tensor>& max, const Tensor& out) {
+    return (!min.has_value() || read_while_write_is_safe(*min, out)) &&
+           (!max.has_value() || read_while_write_is_safe(*max, out));
 }
 
 Tensor& clamp_tensor__cuda(Tensor& self, const std::optional<Tensor>& min,
                            const std::optional<Tensor>& max) {
     NoGradGuard __tp_nograd;
+    if (!min.has_value() && !max.has_value()) return self;
+    auto [common_dtype, out_shape] = clamp_tensor_plan(self, min, max);
+    if (common_dtype == self.dtype() && out_shape == static_cast<std::vector<int64_t>>(self.shape()) &&
+        clamp_bounds_safe(min, max, self)) {
+        clamp_tensor_into_cuda(self, min, max, self);
+        return self;
+    }
     self.copy_(clamp_tensor_cuda(self, min, max));
     return self;
 }
 
 Tensor& clamp_tensor_out_cuda(const Tensor& self, const std::optional<Tensor>& min,
                               const std::optional<Tensor>& max, Tensor& out) {
-    out.copy_(clamp_tensor_cuda(self, min, max));
-    return out;
+    if (!min.has_value() && !max.has_value()) return write_out(out, self);
+    auto [common_dtype, out_shape] = clamp_tensor_plan(self, min, max);
+    if (destination_takes(out, self.device(), common_dtype, out_shape) &&
+        read_while_write_is_safe(self, out) && clamp_bounds_safe(min, max, out)) {
+        clamp_tensor_into_cuda(self, min, max, out);
+        return out;
+    }
+    return write_out(out, clamp_tensor_cuda(self, min, max));
 }
 
 
