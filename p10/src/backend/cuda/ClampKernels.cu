@@ -64,8 +64,7 @@ Tensor clip_cuda(const Tensor& self, const std::optional<Scalar>& min, const std
 }
 
 Tensor& clamp__cuda(Tensor& self, const std::optional<Scalar>& min, const std::optional<Scalar>& max) {
-    Tensor r = clip_cuda(self, std::move(min), std::move(max));
-    self.copy_(r);
+    clamp_kernel_into_cuda(self, self, min, max);
     return self;
 }
 
@@ -73,12 +72,12 @@ Tensor& clamp__cuda(Tensor& self, const std::optional<Scalar>& min, const std::o
 // are the unsuffixed dispatcher names used by the generated native schemas.
 
 Tensor& clamp_min__scalar_cuda(Tensor& self, const Scalar& min) {
-    self.copy_(clamp_min_scalar_cuda(self, min));
+    dtype_unary_into(self, self, HFn48{min.toDouble()}, "clamp_min");
     return self;
 }
 
 Tensor& clamp_max__scalar_cuda(Tensor& self, const Scalar& max) {
-    self.copy_(clamp_max_scalar_cuda(self, max));
+    dtype_unary_into(self, self, HFn49{max.toDouble()}, "clamp_max");
     return self;
 }
 

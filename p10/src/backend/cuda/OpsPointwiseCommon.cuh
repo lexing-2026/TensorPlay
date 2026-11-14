@@ -993,6 +993,38 @@ Tensor& dtype_unary_out(const Tensor& self, Tensor& out, F f, const char* name) 
     return write_out(out, dtype_unary_cuda(self, f, name));
 }
 
+// Scalar-bounded clamp, destination form: one pass applies the floor, the
+// ceiling or both; absent bounds leave their side open.
+inline void clamp_kernel_into_cuda(const Tensor& self, Tensor& result,
+                                   const std::optional<Scalar>& min, const std::optional<Scalar>& max) {
+    if (result.numel() == 0) return;
+    const bool has_min = min.has_value();
+    const bool has_max = max.has_value();
+    TensorIterator iter = TensorIteratorConfig()
+        .check_all_same_dtype(true)
+        .add_output(result)
+        .add_input(self)
+        .build();
+
+    #define TP_CLAMP_CASE(ctype, name) \
+    case DType::name: { \
+        const ctype min_val = has_min ? min->to<ctype>() : ctype(0); \
+        const ctype max_val = has_max ? max->to<ctype>() : ctype(0); \
+        gpu_kernel(iter, [=] __host__ __device__(ctype value) -> ctype { \
+            if (has_min && value < min_val) value = min_val; \
+            if (has_max && value > max_val) value = max_val; \
+            return value; \
+        }); \
+        break; \
+    }
+    switch (self.dtype()) {
+        TENSORPLAY_FORALL_SCALAR_TYPES(TP_CLAMP_CASE)
+        default: TP_THROW(TypeError, "CUDA clamp: Unsupported dtype");
+    }
+    #undef TP_CLAMP_CASE
+    CUDA_CHECK(cudaGetLastError());
+}
+
 // Math unary: f: double->double. Integral->Float32; Half/BF16 compute in
 // float and keep dtype; Float32/Float64 preserved.
 

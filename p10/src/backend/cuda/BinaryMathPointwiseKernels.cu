@@ -1,5 +1,6 @@
 // Pointwise CUDA kernels: binary math family.
 #include "PointwiseCommon.cuh"
+#include "OpsPointwiseCommon.cuh"
 
 #include "tensorplay/ops/TPXOpsGenerated.h"
 
@@ -96,35 +97,6 @@ Tensor& clamp_tensor_out_cuda(const Tensor& self, const std::optional<Tensor>& m
     return out;
 }
 
-
-void clamp_kernel_into_cuda(const Tensor& self, Tensor& result,
-                            const std::optional<Scalar>& min, const std::optional<Scalar>& max) {
-    if (result.numel() == 0) return;
-    const bool has_min = min.has_value();
-    const bool has_max = max.has_value();
-    TensorIterator iter = TensorIteratorConfig()
-        .check_all_same_dtype(true)
-        .add_output(result)
-        .add_input(self)
-        .build();
-
-    #define CLAMP_CASE(ctype, name) \
-    case DType::name: { \
-        const ctype min_val = has_min ? min->to<ctype>() : ctype(0); \
-        const ctype max_val = has_max ? max->to<ctype>() : ctype(0); \
-        gpu_kernel(iter, [=] __host__ __device__(ctype value) -> ctype { \
-            if (has_min && value < min_val) value = min_val; \
-            if (has_max && value > max_val) value = max_val; \
-            return value; \
-        }); \
-        break; \
-    }
-    switch (self.dtype()) {
-        TENSORPLAY_FORALL_SCALAR_TYPES(CLAMP_CASE)
-        default: TP_THROW(TypeError, "CUDA clamp: Unsupported dtype");
-    }
-    #undef CLAMP_CASE
-}
 
 Tensor clamp_kernel_cuda(const Tensor& self, const std::optional<Scalar>& min, const std::optional<Scalar>& max) {
     Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
