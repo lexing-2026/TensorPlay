@@ -943,6 +943,28 @@ Tensor linalg_matrix_norm_string_native_cpu(
     return linalg_matrix_norm_string_impl(self, ord, dims, keepdim, dtype);
 }
 
+// The nuclear spelling is the 'nuc' matrix norm: the singular values of the
+// matrix selected by the two dimensions, summed.  Without explicit dimensions
+// the reduction runs over the trailing pair.
+Tensor nuclear_norm_kernel(const Tensor& self, bool keepdim) {
+    return linalg_matrix_norm_string_impl(self, "nuc", {-2, -1}, keepdim,
+                                          std::nullopt);
+}
+
+Tensor& nuclear_norm_out_kernel(const Tensor& self, bool keepdim, Tensor& out) {
+    return write_linalg_norm_output(nuclear_norm_kernel(self, keepdim), out);
+}
+
+Tensor nuclear_norm_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim,
+                               bool keepdim) {
+    return linalg_matrix_norm_string_impl(self, "nuc", dim, keepdim, std::nullopt);
+}
+
+Tensor& nuclear_norm_dim_out_kernel(const Tensor& self, const std::vector<int64_t>& dim,
+                                    bool keepdim, Tensor& out) {
+    return write_linalg_norm_output(nuclear_norm_dim_kernel(self, dim, keepdim), out);
+}
+
 Tensor& linalg_matrix_norm_string_native_cpu_out(
     const Tensor& self, const std::string& ord, const std::vector<int64_t>& dims,
     bool keepdim, std::optional<DType> dtype, Tensor& out) {
@@ -1216,6 +1238,10 @@ TENSORPLAY_LIBRARY_IMPL(CPU, NativeLinearAlgebra) {
     m.impl("linalg_matrix_norm.str_ord", linalg_matrix_norm_string_native_cpu);
     m.impl("linalg_matrix_norm.str_ord_out",
            linalg_matrix_norm_string_native_cpu_out);
+    m.impl("nuclear_norm", nuclear_norm_kernel);
+    m.impl("nuclear_norm.out", nuclear_norm_out_kernel);
+    m.impl("nuclear_norm.dim", nuclear_norm_dim_kernel);
+    m.impl("nuclear_norm.dim_out", nuclear_norm_dim_out_kernel);
     m.impl("linalg_norm", linalg_norm_native_cpu);
     m.impl("linalg_norm.out", linalg_norm_native_cpu_out);
     m.impl("linalg_norm.ord_str", linalg_norm_string_native_cpu);

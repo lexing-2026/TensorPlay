@@ -2,6 +2,7 @@
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "Exception.h"
+#include "OutWrite.h"
 #include "ReductionKernels.h"
 #include <optional>
 #include <vector>
@@ -269,6 +270,23 @@ Tensor norm_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim, doub
     return self.abs().pow(Scalar(p)).sum(dim, keepdim).pow(Scalar(1.0/p));
 }
 
+// The Frobenius spelling reduces the same p=2 vector norm over at most two
+// dimensions.
+Tensor frobenius_norm_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim,
+                                 bool keepdim) {
+    if (dim.size() > 2) {
+        TP_THROW(ValueError, "frobenius_norm: Expected at most 2 dimensions, but got ",
+                 dim.size(), " dimensions instead");
+    }
+    return norm_dim_kernel(self, dim, 2.0, keepdim);
+}
+
+Tensor& frobenius_norm_out_kernel(const Tensor& self, const std::vector<int64_t>& dim,
+                                 bool keepdim, Tensor& out) {
+    write_out(out, frobenius_norm_dim_kernel(self, dim, keepdim));
+    return out;
+}
+
 Tensor median_kernel(const Tensor& self) {
     return median_stub(DeviceType::CPU, self);
 }
@@ -301,6 +319,8 @@ TENSORPLAY_LIBRARY_IMPL(CPU, ReductionKernels) {
     m.impl("median", median_kernel);
     m.impl("norm", norm_kernel);
     m.impl("norm.dim", norm_dim_kernel);
+    m.impl("frobenius_norm.dim", frobenius_norm_dim_kernel);
+    m.impl("frobenius_norm.out", frobenius_norm_out_kernel);
 }
 
 } // namespace cpu
