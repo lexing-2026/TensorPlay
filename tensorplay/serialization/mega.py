@@ -907,12 +907,36 @@ def _verify_payload(
         return
     offset = int(info["payload_offset"]) + int(header_length)
     size = int(info["stored_nbytes"])
+    checksum = info.get("checksum", b"")
+    expected_hex = info.get("checksum_hex")
     if payload is None:
+        if mapping is not None and (expected_hex or (checksum and any(checksum))):
+            try:
+                cpp = _require_megatensors().cpp
+            except ImportError:
+                cpp = None
+            verifier = getattr(cpp, "verify_buffer_payload", None)
+            if verifier is not None:
+                try:
+                    verifier(
+                        mapping,
+                        offset,
+                        size,
+                        checksum_type,
+                        bytes(checksum)[:32].ljust(32, b"\x00"),
+                        str(expected_hex or "").lower(),
+                    )
+                except RuntimeError as error:
+                    if "checksum mismatch" in str(error):
+                        raise ValueError(
+                            f"MEGA tensor {name!r} checksum verification failed"
+                        ) from error
+                    raise
+                return
         if mapping is not None:
             payload = memoryview(mapping)[offset:offset + size]
         else:
             payload = _read_at(fd, offset, size)
-    expected_hex = info.get("checksum_hex")
     if expected_hex:
         if checksum_type == _CHECKSUM_TYPES["crc32"]:
             actual = f"{zlib.crc32(payload) & 0xFFFFFFFF:08x}"
@@ -921,7 +945,6 @@ def _verify_payload(
         if actual.lower() != expected_hex.lower():
             raise ValueError(f"MEGA tensor {name!r} checksum verification failed")
         return
-    checksum = info.get("checksum", b"")
     if checksum_type == _CHECKSUM_TYPES["crc32"] and checksum and any(checksum):
         actual = (zlib.crc32(payload) & 0xFFFFFFFF).to_bytes(4, "little")
         if checksum[:4] != actual:
@@ -1155,7 +1178,12 @@ def load_mega(filename: str, map_location=None, *, mmap: bool = False):
     finally:
         os.close(fd)
         if mapping is not None:
-            mapping.close()
+            try:
+                mapping.close()
+            except BufferError:
+                # Tensors built from the mapping still hold exported pointers
+                # after a failed load; the mapping closes once they are freed.
+                pass
 
 
 def _convert_safetensors_file(
