@@ -288,7 +288,7 @@ pip install tensorplay \
 ```
 
 > [!NOTE]
-> 请确保 Python 版本与 wheel 标签匹配（如 `cp311` 对应 Python 3.11）。CUDA 版本要求驱动与运行时支持对应 CUDA 版本。完整变体列表见 [`.github/cuda-variants.json`](.github/cuda-variants.json)。
+> 请确保 Python 版本与 wheel 标签匹配（如 `cp311` 对应 Python 3.11）。预编译 wheel 覆盖 Python 3.11–3.13；3.14 与 3.15 需源码构建。CUDA 版本要求驱动与运行时支持对应 CUDA 版本。完整变体列表见 [`.github/cuda-variants.json`](.github/cuda-variants.json)。
 >
 > **按渠道划分的后端。** macOS CPU wheel 默认携带 **MPS**（Metal Performance Shaders）后端——无需单独的 wheel。**ROCm**（AMD GPU，ROCm 7.2/HIP）wheel 作为默认发布渠道构建，并发布到独立的 ROCm pip index（见 [`.github/rocm-variants.json`](.github/rocm-variants.json)）。
 
@@ -603,7 +603,7 @@ pytest test/
 
 指标套件在 `test/test_metrics*.py` 中新增约 184 个测试——覆盖有状态指标、functional 形式、曲线与绘图、AIGC、音频、检索、名义、遥感、包装器以及懒加载的外部依赖指标。
 
-CI 会在每个 PR 和 main 推送上构建完整 wheel 矩阵（Python 3.11–3.15；CPU 覆盖 Linux x86_64/aarch64、macOS arm64、Windows x86_64；CUDA 覆盖 Linux 和 Windows x86_64；ROCm 覆盖 Linux x86_64）并验证每个 wheel。macOS arm64 wheel 携带 **MPS** 后端，配有专门的 Metal 验收与基准工作流；**ROCm** 渠道在发布与 nightly 同一条流水线上于 ROCm 构建容器内运行。参见 [.github/workflows/](.github/workflows/)（`pull`、`trunk`、`publish`、`nightly`、`lint`）。Lint 规则位于 `pyproject.toml` 的 `[tool.ruff]` 段。
+CI 会在每个 PR 和 main 推送上构建完整 wheel 矩阵（Python 3.11–3.13；CPU 覆盖 Linux x86_64/aarch64、macOS arm64、Windows x86_64；CUDA 覆盖 Linux 和 Windows x86_64；ROCm 覆盖 Linux x86_64）并验证每个 wheel。macOS arm64 wheel 携带 **MPS** 后端，配有专门的 Metal 验收与基准工作流；**ROCm** 渠道在发布与 nightly 同一条流水线上于 ROCm 构建容器内运行。参见 [.github/workflows/](.github/workflows/)（`pull`、`trunk`、`publish`、`nightly`、`lint`）。Lint 规则位于 `pyproject.toml` 的 `[tool.ruff]` 段。
 
 ## 资源
 
