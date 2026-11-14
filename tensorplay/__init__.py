@@ -8,6 +8,19 @@ It has a CUDA counterpart, that enables you to run your tensor computations
 on an NVIDIA GPU with compute capability >= 3.0.
 """
 
+# Names below are imported lazily where the interpreter supports it (3.15+);
+# older interpreters ignore this table and import eagerly.
+__lazy_modules__ = {
+    "tensorplay.autograd",
+    "tensorplay.backends",
+    "tensorplay.compiler",
+    "tensorplay.compiler._core",
+    "tensorplay.nn",
+    "tensorplay.optim",
+    "tensorplay.profiler",
+    "tensorplay.stax",
+}
+
 import builtins
 import ctypes
 from enum import IntEnum
@@ -1734,19 +1747,21 @@ def _polish_public_surface():
     # 1) Classes re-exported here but registered on the extension quote the
     #    extension's module path in type errors and reprs ("tensorplay._C.DType"
     #    in `unsupported operand type(s)`); retitle them to the public package.
-    for name, obj in list(globals().items()):
-        if name.startswith("_") or not isinstance(obj, type):
+    #
+    #    Names are looked up by subscript rather than bound in the loop head:
+    #    loading a deferred import into a local resolves it, and this pass
+    #    must leave the deferred modules alone.
+    for name in list(globals()):
+        if name.startswith("_") or not isinstance(globals()[name], type):
             continue
+        obj = globals()[name]
         # Match on the exported name: a class may be registered on the
         # extension under an internal spell (``TensorBase``) while the
         # public alias differs, so its own __qualname__ is not a usable
         # lookup key.  Rewriting __qualname__ to the exported spelling
         # keeps ``tensorplay.<name>`` the one name everywhere (generated
         # code relies on that resolution).
-        if (
-            obj.__module__ in ("tensorplay", "tensorplay._C")
-            and globals().get(name) is obj
-        ):
+        if obj.__module__ in ("tensorplay", "tensorplay._C"):
             # immutable extension types (e.g. Size) reject retitling; the
             # exported spelling is already theirs to keep then
             try:
@@ -1767,18 +1782,19 @@ def _polish_public_surface():
         module_name = getattr(module, "__name__", "")
         if not module_name.startswith("tensorplay") or "._" in module_name:
             continue
-        for name, obj in list(vars(module).items()):
+        for name in list(vars(module)):
             # The shim only targets C functions, so submodules and other
             # non-callables are skipped.  Probing them is not just wasted
             # work: attribute access on lazy proxies such as the cuFFT
             # plan-cache manager runs device init and raises on CPU-only
             # builds, and getattr's default only suppresses AttributeError.
-            if (
-                name.startswith("_")
-                or isinstance(obj, (type, _stdlib_types.ModuleType))
-                or not callable(obj)
-            ):
+            if name.startswith("_"):
                 continue
+            if isinstance(
+                vars(module)[name], (type, _stdlib_types.ModuleType)
+            ) or not callable(vars(module)[name]):
+                continue
+            obj = vars(module)[name]
             try:
                 qualname = getattr(obj, "__qualname__", None)
             except Exception:
