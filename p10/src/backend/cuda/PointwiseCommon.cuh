@@ -324,10 +324,28 @@ struct AsinFunctor { template<typename T> __device__ T operator()(T x) const { r
 struct AsinhFunctor { template<typename T> __device__ T operator()(T x) const { return ::asinh(x); } };
 struct AtanFunctor { template<typename T> __device__ T operator()(T x) const { return ::atan(x); } };
 struct AtanhFunctor { template<typename T> __device__ T operator()(T x) const { return ::atanh(x); } };
-struct CeilFunctor { template<typename T> __device__ T operator()(T x) const { return ::ceil(x); } };
+// A whole-number input is already its own ceiling, floor and rounded value, so
+// the integral specialisations simply pass the value through and never reach
+// the floating-point routines.
+struct CeilFunctor {
+    template<typename T> __device__ T operator()(T x) const {
+        if constexpr (std::is_integral_v<T>) return x;
+        else return ::ceil(x);
+    }
+};
 struct CoshFunctor { template<typename T> __device__ T operator()(T x) const { return ::cosh(x); } };
-struct FloorFunctor { template<typename T> __device__ T operator()(T x) const { return ::floor(x); } };
-struct RoundFunctor { template<typename T> __device__ T operator()(T x) const { return rint(x); } }; // rint matches round better in CUDA
+struct FloorFunctor {
+    template<typename T> __device__ T operator()(T x) const {
+        if constexpr (std::is_integral_v<T>) return x;
+        else return ::floor(x);
+    }
+};
+struct RoundFunctor {
+    template<typename T> __device__ T operator()(T x) const {
+        if constexpr (std::is_integral_v<T>) return x;
+        else return ::rint(x);  // half-to-even, the rounding mode this op documents
+    }
+};
 struct SinhFunctor { template<typename T> __device__ T operator()(T x) const { return ::sinh(x); } };
 struct TanFunctor { template<typename T> __device__ T operator()(T x) const { return ::tan(x); } };
 struct TruncFunctor {
