@@ -4356,12 +4356,18 @@ def threshold(input, threshold, value, *, out=None):
             return _captured
     return _C.threshold(self=input, threshold=threshold, value=value)
 
-def relu6(input):
+def relu6(input, *, out=None):
+    if out is not None:
+        if _capturing():
+            _captured = _capture_call(relu6, (input,), {'out': out})
+            if _captured is not None:
+                return _captured
+        return _C.relu6(self=input, out=out)
     if _capturing():
         _captured = _capture_call(relu6, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.relu6(input)
+    return _C.relu6(self=input)
 
 def leaky_relu(input, negative_slope=0.01, *, out=None):
     if out is not None:
@@ -4613,12 +4619,18 @@ def elu_backward(grad_output, alpha, scale, input_scale, is_result, self_or_resu
             return _captured
     return _C.elu_backward(grad_output=grad_output, alpha=alpha, scale=scale, input_scale=input_scale, is_result=is_result, self_or_result=self_or_result)
 
-def selu(input):
+def selu(input, *, out=None):
+    if out is not None:
+        if _capturing():
+            _captured = _capture_call(selu, (input,), {'out': out})
+            if _captured is not None:
+                return _captured
+        return _C.selu(self=input, out=out)
     if _capturing():
         _captured = _capture_call(selu, (input,), {})
         if _captured is not None:
             return _captured
-    return _C.selu(input)
+    return _C.selu(self=input)
 
 def celu(input, alpha=1.0, *, out=None):
     if out is not None:
@@ -9666,12 +9678,18 @@ def xlogy_(input, other):
             return _captured
     return _C.xlogy_(input, other)
 
-def xlog1py(input, other):
+def xlog1py(input, other, *, out=None):
+    if out is not None:
+        if _capturing():
+            _captured = _capture_call(xlog1py, (input, other), {'out': out})
+            if _captured is not None:
+                return _captured
+        return _C.xlog1py(self=input, other=other, out=out)
     if _capturing():
         _captured = _capture_call(xlog1py, (input, other), {})
         if _captured is not None:
             return _captured
-    return _C.xlog1py(input, other)
+    return _C.xlog1py(self=input, other=other)
 
 def xlog1py_(input, other):
     if _capturing():

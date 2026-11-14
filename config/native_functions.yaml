@@ -7786,6 +7786,10 @@
   device_check: NoCheck
   variants: function
   tags: pointwise
+- func: xlog1py.OutTensor(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
+  variants: function
+  tags: pointwise
 - func: logspace.Tensor_Tensor(Tensor start, Tensor end, int steps, float base=10.0, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
   variants: function
 - func: logspace.Tensor_Scalar(Tensor start, Scalar end, int steps, float base=10.0, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
@@ -8227,6 +8231,14 @@
   variants: function
   tags: pointwise
 - func: relu.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
+  variants: function
+  tags: pointwise
+- func: relu6.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+  device_check: NoCheck
+  variants: function
+  tags: pointwise
+- func: selu.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
   device_check: NoCheck
   variants: function
   tags: pointwise
