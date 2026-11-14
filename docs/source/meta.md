@@ -156,6 +156,29 @@ planes, the angle conversions (`deg2rad`, `rad2deg`) answer complex operands
 in single precision — and `sign`, `sgn`, the boolean forms of `pow` and the
 step family keep their own promotion tables.
 
+The selection and reduction families police their dtypes before answering
+geometry. Every form of `where` reads its condition element by element and
+refuses a non-boolean condition. The extrema split by shape: `max`, `min`,
+`argmax`, `argmin` and the flat `median` have no complex form and say so,
+while `amax`, `amin` and `aminmax` refuse complex planes as type errors only
+after the named dimensions pass the range checks. `nanmedian` answers its
+flat form in a comparable type — a floating plane keeps its width, every
+other plane answers as a whole-number scalar — while its dim form computes
+over floating planes only and refuses both whole-number and half-width
+operands. The vector norm answers a floating or complex operand directly
+(the complex planes in their real component type); a whole-number operand
+runs the norm as a chain of powers, so order 1 keeps the operand type, any
+other finite order answers in single precision, an infinite order
+short-circuits to the largest element and keeps the operand type, a negative
+whole-number order is refused, and a boolean operand has no power form and
+runs only the infinite orders. The pairwise distances accumulate at single
+precision and lift a half-width operand accordingly, and the spread measures
+(`var`, `std`, with their paired means) answer a complex operand's spread in
+its real component type while the mean keeps the complex plane. An ordering
+is undefined over complex planes: the tensor forms of `lt`, `le`, `gt` and
+`ge` refuse a complex operand outright, while equality keeps one, and every
+scalar comparison form keeps a boolean answer.
+
 The random fills (`uniform_`, `normal_`, `cauchy_`, `exponential_`,
 `geometric_`, `log_normal_`, `bernoulli_` and the `random_` family) accept a
 meta tensor and leave its metadata unchanged — there is no data to sample into,
