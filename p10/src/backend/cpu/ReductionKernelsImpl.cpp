@@ -381,6 +381,42 @@ Tensor norm_dim_kernel_impl(const Tensor& self,
                             double p, bool keepdim) {
     if (dims.empty()) return norm_kernel_impl(self, p);
 
+    // An L2 norm that folds only the trailing dimension of a contiguous real
+    // block is one independent stream per row: each row walks the wide
+    // sum-of-squares pass and takes a single square root, while the iterator
+    // path reaches only a fraction of that rate.
+    const int64_t nd = self.dim();
+    if (p == 2.0 && self.is_contiguous() && self.numel() > 0 && nd >= 1 &&
+        dims.size() == 1 &&
+        (self.dtype() == DType::Float32 || self.dtype() == DType::Float64)) {
+        int64_t d = dims[0];
+        if (d < 0) d += nd;
+        if (d == nd - 1) {
+            const int64_t row = self.size(nd - 1);
+            const int64_t outer = self.numel() / row;
+            const int64_t row_grain =
+                std::max<int64_t>(1, GRAIN_SIZE / std::max<int64_t>(row, 1));
+            Tensor out = Tensor::empty(compute_reduction_shape(self, dims, keepdim),
+                                       self.dtype(), self.device());
+            if (self.dtype() == DType::Float32) {
+                const float* in = self.data_ptr<float>();
+                float* op = out.data_ptr<float>();
+                parallel_for(0, outer, row_grain, [&](int64_t b, int64_t e) {
+                    for (int64_t r = b; r < e; ++r)
+                        op[r] = std::sqrt(vec::sum_of_squares(in + r * row, 0, row));
+                });
+            } else {
+                const double* in = self.data_ptr<double>();
+                double* op = out.data_ptr<double>();
+                parallel_for(0, outer, row_grain, [&](int64_t b, int64_t e) {
+                    for (int64_t r = b; r < e; ++r)
+                        op[r] = std::sqrt(vec::sum_of_squares(in + r * row, 0, row));
+                });
+            }
+            return out;
+        }
+    }
+
     #define TP_NORM_DIM_CASE(ctype, dtype_name) \
         case DType::dtype_name: \
             return norm_dim_typed<ctype>(self, dims, p, keepdim)

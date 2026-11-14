@@ -23,6 +23,7 @@
 #include <utility>
 #include <vector>
 #include "OutWrite.h"
+#include "cpu/vec/vec.h"
 
 namespace tensorplay {
 namespace cpu {
@@ -1069,6 +1070,67 @@ Tensor renorm_cpu(const Tensor& self, const Scalar& p, int64_t dim, const Scalar
     }
 
     Tensor norms = ops::norm(self, reduce_dims, pd, true);
+
+    // A slice along the leading dimension of a contiguous block is one
+    // contiguous run, so the shrink collapses into a single pass over the
+    // rows: each row reads its norm, takes the factor, and stores itself
+    // scaled, with no intermediate factor tensors.  A norm that is not a
+    // number fails the comparison and leaves its row untouched.
+    if (dim == 0 && self.is_contiguous() && self.numel() > 0 &&
+        norms.numel() == self.size(0) && norms.dtype() == self.dtype() &&
+        (self.dtype() == DType::Float32 || self.dtype() == DType::Float64)) {
+        const int64_t nrows = self.size(0);
+        const int64_t row_len = self.numel() / nrows;
+        Tensor out = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()),
+                                   self.dtype(), self.device());
+        const int64_t row_grain =
+            std::max<int64_t>(1, GRAIN_SIZE / std::max<int64_t>(row_len, 1));
+        if (self.dtype() == DType::Float32) {
+            const float* in = self.data_ptr<float>();
+            const float* np = norms.data_ptr<float>();
+            float* op = out.data_ptr<float>();
+            const float max_t = static_cast<float>(max_norm);
+            constexpr float kEps = 1e-7f;
+            parallel_for(0, nrows, row_grain, [&](int64_t b, int64_t e) {
+                for (int64_t r = b; r < e; ++r) {
+                    const float n = np[r];
+                    const float f = (n > max_t) ? max_t / (n + kEps) : 1.0f;
+                    const float* src = in + r * row_len;
+                    float* dst = op + r * row_len;
+                    using Vec = vec::Vectorized<float>;
+                    constexpr int64_t kW = static_cast<int64_t>(Vec::size());
+                    const Vec fv(f);
+                    int64_t j = 0;
+                    for (; j + kW <= row_len; j += kW)
+                        (Vec::loadu(src + j) * fv).store(dst + j);
+                    for (; j < row_len; ++j) dst[j] = src[j] * f;
+                }
+            });
+        } else {
+            const double* in = self.data_ptr<double>();
+            const double* np = norms.data_ptr<double>();
+            double* op = out.data_ptr<double>();
+            const double max_t = max_norm;
+            constexpr double kEps = 1e-7;
+            parallel_for(0, nrows, row_grain, [&](int64_t b, int64_t e) {
+                for (int64_t r = b; r < e; ++r) {
+                    const double n = np[r];
+                    const double f = (n > max_t) ? max_t / (n + kEps) : 1.0;
+                    const double* src = in + r * row_len;
+                    double* dst = op + r * row_len;
+                    using Vec = vec::Vectorized<double>;
+                    constexpr int64_t kW = static_cast<int64_t>(Vec::size());
+                    const Vec fv(f);
+                    int64_t j = 0;
+                    for (; j + kW <= row_len; j += kW)
+                        (Vec::loadu(src + j) * fv).store(dst + j);
+                    for (; j < row_len; ++j) dst[j] = src[j] * f;
+                }
+            });
+        }
+        return out;
+    }
+
     Tensor factors = ops::where(
         ops::gt(norms, Scalar(max_norm)),
         ops::div(
