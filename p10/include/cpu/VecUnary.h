@@ -3113,14 +3113,14 @@ using Vml32Entry = void (*)(const int, const float[], float[], const long long);
 using Vml64Entry = void (*)(const int, const double[], double[], const long long);
 
 // Single-precision functions the library evaluates faster than the kernels
-// here.  log, log2, log10, sqrt, tan, atan and tanh are absent because the
-// local form is at least as fast.
+// here.  log, log2, log10, log1p, sqrt, tan, atan, tanh and atanh are absent:
+// the library's high-accuracy log-family kernels measure slower than the
+// local SLEEF entry, so those ops stay on the local form.
 inline Vml32Entry vml32_entry(VOp op) {
     switch (op) {
         case VOp::Exp:   return vmsExp;
         case VOp::Exp2:  return vmsExp2;
         case VOp::Expm1: return vmsExpm1;
-        case VOp::Log1p: return vmsLog1p;
         case VOp::Sin:   return vmsSin;
         case VOp::Cos:   return vmsCos;
         case VOp::Asin:  return vmsAsin;
@@ -3129,7 +3129,6 @@ inline Vml32Entry vml32_entry(VOp op) {
         case VOp::Cosh:  return vmsCosh;
         case VOp::Asinh: return vmsAsinh;
         case VOp::Acosh: return vmsAcosh;
-        case VOp::Atanh: return vmsAtanh;
         case VOp::Erf:   return vmsErf;
         case VOp::Erfc:  return vmsErfc;
         case VOp::ErfInv: return vmsErfInv;
@@ -3150,7 +3149,6 @@ inline Vml64Entry vml64_entry(VOp op) {
         case VOp::Log:   return vmdLn;
         case VOp::Log2:  return vmdLog2;
         case VOp::Log10: return vmdLog10;
-        case VOp::Log1p: return vmdLog1p;
         case VOp::Sin:   return vmdSin;
         case VOp::Cos:   return vmdCos;
         case VOp::Tan:   return vmdTan;
@@ -3161,7 +3159,6 @@ inline Vml64Entry vml64_entry(VOp op) {
         case VOp::Cosh:  return vmdCosh;
         case VOp::Asinh: return vmdAsinh;
         case VOp::Acosh: return vmdAcosh;
-        case VOp::Atanh: return vmdAtanh;
         case VOp::Erf:   return vmdErf;
         case VOp::Erfc:  return vmdErfc;
         case VOp::ErfInv: return vmdErfInv;
