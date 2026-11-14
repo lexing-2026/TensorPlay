@@ -2914,6 +2914,161 @@ def test_softmax_and_complex_passthrough_contracts():
         tp._C.logsumexp(_meta(2, 3, dtype=tp.complex128), [1])
 
 
+REAL_MATH_UNARY = (
+    "exp", "expm1", "log", "log2", "log10", "log1p", "sqrt", "rsqrt",
+    "sin", "cos", "tan", "asin", "acos", "atan",
+    "sinh", "cosh", "asinh", "acosh", "atanh",
+    "tanh", "sigmoid", "tanhshrink",
+)
+
+
+def test_real_math_sweeps_keep_their_planes():
+    # the logarithm / exponential / trigonometric sweeps compute over real
+    # numbers or a complex lane of their own: a whole-number operand is
+    # answered in single precision, a boolean or 8-bit float operand has no
+    # form to run in, and a floating or complex operand keeps its width
+    f8 = getattr(tp, "float8_e4m3fn", None)
+    for name in REAL_MATH_UNARY:
+        f = getattr(tp._C, name)
+        with pytest.raises(TypeError):
+            f(_meta(2, 3, dtype=tp.bool))
+        if f8 is not None:
+            with pytest.raises(TypeError):
+                f(_meta(2, 3, dtype=f8))
+        assert f(_meta(2, 3, dtype=tp.int64)).dtype == tp.float32
+        assert f(_meta(2, 3, dtype=tp.complex128)).dtype == tp.complex128
+        assert f(_meta(2, 3, dtype=tp.float16)).dtype == tp.float16
+
+
+REAL_ONLY_ACTIVATIONS = (
+    ("gelu", ()), ("mish", ()), ("softplus", (1.0, 20.0)), ("elu", (1.0,)),
+    ("selu", ()), ("celu", (1.0,)), ("leaky_relu", (0.01,)),
+    ("hardsigmoid", ()), ("hardswish", ()), ("relu6", ()),
+    ("log_sigmoid", ()), ("hardtanh", (-1.0, 1.0)),
+)
+
+
+def test_real_only_activations_refuse_planes():
+    # the activation family runs a single real-number form: boolean, complex
+    # and 8-bit float operands are refused, whole numbers are answered in
+    # single precision
+    f8 = getattr(tp, "float8_e4m3fn", None)
+    for name, args in REAL_ONLY_ACTIVATIONS:
+        f = getattr(tp._C, name)
+        with pytest.raises(TypeError):
+            f(_meta(2, 3, dtype=tp.bool), *args)
+        with pytest.raises(TypeError):
+            f(_meta(2, 3, dtype=tp.complex128), *args)
+        if f8 is not None:
+            with pytest.raises(TypeError):
+                f(_meta(2, 3, dtype=f8), *args)
+        assert f(_meta(2, 3, dtype=tp.int64), *args).dtype == tp.float32
+
+
+def test_pointwise_inplace_dtype_gates():
+    # sweeps with a complex lane refuse boolean and whole-number targets but
+    # accept a complex target of their own
+    for name in ("exp_", "log_", "sin_", "tanh_", "sigmoid_", "deg2rad_"):
+        t = _meta(2, 3, dtype=tp.int64)
+        with pytest.raises(TypeError):
+            getattr(tp._C, name)(t)
+        t = _meta(2, 3, dtype=tp.bool)
+        with pytest.raises(TypeError):
+            getattr(tp._C, name)(t)
+        t = _meta(2, 3, dtype=tp.complex128)
+        assert getattr(tp._C, name)(t) is t
+    # the single-form sweeps and activations refuse complex targets as well
+    for name in ("erf_", "erfc_", "lgamma_", "silu_", "mish_",
+                 "hardsigmoid_", "hardswish_"):
+        t = _meta(2, 3, dtype=tp.complex128)
+        with pytest.raises(TypeError):
+            getattr(tp._C, name)(t)
+        t = _meta(2, 3, dtype=tp.int64)
+        with pytest.raises(TypeError):
+            getattr(tp._C, name)(t)
+    # the copy-back activations accept a whole-number target and keep it
+    for name, args in (("gelu_", ()), ("elu_", (1.0,)), ("selu_", ()),
+                       ("celu_", (1.0,)), ("leaky_relu_", (0.01,)),
+                       ("relu6_", ()), ("hardtanh_", (-1.0, 1.0))):
+        t = _meta(2, 3, dtype=tp.int64)
+        assert getattr(tp._C, name)(t, *args) is t
+        t = _meta(2, 3, dtype=tp.complex128)
+        with pytest.raises(TypeError):
+            getattr(tp._C, name)(t, *args)
+        t = _meta(2, 3, dtype=tp.bool)
+        with pytest.raises(TypeError):
+            getattr(tp._C, name)(t, *args)
+    # the rectangle clamp only refuses complex and 8-bit float targets
+    for name in ("relu_",):
+        for dt in (tp.int64, tp.bool):
+            t = _meta(2, 3, dtype=dt)
+            assert getattr(tp._C, name)(t) is t
+        t = _meta(2, 3, dtype=tp.complex128)
+        with pytest.raises(TypeError):
+            getattr(tp._C, name)(t)
+    # the rounding family keeps whole planes and refuses complex ones
+    for name in ("ceil_", "floor_", "round_", "trunc_"):
+        t = _meta(2, 3, dtype=tp.int64)
+        assert getattr(tp._C, name)(t) is t
+        t = _meta(2, 3, dtype=tp.complex128)
+        with pytest.raises(TypeError):
+            getattr(tp._C, name)(t)
+    # the fractional part has no whole-number or complex form
+    with pytest.raises(NotImplementedError):
+        tp._C.frac_(_meta(2, 3, dtype=tp.int64))
+    with pytest.raises(TypeError):
+        tp._C.frac_(_meta(2, 3, dtype=tp.complex128))
+
+
+def test_pair_and_clamp_dtype_edges():
+    # the power family keeps plain boolean promotion and refuses a boolean
+    # base with a scalar exponent
+    assert tp._C.pow(_meta(2, 3, dtype=tp.bool),
+                     _meta(2, 3, dtype=tp.bool)).dtype == tp.bool
+    assert tp._C.pow(2.0, _meta(2, 3, dtype=tp.bool)).dtype == tp.float32
+    with pytest.raises(TypeError):
+        tp._C.pow(_meta(2, 3, dtype=tp.bool), 2.0)
+    # the clamp family polices complex and 8-bit float operands and keeps
+    # boolean and whole-number planes
+    f8 = getattr(tp, "float8_e4m3fn", None)
+    for name, args in (("clamp", (-1.0, 1.0)), ("clamp_min", (-1.0,)),
+                       ("clamp_max", (1.0,))):
+        f = getattr(tp._C, name)
+        with pytest.raises(TypeError):
+            f(_meta(2, 3, dtype=tp.complex128), *args)
+        if f8 is not None:
+            with pytest.raises(TypeError):
+                f(_meta(2, 3, dtype=f8), *args)
+        assert f(_meta(2, 3, dtype=tp.int64), *args).dtype == tp.int64
+        assert f(_meta(2, 3, dtype=tp.bool), *args).dtype == tp.bool
+    # sign answers a complex operand in its own plane
+    assert tp._C.sign(_meta(2, 3, dtype=tp.complex128)).dtype == tp.complex128
+    assert tp._C.sgn(_meta(2, 3, dtype=tp.complex128)).dtype == tp.complex128
+    # the step family rejects a complex pair outright
+    with pytest.raises(TypeError):
+        tp._C.heaviside(_meta(2, 3, dtype=tp.complex128),
+                        _meta(2, 3, dtype=tp.complex128))
+    with pytest.raises(TypeError):
+        tp._C.heaviside_(_meta(2, 3, dtype=tp.complex128),
+                         _meta(2, 3, dtype=tp.complex128))
+    t = _meta(2, 3, dtype=tp.int64)
+    assert tp._C.heaviside_(t, _meta(2, 3, dtype=tp.int64)) is t
+    # the rectangle activation refuses a complex plane in both forms
+    with pytest.raises(TypeError):
+        tp._C.relu(_meta(2, 3, dtype=tp.complex128))
+    with pytest.raises(TypeError):
+        tp._C.relu_(_meta(2, 3, dtype=tp.complex128))
+    # the fractional part of a whole-number plane has no kernel form
+    with pytest.raises(NotImplementedError):
+        tp._C.frac(_meta(2, 3, dtype=tp.int64))
+    with pytest.raises(TypeError):
+        tp._C.frac(_meta(2, 3, dtype=tp.complex128))
+    # the angle conversions have no complex form and answer in single
+    # precision
+    assert tp._C.deg2rad(_meta(2, 3, dtype=tp.complex128)).dtype == tp.float32
+    assert tp._C.rad2deg(_meta(2, 3, dtype=tp.complex128)).dtype == tp.float32
+
+
 # ---------------------------------------------------------------------------
 # Cross-checks against the reference framework when it is installed
 # ---------------------------------------------------------------------------
