@@ -693,6 +693,20 @@ Tensor pinv_tensor_kernel(const Tensor& self,
     return empty_meta(out, self.dtype(), self.device());
 }
 
+// The solve answers in the right-hand side's own geometry and type; the
+// factor is only asked for its element type.
+Tensor cholesky_solve_kernel(const Tensor& self, const Tensor& input2,
+                             bool /*upper*/) {
+    check_all_meta(self, input2);
+    if (!isFloatingType(self.dtype())) {
+        TP_THROW(TypeError, "cholesky_solve: only floating-point tensors are supported");
+    }
+    if (!isFloatingType(input2.dtype())) {
+        TP_THROW(TypeError, "cholesky_solve: only floating-point tensors are supported");
+    }
+    return empty_meta(shape_of(self), self.dtype(), self.device());
+}
+
 Tensor matrix_power_kernel(const Tensor& self, int64_t n) {
     if (self.dim() < 2 || self.size(-2) != self.size(-1)) {
         TP_THROW(RuntimeError, "matrix_power(): expected a square matrix");
@@ -739,6 +753,7 @@ TENSORPLAY_LIBRARY_IMPL(Meta, MetaLinalg) {
     // geometry and the matrix plane are the operand's own; the exponent
     // never changes them, and the zeroth power answers an identity of the
     // same width.
+    m.impl("cholesky_solve", cholesky_solve_kernel);
     m.impl("matrix_power", matrix_power_kernel);
     m.impl("linalg_matrix_power", matrix_power_kernel);
 }

@@ -1446,6 +1446,21 @@ Tensor slice_kernel(const Tensor& self, int64_t dim,
     return self.slice(dim, start.value_or(0),
                       end.value_or(std::numeric_limits<int64_t>::max()), step);
 }
+
+// The sliced gradient lands back in the source's full geometry at the
+// gradient's own type.  The sparse refusal and the dimension wrap are
+// structural, so they run here; the element scatter does not.
+Tensor slice_backward_kernel(const Tensor& grad_output, const Tensor& self,
+                             int64_t dim, std::optional<int64_t> start,
+                             std::optional<int64_t> end, int64_t step) {
+    if (self.is_sparse()) {
+        TP_THROW(RuntimeError, "slice(): gradient w.r.t. sparse COO tensors is not supported");
+    }
+    check_all_meta(grad_output, self);
+    self.slice(dim, start.value_or(0),
+               end.value_or(std::numeric_limits<int64_t>::max()), step);
+    return empty_meta(shape_of(self), grad_output.dtype(), grad_output.device());
+}
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 // Shapes that move extents around. These are views of their operand, so they
@@ -1849,6 +1864,7 @@ TENSORPLAY_LIBRARY_IMPL(Meta, MetaShape) {
     m.impl("channel_shuffle", channel_shuffle_kernel);
     m.impl("select_scatter", select_scatter_kernel);
     m.impl("slice_scatter", slice_scatter_kernel);
+    m.impl("slice_backward", slice_backward_kernel);
     m.impl("diagonal_scatter", diagonal_scatter_kernel);
     m.impl("vander", vander_kernel);
     m.impl("block_diag", block_diag_kernel);

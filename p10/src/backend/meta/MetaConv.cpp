@@ -219,6 +219,84 @@ Tensor conv_transpose3d_kernel(const Tensor& input, const Tensor& weight,
     return empty_meta({input.size(0), out_channels, d_out, h_out, w_out},
                       input.dtype(), input.device());
 }
+
+// ---------------------------------------------------------------------------
+// The generic `convolution` spelling owns no geometry of its own: it pins the
+// spatial rank of the operand pair and forwards to the rank-specialized
+// kernel above, the same routing the computing backends apply, so both
+// spellings of the operator answer identically.
+// ---------------------------------------------------------------------------
+Tensor convolution_meta(const Tensor& input, const Tensor& weight,
+                        const std::optional<Tensor>& bias,
+                        const std::vector<int64_t>& stride,
+                        const std::vector<int64_t>& padding,
+                        const std::vector<int64_t>& dilation, bool transposed,
+                        const std::vector<int64_t>& output_padding,
+                        int64_t groups) {
+    const Tensor bias_t = bias.has_value() ? *bias : Tensor();
+    const int64_t k = convolution::spatial_dims(input, weight, "convolution");
+    if (!transposed) {
+        switch (k) {
+            case 1: return conv1d_kernel(input, weight, bias_t, stride, padding,
+                                         dilation, groups);
+            case 2: return conv2d_kernel(input, weight, bias_t, stride, padding,
+                                         dilation, groups);
+            default: return conv3d_kernel(input, weight, bias_t, stride, padding,
+                                          dilation, groups);
+        }
+    }
+    switch (k) {
+        case 1: return conv_transpose1d_kernel(input, weight, bias_t, stride,
+                                               padding, output_padding, groups,
+                                               dilation);
+        case 2: return conv_transpose2d_kernel(input, weight, bias_t, stride,
+                                               padding, output_padding, groups,
+                                               dilation);
+        default: return conv_transpose3d_kernel(input, weight, bias_t, stride,
+                                                padding, output_padding, groups,
+                                                dilation);
+    }
+}
+
+// The backward answers one gradient per requested slot: the input gradient
+// repeats the input geometry, the weight gradient the weight geometry, and
+// the bias gradient is the per-channel reduction of grad_output.  Every
+// gradient carries grad_output's dtype, the width the scatter kernels
+// accumulate in (low-precision inputs route through a widening pass and cast
+// back).  Slots the mask leaves unset stay undefined; that is the signal the
+// autograd engine reads for "no gradient flows to this input".
+std::tuple<Tensor, Tensor, Tensor> convolution_backward_overrideable_meta(
+        const Tensor& grad_output, const Tensor& input, const Tensor& weight,
+        const std::vector<int64_t>& stride, const std::vector<int64_t>& padding,
+        const std::vector<int64_t>& dilation, bool transposed,
+        const std::vector<int64_t>& output_padding, int64_t groups,
+        const std::vector<bool>& output_mask) {
+    convolution::spatial_dims(input, weight, "convolution_backward");
+    const convolution::GradRequest want = convolution::decode_mask(output_mask);
+    if (want.bias) {
+        convolution::check_bias_sizes(std::nullopt, grad_output.size(1));
+    }
+    if (!transposed) {
+        convolution::check_conv_geometry(input, weight, stride, padding,
+                                         dilation, "convolution_backward");
+    }
+    Tensor grad_input;
+    Tensor grad_weight;
+    Tensor grad_bias;
+    if (want.input) {
+        grad_input = empty_meta(shape_of(input), grad_output.dtype(),
+                                grad_output.device());
+    }
+    if (want.weight) {
+        grad_weight = empty_meta(shape_of(weight), grad_output.dtype(),
+                                 grad_output.device());
+    }
+    if (want.bias) {
+        grad_bias = empty_meta({grad_output.size(1)}, grad_output.dtype(),
+                               grad_output.device());
+    }
+    return {grad_input, grad_weight, grad_bias};
+}
 } // anonymous namespace
 TENSORPLAY_LIBRARY_IMPL(Meta, MetaConv) {
     m.impl("conv2d", conv2d_kernel);
@@ -227,6 +305,10 @@ TENSORPLAY_LIBRARY_IMPL(Meta, MetaConv) {
     m.impl("conv_transpose1d", conv_transpose1d_kernel);
     m.impl("conv_transpose2d", conv_transpose2d_kernel);
     m.impl("conv_transpose3d", conv_transpose3d_kernel);
+    m.impl("convolution", convolution_meta);
+    m.impl("convolution_overrideable", convolution_meta);
+    m.impl("convolution_backward_overrideable",
+           convolution_backward_overrideable_meta);
 }
 
 } // namespace meta

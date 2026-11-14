@@ -39,6 +39,57 @@ std::vector<int64_t> broadcast_loss_shape(const Tensor& a, const Tensor& b,
 }
 
 // ---------------------------------------------------------------------------
+// Distance-loss gradients.  Each gradient blends the operand pair through a
+// subtraction, a threshold blend and a multiply by the incoming gradient;
+// the blend keeps the pair's promoted type, with two whole-number exits: the
+// fractional threshold blend and the mean rescale run whole-number planes
+// in single precision, and the incoming gradient joins the promotion.
+// ---------------------------------------------------------------------------
+std::vector<int64_t> loss_grad_shape(const Tensor& grad, const Tensor& input,
+                                     const Tensor& target) {
+    check_all_meta(input, target);
+    check_all_meta(grad, grad);
+    return broadcast_shapes(broadcast_shapes(shape_of(input), shape_of(target)),
+                            shape_of(grad));
+}
+
+DType loss_grad_dtype(const Tensor& input, const Tensor& target,
+                      const Tensor& grad, bool mean_rescale) {
+    const DType pair = promoteTypes(input.dtype(), target.dtype());
+    if (pair == DType::Bool) {
+        TP_THROW(RuntimeError,
+                 "Subtraction, the `-` operator, with two bool tensors is not "
+                 "supported. Use the `^` or `logical_xor()` operator instead.");
+    }
+    DType out = pair;
+    if (!isFloatingType(out) && !isComplexType(out)) out = DType::Float32;
+    out = promoteTypes(out, grad.dtype());
+    if (mean_rescale && !isFloatingType(out) && !isComplexType(out)) {
+        out = DType::Float32;
+    }
+    return out;
+}
+
+Tensor smooth_l1_loss_backward_kernel(const Tensor& grad_output, const Tensor& input,
+                                      const Tensor& target, int64_t reduction,
+                                      double beta) {
+    if (beta < 0) {
+        TP_THROW(ValueError, "smooth_l1_loss does not support negative values for beta.");
+    }
+    return empty_meta(loss_grad_shape(grad_output, input, target),
+                      loss_grad_dtype(input, target, grad_output, reduction == 1),
+                      input.device());
+}
+
+Tensor huber_loss_backward_kernel(const Tensor& grad_output, const Tensor& input,
+                                  const Tensor& target, int64_t reduction,
+                                  double /*delta*/) {
+    return empty_meta(loss_grad_shape(grad_output, input, target),
+                      loss_grad_dtype(input, target, grad_output, reduction == 1),
+                      input.device());
+}
+
+// ---------------------------------------------------------------------------
 // Elementwise losses.
 // ---------------------------------------------------------------------------
 
@@ -494,6 +545,8 @@ TENSORPLAY_LIBRARY_IMPL(Meta, MetaLoss) {
     m.impl("tp_poisson_nll_loss", poisson_nll_loss_kernel);
     m.impl("nll_loss", nll_loss_kernel);
     m.impl("huber_loss", huber_loss_kernel);
+    m.impl("huber_loss_backward", huber_loss_backward_kernel);
+    m.impl("smooth_l1_loss_backward", smooth_l1_loss_backward_kernel);
     m.impl("tp_soft_margin_loss", soft_margin_loss_kernel);
     m.impl("tp_hinge_embedding_loss", hinge_embedding_loss_kernel);
     m.impl("tp_margin_ranking_loss", margin_ranking_loss_kernel);

@@ -486,6 +486,59 @@ Tensor& copy_kernel(Tensor& self, const Tensor& src, bool /*non_blocking*/) {
     }
     return self;
 }
+
+// ---------------------------------------------------------------------------
+// Windows.  A window factory answers a one-dimensional buffer whose length
+// is the requested window length.  The cosine or polynomial samples live in
+// element data, which meta tensors do not carry, but the length and the
+// requested type are shape questions and still get policed here.
+// ---------------------------------------------------------------------------
+Tensor window_meta(int64_t window_length, std::optional<DType> dtype_opt,
+                   const char* name) {
+    if (window_length < 0) {
+        TP_THROW(ValueError, name, ": window_length must be non-negative");
+    }
+    DType dt = dtype_opt.value_or(DType::Float32);
+    if (dt == DType::Undefined) dt = DType::Float32;
+    if (dt != DType::Float32 && dt != DType::Float64) {
+        TP_THROW(NotImplementedError, name, ": only float32/float64 windows are supported");
+    }
+    return empty_meta({window_length}, dt, Device(DeviceType::Meta));
+}
+
+Tensor bartlett_window_kernel(int64_t window_length, bool /*periodic*/,
+                              std::optional<DType> dtype) {
+    return window_meta(window_length, dtype, "bartlett_window");
+}
+
+Tensor blackman_window_kernel(int64_t window_length, bool /*periodic*/,
+                              std::optional<DType> dtype) {
+    return window_meta(window_length, dtype, "blackman_window");
+}
+
+Tensor hann_window_kernel(int64_t window_length, bool /*periodic*/,
+                          std::optional<DType> dtype) {
+    return window_meta(window_length, dtype, "hann_window");
+}
+
+Tensor hamming_window_kernel(int64_t window_length, bool /*periodic*/,
+                             double /*alpha*/, double /*beta*/,
+                             std::optional<DType> dtype) {
+    return window_meta(window_length, dtype, "hamming_window");
+}
+
+// Bernoulli draws land in the operand's own geometry; the per-element
+// probabilities live in element data and are never read here.
+Tensor bernoulli_kernel(const Tensor& self, std::optional<Generator> /*generator*/) {
+    check_all_meta(self, self);
+    return empty_meta(shape_of(self), self.dtype(), self.device());
+}
+
+Tensor bernoulli_p_kernel(const Tensor& self, double /*p*/,
+                          std::optional<Generator> /*generator*/) {
+    check_all_meta(self, self);
+    return empty_meta(shape_of(self), self.dtype(), self.device());
+}
 } // anonymous namespace
 TENSORPLAY_LIBRARY_IMPL(Meta, MetaFactory) {
     m.impl("empty", empty_stub);
@@ -499,6 +552,10 @@ TENSORPLAY_LIBRARY_IMPL(Meta, MetaFactory) {
     m.impl("eye", eye_stub);
     m.impl("linspace", linspace_stub);
     m.impl("logspace", logspace_stub);
+    m.impl("bartlett_window", bartlett_window_kernel);
+    m.impl("blackman_window", blackman_window_kernel);
+    m.impl("hann_window", hann_window_kernel);
+    m.impl("hamming_window", hamming_window_kernel);
     m.impl("rand", rand_stub);
     m.impl("randn", randn_stub);
     m.impl("randn.generator", randn_generator_stub);
@@ -524,6 +581,8 @@ TENSORPLAY_LIBRARY_IMPL(Meta, MetaFactory) {
     m.impl("exponential_", exponential_inplace_kernel);
     m.impl("geometric_", geometric_inplace_kernel);
     m.impl("log_normal_", log_normal_inplace_kernel);
+    m.impl("bernoulli", bernoulli_kernel);
+    m.impl("bernoulli.p", bernoulli_p_kernel);
     m.impl("bernoulli_.float", bernoulli_float_inplace_kernel);
     m.impl("bernoulli_.Tensor", bernoulli_tensor_inplace_kernel);
     m.impl("random_", random_inplace_kernel);

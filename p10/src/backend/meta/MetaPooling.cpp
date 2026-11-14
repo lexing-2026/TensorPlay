@@ -497,6 +497,158 @@ std::tuple<Tensor, Tensor> adaptive_max_pool3d_meta(
             empty_meta(out_shape, DType::Int64, input.device())};
 }
 
+// ---------------------------------------------------------------------------
+// Pooling backwards.
+//
+// Every pooling backward scatters grad_output onto the forward's input
+// geometry: the answer is a zero-filled tensor of the input's shape and
+// dtype, guarded by the same rank and parameter-list checks the forward
+// applies.  The saved argmax indices only steer the scatter, which a meta
+// tensor does not materialize.
+// ---------------------------------------------------------------------------
+
+Tensor avg_pool3d_backward_meta(const Tensor& grad_output, const Tensor& input,
+                                const std::vector<int64_t>& kernel_size,
+                                const std::vector<int64_t>& stride,
+                                const std::vector<int64_t>& padding,
+                                bool ceil_mode, bool count_include_pad,
+                                std::optional<int64_t> divisor_override) {
+    if (divisor_override.has_value() && *divisor_override == 0) {
+        TP_THROW(RuntimeError, "divisor must be not zero");
+    }
+    if (grad_output.dim() == 4 && input.dim() == 4) {
+        return avg_pool3d_backward_meta(grad_output.unsqueeze(0),
+                                        input.unsqueeze(0), kernel_size, stride,
+                                        padding, ceil_mode, count_include_pad,
+                                        divisor_override)
+            .squeeze(0);
+    }
+    if (grad_output.dim() != 5 || input.dim() != 5) {
+        TP_THROW(RuntimeError,
+                 "avg_pool3d_backward: Expected 5D input and grad_output");
+    }
+    const auto ks = expand_pool_param(kernel_size,
+                                      "avg_pool3d_backward kernel_size", 3, 1);
+    const auto st = expand_pool_param(stride.empty() ? ks : stride,
+                                      "avg_pool3d_backward stride", 3, ks[0]);
+    expand_pool_param(padding, "avg_pool3d_backward padding", 3, 0);
+    if (st[0] == 0 || st[1] == 0 || st[2] == 0) {
+        TP_THROW(RuntimeError, "stride should not be zero");
+    }
+    (void)ceil_mode;
+    (void)count_include_pad;
+    return empty_meta(shape_of(input), input.dtype(), input.device());
+}
+
+Tensor adaptive_avg_pool3d_backward_meta(const Tensor& grad_output,
+                                         const Tensor& input) {
+    if (grad_output.dim() == 4 && input.dim() == 4) {
+        return adaptive_avg_pool3d_backward_meta(grad_output.unsqueeze(0),
+                                                 input.unsqueeze(0))
+            .squeeze(0);
+    }
+    if (grad_output.dim() != 5 || input.dim() != 5) {
+        TP_THROW(RuntimeError,
+                 "adaptive_avg_pool3d_backward: Expected 5D input and grad_output");
+    }
+    return empty_meta(shape_of(input), input.dtype(), input.device());
+}
+
+Tensor adaptive_max_pool2d_backward_meta(const Tensor& grad_output,
+                                         const Tensor& input) {
+    if (grad_output.dim() == 3 && input.dim() == 3) {
+        // Unbatched (C, H, W): pool as a batch of one, matching the forward.
+        return adaptive_max_pool2d_backward_meta(grad_output.unsqueeze(0),
+                                                 input.unsqueeze(0))
+            .squeeze(0);
+    }
+    if (grad_output.dim() != 4 || input.dim() != 4) {
+        TP_THROW(RuntimeError,
+                 "adaptive_max_pool2d_backward: Expected 4D input and grad_output");
+    }
+    return empty_meta(shape_of(input), input.dtype(), input.device());
+}
+
+Tensor adaptive_max_pool3d_backward_meta(const Tensor& grad_output,
+                                         const Tensor& input,
+                                         const Tensor& indices) {
+    if (grad_output.dim() == 4 && input.dim() == 4) {
+        return adaptive_max_pool3d_backward_meta(grad_output.unsqueeze(0),
+                                                 input.unsqueeze(0),
+                                                 indices.unsqueeze(0))
+            .squeeze(0);
+    }
+    if (grad_output.dim() != 5 || input.dim() != 5) {
+        TP_THROW(RuntimeError,
+                 "adaptive_max_pool3d_backward: Expected 5D input and grad_output");
+    }
+    (void)indices;
+    return empty_meta(shape_of(input), input.dtype(), input.device());
+}
+
+Tensor max_pool2d_with_indices_backward_meta(
+        const Tensor& grad_output, const Tensor& input,
+        const std::vector<int64_t>& /*kernel_size*/,
+        const std::vector<int64_t>& /*stride*/,
+        const std::vector<int64_t>& /*padding*/,
+        const std::vector<int64_t>& /*dilation*/, bool /*ceil_mode*/,
+        const std::optional<Tensor>& indices_opt) {
+    if (!indices_opt.has_value() || !indices_opt->defined()) {
+        TP_THROW(RuntimeError,
+                 "max_pool2d_with_indices_backward: indices is required");
+    }
+    if (input.dim() == 3) {
+        // Unbatched (C, H, W): pool as a batch of one, matching the forward.
+        return max_pool2d_with_indices_backward_meta(
+                   grad_output.unsqueeze(0), input.unsqueeze(0), {}, {}, {}, {},
+                   /*ceil_mode=*/false, indices_opt->unsqueeze(0))
+            .squeeze(0);
+    }
+    if (grad_output.dim() != 4 || input.dim() != 4) {
+        TP_THROW(RuntimeError,
+                 "max_pool2d_with_indices_backward: Expected 4D input and grad_output");
+    }
+    const Tensor& indices = *indices_opt;
+    if (indices.dim() != 4 || indices.size(0) != grad_output.size(0) ||
+        indices.size(1) != grad_output.size(1) ||
+        indices.size(2) != grad_output.size(2) ||
+        indices.size(3) != grad_output.size(3)) {
+        TP_THROW(RuntimeError,
+                 "max_pool2d_with_indices_backward: expected grad_output with shape [",
+                 grad_output.size(0), ", ", grad_output.size(1), ", ",
+                 grad_output.size(2), ", ", grad_output.size(3),
+                 "] to match indices shape [", indices.size(0), ", ",
+                 indices.size(1), ", ", indices.size(2), ", ", indices.size(3),
+                 "]");
+    }
+    return empty_meta(shape_of(input), input.dtype(), input.device());
+}
+
+Tensor max_pool3d_with_indices_backward_meta(
+        const Tensor& grad_output, const Tensor& input,
+        const std::vector<int64_t>& /*kernel_size*/,
+        const std::vector<int64_t>& /*stride*/,
+        const std::vector<int64_t>& /*padding*/,
+        const std::vector<int64_t>& /*dilation*/, bool /*ceil_mode*/,
+        const std::optional<Tensor>& indices_opt) {
+    if (!indices_opt.has_value() || !indices_opt->defined()) {
+        TP_THROW(RuntimeError,
+                 "max_pool3d_with_indices_backward: indices is required");
+    }
+    if (input.dim() == 4) {
+        // Unbatched (C, D, H, W): pool as a batch of one, matching the forward.
+        return max_pool3d_with_indices_backward_meta(
+                   grad_output.unsqueeze(0), input.unsqueeze(0), {}, {}, {}, {},
+                   /*ceil_mode=*/false, indices_opt->unsqueeze(0))
+            .squeeze(0);
+    }
+    if (grad_output.dim() != 5 || input.dim() != 5) {
+        TP_THROW(RuntimeError,
+                 "max_pool3d_with_indices_backward: Expected 5D input and grad_output");
+    }
+    return empty_meta(shape_of(input), input.dtype(), input.device());
+}
+
 } // anonymous namespace
 
 TENSORPLAY_LIBRARY_IMPL(Meta, MetaPooling) {
@@ -517,6 +669,14 @@ TENSORPLAY_LIBRARY_IMPL(Meta, MetaPooling) {
     m.impl("avg_pool3d", avg_pool3d_meta);
     m.impl("adaptive_avg_pool3d", adaptive_avg_pool3d_meta);
     m.impl("adaptive_max_pool3d", adaptive_max_pool3d_meta);
+    m.impl("avg_pool3d_backward", avg_pool3d_backward_meta);
+    m.impl("_adaptive_avg_pool3d_backward", adaptive_avg_pool3d_backward_meta);
+    m.impl("adaptive_max_pool2d_backward", adaptive_max_pool2d_backward_meta);
+    m.impl("adaptive_max_pool3d_backward", adaptive_max_pool3d_backward_meta);
+    m.impl("max_pool2d_with_indices_backward",
+           max_pool2d_with_indices_backward_meta);
+    m.impl("max_pool3d_with_indices_backward",
+           max_pool3d_with_indices_backward_meta);
 }
 
 } // namespace meta
