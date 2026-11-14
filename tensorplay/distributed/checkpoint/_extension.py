@@ -21,6 +21,13 @@ try:
 except ImportError:
     pass
 
+# The interpreter carries zstd from 3.14 on, so a source build there needs
+# neither of the third-party modules above.
+try:
+    from compression import zstd as stdlib_zstd
+except ImportError:
+    stdlib_zstd = None
+
 __all__ = ["Extension", "StreamTransformExtension", "ZStandard", "ExtensionRegistry"]
 
 
@@ -45,7 +52,9 @@ class StreamTransformExtension(Extension):
 class ZStandard(StreamTransformExtension):
     @staticmethod
     def is_available() -> bool:
-        return zstandard is not None or pyzstd is not None
+        return (
+            stdlib_zstd is not None or zstandard is not None or pyzstd is not None
+        )
 
     @staticmethod
     def registry_name() -> str:
@@ -69,6 +78,8 @@ class ZStandard(StreamTransformExtension):
         return f"{self.registry_name()}/1"
 
     def transform_to(self, output: IO[bytes]) -> IO[bytes]:
+        if stdlib_zstd is not None:
+            return stdlib_zstd.ZstdFile(output, mode="wb")
         if zstandard is not None:
             compressor = zstandard.ZstdCompressor()
             return compressor.stream_writer(output)
@@ -95,6 +106,8 @@ class ZStandard(StreamTransformExtension):
         return Writer(output)
 
     def transform_from(self, input: IO[bytes]) -> IO[bytes]:
+        if stdlib_zstd is not None:
+            return stdlib_zstd.ZstdFile(input, mode="rb")
         if zstandard is not None:
             decompressor = zstandard.ZstdDecompressor()
             return decompressor.stream_reader(input)
