@@ -45,8 +45,22 @@ std::vector<int64_t> broadcast_loss_shape(const Tensor& a, const Tensor& b,
 Tensor mse_loss_kernel(const Tensor& self, const Tensor& target,
                        int64_t reduction) {
     check_all_meta(self, target);
-    return empty_meta(broadcast_loss_shape(self, target, reduction),
-                      self.dtype(), self.device());
+    // The squared difference runs in the pair's promoted type: a boolean pair
+    // has no subtraction, and a whole-number pair answers its mean at single
+    // precision (the sum keeps the pair type); every floating or complex
+    // pair keeps its own type at every reduction.
+    const DType pair = promoteTypes(self.dtype(), target.dtype());
+    if (pair == DType::Bool) {
+        TP_THROW(RuntimeError,
+                 "Subtraction, the `-` operator, with two bool tensors is not "
+                 "supported. Use the `^` or `logical_xor()` operator instead.");
+    }
+    DType out = pair;
+    if (reduction == 1) {
+        if (!isFloatingType(out) && !isComplexType(out)) out = DType::Float32;
+    }
+    return empty_meta(broadcast_loss_shape(self, target, reduction), out,
+                      self.device());
 }
 
 Tensor binary_cross_entropy_kernel(
@@ -58,8 +72,20 @@ Tensor binary_cross_entropy_kernel(
         check_all_meta(self, *weight);
         out = broadcast_shapes(out, shape_of(*weight));
     }
-    return empty_meta(loss_out_shape(out, reduction), self.dtype(),
-                      self.device());
+    // The elementwise form blends three inputs: a logarithm of the input,
+    // the target shifted by a fractional scalar, and an optional weight
+    // multiply.  Whole-number inputs have no logarithm of their own type,
+    // so every whole-number plane answers in single precision; floating and
+    // complex planes keep their own type through all three blends.
+    DType out_dt = self.dtype();
+    if (!isFloatingType(out_dt) && !isComplexType(out_dt)) out_dt = DType::Float32;
+    DType tgt = target.dtype();
+    if (!isFloatingType(tgt) && !isComplexType(tgt)) tgt = DType::Float32;
+    out_dt = promoteTypes(out_dt, tgt);
+    if (weight.has_value() && weight->defined()) {
+        out_dt = promoteTypes(out_dt, weight->dtype());
+    }
+    return empty_meta(loss_out_shape(out, reduction), out_dt, self.device());
 }
 
 Tensor smooth_l1_loss_kernel(const Tensor& self, const Tensor& target,
@@ -69,8 +95,19 @@ Tensor smooth_l1_loss_kernel(const Tensor& self, const Tensor& target,
                  "smooth_l1_loss does not support negative values for beta.");
     }
     check_all_meta(self, target);
-    return empty_meta(broadcast_loss_shape(self, target, reduction),
-                      self.dtype(), self.device());
+    // Both branches of the elementwise switch blend in non-integral scalars,
+    // so a whole-number pair answers in single precision at every reduction;
+    // a boolean pair has no subtraction to feed the switch.
+    const DType pair = promoteTypes(self.dtype(), target.dtype());
+    if (pair == DType::Bool) {
+        TP_THROW(RuntimeError,
+                 "Subtraction, the `-` operator, with two bool tensors is not "
+                 "supported. Use the `^` or `logical_xor()` operator instead.");
+    }
+    DType out = pair;
+    if (!isFloatingType(out) && !isComplexType(out)) out = DType::Float32;
+    return empty_meta(broadcast_loss_shape(self, target, reduction), out,
+                      self.device());
 }
 
 Tensor l1_loss_kernel(const Tensor& input, const Tensor& target,
@@ -105,6 +142,14 @@ std::tuple<Tensor, Tensor> nll_loss_kernel(
     const Tensor& self, const Tensor& target,
     const std::optional<Tensor>& weight, int64_t reduction,
     int64_t /*ignore_index*/) {
+    // The per-element walk reads the log probabilities at four element
+    // widths; anything else has no form and is refused before the layout is
+    // examined.
+    if (self.dtype() != DType::Float32 && self.dtype() != DType::Float64 &&
+        self.dtype() != DType::BFloat16 && self.dtype() != DType::Half) {
+        TP_THROW(NotImplementedError,
+                 "nll_loss only supports Float32, Float64, BFloat16 and Half");
+    }
     const bool no_batch = self.dim() == 1;
     const int64_t n_batch = no_batch ? 1 : self.size(0);
     const int64_t n_classes = self.size(no_batch ? 0 : 1);

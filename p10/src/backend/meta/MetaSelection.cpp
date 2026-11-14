@@ -57,11 +57,18 @@ std::tuple<Tensor, Tensor> topk_kernel(const Tensor& self, int64_t k,
     if (k < 0 || k > dim_size) {
         TP_THROW(RuntimeError, "topk: k must be in [0, dimension size]");
     }
+    std::vector<int64_t> out = shape_of(self);
+    if (nd != 0) out[static_cast<size_t>(dim)] = k;
+    // An empty selection or an empty source writes nothing, so the answer
+    // planes exist for every dtype the element walk could name; the dtype
+    // refusal below only guards a walk that would actually order elements.
+    if (k == 0 || self.numel() == 0) {
+        return {empty_meta(out, self.dtype(), self.device()),
+                empty_meta(out, DType::Int64, self.device())};
+    }
     if (self.dtype() == DType::Bool || !is_scalar_dtype(self.dtype())) {
         TP_THROW(NotImplementedError, "topk: unsupported dtype");
     }
-    std::vector<int64_t> out = shape_of(self);
-    if (nd != 0) out[static_cast<size_t>(dim)] = k;
     return {empty_meta(out, self.dtype(), self.device()),
             empty_meta(out, DType::Int64, self.device())};
 }

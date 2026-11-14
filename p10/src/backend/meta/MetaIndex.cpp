@@ -33,6 +33,27 @@ void require_scalar_elements(const Tensor& tensor, const char* op) {
     }
 }
 
+// The indexed reads and writes share one dimension wrap; an axis that does
+// not name a real dimension is refused with the family's own error type,
+// which reports the axis the caller passed after the negative wrap.
+int64_t wrap_index_dim(int64_t dim, int64_t ndim) {
+    if (dim < 0) dim += ndim;
+    if (dim < 0 || dim >= ndim) {
+        TP_THROW(RuntimeError,
+                 "Dimension out of range (expected to be in range of [",
+                 -ndim, ", ", ndim - 1, "], but got ", dim - ndim, ")");
+    }
+    return dim;
+}
+
+// The flat gather walks real and complex planes alike; only dtypes with no
+// element form at all are refused.
+void require_gatherable_elements(const Tensor& tensor, const char* op) {
+    if (!isComplexType(tensor.dtype()) && !is_scalar_dtype(tensor.dtype())) {
+        TP_THROW(TypeError, op, ": unsupported dtype");
+    }
+}
+
 void require_meta_devices(const Tensor& a, const Tensor& b, const Tensor& c,
                           const char* message) {
     if (!a.device().is_meta() || !b.device().is_meta() ||
@@ -48,7 +69,7 @@ void require_meta_devices(const Tensor& a, const Tensor& b, const Tensor& c,
 
 Tensor gather_kernel(const Tensor& self, int64_t dim, const Tensor& index) {
     const int64_t nd = self.dim();
-    dim = wrap_dim(dim, nd);
+    dim = wrap_index_dim(dim, nd);
     if (index.dim() != nd) {
         TP_THROW(IndexError,
                  "Index must have same number of dimensions as input tensor");
@@ -74,7 +95,7 @@ void check_scatter_geometry(const Tensor& self, int64_t dim,
                             const Tensor& index, const Tensor& src,
                             const char* op) {
     const int64_t nd = self.dim();
-    wrap_dim(dim, nd);
+    wrap_index_dim(dim, nd);
     if (index.dim() != nd) {
         TP_THROW(IndexError,
                  "Index must have same number of dimensions as output tensor");
@@ -90,7 +111,7 @@ void check_scatter_geometry(const Tensor& self, int64_t dim,
 void check_scatter_value_geometry(const Tensor& self, int64_t dim,
                                   const Tensor& index) {
     const int64_t nd = self.dim();
-    wrap_dim(dim, nd);
+    wrap_index_dim(dim, nd);
     if (index.dim() != nd) {
         TP_THROW(IndexError,
                  "Index must have same number of dimensions as output tensor");
@@ -160,7 +181,7 @@ Tensor scatter_reduce_kernel(const Tensor& self, int64_t dim,
                              bool /*include_self*/) {
     check_reduce_name(reduce);
     const int64_t nd = self.dim();
-    dim = wrap_dim(dim, nd);
+    dim = wrap_index_dim(dim, nd);
     if (index.dim() != nd) {
         TP_THROW(IndexError,
                  "index must have the same number of dimensions as self");
@@ -225,7 +246,7 @@ Tensor index_reduce_kernel(const Tensor& self, int64_t dim,
                            bool /*include_self*/) {
     check_index_reduce_name(reduce);
     const int64_t nd = self.dim();
-    dim = wrap_dim(dim, nd);
+    dim = wrap_index_dim(dim, nd);
     if (source.dim() != nd) {
         TP_THROW(IndexError,
                  "index_reduce(): Index is supposed to be a vector");
@@ -282,7 +303,7 @@ Tensor& index_reduce_inplace_kernel(Tensor& self, int64_t dim,
 Tensor index_select_kernel(const Tensor& self, int64_t dim,
                            const Tensor& index) {
     const int64_t nd = self.dim();
-    dim = wrap_dim(dim, nd);
+    dim = wrap_index_dim(dim, nd);
     if (index.dim() > 1) {
         TP_THROW(IndexError, "index_select(): index should be a vector");
     }
@@ -297,7 +318,7 @@ Tensor index_select_kernel(const Tensor& self, int64_t dim,
 Tensor index_add_kernel(const Tensor& self, int64_t dim, const Tensor& index,
                         const Tensor& source) {
     const int64_t nd = self.dim();
-    dim = wrap_dim(dim, nd);
+    dim = wrap_index_dim(dim, nd);
     const int64_t n_idx = index.numel();
     if (n_idx == 0) {
         return empty_meta(shape_of(self), self.dtype(), self.device());
@@ -322,7 +343,7 @@ Tensor& index_add_inplace_kernel(Tensor& self, int64_t dim,
 
 Tensor index_copy_kernel(const Tensor& self, int64_t dim, const Tensor& index,
                          const Tensor& /*source*/) {
-    wrap_dim(dim, self.dim());
+    wrap_index_dim(dim, self.dim());
     if (index.numel() != 0) {
         require_scalar_elements(self, "index_copy");
     }
@@ -338,7 +359,7 @@ Tensor& index_copy_inplace_kernel(Tensor& self, int64_t dim,
 
 void check_index_fill_geometry(const Tensor& self, int64_t dim,
                                const Tensor& index) {
-    wrap_dim(dim, self.dim());
+    wrap_index_dim(dim, self.dim());
     if (index.numel() != 0) {
         require_scalar_elements(self, "index_fill");
     }
@@ -455,7 +476,7 @@ Tensor& masked_scatter_inplace_kernel(Tensor& self, const Tensor& mask,
 // ---------------------------------------------------------------------------
 
 Tensor take_kernel(const Tensor& self, const Tensor& index) {
-    require_scalar_elements(self, "take");
+    require_gatherable_elements(self, "take");
     return empty_meta(shape_of(index), self.dtype(), self.device());
 }
 

@@ -2,10 +2,12 @@
 //
 // A softmax normalizes each row along one axis; the normalization changes
 // values only, so the result repeats the input's sizes and -- apart from an
-// explicit dtype request or a half-to-float upcast -- its element type.
-// Integer inputs answer at single precision.  The backward kernels describe
-// a gradient with the forward output's geometry and the forward input's
-// dtype.
+// explicit dtype request -- its element type.  Integer inputs answer at
+// single precision, and the lower-level form refuses the half-to-float
+// request a host backend cannot carry.  The backward kernels describe a
+// gradient with the forward output's geometry and the incoming gradient's
+// dtype (narrowed to Half when a Half forward received a single-precision
+// gradient).
 
 #include "MetaCommon.h"
 
@@ -70,43 +72,51 @@ Tensor log_softmax_kernel(const Tensor& self, int64_t dim, DType dtype) {
 }
 
 // The lower-level forward takes an explicit half-to-float flag instead of a
-// dtype request; the flag lifts reduced-precision inputs to Float32.
+// dtype request.  A materializing host backend never carries the flag, so a
+// set flag is refused before anything else is read; the rest follows the
+// plain form's table (whole-number planes answer in single precision,
+// complex planes and booleans have no form here).
 Tensor softmax_native_kernel(const Tensor& self, int64_t dim,
                              bool half_to_float) {
+    if (half_to_float) {
+        TP_THROW(RuntimeError,
+                 "softmax with half to float conversion is not supported on CPU");
+    }
     (void)normalize_softmax_dim(dim, self.dim());
-    const DType out = (half_to_float &&
-                       (self.dtype() == DType::Float16 ||
-                        self.dtype() == DType::BFloat16))
-                          ? DType::Float32
-                          : self.dtype();
-    return empty_meta(shape_of(self), out, self.device());
+    require_softmax_dtype(self.dtype());
+    return empty_meta(shape_of(self),
+                      softmax_answer_dtype(self.dtype(), DType::Undefined),
+                      self.device());
 }
 
 Tensor log_softmax_native_kernel(const Tensor& self, int64_t dim,
                                  bool half_to_float) {
+    if (half_to_float) {
+        TP_THROW(RuntimeError,
+                 "log_softmax with half to float conversion is not supported on CPU");
+    }
     (void)normalize_softmax_dim(dim, self.dim());
-    const DType out = (half_to_float &&
-                       (self.dtype() == DType::Float16 ||
-                        self.dtype() == DType::BFloat16))
-                          ? DType::Float32
-                          : self.dtype();
-    return empty_meta(shape_of(self), out, self.device());
+    require_softmax_dtype(self.dtype());
+    return empty_meta(shape_of(self),
+                      softmax_answer_dtype(self.dtype(), DType::Undefined),
+                      self.device());
 }
 
-// The dtype a softmax backward answers in: the forward input's own type,
-// except that a reduced-precision forward computes in Float32 and only comes
-// back down when the incoming gradient is already Float32.
-DType softmax_backward_dtype(DType input_dtype, DType grad_dtype) {
-    const bool reduced = isReducedFloatingType(input_dtype);
-    if (reduced && grad_dtype != DType::Float32) return DType::Float32;
-    return input_dtype;
+// The backward answers at the gradient's own type; the one exception is a
+// Half forward whose gradient came back in single precision, which narrows
+// back to Half.
+DType softmax_backward_dtype(DType grad_dtype, DType input_dtype) {
+    if (grad_dtype == DType::Float32 && input_dtype == DType::Float16) {
+        return DType::Float16;
+    }
+    return grad_dtype;
 }
 
 Tensor softmax_backward_kernel(const Tensor& grad_output, const Tensor& output,
                                int64_t dim, DType input_dtype) {
     (void)normalize_softmax_dim(dim, grad_output.dim());
     return empty_meta(shape_of(grad_output),
-                      softmax_backward_dtype(input_dtype, grad_output.dtype()),
+                      softmax_backward_dtype(grad_output.dtype(), input_dtype),
                       grad_output.device());
 }
 
@@ -115,7 +125,7 @@ Tensor log_softmax_backward_kernel(const Tensor& grad_output,
                                    DType input_dtype) {
     (void)normalize_softmax_dim(dim, grad_output.dim());
     return empty_meta(shape_of(grad_output),
-                      softmax_backward_dtype(input_dtype, grad_output.dtype()),
+                      softmax_backward_dtype(grad_output.dtype(), input_dtype),
                       grad_output.device());
 }
 

@@ -220,6 +220,12 @@ std::tuple<Tensor, Tensor, Tensor> lu_kernel(const Tensor& A, bool pivot) {
     }
     check_linalg_matrix(A, "linalg.lu");
     check_linalg_dtype(A.dtype());
+    // The factorization itself runs on complex planes, but the permutation
+    // matrix it unpacks into is built by writing a whole-number one through
+    // the operand's type, and that write has no complex form.
+    if (isComplexType(A.dtype())) {
+        TP_THROW(TypeError, "linalg.lu: unsupported dtype");
+    }
     const auto batch = linalg_batch_shape(A);
     const int64_t m = A.size(-2);
     const int64_t n = A.size(-1);
@@ -693,6 +699,14 @@ Tensor matrix_power_kernel(const Tensor& self, int64_t n) {
     }
     if (n == std::numeric_limits<int64_t>::min()) {
         TP_THROW(RuntimeError, "matrix_power(): exponent is too small");
+    }
+    // A negative power inverts the operand first, and the inversion runs
+    // over the linalg element types only, so every other operand has no
+    // form for one and the linalg refusal fires.
+    if (n < 0 && !is_linalg_dtype(self.dtype())) {
+        TP_THROW(NotImplementedError,
+                 "unsupported dtype ", scalarTypeName(self.dtype()),
+                 " for linalg on CPU");
     }
     return empty_meta(shape_of(self), self.dtype(), self.device());
 }
