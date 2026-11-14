@@ -814,17 +814,57 @@ template <typename T>
 __global__ void unique_row_emit_kernel(int64_t n, int64_t row_len,
                                        const T* rows, const int64_t* order,
                                        const int64_t* gid, T* out,
-                                       int64_t* inverse) {
+                                       int64_t* inverse, int64_t num_groups,
+                                       int64_t* counts) {
     int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    const int64_t tid = i;
     for (; i < n; i += stride) {
-        const int64_t row = order[i];
+        // A null order vector means positions are already in emission order.
+        const int64_t row = order != nullptr ? order[i] : i;
         const int64_t g = gid[i] - 1;
         const T* src = rows + i * row_len;
         T* dst = out + g * row_len;
         for (int64_t c = 0; c < row_len; ++c) dst[c] = src[c];
         if (inverse != nullptr) inverse[row] = g;
     }
+    // Run lengths ride along in the same launch: run g starts at the first
+    // position whose scan value reaches g+1 and ends where the next run does,
+    // both found by bisection, so the tally costs O(log n) per run instead of
+    // a full pass over the input.  The walk restarts from the thread's own
+    // global id because the emission loop above already advanced it past n.
+    if (counts != nullptr) {
+        for (int64_t g = tid; g < num_groups; g += stride) {
+            const int64_t want = g + 1;
+            int64_t lo = 0, hi = n;
+            while (lo < hi) {
+                const int64_t mid = lo + (hi - lo) / 2;
+                if (gid[mid] < want) lo = mid + 1; else hi = mid;
+            }
+            const int64_t start = lo;
+            int64_t end = n;
+            if (g + 1 < num_groups) {
+                lo = start;
+                hi = n;
+                while (lo < hi) {
+                    const int64_t mid = lo + (hi - lo) / 2;
+                    if (gid[mid] < want + 1) lo = mid + 1; else hi = mid;
+                }
+                end = lo;
+            }
+            counts[g] = end - start;
+        }
+    }
+}
+
+// Run markers for the single-column consecutive path: each element writes a
+// 0/1 flag telling whether it starts a new run.  The flags stay 32-bit
+// because their inclusive sum never exceeds the element count.
+template <typename T>
+__global__ void unique_flag_kernel(int64_t n, const T* in, int32_t* flags) {
+    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    flags[i] = (i > 0 && in[i] != in[i - 1]) ? 1 : 0;
 }
 
 }
@@ -1086,12 +1126,111 @@ std::tuple<Tensor, Tensor, Tensor> unique_dim_cuda_impl(const Tensor& self,
     const int64_t n = front_sizes[0];
     input_flat = input_flat.reshape({n, -1});
     const int64_t row_len = input_flat.size(1);
+    if (consecutive && row_len == 1) {
+        // Single-column runs skip the row machinery: the device run-length
+        // encoder yields the distinct values, their counts, and the run count
+        // in one pass, and the inverse indices are exactly the inclusive sum
+        // of the new-run flags.  Only the inverse branch needs that scan.
+        TP_CHECK(n <= static_cast<int64_t>(std::numeric_limits<int>::max()),
+                 "unique_consecutive: input too large for device run-length encode");
+        auto stream = getCurrentCUDAStream().stream();
+        Tensor values_full = Tensor::empty({n}, self.dtype(), self.device());
+        Tensor counts_full = return_counts
+                                 ? Tensor::empty({n}, DType::Int64, self.device())
+                                 : Tensor();
+        Tensor length_t = Tensor::empty({1}, DType::Int64, self.device());
+        Tensor inverse;
+        Tensor flags;
+        if (return_inverse) {
+            inverse = Tensor::empty({n}, DType::Int64, self.device());
+            flags = Tensor::empty({n}, DType::Int32, self.device());
+        }
+        const int threads = 256;
+        const int blocks = static_cast<int>((n + threads - 1) / threads);
+        const int items = static_cast<int>(n);
+        size_t work_bytes = 0;
+#define UNIQUE_RLE_CASE(ctype, name) \
+    case DType::name: { \
+        const ctype* in = input_flat.data_ptr<ctype>(); \
+        if (return_inverse) { \
+            unique_flag_kernel<ctype><<<blocks, threads, 0, stream>>>( \
+                n, in, flags.data_ptr<int32_t>()); \
+            CUDA_CHECK(cudaGetLastError()); \
+            size_t scan_bytes = 0; \
+            CUDA_CHECK(cub::DeviceScan::InclusiveSum( \
+                nullptr, scan_bytes, flags.data_ptr<int32_t>(), \
+                inverse.data_ptr<int64_t>(), items, stream)); \
+            Tensor scan_storage = Tensor::empty( \
+                {static_cast<int64_t>(std::max<size_t>(scan_bytes, 1))}, \
+                DType::UInt8, self.device()); \
+            CUDA_CHECK(cub::DeviceScan::InclusiveSum( \
+                scan_storage.data_ptr(), scan_bytes, flags.data_ptr<int32_t>(), \
+                inverse.data_ptr<int64_t>(), items, stream)); \
+        } \
+        if (return_counts) { \
+            CUDA_CHECK(cub::DeviceRunLengthEncode::Encode( \
+                nullptr, work_bytes, in, values_full.data_ptr<ctype>(), \
+                counts_full.data_ptr<int64_t>(), length_t.data_ptr<int64_t>(), \
+                items, stream)); \
+            Tensor work_storage = Tensor::empty( \
+                {static_cast<int64_t>(std::max<size_t>(work_bytes, 1))}, \
+                DType::UInt8, self.device()); \
+            CUDA_CHECK(cub::DeviceRunLengthEncode::Encode( \
+                work_storage.data_ptr(), work_bytes, in, \
+                values_full.data_ptr<ctype>(), counts_full.data_ptr<int64_t>(), \
+                length_t.data_ptr<int64_t>(), items, stream)); \
+        } else { \
+            CUDA_CHECK(cub::DeviceSelect::Unique( \
+                nullptr, work_bytes, in, values_full.data_ptr<ctype>(), \
+                length_t.data_ptr<int64_t>(), items, stream)); \
+            Tensor work_storage = Tensor::empty( \
+                {static_cast<int64_t>(std::max<size_t>(work_bytes, 1))}, \
+                DType::UInt8, self.device()); \
+            CUDA_CHECK(cub::DeviceSelect::Unique( \
+                work_storage.data_ptr(), work_bytes, in, \
+                values_full.data_ptr<ctype>(), length_t.data_ptr<int64_t>(), \
+                items, stream)); \
+        } \
+        break; }
+        switch (self.dtype()) {
+            UNIQUE_RLE_CASE(float, Float32)
+            UNIQUE_RLE_CASE(double, Float64)
+            UNIQUE_RLE_CASE(int64_t, Int64)
+            UNIQUE_RLE_CASE(int32_t, Int32)
+            UNIQUE_RLE_CASE(int16_t, Int16)
+            UNIQUE_RLE_CASE(int8_t, Int8)
+            UNIQUE_RLE_CASE(uint8_t, UInt8)
+            UNIQUE_RLE_CASE(uint16_t, UInt16)
+            UNIQUE_RLE_CASE(uint32_t, UInt32)
+            UNIQUE_RLE_CASE(uint64_t, UInt64)
+            UNIQUE_RLE_CASE(Half, Float16)
+            UNIQUE_RLE_CASE(BFloat16, BFloat16)
+            UNIQUE_RLE_CASE(bool, Bool)
+            default:
+                TP_THROW(NotImplementedError, "unique_dim: unsupported dtype on CUDA");
+        }
+#undef UNIQUE_RLE_CASE
+        int64_t num_groups = 0;
+        CUDA_CHECK(cudaMemcpyAsync(&num_groups, length_t.data_ptr<int64_t>(),
+                                   sizeof(int64_t), cudaMemcpyDeviceToHost,
+                                   stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        values_full.resize_({num_groups});
+        Tensor counts;
+        if (return_counts) {
+            counts_full.resize_({num_groups});
+            counts = counts_full;
+        }
+        front_sizes[0] = num_groups;
+        Tensor values = values_full.reshape(front_sizes).moveaxis(0, dim);
+        return std::make_tuple(values, inverse, counts);
+    }
     Tensor rows_sorted;
     Tensor order;
     if (consecutive) {
+        // Input order is already the emission order, so no index vector is
+        // needed and the emit kernel walks positions directly.
         rows_sorted = input_flat;
-        order = Tensor::arange(Scalar(int64_t(0)), Scalar(n), Scalar(int64_t(1)),
-                               DType::Int64, self.device());
     } else {
         rows_sorted = input_flat;
         order = Tensor::arange(Scalar(int64_t(0)), Scalar(n), Scalar(int64_t(1)),
@@ -1106,7 +1245,8 @@ std::tuple<Tensor, Tensor, Tensor> unique_dim_cuda_impl(const Tensor& self,
             rows_sorted = rows_sorted.gather(0, idx);
         }
     }
-    Tensor flags = Tensor::zeros({n}, DType::Int64, self.device());
+    // The equality pass writes every flag, so the buffer starts uninitialized.
+    Tensor flags = Tensor::empty({n}, DType::Int64, self.device());
     const int threads = 256;
     const int blocks = static_cast<int>((n + threads - 1) / threads);
     auto stream = getCurrentCUDAStream().stream();
@@ -1133,20 +1273,31 @@ std::tuple<Tensor, Tensor, Tensor> unique_dim_cuda_impl(const Tensor& self,
             TP_THROW(NotImplementedError, "unique_dim: unsupported dtype on CUDA");
     }
 #undef UNIQUE_ROW_CASE
-    Tensor gid = flags.cumsum(0);
-    const int64_t num_groups =
-        gid.to(Device(DeviceType::CPU)).data_ptr<int64_t>()[n - 1];
+    flags.cumsum_(0);
+    const int64_t* gid = flags.data_ptr<int64_t>();
+    // The run count is the last inclusive-scan value; fetching that single
+    // element keeps the allocation of the output on the host side without
+    // dragging the whole scan buffer across the bus.
+    int64_t num_groups = 0;
+    CUDA_CHECK(cudaMemcpyAsync(&num_groups, gid + (n - 1),
+                               sizeof(int64_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
     Tensor kept_rows = Tensor::empty({num_groups, row_len}, self.dtype(),
                                      self.device());
     Tensor inverse = return_inverse
                          ? Tensor::empty({n}, DType::Int64, self.device())
                          : Tensor();
     int64_t* inverse_ptr = return_inverse ? inverse.data_ptr<int64_t>() : nullptr;
+    const int64_t* order_ptr = order.defined() ? order.data_ptr<int64_t>() : nullptr;
+    Tensor counts = return_counts
+                        ? Tensor::empty({num_groups}, DType::Int64, self.device())
+                        : Tensor();
+    int64_t* counts_ptr = return_counts ? counts.data_ptr<int64_t>() : nullptr;
 #define UNIQUE_ROW_EMIT_CASE(ctype, name) \
     case DType::name: \
         unique_row_emit_kernel<ctype><<<blocks, threads, 0, stream>>>( \
-            n, row_len, rows_sorted.data_ptr<ctype>(), order.data_ptr<int64_t>(), \
-            gid.data_ptr<int64_t>(), kept_rows.data_ptr<ctype>(), inverse_ptr); \
+            n, row_len, rows_sorted.data_ptr<ctype>(), order_ptr, \
+            gid, kept_rows.data_ptr<ctype>(), inverse_ptr, num_groups, counts_ptr); \
         break;
     switch (self.dtype()) {
         UNIQUE_ROW_EMIT_CASE(float, Float32)
@@ -1168,12 +1319,6 @@ std::tuple<Tensor, Tensor, Tensor> unique_dim_cuda_impl(const Tensor& self,
 #undef UNIQUE_ROW_EMIT_CASE
     front_sizes[0] = num_groups;
     Tensor values = kept_rows.reshape(front_sizes).moveaxis(0, dim);
-    Tensor counts;
-    if (return_counts) {
-        Tensor one = Tensor::ones({n}, DType::Int64, self.device());
-        Tensor shifted = gid.sub(Scalar(int64_t(1)));
-        counts = shifted.bincount(one, num_groups);
-    }
     return std::make_tuple(values, inverse, counts);
 }
 
