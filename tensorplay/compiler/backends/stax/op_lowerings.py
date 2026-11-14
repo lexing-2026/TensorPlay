@@ -1385,9 +1385,10 @@ def cast_to(value, dtype):
     put it in.  A value with a loop of its own is cast by a kernel of its own;
     only a scalar read inside a loop is cast by the loop's own arithmetic.
     """
-    if is_tensor_box(value) and value.get_dtype() == dtype:
+    src = getattr(value, "get_dtype", None)
+    if src is not None and value.get_dtype() == dtype:
         return value
-    if is_tensor_box(value):
+    if src is not None:
         return to_dtype(value, dtype)
     return ops.to_dtype(value, dtype)
 
