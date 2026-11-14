@@ -387,7 +387,7 @@ Tensor& relu6_inplace_kernel(Tensor& self) {
 
 Tensor& renorm_inplace_kernel(Tensor& self, const Scalar& p, int64_t dim, const Scalar& maxnorm) {
     NoGradGuard __tp_nograd;
-    self.copy_(self.renorm(p, dim, maxnorm));
+    tensorplay::detail::redispatch_renorm_out_function(self, p, dim, maxnorm, self);
     return self;
 }
 
