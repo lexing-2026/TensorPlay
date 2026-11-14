@@ -1,5 +1,6 @@
 #include "Tensor.h"
 #include "Dispatcher.h"
+#include "OutWrite.h"
 #include "Exception.h"
 #include "Context.h"
 #include "CUDARuntime.h"
@@ -957,12 +958,14 @@ struct logcumsumexp_complex_op {
     }
 };
 
+// Destination form: `result` must already be contiguous with self's shape and
+// the scan's compute dtype.  The passes read each input element before the
+// same position is written, so result may alias self.
 template <typename T, typename Op>
-Tensor scan_entry(const Tensor& self, int64_t dim, T init_val, Op op) {
+void scan_entry_into(const Tensor& self, int64_t dim, T init_val, Op op, Tensor& result) {
     Tensor self_c = self.contiguous();
-    Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self_c.shape()), self_c.dtype(), self_c.device());
     int64_t d_size = self_c.size(dim);
-    if (d_size == 0 || self_c.numel() == 0) return result;
+    if (d_size == 0 || self_c.numel() == 0) return;
     int64_t outer = 1, inner = 1;
     outer_inner(static_cast<std::vector<int64_t>>(self_c.shape()), dim, outer, inner);
     int64_t slices = outer * inner;
@@ -970,7 +973,7 @@ Tensor scan_entry(const Tensor& self, int64_t dim, T init_val, Op op) {
     if (inner == 1 && d_size >= 2 && d_size < 512) {
         launch_short_rows_scan<T>(outer, d_size, self_c.data_ptr<T>(), result.data_ptr<T>(), init_val, op, stream);
         CUDA_CHECK(cudaGetLastError());
-        return result;
+        return;
     }
     if (inner == 1 && outer == 1 && d_size >= 512 && d_size <= 8192) {
         if constexpr (std::is_same_v<Op, scan_arithmetic_op<T, false>>) {
@@ -980,20 +983,20 @@ Tensor scan_entry(const Tensor& self, int64_t dim, T init_val, Op op) {
                  std::is_same_v<T, Half> ||
                  std::is_same_v<T, BFloat16>)) {
                 if (scan_flat_deterministic<T>(self_c, result, stream)) {
-                    return result;
+                    return;
                 }
             }
             if (scan_flat_try_cub_arithmetic<T, false>(self_c, result,
                                                        stream)) {
-                return result;
+                return;
             }
         } else if constexpr (std::is_same_v<Op, scan_arithmetic_op<T, true>>) {
             if (scan_flat_try_cub_arithmetic<T, true>(self_c, result,
                                                       stream)) {
-                return result;
+                return;
             }
         } else if (scan_flat_try_cub<T>(self_c, result, op, stream)) {
-            return result;
+            return;
         }
         constexpr int kScanBlockThreads = 512;
         scan_register_block_kernel<T, Op, kScanBlockThreads, 4><<<
@@ -1001,7 +1004,7 @@ Tensor scan_entry(const Tensor& self, int64_t dim, T init_val, Op op) {
             kScanBlockThreads * sizeof(scan_accum_t<T>), stream>>>(
             1, d_size, self_c.data_ptr<T>(), result.data_ptr<T>(), init_val, op);
         CUDA_CHECK(cudaGetLastError());
-        return result;
+        return;
     }
     if (inner == 1 && outer > 1 && outer <= 64 && d_size >= 8192) {
         constexpr int kScanBlockThreads = 512;
@@ -1011,7 +1014,7 @@ Tensor scan_entry(const Tensor& self, int64_t dim, T init_val, Op op) {
             kScanBlockThreads * sizeof(scan_accum_t<T>), stream>>>(
             outer, d_size, self_c.data_ptr<T>(), result.data_ptr<T>(), init_val, op);
         CUDA_CHECK(cudaGetLastError());
-        return result;
+        return;
     }
     if (inner == 1 && outer == 1 && d_size >= 512) {
         if constexpr (std::is_same_v<Op, scan_arithmetic_op<T, false>>) {
@@ -1021,20 +1024,20 @@ Tensor scan_entry(const Tensor& self, int64_t dim, T init_val, Op op) {
                  std::is_same_v<T, Half> ||
                  std::is_same_v<T, BFloat16>)) {
                 if (scan_flat_deterministic<T>(self_c, result, stream)) {
-                    return result;
+                    return;
                 }
             }
             if (scan_flat_try_cub_arithmetic<T, false>(self_c, result,
                                                        stream)) {
-                return result;
+                return;
             }
         } else if constexpr (std::is_same_v<Op, scan_arithmetic_op<T, true>>) {
             if (scan_flat_try_cub_arithmetic<T, true>(self_c, result,
                                                       stream)) {
-                return result;
+                return;
             }
         } else if (scan_flat_try_cub<T>(self_c, result, op, stream)) {
-            return result;
+            return;
         }
     }
     if (inner == 1 && d_size >= 512) {
@@ -1075,9 +1078,16 @@ Tensor scan_entry(const Tensor& self, int64_t dim, T init_val, Op op) {
             self_c.data_ptr<T>(), result.data_ptr<T>(), init_val, op);
     }
     CUDA_CHECK(cudaGetLastError());
-    return result;
+    return;
 }
 
+}
+
+template <typename T, typename Op>
+Tensor scan_entry(const Tensor& self, int64_t dim, T init_val, Op op) {
+    Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
+    scan_entry_into<T, Op>(self, dim, init_val, op, result);
+    return result;
 }
 
 Tensor cumsum_cuda(const Tensor& self, int64_t dim, std::optional<DType> dtype) {
@@ -1180,6 +1190,88 @@ Tensor cumprod_cuda(const Tensor& self, int64_t dim, std::optional<DType> dtype)
     return src;
 }
 
+// out= entries: a destination that matches the planned result takes the scan
+// straight into its buffer (the passes read each element before the same
+// position is written, so the destination may be self); complex answers and
+// mismatched destinations keep the compute-and-hand-over route.
+Tensor& cumsum_out_cuda(const Tensor& self, int64_t dim, std::optional<DType> dtype, Tensor& out) {
+    int64_t nd = self.dim();
+    dim = wrap_scan_dim(dim, nd);
+    DType out_dtype = dtype.value_or(isIntegralType(self.dtype(), true) ? DType::Int64
+                                                                        : self.dtype());
+    std::vector<int64_t> shape = static_cast<std::vector<int64_t>>(self.shape());
+    if (destination_takes(out, self.device(), out_dtype, shape) &&
+        self.is_contiguous() && out.is_contiguous() &&
+        read_while_write_is_safe(self, out)) {
+        if (nd == 0) { out.copy_(self); return out; }
+        if (isComplexType(out_dtype)) { out.copy_(cumsum_cuda(self, dim, dtype)); return out; }
+        Tensor src = (self.dtype() == out_dtype) ? self : self.to(out_dtype);
+#define TP_CS_OUT_CASE(ctype, name) \
+    case DType::name: \
+        scan_entry_into<ctype>(src, dim, static_cast<ctype>(0), \
+                               scan_arithmetic_op<ctype, false>{}, out); \
+        break;
+        switch (out_dtype) {
+            TP_CS_OUT_CASE(uint8_t, UInt8)
+            TP_CS_OUT_CASE(int8_t, Int8)
+            TP_CS_OUT_CASE(int16_t, Int16)
+            TP_CS_OUT_CASE(int32_t, Int32)
+            TP_CS_OUT_CASE(int64_t, Int64)
+            TP_CS_OUT_CASE(uint16_t, UInt16)
+            TP_CS_OUT_CASE(uint32_t, UInt32)
+            TP_CS_OUT_CASE(uint64_t, UInt64)
+            TP_CS_OUT_CASE(bool, Bool)
+            TP_CS_OUT_CASE(float, Float32)
+            TP_CS_OUT_CASE(double, Float64)
+            TP_CS_OUT_CASE(Half, Float16)
+            TP_CS_OUT_CASE(BFloat16, BFloat16)
+            default: TP_THROW(TypeError, "cumsum: unsupported dtype");
+        }
+#undef TP_CS_OUT_CASE
+        return out;
+    }
+    return write_out(out, cumsum_cuda(self, dim, dtype));
+}
+
+Tensor& cumprod_out_cuda(const Tensor& self, int64_t dim, std::optional<DType> dtype, Tensor& out) {
+    int64_t nd = self.dim();
+    dim = wrap_scan_dim(dim, nd);
+    DType out_dtype = dtype.value_or(isIntegralType(self.dtype(), true) ? DType::Int64
+                                                                        : self.dtype());
+    std::vector<int64_t> shape = static_cast<std::vector<int64_t>>(self.shape());
+    if (destination_takes(out, self.device(), out_dtype, shape) &&
+        self.is_contiguous() && out.is_contiguous() &&
+        read_while_write_is_safe(self, out)) {
+        if (nd == 0) { out.copy_(self); return out; }
+        if (isComplexType(out_dtype)) { out.copy_(cumprod_cuda(self, dim, dtype)); return out; }
+        Tensor src = (self.dtype() == out_dtype) ? self : self.to(out_dtype);
+#define TP_CP_OUT_CASE(ctype, name) \
+    case DType::name: \
+        scan_entry_into<ctype>(src, dim, static_cast<ctype>(1), \
+                               scan_arithmetic_op<ctype, true>{}, out); \
+        break;
+        switch (out_dtype) {
+            TP_CP_OUT_CASE(uint8_t, UInt8)
+            TP_CP_OUT_CASE(int8_t, Int8)
+            TP_CP_OUT_CASE(int16_t, Int16)
+            TP_CP_OUT_CASE(int32_t, Int32)
+            TP_CP_OUT_CASE(int64_t, Int64)
+            TP_CP_OUT_CASE(uint16_t, UInt16)
+            TP_CP_OUT_CASE(uint32_t, UInt32)
+            TP_CP_OUT_CASE(uint64_t, UInt64)
+            TP_CP_OUT_CASE(bool, Bool)
+            TP_CP_OUT_CASE(float, Float32)
+            TP_CP_OUT_CASE(double, Float64)
+            TP_CP_OUT_CASE(Half, Float16)
+            TP_CP_OUT_CASE(BFloat16, BFloat16)
+            default: TP_THROW(TypeError, "cumprod: unsupported dtype");
+        }
+#undef TP_CP_OUT_CASE
+        return out;
+    }
+    return write_out(out, cumprod_cuda(self, dim, dtype));
+}
+
 Tensor logcumsumexp_cuda(const Tensor& self, int64_t dim, std::optional<DType> dtype) {
     int64_t nd = self.dim();
     dim = wrap_scan_dim(dim, nd);
@@ -1278,8 +1370,10 @@ Tensor cumsum_backward_cuda(const Tensor& grad, int64_t dim) {
 
 TENSORPLAY_LIBRARY_IMPL(CUDA, ScanKernels) {
     m.impl("cumsum", cumsum_cuda);
+    m.impl("cumsum.out", cumsum_out_cuda);
     m.impl("cumsum_backward", cumsum_backward_cuda);
     m.impl("cumprod", cumprod_cuda);
+    m.impl("cumprod.out", cumprod_out_cuda);
     m.impl("logcumsumexp", logcumsumexp_cuda);
 }
 

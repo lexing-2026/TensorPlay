@@ -136,13 +136,13 @@ Tensor& cosh_inplace_kernel(Tensor& self) {
 
 Tensor& cumprod_inplace_kernel(Tensor& self, int64_t dim, std::optional<DType> dtype) {
     NoGradGuard __tp_nograd;
-    self.copy_(self.cumprod(dim, dtype));
+    tensorplay::detail::redispatch_cumprod_out_function(self, dim, dtype, self);
     return self;
 }
 
 Tensor& cumsum_inplace_kernel(Tensor& self, int64_t dim, std::optional<DType> dtype) {
     NoGradGuard __tp_nograd;
-    self.copy_(self.cumsum(dim, dtype));
+    tensorplay::detail::redispatch_cumsum_out_function(self, dim, dtype, self);
     return self;
 }
 
