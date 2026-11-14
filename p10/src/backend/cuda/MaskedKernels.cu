@@ -312,7 +312,10 @@ Tensor triu_cuda(const Tensor& self, int64_t diagonal) {
     return triangular_mask_entry<false>(self, diagonal);
 }
 
-Tensor masked_scatter_cuda(const Tensor& self, const Tensor& mask, const Tensor& source) {
+// Core scatter: `result` must be contiguous with self's shape, dtype and
+// device; the pass reads it for the passthrough elements while writing it.
+void masked_scatter_into_cuda(const Tensor& self, const Tensor& mask,
+                              const Tensor& source, Tensor& result) {
     if (source.dtype() != self.dtype()) {
         TP_THROW(TypeError,
                  "masked_scatter: self and source must have the same dtype");
@@ -329,10 +332,9 @@ Tensor masked_scatter_cuda(const Tensor& self, const Tensor& mask, const Tensor&
     Tensor m_full = mask_temp.expand(
         static_cast<std::vector<int64_t>>(self_iter.shape())).contiguous();
     Tensor src = source.contiguous();
-    Tensor result = ::tensorplay::detail::contiguous_clone(self);
     Tensor result_iter = result.dim() == 0 ? result.unsqueeze(0) : result;
     const int64_t n = result_iter.numel();
-    if (n == 0) return result;
+    if (n == 0) return;
     TP_CHECK(n <= static_cast<int64_t>(std::numeric_limits<int>::max()),
              "masked_scatter: input is too large for device scan");
     Tensor mask_flat = m_full.reshape({n});
@@ -364,12 +366,14 @@ Tensor masked_scatter_cuda(const Tensor& self, const Tensor& mask, const Tensor&
     CUDA_CHECK(cudaGetLastError());
     Tensor source_offsets_view = source_offsets.reshape(
         static_cast<std::vector<int64_t>>(result_iter.shape()));
+    // The passthrough value comes from self, so a destination that does not
+    // already hold self's values is filled correctly too.
     TensorIterator iter = TensorIteratorConfig()
         .set_check_mem_overlap(false)
         .check_all_same_dtype(false)
         .resize_outputs(false)
         .add_output(result_iter)
-        .add_input(result_iter)
+        .add_const_input(self_iter)
         .add_const_input(m_full)
         .add_input(source_offsets_view)
         .build();
@@ -400,7 +404,27 @@ Tensor masked_scatter_cuda(const Tensor& self, const Tensor& mask, const Tensor&
     }
 #undef TP_MS_CASE
     CUDA_CHECK(cudaGetLastError());
+}
+
+Tensor masked_scatter_cuda(const Tensor& self, const Tensor& mask, const Tensor& source) {
+    Tensor result = ::tensorplay::detail::contiguous_clone(self);
+    masked_scatter_into_cuda(self, mask, source, result);
     return result;
+}
+
+// out= entry: a matching destination takes the scatter pass straight into its
+// buffer (the pass reads each passthrough element before writing it), so the
+// in-place call keeps self without a compute-then-copy round trip.
+Tensor& masked_scatter_out_cuda(const Tensor& self, const Tensor& mask,
+                                const Tensor& source, Tensor& out) {
+    if (self.is_contiguous() && out.is_contiguous() &&
+        destination_takes(out, self.device(), self.dtype(),
+                          static_cast<std::vector<int64_t>>(self.shape())) &&
+        read_while_write_is_safe(self, out)) {
+        masked_scatter_into_cuda(self, mask, source, out);
+        return out;
+    }
+    return write_out(out, masked_scatter_cuda(self, mask, source));
 }
 
 Tensor& interop_tril_out_cuda(const Tensor& self, int64_t diagonal, Tensor& out) {
@@ -425,6 +449,7 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, MaskedKernels) {
     m.impl("tril", tril_cuda);
     m.impl("triu", triu_cuda);
     m.impl("masked_scatter", masked_scatter_cuda);
+    m.impl("masked_scatter.out", masked_scatter_out_cuda);
     m.impl("tril.out", interop_tril_out_cuda);
     m.impl("triu.out", interop_triu_out_cuda);
     m.impl("masked_fill_.Scalar", interop_masked_fill__Scalar_cuda);

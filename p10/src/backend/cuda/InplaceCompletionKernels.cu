@@ -341,7 +341,7 @@ Tensor& logit_inplace_kernel(Tensor& self, const std::optional<Scalar>& eps) {
 
 Tensor& masked_scatter_inplace_kernel(Tensor& self, const Tensor& mask, const Tensor& source) {
     NoGradGuard __tp_nograd;
-    self.copy_(self.masked_scatter(mask, source));
+    tensorplay::detail::redispatch_masked_scatter_out_function(self, mask, source, self);
     return self;
 }
 
