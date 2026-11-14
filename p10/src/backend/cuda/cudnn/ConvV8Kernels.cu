@@ -410,9 +410,11 @@ static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const 
         // Benchmarking times the candidates of the same heuristic list the
         // plain path ranks; switching to the fallback list instead loses the
         // leading engines and ends up measurably slower than just taking the
-        // first entry.
-        auto& engine_configs = heuristics.getEngineConfig(
-            autotune ? heuristics.getEngineConfigCount() : 1);
+        // first entry.  The plain path walks the whole ranked list too: the
+        // first entry alone would leave the scratch bound nothing to choose
+        // among on shapes where the leading engine asks for a workspace many
+        // times the output itself.
+        auto& engine_configs = heuristics.getEngineConfig(heuristics.getEngineConfigCount());
         if (engine_configs.empty()) {
             TP_THROW(RuntimeError, "cuDNN: no engine configs for conv2d");
         }
@@ -440,11 +442,41 @@ static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const 
                     .setEngineConfig(ec)
                     .build());
         };
-        // A plan whose scratch space exceeds the bound is skipped even when
-        // the heuristic ranks it first: peak memory matters more here than
-        // the last few percent of convolution time.  The smallest plan that
-        // did build is kept as a last resort for shapes where every engine
-        // needs a large scratch buffer.
+        if (!autotune || filtered.size() == 1) {
+            // The heuristic ranks engines by expected quality, and the leading
+            // entry is the plan the fast paths converge on.  Weaving a scratch
+            // bound into that choice would skip the leading plans whenever
+            // their workspace is large and quietly hand the convolution to a
+            // slower engine, so the ranked list is walked in order and the
+            // first plan that builds wins; the plain fallback engines are the
+            // last resort when nothing in the ranked family can be realized.
+            auto first_buildable =
+                [&](fe::EngineConfigList& configs)
+                -> std::shared_ptr<fe::ExecutionPlan> {
+                for (auto& ec : configs) {
+                    try {
+                        return build_plan(ec);
+                    } catch (...) {
+                        // Config cannot be realized on this device; try the next.
+                    }
+                }
+                return nullptr;
+            };
+            auto plan = first_buildable(filtered);
+            if (!plan) {
+                fe::EngineConfigList plain = fallback_engine_configs(op_graph);
+                fe::EngineConfigList plain_usable = usable_engine_configs(
+                    plain, deterministic, allow_tf32, dtype);
+                plan = first_buildable(plain_usable);
+            }
+            if (plan) return plan;
+            TP_THROW(RuntimeError, "cuDNN: no executable engine configs for conv2d");
+        }
+        std::vector<std::shared_ptr<fe::ExecutionPlan>> candidates;
+        // Benchmarking keeps every ranked plan whose scratch fits the bound
+        // as a candidate; a plan that builds but asks for more scratch than
+        // the bound is only kept as a last resort for shapes where every
+        // engine needs a large workspace.
         std::shared_ptr<fe::ExecutionPlan> smallest;
         auto remember_smallest = [&](std::shared_ptr<fe::ExecutionPlan> plan) {
             if (!smallest ||
@@ -452,22 +484,6 @@ static Tensor conv2d_cuda_impl(const Tensor& input, const Tensor& weight, const 
                 smallest = std::move(plan);
             }
         };
-        if (!autotune || filtered.size() == 1) {
-            for (auto& ec : filtered) {
-                try {
-                    auto candidate = build_plan(ec);
-                    if (candidate->getWorkspaceSize() <= workspace_limit) {
-                        return candidate;
-                    }
-                    remember_smallest(std::move(candidate));
-                } catch (...) {
-                    // Config cannot be realized on this device; try the next.
-                }
-            }
-            if (smallest) return smallest;
-            TP_THROW(RuntimeError, "cuDNN: no executable engine configs for conv2d");
-        }
-        std::vector<std::shared_ptr<fe::ExecutionPlan>> candidates;
         for (auto& ec : filtered) {
             try {
                 auto candidate = build_plan(ec);
