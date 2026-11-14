@@ -10,6 +10,7 @@
 #include "DType.h"
 #include "TypeProperties.h"
 
+#include <cmath>
 #include <cstdint>
 #include <vector>
 
@@ -18,24 +19,42 @@ namespace meta {
 
 namespace {
 
-DType norm_answer_dtype(const Tensor& self) {
-    if (!isFloatingType(self.dtype()) && !isComplexType(self.dtype())) {
-        TP_THROW(RuntimeError,
-                 "norm(): input dtype should be either floating point or "
-                 "complex. Got ", toString(self.dtype()), " instead.");
+// The value type of a norm.  A floating or complex operand answers directly
+// (the complex planes answer in their real component type).  A whole-number
+// operand runs the norm as abs, a power, a sum and a root: an infinite order
+// short-circuits to the largest absolute value and keeps the operand type, a
+// negative whole-number order is refused, and the chained powers answer in
+// the operand type only when both the order and its reciprocal are whole
+// numbers (order 1); otherwise single precision.  A boolean operand has no
+// power form: an infinite order reads as the largest element, anything else
+// is refused.
+DType norm_answer_dtype(const Tensor& self, double p) {
+    const DType dt = self.dtype();
+    if (isComplexType(dt)) return toRealValueType(dt);
+    if (isFloatingType(dt)) return dt;
+    if (std::isinf(p)) return dt;
+    if (dt == DType::Bool) {
+        TP_THROW(TypeError,
+                 "pow() received an invalid combination of arguments");
     }
-    return isComplexType(self.dtype()) ? toRealValueType(self.dtype())
-                                       : self.dtype();
+    if (p == std::floor(p)) {
+        if (p < 0) {
+            TP_THROW(RuntimeError,
+                     "Integers to negative integer powers are not allowed.");
+        }
+        if (std::floor(1.0 / p) == 1.0 / p) return dt;
+    }
+    return DType::Float32;
 }
 
-Tensor norm_kernel(const Tensor& self, double /*p*/) {
-    return empty_meta({}, norm_answer_dtype(self), self.device());
+Tensor norm_kernel(const Tensor& self, double p) {
+    return empty_meta({}, norm_answer_dtype(self, p), self.device());
 }
 
 Tensor norm_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim,
-                       double /*p*/, bool keepdim) {
+                       double p, bool keepdim) {
     return empty_meta(reduce_out_shape(self, dim, keepdim),
-                      norm_answer_dtype(self), self.device());
+                      norm_answer_dtype(self, p), self.device());
 }
 
 // A distance is the norm of the difference: the subtraction promotes the pair
@@ -94,7 +113,9 @@ Tensor& renorm_inplace_kernel(Tensor& self, const Scalar& p, int64_t dim,
 
 // The pairwise distances condense a matrix of points into one distance per
 // unordered pair: the upper triangle holds N * (N - 1) / 2 entries, which is
-// also the answer for the empty and single-row inputs where it is zero.
+// also the answer for the empty and single-row inputs where it is zero.  The
+// distances accumulate at single precision, so a half-width operand answers
+// in single precision.
 Tensor pdist_kernel(const Tensor& self, double p) {
     if (!isFloatingType(self.dtype())) {
         TP_THROW(TypeError, "pdist: only floating-point tensors are supported");
@@ -106,8 +127,12 @@ Tensor pdist_kernel(const Tensor& self, double p) {
     if (p < 0.0) {
         TP_THROW(RuntimeError, "pdist only supports non-negative p values");
     }
+    const DType dt = (self.dtype() == DType::Float16 ||
+                      self.dtype() == DType::BFloat16)
+                         ? DType::Float32
+                         : self.dtype();
     const int64_t n = self.size(0);
-    return empty_meta({n * (n - 1) / 2}, self.dtype(), self.device());
+    return empty_meta({n * (n - 1) / 2}, dt, self.device());
 }
 
 } // anonymous namespace

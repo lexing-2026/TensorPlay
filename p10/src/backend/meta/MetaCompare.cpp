@@ -47,12 +47,26 @@ namespace {
         return empty_meta(shape_of(self), DType::Bool, self.device());         \
     }
 
+#define META_ORDERED_COMPARISON_KERNEL(NAME)                                  \
+    Tensor NAME##_tensor_kernel(const Tensor& self, const Tensor& other) {     \
+        check_all_meta(self, other);                                          \
+        if (isComplexType(self.dtype()) || isComplexType(other.dtype())) {     \
+            TP_THROW(NotImplementedError,                                     \
+                     #NAME ": not implemented for complex dtypes");           \
+        }                                                                     \
+        return empty_meta(broadcast2(self, other), DType::Bool, self.device());\
+    }                                                                         \
+    Tensor NAME##_scalar_kernel(const Tensor& self, const Scalar& /*other*/) {\
+        return empty_meta(shape_of(self), DType::Bool, self.device());         \
+    }
+
 META_COMPARISON_KERNEL(eq)
 META_COMPARISON_KERNEL(ne)
-META_COMPARISON_KERNEL(lt)
-META_COMPARISON_KERNEL(le)
-META_COMPARISON_KERNEL(gt)
-META_COMPARISON_KERNEL(ge)
+META_ORDERED_COMPARISON_KERNEL(lt)
+META_ORDERED_COMPARISON_KERNEL(le)
+META_ORDERED_COMPARISON_KERNEL(gt)
+META_ORDERED_COMPARISON_KERNEL(ge)
+#undef META_ORDERED_COMPARISON_KERNEL
 #undef META_COMPARISON_KERNEL
 
 Tensor isclose_kernel(const Tensor& self, const Tensor& other, double rtol,
@@ -72,7 +86,16 @@ Tensor isclose_kernel(const Tensor& self, const Tensor& other, double rtol,
     return empty_meta(broadcast2(self, other), DType::Bool, self.device());
 }
 
+// Every selection form reads the condition element by element, so a
+// non-boolean condition has no form to run in.
+void check_where_condition(const Tensor& condition) {
+    if (condition.dtype() != DType::Bool) {
+        TP_THROW(TypeError, "where condition must be a boolean tensor");
+    }
+}
+
 Tensor where_cpu(const Tensor& condition, const Tensor& self, const Tensor& other) {
+    check_where_condition(condition);
     const std::vector<int64_t> out =
         broadcast_shapes(broadcast2(condition, self), shape_of(other));
     return empty_meta(out, promoteTypes(self.dtype(), other.dtype()),
@@ -81,12 +104,14 @@ Tensor where_cpu(const Tensor& condition, const Tensor& self, const Tensor& othe
 
 Tensor where_scalar_self_cpu(const Tensor& condition, const Scalar& self,
                              const Tensor& other) {
+    check_where_condition(condition);
     const std::vector<int64_t> out = broadcast2(condition, other);
     return empty_meta(out, result_type(self, other.dtype()), other.device());
 }
 
 Tensor where_scalar_other_cpu(const Tensor& condition, const Tensor& self,
                               const Scalar& other) {
+    check_where_condition(condition);
     const std::vector<int64_t> out = broadcast2(condition, self);
     return empty_meta(out, result_type(other, self.dtype()), self.device());
 }
@@ -107,6 +132,7 @@ DType where_scalar_dtype(const Scalar& self, const Scalar& other) {
 
 Tensor where_scalar_scalar_cpu(const Tensor& condition, const Scalar& self,
                                const Scalar& other) {
+    check_where_condition(condition);
     return empty_meta(shape_of(condition), where_scalar_dtype(self, other),
                       condition.device());
 }

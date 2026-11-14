@@ -36,6 +36,9 @@ DType moment_dtype(const Tensor& self) {
     return isFloatingType(self.dtype()) ? self.dtype() : DType::Float32;
 }
 
+// Defined with the mean kernels below; the paired moment forms name it.
+DType mean_like_dtype(const Tensor& self, DType dtype);
+
 // ---------------------------------------------------------------------------
 // Moments.
 // ---------------------------------------------------------------------------
@@ -60,29 +63,39 @@ Tensor std_dim_kernel(const Tensor& self, const std::vector<int64_t>& dim,
                       moment_dtype(self), self.device());
 }
 
-// The paired form reports the moment and the mean, which share their shape
-// and their value type.
+// The paired form reports the moment and the mean, which share their shape;
+// the deviation answers in the real component type, the mean keeps the
+// operand's own plane.
 std::tuple<Tensor, Tensor> std_mean_kernel(const Tensor& self,
                                            const std::vector<int64_t>& dim,
                                            bool /*unbiased*/, bool keepdim) {
     const std::vector<int64_t> out = reduce_out_shape(self, dim, keepdim);
-    const DType dtype = moment_dtype(self);
-    return {empty_meta(out, dtype, self.device()),
-            empty_meta(out, dtype, self.device())};
+    return {empty_meta(out, moment_dtype(self), self.device()),
+            empty_meta(out, mean_like_dtype(self, DType::Undefined),
+                       self.device())};
 }
 
 // ---------------------------------------------------------------------------
 // Extrema.  The extrema without a dimension answer a scalar; with a dimension
-// they answer the winning values and their positions along it.
+// they answer the winning values and their positions along it.  No complex
+// form exists: ordering a complex plane has no kernel.
 // ---------------------------------------------------------------------------
 
 Tensor extrema_kernel(const Tensor& self) {
+    if (isComplexType(self.dtype())) {
+        TP_THROW(NotImplementedError,
+                 "extrema: not implemented for complex dtypes");
+    }
     return empty_meta({}, self.dtype(), self.device());
 }
 
 std::tuple<Tensor, Tensor> extrema_dim_kernel(const Tensor& self, int64_t dim,
                                               bool keepdim) {
     dim = wrap_dim(dim, self.dim());
+    if (isComplexType(self.dtype())) {
+        TP_THROW(NotImplementedError,
+                 "extrema: not implemented for complex dtypes");
+    }
     std::vector<int64_t> out = shape_of(self);
     if (keepdim) {
         out[static_cast<size_t>(dim)] = 1;
@@ -220,12 +233,18 @@ std::tuple<Tensor, Tensor> kthvalue_kernel(const Tensor& self, int64_t k,
 // ---------------------------------------------------------------------------
 
 Tensor median_flat_kernel(const Tensor& self) {
+    if (isComplexType(self.dtype())) {
+        TP_THROW(NotImplementedError,
+                 "median: not implemented for complex dtypes");
+    }
     require_scalar_elements(self, "median");
     return empty_meta({}, self.dtype(), self.device());
 }
 
+// The flattened form reads every element into one list: a floating operand
+// keeps its width, every other operand is read through the whole-number
+// reading type.
 Tensor nanmedian_flat_kernel(const Tensor& self) {
-    require_scalar_elements(self, "nanmedian");
     const DType out = isFloatingType(self.dtype()) ? self.dtype() : DType::Int64;
     return empty_meta({}, out, self.device());
 }
@@ -241,6 +260,12 @@ std::tuple<Tensor, Tensor> nanmedian_dim_kernel(const Tensor& self, int64_t dim,
     if (!isFloatingType(self.dtype())) {
         TP_THROW(RuntimeError,
                  "nanmedian(): only floating point dtypes are supported");
+    }
+    // The sliced form reads elements directly, so only the two widest
+    // floating types have a reading loop.
+    if (self.dtype() != DType::Float32 && self.dtype() != DType::Float64) {
+        TP_THROW(TypeError, "nanmedian: unsupported dtype ",
+                 toString(self.dtype()));
     }
     if (self.size(dim) == 0) {
         TP_THROW(RuntimeError, "nanmedian(): Expected reduction dim ", dim,
@@ -454,6 +479,10 @@ Tensor prod_dim_kernel(const Tensor& self, const std::vector<int64_t>& dims,
 // Index reductions return Int64 coordinates; a missing dim reduces
 // everything to a scalar.
 Tensor arg_kernel(const Tensor& self, std::optional<int64_t> dim, bool keepdim) {
+    if (isComplexType(self.dtype())) {
+        TP_THROW(NotImplementedError,
+                 "argmax: not implemented for complex dtypes");
+    }
     if (!dim.has_value()) {
         return empty_meta({}, DType::Int64, self.device());
     }
@@ -461,20 +490,34 @@ Tensor arg_kernel(const Tensor& self, std::optional<int64_t> dim, bool keepdim) 
                       self.device());
 }
 
+// The clipped extrema run their own reduction loop without a complex form;
+// the dtype is policed after the reduction geometry is resolved.
 Tensor amax_cpu(const Tensor& self, const std::vector<int64_t>& dim, bool keepdim) {
-    return empty_meta(reduce_out_shape(self, dim, keepdim), self.dtype(),
-                      self.device());
+    const auto out = reduce_out_shape(self, dim, keepdim);
+    if (isComplexType(self.dtype())) {
+        TP_THROW(TypeError, "extrema: unsupported dtype ",
+                 toString(self.dtype()));
+    }
+    return empty_meta(out, self.dtype(), self.device());
 }
 
 Tensor amin_cpu(const Tensor& self, const std::vector<int64_t>& dim, bool keepdim) {
-    return empty_meta(reduce_out_shape(self, dim, keepdim), self.dtype(),
-                      self.device());
+    const auto out = reduce_out_shape(self, dim, keepdim);
+    if (isComplexType(self.dtype())) {
+        TP_THROW(TypeError, "extrema: unsupported dtype ",
+                 toString(self.dtype()));
+    }
+    return empty_meta(out, self.dtype(), self.device());
 }
 
 std::tuple<Tensor, Tensor> aminmax_cpu(const Tensor& self,
                                        const std::vector<int64_t>& dim,
                                        bool keepdim) {
     const auto out_shape = reduce_out_shape(self, dim, keepdim);
+    if (isComplexType(self.dtype())) {
+        TP_THROW(TypeError, "extrema: unsupported dtype ",
+                 toString(self.dtype()));
+    }
     return {empty_meta(out_shape, self.dtype(), self.device()),
             empty_meta(out_shape, self.dtype(), self.device())};
 }
@@ -490,14 +533,16 @@ std::tuple<Tensor, Tensor> aminmax_dim_kernel(const Tensor& self, int64_t dim,
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 // Moments. The variance and the mean reduce over the same dimensions, so they
-// share a shape and a type.
+// share a shape; the deviation is a distance and answers in the real
+// component type, the mean keeps the operand's own plane.
 // ---------------------------------------------------------------------------
 std::tuple<Tensor, Tensor> var_mean_kernel(const Tensor& self,
                                            const std::vector<int64_t>& dims,
                                            bool /*unbiased*/, bool keepdim) {
     const std::vector<int64_t> out = reduce_out_shape(self, dims, keepdim);
-    const DType dtype = mean_like_dtype(self, DType::Undefined);
-    return {empty_meta(out, dtype, self.device()), empty_meta(out, dtype, self.device())};
+    return {empty_meta(out, moment_dtype(self), self.device()),
+            empty_meta(out, mean_like_dtype(self, DType::Undefined),
+                       self.device())};
 }
 
 // The trapezoid rule pairs neighbouring samples, so it consumes one fewer
