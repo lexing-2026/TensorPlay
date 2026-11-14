@@ -72,7 +72,9 @@ Tensor batch_norm(const Tensor& input, const std::optional<Tensor>& weight,
     const int64_t xz = quantized::q_zero_point(input);
     if (compute_coefficients) apply(channels, [=] TP_QN_DEVICE (int64_t c) {
         const float inv = 1. / ::sqrt(vp[c] + static_cast<float>(eps));
-        ap[c] = inv * wp[c] * (xs / scale);
+        // The gain keeps its digits in the wide type before the scale ratio
+        // lands on it, and only the stored coefficient narrows.
+        ap[c] = static_cast<float>(static_cast<double>(inv) * wp[c] * (xs / scale));
         bp[c] = (biasp[c] - mp[c] * inv * wp[c]) / scale;
     });
 #ifndef TP_QUANT_CUDA

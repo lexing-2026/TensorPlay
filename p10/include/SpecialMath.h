@@ -2279,11 +2279,14 @@ calc_erfcx(T x)
     if (x < -26.7) {
       return std::numeric_limits<T>::infinity();
     }
-    else if (x < -6.1) {
-      return 2*::exp(x*x);
+    // The square is formed in the wide type: a narrow float would round the
+    // exponent before the exponential widens it anyway.
+    const double x_squared = static_cast<double>(x) * static_cast<double>(x);
+    if (x < -6.1) {
+      return static_cast<T>(2*::exp(x_squared));
     }
     else {
-      return 2*::exp(x*x) - erfcx_y100(400/(4-x));
+      return static_cast<T>(2*::exp(x_squared) - erfcx_y100(400/(4-x)));
     }
   }
 }

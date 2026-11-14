@@ -1020,7 +1020,12 @@ void normalize_codes(const void* input, const float* gamma, const float* beta, v
             const float mean_div_scale = mean_code - shift;
             const float variance = std::max(static_cast<float>(square_sum) / count
                                             - mean_code * mean_code, 0.f);
-            const float scale_div_std = x_scale / std::sqrt(variance * x_scale * x_scale + eps);
+            // Variance scaled into output units; the product runs wide so the
+            // epsilon addition below never sees a rounded float.
+            const double scaled_variance =
+                static_cast<double>(variance) * x_scale * x_scale;
+            const float scale_div_std =
+                static_cast<float>(x_scale / std::sqrt(scaled_variance + eps));
             if (channels_last) {
                 for (int64_t plane = 0; plane < span; ++plane) {
                     const T* run = values + plane * channels;
