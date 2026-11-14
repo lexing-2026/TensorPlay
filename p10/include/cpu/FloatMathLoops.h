@@ -88,18 +88,23 @@ inline Tensor float_math_kernel(const Tensor& self, F f, const char* name,
 // The loop above widens every element to double before calling `f`, so a
 // single-precision input pays the double routine and lands at about half the
 // rate.  Ops that have a vector walk take that instead, at their own width.
-// Every other dtype keeps the generic loop and its promotion rules, and so does
-// a caller that supplies a destination.
+// Every other dtype keeps the generic loop and its promotion rules.  A caller
+// that supplies a destination has already judged it takes the pass -- by the
+// same test float_math_takes applies -- and the walk stores straight into it;
+// that judgement is also what makes reading the source while writing safe,
+// because each element lands on its own slot.
 template <typename F>
 inline Tensor float_math_vec_kernel(const Tensor& self, F f, const char* name,
                                     vecunary::VOp op, vecunary::VParams prm = {},
                                     const Tensor* destination = nullptr) {
     const DType in = self.dtype();
-    if ((in != DType::Float32 && in != DType::Float64) || destination != nullptr)
+    if (in != DType::Float32 && in != DType::Float64)
         return float_math_kernel(self, f, name, destination);
     Tensor w = self.contiguous();
-    Tensor t = Tensor::empty(static_cast<std::vector<int64_t>>(w.shape()), in,
-                             w.device());
+    Tensor t = destination != nullptr
+                   ? *destination
+                   : Tensor::empty(static_cast<std::vector<int64_t>>(w.shape()), in,
+                                   w.device());
     const int64_t n = w.numel();
     if (in == DType::Float64) {
         const double* sp = w.data_ptr<double>();

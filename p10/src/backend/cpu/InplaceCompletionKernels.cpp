@@ -479,7 +479,9 @@ Tensor& trunc_inplace_kernel(Tensor& self) {
 
 Tensor& threshold_inplace_kernel(Tensor& self, const Scalar& threshold, const Scalar& value) {
     NoGradGuard __tp_nograd;
-    self.copy_(Tensor::threshold(self, threshold, value));
+    // Write through the functional out variant in place instead of materialising
+    // a fresh result and copying it back over the input.
+    tensorplay::detail::redispatch_threshold_out_function(self, threshold, value, self);
     return self;
 }
 Tensor& i0_inplace_kernel(Tensor& self) {

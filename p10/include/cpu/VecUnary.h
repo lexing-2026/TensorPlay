@@ -71,7 +71,7 @@ enum class VOp : int {
     // composite activations
     Sigmoid, GeluNone, GeluTanh, Silu, Mish, Selu,
     Elu, Softplus, Hardswish, Hardsigmoid, LeakyRelu,
-    Hardtanh, Relu6,
+    Hardtanh, Relu6, Softshrink, Threshold, Hardshrink,
 };
 
 // Runtime scalars for parameterised ops (elu, softplus, celu, leaky_relu,
@@ -278,6 +278,24 @@ inline T scalar_apply(VOp op, VParams prm, T x) {
             const T slope = static_cast<T>(prm.p0);
             T xf = x;
             return xf < T(0) ? slope * xf : xf;
+        }
+        case VOp::Softshrink: {
+            // Inside the band the answer is x * 0: a finite value lands on
+            // zero, a NaN keeps being a NaN.
+            const T lam = static_cast<T>(prm.p0);
+            return x > lam ? x - lam : (x < -lam ? x + lam : x * T(0));
+        }
+        case VOp::Threshold: {
+            const T thr = static_cast<T>(prm.p0);
+            const T val = static_cast<T>(prm.p1);
+            return x <= thr ? val : x;
+        }
+        case VOp::Hardshrink: {
+            // Ordered compares: a NaN fails both band arms and flows through
+            // unchanged instead of being zeroed.
+            const T lo = static_cast<T>(-prm.p0);
+            const T hi = static_cast<T>(prm.p0);
+            return (x >= lo && x <= hi) ? T(0) : x;
         }
         case VOp::Hardtanh: {
             const T lo = static_cast<T>(prm.p0);
@@ -1064,6 +1082,31 @@ inline __m256 apply_f32(VOp op, VParams prm, __m256 x) {
             const __m256 slope = _mm256_set1_ps(static_cast<float>(prm.p0));
             __m256 neg = _mm256_mul_ps(slope, x);
             return _mm256_blendv_ps(x, neg, _mm256_cmp_ps(x, zero, _CMP_LT_OQ));
+        }
+        case VOp::Softshrink: {
+            // A NaN lane fails both ordered compares, so it is steered to the
+            // x - lam arm explicitly: the answer keeps being a NaN.
+            const __m256 lam = _mm256_set1_ps(static_cast<float>(prm.p0));
+            const __m256 hi = _mm256_blendv_ps(
+                _mm256_mul_ps(x, zero), _mm256_sub_ps(x, lam),
+                _mm256_or_ps(_mm256_cmp_ps(x, lam, _CMP_GT_OQ),
+                             _mm256_cmp_ps(x, x, _CMP_UNORD_Q)));
+            return _mm256_blendv_ps(
+                hi, _mm256_add_ps(x, lam),
+                _mm256_or_ps(_mm256_cmp_ps(x, _mm256_sub_ps(zero, lam), _CMP_LT_OQ),
+                             _mm256_cmp_ps(x, x, _CMP_UNORD_Q)));
+        }
+        case VOp::Threshold: {
+            const __m256 thr = _mm256_set1_ps(static_cast<float>(prm.p0));
+            const __m256 val = _mm256_set1_ps(static_cast<float>(prm.p1));
+            return _mm256_blendv_ps(x, val, _mm256_cmp_ps(x, thr, _CMP_LE_OQ));
+        }
+        case VOp::Hardshrink: {
+            const __m256 lam = _mm256_set1_ps(static_cast<float>(prm.p0));
+            return _mm256_blendv_ps(
+                x, zero,
+                _mm256_and_ps(_mm256_cmp_ps(x, _mm256_sub_ps(zero, lam), _CMP_GE_OQ),
+                              _mm256_cmp_ps(x, lam, _CMP_LE_OQ)));
         }
         case VOp::Hardtanh: {
             const __m256 lo = _mm256_set1_ps(static_cast<float>(prm.p0));
@@ -1958,6 +2001,31 @@ inline __m256d apply_f64(VOp op, VParams prm, __m256d x) {
             __m256d neg = _mm256_mul_pd(slope, x);
             return _mm256_blendv_pd(x, neg, _mm256_cmp_pd(x, _mm256_setzero_pd(), _CMP_LT_OQ));
         }
+        case VOp::Softshrink: {
+            const __m256d zero = _mm256_setzero_pd();
+            const __m256d lam = _mm256_set1_pd(prm.p0);
+            const __m256d nan_lanes = _mm256_cmp_pd(x, x, _CMP_UNORD_Q);
+            const __m256d hi = _mm256_blendv_pd(
+                _mm256_mul_pd(x, zero), _mm256_sub_pd(x, lam),
+                _mm256_or_pd(_mm256_cmp_pd(x, lam, _CMP_GT_OQ), nan_lanes));
+            return _mm256_blendv_pd(
+                hi, _mm256_add_pd(x, lam),
+                _mm256_or_pd(_mm256_cmp_pd(x, _mm256_sub_pd(zero, lam), _CMP_LT_OQ),
+                             nan_lanes));
+        }
+        case VOp::Threshold: {
+            const __m256d thr = _mm256_set1_pd(prm.p0);
+            const __m256d val = _mm256_set1_pd(prm.p1);
+            return _mm256_blendv_pd(x, val, _mm256_cmp_pd(x, thr, _CMP_LE_OQ));
+        }
+        case VOp::Hardshrink: {
+            const __m256d zero = _mm256_setzero_pd();
+            const __m256d lam = _mm256_set1_pd(prm.p0);
+            return _mm256_blendv_pd(
+                x, zero,
+                _mm256_and_pd(_mm256_cmp_pd(x, _mm256_sub_pd(zero, lam), _CMP_GE_OQ),
+                              _mm256_cmp_pd(x, lam, _CMP_LE_OQ)));
+        }
         case VOp::Hardtanh: {
             const __m256d lo = _mm256_set1_pd(prm.p0);
             const __m256d hi = _mm256_set1_pd(prm.p1);
@@ -2231,6 +2299,36 @@ static void half_chunk_avx2(VOp op, VParams prm, const uint16_t* src, uint16_t* 
                 x, _mm256_mul_ps(slope, x), _mm256_cmp_ps(x, zero, _CMP_LT_OQ)))
             break;
         }
+        case VOp::Softshrink: {
+            const __m256 zero = _mm256_setzero_ps();
+            const __m256 lam = _mm256_set1_ps(static_cast<float>(prm.p0));
+            // Every reference to the per-step vector lives inside the chunk
+            // expression: the macro declares its own operand per step.
+            TP_HALF_CHUNK_8(_mm256_blendv_ps(
+                _mm256_blendv_ps(
+                    _mm256_mul_ps(x, zero), _mm256_sub_ps(x, lam),
+                    _mm256_or_ps(_mm256_cmp_ps(x, lam, _CMP_GT_OQ),
+                                 _mm256_cmp_ps(x, x, _CMP_UNORD_Q))),
+                _mm256_add_ps(x, lam),
+                _mm256_or_ps(_mm256_cmp_ps(x, _mm256_sub_ps(zero, lam), _CMP_LT_OQ),
+                             _mm256_cmp_ps(x, x, _CMP_UNORD_Q))))
+            break;
+        }
+        case VOp::Threshold: {
+            const __m256 thr = _mm256_set1_ps(static_cast<float>(prm.p0));
+            const __m256 val = _mm256_set1_ps(static_cast<float>(prm.p1));
+            TP_HALF_CHUNK_8(_mm256_blendv_ps(x, val, _mm256_cmp_ps(x, thr, _CMP_LE_OQ)))
+            break;
+        }
+        case VOp::Hardshrink: {
+            const __m256 zero = _mm256_setzero_ps();
+            const __m256 lam = _mm256_set1_ps(static_cast<float>(prm.p0));
+            TP_HALF_CHUNK_8(_mm256_blendv_ps(
+                x, zero,
+                _mm256_and_ps(_mm256_cmp_ps(x, _mm256_sub_ps(zero, lam), _CMP_GE_OQ),
+                              _mm256_cmp_ps(x, lam, _CMP_LE_OQ))))
+            break;
+        }
         case VOp::Elu: {
             const __m256 negcoef = _mm256_set1_ps(static_cast<float>(prm.p0));
             const __m256 poscoef = _mm256_set1_ps(static_cast<float>(prm.p1));
@@ -2485,6 +2583,30 @@ inline __m512 apply16_f32(VOp op, VParams prm, __m512 x) {
             __m512 neg = _mm512_mul_ps(slope, x);
             return _mm512_mask_mov_ps(x, _mm512_cmp_ps_mask(x, zero, _CMP_LT_OQ), neg);
         }
+        case VOp::Softshrink: {
+            const __m512 lam = _mm512_set1_ps(static_cast<float>(prm.p0));
+            const __mmask16 nan_lanes = _mm512_cmp_ps_mask(x, x, _CMP_UNORD_Q);
+            const __m512 hi = _mm512_mask_mov_ps(
+                _mm512_mul_ps(x, zero),
+                _mm512_cmp_ps_mask(x, lam, _CMP_GT_OQ) | nan_lanes,
+                _mm512_sub_ps(x, lam));
+            return _mm512_mask_mov_ps(
+                hi,
+                _mm512_cmp_ps_mask(x, _mm512_sub_ps(zero, lam), _CMP_LT_OQ) | nan_lanes,
+                _mm512_add_ps(x, lam));
+        }
+        case VOp::Threshold: {
+            const __m512 thr = _mm512_set1_ps(static_cast<float>(prm.p0));
+            const __m512 val = _mm512_set1_ps(static_cast<float>(prm.p1));
+            return _mm512_mask_mov_ps(x, _mm512_cmp_ps_mask(x, thr, _CMP_LE_OQ), val);
+        }
+        case VOp::Hardshrink: {
+            const __m512 lam = _mm512_set1_ps(static_cast<float>(prm.p0));
+            const __mmask16 in_band =
+                _mm512_cmp_ps_mask(x, _mm512_sub_ps(zero, lam), _CMP_GE_OQ) &
+                _mm512_cmp_ps_mask(x, lam, _CMP_LE_OQ);
+            return _mm512_mask_mov_ps(x, in_band, zero);
+        }
         case VOp::Hardtanh: {
             const __m512 lo = _mm512_set1_ps(static_cast<float>(prm.p0));
             const __m512 hi = _mm512_set1_ps(static_cast<float>(prm.p1));
@@ -2720,6 +2842,30 @@ inline __m512d apply16_f64(VOp op, VParams prm, __m512d x) {
         }
         case VOp::Relu6:
             return _mm512_min_pd(_mm512_set1_pd(6.0), _mm512_max_pd(zero, x));
+        case VOp::Softshrink: {
+            const __m512d lam = _mm512_set1_pd(prm.p0);
+            const __mmask8 nan_lanes = _mm512_cmp_pd_mask(x, x, _CMP_UNORD_Q);
+            const __m512d hi = _mm512_mask_mov_pd(
+                _mm512_mul_pd(x, zero),
+                _mm512_cmp_pd_mask(x, lam, _CMP_GT_OQ) | nan_lanes,
+                _mm512_sub_pd(x, lam));
+            return _mm512_mask_mov_pd(
+                hi,
+                _mm512_cmp_pd_mask(x, _mm512_sub_pd(zero, lam), _CMP_LT_OQ) | nan_lanes,
+                _mm512_add_pd(x, lam));
+        }
+        case VOp::Threshold: {
+            const __m512d thr = _mm512_set1_pd(prm.p0);
+            const __m512d val = _mm512_set1_pd(prm.p1);
+            return _mm512_mask_mov_pd(x, _mm512_cmp_pd_mask(x, thr, _CMP_LE_OQ), val);
+        }
+        case VOp::Hardshrink: {
+            const __m512d lam = _mm512_set1_pd(prm.p0);
+            const __mmask8 in_band =
+                _mm512_cmp_pd_mask(x, _mm512_sub_pd(zero, lam), _CMP_GE_OQ) &
+                _mm512_cmp_pd_mask(x, lam, _CMP_LE_OQ);
+            return _mm512_mask_mov_pd(x, in_band, zero);
+        }
         default: return x;
     }
 }
@@ -2882,6 +3028,36 @@ static void bf16_chunk_avx2(VOp op, VParams prm, const uint16_t* src, uint16_t* 
             const __m256 slope = _mm256_set1_ps(static_cast<float>(prm.p0));
             TP_BF16_CHUNK_8(_mm256_blendv_ps(
                 x, _mm256_mul_ps(slope, x), _mm256_cmp_ps(x, zero, _CMP_LT_OQ)))
+            break;
+        }
+        case VOp::Softshrink: {
+            const __m256 zero = _mm256_setzero_ps();
+            const __m256 lam = _mm256_set1_ps(static_cast<float>(prm.p0));
+            // Every reference to the per-step vector lives inside the chunk
+            // expression: the macro declares its own operand per step.
+            TP_BF16_CHUNK_8(_mm256_blendv_ps(
+                _mm256_blendv_ps(
+                    _mm256_mul_ps(x, zero), _mm256_sub_ps(x, lam),
+                    _mm256_or_ps(_mm256_cmp_ps(x, lam, _CMP_GT_OQ),
+                                 _mm256_cmp_ps(x, x, _CMP_UNORD_Q))),
+                _mm256_add_ps(x, lam),
+                _mm256_or_ps(_mm256_cmp_ps(x, _mm256_sub_ps(zero, lam), _CMP_LT_OQ),
+                             _mm256_cmp_ps(x, x, _CMP_UNORD_Q))))
+            break;
+        }
+        case VOp::Threshold: {
+            const __m256 thr = _mm256_set1_ps(static_cast<float>(prm.p0));
+            const __m256 val = _mm256_set1_ps(static_cast<float>(prm.p1));
+            TP_BF16_CHUNK_8(_mm256_blendv_ps(x, val, _mm256_cmp_ps(x, thr, _CMP_LE_OQ)))
+            break;
+        }
+        case VOp::Hardshrink: {
+            const __m256 zero = _mm256_setzero_ps();
+            const __m256 lam = _mm256_set1_ps(static_cast<float>(prm.p0));
+            TP_BF16_CHUNK_8(_mm256_blendv_ps(
+                x, zero,
+                _mm256_and_ps(_mm256_cmp_ps(x, _mm256_sub_ps(zero, lam), _CMP_GE_OQ),
+                              _mm256_cmp_ps(x, lam, _CMP_LE_OQ))))
             break;
         }
         case VOp::Elu: {

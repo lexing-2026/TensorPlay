@@ -1703,7 +1703,9 @@ inline void check_shrink_dtype(const Tensor& self, const char* name) {
 
 Tensor hardshrink_cpu(const Tensor& self, const Scalar& lambd) {
     check_shrink_dtype(self, "hardshrink");
-    return dtype_unary_kernel(self, HardshrinkBand{lambd.toDouble()}, "hardshrink");
+    return float_math_vec_kernel(self, HardshrinkBand{lambd.toDouble()}, "hardshrink",
+                                 vecunary::VOp::Hardshrink,
+                                 vecunary::VParams{lambd.toDouble(), 0.0, 0.0});
 }
 Tensor& hardshrink_out_cpu(const Tensor& self, const Scalar& lambd, Tensor& out) {
     check_shrink_dtype(self, "hardshrink");
@@ -1714,7 +1716,9 @@ Tensor& hardshrink_out_cpu(const Tensor& self, const Scalar& lambd, Tensor& out)
 }
 Tensor softshrink_cpu(const Tensor& self, const Scalar& lambd) {
     check_shrink_dtype(self, "softshrink");
-    return dtype_unary_kernel(self, SoftshrinkBand{lambd.toDouble()}, "softshrink");
+    return float_math_vec_kernel(self, SoftshrinkBand{lambd.toDouble()}, "softshrink",
+                                 vecunary::VOp::Softshrink,
+                                 vecunary::VParams{lambd.toDouble(), 0.0, 0.0});
 }
 Tensor& softshrink_out_cpu(const Tensor& self, const Scalar& lambd, Tensor& out) {
     check_shrink_dtype(self, "softshrink");
@@ -1840,6 +1844,11 @@ struct ThresholdAt {
 Tensor threshold_cpu(const Tensor& self, const Scalar& threshold, const Scalar& value) {
     if (isQuantizedType(self.dtype())) return quantized::activation(self, 6, threshold.toDouble(), value.toDouble());
 
+    if (self.dtype() == DType::Float32 || self.dtype() == DType::Float64) {
+        return float_math_vec_kernel(self, ThresholdAt{threshold.toDouble(), value.toDouble()},
+                                     "threshold", vecunary::VOp::Threshold,
+                                     vecunary::VParams{threshold.toDouble(), value.toDouble(), 0.0});
+    }
     return dtype_unary_kernel(self, ThresholdAt{threshold.toDouble(), value.toDouble()},
                               "threshold");
 }
@@ -1848,6 +1857,16 @@ Tensor& threshold_out_cpu(const Tensor& self, const Scalar& threshold, const Sca
     if (isQuantizedType(self.dtype())) return write_out(out, threshold_cpu(self, threshold, value));
 
     double t = threshold.toDouble(), val = value.toDouble();
+    const DType in = self.dtype();
+    // A destination that fits the flat map takes the vector walk itself, which
+    // also covers the in-place call where the destination is the operand.
+    if ((in == DType::Float32 || in == DType::Float64) &&
+        destination_takes_flat(out, self.device(), in,
+                               static_cast<std::vector<int64_t>>(self.shape()), self)) {
+        float_math_vec_kernel(self, ThresholdAt{t, val}, "threshold", vecunary::VOp::Threshold,
+                              vecunary::VParams{t, val, 0.0}, &out);
+        return out;
+    }
     return dtype_unary_out_kernel(
         self, out, [t, val](const Tensor& v) { return threshold_cpu(v, Scalar(t), Scalar(val)); },
         ThresholdAt{t, val}, "threshold");
