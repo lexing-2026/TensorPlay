@@ -2,6 +2,7 @@
 
 import io
 import json
+import zlib
 from pathlib import Path
 
 import pytest
@@ -321,3 +322,17 @@ def test_mega_compressed_chunk_checksum_corruption_detected(tmp_path: Path):
 
     with pytest.raises(ValueError, match="checksum"):
         tp.load(filename, map_location="cpu")
+
+def test_mega_crc32_fallback_writer_stores_little_endian(tmp_path: Path):
+    import numpy as np
+
+    values = np.arange(1024, dtype=np.float32).reshape((32, 32))
+    filename = tmp_path / "dlpack.mega"
+    tp.save({"w": tp.from_dlpack(values)}, filename, checksum="crc32")
+
+    info = parse_mega_header(str(filename))["tensors"]["w"]
+    expected = zlib.crc32(values.tobytes()) & 0xFFFFFFFF
+    assert bytes(info["checksum"])[:4] == expected.to_bytes(4, "little")
+
+    loaded = tp.load(filename, map_location="cpu")
+    assert np.array_equal(loaded["w"].numpy(), values)

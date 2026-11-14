@@ -790,9 +790,11 @@ def save_mega(filename: str, obj: Any, *, metadata=None,
             descriptor["src_filename"] = payload_path
             descriptor["src_offset"] = record["payload_offset"]
             if checksum != "none":
-                digest = bytes.fromhex(checksums[record["name"]])
                 if checksum == "crc32":
+                    digest = int(checksums[record["name"]], 16).to_bytes(4, "little")
                     digest += b"\x00" * 28
+                else:
+                    digest = bytes.fromhex(checksums[record["name"]])
                 descriptor["checksum_type"] = _CHECKSUM_TYPES[checksum]
                 descriptor["checksum"] = digest
             descriptors.append(descriptor)
