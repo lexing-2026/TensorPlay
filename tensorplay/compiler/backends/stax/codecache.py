@@ -35,7 +35,6 @@ import hashlib
 import json
 import os
 import pathlib
-import pkgutil
 import shutil
 import sys
 import tempfile
@@ -516,23 +515,38 @@ def build_code_hash(
     """Fold the source of a package, and everything under it, into a hash.
 
     Sorted by name so that the same source produces the same hash whatever
-    order the modules happen to be listed in, and recursing into packages so
-    that a change in a submodule shows up.
+    order the modules happen to be listed in, and recursing into
+    subdirectories so that a change in a submodule shows up.  The walk reads
+    the directory entries directly instead of going through the import
+    machinery, whose per-module spec lookup dominated the cost.
     """
 
-    for lib in sorted(pkgutil.iter_modules(roots, prefix), key=lambda x: x.name):
-        spec = lib.module_finder.find_spec(lib.name, None)
-        if spec is None:
-            raise AssertionError(f"Failed to find spec for module {lib.name}")
-        module = spec.origin
-        if module is None:
-            raise AssertionError(f"Module spec for {lib.name} has no origin")
-        with open(module, "rb") as f:
-            hasher.update(spec.name.encode("utf-8"))
-            hasher.update(f.read())
-        if lib.ispkg:
-            # need to also hash submodules
-            build_code_hash(spec.submodule_search_locations, f"{spec.name}.", hasher)
+    pending = [(root, prefix) for root in (sys.path if roots is None else roots)]
+    while pending:
+        directory, module_prefix = pending.pop()
+        try:
+            with os.scandir(directory) as entries:
+                ordered = sorted(entries, key=lambda entry: entry.name)
+        except OSError:
+            continue
+        subdirectories = []
+        for entry in ordered:
+            if entry.is_dir(follow_symlinks=False):
+                if entry.name != "__pycache__":
+                    subdirectories.append(
+                        (entry.path, f"{module_prefix}{entry.name}.")
+                    )
+                continue
+            if not entry.name.endswith(".py"):
+                continue
+            stem = entry.name[:-3]
+            module_name = (
+                module_prefix if stem == "__init__" else f"{module_prefix}{stem}"
+            )
+            hasher.update(module_name.encode("utf-8"))
+            with open(entry.path, "rb") as source:
+                hasher.update(source.read())
+        pending.extend(reversed(subdirectories))
 
 
 @code_key_cache
