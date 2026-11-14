@@ -290,7 +290,7 @@ pip install tensorplay \
 ```
 
 > [!NOTE]
-> Make sure your Python version matches the wheel tags (e.g. `cp310` for Python 3.10). For CUDA wheels, the driver and runtime must support the CUDA version of the wheel. The full variant list lives in [`.github/cuda-variants.json`](.github/cuda-variants.json).
+> Make sure your Python version matches the wheel tags (e.g. `cp311` for Python 3.11). For CUDA wheels, the driver and runtime must support the CUDA version of the wheel. The full variant list lives in [`.github/cuda-variants.json`](.github/cuda-variants.json).
 >
 > **Backends by channel.** The macOS CPU wheels carry the **MPS** (Metal Performance Shaders) backend enabled by default — no separate wheel is needed. **ROCm** wheels (AMD/HIP) are built as a default release lane and published on their own ROCm pip index ([`.github/rocm-variants.json`](.github/rocm-variants.json)).
 
@@ -324,7 +324,7 @@ Building from source gives you a hackable, debuggable install — the recommende
 
 #### Prerequisites
 
-- Python >= 3.10, < 3.14
+- Python >= 3.11, < 3.16
 - CMake >= 3.18 (< 4.0)
 - A C++20-capable compiler (MSVC 2022 on Windows, GCC/Clang on Linux)
 - CUDA Toolkit (optional, for GPU support); set `CMAKE_CUDA_ARCHITECTURES` to target specific GPU architectures
@@ -604,7 +604,7 @@ pytest test/
 
 The metrics suite adds about 184 tests across `test/test_metrics*.py` — stateful metrics, functional forms, curves and plots, AIGC, audio, retrieval, nominal, remote sensing, wrappers and lazy-loaded external-dependency metrics.
 
-CI builds the full wheel matrix (Python 3.10–3.13; CPU on Linux x86_64/aarch64, macOS arm64, and Windows x86_64; CUDA on Linux and Windows x86_64; ROCm on Linux x86_64) and validates every wheel on every pull request and push to `main`. macOS arm64 wheels ship the **MPS** backend, with dedicated Metal acceptance and benchmark workflows; the **ROCm** lane runs in the ROCm build container on the same release/nightly pipelines. See [.github/workflows/](.github/workflows/) (`pull`, `trunk`, `publish`, `nightly`, `lint`). Lint rules live under `[tool.ruff]` in `pyproject.toml`.
+CI builds the full wheel matrix (Python 3.11–3.15; CPU on Linux x86_64/aarch64, macOS arm64, and Windows x86_64; CUDA on Linux and Windows x86_64; ROCm on Linux x86_64) and validates every wheel on every pull request and push to `main`. macOS arm64 wheels ship the **MPS** backend, with dedicated Metal acceptance and benchmark workflows; the **ROCm** lane runs in the ROCm build container on the same release/nightly pipelines. See [.github/workflows/](.github/workflows/) (`pull`, `trunk`, `publish`, `nightly`, `lint`). Lint rules live under `[tool.ruff]` in `pyproject.toml`.
 
 ## Resources
 

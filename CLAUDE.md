@@ -34,7 +34,7 @@ pillar per post.
 
 ## Build
 
-Prerequisites: Python >= 3.10, < 3.14; CMake >= 3.18 (< 4.0); a C++20
+Prerequisites: Python >= 3.11, < 3.16; CMake >= 3.18 (< 4.0); a C++20
 compiler (MSVC 2022 on Windows, GCC/Clang on Linux); optional CUDA Toolkit
 (set `CMAKE_CUDA_ARCHITECTURES` to target specific GPUs) or ROCm 7.2.x
 (HIP backend is built from source).
@@ -155,6 +155,6 @@ pip install --pre tensorplay \
   --extra-index-url https://pypi.org/simple
 ```
 
-Wheel tags must match your Python version (e.g. `cp310` for 3.10). Only the
+Wheel tags must match your Python version (e.g. `cp311` for 3.11). Only the
 latest nightly build per variant is kept. The full process lives in
 [RELEASE.md](RELEASE.md).

@@ -57,6 +57,7 @@ __m256 TP_SLEEF_CC Sleef_erff8_u10(__m256);
 __m256 TP_SLEEF_CC Sleef_erfcf8_u15(__m256);
 __m256 TP_SLEEF_CC Sleef_powf8_u10(__m256, __m256);
 __m256 TP_SLEEF_CC Sleef_hypotf8_u05(__m256, __m256);
+__m256 TP_SLEEF_CC Sleef_lgammaf8_u10(__m256);
 
 // __m256d (d4)
 __m256d TP_SLEEF_CC Sleef_expd4_u10(__m256d);
@@ -83,6 +84,7 @@ __m256d TP_SLEEF_CC Sleef_erfd4_u10(__m256d);
 __m256d TP_SLEEF_CC Sleef_erfcd4_u15(__m256d);
 __m256d TP_SLEEF_CC Sleef_powd4_u10(__m256d, __m256d);
 __m256d TP_SLEEF_CC Sleef_hypotd4_u05(__m256d, __m256d);
+__m256d TP_SLEEF_CC Sleef_lgammad4_u10(__m256d);
 
 // __m512 (f16)
 __m512 TP_SLEEF_CC Sleef_expf16_u10(__m512);
@@ -109,6 +111,7 @@ __m512 TP_SLEEF_CC Sleef_erff16_u10(__m512);
 __m512 TP_SLEEF_CC Sleef_erfcf16_u15(__m512);
 __m512 TP_SLEEF_CC Sleef_powf16_u10(__m512, __m512);
 __m512 TP_SLEEF_CC Sleef_hypotf16_u05(__m512, __m512);
+__m512 TP_SLEEF_CC Sleef_lgammaf16_u10(__m512);
 
 // __m512d (d8)
 __m512d TP_SLEEF_CC Sleef_expd8_u10(__m512d);
@@ -135,6 +138,7 @@ __m512d TP_SLEEF_CC Sleef_erfd8_u10(__m512d);
 __m512d TP_SLEEF_CC Sleef_erfcd8_u15(__m512d);
 __m512d TP_SLEEF_CC Sleef_powd8_u10(__m512d, __m512d);
 __m512d TP_SLEEF_CC Sleef_hypotd8_u05(__m512d, __m512d);
+__m512d TP_SLEEF_CC Sleef_lgammad8_u10(__m512d);
 
 #ifdef __cplusplus
 } // extern "C"
@@ -261,6 +265,12 @@ inline __m256 hypot(__m256 a, __m256 b) { return Sleef_hypotf8_u05(a, b); }
 inline __m256d hypot(__m256d a, __m256d b) { return Sleef_hypotd4_u05(a, b); }
 inline __m512 hypot(__m512 a, __m512 b) { return Sleef_hypotf16_u05(a, b); }
 inline __m512d hypot(__m512d a, __m512d b) { return Sleef_hypotd8_u05(a, b); }
+
+// Full-domain log-gamma, valid over every finite input and the poles.
+inline __m256 lgamma(__m256 a) { return Sleef_lgammaf8_u10(a); }
+inline __m256d lgamma(__m256d a) { return Sleef_lgammad4_u10(a); }
+inline __m512 lgamma(__m512 a) { return Sleef_lgammaf16_u10(a); }
+inline __m512d lgamma(__m512d a) { return Sleef_lgammad8_u10(a); }
 
 } // namespace tpsleef
 } // namespace tensorplay

@@ -12,11 +12,9 @@
 //   cpu/vec/SleefShims.h (runtime-dispatched entry points, linked into
 //   libp10).  Composite activations reuse those building blocks, so the
 //   fast path and the scalar tail implement the same formulas.
-// * lgamma has no libmvec entry point; it uses a Lanczos expansion restricted
-//   to strictly positive inputs (blocks containing non-positive or NaN values
-//   fall back to the scalar std::lgamma, which handles the reflection domain).
-//   PointwiseKernels.cpp element-for-element, including multiplication order,
-//   so vector and fallback paths produce identical values.
+// * lgamma has no libmvec entry point; it runs through the full-domain SLEEF
+//   log-gamma entry point, so the reflection domain, poles and NaN lanes all
+//   stay inside the vector body.
 // * Bounded clamps are always written min(hi, max(lo, x)) — the clamped value
 //   stays the *second* operand of both instructions.  On x86 VMAXPS/VMINPS
 //   return the second operand when either side is NaN (and on a -0.0/+0.0
@@ -317,13 +315,6 @@ inline T scalar_apply(VOp op, VParams prm, T x) {
 
 constexpr float kSignBitF = -0.0f;
 
-// Lanczos g=7, n=9 coefficients.
-constexpr double kLanczos[9] = {
-    0.99999999999980993, 676.5203681218851, -1259.1392167224028,
-    771.32342877765313, -176.61502916214059, 12.507343278686905,
-    -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7};
-constexpr double kHalfLogTwoPi = 0.91893853320467274178032973640562;
-
 // Natural logarithm of a float vector, and its base-2 and base-10 scalings.
 //
 // The input is split as 2^e * m with e = round(log2 x), so m lands in
@@ -500,54 +491,6 @@ inline void log_range_loop(const float* s, float* d, int64_t n, int64_t& i) {
     for (; i + 8 <= n; i += 8) {
         _mm256_storeu_ps(d + i, v_log_impl<Base, false>(_mm256_loadu_ps(s + i)));
     }
-}
-
-__attribute__((target("avx2,fma"), always_inline))
-inline __m256 v_lgamma_pos_f32(__m256 x) {
-    // Valid only where every lane > 0.  Reflection for x < 1:
-    // lgamma(x) = lgamma(x + 1) - log(x).
-    const __m256 one = _mm256_set1_ps(1.0f);
-    const __m256 small = _mm256_cmp_ps(x, one, _CMP_LT_OQ);
-    const __m256 xp = _mm256_add_ps(x, _mm256_and_ps(small, one));
-
-    __m256 z = _mm256_sub_ps(xp, one);
-    __m256 series = _mm256_set1_ps(static_cast<float>(kLanczos[0]));
-#pragma GCC unroll 8
-    for (int i = 1; i < 9; ++i) {
-        __m256 denom = _mm256_add_ps(z, _mm256_set1_ps(static_cast<float>(i)));
-        series = _mm256_fmadd_ps(_mm256_set1_ps(static_cast<float>(kLanczos[i])),
-                                 _mm256_div_ps(one, denom), series);
-    }
-    __m256 t = _mm256_add_ps(z, _mm256_set1_ps(7.5f));
-    __m256 res = _mm256_sub_ps(
-        _mm256_fmadd_ps(_mm256_add_ps(z, _mm256_set1_ps(0.5f)),
-                        v_log_f32(t), _mm256_set1_ps(static_cast<float>(kHalfLogTwoPi))),
-        t);
-    res = _mm256_add_ps(res, v_log_f32(series));
-    return _mm256_sub_ps(res, _mm256_and_ps(small, v_log_f32(x)));
-}
-
-__attribute__((target("avx2,fma"), always_inline))
-inline __m256d v_lgamma_pos_f64(__m256d x) {
-    const __m256d one = _mm256_set1_pd(1.0);
-    const __m256d small = _mm256_cmp_pd(x, one, _CMP_LT_OQ);
-    const __m256d xp = _mm256_add_pd(x, _mm256_and_pd(small, one));
-
-    __m256d z = _mm256_sub_pd(xp, one);
-    __m256d series = _mm256_set1_pd(kLanczos[0]);
-#pragma GCC unroll 8
-    for (int i = 1; i < 9; ++i) {
-        __m256d denom = _mm256_add_pd(z, _mm256_set1_pd(static_cast<double>(i)));
-        series = _mm256_fmadd_pd(_mm256_set1_pd(kLanczos[i]),
-                                 _mm256_div_pd(one, denom), series);
-    }
-    __m256d t = _mm256_add_pd(z, _mm256_set1_pd(7.5));
-    __m256d res = _mm256_sub_pd(
-        _mm256_fmadd_pd(_mm256_add_pd(z, _mm256_set1_pd(0.5)),
-                        tensorplay::tpsleef::log(t), _mm256_set1_pd(kHalfLogTwoPi)),
-        t);
-    res = _mm256_add_pd(res, tensorplay::tpsleef::log(series));
-    return _mm256_sub_pd(res, _mm256_and_pd(small, tensorplay::tpsleef::log(x)));
 }
 
 // Reciprocal via rcp + Newton-Raphson refinements: _mm256_rcp_ps seeds at
@@ -1027,10 +970,7 @@ inline __m256 apply_f32(VOp op, VParams prm, __m256 x) {
         case VOp::Atanh: return tensorplay::tpsleef::atanh(x);
         case VOp::Erf: return v_erf_f32(x);
         case VOp::Erfc: return tensorplay::tpsleef::erfc(x);
-        case VOp::Lgamma: {
-            // Callers guarantee all lanes > 0 here.
-            return v_lgamma_pos_f32(x);
-        }
+        case VOp::Lgamma: return tensorplay::tpsleef::lgamma(x);
         case VOp::Sigmoid:
             return v_sigmoid_f32(x, one, signbit);
         case VOp::GeluNone:
@@ -1374,16 +1314,7 @@ static void f32_chunk_avx2(VOp op, VParams prm, const float* src, float* dst, in
             TP_F32_SIMPLE_LOOP_8(v_gelu_tanh_f32(x, one));
             break;
         case VOp::Lgamma:
-            for (; i + 8 <= n; i += 8) {
-                __m256 x = _mm256_loadu_ps(s + i);
-                if (_mm256_movemask_ps(_mm256_cmp_ps(x, zero, _CMP_LE_OQ))) {
-                    // Non-positive lane (or NaN): scalar fallback keeps the exact
-                    // reflection-domain behaviour of std::lgamma.
-                    for (int64_t j = i; j < i + 8; ++j) d[j] = scalar_apply(op, prm, s[j]);
-                } else {
-                    _mm256_storeu_ps(d + i, v_lgamma_pos_f32(x));
-                }
-            }
+            TP_F32_SIMPLE_LOOP_8(tensorplay::tpsleef::lgamma(x));
             break;
         case VOp::Relu6:
             TP_F32_SIMPLE_LOOP_8(_mm256_min_ps(_mm256_set1_ps(6.0f), _mm256_max_ps(zero, x)));
@@ -1970,7 +1901,7 @@ inline __m256d apply_f64(VOp op, VParams prm, __m256d x) {
         case VOp::Atanh: return tensorplay::tpsleef::atanh(x);
         case VOp::Erf: return v_erf_f64(x);
         case VOp::Erfc: return v_erfc_f64(x);
-        case VOp::Lgamma: return v_lgamma_pos_f64(x);
+        case VOp::Lgamma: return tensorplay::tpsleef::lgamma(x);
         case VOp::Sigmoid:
             return _mm256_div_pd(one, _mm256_add_pd(one, v_exp_f64(_mm256_xor_pd(x, signbit))));
         case VOp::GeluNone: {
@@ -2261,11 +2192,7 @@ static void f64_chunk_avx2(VOp op, VParams prm, const double* src, double* dst, 
         default:
             for (; i + 4 <= n; i += 4) {
                 __m256d x = _mm256_loadu_pd(s + i);
-                if (op == VOp::Lgamma && _mm256_movemask_pd(_mm256_cmp_pd(x, zero, _CMP_LE_OQ))) {
-                    for (int64_t j = i; j < i + 4; ++j) d[j] = scalar_apply(op, prm, s[j]);
-                } else {
-                    _mm256_storeu_pd(d + i, apply_f64(op, prm, x));
-                }
+                _mm256_storeu_pd(d + i, apply_f64(op, prm, x));
             }
             break;
     }
@@ -2386,52 +2313,6 @@ static void half_chunk_avx2(VOp op, VParams prm, const uint16_t* src, uint16_t* 
 // above -- only the register width changes -- so results stay lane-identical
 // ---------------------------------------------------------------------------
 constexpr float kSignBitF512 = -0.0f;  // (shared constant, kept for clarity)
-
-__attribute__((target("avx512f,avx512dq"), always_inline))
-inline __m512 v_lgamma_pos_f32_512(__m512 x) {
-    const __m512 one = _mm512_set1_ps(1.0f);
-    const __mmask16 small = _mm512_cmp_ps_mask(x, one, _CMP_LT_OQ);
-    const __m512 xp = _mm512_add_ps(x, _mm512_maskz_mov_ps(small, one));
-
-    __m512 z = _mm512_sub_ps(xp, one);
-    __m512 series = _mm512_set1_ps(static_cast<float>(kLanczos[0]));
-#pragma GCC unroll 8
-    for (int i = 1; i < 9; ++i) {
-        __m512 denom = _mm512_add_ps(z, _mm512_set1_ps(static_cast<float>(i)));
-        series = _mm512_fmadd_ps(_mm512_set1_ps(static_cast<float>(kLanczos[i])),
-                                 _mm512_div_ps(one, denom), series);
-    }
-    __m512 t = _mm512_add_ps(z, _mm512_set1_ps(7.5f));
-    __m512 res = _mm512_sub_ps(
-        _mm512_fmadd_ps(_mm512_add_ps(z, _mm512_set1_ps(0.5f)),
-                        tensorplay::tpsleef::log(t), _mm512_set1_ps(static_cast<float>(kHalfLogTwoPi))),
-        t);
-    res = _mm512_add_ps(res, tensorplay::tpsleef::log(series));
-    return _mm512_sub_ps(res, _mm512_maskz_mov_ps(small, tensorplay::tpsleef::log(x)));
-}
-
-__attribute__((target("avx512f,avx512dq"), always_inline))
-inline __m512d v_lgamma_pos_f64_512(__m512d x) {
-    const __m512d one = _mm512_set1_pd(1.0);
-    const __mmask8 small = _mm512_cmp_pd_mask(x, one, _CMP_LT_OQ);
-    const __m512d xp = _mm512_add_pd(x, _mm512_maskz_mov_pd(small, one));
-
-    __m512d z = _mm512_sub_pd(xp, one);
-    __m512d series = _mm512_set1_pd(kLanczos[0]);
-#pragma GCC unroll 8
-    for (int i = 1; i < 9; ++i) {
-        __m512d denom = _mm512_add_pd(z, _mm512_set1_pd(static_cast<double>(i)));
-        series = _mm512_fmadd_pd(_mm512_set1_pd(kLanczos[i]),
-                                 _mm512_div_pd(one, denom), series);
-    }
-    __m512d t = _mm512_add_pd(z, _mm512_set1_pd(7.5));
-    __m512d res = _mm512_sub_pd(
-        _mm512_fmadd_pd(_mm512_add_pd(z, _mm512_set1_pd(0.5)),
-                        tensorplay::tpsleef::log(t), _mm512_set1_pd(kHalfLogTwoPi)),
-        t);
-    res = _mm512_add_pd(res, tensorplay::tpsleef::log(series));
-    return _mm512_sub_pd(res, _mm512_maskz_mov_pd(small, tensorplay::tpsleef::log(x)));
-}
 
 // rcp14 seeds at <=2^-14; one NR step reaches ~2^-28, i.e. float-exact for
 // the sigmoid/silu denominators seen here.
@@ -2564,8 +2445,7 @@ inline __m512 apply16_f32(VOp op, VParams prm, __m512 x) {
         case VOp::Atanh: return tensorplay::tpsleef::atanh(x);
         case VOp::Erf: return v_erf_f32_512(x);
         case VOp::Erfc: return tensorplay::tpsleef::erfc(x);
-        case VOp::Lgamma:
-            return v_lgamma_pos_f32_512(x);
+        case VOp::Lgamma: return tensorplay::tpsleef::lgamma(x);
         case VOp::Sigmoid: {
             // rcp14+NR instead of divps; see the 256-bit Sigmoid note for the
             // inf/NaN corner repairs.
@@ -2766,9 +2646,7 @@ static void f32_chunk_avx512(VOp op, VParams prm, const float* src, float* dst, 
         default:
             for (; i + 16 <= n; i += 16) {
                 __m512 x = _mm512_loadu_ps(s + i);
-                if (op == VOp::Lgamma && _mm512_cmplt_ps_mask(x, zero)) {
-                    for (int64_t j = i; j < i + 16; ++j) d[j] = scalar_apply(op, prm, s[j]);
-                } else if (op == VOp::GeluNone) {
+                if (op == VOp::GeluNone) {
                     const __m512 z = _mm512_mul_ps(
                         _mm512_set1_ps(0.7071067811865476f), x);
                     const __m512 az = _mm512_andnot_ps(
@@ -2839,7 +2717,7 @@ inline __m512d apply16_f64(VOp op, VParams prm, __m512d x) {
         case VOp::Atanh: return tensorplay::tpsleef::atanh(x);
         case VOp::Erf: return tensorplay::tpsleef::erf(x);
         case VOp::Erfc: return tensorplay::tpsleef::erfc(x);
-        case VOp::Lgamma: return v_lgamma_pos_f64_512(x);
+        case VOp::Lgamma: return tensorplay::tpsleef::lgamma(x);
         case VOp::Sigmoid:
             return _mm512_div_pd(one, _mm512_add_pd(one, tensorplay::tpsleef::exp(_mm512_xor_pd(x, signbit))));
         case VOp::GeluNone: {
@@ -3000,11 +2878,7 @@ static void f64_chunk_avx512(VOp op, VParams prm, const double* src, double* dst
         default:
             for (; i + 8 <= n; i += 8) {
                 __m512d x = _mm512_loadu_pd(s + i);
-                if (op == VOp::Lgamma && _mm512_cmplt_pd_mask(x, zero)) {
-                    for (int64_t j = i; j < i + 8; ++j) d[j] = scalar_apply(op, prm, s[j]);
-                } else {
-                    _mm512_storeu_pd(d + i, apply16_f64(op, prm, x));
-                }
+                _mm512_storeu_pd(d + i, apply16_f64(op, prm, x));
             }
             break;
     }

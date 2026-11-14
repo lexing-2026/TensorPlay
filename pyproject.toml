@@ -20,7 +20,7 @@ authors = [{ name = "zlx", email = "2095774200@shu.edu.cn" }]
 maintainers = [{ name = "lexing-2026", email = "2095774200@shu.edu.cn" }]
 license = { text = "Apache License 2.0" }
 keywords = ["deep learning", "neural network", "tensor", "framework", "education", "CUDA", "CPU"]
-requires-python = ">=3.10,<3.14"
+requires-python = ">=3.11,<3.16"
 dependencies = [
     "filelock",
     "jinja2>=3.1.0",
@@ -33,10 +33,11 @@ dependencies = [
 
 classifiers = [
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "License :: OSI Approved :: Apache Software License",
     "Operating System :: Microsoft :: Windows",
     "Operating System :: POSIX :: Linux",

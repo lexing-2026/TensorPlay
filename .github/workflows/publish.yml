@@ -37,7 +37,7 @@ on:
       lanes:
         description: >
           Comma-separated substrings of build_name to rebuild, e.g.
-          "linux-x86_64-cu130-py3_10" or "-cpu". Only lanes whose build_name
+          "linux-x86_64-cu130-py3_11" or "-cpu". Only lanes whose build_name
           contains any of the substrings run, which is how a failed release
           is repaired without rebuilding the lanes that already shipped.
           Empty means the full matrix.
