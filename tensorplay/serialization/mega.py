@@ -954,6 +954,62 @@ def _verify_payload(
             raise ValueError(f"MEGA tensor {name!r} checksum verification failed")
 
 
+def _has_recorded_checksum(info: dict) -> bool:
+    if int(info["checksum_type"]) == 0:
+        return False
+    if str(info.get("checksum_hex") or ""):
+        return True
+    checksum = bytes(info.get("checksum", b""))
+    return bool(checksum) and any(checksum)
+
+
+def _verify_job(info: dict, header_length: int) -> dict:
+    return {
+        "offset": header_length + int(info["payload_offset"]),
+        "nbytes": int(info["stored_nbytes"]),
+        "checksum_type": int(info["checksum_type"]),
+        "checksum": bytes(info.get("checksum", b"")).ljust(32, b"\x00"),
+        "expected_hex": str(info.get("checksum_hex") or "").lower(),
+    }
+
+
+def _decode_job(name, info: dict, tensor, header_length: int, *, raw: bool = False) -> dict:
+    """Describe one tensor decode for the native batch decoder."""
+
+    job = {
+        "tensor_name": str(name),
+        "dst_ptr": int(tensor.data_ptr()),
+        "shuffle_elem_size": int(info["shuffle_elem_size"]),
+    }
+    if raw:
+        job["raw"] = True
+    if info["chunks"]:
+        job["chunks"] = [
+            {
+                "file_offset": header_length + int(chunk["payload_offset"]),
+                "stored_nbytes": int(chunk["stored_size"]),
+                "logical_nbytes": int(chunk["logical_size"]),
+                "tensor_flags": int(chunk["flags"]),
+                "compression_codec": int(chunk["codec"]),
+                "checksum_type": int(chunk["checksum_type"]),
+                "checksum": bytes(chunk.get("checksum", b"")).ljust(32, b"\x00"),
+                "dst_offset": int(chunk["logical_offset"]),
+            }
+            for chunk in info["chunks"]
+        ]
+        return job
+    job.update(
+        file_offset=header_length + int(info["payload_offset"]),
+        stored_nbytes=int(info["stored_nbytes"]),
+        logical_nbytes=int(info["logical_nbytes"]),
+        tensor_flags=int(info["tensor_flags"]),
+        compression_codec=int(info["compression_codec"]),
+        checksum_type=int(info["checksum_type"]),
+        checksum=bytes(info.get("checksum", b"")).ljust(32, b"\x00"),
+    )
+    return job
+
+
 def load_mega(filename: str, map_location=None, *, mmap: bool = False):
     from . import archive
     from .policy import _skip_payload_data
@@ -992,6 +1048,8 @@ def load_mega(filename: str, map_location=None, *, mmap: bool = False):
         region_owner = {}
         loaded: dict[str, Any] = {}
         aliases: list[tuple[str, str, dict]] = []
+        deferred_jobs: list[dict] = []
+        deferred_verifies: list[dict] = []
         cpp = None
         for name, info in infos.items():
             raw_dense = (
@@ -1029,9 +1087,17 @@ def load_mega(filename: str, map_location=None, *, mmap: bool = False):
                 except (BufferError, ValueError, RuntimeError):
                     tensor = None
                 if tensor is not None:
-                    _verify_payload(
-                        fd, mapping, filename, header["header_length"], name, info
-                    )
+                    if cpp is None:
+                        cpp = _require_megatensors().cpp
+                    verifier = getattr(cpp, "verify_buffer_payloads", None)
+                    if callable(verifier) and _has_recorded_checksum(info):
+                        deferred_verifies.append(
+                            _verify_job(info, header["header_length"])
+                        )
+                    else:
+                        _verify_payload(
+                            fd, mapping, filename, header["header_length"], name, info
+                        )
                     verified = True
             if tensor is None and raw_dense:
                 if skip:
@@ -1053,26 +1119,44 @@ def load_mega(filename: str, map_location=None, *, mmap: bool = False):
                         cpp = _require_megatensors().cpp
                     raw_loader = getattr(cpp, "copy_raw_payload_fd", None)
                     if raw_loader is not None:
-                        try:
-                            raw_loader(
-                                fd,
-                                filename,
-                                name,
-                                absolute_offset,
-                                int(info["stored_nbytes"]),
-                                int(info["checksum_type"]),
-                                bytes(info["checksum"]) or b"\x00" * 32,
-                                tensor.data_ptr(),
+                        deferred_decoder = getattr(cpp, "decode_payloads_fd", None)
+                        if (
+                            callable(deferred_decoder)
+                            and not swap
+                            and isinstance(target, str)
+                            and target == "cpu"
+                        ):
+                            deferred_jobs.append(
+                                _decode_job(
+                                    name,
+                                    info,
+                                    tensor,
+                                    header["header_length"],
+                                    raw=True,
+                                )
                             )
-                        except RuntimeError as error:
-                            if "checksum mismatch" in str(error):
-                                raise ValueError(
-                                    f"MEGA tensor {name!r} checksum verification failed"
-                                ) from error
-                            raise
-                        verified = True
-                        if swap:
-                            tensor = archive._byteswap_tensor(tensor)
+                            verified = True
+                        else:
+                            try:
+                                raw_loader(
+                                    fd,
+                                    filename,
+                                    name,
+                                    absolute_offset,
+                                    int(info["stored_nbytes"]),
+                                    int(info["checksum_type"]),
+                                    bytes(info["checksum"]) or b"\x00" * 32,
+                                    tensor.data_ptr(),
+                                )
+                            except RuntimeError as error:
+                                if "checksum mismatch" in str(error):
+                                    raise ValueError(
+                                        f"MEGA tensor {name!r} checksum verification failed"
+                                    ) from error
+                                raise
+                            verified = True
+                            if swap:
+                                tensor = archive._byteswap_tensor(tensor)
                     else:
                         data = _read_at(fd, absolute_offset, int(info["stored_nbytes"]))
                         _verify_payload(
@@ -1096,7 +1180,7 @@ def load_mega(filename: str, map_location=None, *, mmap: bool = False):
                                 if info["shape"]
                                 else flat.reshape([])
                             )
-            if not verified:
+            if not verified and not (tensor is None and not skip):
                 _verify_payload(
                     fd, mapping, filename, header["header_length"], name, info
                 )
@@ -1116,42 +1200,73 @@ def load_mega(filename: str, map_location=None, *, mmap: bool = False):
                         dtype=getattr(tp, dtype_name),
                         device=archive._parse_device(decode_device),
                     )
-                if info["chunks"]:
-                    chunk_decoder = getattr(cpp, "decode_chunks_fd", None)
-                    if not callable(chunk_decoder):
-                        raise ImportError("MEGA chunk decoder is unavailable")
-                    chunk_decoder(
-                        fd,
-                        filename,
-                        str(name),
-                        int(header["header_length"]),
-                        info["chunks"],
-                        int(info["logical_nbytes"]),
-                        int(info["shuffle_elem_size"]),
-                        int(tensor.data_ptr()),
-                        decode_device != "cpu",
+                deferred_decoder = getattr(cpp, "decode_payloads_fd", None)
+                deferred = (
+                    callable(deferred_decoder)
+                    and not swap
+                    and decode_device == "cpu"
+                    and isinstance(target, str)
+                    and target == "cpu"
+                )
+                if deferred:
+                    deferred_jobs.append(
+                        _decode_job(name, info, tensor, header["header_length"])
                     )
                 else:
-                    decoder(
-                        fd,
-                        filename,
-                        str(name),
-                        absolute_offset,
-                        int(info["stored_nbytes"]),
-                        int(info["logical_nbytes"]),
-                        int(info["tensor_flags"]),
-                        int(info["compression_codec"]),
-                        int(info["shuffle_elem_size"]),
-                        int(info["checksum_type"]),
-                        bytes(info.get("checksum", b"")),
-                        int(tensor.data_ptr()),
-                        decode_device != "cpu",
-                    )
-                if swap:
-                    tensor = archive._byteswap_tensor(tensor)
+                    if info["chunks"]:
+                        chunk_decoder = getattr(cpp, "decode_chunks_fd", None)
+                        if not callable(chunk_decoder):
+                            raise ImportError("MEGA chunk decoder is unavailable")
+                        chunk_decoder(
+                            fd,
+                            filename,
+                            str(name),
+                            int(header["header_length"]),
+                            info["chunks"],
+                            int(info["logical_nbytes"]),
+                            int(info["shuffle_elem_size"]),
+                            int(tensor.data_ptr()),
+                            decode_device != "cpu",
+                        )
+                    else:
+                        decoder(
+                            fd,
+                            filename,
+                            str(name),
+                            absolute_offset,
+                            int(info["stored_nbytes"]),
+                            int(info["logical_nbytes"]),
+                            int(info["tensor_flags"]),
+                            int(info["compression_codec"]),
+                            int(info["shuffle_elem_size"]),
+                            int(info["checksum_type"]),
+                            bytes(info.get("checksum", b"")),
+                            int(tensor.data_ptr()),
+                            decode_device != "cpu",
+                        )
+                    if swap:
+                        tensor = archive._byteswap_tensor(tensor)
             if tensor is None:
                 tensor = tp.zeros(info["shape"], dtype=getattr(tp, dtype_name))
             loaded[name] = _apply_location(tensor, target)
+        if deferred_verifies:
+            try:
+                cpp.verify_buffer_payloads(mapping, deferred_verifies)
+            except RuntimeError as error:
+                if "checksum" in str(error):
+                    raise ValueError(
+                        "MEGA tensor checksum verification failed"
+                    ) from error
+                raise
+        if deferred_jobs:
+            try:
+                cpp.decode_payloads_fd(fd, filename, deferred_jobs)
+            except RuntimeError as error:
+                if "checksum mismatch" in str(error):
+                    raise ValueError(
+                        "MEGA tensor checksum verification failed"
+                    ) from error
+                raise
         for name, owner, info in aliases:
             base = loaded[owner]
             shape = list(info["shape"])

@@ -233,3 +233,91 @@ def test_map_location_variants(tmp_path: Path):
     by_tensor = tp.load(filename, map_location=into_tensor)
     assert received["location"] in {"cpu", "cuda"}
     assert tp.allclose(by_tensor["w"], value["w"])
+
+
+def _compressed_mega_artifact(tmp_path: Path, values: dict, *, chunk_crc: bool = True) -> Path:
+    import numpy as np
+
+    megacpp = pytest.importorskip("megatensors").cpp
+    src = tmp_path / "compressed-source.bin"
+    payload = tmp_path / "compressed-payload.tmp"
+    target = tmp_path / "compressed.mega"
+    records, offset = [], 0
+    with open(src, "wb") as handle:
+        for name, array in values.items():
+            raw = array.tobytes()
+            handle.write(raw)
+            records.append({
+                "name": name,
+                "shape": list(array.shape),
+                "logical_dtype": "F32",
+                "storage_format": "raw_dense",
+                "payload_offset": 0,
+                "logical_nbytes": len(raw),
+                "stored_nbytes": len(raw),
+                "src_filename": str(src),
+                "src_offset": offset,
+            })
+            offset += len(raw)
+    records = list(megacpp.encode_file_tensors(str(payload), records, 1, 3, 1.0))
+    if chunk_crc:
+        import zlib
+
+        blob = payload.read_bytes()
+        for record in records:
+            chunks = record.get("chunks", [])
+            entries = chunks if chunks else [record]
+            for entry in entries:
+                begin = int(entry["payload_offset"])
+                size = int(entry["stored_size"]) if chunks else int(entry["stored_nbytes"])
+                if not size:
+                    continue
+                entry["checksum_type"] = 1
+                entry["checksum"] = (
+                    zlib.crc32(blob[begin:begin + size]).to_bytes(4, "little") + b"\x00" * 28
+                )
+    megacpp.write_file(
+        str(target),
+        records,
+        {"general.alignment": 4096, "mega.tensor_info.format": "self_describing"},
+        4096,
+    )
+    return target
+
+
+def test_mega_compressed_chunked_load(tmp_path: Path):
+    import numpy as np
+
+    length = 3 * 1024 * 1024
+    values = {
+        "big": np.sin(np.arange(length, dtype=np.float64) / 1000).astype(np.float32),
+        "small": np.linspace(-1.0, 1.0, 4096, dtype=np.float32),
+    }
+    filename = _compressed_mega_artifact(tmp_path, values)
+
+    header = parse_mega_header(str(filename))
+    assert header["tensors"]["big"]["storage_format"] == "chunked_raw_dense"
+    assert len(header["tensors"]["big"]["chunks"]) >= 3
+    assert header["tensors"]["small"]["compression_codec"] == 1
+
+    for mmap in (False, True):
+        loaded = tp.load(filename, map_location="cpu", mmap=mmap)
+        for name, expected in values.items():
+            assert np.array_equal(loaded[name].numpy(), expected), (name, mmap)
+
+
+def test_mega_compressed_chunk_checksum_corruption_detected(tmp_path: Path):
+    import numpy as np
+
+    filename = _compressed_mega_artifact(
+        tmp_path, {"big": np.sin(np.arange(3 * 1024 * 1024) / 1000).astype(np.float32)}
+    )
+    header = parse_mega_header(str(filename))
+    chunk = header["tensors"]["big"]["chunks"][0]
+    offset = header["header_length"] + int(chunk["payload_offset"]) + 3
+    data = bytearray(filename.read_bytes())
+    data[offset] ^= 0xFF
+    filename.write_bytes(data)
+
+    with pytest.raises(ValueError, match="checksum"):
+        tp.load(filename, map_location="cpu")
