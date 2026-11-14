@@ -12,6 +12,7 @@
 #include "GPUPrimitives.cuh"
 #include "Complex.h"
 #include "CUDALoops.cuh"
+#include "../IndexCopyShared.h"
 
 #include <vector>
 #include <cstdint>
@@ -778,6 +779,8 @@ Tensor index_select_cuda(const Tensor& self, int64_t dim, const Tensor& index) {
 Tensor index_copy_cuda(const Tensor& self, int64_t dim, const Tensor& index, const Tensor& source) {
     int64_t nd = self.dim();
     dim = wrap_dim(dim, nd);
+    index_copy_detail::check_index_copy_geometry(self, dim, index, source,
+                                                 "index_copy");
     Tensor idx = (index.dtype() == DType::Int64) ? index.contiguous() : index.to(DType::Int64).contiguous();
     Tensor result = ::tensorplay::detail::contiguous_clone(self);
     int64_t n_idx = idx.numel();
@@ -787,7 +790,9 @@ Tensor index_copy_cuda(const Tensor& self, int64_t dim, const Tensor& index, con
     outer_inner(static_cast<std::vector<int64_t>>(self.shape()), dim, outer, inner);
     int64_t total = outer * n_idx * inner;
     if (total == 0) return result;
-    Tensor source_c = source.contiguous();
+    Tensor source_c =
+        index_copy_detail::expand_scalar_source(source, self, dim, n_idx)
+            .contiguous();
     auto stream = getCurrentCUDAStream().stream();
     const int slice_threads = slice_block_threads(inner);
     if (use_slice_kernel(inner, n_idx, outer) &&
@@ -832,6 +837,8 @@ Tensor& index_copy_inplace_cuda(Tensor& self, int64_t dim, const Tensor& index, 
     NoGradGuard __tp_nograd;
     int64_t nd = self.dim();
     dim = wrap_dim(dim, nd);
+    index_copy_detail::check_index_copy_geometry(self, dim, index, source,
+                                                 "index_copy");
     Tensor idx = (index.dtype() == DType::Int64) ? index.contiguous() : index.to(DType::Int64).contiguous();
     int64_t n_idx = idx.numel();
     if (n_idx == 0) return self;
@@ -846,7 +853,9 @@ Tensor& index_copy_inplace_cuda(Tensor& self, int64_t dim, const Tensor& index, 
         self.copy_(index_copy_cuda(self, dim, index, source));
         return self;
     }
-    Tensor source_c = source.contiguous();
+    Tensor source_c =
+        index_copy_detail::expand_scalar_source(source, self, dim, n_idx)
+            .contiguous();
     auto stream = getCurrentCUDAStream().stream();
     const int slice_threads = slice_block_threads(inner);
     if (use_slice_kernel(inner, n_idx, outer) &&

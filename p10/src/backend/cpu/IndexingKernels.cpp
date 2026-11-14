@@ -12,6 +12,7 @@
 #include "Bucketization.h"
 #include "cpu/ComplexUnary.h"
 #include "cpu/vec/vec.h"
+#include "../IndexCopyShared.h"
 
 #include <tuple>
 #include <vector>
@@ -1400,6 +1401,8 @@ static void index_copy_into(Tensor& dest, const Tensor& self, int64_t dim,
                              const Tensor& index, const Tensor& source) {
     int64_t nd = self.dim();
     dim = wrap_dim(dim, nd);
+    index_copy_detail::check_index_copy_geometry(self, dim, index, source,
+                                                 "index_copy");
     Tensor idx = normalize_index_cpu(index, self.size(dim), "index_copy");
     int64_t n_idx = idx.numel();
     if (n_idx == 0) return;
@@ -1407,7 +1410,9 @@ static void index_copy_into(Tensor& dest, const Tensor& self, int64_t dim,
     int64_t row = self.size(dim);
     int64_t outer = 1, inner = 1;
     outer_inner(static_cast<std::vector<int64_t>>(self.shape()), dim, outer, inner);
-    Tensor source_c = source.contiguous();
+    Tensor source_c =
+        index_copy_detail::expand_scalar_source(source, self, dim, n_idx)
+            .contiguous();
 // The copies of one index slot do not depend on the others, so they spread
 // over the pool; a repeated index then keeps whichever write lands last, as
 // the device paths do.

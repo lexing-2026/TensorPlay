@@ -10,6 +10,7 @@
 
 #include "MetaCommon.h"
 
+#include "../IndexCopyShared.h"
 #include "AdvancedIndex.h"
 #include "DType.h"
 #include "DTypeNames.h"
@@ -342,8 +343,10 @@ Tensor& index_add_inplace_kernel(Tensor& self, int64_t dim,
 }
 
 Tensor index_copy_kernel(const Tensor& self, int64_t dim, const Tensor& index,
-                         const Tensor& /*source*/) {
-    wrap_index_dim(dim, self.dim());
+                         const Tensor& source) {
+    dim = wrap_index_dim(dim, self.dim());
+    index_copy_detail::check_index_copy_geometry(self, dim, index, source,
+                                                 "index_copy");
     if (index.numel() != 0) {
         require_scalar_elements(self, "index_copy");
     }
