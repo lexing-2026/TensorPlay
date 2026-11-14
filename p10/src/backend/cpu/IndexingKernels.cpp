@@ -3297,18 +3297,6 @@ inline T sr_identity(SrReduce op) {
     return static_cast<T>(0);  // unreachable
 }
 
-inline void sr_decode(int64_t flat, int64_t idx_dim_size, int64_t idx_inner,
-                      int64_t& outer_off, int64_t& j, int64_t& idx,
-                      const int64_t* ip, int64_t self_dim_size) {
-    // flat layout: [outer][dim][idx_inner]
-    int64_t rem = flat;
-    outer_off = rem / (idx_dim_size * idx_inner);
-    rem -= outer_off * idx_dim_size * idx_inner;
-    j = rem % idx_inner;
-    idx = ip[flat];
-    if (idx < 0) idx += self_dim_size;
-}
-
 template <typename T>
 inline T sr_floor_div(T v, T c) {
     T q = v / c;
@@ -3318,23 +3306,117 @@ inline T sr_floor_div(T v, T c) {
 
 template <typename T>
 inline void sr_mean_divide(T* d, const int64_t* cp, int64_t n) {
-    for (int64_t i = 0; i < n; ++i) {
-        const int64_t c = cp[i] == 0 ? 1 : cp[i];
-        if constexpr (std::is_floating_point_v<T>) {
-            d[i] /= static_cast<T>(c);
-        } else if constexpr (std::is_integral_v<T> &&
-                             !std::is_same_v<T, bool>) {
-            d[i] = sr_floor_div(d[i], static_cast<T>(c));
-        } else {
-            // Half / BFloat16
-            d[i] = static_cast<T>(static_cast<float>(d[i]) /
-                                  static_cast<float>(c));
+    parallel_for(0, n, GRAIN_SIZE, [&](int64_t b, int64_t e) {
+        for (int64_t i = b; i < e; ++i) {
+            const int64_t c = cp[i] == 0 ? 1 : cp[i];
+            if constexpr (std::is_floating_point_v<T>) {
+                d[i] /= static_cast<T>(c);
+            } else if constexpr (std::is_integral_v<T> &&
+                                 !std::is_same_v<T, bool>) {
+                d[i] = sr_floor_div(d[i], static_cast<T>(c));
+            } else {
+                // Half / BFloat16
+                d[i] = static_cast<T>(static_cast<float>(d[i]) /
+                                      static_cast<float>(c));
+            }
         }
-    }
+    });
 }
 
 inline Tensor sr_where(const Tensor& cond, const Tensor& a, const Tensor& b) {
     return Tensor::where(cond, a, b);
+}
+
+// One row of the scatter fold: every position along the scatter axis lands on
+// this row's slots, and positions are folded in their written order so
+// duplicate indices reproduce the serial result.  The flat form serves the
+// walk whose inner width and destination width are both one -- the common
+// scatter along the trailing dimension -- where the general address arithmetic
+// degenerates into a plain slot number.
+template <typename T, SrReduce OP, bool Flat>
+inline void sr_fold_row(const int64_t* ip_row, const T* vp_row, T* d_row,
+                        int64_t* cp_row, int64_t idx_dim_size,
+                        int64_t idx_inner, int64_t self_inner) {
+    if constexpr (Flat) {
+        for (int64_t t = 0; t < idx_dim_size; ++t) {
+            const int64_t dst = ip_row[t];
+            if constexpr (OP == SrReduce::Sum || OP == SrReduce::Mean) {
+                d_row[dst] = d_row[dst] + vp_row[t];
+            } else if constexpr (OP == SrReduce::Prod) {
+                d_row[dst] = d_row[dst] * vp_row[t];
+            } else if constexpr (OP == SrReduce::AMin) {
+                const T v = vp_row[t];
+                const T cur = d_row[dst];
+                d_row[dst] = (std::isnan(cur) || cur < v) ? cur : v;
+            } else {
+                const T v = vp_row[t];
+                const T cur = d_row[dst];
+                d_row[dst] = (std::isnan(cur) || cur > v) ? cur : v;
+            }
+            if constexpr (OP == SrReduce::Mean) cp_row[dst] += 1;
+        }
+        return;
+    }
+    for (int64_t t = 0; t < idx_dim_size; ++t)
+        for (int64_t j = 0; j < idx_inner; ++j) {
+            const int64_t dst = ip_row[t * idx_inner + j] * self_inner + j;
+            if constexpr (OP == SrReduce::Sum || OP == SrReduce::Mean) {
+                d_row[dst] = d_row[dst] + vp_row[t * idx_inner + j];
+            } else if constexpr (OP == SrReduce::Prod) {
+                d_row[dst] = d_row[dst] * vp_row[t * idx_inner + j];
+            } else if constexpr (OP == SrReduce::AMin) {
+                const T v = vp_row[t * idx_inner + j];
+                const T cur = d_row[dst];
+                d_row[dst] = (std::isnan(cur) || cur < v) ? cur : v;
+            } else {
+                const T v = vp_row[t * idx_inner + j];
+                const T cur = d_row[dst];
+                d_row[dst] = (std::isnan(cur) || cur > v) ? cur : v;
+            }
+            if constexpr (OP == SrReduce::Mean) cp_row[dst] += 1;
+        }
+}
+
+// The rows of one task, each folded with the reduction the call asked for.
+template <typename T, bool Flat>
+inline void sr_fold_rows(SrReduce op, const int64_t* ip, const T* vp, T* d,
+                         int64_t* cp, int64_t gb, int64_t ge, int64_t idx_span,
+                         int64_t idx_dim_size, int64_t idx_inner,
+                         int64_t self_dim_size, int64_t self_inner) {
+    for (int64_t oo = gb; oo < ge; ++oo) {
+        const int64_t* ip_row = ip + oo * idx_span;
+        const T* vp_row = vp + oo * idx_span;
+        T* d_row = d + oo * self_dim_size * self_inner;
+        int64_t* cp_row =
+            cp != nullptr ? cp + oo * self_dim_size * self_inner : nullptr;
+        switch (op) {
+            case SrReduce::Sum:
+                sr_fold_row<T, SrReduce::Sum, Flat>(ip_row, vp_row, d_row,
+                                                    cp_row, idx_dim_size,
+                                                    idx_inner, self_inner);
+                break;
+            case SrReduce::Prod:
+                sr_fold_row<T, SrReduce::Prod, Flat>(ip_row, vp_row, d_row,
+                                                     cp_row, idx_dim_size,
+                                                     idx_inner, self_inner);
+                break;
+            case SrReduce::Mean:
+                sr_fold_row<T, SrReduce::Mean, Flat>(ip_row, vp_row, d_row,
+                                                     cp_row, idx_dim_size,
+                                                     idx_inner, self_inner);
+                break;
+            case SrReduce::AMin:
+                sr_fold_row<T, SrReduce::AMin, Flat>(ip_row, vp_row, d_row,
+                                                     cp_row, idx_dim_size,
+                                                     idx_inner, self_inner);
+                break;
+            case SrReduce::AMax:
+                sr_fold_row<T, SrReduce::AMax, Flat>(ip_row, vp_row, d_row,
+                                                     cp_row, idx_dim_size,
+                                                     idx_inner, self_inner);
+                break;
+        }
+    }
 }
 
 } // anonymous namespace
@@ -3412,16 +3494,25 @@ Tensor sr_reduce_forward(const Tensor& self, int64_t dim, const Tensor& index,
 
     {
         const int64_t* ip0 = idx_c.data_ptr<int64_t>();
-        for (int64_t i = 0; i < total_idx; ++i) {
-            // ("index -1 is out of bounds for dimension D with size N").
-            const int64_t v = ip0[i];
-            if (v < 0 || v >= self_dim_size) {
-                TP_THROW(IndexError, "index ", v,
-                         " is out of bounds for dimension ", dim,
-                         " with size ", self_dim_size);
+        parallel_for(0, total_idx, GRAIN_SIZE, [&](int64_t b, int64_t e) {
+            for (int64_t i = b; i < e; ++i) {
+                // ("index -1 is out of bounds for dimension D with size N").
+                const int64_t v = ip0[i];
+                if (v < 0 || v >= self_dim_size) {
+                    TP_THROW(IndexError, "index ", v,
+                             " is out of bounds for dimension ", dim,
+                             " with size ", self_dim_size);
+                }
             }
-        }
+        });
     }
+    // One result row per outer coordinate: two different outer coordinates
+    // never meet in a slot, and positions along the scatter axis of one row
+    // are folded in their written order, so a task split beside the scatter
+    // axis reproduces the serial fold exactly.
+    const int64_t idx_span = idx_dim_size * idx_inner;
+    const int64_t idx_outer = idx_span > 0 ? total_idx / idx_span : 0;
+    const int64_t sr_grain = std::max<int64_t>(1, GRAIN_SIZE / std::max<int64_t>(idx_span, 1));
 
     Tensor result = detail::contiguous_clone(self);
     if (!include_self && total_idx > 0 && result.numel() > 0) {
@@ -3437,12 +3528,16 @@ Tensor sr_reduce_forward(const Tensor& self, int64_t dim, const Tensor& index,
         ctype* d = result.data_ptr<ctype>();                                 \
         const int64_t* ip = idx_c.data_ptr<int64_t>();                       \
         const ctype init_v = sr_identity<ctype>(op);                         \
-        for (int64_t flat = 0; flat < total_idx; ++flat) {                   \
-            int64_t oo, j, idx;                                              \
-            sr_decode(flat, idx_dim_size, idx_inner, oo, j, idx, ip,         \
-                      self_dim_size);                                        \
-            d[(oo * self_dim_size + idx) * self_inner + j] = init_v;         \
-        }                                                                    \
+        parallel_for(0, idx_outer, sr_grain, [&](int64_t gb, int64_t ge) {   \
+            for (int64_t oo = gb; oo < ge; ++oo) {                           \
+                const int64_t* ip_row = ip + oo * idx_span;                  \
+                ctype* d_row = d + oo * self_dim_size * self_inner;          \
+                for (int64_t t = 0; t < idx_dim_size; ++t)                   \
+                    for (int64_t j = 0; j < idx_inner; ++j)                  \
+                        d_row[ip_row[t * idx_inner + j] * self_inner + j] =  \
+                            init_v;                                          \
+            }                                                                \
+        });                                                                  \
         break;                                                               \
     }
         switch (self.dtype()) {
@@ -3469,44 +3564,30 @@ Tensor sr_reduce_forward(const Tensor& self, int64_t dim, const Tensor& index,
         return v;
     }();
 
+    // A scatter along the trailing dimension of a packed block folds one slot
+    // per position; the walk then needs no width arithmetic at all.
+    const bool flat_rows = (idx_inner == 1 && self_inner == 1);
+
 #define TP_SR_CASE(ctype, name)                                                \
     case DType::name: {                                                        \
         ctype* d = result.data_ptr<ctype>();                                   \
         const int64_t* ip = idx_c.data_ptr<int64_t>();                         \
         const ctype* vp = src_b.data_ptr<ctype>();                             \
-        for (int64_t flat = 0; flat < total_idx; ++flat) {                     \
-            int64_t oo, j, idx;                                                \
-            sr_decode(flat, idx_dim_size, idx_inner, oo, j, idx, ip,           \
-                      self_dim_size);                                          \
-            const int64_t dst =                                                \
-                (oo * self_dim_size + idx) * self_inner + j;                   \
-            const ctype v = vp[flat];                                          \
-            const ctype cur = d[dst];                                          \
-            switch (op) {                                                      \
-                case SrReduce::Sum:                                            \
-                    d[dst] = cur + v;                                          \
-                    break;                                                     \
-                case SrReduce::Prod:                                           \
-                    d[dst] = cur * v;                                          \
-                    break;                                                     \
-                case SrReduce::AMin:                                           \
-                              \
-                    d[dst] =                                                   \
-                        (std::isnan(cur) || cur < v) ? cur : v;                 \
-                    break;                                                     \
-                case SrReduce::AMax:                                           \
-                              \
-                    d[dst] =                                                   \
-                        (std::isnan(cur) || cur > v) ? cur : v;                 \
-                    break;                                                     \
-                case SrReduce::Mean:                                           \
-                    d[dst] = cur + v;                                          \
-                    cp[dst] += 1;                                              \
-                    break;                                                     \
-            }                                                                  \
+        if (flat_rows) {                                                       \
+            parallel_for(0, idx_outer, sr_grain, [&](int64_t gb, int64_t ge) { \
+                sr_fold_rows<ctype, true>(op, ip, vp, d, cp, gb, ge,           \
+                                          idx_span, idx_dim_size, idx_inner,   \
+                                          self_dim_size, self_inner);          \
+            });                                                                \
+        } else {                                                               \
+            parallel_for(0, idx_outer, sr_grain, [&](int64_t gb, int64_t ge) { \
+                sr_fold_rows<ctype, false>(op, ip, vp, d, cp, gb, ge,          \
+                                           idx_span, idx_dim_size, idx_inner,  \
+                                           self_dim_size, self_inner);         \
+            });                                                                \
         }                                                                      \
         if (op == SrReduce::Mean) {                                            \
-            sr_mean_divide<ctype>(d, cp, result.numel());                       \
+            sr_mean_divide<ctype>(d, cp, result.numel());                      \
         }                                                                      \
         break;                                                                 \
     }
