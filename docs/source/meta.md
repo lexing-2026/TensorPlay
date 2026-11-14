@@ -139,6 +139,23 @@ safely is refused. `resize_` itself rewrites the sizes and grows the recorded
 storage length in place — a call that keeps the current sizes is a no-op for
 the strides, and negative or overflowing sizes are refused.
 
+The logarithm, exponential, root and trigonometric sweeps (`exp`, `log` and
+its bases, `sqrt`, `rsqrt`, the six hyperbolic and three inverse-trigonometric
+pairs, `tanh`, `sigmoid`, `tanhshrink`) compute over real numbers or a complex
+lane of their own: a whole-number operand is answered in single precision, a
+boolean or 8-bit float operand has no form to run in and is refused, and a
+floating or complex operand keeps its width. The single-form sweeps and
+activations (`erf`, `erfc`, `lgamma`, `silu`, `gelu`, `mish`, `softplus`, the
+`elu`/`selu`/`celu` trio, `leaky_relu`, `hardsigmoid`, `hardswish`, `relu6`,
+`log_sigmoid`, `hardtanh`, the clamp family) refuse complex and 8-bit float
+operands outright. The same split holds in place: a sweep with a complex lane
+accepts a complex target, a single-form sweep refuses it, and the copy-back
+activations accept a whole-number target and keep its dtype. The members
+without a whole-number form answer what they can — `frac` refuses integral
+planes, the angle conversions (`deg2rad`, `rad2deg`) answer complex operands
+in single precision — and `sign`, `sgn`, the boolean forms of `pow` and the
+step family keep their own promotion tables.
+
 The random fills (`uniform_`, `normal_`, `cauchy_`, `exponential_`,
 `geometric_`, `log_normal_`, `bernoulli_` and the `random_` family) accept a
 meta tensor and leave its metadata unchanged — there is no data to sample into,
