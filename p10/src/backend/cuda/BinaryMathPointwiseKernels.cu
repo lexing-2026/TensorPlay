@@ -1,6 +1,8 @@
 // Pointwise CUDA kernels: binary math family.
 #include "PointwiseCommon.cuh"
 
+#include "tensorplay/ops/TPXOpsGenerated.h"
+
 #include <thrust/iterator/counting_iterator.h>
 
 namespace tensorplay {
@@ -581,22 +583,22 @@ Tensor& lerp_tensor_inplace_kernel_cuda(Tensor& self, const Tensor& end, const T
 }
 
 Tensor& abs_inplace_kernel_cuda(Tensor& self) {
-    self.copy_(abs_kernel_cuda(self));
+    tensorplay::detail::redispatch_abs_out_function(self, self);
     return self;
 }
 
 Tensor& neg_inplace_kernel_cuda(Tensor& self) {
-    self.copy_(neg_kernel_cuda(self));
+    tensorplay::detail::redispatch_neg_out_function(self, self);
     return self;
 }
 
 Tensor& sqrt_inplace_kernel_cuda(Tensor& self) {
-    self.copy_(sqrt_kernel_cuda(self));
+    tensorplay::detail::redispatch_sqrt_out_function(self, self);
     return self;
 }
 
 Tensor& rsqrt_inplace_kernel_cuda(Tensor& self) {
-    self.copy_(rsqrt_kernel_cuda(self));
+    tensorplay::detail::redispatch_rsqrt_out_function(self, self);
     return self;
 }
 

@@ -12,6 +12,7 @@
 #include "Dispatcher.h"
 #include "GradMode.h"
 #include "Tensor.h"
+#include "tensorplay/ops/TPXOpsGenerated.h"
 
 namespace tensorplay {
 namespace cuda {
@@ -27,13 +28,13 @@ struct NoGradGuard {
 
 Tensor& acos_inplace_kernel(Tensor& self) {
     NoGradGuard __tp_nograd;
-    self.copy_(self.acos());
+    tensorplay::detail::redispatch_acos_out_function(self, self);
     return self;
 }
 
 Tensor& acosh_inplace_kernel(Tensor& self) {
     NoGradGuard __tp_nograd;
-    self.copy_(self.acosh());
+    tensorplay::detail::redispatch_acosh_out_function(self, self);
     return self;
 }
 
@@ -63,13 +64,13 @@ Tensor& addr_inplace_kernel(Tensor& self, const Tensor& vec1, const Tensor& vec2
 
 Tensor& asin_inplace_kernel(Tensor& self) {
     NoGradGuard __tp_nograd;
-    self.copy_(self.asin());
+    tensorplay::detail::redispatch_asin_out_function(self, self);
     return self;
 }
 
 Tensor& asinh_inplace_kernel(Tensor& self) {
     NoGradGuard __tp_nograd;
-    self.copy_(self.asinh());
+    tensorplay::detail::redispatch_asinh_out_function(self, self);
     return self;
 }
 
@@ -81,13 +82,13 @@ Tensor& atan2_inplace_kernel(Tensor& self, const Tensor& other) {
 
 Tensor& atan_inplace_kernel(Tensor& self) {
     NoGradGuard __tp_nograd;
-    self.copy_(self.atan());
+    tensorplay::detail::redispatch_atan_out_function(self, self);
     return self;
 }
 
 Tensor& atanh_inplace_kernel(Tensor& self) {
     NoGradGuard __tp_nograd;
-    self.copy_(self.atanh());
+    tensorplay::detail::redispatch_atanh_out_function(self, self);
     return self;
 }
 
@@ -105,7 +106,7 @@ Tensor& baddbmm_inplace_kernel(Tensor& self, const Tensor& batch1, const Tensor&
 
 Tensor& ceil_inplace_kernel(Tensor& self) {
     NoGradGuard __tp_nograd;
-    self.copy_(self.ceil());
+    tensorplay::detail::redispatch_ceil_out_function(self, self);
     return self;
 }
 
@@ -123,13 +124,13 @@ Tensor& clip_inplace_kernel(Tensor& self, const std::optional<Scalar>& min, cons
 
 Tensor& cos_inplace_kernel(Tensor& self) {
     NoGradGuard __tp_nograd;
-    self.copy_(self.cos());
+    tensorplay::detail::redispatch_cos_out_function(self, self);
     return self;
 }
 
 Tensor& cosh_inplace_kernel(Tensor& self) {
     NoGradGuard __tp_nograd;
-    self.copy_(self.cosh());
+    tensorplay::detail::redispatch_cosh_out_function(self, self);
     return self;
 }
 
@@ -159,13 +160,13 @@ Tensor& elu_inplace_kernel(Tensor& self, const Scalar& alpha, const Scalar& scal
 
 Tensor& erf_inplace_kernel(Tensor& self) {
     NoGradGuard __tp_nograd;
-    self.copy_(self.erf());
+    tensorplay::detail::redispatch_erf_out_function(self, self);
     return self;
 }
 
 Tensor& erfc_inplace_kernel(Tensor& self) {
     NoGradGuard __tp_nograd;
-    self.copy_(self.erfc());
+    tensorplay::detail::redispatch_erfc_out_function(self, self);
     return self;
 }
 
@@ -183,25 +184,25 @@ Tensor& exp2_inplace_kernel(Tensor& self) {
 
 Tensor& exp_inplace_kernel(Tensor& self) {
     NoGradGuard __tp_nograd;
-    self.copy_(self.exp());
+    tensorplay::detail::redispatch_exp_out_function(self, self);
     return self;
 }
 
 Tensor& expm1_inplace_kernel(Tensor& self) {
     NoGradGuard __tp_nograd;
-    self.copy_(self.expm1());
+    tensorplay::detail::redispatch_expm1_out_function(self, self);
     return self;
 }
 
 Tensor& floor_inplace_kernel(Tensor& self) {
     NoGradGuard __tp_nograd;
-    self.copy_(self.floor());
+    tensorplay::detail::redispatch_floor_out_function(self, self);
     return self;
 }
 
 Tensor& frac_inplace_kernel(Tensor& self) {
     NoGradGuard __tp_nograd;
-    self.copy_(self.frac());
+    tensorplay::detail::redispatch_frac_out_function(self, self);
     return self;
 }
 
@@ -279,31 +280,31 @@ Tensor& leaky_relu_inplace_kernel(Tensor& self, const Scalar& negative_slope) {
 
 Tensor& lgamma_inplace_kernel(Tensor& self) {
     NoGradGuard __tp_nograd;
-    self.copy_(self.lgamma());
+    tensorplay::detail::redispatch_lgamma_out_function(self, self);
     return self;
 }
 
 Tensor& log10_inplace_kernel(Tensor& self) {
     NoGradGuard __tp_nograd;
-    self.copy_(self.log10());
+    tensorplay::detail::redispatch_log10_out_function(self, self);
     return self;
 }
 
 Tensor& log1p_inplace_kernel(Tensor& self) {
     NoGradGuard __tp_nograd;
-    self.copy_(self.log1p());
+    tensorplay::detail::redispatch_log1p_out_function(self, self);
     return self;
 }
 
 Tensor& log2_inplace_kernel(Tensor& self) {
     NoGradGuard __tp_nograd;
-    self.copy_(self.log2());
+    tensorplay::detail::redispatch_log2_out_function(self, self);
     return self;
 }
 
 Tensor& log_inplace_kernel(Tensor& self) {
     NoGradGuard __tp_nograd;
-    self.copy_(self.log());
+    tensorplay::detail::redispatch_log_out_function(self, self);
     return self;
 }
 
@@ -387,7 +388,7 @@ Tensor& renorm_inplace_kernel(Tensor& self, const Scalar& p, int64_t dim, const 
 
 Tensor& round_inplace_kernel(Tensor& self) {
     NoGradGuard __tp_nograd;
-    self.copy_(self.round());
+    tensorplay::detail::redispatch_round_out_function(self, self);
     return self;
 }
 
@@ -405,13 +406,13 @@ Tensor& sgn_inplace_kernel(Tensor& self) {
 
 Tensor& sigmoid_inplace_kernel(Tensor& self) {
     NoGradGuard __tp_nograd;
-    self.copy_(self.sigmoid());
+    tensorplay::detail::redispatch_sigmoid_out_function(self, self);
     return self;
 }
 
 Tensor& sign_inplace_kernel(Tensor& self) {
     NoGradGuard __tp_nograd;
-    self.copy_(self.sign());
+    tensorplay::detail::redispatch_sign_out_function(self, self);
     return self;
 }
 
@@ -423,7 +424,7 @@ Tensor& silu_inplace_kernel(Tensor& self) {
 
 Tensor& sin_inplace_kernel(Tensor& self) {
     NoGradGuard __tp_nograd;
-    self.copy_(self.sin());
+    tensorplay::detail::redispatch_sin_out_function(self, self);
     return self;
 }
 
@@ -435,25 +436,25 @@ Tensor& sinc_inplace_kernel(Tensor& self) {
 
 Tensor& sinh_inplace_kernel(Tensor& self) {
     NoGradGuard __tp_nograd;
-    self.copy_(self.sinh());
+    tensorplay::detail::redispatch_sinh_out_function(self, self);
     return self;
 }
 
 Tensor& square_inplace_kernel(Tensor& self) {
     NoGradGuard __tp_nograd;
-    self.copy_(self.square());
+    tensorplay::detail::redispatch_square_out_function(self, self);
     return self;
 }
 
 Tensor& tan_inplace_kernel(Tensor& self) {
     NoGradGuard __tp_nograd;
-    self.copy_(self.tan());
+    tensorplay::detail::redispatch_tan_out_function(self, self);
     return self;
 }
 
 Tensor& tanh_inplace_kernel(Tensor& self) {
     NoGradGuard __tp_nograd;
-    self.copy_(self.tanh());
+    tensorplay::detail::redispatch_tanh_out_function(self, self);
     return self;
 }
 
@@ -471,7 +472,7 @@ Tensor& triu_inplace_kernel(Tensor& self, int64_t diagonal) {
 
 Tensor& trunc_inplace_kernel(Tensor& self) {
     NoGradGuard __tp_nograd;
-    self.copy_(self.trunc());
+    tensorplay::detail::redispatch_trunc_out_function(self, self);
     return self;
 }
 
