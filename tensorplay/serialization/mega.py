@@ -1030,16 +1030,23 @@ def load_mega(filename: str, map_location=None, *, mmap: bool = False):
                         cpp = _require_megatensors().cpp
                     raw_loader = getattr(cpp, "copy_raw_payload_fd", None)
                     if raw_loader is not None:
-                        raw_loader(
-                            fd,
-                            filename,
-                            name,
-                            absolute_offset,
-                            int(info["stored_nbytes"]),
-                            int(info["checksum_type"]),
-                            bytes(info["checksum"]) or b"\x00" * 32,
-                            tensor.data_ptr(),
-                        )
+                        try:
+                            raw_loader(
+                                fd,
+                                filename,
+                                name,
+                                absolute_offset,
+                                int(info["stored_nbytes"]),
+                                int(info["checksum_type"]),
+                                bytes(info["checksum"]) or b"\x00" * 32,
+                                tensor.data_ptr(),
+                            )
+                        except RuntimeError as error:
+                            if "checksum mismatch" in str(error):
+                                raise ValueError(
+                                    f"MEGA tensor {name!r} checksum verification failed"
+                                ) from error
+                            raise
                         verified = True
                         if swap:
                             tensor = archive._byteswap_tensor(tensor)
