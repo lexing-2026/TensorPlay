@@ -152,6 +152,7 @@ def _contig_stride(size):
 
 def _byteswap_tensor(tensor):
     from .archive import (
+        _FLOAT8_DTYPES,
         _contiguous_stride,
         _dtype_name_of,
         _tensor_from_flat_bytes,
@@ -166,6 +167,8 @@ def _byteswap_tensor(tensor):
     dtype_name = _dtype_name_of(tensor)
     if dtype_name in {"bfloat16", "complex32", "bcomplex32"}:
         array = tensor.view(getattr(tp, "uint16")).numpy()
+    elif dtype_name in _FLOAT8_DTYPES:
+        array = tensor.view(getattr(tp, "uint8")).numpy()
     else:
         array = tensor.numpy()
     flat = _tensor_from_flat_bytes(array.byteswap().tobytes(), dtype_name)

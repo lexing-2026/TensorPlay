@@ -167,6 +167,32 @@ def test_mega_mmap_load(tmp_path: Path):
     assert float(loaded["w"].sum()) == sum(range(100))
 
 
+def test_mega_float8_round_trip(tmp_path: Path):
+    names = ("float8_e4m3fn", "float8_e5m2", "float8_e8m0fnu")
+    value = {
+        name: tp.arange(16, dtype=tp.uint8).reshape((4, 4)).view(getattr(tp, name))
+        for name in names
+    }
+    filename = tmp_path / "fp8.mega"
+    tp.save(value, filename)
+
+    loaded = tp.load(filename)
+    for name in names:
+        assert loaded[name].dtype == getattr(tp, name)
+        assert (
+            loaded[name].view(tp.uint8).numpy().tobytes()
+            == value[name].view(tp.uint8).numpy().tobytes()
+        )
+
+    mapped = tp.load(filename, mmap=True)
+    for name in names:
+        assert mapped[name].dtype == getattr(tp, name)
+        assert (
+            mapped[name].view(tp.uint8).numpy().tobytes()
+            == value[name].view(tp.uint8).numpy().tobytes()
+        )
+
+
 def test_mega_load_from_buffer(tmp_path: Path):
     value = {"w": tp.arange(5, dtype=tp.float32)}
     filename = tmp_path / "buf.mega"

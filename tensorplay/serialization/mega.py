@@ -46,6 +46,7 @@ _MEGA_DTYPE_SIZES = {
     "F8_E4M3": 1,
     "F8_E8M0": 1,
 }
+_MEGA_FLOAT8 = ("F8_E4M3", "F8_E5M2", "F8_E8M0")
 _MEGA_TO_TP = {
     "BOOL": "bool",
     "U8": "uint8",
@@ -60,6 +61,9 @@ _MEGA_TO_TP = {
     "BF16": "bfloat16",
     "F32": "float32",
     "F64": "float64",
+    "F8_E5M2": "float8_e5m2",
+    "F8_E4M3": "float8_e4m3fn",
+    "F8_E8M0": "float8_e8m0fnu",
 }
 _MEGA_TO_NUMPY = {
     "BOOL": "?",
@@ -75,6 +79,9 @@ _MEGA_TO_NUMPY = {
     "BF16": "u2",
     "F32": "f4",
     "F64": "f8",
+    "F8_E5M2": "u1",
+    "F8_E4M3": "u1",
+    "F8_E8M0": "u1",
 }
 
 
@@ -553,8 +560,11 @@ def _raw_tensor_bytes_view(tensor):
         return None
     import numpy as np
 
-    if archive._dtype_name_of(tensor) == "bfloat16":
+    dtype_name = archive._dtype_name_of(tensor)
+    if dtype_name == "bfloat16":
         array = tensor.view(getattr(tp, "uint16")).numpy()
+    elif dtype_name in archive._FLOAT8_DTYPES:
+        array = tensor.view(getattr(tp, "uint8")).numpy()
     else:
         array = tensor.numpy()
     if not array.flags.c_contiguous:
@@ -709,6 +719,9 @@ def save_mega(filename: str, obj: Any, *, metadata=None,
         "bfloat16": "BF16",
         "float32": "F32",
         "float64": "F64",
+        "float8_e4m3fn": "F8_E4M3",
+        "float8_e5m2": "F8_E5M2",
+        "float8_e8m0fnu": "F8_E8M0",
     }
     for name, tensor in flat.items():
         dtype_name = archive._dtype_name_of(tensor)
@@ -866,6 +879,8 @@ def _mmap_tensor(mapping, offset: int, info: dict):
         flat = tp.from_dlpack(array.__dlpack__())
     if dtype_name == "bfloat16":
         flat = flat.view(getattr(tp, "bfloat16"))
+    elif info["dtype"] in _MEGA_FLOAT8:
+        flat = flat.view(getattr(tp, dtype_name))
     try:
         flat._serialization_keepalive = mapping
     except (AttributeError, TypeError):
@@ -1133,6 +1148,10 @@ def _convert_safetensors_file(
             if dtype_name is None:
                 raise NotImplementedError(
                     f"unsupported safetensors dtype: {dtype!r}"
+                )
+            if dtype not in _MEGA_TO_TP:
+                raise NotImplementedError(
+                    f"safetensors dtype {dtype!r} is not representable in MEGA"
                 )
             raw_shape = spec.get("shape")
             if not isinstance(raw_shape, list):

@@ -30,6 +30,7 @@ __all__ = [
     "describe_safetensors_file",
     "_ITEMSIZE",
     "_NUMPY_DTYPES",
+    "_FLOAT8_DTYPES",
     "_STORAGE_NAMES_BY_DTYPE",
     "_TORCH_STORAGE_DTYPES",
     "_contiguous_stride",
@@ -96,6 +97,8 @@ _ITEMSIZE = {
     "bool": 1, "uint8": 1, "int8": 1, "int16": 2, "uint16": 2, "int32": 4,
     "uint32": 4, "int64": 8, "uint64": 8, "float16": 2, "bfloat16": 2,
     "float32": 4, "float64": 8, "complex64": 8, "complex128": 16,
+    "float8_e4m3fn": 1, "float8_e4m3fnuz": 1, "float8_e5m2": 1,
+    "float8_e5m2fnuz": 1, "float8_e8m0fnu": 1,
 }
 
 _NUMPY_DTYPES = {
@@ -103,6 +106,16 @@ _NUMPY_DTYPES = {
     "int64": "i8", "uint16": "u2", "uint32": "u4", "uint64": "u8", "float16": "f2",
     "float32": "f4", "float64": "f8", "complex64": "c8", "complex128": "c16",
 }
+
+# Byte-addressed dtypes NumPy cannot describe; they travel as their integer
+# storage type and are reinterpreted with ``Tensor.view`` after the copy.
+_FLOAT8_DTYPES = (
+    "float8_e4m3fn",
+    "float8_e4m3fnuz",
+    "float8_e5m2",
+    "float8_e5m2fnuz",
+    "float8_e8m0fnu",
+)
 
 
 def _tp_dtype(name: str):
@@ -118,8 +131,9 @@ def _dtype_name_of(tensor) -> str:
     for name in _NUMPY_DTYPES:
         if tensor.dtype == _tp_dtype(name):
             return name
-    if tensor.dtype == _tp_dtype("bfloat16"):
-        return "bfloat16"
+    for name in ("bfloat16",) + _FLOAT8_DTYPES:
+        if tensor.dtype == _tp_dtype(name):
+            return name
     raise NotImplementedError(f"unsupported TensorPlay dtype: {tensor.dtype}")
 
 
@@ -145,6 +159,8 @@ def _tensor_bytes(tensor) -> bytes:
     dtype_name = _dtype_name_of(tensor)
     if dtype_name == "bfloat16":
         return tensor.view(_tp_dtype("uint16")).numpy().tobytes()
+    if dtype_name in _FLOAT8_DTYPES:
+        return tensor.view(_tp_dtype("uint8")).numpy().tobytes()
     return tensor.numpy().tobytes()
 
 
@@ -159,6 +175,9 @@ def _tensor_from_flat_bytes(data: bytes, dtype_name: str):
     if dtype_name == "bfloat16":
         flat = tp.Tensor._from_bytes(data, [numel], _tp_dtype("uint16"))
         return flat.view(_tp_dtype("bfloat16"))
+    if dtype_name in _FLOAT8_DTYPES:
+        flat = tp.Tensor._from_bytes(data, [numel], _tp_dtype("uint8"))
+        return flat.view(_tp_dtype(dtype_name))
     return tp.Tensor._from_bytes(data, [numel], _tp_dtype(dtype_name))
 
 
@@ -193,6 +212,8 @@ def _byteswap_bytes(data: bytes, dtype_name: str) -> bytes:
 
     if dtype_name == "bfloat16":
         dtype_name = "uint16"
+    elif dtype_name in _FLOAT8_DTYPES:
+        dtype_name = "uint8"
     itemsize = np.dtype(_NUMPY_DTYPES[dtype_name]).itemsize
     if itemsize == 1 or not data:
         return data
@@ -1147,7 +1168,12 @@ def _serialize_object(obj: Any, pickle_protocol: int, *, legacy: bool = False):
     def persistent_id(value):
         if isinstance(value, _PTStorageRef):
             record = record_by_key[value.key]
-            storage_cls = _PT_STORAGE_CLASSES[record["dtype"]]
+            storage_cls = _PT_STORAGE_CLASSES.get(record["dtype"])
+            if storage_cls is None:
+                raise NotImplementedError(
+                    f"dtype {record['dtype']!r} is not representable in '.pt'; "
+                    "use '.mega' or '.safetensors'"
+                )
             result = (
                 "storage",
                 storage_cls,
@@ -1497,6 +1523,9 @@ _SAFETENSORS_DTYPES = {
     "BOOL": "bool", "U8": "uint8", "I8": "int8", "I16": "int16", "I32": "int32",
     "I64": "int64", "U32": "uint32", "U64": "uint64", "F16": "float16",
     "BF16": "bfloat16", "F32": "float32", "F64": "float64",
+    "F8_E4M3": "float8_e4m3fn", "F8_E4M3FNUZ": "float8_e4m3fnuz",
+    "F8_E5M2": "float8_e5m2", "F8_E5M2FNUZ": "float8_e5m2fnuz",
+    "F8_E8M0": "float8_e8m0fnu",
 }
 
 _SAFETENSORS_DTYPE_NAMES = {v: k for k, v in _SAFETENSORS_DTYPES.items()}
@@ -1662,6 +1691,8 @@ def _safetensors_mmap_tensor(mapping, offset: int, length: int, shape: list,
 
     if dtype_name == "bfloat16":
         np_dtype = "u2"
+    elif dtype_name in _FLOAT8_DTYPES:
+        np_dtype = "u1"
     elif dtype_name in _NUMPY_DTYPES:
         np_dtype = _NUMPY_DTYPES[dtype_name]
     else:
@@ -1679,6 +1710,8 @@ def _safetensors_mmap_tensor(mapping, offset: int, length: int, shape: list,
         return None
     if dtype_name == "bfloat16":
         tensor = tensor.view(_tp_dtype("bfloat16"))
+    elif dtype_name in _FLOAT8_DTYPES:
+        tensor = tensor.view(_tp_dtype(dtype_name))
     try:
         tensor._serialization_keepalive = mapping
     except (AttributeError, TypeError):

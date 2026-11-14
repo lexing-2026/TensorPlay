@@ -69,6 +69,11 @@ def _dtype_for_name(dtype_name: str) -> Any:
         "BF16": "bfloat16",
         "F32": "float32",
         "F64": "float64",
+        "F8_E4M3": "float8_e4m3fn",
+        "F8_E4M3FNUZ": "float8_e4m3fnuz",
+        "F8_E5M2": "float8_e5m2",
+        "F8_E5M2FNUZ": "float8_e5m2fnuz",
+        "F8_E8M0": "float8_e8m0fnu",
         "C64": "complex64",
         "C128": "complex128",
     }

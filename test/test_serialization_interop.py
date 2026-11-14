@@ -304,6 +304,50 @@ def test_safetensors_mmap(tmp_path: Path):
     assert _raw_bytes(loaded["v"]) == _raw_bytes(value["v"])
 
 
+_FLOAT8_DTYPES = (
+    "float8_e4m3fn",
+    "float8_e4m3fnuz",
+    "float8_e5m2",
+    "float8_e5m2fnuz",
+    "float8_e8m0fnu",
+)
+
+
+def test_safetensors_float8_round_trip(tmp_path: Path):
+    value = {
+        name: tp.arange(16, dtype=tp.uint8).reshape((4, 4)).view(getattr(tp, name))
+        for name in _FLOAT8_DTYPES
+    }
+    filename = tmp_path / "fp8.safetensors"
+    tp.save(value, filename)
+
+    loaded = tp.load(filename)
+    for name in _FLOAT8_DTYPES:
+        assert loaded[name].dtype == getattr(tp, name)
+        assert _raw_bytes(loaded[name]) == _raw_bytes(value[name])
+
+    info = inspect_checkpoint(filename)
+    assert info["tensors"]["float8_e4m3fn"]["dtype"] == "F8_E4M3"
+    assert info["tensors"]["float8_e4m3fnuz"]["dtype"] == "F8_E4M3FNUZ"
+    assert info["tensors"]["float8_e5m2fnuz"]["dtype"] == "F8_E5M2FNUZ"
+    assert info["tensors"]["float8_e8m0fnu"]["dtype"] == "F8_E8M0"
+
+
+def test_safetensors_float8_mmap(tmp_path: Path):
+    value = {
+        name: tp.arange(16, dtype=tp.uint8).view(getattr(tp, name))
+        for name in ("float8_e4m3fn", "float8_e5m2")
+    }
+    filename = tmp_path / "fp8_mmap.safetensors"
+    tp.save(value, filename)
+
+    with open(filename, "rb") as handle:
+        loaded = tp.load(handle, mmap=True)
+    for name, tensor in value.items():
+        assert loaded[name].dtype == tensor.dtype
+        assert _raw_bytes(loaded[name]) == _raw_bytes(tensor)
+
+
 def test_safetensors_corrupt_offsets_rejected(tmp_path: Path):
     filename = tmp_path / "corrupt.safetensors"
     tp.save({"w": tp.ones((2,), dtype=tp.float32)}, filename)
