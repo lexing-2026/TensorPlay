@@ -123,9 +123,8 @@ Tensor rad2deg_cuda(const Tensor& self) {
 }
 
 Tensor erfinv_cuda(const Tensor& self) {
-    // CUDA has no native erfinv; use the Cephes calc_erfinv from SpecialMath.h
-    // host-only ::erfinv — linking that from device code leaves an undefined
-    // symbol in libp10.so.
+    // The functor picks the CUDA math library's inverse error function on the
+    // device and the rational + Newton fallback on the host.
     return float_math_cuda(self, HFn32{}, "erfinv");
 }
 

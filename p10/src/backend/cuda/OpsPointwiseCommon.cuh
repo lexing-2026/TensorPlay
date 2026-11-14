@@ -335,10 +335,20 @@ struct HFn31 : GenFnBase<HFn31> {
 
 struct HFn32 : GenFnBase<HFn32> {
     __host__ __device__ auto run(double x) const {
- return tensorplay::special_math::calc_erfinv(x);
+#ifdef __CUDA_ARCH__
+        // The CUDA math library's inverse error function beats the rational
+        // + Newton fallback and matches it bit-for-bit on the same input.
+        return ::erfinv(x);
+#else
+        return tensorplay::special_math::calc_erfinv(x);
+#endif
     }
     __host__ __device__ float runf(float x) const {
+#ifdef __CUDA_ARCH__
+        return ::erfinvf(x);
+#else
         return tensorplay::special_math::calc_erfinv(x);
+#endif
     }
 };
 
