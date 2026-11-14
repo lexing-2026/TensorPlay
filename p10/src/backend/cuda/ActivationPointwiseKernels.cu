@@ -465,6 +465,70 @@ Tensor rrelu_with_noise_backward_kernel_cuda(const Tensor& grad_output, const Te
     return binary_float_op_kernel_v2(grad_output, self, RreluWithNoiseEvalBackwardFunctor(slope));
 }
 
+// out= entries: run the activation straight into a destination that already
+// matches the allocating form; quantized and complex inputs, and
+// destinations needing a resize or a cast, go back through the allocating
+// form.
+Tensor& silu_out_cuda(const Tensor& self, Tensor& out) {
+    if (isQuantizedType(self.dtype()) || isComplexType(self.dtype()))
+        return write_out(out, silu_kernel_cuda(self));
+    return unary_float_op_kernel_out(self, out, SiluFunctor());
+}
+
+Tensor& relu6_out_cuda(const Tensor& self, Tensor& out) {
+    if (isQuantizedType(self.dtype()) || isComplexType(self.dtype()))
+        return write_out(out, relu6_kernel_cuda(self));
+    return unary_float_op_kernel_out(self, out, HardtanhFunctor(0.0, 6.0));
+}
+
+Tensor& hardswish_out_cuda(const Tensor& self, Tensor& out) {
+    if (isQuantizedType(self.dtype()) || isComplexType(self.dtype()))
+        return write_out(out, hardswish_kernel_cuda(self));
+    return unary_float_op_kernel_out(self, out, HardswishFunctor());
+}
+
+Tensor& hardsigmoid_out_cuda(const Tensor& self, Tensor& out) {
+    if (isQuantizedType(self.dtype()) || isComplexType(self.dtype()))
+        return write_out(out, hardsigmoid_kernel_cuda(self));
+    return unary_float_op_kernel_out(self, out, HardsigmoidFunctor());
+}
+
+Tensor& mish_out_cuda(const Tensor& self, Tensor& out) {
+    if (isQuantizedType(self.dtype()) || isComplexType(self.dtype()))
+        return write_out(out, mish_kernel_cuda(self));
+    return unary_float_op_kernel_out(self, out, MishFunctor());
+}
+
+Tensor& selu_out_cuda(const Tensor& self, Tensor& out) {
+    if (isQuantizedType(self.dtype()) || isComplexType(self.dtype()))
+        return write_out(out, selu_kernel_cuda(self));
+    return unary_float_op_kernel_out(self, out, SeluFunctor());
+}
+
+Tensor& hardtanh_out_cuda(const Tensor& self, const Scalar& min_val, const Scalar& max_val, Tensor& out) {
+    if (isQuantizedType(self.dtype()) || isComplexType(self.dtype()))
+        return write_out(out, hardtanh_kernel_cuda(self, min_val, max_val));
+    return unary_float_op_kernel_out(self, out, HardtanhFunctor(min_val.toDouble(), max_val.toDouble()));
+}
+
+Tensor& leaky_relu_out_cuda(const Tensor& self, const Scalar& negative_slope, Tensor& out) {
+    if (isQuantizedType(self.dtype()) || isComplexType(self.dtype()))
+        return write_out(out, leaky_relu_kernel_cuda(self, negative_slope));
+    return unary_float_op_kernel_out(self, out, LeakyReluFunctor(negative_slope.toDouble()));
+}
+
+Tensor& elu_out_cuda(const Tensor& self, const Scalar& alpha, const Scalar& scale, const Scalar& input_scale, Tensor& out) {
+    if (isComplexType(self.dtype()))
+        return write_out(out, elu_kernel_cuda(self, alpha, scale, input_scale));
+    return unary_float_op_kernel_out(self, out, EluFunctor(alpha.toDouble(), scale.toDouble(), input_scale.toDouble()));
+}
+
+Tensor& celu_out_cuda(const Tensor& self, const Scalar& alpha, Tensor& out) {
+    if (isComplexType(self.dtype()))
+        return write_out(out, celu_kernel_cuda(self, alpha));
+    return unary_float_op_kernel_out(self, out, CeluFunctor(alpha.toDouble()));
+}
+
 TENSORPLAY_LIBRARY_IMPL(CUDA, PointwiseKernels) {
     m.impl("relu", relu_kernel_cuda);
     m.impl("gelu", gelu_kernel_cuda_v2);
@@ -491,6 +555,16 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, PointwiseKernels) {
     m.impl("mish", mish_kernel_cuda);
     m.impl("mish_backward", mish_backward_kernel_cuda);
     m.impl("selu", selu_kernel_cuda);
+    m.impl("silu.out", silu_out_cuda);
+    m.impl("relu6.out", relu6_out_cuda);
+    m.impl("hardswish.out", hardswish_out_cuda);
+    m.impl("hardsigmoid.out", hardsigmoid_out_cuda);
+    m.impl("mish.out", mish_out_cuda);
+    m.impl("selu.out", selu_out_cuda);
+    m.impl("hardtanh.out", hardtanh_out_cuda);
+    m.impl("leaky_relu.out", leaky_relu_out_cuda);
+    m.impl("elu.out", elu_out_cuda);
+    m.impl("celu.out", celu_out_cuda);
     m.impl("celu", celu_kernel_cuda);
     m.impl("softplus", softplus_kernel_cuda);
     m.impl("softplus_backward", softplus_backward_kernel_cuda);

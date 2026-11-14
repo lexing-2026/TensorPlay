@@ -97,9 +97,9 @@ Tensor& clamp_tensor_out_cuda(const Tensor& self, const std::optional<Tensor>& m
 }
 
 
-Tensor clamp_kernel_cuda(const Tensor& self, const std::optional<Scalar>& min, const std::optional<Scalar>& max) {
-    Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
-    if (self.numel() == 0) return result;
+void clamp_kernel_into_cuda(const Tensor& self, Tensor& result,
+                            const std::optional<Scalar>& min, const std::optional<Scalar>& max) {
+    if (result.numel() == 0) return;
     const bool has_min = min.has_value();
     const bool has_max = max.has_value();
     TensorIterator iter = TensorIteratorConfig()
@@ -124,7 +124,23 @@ Tensor clamp_kernel_cuda(const Tensor& self, const std::optional<Scalar>& min, c
         default: TP_THROW(TypeError, "CUDA clamp: Unsupported dtype");
     }
     #undef CLAMP_CASE
+}
+
+Tensor clamp_kernel_cuda(const Tensor& self, const std::optional<Scalar>& min, const std::optional<Scalar>& max) {
+    Tensor result = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
+    clamp_kernel_into_cuda(self, result, min, max);
     return result;
+}
+
+Tensor& clamp_out_kernel_cuda(const Tensor& self, const std::optional<Scalar>& min,
+                              const std::optional<Scalar>& max, Tensor& out) {
+    if (destination_takes(out, self.device(), self.dtype(),
+                          static_cast<std::vector<int64_t>>(self.shape())) &&
+        read_while_write_is_safe(self, out)) {
+        clamp_kernel_into_cuda(self, out, min, max);
+        return out;
+    }
+    return write_out(out, clamp_kernel_cuda(self, min, max));
 }
 
 Tensor clamp_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self, const std::optional<Scalar>& min, const std::optional<Scalar>& max) {
@@ -167,18 +183,10 @@ Tensor clamp_backward_kernel_cuda(const Tensor& grad_output, const Tensor& self,
 // --- Binary Ops ---
 
 template<typename Functor>
-Tensor binary_float_op_kernel_v2(const Tensor& self, const Tensor& other, Functor functor) {
-    // The operands meet in their common broadcast shape; the iterator reads
-    // each at its own positions of it.
-    const std::vector<int64_t> out_shape = broadcast_shapes(
-        static_cast<std::vector<int64_t>>(self.shape()),
-        static_cast<std::vector<int64_t>>(other.shape()));
-
-    DType out_dtype = self.dtype();
-    if (isIntegralType(out_dtype)) out_dtype = DType::Float32;
-
-    Tensor result = Tensor::empty(out_shape, out_dtype, self.device());
-    if (self.numel() == 0) return result;
+void binary_float_op_kernel_into(const Tensor& self, const Tensor& other, Tensor& result,
+                                 Functor functor) {
+    if (result.numel() == 0) return;
+    const DType out_dtype = result.dtype();
     Tensor a = self.dtype() == out_dtype ? self : self.to(out_dtype);
     Tensor b = other.dtype() == out_dtype ? other : other.to(out_dtype);
     TensorIterator iter = TensorIteratorConfig()
@@ -213,6 +221,21 @@ Tensor binary_float_op_kernel_v2(const Tensor& self, const Tensor& other, Functo
         default:
             TP_THROW(TypeError, "CUDA binary op: Unsupported output dtype");
     }
+}
+
+template<typename Functor>
+Tensor binary_float_op_kernel_v2(const Tensor& self, const Tensor& other, Functor functor) {
+    // The operands meet in their common broadcast shape; the iterator reads
+    // each at its own positions of it.
+    const std::vector<int64_t> out_shape = broadcast_shapes(
+        static_cast<std::vector<int64_t>>(self.shape()),
+        static_cast<std::vector<int64_t>>(other.shape()));
+
+    DType out_dtype = self.dtype();
+    if (isIntegralType(out_dtype)) out_dtype = DType::Float32;
+
+    Tensor result = Tensor::empty(out_shape, out_dtype, self.device());
+    binary_float_op_kernel_into(self, other, result, functor);
     return result;
 }
 
@@ -371,18 +394,74 @@ Tensor pow_scalar_tensor_kernel_cuda(const Scalar& base, const Tensor& exponent)
     return unary_float_op_kernel_v2(
         exponent_cast, PowBaseFunctor{base.toDouble()});
 }
-Tensor atan2_kernel_cuda(const Tensor& self, const Tensor& other) {
-    // The pair is promoted together (a whole-number pair answers in float)
-    // and meets in its common broadcast shape.
-    const std::vector<int64_t> out_shape = broadcast_shapes(
+
+Tensor& pow_tensor_tensor_out_cuda(const Tensor& self, const Tensor& other, Tensor& out) {
+    const bool self_wrapped =
+        self.dim() == 0 && self.unsafeGetTensorImpl()->is_wrapped_number();
+    const bool other_wrapped =
+        other.dim() == 0 && other.unsafeGetTensorImpl()->is_wrapped_number();
+    DType rd = promoteTypes(self.dtype(), other.dtype());
+    if (self_wrapped != other_wrapped) {
+        rd = self_wrapped
+            ? wrapped_scalar_pair_dtype(other.dtype(), self.dtype())
+            : wrapped_scalar_pair_dtype(self.dtype(), other.dtype());
+    }
+    if (isComplexType(rd)) {
+        return write_out(out, pow_kernel_cuda(self, other));
+    }
+    // Same-dtype elementwise path: the answer width follows the promoting
+    // binary kernel (integral pairs answer in Float32).
+    std::vector<int64_t> out_shape = broadcast_shapes(
         static_cast<std::vector<int64_t>>(self.shape()),
         static_cast<std::vector<int64_t>>(other.shape()));
+    DType out_dtype = rd;
+    if (isIntegralType(out_dtype)) out_dtype = DType::Float32;
+    if (destination_takes(out, self.device(), out_dtype, out_shape) &&
+        read_while_write_is_safe(self, out) && read_while_write_is_safe(other, out)) {
+        binary_float_op_kernel_into(self, other, out, PowFunctor());
+        return out;
+    }
+    return write_out(out, pow_kernel_cuda(self, other));
+}
 
-    DType out_dtype = ops::result_type(self, other);
-    if (isIntegralType(out_dtype, /*includeBool=*/true)) out_dtype = DType::Float32;
+Tensor& pow_tensor_scalar_out_cuda(const Tensor& self, const Scalar& exponent, Tensor& out) {
+    if (!isComplexType(self.dtype()) && !exponent.isComplex() &&
+        isIntegralType(self.dtype()) && !exponent.isFloatingPoint() &&
+        exponent.to<int64_t>() < 0) {
+        TP_THROW(RuntimeError, "Integers to negative integer powers are not allowed.");
+    }
+    if (isComplexType(self.dtype()) || exponent.isComplex()) {
+        return write_out(out, pow_scalar_kernel_cuda(self, exponent));
+    }
+    DType out_dtype = self.dtype();
+    if (isIntegralType(out_dtype)) out_dtype = DType::Float32;
+    const auto shape = static_cast<std::vector<int64_t>>(self.shape());
+    if (destination_takes(out, self.device(), out_dtype, shape) &&
+        read_while_write_is_safe(self, out)) {
+        unary_float_op_kernel_into(self, out, PowScalarFunctor(exponent.toDouble()));
+        return out;
+    }
+    return write_out(out, pow_scalar_kernel_cuda(self, exponent));
+}
 
-    Tensor result = Tensor::empty(out_shape, out_dtype, self.device());
-    if (self.numel() == 0) return result;
+Tensor& float_power_tensor_tensor_out_cuda(const Tensor& self, const Tensor& exponent, Tensor& out) {
+    // The pair widens to double width (complex pairs to double complex)
+    // before the power, so the destination width follows that widening.
+    const DType dt = (isComplexType(self.dtype()) || isComplexType(exponent.dtype()))
+                         ? DType::ComplexDouble
+                         : DType::Float64;
+    return pow_tensor_tensor_out_cuda(self.to(dt), exponent.to(dt), out);
+}
+
+Tensor& float_power_tensor_scalar_out_cuda(const Tensor& self, const Scalar& exponent, Tensor& out) {
+    const DType dt = (isComplexType(self.dtype()) || exponent.isComplex())
+                         ? DType::ComplexDouble
+                         : DType::Float64;
+    return pow_tensor_scalar_out_cuda(self.to(dt), exponent, out);
+}
+void atan2_kernel_into_cuda(const Tensor& self, const Tensor& other, Tensor& result,
+                            DType out_dtype) {
+    if (result.numel() == 0) return;
     Tensor a = self.dtype() == out_dtype ? self : self.to(out_dtype);
     Tensor b = other.dtype() == out_dtype ? other : other.to(out_dtype);
     TensorIterator iter = TensorIteratorConfig()
@@ -414,7 +493,36 @@ Tensor atan2_kernel_cuda(const Tensor& self, const Tensor& other) {
             break;
         default: TP_THROW(TypeError, "CUDA atan2: Unsupported output dtype");
     }
+}
+
+Tensor atan2_kernel_cuda(const Tensor& self, const Tensor& other) {
+    // The pair is promoted together (a whole-number pair answers in float)
+    // and meets in its common broadcast shape.
+    const std::vector<int64_t> out_shape = broadcast_shapes(
+        static_cast<std::vector<int64_t>>(self.shape()),
+        static_cast<std::vector<int64_t>>(other.shape()));
+
+    DType out_dtype = ops::result_type(self, other);
+    if (isIntegralType(out_dtype, /*includeBool=*/true)) out_dtype = DType::Float32;
+
+    Tensor result = Tensor::empty(out_shape, out_dtype, self.device());
+    atan2_kernel_into_cuda(self, other, result, out_dtype);
     return result;
+}
+
+Tensor& atan2_out_kernel_cuda(const Tensor& self, const Tensor& other, Tensor& out) {
+    const std::vector<int64_t> out_shape = broadcast_shapes(
+        static_cast<std::vector<int64_t>>(self.shape()),
+        static_cast<std::vector<int64_t>>(other.shape()));
+    DType out_dtype = ops::result_type(self, other);
+    if (isIntegralType(out_dtype, /*includeBool=*/true)) out_dtype = DType::Float32;
+
+    if (destination_takes(out, self.device(), out_dtype, out_shape) &&
+        read_while_write_is_safe(self, out) && read_while_write_is_safe(other, out)) {
+        atan2_kernel_into_cuda(self, other, out, out_dtype);
+        return out;
+    }
+    return write_out(out, atan2_kernel_cuda(self, other));
 }
 
 // --- Lerp ---
@@ -726,6 +834,7 @@ Tensor masked_select_kernel_cuda(const Tensor& self, const Tensor& mask) {
 
 TENSORPLAY_LIBRARY_IMPL(CUDA, PointwiseKernels) {
     m.impl("clamp", clamp_kernel_cuda);
+    m.impl("clamp.out", clamp_out_kernel_cuda);
     m.impl("clamp_backward", clamp_backward_kernel_cuda);
 
         m.impl("clamp.Tensor", clamp_tensor_cuda);
@@ -737,7 +846,12 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, PointwiseKernels) {
     m.impl("pow.Tensor_Tensor", pow_kernel_cuda);
     m.impl("pow.Tensor_Scalar", pow_scalar_kernel_cuda);
     m.impl("pow.Scalar", pow_scalar_tensor_kernel_cuda);
+    m.impl("pow.Tensor_Tensor_out", pow_tensor_tensor_out_cuda);
+    m.impl("pow.Tensor_Scalar_out", pow_tensor_scalar_out_cuda);
+    m.impl("float_power.Tensor_Tensor_out", float_power_tensor_tensor_out_cuda);
+    m.impl("float_power.Tensor_Scalar_out", float_power_tensor_scalar_out_cuda);
     m.impl("atan2", atan2_kernel_cuda);
+    m.impl("atan2.out", atan2_out_kernel_cuda);
 
     m.impl("lerp", lerp_scalar_kernel_cuda);
     m.impl("lerp.Tensor", lerp_tensor_kernel_cuda);

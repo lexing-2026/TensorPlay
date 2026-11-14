@@ -19,6 +19,7 @@
 #include "DType.h"
 #include "Utils.h"
 #include "Exception.h"
+#include "OutWrite.h"
 #include "TypePromotion.h"
 #include "TypeProperties.h"
 #include "CUDALoops.cuh"
@@ -176,10 +177,8 @@ Tensor bitwise_scalar_cuda(const Tensor& self_in, Scalar other, Pred pred, const
     return out;
 }
 
-Tensor bitwise_not_cuda(const Tensor& self) {
-    bitwise_check_cuda(self, "bitwise_not");
-    Tensor out = Tensor::empty(shape_of(self), self.dtype(), self.device());
-    if (out.numel() == 0) return out;
+void bitwise_not_into_cuda(const Tensor& self, Tensor& out) {
+    if (out.numel() == 0) return;
     TensorIterator iter = TensorIteratorConfig()
         .check_all_same_dtype(true)
         .add_output(out)
@@ -189,7 +188,7 @@ Tensor bitwise_not_cuda(const Tensor& self) {
         gpu_kernel(iter, [] __host__ __device__ (bool value) -> bool {
             return !value;
         });
-        return out;
+        return;
     }
 #define TP_BNOT(ctype, name_) \
     case DType::name_: \
@@ -202,6 +201,12 @@ Tensor bitwise_not_cuda(const Tensor& self) {
         default: TP_THROW(TypeError, "bitwise_not: unsupported dtype");
     }
 #undef TP_BNOT
+}
+
+Tensor bitwise_not_cuda(const Tensor& self) {
+    bitwise_check_cuda(self, "bitwise_not");
+    Tensor out = Tensor::empty(shape_of(self), self.dtype(), self.device());
+    bitwise_not_into_cuda(self, out);
     return out;
 }
 
@@ -359,6 +364,18 @@ Tensor& bitwise_assign_out_cuda(Tensor& out, const Tensor& result) {
     return out;
 }
 
+// out= entry: run the flip straight into a destination that already matches
+// the allocating form; everything else computes fresh and transfers over.
+Tensor& bitwise_not_out_cuda(const Tensor& self, Tensor& out) {
+    bitwise_check_cuda(self, "bitwise_not");
+    if (destination_takes(out, self.device(), self.dtype(), shape_of(self)) &&
+        read_while_write_is_safe(self, out)) {
+        bitwise_not_into_cuda(self, out);
+        return out;
+    }
+    return bitwise_assign_out_cuda(out, bitwise_not_cuda(self));
+}
+
 Tensor& bitwise_and_tensor_out_cuda(const Tensor& a, const Tensor& b, Tensor& out) {
     return bitwise_assign_out_cuda(out, bitwise_and_tensor_cuda(a, b));
 }
@@ -394,6 +411,7 @@ Tensor& bitwise_rshift_scalar_out_cuda(const Tensor& a, const Scalar& b, Tensor&
 
 TENSORPLAY_LIBRARY_IMPL(CUDA, BitwiseKernels) {
     m.impl("bitwise_not", bitwise_not_cuda);
+    m.impl("bitwise_not.out", bitwise_not_out_cuda);
     m.impl("bitwise_and.Tensor", bitwise_and_tensor_cuda);
     m.impl("bitwise_or.Tensor", bitwise_or_tensor_cuda);
     m.impl("bitwise_xor.Tensor", bitwise_xor_tensor_cuda);

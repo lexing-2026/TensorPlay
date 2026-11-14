@@ -893,9 +893,8 @@ Tensor logical_binary_cuda(const Tensor& a_in, const Tensor& b_in, Pred pred,
 }
 
 template <typename Pred>
-Tensor logical_unary_cuda(const Tensor& self, Pred pred, const char* name) {
-    Tensor out = Tensor::empty(shape_of(self), DType::Bool, self.device());
-    if (out.numel() == 0) return out;
+void logical_unary_into(const Tensor& self, Tensor& out, Pred pred, const char* name) {
+    if (out.numel() == 0) return;
     TensorIterator iter = TensorIteratorConfig()
         .check_all_same_dtype(false)
         .add_output(out)
@@ -927,15 +926,34 @@ Tensor logical_unary_cuda(const Tensor& self, Pred pred, const char* name) {
     }
 #undef TP_LOGICAL_UNARY
     CUDA_CHECK(cudaGetLastError());
+}
+
+template <typename Pred>
+Tensor logical_unary_cuda(const Tensor& self, Pred pred, const char* name) {
+    Tensor out = Tensor::empty(shape_of(self), DType::Bool, self.device());
+    logical_unary_into(self, out, pred, name);
     return out;
+}
+
+// out= entry for the boolean unary family; the destination has to carry the
+// bool width the allocating form produces.
+template <typename Pred>
+Tensor& logical_unary_out(const Tensor& self, Tensor& out, Pred pred, const char* name) {
+    if (destination_takes(out, self.device(), DType::Bool, shape_of(self)) &&
+        read_while_write_is_safe(self, out)) {
+        logical_unary_into(self, out, pred, name);
+        return out;
+    }
+    return write_out(out, logical_unary_cuda(self, pred, name));
 }
 
 // Dtype-preserving unary.
 
+// Dtype-preserving unary, destination form: the caller supplies a buffer
+// already matching the allocating shape and width.
 template <typename F>
-Tensor dtype_unary_cuda(const Tensor& self, F f, const char* name) {
-    Tensor out = Tensor::empty(shape_of(self), self.dtype(), self.device());
-    if (self.numel() == 0) return out;
+void dtype_unary_into(const Tensor& self, Tensor& out, F f, const char* name) {
+    if (self.numel() == 0) return;
     TensorIterator iter = TensorIteratorConfig()
         .check_all_same_dtype(true)
         .add_output(out)
@@ -953,7 +971,26 @@ Tensor dtype_unary_cuda(const Tensor& self, F f, const char* name) {
     }
 #undef TP_DU
     CUDA_CHECK(cudaGetLastError());
+}
+
+template <typename F>
+Tensor dtype_unary_cuda(const Tensor& self, F f, const char* name) {
+    Tensor out = Tensor::empty(shape_of(self), self.dtype(), self.device());
+    dtype_unary_into(self, out, f, name);
     return out;
+}
+
+// out= entry: write straight into a buffer that already matches the
+// allocating form; anything needing a resize, a cast or an unsafe overlap
+// keeps the compute-and-hand-over route.
+template <typename F>
+Tensor& dtype_unary_out(const Tensor& self, Tensor& out, F f, const char* name) {
+    if (destination_takes(out, self.device(), self.dtype(), shape_of(self)) &&
+        read_while_write_is_safe(self, out)) {
+        dtype_unary_into(self, out, f, name);
+        return out;
+    }
+    return write_out(out, dtype_unary_cuda(self, f, name));
 }
 
 // Math unary: f: double->double. Integral->Float32; Half/BF16 compute in
@@ -979,23 +1016,22 @@ struct has_runf : std::bool_constant<has_runf_n<F, float>::value> {};
 template <typename F>
 struct has_runf2 : std::bool_constant<has_runf_n<F, float, float>::value> {};
 
+// Destination form of the math unary: the caller supplies a buffer already
+// sized to the allocating form's width.  Half and bfloat16 widen and narrow
+// inside the single launch; integral inputs are staged through the float
+// compute width first.
 template <typename F>
-Tensor float_math_cuda(const Tensor& self, F f, const char* name) {
+void float_math_into(const Tensor& self, Tensor& out, F f) {
+    if (out.numel() == 0) return;
     DType in = self.dtype();
-    DType out_dt = isFloatingType(in) ? in : DType::Float32;
     DType compute_dt = (in == DType::Float64) ? DType::Float64 : DType::Float32;
-    // Half and bfloat16 keep their own buffers.  Widening inside the kernel
-    // leaves one launch and one pass over memory; staging through a float
-    // tensor costs two extra launches and twice the traffic.
-    if (out_dt != compute_dt) {
-        Tensor out = Tensor::empty(shape_of(self), out_dt, self.device());
-        if (self.numel() == 0) return out;
+    if (out.dtype() != compute_dt) {
         TensorIterator iter = TensorIteratorConfig()
             .check_all_same_dtype(true)
             .add_output(out)
             .add_const_input(self)
             .build();
-        if (out_dt == DType::Float16) {
+        if (out.dtype() == DType::Float16) {
             gpu_kernel(iter, [f] __host__ __device__(Half x) -> Half {
                 if constexpr (has_runf<F>::value)
                     return static_cast<Half>(f.runf(static_cast<float>(x)));
@@ -1011,32 +1047,54 @@ Tensor float_math_cuda(const Tensor& self, F f, const char* name) {
             });
         }
         CUDA_CHECK(cudaGetLastError());
-        return out;
+        return;
     }
     Tensor w = (in == compute_dt) ? self : self.to(compute_dt);
-    Tensor t = Tensor::empty(shape_of(w), compute_dt, w.device());
-    if (w.numel() > 0) {
-        TensorIterator iter = TensorIteratorConfig()
-            .check_all_same_dtype(true)
-            .add_output(t)
-            .add_const_input(w)
-            .build();
-        if (compute_dt == DType::Float64) {
-            gpu_kernel(iter, [f] __host__ __device__(double x) -> double {
-                return f(x);
-            });
-        } else if constexpr (has_runf<F>::value) {
-            gpu_kernel(iter, [f] __host__ __device__(float x) -> float {
-                return f.runf(x);
-            });
-        } else {
-            gpu_kernel(iter, [f] __host__ __device__(float x) -> float {
-                return static_cast<float>(f(static_cast<double>(x)));
-            });
-        }
-        CUDA_CHECK(cudaGetLastError());
+    TensorIterator iter = TensorIteratorConfig()
+        .check_all_same_dtype(true)
+        .add_output(out)
+        .add_const_input(w)
+        .build();
+    if (compute_dt == DType::Float64) {
+        gpu_kernel(iter, [f] __host__ __device__(double x) -> double {
+            return f(x);
+        });
+    } else if constexpr (has_runf<F>::value) {
+        gpu_kernel(iter, [f] __host__ __device__(float x) -> float {
+            return f.runf(x);
+        });
+    } else {
+        gpu_kernel(iter, [f] __host__ __device__(float x) -> float {
+            return static_cast<float>(f(static_cast<double>(x)));
+        });
     }
-    return (out_dt == compute_dt) ? t : t.to(out_dt);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <typename F>
+Tensor float_math_cuda(const Tensor& self, F f, const char* name) {
+    DType in = self.dtype();
+    DType out_dt = isFloatingType(in) ? in : DType::Float32;
+    Tensor out = Tensor::empty(shape_of(self), out_dt, self.device());
+    float_math_into(self, out, f);
+    return out;
+}
+
+// out= entry for the math unary family: same promotion and width rules as
+// the allocating form, with the result written straight into a buffer that
+// already matches it.  A destination needing a resize, a cast, or that
+// overlaps the operand in an unsafe way keeps the compute-and-hand-over
+// route.
+template <typename F>
+Tensor& float_math_out(const Tensor& self, Tensor& out, F f, const char* name) {
+    DType in = self.dtype();
+    DType out_dt = isFloatingType(in) ? in : DType::Float32;
+    if (destination_takes(out, self.device(), out_dt, shape_of(self)) &&
+        read_while_write_is_safe(self, out)) {
+        float_math_into(self, out, f);
+        return out;
+    }
+    return write_out(out, float_math_cuda(self, f, name));
 }
 
 // Math binary with floating promotion.

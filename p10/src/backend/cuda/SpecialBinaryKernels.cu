@@ -1,12 +1,15 @@
 #include "SpecialKernelUtils.cuh"
 
 #include <SpecialMath.h>
+#include "OutWrite.h"
 
 namespace tensorplay::cuda {
 namespace {
 
 using special_detail::binary_float_cuda;
+using special_detail::shape_of;
 using special_detail::typed_binary_cuda;
+using special_detail::TypedMathBinary;
 using tensorplay::special_math::calc_xlog1py;
 using tensorplay::special_math::calc_xlogy;
 using tensorplay::special_math::chebyshev_polynomial_t_forward;
@@ -109,6 +112,44 @@ Tensor xlogy_cuda(const Tensor& x, const Tensor& y) {
     return typed_binary_cuda(x, y, XLogyFn{});
 }
 
+// out= entries: the answer width is the promoted width the allocating form
+// produces; matching destinations take the pass straight into their buffer.
+template <typename Fn>
+Tensor& typed_binary_out_cuda(const Tensor& x, const Tensor& y, Tensor& out, Fn fn) {
+    DType dtype = promoteTypes(x.dtype(), y.dtype());
+    if (!isFloatingType(dtype)) dtype = DType::Float32;
+    DType compute_dtype = (dtype == DType::Float64) ? DType::Float64 : DType::Float32;
+    const std::vector<int64_t> output_shape =
+        broadcast_shapes(shape_of(x), shape_of(y));
+    if (destination_takes(out, x.device(), dtype, output_shape) &&
+        read_while_write_is_safe(x, out) && read_while_write_is_safe(y, out)) {
+        Tensor lhs = x.to(compute_dtype);
+        Tensor rhs = y.to(compute_dtype);
+        if (out.numel() > 0) {
+            TensorIterator iter = TensorIteratorConfig()
+                .check_all_same_dtype(true)
+                .add_output(out)
+                .add_input(lhs)
+                .add_input(rhs)
+                .build();
+            if (compute_dtype == DType::Float64) {
+                gpu_kernel(iter, TypedMathBinary<Fn, double>{fn});
+            } else {
+                gpu_kernel(iter, TypedMathBinary<Fn, float>{fn});
+            }
+        }
+        return out;
+    }
+    return write_out(out, typed_binary_cuda(x, y, fn));
+}
+
+Tensor& xlog1py_out_cuda(const Tensor& x, const Tensor& y, Tensor& out) {
+    return typed_binary_out_cuda(x, y, out, XLog1pyFn{});
+}
+Tensor& xlogy_out_cuda(const Tensor& x, const Tensor& y, Tensor& out) {
+    return typed_binary_out_cuda(x, y, out, XLogyFn{});
+}
+
 }  // namespace
 
 TENSORPLAY_LIBRARY_IMPL(CUDA, SpecialBinaryKernels) {
@@ -127,6 +168,8 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, SpecialBinaryKernels) {
     m.impl("zeta", zeta_cuda);
     m.impl("xlog1py", xlog1py_cuda);
     m.impl("xlogy", xlogy_cuda);
+    m.impl("xlog1py.OutTensor", xlog1py_out_cuda);
+    m.impl("xlogy.OutTensor", xlogy_out_cuda);
 }
 
 }  // namespace tensorplay::cuda
