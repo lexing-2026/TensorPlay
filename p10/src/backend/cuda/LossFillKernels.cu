@@ -1,11 +1,13 @@
 // nn loss operators - CUDA kernels for the reduction-parameterized family
 // (mse / nll / nll2d / smooth_l1 / huber / bce and their backwards).
 //
-// Conventions match the sibling loss files: elementwise (or
-// one-thread-per-row) kernels write per-element losses into a Float64
-// buffer, an atomicAdd grid reduction sums it, and the scalar finalization
-// happens on the host.  Gradients are one thread per element (or per row)
-// writing into a zeroed result; mean reduction rescales by the contributing
+// Conventions: everything runs in the input's own carry type (half/float
+// accumulate in float, double in double).  Unreduced losses come from an
+// elementwise pass; reduced losses fold the per-element math into a two-stage
+// tree (per-block partials, then one block merges and applies the mean/sum
+// scale), so the scalar stays on the device and a training step never waits
+// on a host round trip.  Gradients are one thread per element (or per row)
+// writing into a result the mean reduction rescales by the contributing
 // count.
 
 #include "Tensor.h"
@@ -43,11 +45,37 @@ inline std::vector<int64_t> shape_of(const Tensor& t) {
     return static_cast<std::vector<int64_t>>(t.shape());
 }
 
+// Upper bound on the first stage's block count, chosen so the partial buffer
+// stays small enough for the second stage to reduce in a single block.
+constexpr int64_t kLossReduceMaxBlocks = 1024;
+constexpr int kLossReduceBlock = 256;
+
 template <typename T>
-__global__ void atomic_sum_kernel_t(int64_t n, const T* in, T* total) {
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-    for (; i < n; i += stride) atomicAdd(total, in[i]);
+__global__ void loss_sum_partial_kernel(int64_t n, const T* in, T* partials) {
+    __shared__ T warp_partials[kLossReduceBlock / 32];
+    const int64_t stride = static_cast<int64_t>(kLossReduceBlock) * gridDim.x;
+    T acc = T(0);
+    for (int64_t i = static_cast<int64_t>(blockIdx.x) * kLossReduceBlock +
+                     threadIdx.x;
+         i < n; i += stride) {
+        acc += in[i];
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xffffffffffffffffull, acc, offset);
+    }
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (lane == 0) warp_partials[warp] = acc;
+    __syncthreads();
+    if (warp == 0) {
+        T total = (lane < kLossReduceBlock / 32) ? warp_partials[lane] : T(0);
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            total += __shfl_down_sync(0xffffffffffffffffull, total, offset);
+        }
+        if (lane == 0) partials[blockIdx.x] = total;
+    }
 }
 
 #define CUDA_CHECK(condition) \
@@ -81,11 +109,6 @@ __global__ void finalize_loss_scalar_kernel(const T* total, T* out, double scale
 // the base address and the element count to be a multiple of four, and a loss
 // may sit on any offset of any shape; the scalar path reads the same bytes in
 // fully coalesced 32-wide transactions either way.
-
-// Upper bound on the first stage's block count, chosen so the partial buffer
-// stays small enough for the second stage to reduce in a single block.
-constexpr int64_t kLossReduceMaxBlocks = 1024;
-constexpr int kLossReduceBlock = 256;
 
 template <typename T>
 __global__ void loss_sq_diff_partial_kernel(int64_t n, const T* x, const T* t,
@@ -143,20 +166,47 @@ __global__ void loss_finish_partials_kernel(int64_t count, const T* partials,
     }
 }
 
-// Host-side reduction for the loss families that still derive their scalar
-// on the CPU (kept for the smooth_l1 / huber / bce rows).
-double host_sum_f64(const Tensor& elems, int64_t n) {
-    Tensor total = Tensor::zeros({1}, DType::Float64, elems.device());
-    if (n > 0) {
-        atomic_sum_kernel_t<double><<<loss_grid(n), kThreads, 0,
-                            getCurrentCUDAStream().stream()>>>(
-            n, elems.data_ptr<double>(), total.data_ptr<double>());
-        CUDA_CHECK(cudaGetLastError());
+// Two-stage device sum over a precomputed per-element loss buffer.  The
+// scalar never crosses to the host: the caller hands back a 0-dim tensor in
+// the loss carry type, cast to the user's dtype only at the very end.
+// `reduction` is 1 (mean) or 2 (sum); the caller handles the unreduced form.
+Tensor reduce_loss_elems(const Tensor& elems, int64_t reduction, int64_t n,
+                         DType in_dtype) {
+    if (reduction != 1 && reduction != 2) {
+        TP_THROW(ValueError, "Invalid reduction mode");
     }
-    double h = 0;
-    CUDA_CHECK(cudaMemcpy(&h, total.data_ptr<double>(), sizeof(double),
-                          cudaMemcpyDeviceToHost));
-    return h;
+    Tensor result = Tensor::empty({}, elems.dtype(), elems.device());
+    const double scale =
+        (reduction == 1 && n) ? 1.0 / static_cast<double>(n) : 1.0;
+    if (n == 0) {
+        result.zero_();
+        return result.to(in_dtype);
+    }
+    const auto stream = getCurrentCUDAStream().stream();
+    const int64_t blocks = std::min<int64_t>(
+        (n + kLossReduceBlock - 1) / kLossReduceBlock, kLossReduceMaxBlocks);
+    Tensor partials = Tensor::empty({blocks}, elems.dtype(), elems.device());
+    if (elems.dtype() == DType::Float64) {
+        loss_sum_partial_kernel<double>
+            <<<static_cast<unsigned>(blocks), kLossReduceBlock, 0, stream>>>(
+                n, elems.data_ptr<double>(), partials.data_ptr<double>());
+        CUDA_CHECK(cudaGetLastError());
+        loss_finish_partials_kernel<double>
+            <<<1, kLossReduceBlock, 0, stream>>>(
+                blocks, partials.data_ptr<double>(),
+                result.data_ptr<double>(), scale);
+    } else {
+        loss_sum_partial_kernel<float>
+            <<<static_cast<unsigned>(blocks), kLossReduceBlock, 0, stream>>>(
+                n, elems.data_ptr<float>(), partials.data_ptr<float>());
+        CUDA_CHECK(cudaGetLastError());
+        loss_finish_partials_kernel<float>
+            <<<1, kLossReduceBlock, 0, stream>>>(
+                blocks, partials.data_ptr<float>(),
+                result.data_ptr<float>(), scale);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return result.to(in_dtype);
 }
 
 // Reduction carry type for a loss input: half/float accumulate in float,
@@ -191,10 +241,6 @@ std::pair<Tensor, Tensor> pair_dev(const Tensor& a, const Tensor& b,
     return {ae.to(target), be.to(target)};
 }
 
-std::pair<Tensor, Tensor> pair_f64_dev(const Tensor& a, const Tensor& b) {
-    return pair_dev(a, b, DType::Float64);
-}
-
 // ---------------------------------------------------------------------------
 // elementwise loss / gradient kernels
 // ---------------------------------------------------------------------------
@@ -210,29 +256,29 @@ __global__ void mse_grad_kernel_t(int64_t n, const T* x, const T* t,
     }
 }
 
-__global__ void smooth_l1_grad_kernel(int64_t n, const double* x, const double* t,
-                                      const double* g, double beta, double norm,
-                                      double* o) {
+template <typename T>
+__global__ void smooth_l1_grad_kernel_t(int64_t n, const T* x, const T* t,
+                                        const T* g, T beta, T norm, T* o) {
     int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t st = static_cast<int64_t>(blockDim.x) * gridDim.x;
     for (; i < n; i += st) {
-        const double d = x[i] - t[i];
-        const double ad = ::fabs(d);
-        const double local = ad <= beta ? d / beta
-                                        : (d > 0.0 ? 1.0 : (d < 0.0 ? -1.0 : 0.0));
+        const T d = x[i] - t[i];
+        const T ad = ::fabs(d);
+        const T local = ad <= beta ? d / beta
+                                   : (d > T(0) ? T(1) : (d < T(0) ? T(-1) : T(0)));
         o[i] = norm * local * g[i];
     }
 }
 
-__global__ void huber_grad_kernel(int64_t n, const double* x, const double* t,
-                                  const double* g, double delta, double norm,
-                                  double* o) {
+template <typename T>
+__global__ void huber_grad_kernel_t(int64_t n, const T* x, const T* t,
+                                    const T* g, T delta, T norm, T* o) {
     int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t st = static_cast<int64_t>(blockDim.x) * gridDim.x;
     for (; i < n; i += st) {
-        const double d = x[i] - t[i];
-        const double ad = ::fabs(d);
-        const double local = ad <= delta ? d : delta * (d > 0.0 ? 1.0 : -1.0);
+        const T d = x[i] - t[i];
+        const T ad = ::fabs(d);
+        const T local = ad <= delta ? d : delta * (d > T(0) ? T(1) : T(-1));
         o[i] = norm * local * g[i];
     }
 }
@@ -241,29 +287,51 @@ __global__ void huber_grad_kernel(int64_t n, const double* x, const double* t,
 // binary_cross_entropy elementwise kernels
 // ---------------------------------------------------------------------------
 
-__global__ void bce_elem_kernel(int64_t n, const double* x, const double* t,
-                                const double* w, bool has_w, double* o) {
+template <typename T>
+__global__ void bce_elem_kernel_t(int64_t n, const T* x, const T* t,
+                                  const T* w, bool has_w, T* o) {
     int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t st = static_cast<int64_t>(blockDim.x) * gridDim.x;
     for (; i < n; i += st) {
         // (t-1) log(1-x) - t log(x), floored at -100 like the elementwise cap
-        const double lx = ::fmax(::log(x[i]), -100.0);
-        const double l1x = ::fmax(::log(1.0 - x[i]), -100.0);
-        double v = (t[i] - 1.0) * l1x - t[i] * lx;
+        const T lx = ::fmax(::log(x[i]), T(-100.0));
+        const T l1x = ::fmax(::log(T(1.0) - x[i]), T(-100.0));
+        T v = (t[i] - T(1.0)) * l1x - t[i] * lx;
         o[i] = has_w ? w[i] * v : v;
     }
 }
 
-__global__ void bce_grad_kernel(int64_t n, const double* x, const double* t,
-                                const double* g, const double* w, bool has_w,
-                                double norm, double* o) {
+template <typename T>
+__global__ void bce_grad_kernel_t(int64_t n, const T* x, const T* t,
+                                  const T* g, const T* w, bool has_w,
+                                  T norm, T* o) {
     int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t st = static_cast<int64_t>(blockDim.x) * gridDim.x;
     for (; i < n; i += st) {
-        const double denom = ::fmax(x[i] * (1.0 - x[i]), 1e-12);
-        double v = g[i] * (x[i] - t[i]) / denom;
+        const T denom = ::fmax(x[i] * (T(1.0) - x[i]), T(1e-12));
+        T v = g[i] * (x[i] - t[i]) / denom;
         if (has_w) v *= w[i];
         o[i] = norm * v;
+    }
+}
+
+// Range gate for the forward: one fused pass over both operands counts the
+// lanes that answer neither bound comparison (a missing measurement falls in
+// that class alongside the two out-of-range sides).  The counters land on the
+// host so the caller can raise a proper exception naming the offending side.
+template <typename T>
+__global__ void bce_check_01_kernel(int64_t n, const T* a, const T* b,
+                                    int64_t* bad) {
+    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t st = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    for (; i < n; i += st) {
+        const T x = a[i];
+        const T y = b[i];
+        const int ax = (x >= T(0) && x <= T(1)) ? 0 : 1;
+        const int by = (y >= T(0) && y <= T(1)) ? 0 : 1;
+        if (ax | by) {
+            atomicAdd(reinterpret_cast<unsigned long long*>(bad + ax), 1ull);
+        }
     }
 }
 
@@ -534,15 +602,6 @@ inline bool is_loss_float(DType t) {
            t == DType::Float16 || t == DType::BFloat16;
 }
 
-inline DType out_scalar_dtype(DType t) {
-    return t == DType::Float64 ? DType::Float64 : DType::Float32;
-}
-
-Tensor f64_dev(const Tensor& t) {
-    const Tensor c = t.is_contiguous() ? t : t.contiguous();
-    return c.dtype() == DType::Float64 ? c : c.to(DType::Float64);
-}
-
 }  // anonymous namespace
 
 // ===========================================================================
@@ -684,9 +743,9 @@ Tensor smooth_l1_loss_cuda(const Tensor& input, const Tensor& target,
         TP_THROW(ValueError,
                  "smooth_l1_loss does not support negative values for beta.");
     }
-    auto pr = pair_f64_dev(input, target);
-    Tensor elems = Tensor::empty(shape_of(pr.first), DType::Float64,
-                                  input.device());
+    const DType acc = loss_accumulate_dtype(input.dtype());
+    auto pr = pair_dev(input, target, acc);
+    Tensor elems = Tensor::empty(shape_of(pr.first), acc, input.device());
     const int64_t n = elems.numel();
     if (n) {
         TensorIterator iter = TensorIteratorConfig()
@@ -695,18 +754,22 @@ Tensor smooth_l1_loss_cuda(const Tensor& input, const Tensor& target,
             .add_const_input(pr.first)
             .add_const_input(pr.second)
             .build();
-        gpu_kernel(iter, [beta] __host__ __device__(double x, double t) -> double {
-            const double d = ::fabs(x - t);
-            return d < beta ? 0.5 * d * d / beta : d - 0.5 * beta;
-        });
+        if (acc == DType::Float64) {
+            gpu_kernel(iter, [beta] __host__ __device__(double x, double t) -> double {
+                const double d = ::fabs(x - t);
+                return d < beta ? 0.5 * d * d / beta : d - 0.5 * beta;
+            });
+        } else {
+            const float fb = static_cast<float>(beta);
+            gpu_kernel(iter, [fb] __host__ __device__(float x, float t) -> float {
+                const float d = ::fabs(x - t);
+                return d < fb ? 0.5f * d * d / fb : d - 0.5f * fb;
+            });
+        }
         CUDA_CHECK(cudaGetLastError());
     }
     if (reduction == 0) return elems.to(input.dtype());
-    const double total = host_sum_f64(elems, n);
-    const double v = reduction == 1 && n ? total / n : total;
-    return Tensor::full({}, Scalar(v), out_scalar_dtype(input.dtype()),
-                         input.device())
-        .to(input.dtype());
+    return reduce_loss_elems(elems, reduction, n, input.dtype());
 }
 
 Tensor smooth_l1_loss_backward_cuda(const Tensor& grad_output,
@@ -716,20 +779,35 @@ Tensor smooth_l1_loss_backward_cuda(const Tensor& grad_output,
         TP_THROW(ValueError,
                  "smooth_l1_loss does not support negative values for beta.");
     }
-    auto pr = pair_f64_dev(input, target);
+    const DType acc = loss_accumulate_dtype(input.dtype());
+    auto pr = pair_dev(input, target, acc);
     // The kernels read grad linearly: materialize its broadcast.
-    const Tensor g = grad_output.shape() == pr.first.shape()
-        ? f64_dev(grad_output)
-        : f64_dev(grad_output.expand(shape_of(pr.first)));
-    Tensor out = Tensor::empty(shape_of(pr.first), DType::Float64,
-                               input.device());
+    const Tensor g = (grad_output.shape() == pr.first.shape()
+                          ? grad_output
+                          : grad_output.expand(shape_of(pr.first)))
+        .contiguous()
+        .to(acc);
+    Tensor out = Tensor::empty(shape_of(pr.first), acc, input.device());
     const int64_t n = out.numel();
     if (n) {
-        const double norm = reduction == 1 ? 1.0 / static_cast<double>(n) : 1.0;
-        smooth_l1_grad_kernel<<<loss_grid(n), kThreads, 0,
-                                getCurrentCUDAStream().stream()>>>(
-            n, pr.first.data_ptr<double>(), pr.second.data_ptr<double>(),
-            g.data_ptr<double>(), beta, norm, out.data_ptr<double>());
+        const auto stream = getCurrentCUDAStream().stream();
+        if (acc == DType::Float64) {
+            const double norm =
+                reduction == 1 ? 1.0 / static_cast<double>(n) : 1.0;
+            smooth_l1_grad_kernel_t<double>
+                <<<loss_grid(n), kThreads, 0, stream>>>(
+                    n, pr.first.data_ptr<double>(),
+                    pr.second.data_ptr<double>(), g.data_ptr<double>(), beta,
+                    norm, out.data_ptr<double>());
+        } else {
+            const float norm =
+                reduction == 1 ? 1.0f / static_cast<float>(n) : 1.0f;
+            smooth_l1_grad_kernel_t<float>
+                <<<loss_grid(n), kThreads, 0, stream>>>(
+                    n, pr.first.data_ptr<float>(),
+                    pr.second.data_ptr<float>(), g.data_ptr<float>(),
+                    static_cast<float>(beta), norm, out.data_ptr<float>());
+        }
         CUDA_CHECK(cudaGetLastError());
     }
     return out.to(input.dtype());
@@ -745,9 +823,9 @@ Tensor huber_loss_cuda(const Tensor& input, const Tensor& target,
         TP_THROW(ValueError,
                  "huber_loss does not support non-positive values for delta.");
     }
-    auto pr = pair_f64_dev(input, target);
-    Tensor elems = Tensor::empty(shape_of(pr.first), DType::Float64,
-                                  input.device());
+    const DType acc = loss_accumulate_dtype(input.dtype());
+    auto pr = pair_dev(input, target, acc);
+    Tensor elems = Tensor::empty(shape_of(pr.first), acc, input.device());
     const int64_t n = elems.numel();
     if (n) {
         TensorIterator iter = TensorIteratorConfig()
@@ -756,37 +834,56 @@ Tensor huber_loss_cuda(const Tensor& input, const Tensor& target,
             .add_const_input(pr.first)
             .add_const_input(pr.second)
             .build();
-        gpu_kernel(iter, [delta] __host__ __device__(double x, double t) -> double {
-            const double d = ::fabs(x - t);
-            return d < delta ? 0.5 * d * d : delta * (d - 0.5 * delta);
-        });
+        if (acc == DType::Float64) {
+            gpu_kernel(iter, [delta] __host__ __device__(double x, double t) -> double {
+                const double d = ::fabs(x - t);
+                return d < delta ? 0.5 * d * d : delta * (d - 0.5 * delta);
+            });
+        } else {
+            const float fd = static_cast<float>(delta);
+            gpu_kernel(iter, [fd] __host__ __device__(float x, float t) -> float {
+                const float d = ::fabs(x - t);
+                return d < fd ? 0.5f * d * d : fd * (d - 0.5f * fd);
+            });
+        }
         CUDA_CHECK(cudaGetLastError());
     }
     if (reduction == 0) return elems.to(input.dtype());
-    const double total = host_sum_f64(elems, n);
-    const double v = reduction == 1 && n ? total / n : total;
-    return Tensor::full({}, Scalar(v), out_scalar_dtype(input.dtype()),
-                         input.device())
-        .to(input.dtype());
+    return reduce_loss_elems(elems, reduction, n, input.dtype());
 }
 
 Tensor huber_loss_backward_cuda(const Tensor& grad_output,
                                 const Tensor& input, const Tensor& target,
                                 int64_t reduction, double delta) {
-    auto pr = pair_f64_dev(input, target);
+    const DType acc = loss_accumulate_dtype(input.dtype());
+    auto pr = pair_dev(input, target, acc);
     // The kernels read grad linearly: materialize its broadcast.
-    const Tensor g = grad_output.shape() == pr.first.shape()
-        ? f64_dev(grad_output)
-        : f64_dev(grad_output.expand(shape_of(pr.first)));
-    Tensor out = Tensor::empty(shape_of(pr.first), DType::Float64,
-                               input.device());
+    const Tensor g = (grad_output.shape() == pr.first.shape()
+                          ? grad_output
+                          : grad_output.expand(shape_of(pr.first)))
+        .contiguous()
+        .to(acc);
+    Tensor out = Tensor::empty(shape_of(pr.first), acc, input.device());
     const int64_t n = out.numel();
     if (n) {
-        const double norm = reduction == 1 ? 1.0 / static_cast<double>(n) : 1.0;
-        huber_grad_kernel<<<loss_grid(n), kThreads, 0,
-                            getCurrentCUDAStream().stream()>>>(
-            n, pr.first.data_ptr<double>(), pr.second.data_ptr<double>(),
-            g.data_ptr<double>(), delta, norm, out.data_ptr<double>());
+        const auto stream = getCurrentCUDAStream().stream();
+        if (acc == DType::Float64) {
+            const double norm =
+                reduction == 1 ? 1.0 / static_cast<double>(n) : 1.0;
+            huber_grad_kernel_t<double>
+                <<<loss_grid(n), kThreads, 0, stream>>>(
+                    n, pr.first.data_ptr<double>(),
+                    pr.second.data_ptr<double>(), g.data_ptr<double>(), delta,
+                    norm, out.data_ptr<double>());
+        } else {
+            const float norm =
+                reduction == 1 ? 1.0f / static_cast<float>(n) : 1.0f;
+            huber_grad_kernel_t<float>
+                <<<loss_grid(n), kThreads, 0, stream>>>(
+                    n, pr.first.data_ptr<float>(),
+                    pr.second.data_ptr<float>(), g.data_ptr<float>(),
+                    static_cast<float>(delta), norm, out.data_ptr<float>());
+        }
         CUDA_CHECK(cudaGetLastError());
     }
     return out.to(input.dtype());
@@ -798,16 +895,36 @@ Tensor huber_loss_backward_cuda(const Tensor& grad_output,
 
 namespace {
 
-// Validates the 0/1 domain on the host by summing out-of-range indicators.
-// Counting the lanes strictly below or above the bounds lets a lane that is
-// not a number through, since it answers neither comparison, so the probe for
-// a missing measurement is summed alongside the two bounds.
-void bce_check_01_cuda(const Tensor& t, const char* what) {
-    if (t.numel() == 0) return;
-    Tensor bad = (t.lt(Scalar(0.0)) + t.gt(Scalar(1.0)) + Tensor::isnan(t)).sum();
-    if (bad.item().to<double>() > 0) {
-        TP_THROW(RuntimeError, std::string("all elements of ") + what +
-                 " should be between 0 and 1");
+// Validates the 0/1 domain of both operands in one fused pass.  Counting the
+// lanes strictly below or above the bounds lets a lane that is not a number
+// through, since it answers neither comparison, so the probe for a missing
+// measurement is summed alongside the two bounds.  The kernel works on the
+// converted operands, whose value classes match the originals.
+void bce_check_01_pair_cuda(const Tensor& x, const Tensor& t, DType acc) {
+    const int64_t n = x.numel();
+    if (n == 0) return;
+    Tensor bad = Tensor::zeros({2}, DType::Int64, x.device());
+    const auto stream = getCurrentCUDAStream().stream();
+    if (acc == DType::Float64) {
+        bce_check_01_kernel<double><<<loss_grid(n), kThreads, 0, stream>>>(
+            n, x.data_ptr<double>(), t.data_ptr<double>(),
+            bad.data_ptr<int64_t>());
+    } else {
+        bce_check_01_kernel<float><<<loss_grid(n), kThreads, 0, stream>>>(
+            n, x.data_ptr<float>(), t.data_ptr<float>(),
+            bad.data_ptr<int64_t>());
+    }
+    CUDA_CHECK(cudaGetLastError());
+    int64_t counts[2] = {0, 0};
+    CUDA_CHECK(cudaMemcpy(counts, bad.data_ptr<int64_t>(), sizeof(counts),
+                          cudaMemcpyDeviceToHost));
+    if (counts[0] > 0) {
+        TP_THROW(RuntimeError,
+                 "all elements of input should be between 0 and 1");
+    }
+    if (counts[1] > 0) {
+        TP_THROW(RuntimeError,
+                 "all elements of target should be between 0 and 1");
     }
 }
 
@@ -820,28 +937,33 @@ Tensor binary_cross_entropy_cuda(const Tensor& input, const Tensor& target,
         TP_THROW(NotImplementedError,
                  "binary_cross_entropy CUDA supports floating dtypes only");
     }
-    bce_check_01_cuda(input, "input");
-    bce_check_01_cuda(target, "target");
-    auto pr = pair_f64_dev(input, target);
+    const DType acc = loss_accumulate_dtype(input.dtype());
+    auto pr = pair_dev(input, target, acc);
+    bce_check_01_pair_cuda(pr.first, pr.second, acc);
     const bool has_w = weight_opt.has_value() && weight_opt->defined();
-    Tensor w = has_w ? f64_dev(weight_opt->expand(shape_of(pr.first)))
-                     : pr.first;  // dummy pointer when absent
-    Tensor elems = Tensor::empty(shape_of(pr.first), DType::Float64,
-                                  input.device());
+    Tensor w;
+    if (has_w) {
+        w = weight_opt->expand(shape_of(pr.first)).contiguous().to(acc);
+    }
+    Tensor elems = Tensor::empty(shape_of(pr.first), acc, input.device());
     const int64_t n = elems.numel();
     if (n) {
-        bce_elem_kernel<<<loss_grid(n), kThreads, 0,
-                          getCurrentCUDAStream().stream()>>>(
-            n, pr.first.data_ptr<double>(), pr.second.data_ptr<double>(),
-            w.data_ptr<double>(), has_w, elems.data_ptr<double>());
+        const auto stream = getCurrentCUDAStream().stream();
+        if (acc == DType::Float64) {
+            bce_elem_kernel_t<double><<<loss_grid(n), kThreads, 0, stream>>>(
+                n, pr.first.data_ptr<double>(), pr.second.data_ptr<double>(),
+                has_w ? w.data_ptr<double>() : nullptr, has_w,
+                elems.data_ptr<double>());
+        } else {
+            bce_elem_kernel_t<float><<<loss_grid(n), kThreads, 0, stream>>>(
+                n, pr.first.data_ptr<float>(), pr.second.data_ptr<float>(),
+                has_w ? w.data_ptr<float>() : nullptr, has_w,
+                elems.data_ptr<float>());
+        }
         CUDA_CHECK(cudaGetLastError());
     }
     if (reduction == 0) return elems.to(input.dtype());
-    const double total = host_sum_f64(elems, n);
-    const double v = reduction == 1 && n ? total / n : total;
-    return Tensor::full({}, Scalar(v), out_scalar_dtype(input.dtype()),
-                         input.device())
-        .to(input.dtype());
+    return reduce_loss_elems(elems, reduction, n, input.dtype());
 }
 
 Tensor binary_cross_entropy_backward_cuda(const Tensor& grad_output,
@@ -849,24 +971,38 @@ Tensor binary_cross_entropy_backward_cuda(const Tensor& grad_output,
                                           const Tensor& target,
                                           const std::optional<Tensor>& weight_opt,
                                           int64_t reduction) {
-    auto pr = pair_f64_dev(input, target);
+    const DType acc = loss_accumulate_dtype(input.dtype());
+    auto pr = pair_dev(input, target, acc);
     // The kernels read grad linearly: materialize its broadcast.
-    const Tensor g = grad_output.shape() == pr.first.shape()
-        ? f64_dev(grad_output)
-        : f64_dev(grad_output.expand(shape_of(pr.first)));
+    const Tensor g = (grad_output.shape() == pr.first.shape()
+                          ? grad_output
+                          : grad_output.expand(shape_of(pr.first)))
+        .contiguous()
+        .to(acc);
     const bool has_w = weight_opt.has_value() && weight_opt->defined();
-    Tensor w = has_w ? f64_dev(weight_opt->expand(shape_of(pr.first)))
-                     : pr.first;
-    Tensor out = Tensor::empty(shape_of(pr.first), DType::Float64,
-                               input.device());
+    Tensor w;
+    if (has_w) {
+        w = weight_opt->expand(shape_of(pr.first)).contiguous().to(acc);
+    }
+    Tensor out = Tensor::empty(shape_of(pr.first), acc, input.device());
     const int64_t n = out.numel();
     if (n) {
-        const double norm = reduction == 1 ? 1.0 / static_cast<double>(n) : 1.0;
-        bce_grad_kernel<<<loss_grid(n), kThreads, 0,
-                          getCurrentCUDAStream().stream()>>>(
-            n, pr.first.data_ptr<double>(), pr.second.data_ptr<double>(),
-            g.data_ptr<double>(), w.data_ptr<double>(), has_w, norm,
-            out.data_ptr<double>());
+        const auto stream = getCurrentCUDAStream().stream();
+        if (acc == DType::Float64) {
+            const double norm =
+                reduction == 1 ? 1.0 / static_cast<double>(n) : 1.0;
+            bce_grad_kernel_t<double><<<loss_grid(n), kThreads, 0, stream>>>(
+                n, pr.first.data_ptr<double>(), pr.second.data_ptr<double>(),
+                g.data_ptr<double>(), has_w ? w.data_ptr<double>() : nullptr,
+                has_w, norm, out.data_ptr<double>());
+        } else {
+            const float norm =
+                reduction == 1 ? 1.0f / static_cast<float>(n) : 1.0f;
+            bce_grad_kernel_t<float><<<loss_grid(n), kThreads, 0, stream>>>(
+                n, pr.first.data_ptr<float>(), pr.second.data_ptr<float>(),
+                g.data_ptr<float>(), has_w ? w.data_ptr<float>() : nullptr,
+                has_w, norm, out.data_ptr<float>());
+        }
         CUDA_CHECK(cudaGetLastError());
     }
     return out.to(input.dtype());

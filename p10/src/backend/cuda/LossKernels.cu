@@ -45,14 +45,23 @@ Tensor mean_from_elems(const Tensor& elems, int64_t n, DType dt, const Device& d
     return result.dtype() == out_dtype ? result : result.to(out_dtype);
 }
 
-std::pair<Tensor, Tensor> pair_f64_dev(const Tensor& a, const Tensor& b) {
-    std::vector<int64_t> shape = broadcast_shapes(shape_of(a), shape_of(b));
-    return {a.expand(shape).contiguous().to(DType::Float64),
-            b.expand(shape).contiguous().to(DType::Float64)};
+// Loss carry type: half/float accumulate in float, everything else in double.
+inline DType loss_carry_dtype(DType t) {
+    return (t == DType::Float32 || t == DType::Float16 || t == DType::BFloat16)
+        ? DType::Float32
+        : DType::Float64;
 }
 
-Tensor expand_f64_dev(const Tensor& a, const std::vector<int64_t>& shape) {
-    return a.expand(shape).contiguous().to(DType::Float64);
+std::pair<Tensor, Tensor> pair_carry_dev(const Tensor& a, const Tensor& b,
+                                         DType acc) {
+    std::vector<int64_t> shape = broadcast_shapes(shape_of(a), shape_of(b));
+    return {a.expand(shape).contiguous().to(acc),
+            b.expand(shape).contiguous().to(acc)};
+}
+
+Tensor expand_carry_dev(const Tensor& a, const std::vector<int64_t>& shape,
+                        DType acc) {
+    return a.expand(shape).contiguous().to(acc);
 }
 
 void tp_validate_reduction(int64_t reduction) {
@@ -82,6 +91,10 @@ __host__ __device__ inline double dsp(double y) {
     return ::fmax(y, 0.0) + ::log1p(::exp(-::fabs(y)));
 }
 
+__host__ __device__ inline float dspf(float y) {
+    return ::fmaxf(y, 0.0f) + ::log1pf(::expf(-::fabsf(y)));
+}
+
 } // anonymous namespace
 
 // ===========================================================================
@@ -89,8 +102,9 @@ __host__ __device__ inline double dsp(double y) {
 // ===========================================================================
 
 Tensor l1_loss_cuda(const Tensor& input, const Tensor& target) {
-    auto pr = pair_f64_dev(input, target);
-    Tensor elems = Tensor::empty(shape_of(pr.first), DType::Float64, input.device());
+    const DType acc = loss_carry_dtype(input.dtype());
+    auto pr = pair_carry_dev(input, target, acc);
+    Tensor elems = Tensor::empty(shape_of(pr.first), acc, input.device());
     int64_t n = elems.numel();
     if (n) {
         TensorIterator iter = TensorIteratorConfig()
@@ -99,17 +113,24 @@ Tensor l1_loss_cuda(const Tensor& input, const Tensor& target) {
             .add_const_input(pr.first)
             .add_const_input(pr.second)
             .build();
-        gpu_kernel(iter, [] __host__ __device__(double a, double b) -> double {
-            return ::fabs(a - b);
-        });
+        if (acc == DType::Float64) {
+            gpu_kernel(iter, [] __host__ __device__(double a, double b) -> double {
+                return ::fabs(a - b);
+            });
+        } else {
+            gpu_kernel(iter, [] __host__ __device__(float a, float b) -> float {
+                return ::fabs(a - b);
+            });
+        }
         CUDA_CHECK(cudaGetLastError());
     }
     return mean_from_elems(elems, n, input.dtype(), input.device());
 }
 
 Tensor kl_div_cuda(const Tensor& input, const Tensor& target) {
-    auto pr = pair_f64_dev(input, target);
-    Tensor elems = Tensor::empty(shape_of(pr.first), DType::Float64, input.device());
+    const DType acc = loss_carry_dtype(input.dtype());
+    auto pr = pair_carry_dev(input, target, acc);
+    Tensor elems = Tensor::empty(shape_of(pr.first), acc, input.device());
     int64_t n = elems.numel();
     if (n) {
         TensorIterator iter = TensorIteratorConfig()
@@ -118,9 +139,15 @@ Tensor kl_div_cuda(const Tensor& input, const Tensor& target) {
             .add_const_input(pr.first)
             .add_const_input(pr.second)
             .build();
-        gpu_kernel(iter, [] __host__ __device__(double x, double t) -> double {
-            return t > 0 ? t * (::log(t) - x) : 0.0;
-        });
+        if (acc == DType::Float64) {
+            gpu_kernel(iter, [] __host__ __device__(double x, double t) -> double {
+                return t > 0 ? t * (::log(t) - x) : 0.0;
+            });
+        } else {
+            gpu_kernel(iter, [] __host__ __device__(float x, float t) -> float {
+                return t > 0.0f ? t * (::log(t) - x) : 0.0f;
+            });
+        }
         CUDA_CHECK(cudaGetLastError());
     }
     return mean_from_elems(elems, n, input.dtype(), input.device());
@@ -131,14 +158,15 @@ Tensor binary_cross_entropy_with_logits_cuda(const Tensor& self, const Tensor& t
                                              const std::optional<Tensor>& pos_weight_opt) {
     Tensor weight = weight_opt.value_or(Tensor());
     Tensor pos_weight = pos_weight_opt.value_or(Tensor());
-    auto pr = pair_f64_dev(self, target);
+    const DType acc = loss_carry_dtype(self.dtype());
+    auto pr = pair_carry_dev(self, target, acc);
     bool has_w = weight.defined() && weight.numel() > 0;
     bool has_pw = pos_weight.defined() && pos_weight.numel() > 0;
-    Tensor w = has_w ? expand_f64_dev(weight, shape_of(pr.first))
+    Tensor w = has_w ? expand_carry_dev(weight, shape_of(pr.first), acc)
                      : pr.first;  // dummy pointer when absent
-    Tensor pw = has_pw ? expand_f64_dev(pos_weight, shape_of(pr.first))
+    Tensor pw = has_pw ? expand_carry_dev(pos_weight, shape_of(pr.first), acc)
                        : pr.first;
-    Tensor elems = Tensor::empty(shape_of(pr.first), DType::Float64, self.device());
+    Tensor elems = Tensor::empty(shape_of(pr.first), acc, self.device());
     int64_t n = elems.numel();
     if (n) {
         TensorIterator iter = TensorIteratorConfig()
@@ -149,20 +177,30 @@ Tensor binary_cross_entropy_with_logits_cuda(const Tensor& self, const Tensor& t
             .add_const_input(w)
             .add_const_input(pw)
             .build();
-        gpu_kernel(iter, [has_w, has_pw] __host__ __device__(
-            double x, double t, double wv, double pwv) -> double {
-            const double wi = has_w ? wv : 1.0;
-            const double pi = has_pw ? pwv : 1.0;
-            return wi * (pi * t * dsp(-x) + (1.0 - t) * dsp(x));
-        });
+        if (acc == DType::Float64) {
+            gpu_kernel(iter, [has_w, has_pw] __host__ __device__(
+                double x, double t, double wv, double pwv) -> double {
+                const double wi = has_w ? wv : 1.0;
+                const double pi = has_pw ? pwv : 1.0;
+                return wi * (pi * t * dsp(-x) + (1.0 - t) * dsp(x));
+            });
+        } else {
+            gpu_kernel(iter, [has_w, has_pw] __host__ __device__(
+                float x, float t, float wv, float pwv) -> float {
+                const float wi = has_w ? wv : 1.0f;
+                const float pi = has_pw ? pwv : 1.0f;
+                return wi * (pi * t * dspf(-x) + (1.0f - t) * dspf(x));
+            });
+        }
         CUDA_CHECK(cudaGetLastError());
     }
     return mean_from_elems(elems, n, self.dtype(), self.device());
 }
 
 Tensor hinge_embedding_loss_cuda(const Tensor& input, const Tensor& target, const Scalar& margin) {
-    auto pr = pair_f64_dev(input, target);
-    Tensor elems = Tensor::empty(shape_of(pr.first), DType::Float64, input.device());
+    const DType acc = loss_carry_dtype(input.dtype());
+    auto pr = pair_carry_dev(input, target, acc);
+    Tensor elems = Tensor::empty(shape_of(pr.first), acc, input.device());
     int64_t n = elems.numel();
     if (n) {
         const double margin_value = margin.toDouble();
@@ -172,11 +210,19 @@ Tensor hinge_embedding_loss_cuda(const Tensor& input, const Tensor& target, cons
             .add_const_input(pr.first)
             .add_const_input(pr.second)
             .build();
-        gpu_kernel(iter, [margin_value] __host__ __device__(double x, double t) -> double {
-            // where(t != 1, relu(margin - x), 0) + where(t != -1, x, 0)
-            return ((t != 1.0) ? ::fmax(0.0, margin_value - x) : 0.0)
-                 + ((t != -1.0) ? x : 0.0);
-        });
+        if (acc == DType::Float64) {
+            gpu_kernel(iter, [margin_value] __host__ __device__(double x, double t) -> double {
+                // where(t != 1, relu(margin - x), 0) + where(t != -1, x, 0)
+                return ((t != 1.0) ? ::fmax(0.0, margin_value - x) : 0.0)
+                     + ((t != -1.0) ? x : 0.0);
+            });
+        } else {
+            const float margin_f = static_cast<float>(margin_value);
+            gpu_kernel(iter, [margin_f] __host__ __device__(float x, float t) -> float {
+                return ((t != 1.0f) ? ::fmaxf(0.0f, margin_f - x) : 0.0f)
+                     + ((t != -1.0f) ? x : 0.0f);
+            });
+        }
         CUDA_CHECK(cudaGetLastError());
     }
     return mean_from_elems(elems, n, input.dtype(), input.device());
@@ -184,9 +230,10 @@ Tensor hinge_embedding_loss_cuda(const Tensor& input, const Tensor& target, cons
 
 Tensor margin_ranking_loss_cuda(const Tensor& input1, const Tensor& input2,
                                 const Tensor& target, const Scalar& margin) {
-    auto pr = pair_f64_dev(input1, input2);
-    Tensor tg = expand_f64_dev(target, shape_of(pr.first));
-    Tensor elems = Tensor::empty(shape_of(pr.first), DType::Float64, input1.device());
+    const DType acc = loss_carry_dtype(input1.dtype());
+    auto pr = pair_carry_dev(input1, input2, acc);
+    Tensor tg = expand_carry_dev(target, shape_of(pr.first), acc);
+    Tensor elems = Tensor::empty(shape_of(pr.first), acc, input1.device());
     int64_t n = elems.numel();
     if (n) {
         const double margin_value = margin.toDouble();
@@ -197,18 +244,27 @@ Tensor margin_ranking_loss_cuda(const Tensor& input1, const Tensor& input2,
             .add_const_input(pr.second)
             .add_const_input(tg)
             .build();
-        gpu_kernel(iter, [margin_value] __host__ __device__(
-            double a, double b, double target_value) -> double {
-            return ::fmax(0.0, margin_value - target_value * (a - b));
-        });
+        if (acc == DType::Float64) {
+            gpu_kernel(iter, [margin_value] __host__ __device__(
+                double a, double b, double target_value) -> double {
+                return ::fmax(0.0, margin_value - target_value * (a - b));
+            });
+        } else {
+            const float margin_f = static_cast<float>(margin_value);
+            gpu_kernel(iter, [margin_f] __host__ __device__(
+                float a, float b, float target_value) -> float {
+                return ::fmaxf(0.0f, margin_f - target_value * (a - b));
+            });
+        }
         CUDA_CHECK(cudaGetLastError());
     }
     return mean_from_elems(elems, n, input1.dtype(), input1.device());
 }
 
 Tensor soft_margin_loss_cuda(const Tensor& input, const Tensor& target) {
-    auto pr = pair_f64_dev(input, target);
-    Tensor elems = Tensor::empty(shape_of(pr.first), DType::Float64, input.device());
+    const DType acc = loss_carry_dtype(input.dtype());
+    auto pr = pair_carry_dev(input, target, acc);
+    Tensor elems = Tensor::empty(shape_of(pr.first), acc, input.device());
     int64_t n = elems.numel();
     if (n) {
         TensorIterator iter = TensorIteratorConfig()
@@ -217,9 +273,15 @@ Tensor soft_margin_loss_cuda(const Tensor& input, const Tensor& target) {
             .add_const_input(pr.first)
             .add_const_input(pr.second)
             .build();
-        gpu_kernel(iter, [] __host__ __device__(double x, double t) -> double {
-            return dsp(-t * x);
-        });
+        if (acc == DType::Float64) {
+            gpu_kernel(iter, [] __host__ __device__(double x, double t) -> double {
+                return dsp(-t * x);
+            });
+        } else {
+            gpu_kernel(iter, [] __host__ __device__(float x, float t) -> float {
+                return dspf(-t * x);
+            });
+        }
         CUDA_CHECK(cudaGetLastError());
     }
     return mean_from_elems(elems, n, input.dtype(), input.device());
@@ -227,8 +289,9 @@ Tensor soft_margin_loss_cuda(const Tensor& input, const Tensor& target) {
 
 Tensor poisson_nll_loss_cuda(const Tensor& input, const Tensor& target, bool log_input,
                              bool full, double eps) {
-    auto pr = pair_f64_dev(input, target);
-    Tensor elems = Tensor::empty(shape_of(pr.first), DType::Float64, input.device());
+    const DType acc = loss_carry_dtype(input.dtype());
+    auto pr = pair_carry_dev(input, target, acc);
+    Tensor elems = Tensor::empty(shape_of(pr.first), acc, input.device());
     int64_t n = elems.numel();
     if (n) {
         TensorIterator iter = TensorIteratorConfig()
@@ -237,12 +300,22 @@ Tensor poisson_nll_loss_cuda(const Tensor& input, const Tensor& target, bool log
             .add_const_input(pr.first)
             .add_const_input(pr.second)
             .build();
-        gpu_kernel(iter, [log_input, full, eps] __host__ __device__(double x, double z) -> double {
-            double l2 = log_input ? (::exp(x) - z * x)
-                                  : (x - z * ::log(::exp(x) + eps));
-            if (full && z > 0) l2 += z * ::log(z) - ::lgamma(z + 1.0);
-            return l2;
-        });
+        if (acc == DType::Float64) {
+            gpu_kernel(iter, [log_input, full, eps] __host__ __device__(double x, double z) -> double {
+                double l2 = log_input ? (::exp(x) - z * x)
+                                      : (x - z * ::log(::exp(x) + eps));
+                if (full && z > 0) l2 += z * ::log(z) - ::lgamma(z + 1.0);
+                return l2;
+            });
+        } else {
+            const float feps = static_cast<float>(eps);
+            gpu_kernel(iter, [log_input, full, feps] __host__ __device__(float x, float z) -> float {
+                float l2 = log_input ? (::exp(x) - z * x)
+                                     : (x - z * ::log(::exp(x) + feps));
+                if (full && z > 0) l2 += z * ::log(z) - ::lgamma(z + 1.0);
+                return l2;
+            });
+        }
         CUDA_CHECK(cudaGetLastError());
     }
     return mean_from_elems(elems, n, input.dtype(), input.device());
@@ -282,13 +355,76 @@ Tensor multilabel_soft_margin_loss_cuda(const Tensor& input, const Tensor& targe
 
 Tensor tp_l1_loss_cuda(const Tensor& input, const Tensor& target,
                        int64_t reduction) {
-    return tp_loss_reduce((input - target).abs(), reduction);
+    tp_validate_reduction(reduction);
+    const DType acc = loss_carry_dtype(input.dtype());
+    auto pr = pair_carry_dev(input, target, acc);
+    Tensor elems = Tensor::empty(shape_of(pr.first), acc, input.device());
+    const int64_t n = elems.numel();
+    if (n) {
+        TensorIterator iter = TensorIteratorConfig()
+            .check_all_same_dtype(true)
+            .add_output(elems)
+            .add_const_input(pr.first)
+            .add_const_input(pr.second)
+            .build();
+        if (acc == DType::Float64) {
+            gpu_kernel(iter, [] __host__ __device__(double a, double b) -> double {
+                return ::fabs(a - b);
+            });
+        } else {
+            gpu_kernel(iter, [] __host__ __device__(float a, float b) -> float {
+                return ::fabs(a - b);
+            });
+        }
+        CUDA_CHECK(cudaGetLastError());
+    }
+    if (reduction == 0) return elems.to(input.dtype());
+    return tp_loss_reduce(elems, reduction);
 }
 
 Tensor tp_l1_loss_backward_cuda(const Tensor& grad_output, const Tensor& input,
                                 const Tensor& target, int64_t reduction) {
-    Tensor grad = (input - target).sign() * grad_output;
-    return tp_scale_grad(grad, reduction, input.numel());
+    tp_validate_reduction(reduction);
+    const DType acc = loss_carry_dtype(input.dtype());
+    auto pr = pair_carry_dev(input, target, acc);
+    // The kernels read grad linearly: materialize its broadcast.
+    const Tensor g = (grad_output.shape() == pr.first.shape()
+                          ? grad_output
+                          : grad_output.expand(shape_of(pr.first)))
+        .contiguous()
+        .to(acc);
+    Tensor out = Tensor::empty(shape_of(pr.first), acc, input.device());
+    const int64_t n = out.numel();
+    if (n) {
+        TensorIterator iter = TensorIteratorConfig()
+            .check_all_same_dtype(true)
+            .add_output(out)
+            .add_const_input(pr.first)
+            .add_const_input(pr.second)
+            .add_const_input(g)
+            .build();
+        if (acc == DType::Float64) {
+            const double norm =
+                reduction == 1 ? 1.0 / static_cast<double>(n) : 1.0;
+            gpu_kernel(iter, [norm] __host__ __device__(
+                double a, double b, double gv) -> double {
+                const double d = a - b;
+                const double s = d > 0.0 ? 1.0 : (d < 0.0 ? -1.0 : 0.0);
+                return norm * s * gv;
+            });
+        } else {
+            const float norm =
+                reduction == 1 ? 1.0f / static_cast<float>(n) : 1.0f;
+            gpu_kernel(iter, [norm] __host__ __device__(
+                float a, float b, float gv) -> float {
+                const float d = a - b;
+                const float s = d > 0.0f ? 1.0f : (d < 0.0f ? -1.0f : 0.0f);
+                return norm * s * gv;
+            });
+        }
+        CUDA_CHECK(cudaGetLastError());
+    }
+    return out.to(input.dtype());
 }
 
 Tensor tp_kl_div_cuda(const Tensor& input, const Tensor& target,
