@@ -1430,6 +1430,57 @@ static bool try_sum_dim_real(const Tensor& input, Tensor& output, int64_t dim) {
         constexpr int64_t kMinRow = 16;
         if (d_size < kMinRow) return false;
         const int64_t rows = input.numel() / d_size;
+        // A handful of very long rows cannot be spread across the team by
+        // row: there are fewer rows than workers.  Chunk the column range
+        // instead, fold one partial per worker slot, and merge the slots in
+        // a fixed order so a rerun reproduces the same quotient.
+        if (d_size >= 65536 && rows <= 8) {
+            const int64_t nslots = std::max<int64_t>(get_num_threads(), 1);
+            // Keep at least one chunk per slot; chunks finer than the floor
+            // would only add scheduling overhead.
+            const int64_t grain =
+                std::min<int64_t>(GRAIN_SIZE, std::max<int64_t>(8192, d_size / nslots));
+            if (input.dtype() == DType::Float32) {
+                const float* values = input.data_ptr<float>();
+                float* results = output.data_ptr<float>();
+                std::vector<double> part(rows * nslots, 0.0);
+                parallel_for(0, d_size, grain,
+                             [&](int64_t b, int64_t e) {
+                    const int64_t tid = get_thread_num();
+                    for (int64_t row = 0; row < rows; ++row) {
+                        part[row * nslots + tid] +=
+                            vec::sum(values + row * d_size, b, e);
+                    }
+                });
+                for (int64_t row = 0; row < rows; ++row) {
+                    double s = 0.0;
+                    for (int64_t k = 0; k < nslots; ++k) {
+                        s += part[row * nslots + k];
+                    }
+                    results[row] = static_cast<float>(s);
+                }
+            } else {
+                const double* values = input.data_ptr<double>();
+                double* results = output.data_ptr<double>();
+                std::vector<double> part(rows * nslots, 0.0);
+                parallel_for(0, d_size, grain,
+                             [&](int64_t b, int64_t e) {
+                    const int64_t tid = get_thread_num();
+                    for (int64_t row = 0; row < rows; ++row) {
+                        part[row * nslots + tid] +=
+                            vec::sum(values + row * d_size, b, e);
+                    }
+                });
+                for (int64_t row = 0; row < rows; ++row) {
+                    double s = 0.0;
+                    for (int64_t k = 0; k < nslots; ++k) {
+                        s += part[row * nslots + k];
+                    }
+                    results[row] = s;
+                }
+            }
+            return true;
+        }
         const int64_t row_grain = std::max<int64_t>(
             1, GRAIN_SIZE / std::max<int64_t>(d_size, 1));
         if (input.dtype() == DType::Float32) {
