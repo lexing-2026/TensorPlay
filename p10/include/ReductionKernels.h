@@ -43,6 +43,11 @@ DECLARE_DISPATCH(sum_fn, sum_stub)
 using sum_dim_fn = Tensor (*)(const Tensor&, const std::vector<int64_t>&, bool, DType);
 DECLARE_DISPATCH(sum_dim_fn, sum_dim_stub)
 
+// NaN-masked wide reduction over contiguous float rows; `handled` reports
+// whether the layout was answered.
+using nansum_dim_fn = Tensor (*)(const Tensor&, const std::vector<int64_t>&, bool, DType, bool*);
+DECLARE_DISPATCH(nansum_dim_fn, nansum_dim_stub)
+
 // Fused dual-input reductions: sum((a-b)^2) and sum(|a-b|) in one pass over
 // both inputs, avoiding the intermediate difference/power tensors.
 using sum_squared_error_fn = Tensor (*)(const Tensor&, const Tensor&, const std::vector<int64_t>&, bool);

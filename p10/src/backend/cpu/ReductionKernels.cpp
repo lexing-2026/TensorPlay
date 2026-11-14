@@ -15,6 +15,7 @@ namespace cpu {
 
 DEFINE_DISPATCH(sum_stub);
 DEFINE_DISPATCH(sum_dim_stub);
+DEFINE_DISPATCH(nansum_dim_stub);
 DEFINE_DISPATCH(sum_squared_error_stub);
 DEFINE_DISPATCH(sum_abs_error_stub);
 DEFINE_DISPATCH(extrema_dim_stub);

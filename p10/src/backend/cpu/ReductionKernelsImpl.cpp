@@ -2757,8 +2757,114 @@ Tensor sum_dim_kernel_impl(const Tensor& self, const std::vector<int64_t>& dims,
     
     TensorIterator iter = TensorIterator::reduce_op(viewed, input);
     sum_kernel_iter(iter);
-    
+
     return acc_dtype == out_dtype ? out : out.to(out_dtype);
+}
+
+// NaN-masked wide reduction over contiguous float rows; answers through
+// `handled` so the caller can fall back for the layouts this skips.  A fold
+// that collapses to one value runs as a single masked pass; the multi-row
+// shapes zero the NaN lanes into a scratch copy and let the plain
+// reduction's row plans carry every layout they know.
+Tensor nansum_dim_kernel_impl(const Tensor& self, const std::vector<int64_t>& dims,
+                              bool keepdim, DType dtype, bool* handled) {
+    *handled = false;
+    if (!self.is_contiguous() || self.numel() == 0 ||
+        (self.dtype() != DType::Float32 && self.dtype() != DType::Float64)) {
+        return Tensor();
+    }
+    *handled = true;
+    const int64_t nd = self.dim();
+    std::vector<int64_t> dim = dims;
+    if (dim.empty()) {
+        for (int64_t i = 0; i < nd; ++i) dim.push_back(i);
+    }
+    for (int64_t& d : dim) {
+        if (d < 0) d += nd;
+    }
+    std::vector<int64_t> distinct(dim);
+    std::sort(distinct.begin(), distinct.end());
+    distinct.erase(std::unique(distinct.begin(), distinct.end()), distinct.end());
+    const bool covers_all = static_cast<int64_t>(distinct.size()) == nd;
+
+    if (covers_all) {
+        Tensor out = Tensor::zeros(
+            keepdim ? std::vector<int64_t>(static_cast<size_t>(nd), 1)
+                    : std::vector<int64_t>{},
+            dtype, self.device());
+        const int64_t n = self.numel();
+        double s = 0.0;
+        if (dtype == DType::Float32) {
+            const float* x = self.data_ptr<float>();
+            if (n < 4096 || get_num_threads() == 1 || in_parallel_region()) {
+                s = vec::nansum(x, 0, n);
+            } else {
+                std::vector<double> part(
+                    static_cast<size_t>(std::max<int64_t>(get_num_threads(), 1)), 0.0);
+                parallel_for(0, n, GRAIN_SIZE, [&](int64_t b, int64_t e) {
+                    part[static_cast<size_t>(get_thread_num())] +=
+                        vec::nansum(x, b, e);
+                });
+                for (double p : part) s += p;
+            }
+        } else {
+            const double* x = self.data_ptr<double>();
+            if (n < 4096 || get_num_threads() == 1 || in_parallel_region()) {
+                s = vec::nansum(x, 0, n);
+            } else {
+                std::vector<double> part(
+                    static_cast<size_t>(std::max<int64_t>(get_num_threads(), 1)), 0.0);
+                parallel_for(0, n, GRAIN_SIZE, [&](int64_t b, int64_t e) {
+                    part[static_cast<size_t>(get_thread_num())] +=
+                        vec::nansum(x, b, e);
+                });
+                for (double p : part) s += p;
+            }
+        }
+        if (dtype == DType::Float32) {
+            *out.data_ptr<float>() = static_cast<float>(s);
+        } else {
+            *out.data_ptr<double>() = s;
+        }
+        return out;
+    }
+
+    Tensor x = self;
+    const int64_t n = self.numel();
+    const int64_t nslots = static_cast<int64_t>(std::max<int64_t>(get_num_threads(), 1));
+    std::vector<char> hits(static_cast<size_t>(nslots), 0);
+    if (self.dtype() == DType::Float32) {
+        const float* xp = x.data_ptr<float>();
+        parallel_for(0, n, GRAIN_SIZE, [&](int64_t b, int64_t e) {
+            hits[static_cast<size_t>(get_thread_num())] |= vec::any_nan(xp, b, e) ? 1 : 0;
+        });
+    } else {
+        const double* xp = x.data_ptr<double>();
+        parallel_for(0, n, GRAIN_SIZE, [&](int64_t b, int64_t e) {
+            hits[static_cast<size_t>(get_thread_num())] |= vec::any_nan(xp, b, e) ? 1 : 0;
+        });
+    }
+    bool dirty = false;
+    for (char h : hits) dirty = dirty || h != 0;
+    if (dirty) {
+        Tensor clean = Tensor::empty(
+            static_cast<std::vector<int64_t>>(self.shape()), self.dtype(), self.device());
+        if (self.dtype() == DType::Float32) {
+            const float* xp = x.data_ptr<float>();
+            float* dp = clean.data_ptr<float>();
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t b, int64_t e) {
+                vec::store_without_nan(xp, b, e, dp);
+            });
+        } else {
+            const double* xp = x.data_ptr<double>();
+            double* dp = clean.data_ptr<double>();
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t b, int64_t e) {
+                vec::store_without_nan(xp, b, e, dp);
+            });
+        }
+        x = clean;
+    }
+    return sum_dim_kernel_impl(x, dims, keepdim, dtype);
 }
 
 
@@ -5072,6 +5178,7 @@ Tensor median_kernel_impl(const Tensor& self) {
 #endif
 REGISTER_SUM_DISPATCH(sum_stub, &sum_kernel_impl);
 REGISTER_SUM_DISPATCH(sum_dim_stub, &sum_dim_kernel_impl);
+REGISTER_DISPATCH(nansum_dim_stub, &nansum_dim_kernel_impl);
 REGISTER_DISPATCH(sum_squared_error_stub, &sum_squared_error_kernel_impl);
 REGISTER_DISPATCH(sum_abs_error_stub, &sum_abs_error_kernel_impl);
 REGISTER_SUM_DISPATCH(extrema_dim_stub, &extrema_dim_kernel_impl);

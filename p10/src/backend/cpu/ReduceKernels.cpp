@@ -313,10 +313,22 @@ Tensor nansum_cpu(const Tensor& self, const std::vector<int64_t>& dim_in,
     if (isComplexType(self.dtype())) {
         TP_THROW(RuntimeError, "nansum on CPU does not support complex inputs");
     }
+    const int64_t nd = self.dim();
     const DType out_dt = isFloatingType(self.dtype()) ? self.dtype() : DType::Int64;
     std::vector<int64_t> dim = dim_in;
     if (dim.empty()) {
-        for (int64_t i = 0; i < self.dim(); ++i) dim.push_back(i);
+        for (int64_t i = 0; i < nd; ++i) dim.push_back(i);
+    }
+    for (int64_t& d : dim) d = wrap_dim(d, std::max<int64_t>(nd, 1));
+
+    // Contiguous float rows go to the vector team: one masked pass when the
+    // fold collapses to a single value, otherwise the NaN lanes are zeroed
+    // and the plain reduction's row plans carry the rest.
+    bool handled = false;
+    Tensor out = nansum_dim_stub(DeviceType::CPU, self, dim, keepdim, out_dt,
+                                 &handled);
+    if (handled) {
+        return out;
     }
     return reduce_dims_impl<double>(
         self, dim, keepdim, out_dt, 0.0,
@@ -1098,11 +1110,10 @@ Tensor nanmean_cpu(const Tensor& self, std::optional<int64_t> dim_opt,
         for (int64_t i = 0; i < x.dim(); ++i) dims.push_back(i);
     }
     Tensor total = nansum_cpu(x, dims, keepdim);
-    Tensor valid = isnan_cpu(x).logical_not();
-    Tensor count = reduce_dims_impl<double>(
-        valid, dims, keepdim, DType::Float32, 0.0,
-        [](double acc, double value) { return acc + value; },
-        [](double acc) { return acc; });
+    // The denominator counts the finite rows; the plain reduction walks the
+    // byte mask far faster than a per-element accumulator.
+    Tensor count = sum_dim_stub(DeviceType::CPU, isnan_cpu(x).logical_not(),
+                                dims, keepdim, DType::Int64);
     Tensor zero = count.eq(Scalar(0.0));
     Tensor quot = total.div(count);
     return quot.masked_fill(

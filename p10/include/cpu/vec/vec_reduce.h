@@ -176,6 +176,87 @@ inline T sum(const T* x, int64_t begin, int64_t end) {
     return s;
 }
 
+// Streams the sum over x[begin, end) with every NaN lane read as zero.  The
+// accumulator layout matches sum, so the two answers agree on NaN-free data
+// and a chunk boundary split the same way reproduces the same quotient.
+template <typename T>
+inline T nansum(const T* x, int64_t begin, int64_t end) {
+    using Vec = Vectorized<T>;
+    constexpr int64_t W = static_cast<int64_t>(Vec::size());
+    const int64_t n = end - begin;
+    if (n < 16 * W) {
+        T s = T(0);
+        for (int64_t i = begin; i < end; ++i) {
+            s += std::isnan(x[i]) ? T(0) : x[i];
+        }
+        return s;
+    }
+    const Vec zero(T(0));
+    Vec a0(T(0)), a1(T(0)), a2(T(0)), a3(T(0));
+    Vec a4(T(0)), a5(T(0)), a6(T(0)), a7(T(0));
+    Vec a8(T(0)), a9(T(0)), a10(T(0)), a11(T(0));
+    Vec a12(T(0)), a13(T(0)), a14(T(0)), a15(T(0));
+    constexpr int64_t kStep = 16 * W;
+    int64_t i = begin;
+    for (; i + kStep <= end; i += kStep) {
+        a0 = a0 + Vec::blendv(Vec::loadu(x + i), zero, Vec::loadu(x + i).isnan());
+        a1 = a1 + Vec::blendv(Vec::loadu(x + i + W), zero, Vec::loadu(x + i + W).isnan());
+        a2 = a2 + Vec::blendv(Vec::loadu(x + i + 2 * W), zero, Vec::loadu(x + i + 2 * W).isnan());
+        a3 = a3 + Vec::blendv(Vec::loadu(x + i + 3 * W), zero, Vec::loadu(x + i + 3 * W).isnan());
+        a4 = a4 + Vec::blendv(Vec::loadu(x + i + 4 * W), zero, Vec::loadu(x + i + 4 * W).isnan());
+        a5 = a5 + Vec::blendv(Vec::loadu(x + i + 5 * W), zero, Vec::loadu(x + i + 5 * W).isnan());
+        a6 = a6 + Vec::blendv(Vec::loadu(x + i + 6 * W), zero, Vec::loadu(x + i + 6 * W).isnan());
+        a7 = a7 + Vec::blendv(Vec::loadu(x + i + 7 * W), zero, Vec::loadu(x + i + 7 * W).isnan());
+        a8 = a8 + Vec::blendv(Vec::loadu(x + i + 8 * W), zero, Vec::loadu(x + i + 8 * W).isnan());
+        a9 = a9 + Vec::blendv(Vec::loadu(x + i + 9 * W), zero, Vec::loadu(x + i + 9 * W).isnan());
+        a10 = a10 + Vec::blendv(Vec::loadu(x + i + 10 * W), zero, Vec::loadu(x + i + 10 * W).isnan());
+        a11 = a11 + Vec::blendv(Vec::loadu(x + i + 11 * W), zero, Vec::loadu(x + i + 11 * W).isnan());
+        a12 = a12 + Vec::blendv(Vec::loadu(x + i + 12 * W), zero, Vec::loadu(x + i + 12 * W).isnan());
+        a13 = a13 + Vec::blendv(Vec::loadu(x + i + 13 * W), zero, Vec::loadu(x + i + 13 * W).isnan());
+        a14 = a14 + Vec::blendv(Vec::loadu(x + i + 14 * W), zero, Vec::loadu(x + i + 14 * W).isnan());
+        a15 = a15 + Vec::blendv(Vec::loadu(x + i + 15 * W), zero, Vec::loadu(x + i + 15 * W).isnan());
+    }
+    Vec acc = (((a0 + a1) + (a2 + a3)) + ((a4 + a5) + (a6 + a7))) +
+              (((a8 + a9) + (a10 + a11)) + ((a12 + a13) + (a14 + a15)));
+    for (; i + W <= end; i += W) {
+        const Vec v = Vec::loadu(x + i);
+        acc = acc + Vec::blendv(v, zero, v.isnan());
+    }
+    T s = acc.reduce_add();
+    for (; i < end; ++i) s += std::isnan(x[i]) ? T(0) : x[i];
+    return s;
+}
+
+// Reports whether any lane of x[begin, end) holds a NaN; the walk stops at
+// the first dirty block.
+template <typename T>
+inline bool any_nan(const T* x, int64_t begin, int64_t end) {
+    using Vec = Vectorized<T>;
+    constexpr int64_t W = static_cast<int64_t>(Vec::size());
+    int64_t i = begin;
+    for (; i + W <= end; i += W) {
+        if (nan_lane_mask(Vec::loadu(x + i)) != 0) return true;
+    }
+    for (; i < end; ++i) {
+        if (std::isnan(x[i])) return true;
+    }
+    return false;
+}
+
+// Writes x[begin, end) to dst with every NaN lane replaced by zero.
+template <typename T>
+inline void store_without_nan(const T* x, int64_t begin, int64_t end, T* dst) {
+    using Vec = Vectorized<T>;
+    constexpr int64_t W = static_cast<int64_t>(Vec::size());
+    const Vec zero(T(0));
+    int64_t i = begin;
+    for (; i + W <= end; i += W) {
+        const Vec v = Vec::loadu(x + i);
+        Vec::blendv(v, zero, v.isnan()).store(dst + i);
+    }
+    for (; i < end; ++i) dst[i] = std::isnan(x[i]) ? T(0) : x[i];
+}
+
 // Streams the sum of squares over x[begin, end) through four independent
 // accumulators and one horizontal fold; the caller decides where the square
 // root belongs.
