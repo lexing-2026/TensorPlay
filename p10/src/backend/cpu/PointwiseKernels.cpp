@@ -130,8 +130,12 @@ inline void vec_run(vecunary::VOp op, const vecunary::VParams& prm,
 
 // Elementwise kernels use a finer grain than the global default: with the
 // spinning intraop pool a chunk handoff costs ~1-2us, so splitting small-ish
-// tensors across all workers wins far more than the handoff costs.
-constexpr int64_t kUnaryGrain = 8192;
+// tensors across all workers wins far more than the handoff costs.  2048
+// elements per thread-chunk ceiling keeps mid-size tensors (2k-160k elements)
+// on every worker: compute-bound transcendental walks at 100k elements lose
+// ~1.5x when the grain lets only two thirds of the pool join, and a 2048-wide
+// chunk still amortizes the handoff by three orders of magnitude.
+constexpr int64_t kUnaryGrain = 2048;
 
 // Elementwise compute is storage-order agnostic, so a channels-last input is
 // processed in its own physical order and the result keeps that layout
