@@ -82,10 +82,25 @@ only. Concatenation keeps a zero-valued plane's geometry: its length along
 the joined dimension counts, and only size-[0] 1-d inputs are exempt from
 the wrap and shape checks. The plain loss names average to a scalar at
 the double type when their leading operand has one, single precision
-otherwise. The margin losses still enforce their target
+otherwise. The squared difference and the switched absolute blend run in
+the pair's promoted type: a boolean pair has no subtraction to feed them,
+and a whole-number pair answers at single precision (for the mean
+reduction of the squared difference, and at every reduction for the
+switched blend). The scored loss runs over the four wide element types
+only, and the logarithmic loss blends a logarithm of the input, the target
+shifted by a fractional scalar and an optional weight multiply, so
+whole-number planes answer at single precision and the weight joins the
+promotion. The margin losses still enforce their target
 layout (a 1-D index vector for the multi-class form, a rank-2 label table for
 the multi-label one); only the per-entry index range is a value check that
-cannot run.
+cannot run. The gathered reads and writes share one dimension wrap: a
+negative axis counts from the end, and an axis past the end is refused
+after the wrap, which reports the axis the caller passed. The flat read
+walks real and complex planes alike. The normalization family's
+lower-level forward refuses the half-to-float conversion request before
+anything else is read, and its backwards answer at the incoming gradient's
+own type — narrowed back to half width when a half plane received a
+single-precision gradient.
 
 Linear algebra reports the full result geometry: `cholesky`/`cholesky_ex`,
 `inv`/`inv_ex`, `det`/`slogdet`, the LU family (`lu`, `lu_factor_ex`,
@@ -97,6 +112,25 @@ including the integer `info`, pivot and rank planes and the dtype changes
 enforced as on a materialized tensor: square and matrix requirements, the
 floating-point dtype gate, and the `driver`/`mode` names. Composed helpers
 (`matrix_power`, `matrix_rank`, `cond`, `norm`, `polar`) build on those.
+The factorization unpacks its permutation into a matrix written in the
+operand's own type, so complex operands are refused as type errors; a
+negative power inverts its operand first, and that inversion runs over the
+linalg element types only, so every other operand is refused before any
+geometry is answered.
+
+The attention entries compose their answer from recordable primitives: a
+transposed score product, an optional additive mask, and a weighted value
+product. The four wide element types are accepted and every other operand
+is refused; the head extent read from the query must be non-zero and match
+the key's; the key and value must describe the same weights, with a
+whole-group head count when grouped queries are asked for and matching
+leading extents when the key carries the query's rank. Masks of any
+broadcastable rank join the scores lifted to the accumulation type, so a
+wider mask is narrowed and the answer keeps the query's type;
+reduced-width operands accumulate in single precision and return to their
+own width. The variant that also reports the softmax normalizing constant
+skips the geometry checks the plain form makes — the products enforce
+their own — and always reports that plane in single precision.
 
 The complex factories answer their broadcast geometry and promote to the
 matching complex type: `complex` pairs a real and an imaginary plane, `polar`
@@ -177,7 +211,12 @@ precision and lift a half-width operand accordingly, and the spread measures
 its real component type while the mean keeps the complex plane. An ordering
 is undefined over complex planes: the tensor forms of `lt`, `le`, `gt` and
 `ge` refuse a complex operand outright, while equality keeps one, and every
-scalar comparison form keeps a boolean answer.
+scalar comparison form keeps a boolean answer. The ordering selections
+split by whether they would actually reorder elements: a sort walks
+whole-number and floating planes of any width and refuses complex ones,
+while `topk` answers an empty selection, or one over an empty source, for
+every plane — nothing is written, so the answer planes exist for all types
+— and refuses the ordering walk for boolean and complex planes.
 
 The random fills (`uniform_`, `normal_`, `cauchy_`, `exponential_`,
 `geometric_`, `log_normal_`, `bernoulli_` and the `random_` family) accept a
