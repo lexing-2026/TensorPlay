@@ -116,7 +116,9 @@ The factorization unpacks its permutation into a matrix written in the
 operand's own type, so complex operands are refused as type errors; a
 negative power inverts its operand first, and that inversion runs over the
 linalg element types only, so every other operand is refused before any
-geometry is answered.
+geometry is answered. The Cholesky solve answers in the right-hand side's
+own geometry and type; the factor is only read for its element type, so the
+floating gate runs over both operands before anything else.
 
 The attention entries compose their answer from recordable primitives: a
 transposed score product, an optional additive mask, and a weighted value
@@ -150,6 +152,67 @@ samples its keep mask in single precision and rescales at the promoted type,
 normally derived from the stored extrema, which a metadata-only device cannot
 read, so that validation is left to a materializing backend), and `frexp`
 returns the mantissa in the input dtype beside a 32-bit exponent plane.
+
+The window factories (`bartlett_window`, `blackman_window`, `hann_window`,
+`hamming_window`) answer the requested length in the default floating width
+and refuse a negative count; the `bernoulli` fill keeps its operand's
+metadata. `linear` folds the weight transpose and the optional bias into a
+matrix product: the input's leading extents join the weight's rows, a rank-1
+input keeps its vector geometry, and a weight whose columns miss the input's
+last extent is refused. The loss backwards for the squared distance and the
+switched absolute blend answer the input's own geometry after the shape
+agreement check, in the gradient's dtype — a half-width gradient keeps its
+width — for every reduction mode. The slice backward spreads the gradient
+into the full shape along the wrapped dimension with the slice's own step.
+
+The convolution dispatcher answers every rank the spatial dimensions
+describe: the plain and transposed forms report the stride-extended geometry
+from the input, weight and optional bias planes, and the backward reports
+the input, weight and bias gradients the requested-slot mask asks for —
+masked slots stay undefined, the bias gradient spans the gradient's channel
+extent (which the transposed form maps to its output channels), and the
+transposed form skips the forward geometry cross-check because the weight
+describes the inverse mapping. The pooling backwards answer the input's own
+geometry: `avg_pool3d` re-derives the padded extent with or without ceiling
+mode, refuses a zero divisor override and a zero stride, and folds an
+unbatched gradient into a batch of one; the adaptive forms accept the
+batched ranks of their rank (`_adaptive_avg_pool3d_backward` and the max
+pair, plus the unbatched 3-D form of the 2-D max backward that the forward
+and the wider contract both support); and the with-indices backwards require
+the saved index plane, refusing a missing one or one whose geometry misses
+the gradient's, with the unbatched 2-D form likewise folded into a batch of
+one.
+
+The embedding backwards answer the table geometry: the dense lookup backward
+repeats the gradient's trailing extents behind the row count, refuses index
+planes outside the two stored widths, and enforces the gradient's own dtype
+gates (8-bit floats have no accumulate form, booleans no subtraction); the
+bagged backward answers the same table for every reduction mode,
+cross-checking the recorded winner buffer against the gradient plane in max
+mode and requiring one offset2bag entry per lookup otherwise; per-sample
+weights ride only with the sum mode and answer one scalar per lookup. The
+segment-reduce backward spreads the gradient over the data's geometry after
+wrapping the axis and requiring either a lengths or an offsets plane, with
+the reduction name checked against the family's spellings; the 3-D
+grid-sampler backward always answers both gradients — the input's geometry
+and the grid's sampling extents carrying the three coordinate components —
+refusing the bicubic sweep on 5-D inputs and non-floating operands, while
+the requested-slot mask only steers buffer fill on a materializing backend.
+
+The sparse COO factory reuses the shared constructor: the index plane and
+the values' dense extents validate against the requested size unchanged,
+but inferring the size from the stored index maxima reads element data, so
+an explicit size is required. The layout reduction (`_sparse_sum`) collapses
+every extent into a scalar in the values' dtype and registers under the
+layout key, so a dense operand reaches no kernel at all — the same outcome
+a dense tensor gets on a computing backend. The layout product
+(`_sparse_addmm`) dispatches from its dense operands and re-runs the dense
+side's gates: the sparse operand must be a rank-2 coordinate plane (blocked
+layouts aside, no hybrid), all operands share one device and dtype, and the
+inner extents must meet before the answer geometry is written. The list
+sweeps walk their operands pairwise: `_foreach_copy` clones each source, so
+the answer carries the source's metadata, `_foreach_mm` products each pair
+through the plain matrix product, and both refuse unequal list lengths.
 
 The special-function families answer their shape arithmetic directly: the
 Bessel and Airy tables (`bessel_j0`/`j1`, `bessel_y0`/`y1`, `airy_ai`,
