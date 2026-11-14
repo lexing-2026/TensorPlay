@@ -1314,6 +1314,12 @@ bundle_triton_into_fx_graph_cache: bool | None = None
 use_static_triton_launcher: bool = False
 force_disable_caches: bool = False
 
+#: Whether a region's finished wrapper is stored under its own key and loaded
+#: again instead of being re-scheduled and re-printed.  ``False`` answers a
+#: measurement: a number read out of a cache is the number that was measured
+#: then, not the number this run would have taken.
+cache_graph_artifacts: bool = True
+
 #: How many pairs of groups to try fusing before giving up on a round of
 #: grouping, which bounds the work one round can take when there are many
 #: groups.

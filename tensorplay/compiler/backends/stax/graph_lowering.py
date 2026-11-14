@@ -28,6 +28,8 @@ from tensorplay.utils import _pytree as pytree
 
 from . import config, ir
 from .fx_utils import count_flops_fx
+from .graph_artifact_cache import publish as _publish_graph_artifact
+from .graph_artifact_cache import lookup as _lookup_graph_artifact
 from .loops import compute_required_storage_length, contiguous_strides
 from .utils import (
     gather_origins,
@@ -2593,9 +2595,22 @@ class GraphLowering(Interpreter):
         knows the key it was built under and the file it was written to, so
         the same region asked for again is recognised as the same region and
         the built file is reached rather than rebuilt.
+
+        Scheduling and printing a region depends on nothing but the region, so
+        a wrapper stored under this region's name is loaded instead of being
+        worked out again; the builder that runs on it is content-addressed on
+        its own, so a stored wrapper reaches the binary it built the first
+        time.
         """
 
+        wrapper_code = _lookup_graph_artifact(self)
+        if wrapper_code is not None:
+            if isinstance(wrapper_code, ValueWithLineMap):
+                return self._compile_to_module_lines(wrapper_code)
+            return self._compile_to_cpp_module(wrapper_code)
+
         wrapper_code, _ = self.codegen()
+        _publish_graph_artifact(self, wrapper_code)
 
         if isinstance(wrapper_code, CppWrapperCode):
             return self._compile_to_cpp_module(wrapper_code)
