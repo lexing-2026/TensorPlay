@@ -28,15 +28,63 @@ Tensor unary_meta(const Tensor& self) {
     return empty_meta(shape_of(self), self.dtype(), self.device());
 }
 
-// A float-only activation answers an integral or boolean operand in the
-// default floating type, having no integral form to answer in; a floating or
-// complex operand keeps its own type.
-Tensor float_unary_meta(const Tensor& self) {
-    DType dtype = self.dtype();
-    if (isIntegralType(dtype, /*includeBool=*/true)) {
-        dtype = globalContext().defaultDType();
+// A real-number sweep keeps a complex lane of its own: a whole-number
+// operand answers in single precision, a boolean or 8-bit float operand has
+// no form to run in, and a floating or complex operand keeps its width.
+Tensor real_math_meta(const Tensor& self) {
+    return empty_meta(shape_of(self), real_math_dtype(self.dtype()),
+                      self.device());
+}
+
+// A real-only activation has neither a complex lane nor a boolean one:
+// integers answer in single precision, every other operand is refused.
+Tensor real_only_meta(const Tensor& self) {
+    const DType dtype = self.dtype();
+    if (dtype == DType::Bool || isComplexType(dtype) || isFloat8Type(dtype)) {
+        TP_THROW(TypeError, "Unsupported dtype (expected float)");
     }
-    return empty_meta(shape_of(self), dtype, self.device());
+    return empty_meta(shape_of(self),
+                      isIntegralType(dtype) ? DType::Float32 : dtype,
+                      self.device());
+}
+
+// The in-place spelling of a real-number sweep lands the floating answer in
+// the operand's own bytes: a whole-number plane cannot hold it, and a boolean
+// or 8-bit float plane has no sweep to run in the first place.
+void check_real_math_inplace(const Tensor& self) {
+    const DType dt = self.dtype();
+    if (dt == DType::Bool || isFloat8Type(dt)) {
+        TP_THROW(TypeError, "Unsupported dtype (expected float)");
+    }
+    if (isIntegralType(dt)) {
+        TP_THROW(TypeError,
+                 "Attempting to cast from Float32 to out tensor with dtype ",
+                 toString(dt),
+                 ", but this can't be cast because it is not safe!");
+    }
+}
+
+// The in-place spelling of a real-only sweep refuses complex planes as well.
+void check_real_only_inplace(const Tensor& self) {
+    const DType dt = self.dtype();
+    if (dt == DType::Bool || isComplexType(dt) || isFloat8Type(dt)) {
+        TP_THROW(TypeError, "Unsupported dtype (expected float)");
+    }
+    if (isIntegralType(dt)) {
+        TP_THROW(TypeError,
+                 "Attempting to cast from Float32 to out tensor with dtype ",
+                 toString(dt),
+                 ", but this can't be cast because it is not safe!");
+    }
+}
+
+// The in-place spelling that copies the answer back keeps whole-number
+// planes: only the operands the sweep itself refuses are turned away.
+void check_real_only_operand(const Tensor& self) {
+    const DType dt = self.dtype();
+    if (dt == DType::Bool || isComplexType(dt) || isFloat8Type(dt)) {
+        TP_THROW(TypeError, "Unsupported dtype (expected float)");
+    }
 }
 
 // The shrink maps are defined on the half, bfloat16, float and double
@@ -57,126 +105,149 @@ void check_shrink_dtype(const Tensor& self, const char* name) {
 // ---------------------------------------------------------------------------
 
 Tensor relu_kernel(const Tensor& self) {
+    // The rectifier maps every real element as it stands and has no complex
+    // form.
+    if (isComplexType(self.dtype()) || isFloat8Type(self.dtype())) {
+        TP_THROW(TypeError, "Unsupported dtype");
+    }
     return unary_meta(self);
 }
 
 Tensor& relu_inplace_kernel(Tensor& self) {
+    if (isComplexType(self.dtype()) || isFloat8Type(self.dtype())) {
+        TP_THROW(TypeError, "Unsupported dtype");
+    }
     return self;
 }
 
 Tensor gelu_kernel(const Tensor& self, const std::string& /*approximate*/) {
-    return float_unary_meta(self);
+    return real_only_meta(self);
 }
 
 Tensor& gelu_inplace_kernel(Tensor& self, const std::string& /*approximate*/) {
+    check_real_only_operand(self);
     return self;
 }
 
 Tensor tanh_kernel(const Tensor& self) {
-    return float_unary_meta(self);
+    return real_math_meta(self);
 }
 
 Tensor& tanh_inplace_kernel(Tensor& self) {
+    check_real_math_inplace(self);
     return self;
 }
 
 Tensor sigmoid_kernel(const Tensor& self) {
-    return float_unary_meta(self);
+    return real_math_meta(self);
 }
 
 Tensor& sigmoid_inplace_kernel(Tensor& self) {
+    check_real_math_inplace(self);
     return self;
 }
 
 Tensor silu_kernel(const Tensor& self) {
-    return unary_meta(self);
+    return real_only_meta(self);
 }
 
 Tensor& silu_inplace_kernel(Tensor& self) {
+    check_real_only_inplace(self);
     return self;
 }
 
 Tensor mish_kernel(const Tensor& self) {
-    return float_unary_meta(self);
+    return real_only_meta(self);
 }
 
 Tensor& mish_inplace_kernel(Tensor& self) {
+    check_real_only_inplace(self);
     return self;
 }
 
 Tensor softplus_kernel(const Tensor& self, const Scalar& /*beta*/,
                        const Scalar& /*threshold*/) {
-    return float_unary_meta(self);
+    return real_only_meta(self);
 }
 
 Tensor& softplus_inplace_kernel(Tensor& self, const Scalar& /*beta*/,
                                 const Scalar& /*threshold*/) {
+    check_real_only_operand(self);
     return self;
 }
 
 Tensor elu_kernel(const Tensor& self, const Scalar& /*alpha*/,
                   const Scalar& /*scale*/, const Scalar& /*input_scale*/) {
-    return float_unary_meta(self);
+    return real_only_meta(self);
 }
 
 Tensor& elu_inplace_kernel(Tensor& self, const Scalar& /*alpha*/,
                            const Scalar& /*scale*/,
                            const Scalar& /*input_scale*/) {
+    check_real_only_operand(self);
     return self;
 }
 
 Tensor selu_kernel(const Tensor& self) {
-    return float_unary_meta(self);
+    return real_only_meta(self);
 }
 
 Tensor& selu_inplace_kernel(Tensor& self) {
+    check_real_only_operand(self);
     return self;
 }
 
 Tensor celu_kernel(const Tensor& self, const Scalar& /*alpha*/) {
-    return float_unary_meta(self);
+    return real_only_meta(self);
 }
 
 Tensor& celu_inplace_kernel(Tensor& self, const Scalar& /*alpha*/) {
+    check_real_only_operand(self);
     return self;
 }
 
 Tensor leaky_relu_kernel(const Tensor& self, const Scalar& /*negative_slope*/) {
-    return float_unary_meta(self);
+    return real_only_meta(self);
 }
 
 Tensor& leaky_relu_inplace_kernel(Tensor& self, const Scalar& /*negative_slope*/) {
+    check_real_only_operand(self);
     return self;
 }
 
 Tensor hardsigmoid_kernel(const Tensor& self) {
-    return float_unary_meta(self);
+    return real_only_meta(self);
 }
 
 Tensor& hardsigmoid_inplace_kernel(Tensor& self) {
+    check_real_only_inplace(self);
     return self;
 }
 
 Tensor hardswish_kernel(const Tensor& self) {
-    return float_unary_meta(self);
+    return real_only_meta(self);
 }
 
 Tensor& hardswish_inplace_kernel(Tensor& self) {
+    check_real_only_inplace(self);
     return self;
 }
 
 Tensor hardtanh_kernel(const Tensor& self, const Scalar& /*min_val*/,
                        const Scalar& /*max_val*/) {
-    return float_unary_meta(self);
+    // The band clamp runs on real numbers only: integers answer in single
+    // precision, and a boolean, 8-bit float or complex operand is refused.
+    return real_only_meta(self);
 }
 
 Tensor& hardtanh_inplace_kernel(Tensor& self, const Scalar& /*min_val*/,
                                 const Scalar& /*max_val*/) {
+    check_real_only_operand(self);
     return self;
 }
 
 Tensor tanhshrink_kernel(const Tensor& self) {
-    return float_unary_meta(self);
+    return real_math_meta(self);
 }
 
 Tensor softshrink_kernel(const Tensor& self, const Scalar& /*lambd*/) {
@@ -190,15 +261,16 @@ Tensor hardshrink_kernel(const Tensor& self, const Scalar& /*lambd*/) {
 }
 
 Tensor relu6_kernel(const Tensor& self) {
-    return float_unary_meta(self);
+    return real_only_meta(self);
 }
 
 Tensor& relu6_inplace_kernel(Tensor& self) {
+    check_real_only_operand(self);
     return self;
 }
 
 Tensor log_sigmoid_kernel(const Tensor& self) {
-    return float_unary_meta(self);
+    return real_only_meta(self);
 }
 
 // ---------------------------------------------------------------------------
@@ -236,25 +308,40 @@ Tensor trunc_kernel(const Tensor& self) {
 }
 
 Tensor& trunc_inplace_kernel(Tensor& self) {
+    if (isComplexType(self.dtype())) {
+        TP_THROW(TypeError, "Unsupported dtype");
+    }
     return self;
 }
 
 Tensor frac_kernel(const Tensor& self) {
-    if (isComplexType(self.dtype())) {
+    const DType dt = self.dtype();
+    if (isComplexType(dt)) {
         TP_THROW(TypeError, "Unsupported dtype");
+    }
+    // The fractional part has no whole-number pass to run in.
+    if (isIntegralType(dt)) {
+        TP_THROW(NotImplementedError, "frac is not implemented for '",
+                 toString(dt), "'");
     }
     return unary_meta(self);
 }
 
 Tensor& frac_inplace_kernel(Tensor& self) {
+    const DType dt = self.dtype();
+    if (isComplexType(dt)) {
+        TP_THROW(TypeError, "Unsupported dtype");
+    }
+    if (isIntegralType(dt)) {
+        TP_THROW(NotImplementedError, "frac is not implemented for '",
+                 toString(dt), "'");
+    }
     return self;
 }
 
 Tensor sign_kernel(const Tensor& self) {
-    if (isComplexType(self.dtype())) {
-        TP_THROW(NotImplementedError,
-                 "sign is not supported for complex inputs");
-    }
+    // The sign map runs on real lanes and complex lanes alike and answers in
+    // the operand's own type.
     return unary_meta(self);
 }
 
@@ -262,8 +349,8 @@ Tensor& sign_inplace_kernel(Tensor& self) {
     return self;
 }
 
-// sgn is the complex-aware sign: it keeps the input dtype even for complex
-// inputs, where sign is rejected.
+// sgn is the complex-aware sign: it keeps the input dtype, including for
+// complex inputs.
 Tensor sgn_kernel(const Tensor& self) {
     return unary_meta(self);
 }
@@ -274,24 +361,36 @@ Tensor& sgn_inplace_kernel(Tensor& self) {
 
 // ---------------------------------------------------------------------------
 // Clamps.  A scalar bound keeps the input's geometry and type; a tensor
-// bound broadcasts like any binary pointwise op and promotes the pair.
+// bound broadcasts like any binary pointwise op and promotes the pair.  The
+// band comparison runs on real elements only, so complex planes and 8-bit
+// floats are refused.
 // ---------------------------------------------------------------------------
 
+void check_clamp_dtype(const Tensor& self) {
+    if (isComplexType(self.dtype()) || isFloat8Type(self.dtype())) {
+        TP_THROW(TypeError, "Unsupported dtype");
+    }
+}
+
 Tensor clamp_min_scalar_kernel(const Tensor& self, const Scalar& /*min*/) {
+    check_clamp_dtype(self);
     return unary_meta(self);
 }
 
 Tensor clamp_max_scalar_kernel(const Tensor& self, const Scalar& /*max*/) {
+    check_clamp_dtype(self);
     return unary_meta(self);
 }
 
 Tensor clamp_min_tensor_kernel(const Tensor& self, const Tensor& min) {
     check_all_meta(self, min);
+    check_clamp_dtype(self);
     return empty_meta(broadcast2(self, min), self.dtype(), self.device());
 }
 
 Tensor clamp_max_tensor_kernel(const Tensor& self, const Tensor& max) {
     check_all_meta(self, max);
+    check_clamp_dtype(self);
     return empty_meta(broadcast2(self, max), self.dtype(), self.device());
 }
 
@@ -300,28 +399,34 @@ Tensor clamp_max_tensor_kernel(const Tensor& self, const Tensor& max) {
 // the write would leave behind.
 Tensor& clamp_inplace_kernel(Tensor& self, const std::optional<Scalar>& /*min*/,
                              const std::optional<Scalar>& /*max*/) {
+    check_clamp_dtype(self);
     return self;
 }
 
 Tensor& clamp_tensor_inplace_kernel(Tensor& self,
                                     const std::optional<Tensor>& /*min*/,
                                     const std::optional<Tensor>& /*max*/) {
+    check_clamp_dtype(self);
     return self;
 }
 
 Tensor& clamp_min_scalar_inplace_kernel(Tensor& self, const Scalar& /*min*/) {
+    check_clamp_dtype(self);
     return self;
 }
 
 Tensor& clamp_max_scalar_inplace_kernel(Tensor& self, const Scalar& /*max*/) {
+    check_clamp_dtype(self);
     return self;
 }
 
 Tensor& clamp_min_tensor_inplace_kernel(Tensor& self, const Tensor& /*min*/) {
+    check_clamp_dtype(self);
     return self;
 }
 
 Tensor& clamp_max_tensor_inplace_kernel(Tensor& self, const Tensor& /*max*/) {
+    check_clamp_dtype(self);
     return self;
 }
 
@@ -347,18 +452,14 @@ Tensor pow_tensor_scalar_kernel(const Tensor& self, const Scalar& exponent) {
 
 Tensor pow_tensor_tensor_kernel(const Tensor& self, const Tensor& exponent) {
     check_all_meta(self, exponent);
-    if (self.dtype() == DType::Bool || exponent.dtype() == DType::Bool) {
-        TP_THROW(TypeError, "pow is not supported for bool tensors");
-    }
+    // A boolean base or exponent takes part in the promotion like any
+    // whole-number operand; only the scalar-exponent spellings refuse it.
     return empty_meta(broadcast2(self, exponent),
                       promoteTypes(self.dtype(), exponent.dtype()),
                       self.device());
 }
 
 Tensor pow_scalar_tensor_kernel(const Scalar& base, const Tensor& exponent) {
-    if (exponent.dtype() == DType::Bool) {
-        TP_THROW(TypeError, "pow is not supported for bool tensors");
-    }
     return empty_meta(shape_of(exponent), result_type(base, exponent.dtype()),
                       exponent.device());
 }

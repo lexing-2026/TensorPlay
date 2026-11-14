@@ -295,6 +295,13 @@ Tensor& pair_inplace_kernel(Tensor& self, const Tensor& other) {
     return self;
 }
 
+// The step map runs on real numbers only, so its in-place spelling refuses a
+// complex plane before it touches the destination.
+Tensor& heaviside_inplace_kernel(Tensor& self, const Tensor& other) {
+    reject_complex_pair(self, other, "heaviside");
+    return pair_inplace_kernel(self, other);
+}
+
 Tensor& pair_scalar_inplace_kernel(Tensor& self, const Scalar& other) {
     (void)other;
     return self;
@@ -319,22 +326,27 @@ Tensor& neg_inplace_kernel(Tensor& self) {
 }
 
 Tensor exp_kernel(const Tensor& self) {
-    return empty_meta(shape_of(self), unary_float_dtype(self.dtype()),
+    return empty_meta(shape_of(self), real_math_dtype(self.dtype()),
                       self.device());
 }
 
 Tensor log_kernel(const Tensor& self) {
-    return empty_meta(shape_of(self), unary_float_dtype(self.dtype()),
+    return empty_meta(shape_of(self), real_math_dtype(self.dtype()),
                       self.device());
 }
 
 Tensor sqrt_kernel(const Tensor& self) {
-    return empty_meta(shape_of(self), unary_float_dtype(self.dtype()),
+    return empty_meta(shape_of(self), real_math_dtype(self.dtype()),
                       self.device());
 }
 
 Tensor clamp_kernel(const Tensor& self, const std::optional<Scalar>& /*min*/,
                     const std::optional<Scalar>& /*max*/) {
+    // The band comparison runs on real elements only, so complex planes and
+    // 8-bit floats are refused.
+    if (isComplexType(self.dtype()) || isFloat8Type(self.dtype())) {
+        TP_THROW(TypeError, "Unsupported dtype");
+    }
     return empty_meta(shape_of(self), self.dtype(), self.device());
 }
 
@@ -376,62 +388,62 @@ Tensor threshold_kernel(const Tensor& self, const Scalar& /*threshold*/,
                           self.device());                                     \
     }
 
-// The error-function maps have a real-number form only: integers answer in
-// single precision, every other operand -- complex planes, booleans, the
-// 8-bit floats -- is refused.
-Tensor erf_kernel(const Tensor& self) {
-    const DType dt = self.dtype();
-    if (!isIntegralType(dt) && !isFloatingType(dt)) {
-        TP_THROW(TypeError, "Unsupported dtype (expected float)");
+// A real-number sweep keeps a complex lane of its own: a whole-number
+// operand answers in single precision, a boolean or 8-bit float operand has
+// no form to run in, and a floating or complex operand keeps its width; see
+// ``real_math_dtype``.
+#define META_REAL_MATH_KERNEL(NAME)                                           \
+    Tensor NAME##_kernel(const Tensor& self) {                                \
+        return empty_meta(shape_of(self), real_math_dtype(self.dtype()),      \
+                          self.device());                                     \
     }
-    return empty_meta(shape_of(self), float_math_dtype(dt), self.device());
-}
 
-Tensor erfc_kernel(const Tensor& self) {
-    const DType dt = self.dtype();
-    if (!isIntegralType(dt) && !isFloatingType(dt)) {
-        TP_THROW(TypeError, "Unsupported dtype (expected float)");
+// The real-only sweeps have neither a complex lane nor a boolean one:
+// integers answer in single precision, every other operand is refused.
+#define META_REAL_ONLY_FLOAT_KERNEL(NAME)                                     \
+    Tensor NAME##_kernel(const Tensor& self) {                                \
+        const DType dt = self.dtype();                                        \
+        if (dt == DType::Bool || isComplexType(dt) || isFloat8Type(dt)) {     \
+            TP_THROW(TypeError, "Unsupported dtype (expected float)");        \
+        }                                                                     \
+        return empty_meta(shape_of(self), float_math_dtype(dt),               \
+                          self.device());                                     \
     }
-    return empty_meta(shape_of(self), float_math_dtype(dt), self.device());
-}
 
-Tensor lgamma_kernel(const Tensor& self) {
-    const DType dt = self.dtype();
-    if (!isIntegralType(dt) && !isFloatingType(dt)) {
-        TP_THROW(TypeError, "Unsupported dtype (expected float)");
-    }
-    return empty_meta(shape_of(self), float_math_dtype(dt), self.device());
-}
-
-META_UNARY_FLOAT_KERNEL(silu)
-META_UNARY_FLOAT_KERNEL(rsqrt)
-META_UNARY_FLOAT_KERNEL(cos)
-META_UNARY_FLOAT_KERNEL(sin)
+META_REAL_ONLY_FLOAT_KERNEL(silu)
+META_REAL_ONLY_FLOAT_KERNEL(erf)
+META_REAL_ONLY_FLOAT_KERNEL(erfc)
+META_REAL_ONLY_FLOAT_KERNEL(lgamma)
+META_REAL_MATH_KERNEL(rsqrt)
+META_REAL_MATH_KERNEL(cos)
+META_REAL_MATH_KERNEL(sin)
 META_UNARY_FLOAT_MATH_KERNEL(exp2)
-META_UNARY_FLOAT_KERNEL(expm1)
-META_UNARY_FLOAT_KERNEL(log2)
-META_UNARY_FLOAT_KERNEL(log10)
-META_UNARY_FLOAT_KERNEL(log1p)
-META_UNARY_FLOAT_KERNEL(tan)
-META_UNARY_FLOAT_KERNEL(asin)
-META_UNARY_FLOAT_KERNEL(acos)
-META_UNARY_FLOAT_KERNEL(atan)
-META_UNARY_FLOAT_KERNEL(sinh)
-META_UNARY_FLOAT_KERNEL(cosh)
-META_UNARY_FLOAT_KERNEL(asinh)
-META_UNARY_FLOAT_KERNEL(acosh)
-META_UNARY_FLOAT_KERNEL(atanh)
+META_REAL_MATH_KERNEL(expm1)
+META_REAL_MATH_KERNEL(log2)
+META_REAL_MATH_KERNEL(log10)
+META_REAL_MATH_KERNEL(log1p)
+META_REAL_MATH_KERNEL(tan)
+META_REAL_MATH_KERNEL(asin)
+META_REAL_MATH_KERNEL(acos)
+META_REAL_MATH_KERNEL(atan)
+META_REAL_MATH_KERNEL(sinh)
+META_REAL_MATH_KERNEL(cosh)
+META_REAL_MATH_KERNEL(asinh)
+META_REAL_MATH_KERNEL(acosh)
+META_REAL_MATH_KERNEL(atanh)
 META_UNARY_FLOAT_KERNEL(reciprocal)
 META_UNARY_KERNEL(square)
 META_UNARY_FLOAT_MATH_KERNEL(sinc)
 META_UNARY_FLOAT_MATH_KERNEL(erfinv)
 META_UNARY_FLOAT_MATH_KERNEL(digamma)
 META_UNARY_FLOAT_MATH_KERNEL(i0)
-META_UNARY_FLOAT_KERNEL(deg2rad)
-META_UNARY_FLOAT_KERNEL(rad2deg)
+META_UNARY_FLOAT_MATH_KERNEL(deg2rad)
+META_UNARY_FLOAT_MATH_KERNEL(rad2deg)
 #undef META_UNARY_KERNEL
 #undef META_UNARY_FLOAT_KERNEL
 #undef META_UNARY_FLOAT_MATH_KERNEL
+#undef META_REAL_MATH_KERNEL
+#undef META_REAL_ONLY_FLOAT_KERNEL
 
 Tensor absolute_kernel(const Tensor& self) {
     return abs_kernel(self);
@@ -442,43 +454,92 @@ Tensor absolute_kernel(const Tensor& self) {
 #define META_UNARY_INPLACE_KERNEL(NAME)                                       \
     Tensor& NAME##_inplace_kernel(Tensor& self) { return self; }
 
+// The in-place spelling of a real-number sweep lands the floating answer in
+// the operand's own bytes: a whole-number plane cannot hold it, and a boolean
+// or 8-bit float plane has no sweep to run in the first place.  A complex
+// plane keeps its own lane, and a floating plane its width.
+#define META_REAL_MATH_INPLACE_KERNEL(NAME)                                   \
+    Tensor& NAME##_inplace_kernel(Tensor& self) {                             \
+        const DType dt = self.dtype();                                        \
+        if (dt == DType::Bool || isFloat8Type(dt)) {                          \
+            TP_THROW(TypeError, "Unsupported dtype (expected float)");        \
+        }                                                                     \
+        if (isIntegralType(dt)) {                                             \
+            TP_THROW(TypeError,                                               \
+                     "Attempting to cast from Float32 to out tensor with dtype ", \
+                     toString(dt),                                            \
+                     ", but this can't be cast because it is not safe!");     \
+        }                                                                     \
+        return self;                                                          \
+    }
+
+// The in-place spelling of a real-only sweep refuses complex planes as well:
+// the sweep has no complex lane to read or write.
+#define META_REAL_ONLY_INPLACE_KERNEL(NAME)                                   \
+    Tensor& NAME##_inplace_kernel(Tensor& self) {                             \
+        const DType dt = self.dtype();                                        \
+        if (dt == DType::Bool || isComplexType(dt) || isFloat8Type(dt)) {     \
+            TP_THROW(TypeError, "Unsupported dtype (expected float)");        \
+        }                                                                     \
+        if (isIntegralType(dt)) {                                             \
+            TP_THROW(TypeError,                                               \
+                     "Attempting to cast from Float32 to out tensor with dtype ", \
+                     toString(dt),                                            \
+                     ", but this can't be cast because it is not safe!");     \
+        }                                                                     \
+        return self;                                                          \
+    }
+
+// The in-place spelling of a rounding map keeps whole-number and boolean
+// planes unchanged and refuses complex ones.
+#define META_ROUND_INPLACE_KERNEL(NAME)                                       \
+    Tensor& NAME##_inplace_kernel(Tensor& self) {                             \
+        if (isComplexType(self.dtype()) || isFloat8Type(self.dtype())) {      \
+            TP_THROW(TypeError, "Unsupported dtype");                         \
+        }                                                                     \
+        return self;                                                          \
+    }
+
 META_UNARY_INPLACE_KERNEL(abs)
 META_UNARY_INPLACE_KERNEL(absolute)
-META_UNARY_INPLACE_KERNEL(sqrt)
-META_UNARY_INPLACE_KERNEL(rsqrt)
-META_UNARY_INPLACE_KERNEL(exp)
-META_UNARY_INPLACE_KERNEL(exp2)
-META_UNARY_INPLACE_KERNEL(expm1)
-META_UNARY_INPLACE_KERNEL(log)
-META_UNARY_INPLACE_KERNEL(log2)
-META_UNARY_INPLACE_KERNEL(log10)
-META_UNARY_INPLACE_KERNEL(log1p)
-META_UNARY_INPLACE_KERNEL(sin)
-META_UNARY_INPLACE_KERNEL(cos)
-META_UNARY_INPLACE_KERNEL(tan)
-META_UNARY_INPLACE_KERNEL(asin)
-META_UNARY_INPLACE_KERNEL(acos)
-META_UNARY_INPLACE_KERNEL(atan)
-META_UNARY_INPLACE_KERNEL(sinh)
-META_UNARY_INPLACE_KERNEL(cosh)
-META_UNARY_INPLACE_KERNEL(asinh)
-META_UNARY_INPLACE_KERNEL(acosh)
-META_UNARY_INPLACE_KERNEL(atanh)
-META_UNARY_INPLACE_KERNEL(ceil)
-META_UNARY_INPLACE_KERNEL(floor)
-META_UNARY_INPLACE_KERNEL(round)
-META_UNARY_INPLACE_KERNEL(reciprocal)
+META_REAL_MATH_INPLACE_KERNEL(sqrt)
+META_REAL_MATH_INPLACE_KERNEL(rsqrt)
+META_REAL_MATH_INPLACE_KERNEL(exp)
+META_REAL_MATH_INPLACE_KERNEL(exp2)
+META_REAL_MATH_INPLACE_KERNEL(expm1)
+META_REAL_MATH_INPLACE_KERNEL(log)
+META_REAL_MATH_INPLACE_KERNEL(log2)
+META_REAL_MATH_INPLACE_KERNEL(log10)
+META_REAL_MATH_INPLACE_KERNEL(log1p)
+META_REAL_MATH_INPLACE_KERNEL(sin)
+META_REAL_MATH_INPLACE_KERNEL(cos)
+META_REAL_MATH_INPLACE_KERNEL(tan)
+META_REAL_MATH_INPLACE_KERNEL(asin)
+META_REAL_MATH_INPLACE_KERNEL(acos)
+META_REAL_MATH_INPLACE_KERNEL(atan)
+META_REAL_MATH_INPLACE_KERNEL(sinh)
+META_REAL_MATH_INPLACE_KERNEL(cosh)
+META_REAL_MATH_INPLACE_KERNEL(asinh)
+META_REAL_MATH_INPLACE_KERNEL(acosh)
+META_REAL_MATH_INPLACE_KERNEL(atanh)
+META_ROUND_INPLACE_KERNEL(ceil)
+META_ROUND_INPLACE_KERNEL(floor)
+META_ROUND_INPLACE_KERNEL(round)
+META_REAL_MATH_INPLACE_KERNEL(reciprocal)
 META_UNARY_INPLACE_KERNEL(square)
-META_UNARY_INPLACE_KERNEL(sinc)
-META_UNARY_INPLACE_KERNEL(erf)
-META_UNARY_INPLACE_KERNEL(erfc)
-META_UNARY_INPLACE_KERNEL(erfinv)
-META_UNARY_INPLACE_KERNEL(lgamma)
+META_REAL_MATH_INPLACE_KERNEL(sinc)
+META_REAL_ONLY_INPLACE_KERNEL(erf)
+META_REAL_ONLY_INPLACE_KERNEL(erfc)
+META_REAL_MATH_INPLACE_KERNEL(erfinv)
+META_REAL_ONLY_INPLACE_KERNEL(lgamma)
 META_UNARY_INPLACE_KERNEL(digamma)
 META_UNARY_INPLACE_KERNEL(i0)
-META_UNARY_INPLACE_KERNEL(deg2rad)
-META_UNARY_INPLACE_KERNEL(rad2deg)
+META_REAL_MATH_INPLACE_KERNEL(deg2rad)
+META_REAL_MATH_INPLACE_KERNEL(rad2deg)
 #undef META_UNARY_INPLACE_KERNEL
+#undef META_REAL_MATH_INPLACE_KERNEL
+#undef META_REAL_ONLY_INPLACE_KERNEL
+#undef META_ROUND_INPLACE_KERNEL
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 // Predicates and the maps that answer beside the operand's own type.  A
@@ -666,7 +727,7 @@ TENSORPLAY_LIBRARY_IMPL(Meta, MetaPointwise) {
     m.impl("heaviside", heaviside_kernel);
     m.impl("xlogy", float_pair_kernel);
     m.impl("atan2_", pair_inplace_kernel);
-    m.impl("heaviside_", pair_inplace_kernel);
+    m.impl("heaviside_", heaviside_inplace_kernel);
     m.impl("hypot_", pair_inplace_kernel);
     m.impl("nextafter_", pair_inplace_kernel);
     m.impl("neg", neg_kernel);

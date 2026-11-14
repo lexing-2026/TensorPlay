@@ -115,6 +115,17 @@ inline DType float_math_dtype(DType dtype) {
     return isFloatingType(dtype) ? dtype : DType::Float32;
 }
 
+// The real-number sweeps (logarithms, exponentials, roots, trigonometry)
+// keep a complex lane of their own: a whole-number operand answers in single
+// precision, a boolean or 8-bit float operand has no form to run in, and a
+// floating or complex operand keeps its width.
+inline DType real_math_dtype(DType dtype) {
+    if (dtype == DType::Bool || isFloat8Type(dtype)) {
+        TP_THROW(TypeError, "Unsupported dtype (expected float)");
+    }
+    return isIntegralType(dtype) ? DType::Float32 : dtype;
+}
+
 // Result dtype for add/sub-style arithmetic: promote the operands, and a
 // floating alpha lifts an integer pair to at least float.
 inline DType add_like_dtype(DType self_dtype, DType other_dtype,
