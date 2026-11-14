@@ -893,7 +893,9 @@ def _mmap_tensor(mapping, offset: int, info: dict):
     return result
 
 
-def _verify_payload(fd, mapping, filename: str, header_length: int, name: str, info: dict):
+def _verify_payload(
+    fd, mapping, filename: str, header_length: int, name: str, info: dict, payload=None
+):
     from .policy import _skip_payload_data
 
     if _skip_payload_data():
@@ -905,10 +907,11 @@ def _verify_payload(fd, mapping, filename: str, header_length: int, name: str, i
         return
     offset = int(info["payload_offset"]) + int(header_length)
     size = int(info["stored_nbytes"])
-    if mapping is not None:
-        payload = memoryview(mapping)[offset:offset + size]
-    else:
-        payload = _read_at(fd, offset, size)
+    if payload is None:
+        if mapping is not None:
+            payload = memoryview(mapping)[offset:offset + size]
+        else:
+            payload = _read_at(fd, offset, size)
     expected_hex = info.get("checksum_hex")
     if expected_hex:
         if checksum_type == _CHECKSUM_TYPES["crc32"]:
@@ -968,7 +971,6 @@ def load_mega(filename: str, map_location=None, *, mmap: bool = False):
         aliases: list[tuple[str, str, dict]] = []
         cpp = None
         for name, info in infos.items():
-            _verify_payload(fd, mapping, filename, header["header_length"], name, info)
             raw_dense = (
                 info["storage_format"] == "raw_dense"
                 and int(info["tensor_flags"]) == 0
@@ -991,6 +993,7 @@ def load_mega(filename: str, map_location=None, *, mmap: bool = False):
                 map_location, saved_location, info["logical_nbytes"]
             )
             tensor = None
+            verified = False
             absolute_offset = header["header_length"] + int(info["payload_offset"])
             if (
                 mapping is not None
@@ -1002,12 +1005,26 @@ def load_mega(filename: str, map_location=None, *, mmap: bool = False):
                     tensor = _mmap_tensor(mapping, absolute_offset, info)
                 except (BufferError, ValueError, RuntimeError):
                     tensor = None
+                if tensor is not None:
+                    _verify_payload(
+                        fd, mapping, filename, header["header_length"], name, info
+                    )
+                    verified = True
             if tensor is None and raw_dense:
-                data = (
-                    b"\x00" * int(info["stored_nbytes"])
-                    if skip
-                    else _read_at(fd, absolute_offset, int(info["stored_nbytes"]))
-                )
+                if skip:
+                    data = b"\x00" * int(info["stored_nbytes"])
+                else:
+                    data = _read_at(fd, absolute_offset, int(info["stored_nbytes"]))
+                    _verify_payload(
+                        fd,
+                        None,
+                        filename,
+                        header["header_length"],
+                        name,
+                        info,
+                        payload=data,
+                    )
+                    verified = True
                 if swap:
                     data = archive._byteswap_bytes(data, dtype_name)
                 flat = archive._tensor_from_flat_bytes(data, dtype_name)
@@ -1019,6 +1036,10 @@ def load_mega(filename: str, map_location=None, *, mmap: bool = False):
                         if info["shape"]
                         else flat.reshape([])
                     )
+            if not verified:
+                _verify_payload(
+                    fd, mapping, filename, header["header_length"], name, info
+                )
             if tensor is None and not skip:
                 if cpp is None:
                     cpp = _require_megatensors().cpp
