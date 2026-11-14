@@ -3502,3 +3502,406 @@ def test_mm_metadata_matches_reference():
     ours = _meta(2, 3) @ _meta(3, 5)
     theirs = _torch_meta(2, 3) @ _torch_meta(3, 5)
     assert tuple(ours.shape) == tuple(theirs.shape)
+
+
+# ---------------------------------------------------------------------------
+# Convolution family
+# ---------------------------------------------------------------------------
+
+
+def test_convolution_family_metadata():
+    C = tp._C
+
+    def meta(*shape, dt=tp.float32):
+        return tp.zeros(list(shape), dtype=dt, device="meta")
+
+    conv = C.convolution(meta(1, 3, 8), meta(2, 3, 2), None,
+                         [1], [0], [1], False, [0], 1)
+    assert tuple(conv.shape) == (1, 2, 7)
+    conv2d = C.convolution(meta(1, 3, 6, 6), meta(2, 3, 2, 2), None,
+                           [1], [0], [1], False, [0], 1)
+    assert tuple(conv2d.shape) == (1, 2, 5, 5)
+    assert tuple(C.convolution(meta(1, 3, 6, 6, 6), meta(2, 3, 2, 2, 2), None,
+                               [1], [0], [1], False, [0], 1).shape) == (1, 2, 5, 5, 5)
+    assert tuple(C.convolution(meta(1, 3, 6, 6), meta(2, 3, 2, 2), meta(2),
+                               [1], [0], [1], False, [0], 1).shape) == (1, 2, 5, 5)
+    assert tuple(C.convolution(meta(1, 3, 6, 6), meta(2, 3, 2, 2), None,
+                               [2], [0], [1], False, [0], 1).shape) == (1, 2, 3, 3)
+    assert tuple(C.convolution(meta(1, 4, 6, 6), meta(4, 1, 2, 2), None,
+                               [1], [0], [1], False, [0], 4).shape) == (1, 4, 5, 5)
+    assert tuple(C.convolution(meta(1, 2, 6), meta(2, 3, 2), None,
+                               [1], [0], [1], True, [0], 1).shape) == (1, 3, 7)
+    assert tuple(C.convolution(meta(1, 2, 6, 6), meta(2, 3, 2, 2), None,
+                               [1], [0], [1], True, [0], 1).shape) == (1, 3, 7, 7)
+    assert tuple(C.convolution(meta(1, 2, 6), meta(2, 3, 2), None,
+                               [2], [0], [1], True, [0], 1).shape) == (1, 3, 12)
+    f16 = C.convolution(meta(1, 3, 6, 6, dt=tp.float16),
+                        meta(2, 3, 2, 2, dt=tp.float16), None,
+                        [1], [0], [1], False, [0], 1)
+    assert f16.dtype == tp.float16
+
+    # overrideable spellings share the same geometry
+    assert tuple(C.convolution_overrideable(meta(1, 3, 6, 6), meta(2, 3, 2, 2), None,
+                                            [1], [0], [1], False, [0], 1).shape) == (1, 2, 5, 5)
+
+    with pytest.raises(Exception):
+        C.convolution(meta(1, 3, 6), meta(2, 3, 2, 2), None,
+                      [1], [0], [1], False, [0], 1)
+    with pytest.raises(Exception):
+        C.convolution(meta(1, 3, 6, 6), meta(2, 4, 2, 2), None,
+                      [1], [0], [1], False, [0], 1)
+
+
+def test_convolution_backward_overrideable_metadata():
+    C = tp._C
+
+    def meta(*shape):
+        return tp.zeros(list(shape), dtype=tp.float32, device="meta")
+
+    gi, gw, gb = C.convolution_backward_overrideable(
+        meta(1, 2, 5, 5), meta(1, 3, 6, 6), meta(2, 3, 2, 2),
+        [1], [0], [1], False, [0], 1, [True, True, True])
+    assert tuple(gi.shape) == (1, 3, 6, 6)
+    assert tuple(gw.shape) == (2, 3, 2, 2)
+    assert tuple(gb.shape) == (2,)
+    gi, gw, gb = C.convolution_backward_overrideable(
+        meta(1, 2, 7), meta(1, 3, 8), meta(2, 3, 2),
+        [1], [0], [1], False, [0], 1, [True, True, True])
+    assert tuple(gi.shape) == (1, 3, 8)
+    assert tuple(gw.shape) == (2, 3, 2)
+    assert tuple(gb.shape) == (2,)
+    gi, gw, gb = C.convolution_backward_overrideable(
+        meta(1, 2, 5, 5), meta(1, 3, 6, 6), meta(2, 3, 2, 2),
+        [1], [0], [1], False, [0], 1, [True, False, False])
+    assert tuple(gi.shape) == (1, 3, 6, 6)
+    assert not gw.defined() and not gb.defined()
+    gi, gw, gb = C.convolution_backward_overrideable(
+        meta(1, 2, 5, 5), meta(1, 3, 6, 6), meta(2, 3, 2, 2),
+        [1], [0], [1], False, [0], 1, [False, False, False])
+    assert not gi.defined() and not gw.defined() and not gb.defined()
+    # transposed backward answers the weight geometry without the forward
+    # geometry cross-check; the bias gradient spans the transposed output's
+    # channels, which are the backward grad_output's
+    gi, gw, gb = C.convolution_backward_overrideable(
+        meta(1, 3, 7), meta(1, 2, 6), meta(2, 3, 2),
+        [1], [0], [1], True, [0], 1, [True, True, True])
+    assert tuple(gw.shape) == (2, 3, 2)
+    assert tuple(gb.shape) == (3,)
+
+
+# ---------------------------------------------------------------------------
+# Pooling backwards
+# ---------------------------------------------------------------------------
+
+
+def test_avg_pool3d_backward_metadata():
+    C = tp._C
+
+    def meta(*shape):
+        return tp.zeros(list(shape), dtype=tp.float32, device="meta")
+
+    g = C.avg_pool3d_backward(meta(1, 2, 3, 3, 3), meta(1, 2, 6, 6, 6),
+                              [2], [2], [0], False, True, None)
+    assert tuple(g.shape) == (1, 2, 6, 6, 6)
+    assert tuple(C.avg_pool3d_backward(meta(1, 2, 3, 3, 3), meta(1, 2, 6, 6, 6),
+                                       [2], [1], [0], False, True, None).shape) == (1, 2, 6, 6, 6)
+    assert tuple(C.avg_pool3d_backward(meta(1, 2, 3, 3, 3), meta(1, 2, 7, 7, 7),
+                                       [2], [2], [0], True, True, None).shape) == (1, 2, 7, 7, 7)
+    assert tuple(C.avg_pool3d_backward(meta(1, 2, 3, 3, 3), meta(1, 2, 6, 6, 6),
+                                       [2], [2], [1], False, False, None).shape) == (1, 2, 6, 6, 6)
+    assert tuple(C.avg_pool3d_backward(meta(1, 2, 3, 3, 3), meta(1, 2, 6, 6, 6),
+                                       [2], [2], [0], False, True, 4).shape) == (1, 2, 6, 6, 6)
+    # 4D inputs enter the batched path and answer the same geometry
+    assert tuple(C.avg_pool3d_backward(meta(2, 3, 3, 3), meta(2, 4, 4, 4),
+                                       [2], [2], [0], False, True, None).shape) == (2, 4, 4, 4)
+    with pytest.raises(Exception):
+        C.avg_pool3d_backward(meta(1, 2, 3, 3, 3), meta(1, 2, 6, 6, 6),
+                              [2], [2], [0], False, True, 0)
+
+
+def test_adaptive_pooling_backwards_metadata():
+    C = tp._C
+
+    def meta(*shape):
+        return tp.zeros(list(shape), dtype=tp.float32, device="meta")
+
+    g = C._adaptive_avg_pool3d_backward(meta(1, 2, 3, 3, 3), meta(1, 2, 6, 6, 6))
+    assert tuple(g.shape) == (1, 2, 6, 6, 6)
+    assert tuple(C._adaptive_avg_pool3d_backward(meta(2, 3, 3, 3),
+                                                 meta(2, 4, 4, 4)).shape) == (2, 4, 4, 4)
+
+    assert tuple(C.adaptive_max_pool2d_backward(meta(1, 2, 3, 3),
+                                                meta(1, 2, 6, 6)).shape) == (1, 2, 6, 6)
+    assert tuple(C.adaptive_max_pool2d_backward(meta(2, 3, 3),
+                                                meta(2, 6, 6)).shape) == (2, 6, 6)
+    assert tuple(C.adaptive_max_pool2d_backward(meta(2, 3, 3, 3),
+                                                meta(2, 6, 6, 6)).shape) == (2, 6, 6, 6)
+
+    g = C.adaptive_max_pool3d_backward(meta(1, 2, 3, 3, 3), meta(1, 2, 6, 6, 6),
+                                       tp.zeros([1, 2, 3, 3, 3], dtype=tp.int64,
+                                                device="meta"))
+    assert tuple(g.shape) == (1, 2, 6, 6, 6)
+
+
+def test_max_pool_with_indices_backwards_metadata():
+    C = tp._C
+
+    def meta(*shape, dt=tp.float32):
+        return tp.zeros(list(shape), dtype=dt, device="meta")
+
+    idx2d = meta(1, 2, 3, 3, dt=tp.int64)
+    g = C.max_pool2d_with_indices_backward(meta(1, 2, 3, 3), meta(1, 2, 6, 6),
+                                           [2], [2], [0], [1], False, idx2d)
+    assert tuple(g.shape) == (1, 2, 6, 6)
+    # a 3D input enters the batched path and answers the same geometry
+    g = C.max_pool2d_with_indices_backward(meta(2, 3, 3), meta(2, 6, 6),
+                                           [2], [2], [0], [1], False,
+                                           meta(2, 3, 3, dt=tp.int64))
+    assert tuple(g.shape) == (2, 6, 6)
+    with pytest.raises(Exception):
+        C.max_pool2d_with_indices_backward(meta(1, 2, 3, 3), meta(1, 2, 6, 6),
+                                           [2], [2], [0], [1], False, None)
+    with pytest.raises(Exception):
+        C.max_pool2d_with_indices_backward(meta(1, 2, 3, 3), meta(1, 2, 6, 6),
+                                           [2], [2], [0], [1], False,
+                                           meta(1, 2, 4, 4, dt=tp.int64))
+
+    g = C.max_pool3d_with_indices_backward(meta(1, 2, 3, 3, 3),
+                                           meta(1, 2, 6, 6, 6),
+                                           [2], [2], [0], [1], False,
+                                           meta(1, 2, 3, 3, 3, dt=tp.int64))
+    assert tuple(g.shape) == (1, 2, 6, 6, 6)
+
+
+# ---------------------------------------------------------------------------
+# Embedding backwards
+# ---------------------------------------------------------------------------
+
+
+def test_embedding_dense_backward_metadata():
+    C = tp._C
+
+    def meta(*shape, dt=tp.float32):
+        return tp.zeros(list(shape), dtype=dt, device="meta")
+
+    def meta_i(*shape):
+        return tp.zeros(list(shape), dtype=tp.int64, device="meta")
+
+    g = C.embedding_dense_backward(meta(6, 5), meta_i(8), 6, -1, False)
+    assert tuple(g.shape) == (6, 5)
+    g = C.embedding_dense_backward(meta(6, 5, 4), meta_i(2, 3), 6, -1, False)
+    assert tuple(g.shape) == (6, 4)
+    g = C.embedding_dense_backward(meta(6, 5, dt=tp.float16), meta_i(8), 6, -1, False)
+    assert g.dtype == tp.float16
+    g = C.embedding_dense_backward(meta(6, 5), tp.zeros([0], dtype=tp.int64,
+                                                        device="meta"), 6, -1, False)
+    assert tuple(g.shape) == (6, 5)
+    with pytest.raises(Exception):
+        C.embedding_dense_backward(meta(6, 5), meta(8, dtype=tp.float32), 6, -1, False)
+    with pytest.raises(Exception):
+        C.embedding_dense_backward(meta(6, 5, dtype=tp.bool), meta_i(8), 6, -1, False)
+
+
+def test_embedding_bag_backwards_metadata():
+    C = tp._C
+
+    def meta(*shape, dt=tp.float32):
+        return tp.zeros(list(shape), dtype=dt, device="meta")
+
+    def meta_i(*shape):
+        return tp.zeros(list(shape), dtype=tp.int64, device="meta")
+
+    # modes: 0 sum, 1 mean, 2 max
+    for mode in (0, 1):
+        g = C._embedding_bag_dense_backward(meta(2, 5), meta_i(8), meta(8),
+                                            meta_i(2), meta_i(2), 6, False,
+                                            mode, None, -1)
+        assert tuple(g.shape) == (6, 5)
+    g = C._embedding_bag_dense_backward(meta(2, 5), meta_i(8), meta(8),
+                                        meta_i(2), meta_i(2, 5), 6, False,
+                                        2, None, -1)
+    assert tuple(g.shape) == (6, 5)
+    with pytest.raises(Exception):
+        C._embedding_bag_dense_backward(meta(2, 5, 4), meta_i(8), meta(8),
+                                        meta_i(2), meta_i(2), 6, False, 0, None, -1)
+    with pytest.raises(Exception):
+        C._embedding_bag_dense_backward(meta(2, 5), meta_i(8), meta(8),
+                                        meta_i(2), meta_i(2), -1, False, 0, None, -1)
+    with pytest.raises(Exception):
+        C._embedding_bag_dense_backward(meta(2, 5), meta_i(8), meta(4),
+                                        meta_i(2), meta_i(2), 6, False, 0, None, -1)
+    # per-sample weights ride along with the sum reduction
+    g = C._embedding_bag_dense_backward(meta(2, 5), meta_i(8), meta(8),
+                                        meta_i(2), meta_i(2), 6, False, 0,
+                                        meta(8), -1)
+    assert tuple(g.shape) == (6, 5)
+
+    g = C._embedding_bag_per_sample_weights_backward(
+        meta(2, 5), meta(6, 5), meta_i(8), meta_i(2), meta(8), 0, -1)
+    assert tuple(g.shape) == (8,)
+    with pytest.raises(Exception):
+        C._embedding_bag_per_sample_weights_backward(
+            meta(2, 5), meta(6, 5), meta_i(8), meta_i(2), meta(8), 2, -1)
+
+
+# ---------------------------------------------------------------------------
+# Segment reduce and grid sampler backwards
+# ---------------------------------------------------------------------------
+
+
+def test_segment_reduce_backward_metadata():
+    C = tp._C
+
+    def meta(*shape):
+        return tp.zeros(list(shape), dtype=tp.float32, device="meta")
+
+    lengths = tp.zeros([2], dtype=tp.int64, device="meta")
+    for reduce in ("sum", "mean"):
+        g = C._segment_reduce_backward(meta(2, 5), meta(2, 5), meta(4, 5),
+                                       reduce, lengths=lengths)
+        assert tuple(g.shape) == (4, 5)
+    with pytest.raises(Exception):
+        C._segment_reduce_backward(meta(2, 5), meta(2, 5), meta(4, 5),
+                                   "bogus", lengths=lengths)
+    with pytest.raises(Exception):
+        C._segment_reduce_backward(meta(2, 5), meta(2, 5), meta(4, 5), "sum")
+    with pytest.raises(Exception):
+        C._segment_reduce_backward(meta(2, 5), meta(2, 5), meta(4, 5),
+                                   "sum", lengths=lengths, axis=2)
+
+
+def test_grid_sampler_3d_backward_metadata():
+    C = tp._C
+
+    def meta(*shape, dt=tp.float32):
+        return tp.zeros(list(shape), dtype=dt, device="meta")
+
+    gi, gg = C.grid_sampler_3d_backward(meta(1, 2, 3, 3, 3), meta(1, 2, 6, 6, 6),
+                                        meta(1, 3, 3, 3, 3), 0, 0, True,
+                                        [True, True])
+    assert tuple(gi.shape) == (1, 2, 6, 6, 6)
+    assert tuple(gg.shape) == (1, 3, 3, 3, 3)
+    assert gg.dtype == tp.float32
+    # the output mask only steers the buffer fill on computing backends
+    gi, _ = C.grid_sampler_3d_backward(meta(1, 2, 3, 3, 3), meta(1, 2, 6, 6, 6),
+                                       meta(1, 3, 3, 3, 3), 0, 0, True,
+                                       [True, False])
+    assert tuple(gi.shape) == (1, 2, 6, 6, 6)
+    with pytest.raises(Exception):
+        C.grid_sampler_3d_backward(meta(1, 2, 3, 3, 3), meta(1, 2, 6, 6, 6),
+                                   meta(1, 3, 3, 3, 3), 2, 0, True, [True, True])
+    with pytest.raises(Exception):
+        C.grid_sampler_3d_backward(meta(1, 2, 6, 6, 6, dt=tp.int32),
+                                   meta(1, 2, 6, 6, 6, dt=tp.int32),
+                                   meta(1, 3, 3, 3, 3, dt=tp.int32), 0, 0, True,
+                                   [True, True])
+
+
+# ---------------------------------------------------------------------------
+# Sparse COO factories
+# ---------------------------------------------------------------------------
+
+
+def test_sparse_coo_tensor_on_meta():
+    C = tp._C
+
+    def meta_i(*shape):
+        return tp.zeros(list(shape), dtype=tp.int64, device="meta")
+
+    def meta_f(*shape, dt=tp.float32):
+        return tp.zeros(list(shape), dtype=dt, device="meta")
+
+    sp = C.sparse_coo_tensor(meta_i(1, 4), meta_f(4, 3), [2, 3])
+    assert sp.is_sparse
+    assert sp.is_meta
+    assert tuple(sp.shape) == (2, 3)
+    assert tuple(sp._indices().shape) == (1, 4)
+    assert tuple(sp._values().shape) == (4, 3)
+    assert sp.sparse_dim() == 1
+    sp = C.sparse_coo_tensor(meta_i(1, 4), meta_f(4, 3, dt=tp.float64), [2, 3])
+    assert sp.dtype == tp.float64
+    sp = C.sparse_coo_tensor(meta_i(1, 4), meta_i(4, 3), [2, 3])
+    assert sp.dtype == tp.int64
+    with pytest.raises(Exception):
+        C.sparse_coo_tensor(meta_i(1, 4), meta_f(4, 2), [2, 3])
+    with pytest.raises(Exception):
+        C.sparse_coo_tensor(meta_i(1, 4), meta_f(3, 3), [2, 3])
+    # a hybrid COO (2 sparse dims plus one dense trailing extent) is valid
+    sp = C.sparse_coo_tensor(meta_i(2, 4), meta_f(4, 3), [2, 3, 3])
+    assert tuple(sp.shape) == (2, 3, 3)
+    assert sp.sparse_dim() == 2
+
+
+def test_sparse_sum_on_meta():
+    C = tp._C
+
+    def sp(n):
+        return C.sparse_coo_tensor(tp.zeros([1, n], dtype=tp.int64, device="meta"),
+                                   tp.zeros([n, 3], dtype=tp.float32, device="meta"),
+                                   [2, 3])
+
+    out = C._sparse_sum(sp(4))
+    assert tuple(out.shape) == ()
+    assert out.dtype == tp.float32
+    out = C._sparse_sum(C.sparse_coo_tensor(
+        tp.zeros([1, 4], dtype=tp.int64, device="meta"),
+        tp.zeros([4, 3], dtype=tp.float64, device="meta"), [2, 3]))
+    assert out.dtype == tp.float64
+    # a dense operand reaches no kernel at all, matching the dense-key
+    # outcome on computing backends
+    with pytest.raises(NotImplementedError):
+        C._sparse_sum(tp.zeros([2, 3], dtype=tp.float32, device="meta"))
+
+
+def test_sparse_addmm_on_meta():
+    C = tp._C
+
+    def meta(*shape, dt=tp.float32):
+        return tp.zeros(list(shape), dtype=dt, device="meta")
+
+    # a fully sparse 3x4 matrix: two sparse dims, 1-D values plane
+    def sp():
+        return C.sparse_coo_tensor(tp.zeros([2, 4], dtype=tp.int64, device="meta"),
+                                   meta(4), [3, 4])
+
+    out = C._sparse_addmm(meta(3, 5), sp(), meta(4, 5))
+    assert tuple(out.shape) == (3, 5)
+    assert out.dtype == tp.float32
+    out = C._sparse_addmm(meta(3, 5), sp(), meta(4, 5), beta=0, alpha=1)
+    assert tuple(out.shape) == (3, 5)
+    # a sparse self keeps the dense-mat1 gate; a dense self answers the product
+    with pytest.raises(RuntimeError):
+        C._sparse_addmm(sp(), meta(2, 3), meta(3, 3))
+    with pytest.raises(Exception):
+        C._sparse_addmm(meta(3, 5), sp(), meta(5, 6))
+
+
+# ---------------------------------------------------------------------------
+# Foreach copy and mm
+# ---------------------------------------------------------------------------
+
+
+def test_foreach_copy_and_mm_on_meta():
+    C = tp._C
+
+    def meta(*shape, dt=tp.float32):
+        return tp.zeros(list(shape), dtype=dt, device="meta")
+
+    outs = C._foreach_copy([meta(2, 3)], [meta(2, 3)], False)
+    assert tuple(outs[0].shape) == (2, 3)
+    outs = C._foreach_copy([meta(2, 3), meta(4)], [meta(2, 3), meta(4)], False)
+    assert [tuple(o.shape) for o in outs] == [(2, 3), (4,)]
+    # the copy answers the source's metadata: dtype comes from the source
+    outs = C._foreach_copy([meta(2, 3)], [meta(2, 3, dt=tp.float64)], False)
+    assert outs[0].dtype == tp.float64
+    outs = C._foreach_copy([meta(2, 3, dt=tp.float16)], [meta(2, 3)], False)
+    assert outs[0].dtype == tp.float32
+    with pytest.raises(ValueError):
+        C._foreach_copy([meta(2, 3), meta(4)], [meta(2, 3)], False)
+
+    outs = C._foreach_mm([meta(2, 3)], [meta(3, 4)])
+    assert tuple(outs[0].shape) == (2, 4)
+    outs = C._foreach_mm([meta(2, 3), meta(4, 5)], [meta(3, 4), meta(5, 6)])
+    assert [tuple(o.shape) for o in outs] == [(2, 4), (4, 6)]
+    with pytest.raises(Exception):
+        C._foreach_mm([meta(2, 3)], [meta(4, 5)])
