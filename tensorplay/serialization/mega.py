@@ -1013,29 +1013,59 @@ def load_mega(filename: str, map_location=None, *, mmap: bool = False):
             if tensor is None and raw_dense:
                 if skip:
                     data = b"\x00" * int(info["stored_nbytes"])
+                    if swap:
+                        data = archive._byteswap_bytes(data, dtype_name)
+                    flat = archive._tensor_from_flat_bytes(data, dtype_name)
+                    if flat is None:
+                        tensor = tp.empty(info["shape"], dtype=getattr(tp, dtype_name))
+                    else:
+                        tensor = (
+                            flat.reshape(info["shape"])
+                            if info["shape"]
+                            else flat.reshape([])
+                        )
                 else:
-                    data = _read_at(fd, absolute_offset, int(info["stored_nbytes"]))
-                    _verify_payload(
-                        fd,
-                        None,
-                        filename,
-                        header["header_length"],
-                        name,
-                        info,
-                        payload=data,
-                    )
-                    verified = True
-                if swap:
-                    data = archive._byteswap_bytes(data, dtype_name)
-                flat = archive._tensor_from_flat_bytes(data, dtype_name)
-                if flat is None:
                     tensor = tp.empty(info["shape"], dtype=getattr(tp, dtype_name))
-                else:
-                    tensor = (
-                        flat.reshape(info["shape"])
-                        if info["shape"]
-                        else flat.reshape([])
-                    )
+                    if cpp is None:
+                        cpp = _require_megatensors().cpp
+                    raw_loader = getattr(cpp, "copy_raw_payload_fd", None)
+                    if raw_loader is not None:
+                        raw_loader(
+                            fd,
+                            filename,
+                            name,
+                            absolute_offset,
+                            int(info["stored_nbytes"]),
+                            int(info["checksum_type"]),
+                            bytes(info["checksum"]) or b"\x00" * 32,
+                            tensor.data_ptr(),
+                        )
+                        verified = True
+                        if swap:
+                            tensor = archive._byteswap_tensor(tensor)
+                    else:
+                        data = _read_at(fd, absolute_offset, int(info["stored_nbytes"]))
+                        _verify_payload(
+                            fd,
+                            None,
+                            filename,
+                            header["header_length"],
+                            name,
+                            info,
+                            payload=data,
+                        )
+                        verified = True
+                        if swap:
+                            data = archive._byteswap_bytes(data, dtype_name)
+                        flat = archive._tensor_from_flat_bytes(data, dtype_name)
+                        if flat is None:
+                            tensor = tp.empty(info["shape"], dtype=getattr(tp, dtype_name))
+                        else:
+                            tensor = (
+                                flat.reshape(info["shape"])
+                                if info["shape"]
+                                else flat.reshape([])
+                            )
             if not verified:
                 _verify_payload(
                     fd, mapping, filename, header["header_length"], name, info
