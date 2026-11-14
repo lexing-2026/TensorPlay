@@ -3221,6 +3221,255 @@ def test_ordered_comparisons_refuse_complex():
 
 
 # ---------------------------------------------------------------------------
+# Family refusal paths: dimension wrapping, dtype tables and geometry checks
+# ---------------------------------------------------------------------------
+
+
+def test_index_family_wraps_negative_and_rejects_unknown_dims():
+    t = _meta(2, 3)
+    vec = _meta(2, dtype=tp.int64)
+    # The gathered reads and writes share one dimension wrap: a negative axis
+    # counts from the end, and an axis past the end is refused after the wrap.
+    for call in (
+        lambda d: tp.gather(t, d, _meta(2, 2, dtype=tp.int64)),
+        lambda d: tp.index_select(t, d, _meta(2, dtype=tp.int64)),
+        lambda d: tp._C.scatter(t, d, _meta(2, 2, dtype=tp.int64),
+                                _meta(2, 2)),
+        lambda d: tp._C.scatter_add(t, d, _meta(2, 2, dtype=tp.int64),
+                                    _meta(2, 2)),
+        lambda d: tp._C.index_add(t, d, _meta(2, dtype=tp.int64), _meta(2, 2)),
+        lambda d: tp._C.index_fill(t, d, _meta(2, dtype=tp.int64), 1.0),
+    ):
+        with pytest.raises(RuntimeError):
+            call(5)
+        assert call(-1) is not None
+    # The flat read walks real and complex planes alike.
+    c = _meta(2, 3, dtype=tp.complex64)
+    assert tp.take(c, _meta(2, dtype=tp.int64)).dtype == tp.complex64
+
+
+def test_topk_zero_and_empty_selections():
+    # A selection that writes nothing still produces the answer planes for
+    # every dtype, including those the ordering walk itself refuses.
+    for dt in (tp.bool, tp.complex64, tp.int64, tp.float16):
+        values, indices = tp._C.topk(_meta(2, 3, dtype=dt), 0, 1, True, True)
+        assert tuple(values.shape) == (2, 0)
+        assert values.dtype == dt
+        assert indices.dtype == tp.int64
+    empty_bool = _meta(0, 3, dtype=tp.bool)
+    values, indices = tp._C.topk(empty_bool, 3, 1, True, True)
+    assert tuple(values.shape) == (0, 3)
+    assert values.dtype == tp.bool
+    assert indices.dtype == tp.int64
+    # A walk that would actually order elements refuses booleans and
+    # complex planes.
+    with pytest.raises(NotImplementedError):
+        tp._C.topk(_meta(2, 3, dtype=tp.bool), 2, 1, True, True)
+    with pytest.raises(NotImplementedError):
+        tp._C.topk(_meta(2, 3, dtype=tp.complex64), 2, 1, True, True)
+    with pytest.raises(RuntimeError):
+        tp._C.topk(_meta(2, 3), 5, 1, True, True)
+
+
+def test_softmax_native_and_backward_tables():
+    t = _meta(2, 3)
+    i = _meta(2, 3, dtype=tp.int64)
+    # The lower-level forward refuses a set half-to-float flag before it
+    # reads anything else.
+    for x in (t, i, _meta(2, 3, dtype=tp.complex64)):
+        with pytest.raises(RuntimeError):
+            tp._C._softmax(x, 1, True)
+        with pytest.raises(RuntimeError):
+            tp._C._log_softmax(x, 1, True)
+    # Whole-number planes answer at single precision; boolean and complex
+    # planes have no normalization.
+    assert tp._C._softmax(i, 1, False).dtype == tp.float32
+    assert tp._C._log_softmax(i, 1, False).dtype == tp.float32
+    assert tp._C._softmax(t, 1, False).dtype == tp.float32
+    with pytest.raises(TypeError):
+        tp._C._softmax(_meta(2, 3, dtype=tp.bool), 1, False)
+    with pytest.raises(TypeError):
+        tp._C._softmax(_meta(2, 3, dtype=tp.complex64), 1, False)
+    with pytest.raises(IndexError):
+        tp._C._softmax(t, 5, False)
+    # The backward answers at the incoming gradient's own type, except a
+    # half forward whose gradient arrived in single precision narrows back.
+    g16 = _meta(2, 3, dtype=tp.float16)
+    g32 = _meta(2, 3, dtype=tp.float32)
+    out16 = _meta(2, 3, dtype=tp.float16)
+    assert tp._C._softmax_backward_data(g32, out16, 1, tp.float16).dtype == tp.float16
+    assert tp._C._softmax_backward_data(g16, out16, 1, tp.float16).dtype == tp.float16
+    assert tp._C._softmax_backward_data(
+        _meta(2, 3, dtype=tp.float64), t, 1, tp.float32).dtype == tp.float64
+    assert tp._C._softmax_backward_data(
+        _meta(2, 3, dtype=tp.bfloat16), _meta(2, 3, dtype=tp.bfloat16), 1,
+        tp.bfloat16).dtype == tp.bfloat16
+    assert tp._C._log_softmax_backward_data(g32, out16, 1, tp.float16).dtype == tp.float16
+
+
+def _attn(dtype=tp.float32, *shape):
+    return _meta(*(shape or (1, 2, 3, 4)), dtype=dtype)
+
+
+def test_attention_geometry_checks_and_dtypes():
+    q = _attn()
+    out = tp._C.scaled_dot_product_attention(q, _attn(), _attn())
+    assert tuple(out.shape) == (1, 2, 3, 4)
+    assert out.dtype == tp.float32
+    for dt in (tp.float16, tp.bfloat16, tp.float64):
+        assert tp._C.scaled_dot_product_attention(
+            _attn(dt), _attn(dt), _attn(dt)).dtype == dt
+    for dt in (tp.complex64, tp.int64, tp.bool):
+        with pytest.raises(NotImplementedError):
+            tp._C.scaled_dot_product_attention(_attn(dt), _attn(dt), _attn(dt))
+    # A mask of any broadcastable rank joins the scores in the working
+    # precision: a wide mask is narrowed, so the answer keeps its own type.
+    for mask_shape, mask_dt in (((3,), tp.float32), ((3, 3), tp.float32),
+                                ((1, 1, 3, 3), tp.bool), ((3, 3), tp.float64)):
+        assert tp._C.scaled_dot_product_attention(
+            q, _attn(), _attn(), _meta(*mask_shape, dtype=mask_dt)
+        ).dtype == tp.float32
+    with pytest.raises(RuntimeError):
+        tp._C.scaled_dot_product_attention(q, _attn(), _attn(), _meta(2, 2))
+    with pytest.raises(RuntimeError):
+        tp._C.scaled_dot_product_attention(q, _attn(), _attn(),
+                                           _meta(1, 3, 3, 3))
+    # One head dimension is read from the query and must be non-zero, match
+    # the key, and sit inside matching key/value weights.
+    with pytest.raises(ValueError):
+        tp._C.scaled_dot_product_attention(_attn(tp.float32, 1, 2, 3, 0),
+                                           _attn(tp.float32, 1, 2, 3, 0),
+                                           _attn(tp.float32, 1, 2, 3, 0))
+    with pytest.raises(ValueError):
+        tp._C.scaled_dot_product_attention(_attn(), _attn(tp.float32, 1, 2, 4, 4),
+                                           _attn(tp.float32, 1, 2, 3, 4))
+    with pytest.raises(ValueError):
+        tp._C.scaled_dot_product_attention(_attn(tp.float32, 1, 4, 3, 4),
+                                           _attn(tp.float32, 1, 3, 3, 4),
+                                           _attn(tp.float32, 1, 3, 3, 4))
+    # Mixed operand types reach the score product's own refusal.
+    with pytest.raises(RuntimeError):
+        tp._C.scaled_dot_product_attention(_attn(tp.float64), _attn(),
+                                           _attn())
+    with pytest.raises(RuntimeError):
+        tp._C.scaled_dot_product_attention(_attn(), _attn(tp.float64),
+                                           _attn(tp.float64))
+    # Ranks other than three and four follow the score product's rules: the
+    # key and value must broadcast against the query's batch geometry.
+    assert tuple(tp._C.scaled_dot_product_attention(
+        _attn(tp.float32, 2, 3, 4), _attn(tp.float32, 2, 3, 4),
+        _attn(tp.float32, 2, 3, 4)).shape) == (2, 3, 4)
+    assert tuple(tp._C.scaled_dot_product_attention(
+        _attn(tp.float32, 3, 4), _attn(tp.float32, 3, 4),
+        _attn(tp.float32, 3, 4)).shape) == (3, 4)
+    assert tuple(tp._C.scaled_dot_product_attention(
+        _attn(tp.float32, 4), _attn(tp.float32, 3, 4),
+        _attn(tp.float32, 3, 4)).shape) == (4,)
+    # A lower-rank key/value pair broadcasts against the query's batch, and
+    # a one-dimensional key whose value is also flat has no matrix axis to
+    # transpose.
+    assert tuple(tp._C.scaled_dot_product_attention(
+        _attn(tp.float32, 2, 3, 4), _attn(tp.float32, 3, 4),
+        _attn(tp.float32, 3, 4)).shape) == (2, 3, 4)
+    with pytest.raises(IndexError):
+        tp._C.scaled_dot_product_attention(_attn(tp.float32, 2, 3, 4),
+                                           _attn(tp.float32, 4),
+                                           _attn(tp.float32, 4))
+    with pytest.raises(RuntimeError):
+        tp._C.scaled_dot_product_attention(
+            _attn(tp.float32, 2, 3, 3, 4), _attn(tp.float32, 5, 3, 4),
+            _attn(tp.float32, 5, 3, 4))
+    # A query batch of one expands to the key/value batch instead.
+    assert tuple(tp._C.scaled_dot_product_attention(
+        _attn(tp.float32, 2, 1, 3, 4), _attn(tp.float32, 1, 3, 4),
+        _attn(tp.float32, 1, 3, 4)).shape) == (2, 1, 3, 4)
+    assert tuple(tp._C.scaled_dot_product_attention(
+        _attn(tp.float32, 2, 3, 4, 5, 6), _attn(tp.float32, 2, 3, 4, 5, 6),
+        _attn(tp.float32, 2, 3, 4, 5, 6)).shape) == (2, 3, 4, 5, 6)
+
+
+def test_attention_lse_planes():
+    q, k, v = _attn(), _attn(), _attn()
+    out, lse = tp._C._scaled_dot_product_attention_with_lse(q, k, v, False, 0)
+    assert tuple(out.shape) == (1, 2, 3, 4)
+    assert out.dtype == tp.float32
+    assert tuple(lse.shape) == (1, 2, 3)
+    assert lse.dtype == tp.float32
+    with pytest.raises(NotImplementedError):
+        tp._C._scaled_dot_product_attention_with_lse(
+            _attn(tp.int64), _attn(tp.int64), _attn(tp.int64), False, 0)
+
+
+def test_linalg_whole_number_and_complex_refusals():
+    eye = tp.eye(3, device="meta")
+    assert tp._C.matrix_power(eye, -1).dtype == tp.float32
+    # A negative power inverts the operand, which runs over the linalg
+    # element types only.
+    for dt in (tp.int64, tp.float16, tp.bool):
+        with pytest.raises(NotImplementedError):
+            tp._C.matrix_power(tp.eye(3, dtype=dt, device="meta"), -1)
+    assert tp._C.matrix_power(
+        tp.eye(3, dtype=tp.int64, device="meta"), 2).dtype == tp.int64
+    # The factorization unpacks a permutation written in the operand's own
+    # type, so complex planes have no form for it.
+    for shape in ((3, 3), (2, 3)):
+        with pytest.raises(TypeError):
+            tp._C.linalg_lu(_meta(*shape, dtype=tp.complex64))
+
+
+def test_loss_dtype_tables():
+    # The squared difference runs in the pair's promoted type: a whole-number
+    # pair answers its mean at single precision and keeps its pair type for
+    # the elementwise and summed forms.
+    i = _meta(2, 3, dtype=tp.int64)
+    assert tp._C.mse_loss(i, i, 1).dtype == tp.float32
+    assert tp._C.mse_loss(i, i, 0).dtype == tp.int64
+    assert tp._C.mse_loss(i, i, 2).dtype == tp.int64
+    assert tp._C.mse_loss(_meta(2, 3, dtype=tp.complex64),
+                          _meta(2, 3, dtype=tp.complex64), 1).dtype == tp.complex64
+    assert tp._C.mse_loss(_meta(2, 3, dtype=tp.float32), i, 1).dtype == tp.float32
+    assert tp._C.mse_loss(_meta(2, 3, dtype=tp.float32),
+                          _meta(2, 3, dtype=tp.float64), 1).dtype == tp.float64
+    with pytest.raises(RuntimeError):
+        tp._C.mse_loss(_meta(2, 3, dtype=tp.bool), _meta(2, 3, dtype=tp.bool), 1)
+    assert tp._C.mse_loss(_meta(2, 3, dtype=tp.bool), t32 := _meta(2, 3), 1).dtype == tp.float32
+    with pytest.raises(ValueError):
+        tp._C.mse_loss(i, i, 5)
+    # The switched absolute blend multiplies by non-integral scalars in both
+    # branches, so a whole-number pair answers at single precision at every
+    # reduction.
+    for reduction in (0, 1, 2):
+        assert tp._C.smooth_l1_loss(i, i, 0.0, reduction).dtype == tp.float32
+    assert tp._C.smooth_l1_loss(_meta(2, 3, dtype=tp.complex64),
+                                _meta(2, 3, dtype=tp.complex64), 0.0,
+                                1).dtype == tp.complex64
+    with pytest.raises(RuntimeError):
+        tp._C.smooth_l1_loss(_meta(2, 3, dtype=tp.bool),
+                             _meta(2, 3, dtype=tp.bool), 0.0, 1)
+    with pytest.raises(ValueError):
+        tp._C.smooth_l1_loss(t32, t32, 0.0, -1.0)
+    # The scored loss runs over the four wide element types only.
+    tgt = _meta(2, dtype=tp.int64)
+    raw, total = tp._C.nll_loss(_meta(2, 4, dtype=tp.float16), tgt, None, 1, -100)
+    assert raw.dtype == tp.float16
+    assert total.dtype == tp.float16
+    raw, total = tp._C.nll_loss(_meta(2, 4, dtype=tp.bfloat16), tgt, None, 1, -100)
+    assert raw.dtype == tp.bfloat16
+    assert total.dtype == tp.bfloat16
+    for dt in (tp.int64, tp.bool):
+        with pytest.raises(NotImplementedError):
+            tp._C.nll_loss(_meta(2, 4, dtype=dt), tgt, None, 1, -100)
+    # The logarithmic loss blends a logarithm and a fractional shift, so
+    # whole-number planes answer at single precision; the weight joins the
+    # promotion.
+    assert tp._C.binary_cross_entropy(i, i, None, 1).dtype == tp.float32
+    assert tp._C.binary_cross_entropy(
+        _meta(2, 3, dtype=tp.float16), _meta(2, 3, dtype=tp.float16), None,
+        1).dtype == tp.float16
+    assert tp._C.binary_cross_entropy(i, i, i, 1).dtype == tp.float32
+
+
+# ---------------------------------------------------------------------------
 # Cross-checks against the reference framework when it is installed
 # ---------------------------------------------------------------------------
 
