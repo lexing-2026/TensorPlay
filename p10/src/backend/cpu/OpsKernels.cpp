@@ -812,9 +812,18 @@ Tensor reciprocal_cpu(const Tensor& self) {
             return static_cast<T>(1) / z;
         });
     }
-    return float_math_kernel(self, ReciprocalScalar{}, "reciprocal");
+    return float_math_vec_kernel(self, ReciprocalScalar{}, "reciprocal",
+                                 vecunary::VOp::Reciprocal);
 }
 Tensor& reciprocal_out_cpu(const Tensor& self, Tensor& out) {
+    if ((self.dtype() == DType::Float32 || self.dtype() == DType::Float64) &&
+        destination_takes_flat(out, self.device(), self.dtype(),
+                               static_cast<std::vector<int64_t>>(self.shape()),
+                               self)) {
+        float_math_vec_kernel(self, ReciprocalScalar{}, "reciprocal",
+                              vecunary::VOp::Reciprocal, {}, &out);
+        return out;
+    }
     return float_math_out_kernel(self, out, reciprocal_cpu, ReciprocalScalar{},
                                  "reciprocal");
 }
@@ -837,12 +846,28 @@ Tensor exp2_cpu(const Tensor& self) {
     return float_math_vec_kernel(self, Exp2Scalar{}, "exp2", vecunary::VOp::Exp2);
 }
 Tensor& exp2_out_cpu(const Tensor& self, Tensor& out) {
+    if ((self.dtype() == DType::Float32 || self.dtype() == DType::Float64) &&
+        destination_takes_flat(out, self.device(), self.dtype(),
+                               static_cast<std::vector<int64_t>>(self.shape()),
+                               self)) {
+        float_math_vec_kernel(self, Exp2Scalar{}, "exp2", vecunary::VOp::Exp2,
+                              {}, &out);
+        return out;
+    }
     return float_math_out_kernel(self, out, exp2_cpu, Exp2Scalar{}, "exp2");
 }
 Tensor sinc_cpu(const Tensor& self) {
     return float_math_vec_kernel(self, SincScalar{}, "sinc", vecunary::VOp::Sinc);
 }
 Tensor& sinc_out_cpu(const Tensor& self, Tensor& out) {
+    if ((self.dtype() == DType::Float32 || self.dtype() == DType::Float64) &&
+        destination_takes_flat(out, self.device(), self.dtype(),
+                               static_cast<std::vector<int64_t>>(self.shape()),
+                               self)) {
+        float_math_vec_kernel(self, SincScalar{}, "sinc", vecunary::VOp::Sinc,
+                              {}, &out);
+        return out;
+    }
     return float_math_out_kernel(self, out, sinc_cpu, SincScalar{}, "sinc");
 }
 Tensor deg2rad_cpu(const Tensor& self) {
@@ -862,6 +887,14 @@ Tensor erfinv_cpu(const Tensor& self) {
                                  vecunary::VOp::ErfInv);
 }
 Tensor& erfinv_out_cpu(const Tensor& self, Tensor& out) {
+    if ((self.dtype() == DType::Float32 || self.dtype() == DType::Float64) &&
+        destination_takes_flat(out, self.device(), self.dtype(),
+                               static_cast<std::vector<int64_t>>(self.shape()),
+                               self)) {
+        float_math_vec_kernel(self, ErfinvScalar{}, "erfinv",
+                              vecunary::VOp::ErfInv, {}, &out);
+        return out;
+    }
     return float_math_out_kernel(self, out, erfinv_cpu, ErfinvScalar{}, "erfinv");
 }
 Tensor logit_cpu(const Tensor& self, const std::optional<Scalar>& eps) {
@@ -872,9 +905,17 @@ Tensor logit_cpu(const Tensor& self, const std::optional<Scalar>& eps) {
 // The destination form spells eps as the schema does, a width the caller chose;
 // the value it holds is what the allocating form would have clamped to.
 Tensor& logit_out_cpu(const Tensor& self, std::optional<double> eps, Tensor& out) {
+    const double e = eps.has_value() ? *eps : -1.0;
+    if ((self.dtype() == DType::Float32 || self.dtype() == DType::Float64) &&
+        destination_takes_flat(out, self.device(), self.dtype(),
+                               static_cast<std::vector<int64_t>>(self.shape()),
+                               self)) {
+        float_math_vec_kernel(self, LogitScalar{e}, "logit", vecunary::VOp::Logit,
+                              vecunary::VParams{e, 0.0, 0.0}, &out);
+        return out;
+    }
     if (float_math_takes(self, out)) {
-        float_math_kernel(self, LogitScalar{eps.has_value() ? *eps : -1.0},
-                          "logit", &out);
+        float_math_kernel(self, LogitScalar{e}, "logit", &out);
         return out;
     }
     std::optional<Scalar> width;
@@ -894,6 +935,13 @@ Tensor i0_cpu(const Tensor& self) {
     return float_math_vec_kernel(self, I0Scalar{}, "i0", vecunary::VOp::I0);
 }
 Tensor& i0_out_cpu(const Tensor& self, Tensor& out) {
+    if ((self.dtype() == DType::Float32 || self.dtype() == DType::Float64) &&
+        destination_takes_flat(out, self.device(), self.dtype(),
+                               static_cast<std::vector<int64_t>>(self.shape()),
+                               self)) {
+        float_math_vec_kernel(self, I0Scalar{}, "i0", vecunary::VOp::I0, {}, &out);
+        return out;
+    }
     return float_math_out_kernel(self, out, i0_cpu, I0Scalar{}, "i0");
 }
 Tensor nan_to_num_cpu(const Tensor& self, const Scalar& nan,

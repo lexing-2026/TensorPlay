@@ -1141,6 +1141,27 @@ inline __m256 apply_f32(VOp op, VParams prm, __m256 x) {
         }                                                                \
     }
 
+// sin(y)/y at y = pi*x, with the near-zero arm answering one.  The product
+// lives in registers from load to store, so an aliased source and destination
+// pair never meets a half-written pass the way a multi-pass composition would.
+__attribute__((target("avx2,fma"), always_inline))
+static inline __m256 v_sinc_f32x8(__m256 x) {
+    const __m256 px = _mm256_mul_ps(_mm256_set1_ps(3.14159265358979323846f), x);
+    const __m256 near_zero = _mm256_cmp_ps(_mm256_andnot_ps(_mm256_set1_ps(kSignBitF), px),
+                                           _mm256_set1_ps(1e-30f), _CMP_LT_OQ);
+    return _mm256_blendv_ps(_mm256_div_ps(tensorplay::tpsleef::sin(px), px),
+                            _mm256_set1_ps(1.0f), near_zero);
+}
+
+__attribute__((target("avx2,fma"), always_inline))
+static inline __m256d v_sinc_f64x4(__m256d x) {
+    const __m256d px = _mm256_mul_pd(_mm256_set1_pd(3.14159265358979323846), x);
+    const __m256d near_zero = _mm256_cmp_pd(_mm256_andnot_pd(_mm256_set1_pd(-0.0), px),
+                                            _mm256_set1_pd(1e-30), _CMP_LT_OQ);
+    return _mm256_blendv_pd(_mm256_div_pd(tensorplay::tpsleef::sin(px), px),
+                            _mm256_set1_pd(1.0), near_zero);
+}
+
 __attribute__((target("avx2,fma"), noinline))
 static void f32_chunk_avx2(VOp op, VParams prm, const float* src, float* dst, int64_t b, int64_t e) {
     const float* s = src + b;
@@ -1389,6 +1410,9 @@ static void f32_chunk_avx2(VOp op, VParams prm, const float* src, float* dst, in
         }
         case VOp::Sin:
             TP_F32_SIMPLE_LOOP_8(tensorplay::tpsleef::sin(x));
+            break;
+        case VOp::Sinc:
+            TP_F32_SIMPLE_LOOP_8(v_sinc_f32x8(x));
             break;
         case VOp::Cos:
             TP_F32_SIMPLE_LOOP_8(tensorplay::tpsleef::cos(x));
@@ -2187,6 +2211,9 @@ static void f64_chunk_avx2(VOp op, VParams prm, const double* src, double* dst, 
         case VOp::Sin:
             TP_F64_SIMPLE_LOOP_4(tensorplay::tpsleef::sin(x));
             break;
+        case VOp::Sinc:
+            TP_F64_SIMPLE_LOOP_4(v_sinc_f64x4(x));
+            break;
         case VOp::Cos:
             TP_F64_SIMPLE_LOOP_4(tensorplay::tpsleef::cos(x));
             break;
@@ -2468,6 +2495,26 @@ inline __m512 v_softplus_f32_512(__m512 beta, __m512 threshold, __m512 x) {
     return _mm512_mask_mov_ps(sp, _mm512_cmp_ps_mask(bx, threshold, _CMP_GT_OQ), x);
 }
 
+// 512-bit twins of the sinc helpers above: same register-resident product, so
+// the aliased destination case stays a single load-to-store span.
+__attribute__((target("avx512f,avx512dq"), always_inline))
+static inline __m512 v_sinc_f32_512(__m512 x) {
+    const __m512 px = _mm512_mul_ps(_mm512_set1_ps(3.14159265358979323846f), x);
+    const __mmask16 near_zero = _mm512_cmp_ps_mask(
+        _mm512_andnot_ps(_mm512_set1_ps(kSignBitF512), px), _mm512_set1_ps(1e-30f), _CMP_LT_OQ);
+    return _mm512_mask_mov_ps(_mm512_div_ps(tensorplay::tpsleef::sin(px), px),
+                              near_zero, _mm512_set1_ps(1.0f));
+}
+
+__attribute__((target("avx512f,avx512dq"), always_inline))
+static inline __m512d v_sinc_f64_512(__m512d x) {
+    const __m512d px = _mm512_mul_pd(_mm512_set1_pd(3.14159265358979323846), x);
+    const __mmask8 near_zero = _mm512_cmp_pd_mask(
+        _mm512_andnot_pd(_mm512_set1_pd(-0.0), px), _mm512_set1_pd(1e-30), _CMP_LT_OQ);
+    return _mm512_mask_mov_pd(_mm512_div_pd(tensorplay::tpsleef::sin(px), px),
+                              near_zero, _mm512_set1_pd(1.0));
+}
+
 __attribute__((target("avx512f,avx512dq"), always_inline))
 inline __m512 apply16_f32(VOp op, VParams prm, __m512 x) {
     const __m512 one = _mm512_set1_ps(1.0f);
@@ -2503,6 +2550,7 @@ inline __m512 apply16_f32(VOp op, VParams prm, __m512 x) {
         case VOp::Log10: return tensorplay::tpsleef::log10(x);
         case VOp::Log1p: return tensorplay::tpsleef::log1p(x);
         case VOp::Sin: return tensorplay::tpsleef::sin(x);
+        case VOp::Sinc: return v_sinc_f32_512(x);
         case VOp::Cos: return tensorplay::tpsleef::cos(x);
         case VOp::Tan: return tensorplay::tpsleef::tan(x);
         case VOp::Asin: return tensorplay::tpsleef::asin(x);
@@ -2777,6 +2825,7 @@ inline __m512d apply16_f64(VOp op, VParams prm, __m512d x) {
         case VOp::Log10: return tensorplay::tpsleef::log10(x);
         case VOp::Log1p: return tensorplay::tpsleef::log1p(x);
         case VOp::Sin: return tensorplay::tpsleef::sin(x);
+        case VOp::Sinc: return v_sinc_f64_512(x);
         case VOp::Cos: return tensorplay::tpsleef::cos(x);
         case VOp::Tan: return tensorplay::tpsleef::tan(x);
         case VOp::Asin: return tensorplay::tpsleef::asin(x);
@@ -3270,24 +3319,21 @@ inline bool vml_only_op(VOp op) {
 inline void run_f32(VOp op, VParams prm, const float* src, float* dst, int64_t b, int64_t e);
 inline void run_f64(VOp op, VParams prm, const double* src, double* dst, int64_t b, int64_t e);
 
-// sinc and logit need the scaling/clamping applied before the transcendental,
-// entr the result after it.  Both halves stay in the vector walk: the fix-up is
-// one elementwise pass, and the transcendental is the same entry the plain op
-// uses, so the composed form costs one extra pass over the block.
+// logit needs the clamping applied before the transcendental, entr the result
+// after it.  Both halves stay in the vector walk: the fix-up is one elementwise
+// pass, and the transcendental is the same entry the plain op uses, so the
+// composed form costs one extra pass over the block.  The entr and Bessel arms
+// read the source again after dst has been written, so an aliased pair takes
+// the element-wise form; sinc carries a real lane in the chunk kernels and
+// never lands here.
 inline bool composed_f32(VOp op, VParams prm, const float* src, float* dst, int64_t b,
                          int64_t e) {
     switch (op) {
-        case VOp::Sinc: {
-            constexpr float kPi = 3.14159265358979323846f;
-            for (int64_t i = b; i < e; ++i) dst[i] = kPi * src[i];
-            run_f32(VOp::Sin, {}, dst, dst, b, e);
-            for (int64_t i = b; i < e; ++i) {
-                const float px = kPi * src[i];
-                dst[i] = std::fabs(px) < 1e-30f ? 1.0f : dst[i] / px;
-            }
-            return true;
-        }
         case VOp::Entr:
+            if (src == dst) {
+                for (int64_t i = b; i < e; ++i) dst[i] = scalar_apply(op, prm, src[i]);
+                return true;
+            }
             run_f32(VOp::Log, {}, src, dst, b, e);
             for (int64_t i = b; i < e; ++i) {
                 const float x = src[i];
@@ -3311,6 +3357,10 @@ inline bool composed_f32(VOp op, VParams prm, const float* src, float* dst, int6
             return true;
         }
         case VOp::SphBesselJ0:
+            if (src == dst) {
+                for (int64_t i = b; i < e; ++i) dst[i] = scalar_apply(op, prm, src[i]);
+                return true;
+            }
             run_f32(VOp::Sin, {}, src, dst, b, e);
             for (int64_t i = b; i < e; ++i)
                 dst[i] = spherical_j0_from_sin(src[i], dst[i]);
@@ -3323,17 +3373,11 @@ inline bool composed_f32(VOp op, VParams prm, const float* src, float* dst, int6
 inline bool composed_f64(VOp op, VParams prm, const double* src, double* dst, int64_t b,
                          int64_t e) {
     switch (op) {
-        case VOp::Sinc: {
-            constexpr double kPi = 3.14159265358979323846;
-            for (int64_t i = b; i < e; ++i) dst[i] = kPi * src[i];
-            run_f64(VOp::Sin, {}, dst, dst, b, e);
-            for (int64_t i = b; i < e; ++i) {
-                const double px = kPi * src[i];
-                dst[i] = std::fabs(px) < 1e-30 ? 1.0 : dst[i] / px;
-            }
-            return true;
-        }
         case VOp::Entr:
+            if (src == dst) {
+                for (int64_t i = b; i < e; ++i) dst[i] = scalar_apply(op, prm, src[i]);
+                return true;
+            }
             run_f64(VOp::Log, {}, src, dst, b, e);
             for (int64_t i = b; i < e; ++i) {
                 const double x = src[i];
@@ -3357,6 +3401,10 @@ inline bool composed_f64(VOp op, VParams prm, const double* src, double* dst, in
             return true;
         }
         case VOp::SphBesselJ0:
+            if (src == dst) {
+                for (int64_t i = b; i < e; ++i) dst[i] = scalar_apply(op, prm, src[i]);
+                return true;
+            }
             run_f64(VOp::Sin, {}, src, dst, b, e);
             for (int64_t i = b; i < e; ++i)
                 dst[i] = spherical_j0_from_sin(src[i], dst[i]);
