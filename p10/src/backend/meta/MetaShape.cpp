@@ -434,15 +434,25 @@ void gate_upsample_dtype(const Tensor& operand) {
     }
 }
 
-// Multiplies extents in a wide accumulator: recorded sizes are caller
-// supplied, so their product can leave the 64-bit range, and anything past
-// that range only ever makes the swept span larger.
-__int128 span_product(const std::vector<int64_t>& extents) {
-    constexpr __int128 cap = static_cast<__int128>(1) << 100;
-    __int128 acc = 1;
+// Multiplies extents in a saturating accumulator: recorded sizes are caller
+// supplied, so their product can leave the 64-bit range.  The checks below
+// only ask whether a swept span reaches past another, so a product past the
+// range clamps to the largest recorded count and reads as larger than any
+// span a real tensor can hold.  The division guard keeps every intermediate
+// inside 64-bit arithmetic on platforms without a double-width integer.
+constexpr int64_t kSpanCeiling = std::numeric_limits<int64_t>::max();
+
+int64_t span_mul(int64_t left, int64_t right) {
+    if (left == 0 || right == 0) return 0;
+    if (left > kSpanCeiling / right) return kSpanCeiling;
+    return left * right;
+}
+
+int64_t span_product(const std::vector<int64_t>& extents) {
+    int64_t acc = 1;
     for (const int64_t extent : extents) {
-        acc *= extent;
-        if (acc > cap) return cap;
+        acc = span_mul(acc, extent);
+        if (acc == kSpanCeiling) return acc;
     }
     return acc;
 }
@@ -533,11 +543,11 @@ Tensor upsample_backward_answer(const char* name, const Tensor& grad_output,
         return empty_meta(input_size, grad_output.dtype(), grad_output.device());
     }
     gate_upsample_dtype(grad_output);
-    const __int128 rows = rows_span_batches
-        ? static_cast<__int128>(grad_output.size(0)) * grad_output.size(1)
+    const int64_t rows = rows_span_batches
+        ? span_mul(grad_output.size(0), grad_output.size(1))
         : grad_output.size(1);
-    if (rows * span_product(src) > static_cast<__int128>(grad_output.numel()) ||
-        rows * span_product(dst) > span_product(input_size)) {
+    if (span_mul(rows, span_product(src)) > grad_output.numel() ||
+        span_mul(rows, span_product(dst)) > span_product(input_size)) {
         TP_THROW(RuntimeError, name,
                  ": the recorded geometry sweeps past the gradient or the answer");
     }
