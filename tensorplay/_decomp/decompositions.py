@@ -2642,37 +2642,66 @@ def native_group_norm(input, weight, bias, N, C, HxW, group, eps):
     """Each group of channels normalized by its own mean and spread.
 
     The channels of a group and the spatial positions inside them are the axes
-    the statistics are taken over, so the group is made an axis of its own and
-    the two that follow it are reduced together.  The spread is the biased one
-    (dividing by the count rather than by one less than it) because the count is
-    the whole group, not a sample of it, and the inverse spread is taken after
-    the epsilon has been added so a constant group stays finite.
+    the statistics are taken over.  The spatial positions are reduced per
+    channel first, and each group's statistics are pooled from those
+    per-channel moments: the pooled mean is the mean of the channel means, and
+    the pooled spread follows the law of total variance -- the mean
+    within-channel spread plus the spread of the channel means around the
+    pooled mean.  Every reshape then lands on a tensor the walk itself
+    produced, which is contiguous whatever layout the input's channels sit in,
+    so a channels-last input is read in place and no layout copy is made.
 
-    The two statistics come back with the reduced axes squeezed out, so each is
-    one value per group and broadcasts against the input again.
+    The walk reduces the input in its stored precision and widens inside the
+    reduction, so no float copy of the whole tensor is materialised for the
+    statistics.  The spread is the biased one (dividing by the count rather
+    than by one less than it) because the count is the whole group, not a
+    sample of it, and the inverse spread is taken after the epsilon has been
+    added so a constant group stays finite.
+
+    The two statistics come back one value per group and broadcast against the
+    input again.
     """
     cpg = C // group
-    # [N, group, channels-per-group, spatial] so the group's own channels and
-    # the positions inside them are the last two axes.  The input is read in
-    # its stored precision and widened inside the walk that reduces it, so no
-    # float copy of the whole tensor is materialised for the statistics.
-    grouped = input.reshape(N, group, cpg, HxW)
-    var, mean = tp.var_mean(grouped, dim=[2, 3], unbiased=False, keepdim=True)
-    rstd = (var + eps).rsqrt()
+    dims = list(range(2, input.dim()))
+    if dims:
+        var_c, mean_c = ops.var_mean.default(input, dims, unbiased=False, keepdim=False)
+    else:
+        # no spatial positions: each channel holds a single position, so the
+        # spread of one position is zero and its mean is the position itself
+        var_c = input * 0
+        mean_c = input
+    # [N, group, channels-per-group] pools the group's channels; (N, C) is the
+    # walk's own output, so the group axis is a view away.
+    grouped_var = var_c.reshape(N, group, cpg)
+    grouped_mean = mean_c.reshape(N, group, cpg)
+    mean_g = grouped_mean.sum(dim=-1) / cpg
+    var_g = (
+        grouped_var.sum(dim=-1) / cpg
+        + ((grouped_mean - mean_g.unsqueeze(-1)) ** 2).sum(dim=-1) / cpg
+    )
+    rstd_g = (var_g + eps).rsqrt()
 
-    out = (grouped - mean) * rstd
-    out = out.reshape(input.shape)
     # one coefficient per channel: the channel axis is kept, every other axis
-    # is a singleton, so each channel is scaled on its own.
-    per_channel = [1, C] + [1] * (input.dim() - 2)
+    # is a singleton, so each channel is scaled on its own.  The per-channel
+    # pair is the group's pair repeated over the channels of the group, and the
+    # weight and bias stay one value per channel, shared across the batch.
+    per_channel = [N, C] + [1] * (input.dim() - 2)
+    mean_pc = (
+        mean_g.unsqueeze(-1).expand(N, group, cpg).reshape(N, C).reshape(per_channel)
+    )
+    rstd_pc = (
+        rstd_g.unsqueeze(-1).expand(N, group, cpg).reshape(N, C).reshape(per_channel)
+    )
+    out = (input - mean_pc) * rstd_pc
+    shared_channel = [1, C] + [1] * (input.dim() - 2)
     if weight is not None:
-        out = out * weight.reshape(per_channel)
+        out = out * weight.reshape(shared_channel)
     if bias is not None:
-        out = out + bias.reshape(per_channel)
+        out = out + bias.reshape(shared_channel)
     return (
         _cast(out, input.dtype),
-        mean.squeeze((2, 3)),
-        rstd.squeeze((2, 3)),
+        mean_g,
+        rstd_g,
     )
 
 
