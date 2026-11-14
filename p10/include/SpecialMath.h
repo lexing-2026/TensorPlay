@@ -331,6 +331,92 @@ TP_HOST_DEVICE inline scalar_t zeta(scalar_t x, scalar_t q)  {
 }
 
 /*
+ * This function is derived from the implementation of the zeta function in the Cephes Math Library.
+ * See note [3-Clause BSD License for the Cephes Math Library].
+ *
+ * Variant of zeta() that accumulates in scalar_t itself: the wide fixed-point
+ * accumulator forces every power onto the narrow units of the device, which
+ * costs an order of magnitude on cards where double throughput is a small
+ * fraction of float throughput.  Series terms near the convergence floor
+ * lose the low bits the wide accumulator keeps, matching the precision the
+ * element type carries anyway.
+ */
+template <typename scalar_t, bool is_cuda=false>
+TP_HOST_DEVICE inline scalar_t zeta_scalar(scalar_t x, scalar_t q)  {
+  const scalar_t MACHEP = static_cast<scalar_t>(1.11022302462515654042E-16);
+  constexpr scalar_t zero = scalar_t{0.0};
+  constexpr scalar_t half = scalar_t{0.5};
+  constexpr scalar_t one = scalar_t{1.0};
+  static const scalar_t A[] = {
+      static_cast<scalar_t>(12.0),
+      static_cast<scalar_t>(-720.0),
+      static_cast<scalar_t>(30240.0),
+      static_cast<scalar_t>(-1209600.0),
+      static_cast<scalar_t>(47900160.0),
+      static_cast<scalar_t>(-1.8924375803183791606e9),
+      static_cast<scalar_t>(7.47242496e10),
+      static_cast<scalar_t>(-2.950130727918164224e12),
+      static_cast<scalar_t>(1.1646782814350067249e14),
+      static_cast<scalar_t>(-4.5979787224074726105e15),
+      static_cast<scalar_t>(1.8152105401943546773e17),
+      static_cast<scalar_t>(-7.1661652561756670113e18)
+  };
+
+  scalar_t a, b, k, s, t, w;
+  if (x == one) {
+    return std::numeric_limits<scalar_t>::infinity();
+  }
+
+  if (x < one) {
+    return std::numeric_limits<scalar_t>::quiet_NaN();
+  }
+
+  if (q <= zero) {
+    if (q == std::floor(q)) {
+      return std::numeric_limits<scalar_t>::infinity();
+    }
+    if (x != std::floor(x)) {
+      return std::numeric_limits<scalar_t>::quiet_NaN();
+    }
+  }
+
+  s = std::pow(q, -x);
+  a = q;
+  int i = 0;
+  b = zero;
+  while ((i < 9) || (a <= scalar_t{9.0})) {
+    i += 1;
+    a += one;
+    b = std::pow(a, -x);
+    s += b;
+    if ((-MACHEP * s < b) && (b < MACHEP * s)) {
+      return s;
+    }
+  };
+
+  w = a;
+  s += b * w / (x - one);
+  s -= half * b;
+  a = one;
+  k = zero;
+  for (i = 0; i < 12; i++) {
+    a *= x + k;
+    b /= w;
+    t = a * b / A[i];
+    s = s + t;
+    t = std::fabs(t / s);
+    if (t < MACHEP) {
+      return s;
+    }
+    k += one;
+    a *= x + k;
+    b /= w;
+    k += one;
+  }
+  return s;
+}
+
+/*
  * This function is derived from the implementation of the digamma function in the Cephes Math Library.
  * See note [3-Clause BSD License for the Cephes Math Library].
  *

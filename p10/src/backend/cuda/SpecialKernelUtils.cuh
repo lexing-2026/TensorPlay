@@ -7,6 +7,7 @@
 #include "Utils.h"
 
 #include <cstdint>
+#include <type_traits>
 #include <vector>
 
 namespace tensorplay::cuda::special_detail {
@@ -15,12 +16,28 @@ inline std::vector<int64_t> shape_of(const Tensor& tensor) {
     return static_cast<std::vector<int64_t>>(tensor.shape());
 }
 
+// Single-precision hook, matching the pointwise families: functors that
+// carry runf(float) evaluate 32-bit elements directly instead of widening
+// every element to double and paying the reduced double instruction
+// throughput consumer cards expose.
+template <typename F, typename... Args>
+struct has_runf_n {
+    template <typename G, typename = decltype(std::declval<const G&>().runf(std::declval<Args>()...))>
+    static std::true_type test(int);
+    template <typename G>
+    static std::false_type test(...);
+    static constexpr bool value = decltype(test<F>(0))::value;
+};
+
 template <typename F, typename T>
 struct FloatMathUnary {
     F function;
 
     __device__ T operator()(T value) const {
-        return static_cast<T>(function(static_cast<double>(value)));
+        if constexpr (has_runf_n<F, float>::value && std::is_same_v<T, float>)
+            return function.runf(value);
+        else
+            return static_cast<T>(function(static_cast<double>(value)));
     }
 };
 
@@ -29,8 +46,11 @@ struct FloatMathBinary {
     F function;
 
     __device__ T operator()(T lhs, T rhs) const {
-        return static_cast<T>(function(static_cast<double>(lhs),
-                                       static_cast<double>(rhs)));
+        if constexpr (has_runf_n<F, float, float>::value && std::is_same_v<T, float>)
+            return function.runf(lhs, rhs);
+        else
+            return static_cast<T>(function(static_cast<double>(lhs),
+                                           static_cast<double>(rhs)));
     }
 };
 

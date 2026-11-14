@@ -22,6 +22,7 @@ using tensorplay::special_math::shifted_chebyshev_polynomial_u_forward;
 using tensorplay::special_math::shifted_chebyshev_polynomial_v_forward;
 using tensorplay::special_math::shifted_chebyshev_polynomial_w_forward;
 using tensorplay::special_math::zeta;
+using tensorplay::special_math::zeta_scalar;
 
 struct XLog1pyFn {
     template <typename T>
@@ -31,6 +32,11 @@ struct XLog1pyFn {
 struct XLogyFn {
     template <typename T>
     __device__ T operator()(T x, T y) const { return calc_xlogy(x, y); }
+};
+
+struct ZetaFn {
+    __host__ __device__ double operator()(double a, double b) const { return zeta(a, b); }
+    __host__ __device__ float runf(float a, float b) const { return zeta_scalar(a, b); }
 };
 
 Tensor chebyshev_polynomial_t_cuda(const Tensor& x, const Tensor& n) {
@@ -94,9 +100,7 @@ Tensor legendre_polynomial_p_cuda(const Tensor& x, const Tensor& n) {
     }, "legendre_polynomial_p");
 }
 Tensor zeta_cuda(const Tensor& s, const Tensor& q) {
-    return binary_float_cuda(s, q, [] __host__ __device__ (double a, double b) {
-        return zeta(a, b);
-    }, "zeta");
+    return binary_float_cuda(s, q, ZetaFn{}, "zeta");
 }
 Tensor xlog1py_cuda(const Tensor& x, const Tensor& y) {
     return typed_binary_cuda(x, y, XLog1pyFn{});

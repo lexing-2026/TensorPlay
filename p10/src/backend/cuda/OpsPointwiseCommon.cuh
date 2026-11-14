@@ -271,8 +271,9 @@ struct HFn24 : GenFnBase<HFn24> {
 
 struct HFn25 : GenFnBase<HFn25> {
     __host__ __device__ auto run(double x) const {
- return 1.0 / x; 
+ return 1.0 / x;
     }
+    __host__ __device__ float runf(float x) const { return 1.0f / x; }
 };
 
 struct HFn26 : GenFnBase<HFn26> {
@@ -290,28 +291,35 @@ struct HFn26 : GenFnBase<HFn26> {
 
 struct HFn27 : GenFnBase<HFn27> {
     __host__ __device__ auto run(double x) const {
- return ::exp2(x); 
+ return ::exp2(x);
     }
+    __host__ __device__ float runf(float x) const { return ::exp2f(x); }
 };
 
 struct HFn28 : GenFnBase<HFn28> {
     __host__ __device__ auto run(double x) const {
         double px = M_PI * x;
         return ::fabs(px) < 1e-30 ? 1.0 : ::sin(px) / px;
-    
+
+    }
+    __host__ __device__ float runf(float x) const {
+        float px = static_cast<float>(M_PI) * x;
+        return ::fabsf(px) < 1e-30f ? 1.0f : ::sinf(px) / px;
     }
 };
 
 struct HFn29 : GenFnBase<HFn29> {
     __host__ __device__ auto run(double x) const {
- return x * (M_PI / 180.0); 
+ return x * (M_PI / 180.0);
     }
+    __host__ __device__ float runf(float x) const { return x * static_cast<float>(M_PI / 180.0); }
 };
 
 struct HFn30 : GenFnBase<HFn30> {
     __host__ __device__ auto run(double x) const {
- return x * (180.0 / M_PI); 
+ return x * (180.0 / M_PI);
     }
+    __host__ __device__ float runf(float x) const { return x * static_cast<float>(180.0 / M_PI); }
 };
 
 struct HFn31 : GenFnBase<HFn31> {
@@ -327,7 +335,10 @@ struct HFn31 : GenFnBase<HFn31> {
 
 struct HFn32 : GenFnBase<HFn32> {
     __host__ __device__ auto run(double x) const {
- return tensorplay::special_math::calc_erfinv(x); 
+ return tensorplay::special_math::calc_erfinv(x);
+    }
+    __host__ __device__ float runf(float x) const {
+        return tensorplay::special_math::calc_erfinv(x);
     }
 };
 
@@ -337,7 +348,14 @@ struct HFn33 : GenFnBase<HFn33> {
     __host__ __device__ auto run(double p) const {
                                if (e >= 0) p = ::fmin(::fmax(p, e), 1.0 - e);
                                return ::log(p / (1.0 - p));
-                           
+
+    }
+    __host__ __device__ float runf(float p) const {
+        if (e >= 0) {
+            float ef = static_cast<float>(e);
+            p = ::fminf(::fmaxf(p, ef), 1.0f - ef);
+        }
+        return ::logf(p / (1.0f - p));
     }
 };
 
@@ -357,7 +375,10 @@ struct HFn34 : GenFnBase<HFn34> {
 struct HFn35 : GenFnBase<HFn35> {
     __host__ __device__ auto run(double v) const {
         return tensorplay::special_math::modified_bessel_i0_forward(v);
-    
+
+    }
+    __host__ __device__ float runf(float v) const {
+        return tensorplay::special_math::modified_bessel_i0_forward(v);
     }
 };
 
@@ -373,7 +394,12 @@ struct HFn40 : GenFnBase<HFn40> {
         double m = ::fmax(x, y);
         if (m == -std::numeric_limits<double>::infinity() || m != m) return m;
         return m + ::log1p(::exp(-::fabs(x - y)));
-    
+
+    }
+    __host__ __device__ float runf(float x, float y) const {
+        float m = ::fmaxf(x, y);
+        if (m == -std::numeric_limits<float>::infinity() || m != m) return m;
+        return m + ::log1pf(::expf(-::fabsf(x - y)));
     }
 };
 
@@ -382,7 +408,12 @@ struct HFn41 : GenFnBase<HFn41> {
         double m = ::fmax(x, y);
         if (m == -std::numeric_limits<double>::infinity() || m != m) return m;
         return m + ::log1p(::exp2(-::fabs(x - y))) / M_LN2;
-    
+
+    }
+    __host__ __device__ float runf(float x, float y) const {
+        float m = ::fmaxf(x, y);
+        if (m == -std::numeric_limits<float>::infinity() || m != m) return m;
+        return m + ::log1pf(::exp2f(-::fabsf(x - y))) / static_cast<float>(M_LN2);
     }
 };
 
@@ -928,6 +959,26 @@ Tensor dtype_unary_cuda(const Tensor& self, F f, const char* name) {
 // Math unary: f: double->double. Integral->Float32; Half/BF16 compute in
 // float and keep dtype; Float32/Float64 preserved.
 
+// Single-precision hook: functors that carry runf(float) evaluate the
+// 32-bit element directly. Without it the launch widens every element to
+// double, and the transcendental instructions then run at the reduced
+// double throughput consumer cards expose, several times slower than the
+// equivalent float instructions.
+template <typename F, typename... Args>
+struct has_runf_n {
+    template <typename G, typename = decltype(std::declval<const G&>().runf(std::declval<Args>()...))>
+    static std::true_type test(int);
+    template <typename G>
+    static std::false_type test(...);
+    static constexpr bool value = decltype(test<F>(0))::value;
+};
+
+template <typename F>
+struct has_runf : std::bool_constant<has_runf_n<F, float>::value> {};
+
+template <typename F>
+struct has_runf2 : std::bool_constant<has_runf_n<F, float, float>::value> {};
+
 template <typename F>
 Tensor float_math_cuda(const Tensor& self, F f, const char* name) {
     DType in = self.dtype();
@@ -946,11 +997,17 @@ Tensor float_math_cuda(const Tensor& self, F f, const char* name) {
             .build();
         if (out_dt == DType::Float16) {
             gpu_kernel(iter, [f] __host__ __device__(Half x) -> Half {
-                return static_cast<Half>(f(static_cast<float>(x)));
+                if constexpr (has_runf<F>::value)
+                    return static_cast<Half>(f.runf(static_cast<float>(x)));
+                else
+                    return static_cast<Half>(f(static_cast<float>(x)));
             });
         } else {
             gpu_kernel(iter, [f] __host__ __device__(BFloat16 x) -> BFloat16 {
-                return static_cast<BFloat16>(f(static_cast<float>(x)));
+                if constexpr (has_runf<F>::value)
+                    return static_cast<BFloat16>(f.runf(static_cast<float>(x)));
+                else
+                    return static_cast<BFloat16>(f(static_cast<float>(x)));
             });
         }
         CUDA_CHECK(cudaGetLastError());
@@ -967,6 +1024,10 @@ Tensor float_math_cuda(const Tensor& self, F f, const char* name) {
         if (compute_dt == DType::Float64) {
             gpu_kernel(iter, [f] __host__ __device__(double x) -> double {
                 return f(x);
+            });
+        } else if constexpr (has_runf<F>::value) {
+            gpu_kernel(iter, [f] __host__ __device__(float x) -> float {
+                return f.runf(x);
             });
         } else {
             gpu_kernel(iter, [f] __host__ __device__(float x) -> float {
@@ -1000,11 +1061,17 @@ void binary_float_into(const Tensor& a_in, const Tensor& b_in, const Tensor& out
             .build();
         if (dt == DType::Float16) {
             gpu_kernel(iter, [f] __host__ __device__(Half x, Half y) -> Half {
-                return static_cast<Half>(f(static_cast<float>(x), static_cast<float>(y)));
+                if constexpr (has_runf2<F>::value)
+                    return static_cast<Half>(f.runf(static_cast<float>(x), static_cast<float>(y)));
+                else
+                    return static_cast<Half>(f(static_cast<float>(x), static_cast<float>(y)));
             });
         } else {
             gpu_kernel(iter, [f] __host__ __device__(BFloat16 x, BFloat16 y) -> BFloat16 {
-                return static_cast<BFloat16>(f(static_cast<float>(x), static_cast<float>(y)));
+                if constexpr (has_runf2<F>::value)
+                    return static_cast<BFloat16>(f.runf(static_cast<float>(x), static_cast<float>(y)));
+                else
+                    return static_cast<BFloat16>(f(static_cast<float>(x), static_cast<float>(y)));
             });
         }
         return;
@@ -1020,6 +1087,10 @@ void binary_float_into(const Tensor& a_in, const Tensor& b_in, const Tensor& out
     if (compute_dt == DType::Float64) {
         gpu_kernel(iter, [f] __host__ __device__(double x, double y) -> double {
             return f(x, y);
+        });
+    } else if constexpr (has_runf2<F>::value) {
+        gpu_kernel(iter, [f] __host__ __device__(float x, float y) -> float {
+            return f.runf(x, y);
         });
     } else {
         gpu_kernel(iter, [f] __host__ __device__(float x, float y) -> float {
