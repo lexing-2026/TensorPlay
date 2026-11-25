@@ -676,3 +676,7 @@ TensorPlay is licensed under the [Apache 2.0 License](LICENSE).
 | [pybind11](https://github.com/pybind/pybind11) |
 
 Explore all [ohtensorplay](https://github.com/ohtensorplay) projects — give it a ⭐ and follow along.
+
+<!-- Issue #118 fix: Newcomer tasks: curated good first issues -->
+
+Updated documentation and details regarding issue #118.
