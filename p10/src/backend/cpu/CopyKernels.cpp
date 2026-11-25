@@ -121,6 +121,22 @@ void parallel_strided_copy(self_t* dst, const std::vector<int64_t>& dst_strides_
         c_sstr[i] = o_sstr[order[i]];
     }
 
+    // A transposed pair (dst-contiguous inner, src-contiguous right behind it)
+    // reads its source as one long contiguous run per column: put that
+    // src-contiguous dim innermost so the loads are sequential instead of one
+    // strided gather per destination element.  The destination addresses stay
+    // inside one small tile, so the interleaved stores hit L1.
+    if (m >= 2 && c_dstr[m - 1] == 1 && c_sstr[m - 1] != 1) {
+        for (int j = m - 2; j >= 0; --j) {
+            if (c_sstr[j] == 1) {
+                std::swap(c_sizes[j], c_sizes[m - 1]);
+                std::swap(c_dstr[j], c_dstr[m - 1]);
+                std::swap(c_sstr[j], c_sstr[m - 1]);
+                break;
+            }
+        }
+    }
+
     const int64_t inner_len = c_sizes[m - 1];
     const int64_t d_is = c_dstr[m - 1];
     const int64_t s_is = c_sstr[m - 1];
