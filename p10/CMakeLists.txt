@@ -892,6 +892,7 @@ set(TP_CPU_KERNEL_SRCS
     src/backend/cpu/ReduceMomentsKernels.cpp
     src/backend/cpu/BitwiseKernelsImpl.cpp
     src/backend/cpu/DistanceKernelsImpl.cpp
+    src/backend/cpu/ScalarArithVecKernelsImpl.cpp
     src/backend/cpu/LossVecKernelsImpl.cpp
     src/backend/cpu/RangeKernelsImpl.cpp
     src/backend/cpu/PoolingKernelsImpl.cpp
