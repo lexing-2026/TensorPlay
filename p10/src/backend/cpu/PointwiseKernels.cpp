@@ -2998,55 +2998,31 @@ Tensor clamp_write(const Tensor& self, const std::optional<Scalar>& min,
     Tensor self_contig = self.contiguous();
 
 #if defined(_M_X64)
-    // One vector pass over both bounds, the shape ATen's clamp kernel takes:
-    // max with the lower bound first, then min with the upper.  A NaN lane
-    // survives because each instruction answers its *second* operand when
-    // either input is one, and the NaN is the second operand both times.
-    // The capped select slot cannot do this in one pass -- it resolves the
-    // bound per lane through a compare ladder -- and 1M clamp paid for it.
+    // The bounded pair is a tier chunk walk: vec::clamp is the same
+    // min(max(lo, v), hi) the GCC clamp_f32_avx* bodies spell out, and a NaN
+    // lane keeps its NaN through both compares.  It beats the local AVX2 strip
+    // (8 lanes) because the tier body runs 16 lanes at a time and a 1M clamp
+    // is L3-resident, so lanes -- not bytes -- decide the time.
     if (n > 0 &&
         (self.dtype() == DType::Float32 || self.dtype() == DType::Float64)) {
         const double lo = min.has_value()
             ? min->toDouble() : -std::numeric_limits<double>::infinity();
         const double hi = max.has_value()
             ? max->toDouble() : std::numeric_limits<double>::infinity();
+        const int dtype = static_cast<int>(self.dtype());
         if (self.dtype() == DType::Float32) {
             const float* src = self_contig.data_ptr<float>();
             float* dst = result.data_ptr<float>();
-            const __m256 vlo = _mm256_set1_ps(static_cast<float>(lo));
-            const __m256 vhi = _mm256_set1_ps(static_cast<float>(hi));
             parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-                int64_t i = begin;
-                for (; i + 8 <= end; i += 8) {
-                    const __m256 v = _mm256_loadu_ps(src + i);
-                    _mm256_storeu_ps(dst + i,
-                                     _mm256_min_ps(vhi, _mm256_max_ps(vlo, v)));
-                }
-                for (; i < end; ++i) {
-                    float v = src[i];
-                    if (v < static_cast<float>(lo)) v = static_cast<float>(lo);
-                    if (v > static_cast<float>(hi)) v = static_cast<float>(hi);
-                    dst[i] = v;
-                }
+                select_vec_stub(DeviceType::CPU, src + begin, nullptr,
+                                dst + begin, end - begin, 0, lo, hi, dtype);
             });
         } else {
             const double* src = self_contig.data_ptr<double>();
             double* dst = result.data_ptr<double>();
-            const __m256d vlo = _mm256_set1_pd(lo);
-            const __m256d vhi = _mm256_set1_pd(hi);
             parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-                int64_t i = begin;
-                for (; i + 4 <= end; i += 4) {
-                    const __m256d v = _mm256_loadu_pd(src + i);
-                    _mm256_storeu_pd(dst + i,
-                                     _mm256_min_pd(vhi, _mm256_max_pd(vlo, v)));
-                }
-                for (; i < end; ++i) {
-                    double v = src[i];
-                    if (v < lo) v = lo;
-                    if (v > hi) v = hi;
-                    dst[i] = v;
-                }
+                select_vec_stub(DeviceType::CPU, src + begin, nullptr,
+                                dst + begin, end - begin, 0, lo, hi, dtype);
             });
         }
         return result;
