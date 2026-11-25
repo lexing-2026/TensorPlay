@@ -84,6 +84,42 @@ void transpose_copy_tiled(T* dst, const T* src, int64_t rows, int64_t cols) {
         });
 }
 
+// A strided 2-D matrix written into a contiguous transposed block: the source
+// answers `rows` contiguous elements per column at `lda` stride, the
+// destination is `cols`-wide and contiguous.  Walking it run by run would make
+// one side scalar and cache-line scattered, so the tile is transposed inside
+// registers/L1 first and both global directions then move whole 16-element
+// runs.
+template <typename T>
+void transpose_blocked_lda(T* dst, const T* src, int64_t rows, int64_t cols,
+                           int64_t lda) {
+    constexpr int64_t block = 16;
+    const int64_t tile_rows = (rows + block - 1) / block;
+    const int64_t tile_cols = (cols + block - 1) / block;
+    parallel::parallel_for(0, tile_rows * tile_cols, 1,
+        [=](int64_t begin, int64_t end) {
+            alignas(64) T tile[block * block];
+            for (int64_t tile_id = begin; tile_id < end; ++tile_id) {
+                const int64_t row0 = (tile_id / tile_cols) * block;
+                const int64_t col0 = (tile_id % tile_cols) * block;
+                const int64_t nr = std::min(block, rows - row0);
+                const int64_t nc = std::min(block, cols - col0);
+                // tile[r][c] is filled from contiguous source runs (one column
+                // at a time) and then written back as contiguous destination
+                // runs, so no global access is scattered.
+                for (int64_t c = 0; c < nc; ++c) {
+                    const T* s = src + (col0 + c) * lda + row0;
+                    for (int64_t r = 0; r < nr; ++r) tile[r * block + c] = s[r];
+                }
+                for (int64_t r = 0; r < nr; ++r) {
+                    std::memcpy(dst + (row0 + r) * cols + col0,
+                                tile + r * block,
+                                static_cast<size_t>(nc) * sizeof(T));
+                }
+            }
+        });
+}
+
 template <typename self_t, typename src_t>
 void parallel_strided_copy(self_t* dst, const std::vector<int64_t>& dst_strides_in,
                            const src_t* src, const std::vector<int64_t>& src_strides_in,
@@ -119,6 +155,71 @@ void parallel_strided_copy(self_t* dst, const std::vector<int64_t>& dst_strides_
         c_sizes[i] = o_sizes[order[i]];
         c_dstr[i] = o_dstr[order[i]];
         c_sstr[i] = o_sstr[order[i]];
+    }
+
+    // A destination-contiguous block that is a strided 2-D matrix in the
+    // source is a plain transpose of that block.  Every other dim must sit at
+    // the same stride in both layouts, which makes the block offset identical
+    // on either side and lets the tile walk be shared.
+    if constexpr (std::is_same_v<self_t, src_t>) {
+        int ti = -1, tj = -1;
+        for (int i = 0; i < m && ti < 0; ++i) {
+            if (c_sstr[i] != 1) continue;
+            for (int j = 0; j < m; ++j) {
+                if (j == i || c_dstr[j] != 1) continue;
+                if (c_dstr[i] != c_sizes[j]) continue;
+                if (c_sstr[j] < c_sizes[i]) continue;
+                if (c_sizes[i] * c_sizes[j] < 256) continue;
+                ti = i;
+                tj = j;
+                break;
+            }
+        }
+        if (ti >= 0) {
+            const int64_t rows = c_sizes[ti];    // destination rows
+            const int64_t cols = c_sizes[tj];    // destination columns
+            const int64_t lda = c_sstr[tj];
+            std::vector<int64_t> osz, od, os;
+            for (int k = 0; k < m; ++k) {
+                if (k == ti || k == tj) continue;
+                osz.push_back(c_sizes[k]);
+                od.push_back(c_dstr[k]);
+                os.push_back(c_sstr[k]);
+            }
+            const int64_t outer =
+                std::accumulate(osz.begin(), osz.end(), int64_t{1},
+                                std::multiplies<int64_t>{});
+            const int64_t grain = std::max<int64_t>(
+                1, parallel::GRAIN_SIZE / std::max<int64_t>(rows * cols, 1));
+            parallel::parallel_for(0, outer, grain,
+                [&](int64_t b, int64_t e) {
+                    std::vector<int64_t> idx(osz.size(), 0);
+                    int64_t d_off = 0, s_off = 0;
+                    int64_t rest = b;
+                    for (int i = static_cast<int>(osz.size()) - 1; i >= 0; --i) {
+                        const int64_t q = rest / osz[i];
+                        idx[i] = rest - q * osz[i];
+                        rest = q;
+                        d_off += idx[i] * od[i];
+                        s_off += idx[i] * os[i];
+                    }
+                    for (int64_t o = b; o < e; ++o) {
+                        transpose_blocked_lda(dst + d_off, src + s_off, rows,
+                                              cols, lda);
+                        for (int i = static_cast<int>(osz.size()) - 1; i >= 0; --i) {
+                            if (++idx[i] < osz[i]) {
+                                d_off += od[i];
+                                s_off += os[i];
+                                break;
+                            }
+                            idx[i] = 0;
+                            d_off -= (osz[i] - 1) * od[i];
+                            s_off -= (osz[i] - 1) * os[i];
+                        }
+                    }
+                });
+            return;
+        }
     }
 
     // A transposed pair (dst-contiguous inner, src-contiguous right behind it)

@@ -19,8 +19,13 @@
 
 #include <algorithm>
 #include <atomic>
+#if defined(_MSC_VER)
+#include <xmmintrin.h>
+#endif
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 
 namespace tensorplay {
 namespace cpu {
@@ -1325,7 +1330,24 @@ std::tuple<double, double> nll_rows_typed(const T* input,
     const double loss = parallel_ranges(
         rows, 1, [&](int64_t begin, int64_t end) -> double {
             double total = 0.0;
+            // Each row answers one element from its own 2 KB class strip, so
+            // the walk is a chain of cold cache lines and TLB entries.  Ask
+            // for the row a few steps ahead while the current one is in flight.
+            constexpr int64_t kPrefetchAhead = 8;
             for (int64_t r = begin; r < end; ++r) {
+                const int64_t ahead = r + kPrefetchAhead;
+                if (ahead < end) {
+                    const int64_t at = target[ahead];
+                    if (at != ignore_index) {
+#if defined(_MSC_VER)
+                        _mm_prefetch(reinterpret_cast<const char*>(
+                                         input + ahead * cols + at),
+                                     _MM_HINT_T0);
+#else
+                        __builtin_prefetch(input + ahead * cols + at, 0, 1);
+#endif
+                    }
+                }
                 const int64_t t = target[r];
                 double row_loss = 0.0;
                 if (t != ignore_index) {
@@ -2299,11 +2321,17 @@ double bce_logits_rows_impl(const void* input, const void* target,
     }
 }
 
+#define TP_STR2(x) #x
+#define TP_STR(x) TP_STR2(x)
 double triplet_rows_impl(const void* anchor, const void* positive,
                          const void* negative, void* out, int64_t rows,
                          int64_t width, double margin, double p, double eps,
                          bool swap, int dtype) {
-    switch (static_cast<DType>(dtype)) {
+    if (std::getenv("TP_TRIPLET_DEBUG")) {
+        std::fprintf(stderr, "[triplet] cap=%s dtype=%d rows=%lld width=%lld threads=%lld\n",
+                     TP_STR(CPU_CAPABILITY), dtype, (long long)rows, (long long)width,
+                     (long long)parallel::get_num_threads());
+    }    switch (static_cast<DType>(dtype)) {
         case DType::Float64:
             return triplet_rows_typed(static_cast<const double*>(anchor),
                                       static_cast<const double*>(positive),
