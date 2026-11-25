@@ -2594,6 +2594,16 @@ def binary_cross_entropy_with_logits(
             f"Target size ({target.size()}) must be the same as input size ({input.size()})"
         )
 
+    # The stable softplus form lives in a fused kernel that reads both planes
+    # once; the composition below (logsigmoid + four elementwise passes) is the
+    # fallback for the dtypes that kernel does not take.  Same arithmetic,
+    # fewer temporaries.
+    if (input.dtype == target.dtype and
+            input.dtype in (tensorplay.float32, tensorplay.float64)):
+        return _C.binary_cross_entropy_with_logits(
+            self=input, target=target, weight=weight, pos_weight=pos_weight,
+            reduction=reduction_enum)
+
     log_sigmoid_input = logsigmoid(input)
     if pos_weight is not None:
         log_weight = (pos_weight - 1).mul(target).add(1)
