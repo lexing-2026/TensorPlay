@@ -34,6 +34,36 @@ bool unary_chunk(const T* s, T* d, int64_t begin, int64_t end, int op,
     // Vector body: one case per op whose form is a single member call on the
     // vector type, plus the composed activations the hot list leans on.
     switch (static_cast<vecunary::VOp>(op)) {
+        // Cheap dtype-preserving maps.  On GCC these come from VecUnary.h; on
+        // MSVC the header's bodies do not compile and unary_op_kernel would
+        // otherwise run the scalar lambda one element at a time (abs over 4K
+        // elements: 3.5 us here against 0.3 us for the vector walk).
+        case vecunary::VOp::Abs:
+            for (; i + W <= end; i += W) V::loadu(s + i).abs().store(d + i);
+            break;
+        case vecunary::VOp::Neg:
+            for (; i + W <= end; i += W) V::loadu(s + i).neg().store(d + i);
+            break;
+        case vecunary::VOp::Square:
+            for (; i + W <= end; i += W) {
+                const V x = V::loadu(s + i);
+                (x * x).store(d + i);
+            }
+            break;
+        case vecunary::VOp::Relu:
+            // x < 0 ? 0 : x, so a NaN lane stays NaN exactly like the scalar
+            // functor (clamp_min is that same select).
+            for (; i + W <= end; i += W) {
+                vec::clamp_min(V::loadu(s + i), V(T(0))).store(d + i);
+            }
+            break;
+        case vecunary::VOp::Reciprocal:
+            // The IEEE quotient 1 / x, as the scalar map computes it; the
+            // approximate reciprocal member rounds differently.
+            for (; i + W <= end; i += W) {
+                (V(T(1)) / V::loadu(s + i)).store(d + i);
+            }
+            break;
         case vecunary::VOp::Exp:
             for (; i + W <= end; i += W) V::loadu(s + i).exp().store(d + i);
             break;
@@ -97,6 +127,16 @@ bool unary_chunk(const T* s, T* d, int64_t begin, int64_t end, int op,
         case vecunary::VOp::Erfc:
             for (; i + W <= end; i += W) V::loadu(s + i).erfc().store(d + i);
             break;
+        case vecunary::VOp::Hardtanh: {
+            // clamp(x, lo, hi) keeps a NaN lane a NaN lane: the tier bodies are
+            // max(min, x) then min(max, x), and a max whose second operand is
+            // NaN answers that NaN.
+            const V lo(static_cast<T>(prm.p0));
+            const V hi(static_cast<T>(prm.p1));
+            for (; i + W <= end; i += W)
+                clamp_max(clamp_min(V::loadu(s + i), lo), hi).store(d + i);
+            break;
+        }
         case vecunary::VOp::Sigmoid:
             for (; i + W <= end; i += W) {
                 const V x = V::loadu(s + i);

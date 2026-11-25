@@ -1308,7 +1308,7 @@ template <typename T>
 double nll_weight_total_typed(const int64_t* target, const T* weight,
                               int64_t rows, int64_t ignore_index,
                               bool has_weight) {
-    return parallel_ranges(rows, 1, [&](int64_t begin, int64_t end) -> double {
+    return parallel_ranges(rows, 256, [&](int64_t begin, int64_t end) -> double {
         double total = 0.0;
         for (int64_t r = begin; r < end; ++r) {
             if (target[r] != ignore_index) {
@@ -1333,7 +1333,7 @@ std::tuple<double, double> nll_rows_typed(const T* input,
             // Each row answers one element from its own 2 KB class strip, so
             // the walk is a chain of cold cache lines and TLB entries.  Ask
             // for the row a few steps ahead while the current one is in flight.
-            constexpr int64_t kPrefetchAhead = 8;
+            constexpr int64_t kPrefetchAhead = 16;
             for (int64_t r = begin; r < end; ++r) {
                 const int64_t ahead = r + kPrefetchAhead;
                 if (ahead < end) {
@@ -1375,7 +1375,7 @@ void nll_grad_typed(const T* grad_output, const int64_t* target,
     const bool per_row = reduction == 0;
     const double inv_tw =
         (reduction == 1 && total_weight > 0.0) ? 1.0 / total_weight : 1.0;
-    parallel_ranges(rows, 1, [&](int64_t begin, int64_t end) -> double {
+    parallel_ranges(rows, 256, [&](int64_t begin, int64_t end) -> double {
         for (int64_t r = begin; r < end; ++r) {
             const int64_t t = target[r];
             if (t == ignore_index) continue;

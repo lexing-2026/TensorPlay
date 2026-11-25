@@ -3,6 +3,7 @@
 #include "Dispatcher.h"
 #include "Exception.h"
 #include "LossReduce.h"
+#include "Parallel.h"
 #include "cpu/LossVecKernels.h"
 #include "Scalar.h"
 #include <algorithm>
@@ -87,19 +88,47 @@ std::tuple<Tensor, Tensor> nll_loss_impl(const Tensor& input_arg, const Tensor& 
     const int64_t* target_data = target.data_ptr<int64_t>();
     const scalar_t* weight_data = weight.defined() ? weight.data_ptr<scalar_t>() : nullptr;
 
-    std::vector<scalar_t> output_data(static_cast<size_t>(n_batch));
-    double total_weight = 0;
-    for (int64_t i = 0; i < n_batch; ++i) {
-        const int64_t t = target_data[i];
-        if (t == ignore_index) {
-            output_data[static_cast<size_t>(i)] = 0;
-            continue;
+    // One gathered score per row, and rows are independent: the row is the unit
+    // the walk splits on.  The reduce rides along in the same walk -- each chunk
+    // keeps its own pair of sums and the tail adds them up -- so a 32K-row loss
+    // stops paying for a serial pass with a branch and a double add in it.
+    std::vector<scalar_t> output_data(reduction == 0 ? static_cast<size_t>(n_batch)
+                                                     : static_cast<size_t>(0));
+    constexpr int64_t kRowChunk = 1024;
+    const int64_t n_chunks = (n_batch + kRowChunk - 1) / kRowChunk;
+    std::vector<double> chunk_sum(static_cast<size_t>(n_chunks), 0.0);
+    std::vector<double> chunk_weight(static_cast<size_t>(n_chunks), 0.0);
+    int64_t bad_target = -1;
+    parallel::parallel_for(0, n_batch, kRowChunk, [&](int64_t b, int64_t e) {
+        const size_t ci = static_cast<size_t>(b / kRowChunk);
+        double local_sum = 0.0;
+        double local_weight = 0.0;
+        for (int64_t i = b; i < e; ++i) {
+            const int64_t t = target_data[i];
+            if (t == ignore_index) {
+                if (reduction == 0) output_data[static_cast<size_t>(i)] = 0;
+                continue;
+            }
+            if (t < 0 || t >= n_classes) {
+                bad_target = t;
+                continue;
+            }
+            const double w = weight_data ? static_cast<double>(weight_data[t]) : 1.0;
+            const double loss =
+                -static_cast<double>(input_data[i * n_classes + t]) * w;
+            local_sum += loss;
+            local_weight += w;
+            if (reduction == 0) output_data[static_cast<size_t>(i)] = static_cast<scalar_t>(loss);
         }
-        if (t < 0 || t >= n_classes) TP_THROW(IndexError, "Target ", t, " is out of bounds.");
-        const double w = weight_data ? static_cast<double>(weight_data[t]) : 1.0;
-        output_data[static_cast<size_t>(i)] =
-            static_cast<scalar_t>(-static_cast<double>(input_data[i * n_classes + t]) * w);
-        total_weight += w;
+        chunk_sum[ci] = local_sum;
+        chunk_weight[ci] = local_weight;
+    });
+    if (bad_target >= 0) TP_THROW(IndexError, "Target ", bad_target, " is out of bounds.");
+    double total_weight = 0;
+    double sum = 0;
+    for (int64_t c = 0; c < n_chunks; ++c) {
+        sum += chunk_sum[static_cast<size_t>(c)];
+        total_weight += chunk_weight[static_cast<size_t>(c)];
     }
 
     const DType dt = input.dtype();
@@ -110,8 +139,6 @@ std::tuple<Tensor, Tensor> nll_loss_impl(const Tensor& input_arg, const Tensor& 
         const double reported = no_batch ? total_weight : 0.0;
         return std::make_tuple(per_sample, Tensor::full({}, Scalar(reported), dt, input.device()));
     }
-    double sum = 0;
-    for (scalar_t x : output_data) sum += static_cast<double>(x);
     if (reduction == 1) {
         sum /= total_weight;  // every target ignored: 0 / 0 is NaN
     } else if (reduction != 2) {
@@ -319,24 +346,51 @@ std::tuple<Tensor, Tensor> nll_loss2d_impl(const Tensor& input, const Tensor& ta
     const int64_t* target_data = target_c.data_ptr<int64_t>();
     const scalar_t* weight_data = weight.has_value() && weight->defined() ? weight->data_ptr<scalar_t>() : nullptr;
 
-    std::vector<scalar_t> output_data(reduction == 0 ? rows : 1);
+    std::vector<scalar_t> output_data(reduction == 0 ? rows : static_cast<int64_t>(0));
+    constexpr int64_t kRowChunk = 256;
+    const int64_t n_chunks = (rows + kRowChunk - 1) / kRowChunk;
+    std::vector<double> chunk_sum(static_cast<size_t>(n_chunks), 0.0);
+    std::vector<double> chunk_weight(static_cast<size_t>(n_chunks), 0.0);
+    const int64_t hw = H * W;
+    int64_t bad_target = -1;
+
+    parallel::parallel_for(0, rows, kRowChunk, [&](int64_t b, int64_t e) {
+        const size_t ci = static_cast<size_t>(b / kRowChunk);
+        double local_sum = 0.0;
+        double local_weight = 0.0;
+        // The row index walks forward one pixel at a time, so the batch and the
+        // in-image offset are carried in registers instead of divided per row.
+        int64_t n = b / hw;
+        int64_t pos = b % hw;
+        for (int64_t i = b; i < e; ++i) {
+            const int64_t t = target_data[i];
+            if (t == ignore_index) {
+                if (reduction == 0) output_data[static_cast<size_t>(i)] = 0;
+            } else if (t < 0 || t >= C) {
+                bad_target = t;
+            } else {
+                const double w = weight_data ? static_cast<double>(weight_data[t]) : 1.0;
+                const double loss =
+                    -static_cast<double>(input_data[(n * C + t) * hw + pos]) * w;
+                local_sum += loss;
+                local_weight += w;
+                if (reduction == 0) output_data[static_cast<size_t>(i)] = static_cast<scalar_t>(loss);
+            }
+            if (++pos == hw) {
+                pos = 0;
+                ++n;
+            }
+        }
+        chunk_sum[ci] = local_sum;
+        chunk_weight[ci] = local_weight;
+    });
+    if (bad_target >= 0) TP_THROW(RuntimeError, "Target out of bounds");
+
     double total_weight = 0;
     double sum = 0;
-
-    for (int64_t i = 0; i < rows; ++i) {
-        const int64_t t = target_data[i];
-        if (t == ignore_index) {
-            if (reduction == 0) output_data[i] = 0;
-            continue;
-        }
-        if (t < 0 || t >= C) TP_THROW(RuntimeError, "Target out of bounds");
-        const int64_t n = i / (H * W);
-        const int64_t pos = i % (H * W);
-        const double w = weight_data ? static_cast<double>(weight_data[t]) : 1.0;
-        const double loss = -static_cast<double>(input_data[(n * C + t) * H * W + pos]) * w;
-        total_weight += w;
-        sum += loss;
-        if (reduction == 0) output_data[i] = static_cast<scalar_t>(loss);
+    for (int64_t c = 0; c < n_chunks; ++c) {
+        sum += chunk_sum[static_cast<size_t>(c)];
+        total_weight += chunk_weight[static_cast<size_t>(c)];
     }
 
     DType dt = input.dtype();
