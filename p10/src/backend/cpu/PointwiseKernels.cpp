@@ -15,6 +15,8 @@
 #include "cpu/VecReducedMath.h"
 #include "cpu/ComplexUnary.h"
 #include "cpu/SoftmaxStridedKernels.h"
+#include "cpu/SoftmaxRowKernels.h"
+#include "cpu/UnaryVecKernels.h"
 #include "cpu/VecComplex.h"
 #include "cpu/ActivationUnaryKernels.h"
 #include "cpu/StreamDestination.h"
@@ -39,6 +41,8 @@ DEFINE_DISPATCH(sigmoid_f64_stub);
 DEFINE_DISPATCH(silu_f64_stub);
 DEFINE_DISPATCH(softmax_strided_f32_stub);
 DEFINE_DISPATCH(softmax_strided_f64_stub);
+DEFINE_DISPATCH(softmax_row_stub);
+DEFINE_DISPATCH(unary_vec_stub);
 }} // namespace tensorplay::cpu
 
 #ifdef USE_ONEDNN
@@ -589,6 +593,26 @@ Tensor unary_float_op_kernel(const Tensor& self, Func func,
                  }
                  Tensor self_contig = contiguous_path ? self : self.contiguous();
                  const float* src = self_contig.data_ptr<float>();
+#if defined(_M_X64)
+                 // Tier-compiled transcendental walk: the vector bodies in
+                 // VecUnary.h need GCC target attributes, so the same chunk is
+                 // answered by UnaryVecKernelsImpl.cpp at this host's width.
+                 // An op without a tier body falls back per chunk.
+                 if (vec_op != vecunary::VOp::None) {
+                     const int uop = static_cast<int>(vec_op);
+                     const int udt = static_cast<int>(DType::Float32);
+                     parallel_for(0, n, kUnaryGrain, [&](int64_t begin, int64_t end) {
+                         if (!unary_vec_stub(DeviceType::CPU, src, dst, begin,
+                                             end, uop, vec_prm.p0, vec_prm.p1,
+                                             vec_prm.p2, udt)) {
+                             for (int64_t i = begin; i < end; ++i) {
+                                 dst[i] = func(src[i]);
+                             }
+                         }
+                     });
+                     break;
+                 }
+#endif
                  if (vec_ok) {
                      parallel_for(0, n, kUnaryGrain, [&](int64_t begin, int64_t end) { \
                      vecunary::run_f32(vec_op, vec_prm, src, dst, begin, end);
@@ -3900,12 +3924,30 @@ static Tensor softmax_fused_kernel_impl(const Tensor& self, int64_t dim, DType o
         break; \
     }
     switch (out_dtype) {
+#if defined(_M_X64)
+        // The row walk is compiled per CPU_CAPABILITY in
+        // SoftmaxRowKernelsImpl.cpp; the widths above are the GCC build's
+        // per-function kernels and are compiled out here.
+        case DType::Float32: {
+            softmax_row_stub(DeviceType::CPU, input.data_ptr<float>(),
+                             result.data_ptr<float>(), rows, size, LogMode,
+                             static_cast<int>(DType::Float32));
+            break;
+        }
+        case DType::Float64: {
+            softmax_row_stub(DeviceType::CPU, input.data_ptr<double>(),
+                             result.data_ptr<double>(), rows, size, LogMode,
+                             static_cast<int>(DType::Float64));
+            break;
+        }
+#else
         // A width that fills one vector already pays for the vector row: the
         // lane fold is a handful of register operations and the remainder is
         // still walked one element at a time, so the scalar body is only the
         // answer below a single vector.
         SOFTMAX_CASE(float, Float32, f32_512, f32_256, 16, 8)
         SOFTMAX_CASE(double, Float64, f64_512, f64_256, 8, 4)
+#endif
         default: TP_THROW(TypeError, "softmax: unsupported dtype");
     }
     #undef SOFTMAX_CASE
