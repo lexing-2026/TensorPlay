@@ -38,6 +38,16 @@ jobs:
       build_environment: pull-smoke-linux-x86_64-py3_12
       runs_on: ubuntu-22.04
       python_version: "3.12"
+      # The shard files are copied flat into $GITHUB_WORKSPACE/.ci-test-tmp.
+      # With the rootdir discovered from the checkout, pytest names the
+      # modules after that directory (`_ci-test-tmp.test_compiler_backends`),
+      # and the hyphen makes those names unimportable: an entry point built
+      # from `__name__` no longer matches importlib.metadata's pattern, and
+      # multiprocessing spawn cannot re-import the target's module.  Pinning
+      # the rootdir to the directory the tests run in keeps the repository
+      # pytest.ini but names the modules `test_compiler_backends`, which is
+      # what both mechanisms expect.
+      pytest_extra_args: "--rootdir ."
       test_matrix: >-
         [{"name":"native-sparse","test_files":"test/test_set_native.py test/test_compressed_sparse_constructors.py"},
         {"name":"nn-utils","test_files":"test/nn/test_nn_utils_norm.py"},
