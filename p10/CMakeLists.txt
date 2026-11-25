@@ -895,6 +895,7 @@ set(TP_CPU_KERNEL_SRCS
     src/backend/cpu/ScalarArithVecKernelsImpl.cpp
     src/backend/cpu/UnaryVecKernelsImpl.cpp
     src/backend/cpu/SoftmaxRowKernelsImpl.cpp
+    src/backend/cpu/SelectVecKernelsImpl.cpp
     src/backend/cpu/LossVecKernelsImpl.cpp
     src/backend/cpu/RangeKernelsImpl.cpp
     src/backend/cpu/PoolingKernelsImpl.cpp
