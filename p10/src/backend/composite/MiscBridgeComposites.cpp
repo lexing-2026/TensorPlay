@@ -267,6 +267,15 @@ Tensor _to_sparse_impl(const Tensor& self, std::optional<int64_t> layout,
     TP_THROW(RuntimeError, "_to_sparse: conversion to layout ", layout_to, " not supported");
 }
 
+Tensor _to_sparse_csr_impl(const Tensor& self,
+                           std::optional<int64_t> dense_dim) {
+    if (dense_dim.value_or(0) != 0) {
+        TP_THROW(NotImplementedError,
+                 "_to_sparse_csr: dense dimensions are not supported");
+    }
+    return ops::to_sparse_csr(self);
+}
+
 TENSORPLAY_LIBRARY_IMPL(Composite, MiscBridgeComposites) {
     m.impl("copysign_.Scalar", copysign__scalar);
     m.impl("copysign.Scalar_out", copysign_scalar_out);
@@ -286,6 +295,7 @@ TENSORPLAY_LIBRARY_IMPL(Composite, MiscBridgeComposites) {
     m.impl("_dim_arange", _dim_arange_impl);
     m.impl("_masked_scale", _masked_scale_impl);
     m.impl("_to_sparse", _to_sparse_impl);
+    m.impl("_to_sparse_csr", _to_sparse_csr_impl);
 }
 
 } // namespace composite

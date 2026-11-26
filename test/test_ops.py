@@ -152,6 +152,14 @@ class TestOps(unittest.TestCase):
         self.assertEqual(len(first), 3)
         self.assertTrue(all(0 <= v < 3 for row in first for v in row))
 
+    def test_internal_to_sparse_csr_matches_the_public_conversion(self):
+        d = tp.tensor([[1.0, 0.0, 2.0], [0.0, 0.0, 0.0], [3.0, 4.0, 5.0]])
+        s = tp.ops.tp._to_sparse_csr(d)
+        self.assertTrue(s.is_sparse_csr())
+        self.assertEqual(s.crow_indices().tolist(), [0, 2, 2, 5])
+        self.assertEqual(s.col_indices().tolist(), [0, 2, 0, 1, 2])
+        self.assertEqual(s.values().tolist(), [1.0, 2.0, 3.0, 4.0, 5.0])
+
 class TestOpPackets(unittest.TestCase):
     def test_inplace_packet_call_reaches_the_kernel(self):
         # Ops whose resolver is not exposed as a C function answer from
