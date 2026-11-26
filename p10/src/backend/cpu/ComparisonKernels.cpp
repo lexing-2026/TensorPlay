@@ -10,6 +10,7 @@
 #include "Parallel.h"
 #include "cpu/PairMath.h"
 #include "cpu/VecUnary.h"
+#include "cpu/SelectVecKernels.h"
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
 #endif
@@ -795,9 +796,51 @@ struct MinimumOp {
     }
 };
 
+#if defined(_M_X64)
+// The same packed same-width pair the pair walk would take, handed to the tier
+// chunk walk instead: on MSVC the vecbinary bodies do not exist, so the flat
+// map (a NaN test per element) was the only answer before this path.
+inline bool select_pair_takes(const Tensor& a, const Tensor& b) {
+    if (a.dtype() != b.dtype()) return false;
+    if (a.dtype() != DType::Float32 && a.dtype() != DType::Float64) return false;
+    return a.shape() == b.shape() && a.is_contiguous() && b.is_contiguous() &&
+           a.numel() > 0;
+}
+
+inline Tensor select_pair_alloc(int op, const Tensor& a, const Tensor& b) {
+    Tensor result = Tensor::empty(
+        static_cast<std::vector<int64_t>>(a.shape()), a.dtype(), a.device());
+    const int64_t n = result.numel();
+    const int dtype = static_cast<int>(a.dtype());
+    if (a.dtype() == DType::Float32) {
+        const float* x = a.data_ptr<float>();
+        const float* y = b.data_ptr<float>();
+        float* d = result.data_ptr<float>();
+        parallel::parallel_for_balanced(0, n, parallel::GRAIN_SIZE,
+                                        [&](int64_t begin, int64_t end) {
+            select_vec_stub(DeviceType::CPU, x + begin, y + begin, d + begin,
+                            end - begin, op, 0.0, 0.0, dtype);
+        });
+    } else {
+        const double* x = a.data_ptr<double>();
+        const double* y = b.data_ptr<double>();
+        double* d = result.data_ptr<double>();
+        parallel::parallel_for_balanced(0, n, parallel::GRAIN_SIZE,
+                                        [&](int64_t begin, int64_t end) {
+            select_vec_stub(DeviceType::CPU, x + begin, y + begin, d + begin,
+                            end - begin, op, 0.0, 0.0, dtype);
+        });
+    }
+    return result;
+}
+#endif
+
 // A floating pair of one width, in one shape and packed, is answered a vector
 // at a time; everything else keeps the flat map.
 Tensor maximum_cpu(const Tensor& self, const Tensor& other) {
+#if defined(_M_X64)
+    if (select_pair_takes(self, other)) return select_pair_alloc(1, self, other);
+#endif
     if (pair_vector_takes(self, other)) {
         return pair_math_alloc<vecbinary::BOp::Maximum>(self, other);
     }
@@ -805,6 +848,9 @@ Tensor maximum_cpu(const Tensor& self, const Tensor& other) {
 }
 
 Tensor minimum_cpu(const Tensor& self, const Tensor& other) {
+#if defined(_M_X64)
+    if (select_pair_takes(self, other)) return select_pair_alloc(2, self, other);
+#endif
     if (pair_vector_takes(self, other)) {
         return pair_math_alloc<vecbinary::BOp::Minimum>(self, other);
     }

@@ -17,6 +17,7 @@
 #include "cpu/SoftmaxStridedKernels.h"
 #include "cpu/SoftmaxRowKernels.h"
 #include "cpu/UnaryVecKernels.h"
+#include "cpu/SelectVecKernels.h"
 #include "cpu/VecComplex.h"
 #include "cpu/ActivationUnaryKernels.h"
 #include "cpu/StreamDestination.h"
@@ -43,6 +44,7 @@ DEFINE_DISPATCH(softmax_strided_f32_stub);
 DEFINE_DISPATCH(softmax_strided_f64_stub);
 DEFINE_DISPATCH(softmax_row_stub);
 DEFINE_DISPATCH(unary_vec_stub);
+DEFINE_DISPATCH(select_vec_stub);
 }} // namespace tensorplay::cpu
 
 #ifdef USE_ONEDNN
@@ -2958,6 +2960,36 @@ Tensor clamp_write(const Tensor& self, const std::optional<Scalar>& min,
                    const std::optional<Scalar>& max, Tensor result) {
     int64_t n = self.numel();
     Tensor self_contig = self.contiguous();
+
+#if defined(_M_X64)
+    // The bounded pair is a tier chunk walk: vec::clamp is the same
+    // min(max(lo, v), hi) the GCC clamp_f32_avx* bodies spell out, and a NaN
+    // lane keeps its NaN through both compares.
+    if (n > 0 &&
+        (self.dtype() == DType::Float32 || self.dtype() == DType::Float64)) {
+        const double lo = min.has_value()
+            ? min->toDouble() : -std::numeric_limits<double>::infinity();
+        const double hi = max.has_value()
+            ? max->toDouble() : std::numeric_limits<double>::infinity();
+        const int dtype = static_cast<int>(self.dtype());
+        if (self.dtype() == DType::Float32) {
+            const float* src = self_contig.data_ptr<float>();
+            float* dst = result.data_ptr<float>();
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                select_vec_stub(DeviceType::CPU, src + begin, nullptr,
+                                dst + begin, end - begin, 0, lo, hi, dtype);
+            });
+        } else {
+            const double* src = self_contig.data_ptr<double>();
+            double* dst = result.data_ptr<double>();
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                select_vec_stub(DeviceType::CPU, src + begin, nullptr,
+                                dst + begin, end - begin, 0, lo, hi, dtype);
+            });
+        }
+        return result;
+    }
+#endif
 
 #if defined(__x86_64__)
     if ((vecunary::avx512_available() || vecunary::avx2_available()) &&
