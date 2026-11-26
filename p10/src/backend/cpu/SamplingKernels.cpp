@@ -3,6 +3,7 @@
 #include "Generator.h"
 #include "DistributionsHelper.h"
 #include "Exception.h"
+#include "Parallel.h"
 #include <vector>
 #include <algorithm>
 #include <cmath>
@@ -89,46 +90,71 @@ Tensor multinomial_kernel_cpu(const Tensor& self, int64_t num_samples, bool repl
   if (num_samples == 0) return result;
 
   Generator& gen = generator.has_value() ? *generator : default_generator();
-  std::vector<double> cdf(cols);
-  for (int64_t r = 0; r < rows; ++r) {
-    const float* row = pdata + r * cols;
-    if (replacement) {
-      // Build the cumulative distribution once per row.  Recomputing the row
-      // sum and walking it linearly for every draw made the cost
-      // O(rows * samples * cols); a binary search per draw is
-      // O(rows * (cols + samples * log(cols))) and allocates nothing per
-      // sample.
-      double total = 0.0;
-      for (int64_t c = 0; c < cols; ++c) {
-        total += static_cast<double>(row[c]);
-        cdf[c] = total;
-      }
-      if (!(total > 0)) {
-        for (int64_t s = 0; s < num_samples; ++s) {
-          rdata[is_1d ? s : r * num_samples + s] = 0;
-        }
-        continue;
-      }
-      uniform_real_distribution<double> uniform(0.0, 1.0);
-      for (int64_t s = 0; s < num_samples; ++s) {
-        double pick = uniform(&gen) * total;
-        // upper_bound matches the old `pick < cum` comparison: a draw that
-        // lands exactly on a boundary advances past that category.
-        auto it = std::upper_bound(cdf.begin(), cdf.end(), pick);
-        int64_t idx = it == cdf.end() ? cols - 1 : it - cdf.begin();
-        rdata[is_1d ? s : r * num_samples + s] = idx;
-      }
-    } else {
-      // Without replacement: repeatedly sample from the remaining mass,
-      std::vector<double> remaining(cols);
-      for (int64_t c = 0; c < cols; ++c) remaining[c] = row[c];
-      for (int64_t s = 0; s < num_samples; ++s) {
-        int64_t pick = sample_discrete(gen, remaining.begin(), remaining.end());
-        rdata[is_1d ? s : r * num_samples + s] = pick;
-        remaining[pick] = 0.0;
-      }
+
+  // The replacement path is a per-row CDF build plus one binary search per
+  // draw; the rows share no state.  Drawing the uniforms up front in the
+  // same row-major order the serial loop used keeps the generator sequence
+  // identical, and lets the row walk run on the intra-op pool afterwards.
+  // Above the memory cap the serial path still runs, with the generator used
+  // directly.
+  const int64_t total_draws = rows * num_samples;
+  constexpr int64_t kMaxPreparedDraws = 8 << 20;
+  const bool prepared_draws =
+      replacement && rows > 64 && total_draws <= kMaxPreparedDraws;
+  std::vector<double> uniforms;
+  if (prepared_draws) {
+    uniforms.resize(total_draws);
+    uniform_real_distribution<double> uniform(0.0, 1.0);
+    for (int64_t i = 0; i < total_draws; ++i) {
+      uniforms[i] = uniform(&gen);
     }
   }
+  const double* draws = prepared_draws ? uniforms.data() : nullptr;
+  const int64_t grain = prepared_draws ? 64 : rows;
+  parallel::parallel_for(0, rows, grain, [&](int64_t begin, int64_t end) {
+    std::vector<double> cdf(cols);
+    for (int64_t r = begin; r < end; ++r) {
+      const float* row = pdata + r * cols;
+      if (replacement) {
+        // Build the cumulative distribution once per row.  Recomputing the row
+        // sum and walking it linearly for every draw made the cost
+        // O(rows * samples * cols); a binary search per draw is
+        // O(rows * (cols + samples * log(cols))) and allocates nothing per
+        // sample.
+        double total = 0.0;
+        for (int64_t c = 0; c < cols; ++c) {
+          total += static_cast<double>(row[c]);
+          cdf[c] = total;
+        }
+        if (!(total > 0)) {
+          for (int64_t s = 0; s < num_samples; ++s) {
+            rdata[is_1d ? s : r * num_samples + s] = 0;
+          }
+          continue;
+        }
+        uniform_real_distribution<double> uniform(0.0, 1.0);
+        for (int64_t s = 0; s < num_samples; ++s) {
+          double pick = draws != nullptr
+              ? draws[r * num_samples + s] * total
+              : uniform(&gen) * total;
+          // upper_bound matches the old `pick < cum` comparison: a draw that
+          // lands exactly on a boundary advances past that category.
+          auto it = std::upper_bound(cdf.begin(), cdf.end(), pick);
+          int64_t idx = it == cdf.end() ? cols - 1 : it - cdf.begin();
+          rdata[is_1d ? s : r * num_samples + s] = idx;
+        }
+      } else {
+        // Without replacement: repeatedly sample from the remaining mass,
+        std::vector<double> remaining(cols);
+        for (int64_t c = 0; c < cols; ++c) remaining[c] = row[c];
+        for (int64_t s = 0; s < num_samples; ++s) {
+          int64_t pick = sample_discrete(gen, remaining.begin(), remaining.end());
+          rdata[is_1d ? s : r * num_samples + s] = pick;
+          remaining[pick] = 0.0;
+        }
+      }
+    }
+  });
   return result;
 }
 
