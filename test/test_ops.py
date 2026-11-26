@@ -92,6 +92,21 @@ class TestOps(unittest.TestCase):
         self.assertEqual(len(chunks2), 3)
         self.assertEqual(chunks2[0].shape, tp.Size([4]))
 
+    def test_multinomial_replacement_uses_one_cdf_per_row(self):
+        # One-hot rows must sample the same index for every draw; this pins
+        # the CDF shape and the binary search, including the zero-mass row.
+        probs = tp.tensor([
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+        ])
+        samples = tp.multinomial(probs, 8, replacement=True)
+        self.assertEqual(tuple(samples.shape), (4, 8))
+        self.assertEqual(samples[0].tolist(), [1] * 8)
+        self.assertEqual(samples[2].tolist(), [0] * 8)
+        self.assertEqual(samples[3].tolist(), [0] * 8)
+
 class TestOpPackets(unittest.TestCase):
     def test_inplace_packet_call_reaches_the_kernel(self):
         # Ops whose resolver is not exposed as a C function answer from
