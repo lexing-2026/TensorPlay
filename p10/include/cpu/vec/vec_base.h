@@ -332,9 +332,11 @@ struct Vectorized {
     }
     return ret;
   }
+  // A fold starts from the first lane: an identity of 0 is only correct for
+  // addition, and silently truncates a minimum or zeroes a product.
   T reduce(T (*const f)(T, T)) const {
-    T ret = 0;
-    for (int64_t i = 0; i < size(); i++) {
+    T ret = values[0];
+    for (int64_t i = 1; i < size(); i++) {
       ret = f(ret, values[i]);
       if (++i < size())
         ret = f(ret, values[i]);
@@ -350,8 +352,8 @@ struct Vectorized {
     return ret;
   }
   T reduce(T (*const f)(T, T)) const {
-    T ret = 0;
-    for (int64_t i = 0; i != size(); i++) {
+    T ret = values[0];
+    for (int64_t i = 1; i != size(); i++) {
       ret = f(ret, values[i]);
     }
     return ret;
@@ -365,8 +367,8 @@ struct Vectorized {
     return ret;
   }
   T reduce(T (*const f)(const T&, const T&)) const {
-    T ret = 0;
-    for (int64_t i = 0; i != size(); i++) {
+    T ret = values[0];
+    for (int64_t i = 1; i != size(); i++) {
       ret = f(ret, values[i]);
     }
     return ret;
