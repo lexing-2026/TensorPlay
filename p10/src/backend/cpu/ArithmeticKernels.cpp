@@ -19,6 +19,7 @@
 #include "cpu/VecReducedMath.h"
 #include "cpu/VecBinaryMath.h"
 #include "cpu/StreamDestination.h"
+#include "cpu/ScalarArithVecKernels.h"
 #include <iostream>
 #include <vector>
 #include <cmath>
@@ -3908,6 +3909,32 @@ Tensor& div_inplace_kernel(Tensor& self, const Tensor& other) {
 
 
 
+DEFINE_DISPATCH(scalar_vec_stub);
+
+#if defined(_M_X64)
+namespace {
+// MSVC has no per-function ISA target attributes, so the contiguous
+// wrapped-scalar walks go through the tier-compiled stub declared in
+// cpu/ScalarArithVecKernels.h (implemented in ScalarArithVecKernelsImpl.cpp):
+// the DEFAULT copy is a plain loop and the AVX2/AVX512 copies inherit the
+// tier's own /arch flag.  Without this, the scalar forms of add/sub/mul/div
+// fall into the recursive per-element functor and run 20-60x behind their
+// tensor forms, which is where every `x + eps` composite pays for it.
+enum : int { SCALAR_VEC_ADD = 0, SCALAR_VEC_MUL = 1, SCALAR_VEC_DIV = 2 };
+
+template <typename T>
+inline void scalar_vec_run(int code, const T* a, T* y, int64_t n, double scalar) {
+    const int dtype = static_cast<int>(std::is_same_v<T, double>
+                                           ? DType::Float64
+                                           : DType::Float32);
+    parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+        scalar_vec_stub(DeviceType::CPU, a + begin, y + begin, end - begin,
+                        scalar, code, dtype);
+    });
+}
+} // namespace
+#endif
+
 // --- Scalar Kernels ---
 
 namespace {
@@ -3928,6 +3955,30 @@ inline DType scalar_result_dtype(DType self_dt, const Scalar& other,
 
 Tensor add_scalar_kernel(const Tensor& self, const Scalar& other, const Scalar& alpha) {
     DType result_dtype = scalar_result_dtype(self.dtype(), other, &alpha);
+
+#if defined(_M_X64)
+    // Same fold as the x86-64 block below, through the tier-compiled walk.
+    if (self.dtype() == DType::Float32 && result_dtype == DType::Float32 &&
+        !other.isComplex() && !alpha.isComplex() && self.is_contiguous()) {
+        Tensor result = Tensor::empty(
+            static_cast<std::vector<int64_t>>(self.shape()), DType::Float32,
+            self.device());
+        const float scalar = alpha.to<float>() * other.to<float>();
+        scalar_vec_run(SCALAR_VEC_ADD, self.data_ptr<float>(),
+                       result.data_ptr<float>(), self.numel(), scalar);
+        return result;
+    }
+    if (self.dtype() == DType::Float64 && result_dtype == DType::Float64 &&
+        !other.isComplex() && !alpha.isComplex() && self.is_contiguous()) {
+        Tensor result = Tensor::empty(
+            static_cast<std::vector<int64_t>>(self.shape()), DType::Float64,
+            self.device());
+        const double scalar = alpha.to<double>() * other.to<double>();
+        scalar_vec_run(SCALAR_VEC_ADD, self.data_ptr<double>(),
+                       result.data_ptr<double>(), self.numel(), scalar);
+        return result;
+    }
+#endif
 
 #if defined(__x86_64__)
     // Native add.Scalar lowers a wrapped scalar to the same vectorized
@@ -3997,6 +4048,31 @@ Tensor add_scalar_kernel(const Tensor& self, const Scalar& other, const Scalar& 
 Tensor sub_scalar_kernel(const Tensor& self, const Scalar& other, const Scalar& alpha) {
     DType result_dtype = scalar_result_dtype(self.dtype(), other, &alpha);
 
+#if defined(_M_X64)
+    // Subtracting a product is one negated sum, so it takes the add walk.
+    if (self.dtype() == DType::Float32 && result_dtype == DType::Float32 &&
+        !other.isComplex() && !alpha.isComplex() && self.is_contiguous()) {
+        Tensor result = Tensor::empty(
+            static_cast<std::vector<int64_t>>(self.shape()), DType::Float32,
+            self.device());
+        const float scalar = alpha.to<float>() * other.to<float>();
+        scalar_vec_run(SCALAR_VEC_ADD, self.data_ptr<float>(),
+                       result.data_ptr<float>(), self.numel(),
+                       static_cast<double>(-scalar));
+        return result;
+    }
+    if (self.dtype() == DType::Float64 && result_dtype == DType::Float64 &&
+        !other.isComplex() && !alpha.isComplex() && self.is_contiguous()) {
+        Tensor result = Tensor::empty(
+            static_cast<std::vector<int64_t>>(self.shape()), DType::Float64,
+            self.device());
+        const double scalar = alpha.to<double>() * other.to<double>();
+        scalar_vec_run(SCALAR_VEC_ADD, self.data_ptr<double>(),
+                       result.data_ptr<double>(), self.numel(), -scalar);
+        return result;
+    }
+#endif
+
 #if defined(__x86_64__)
     // x - alpha*other folds into one scalar term, so the contiguous float
     // surface takes the same vectorized loop as add.Scalar with the negated
@@ -4063,6 +4139,29 @@ Tensor sub_scalar_kernel(const Tensor& self, const Scalar& other, const Scalar& 
 
 Tensor mul_scalar_kernel(const Tensor& self, const Scalar& other) {
     DType result_dtype = scalar_result_dtype(self.dtype(), other);
+
+#if defined(_M_X64)
+    if (self.dtype() == DType::Float32 && result_dtype == DType::Float32 &&
+        !other.isComplex() && self.is_contiguous()) {
+        Tensor result = Tensor::empty(
+            static_cast<std::vector<int64_t>>(self.shape()), DType::Float32,
+            self.device());
+        scalar_vec_run(SCALAR_VEC_MUL, self.data_ptr<float>(),
+                       result.data_ptr<float>(), self.numel(),
+                       static_cast<double>(other.to<float>()));
+        return result;
+    }
+    if (self.dtype() == DType::Float64 && result_dtype == DType::Float64 &&
+        !other.isComplex() && self.is_contiguous()) {
+        Tensor result = Tensor::empty(
+            static_cast<std::vector<int64_t>>(self.shape()), DType::Float64,
+            self.device());
+        scalar_vec_run(SCALAR_VEC_MUL, self.data_ptr<double>(),
+                       result.data_ptr<double>(), self.numel(),
+                       other.to<double>());
+        return result;
+    }
+#endif
 
 #if defined(__x86_64__)
     if (self.dtype() == DType::Float32 && result_dtype == DType::Float32 &&
@@ -4133,6 +4232,29 @@ Tensor div_scalar_kernel(const Tensor& self, const Scalar& other) {
         result_dtype = promoteTypes(toComplexType(result_dtype), other.dtype());
     }
 
+#if defined(_M_X64)
+    if (self.dtype() == DType::Float32 && result_dtype == DType::Float32 &&
+        !other.isComplex() && self.is_contiguous()) {
+        Tensor result = Tensor::empty(
+            static_cast<std::vector<int64_t>>(self.shape()), DType::Float32,
+            self.device());
+        scalar_vec_run(SCALAR_VEC_DIV, self.data_ptr<float>(),
+                       result.data_ptr<float>(), self.numel(),
+                       static_cast<double>(other.to<float>()));
+        return result;
+    }
+    if (self.dtype() == DType::Float64 && result_dtype == DType::Float64 &&
+        !other.isComplex() && self.is_contiguous()) {
+        Tensor result = Tensor::empty(
+            static_cast<std::vector<int64_t>>(self.shape()), DType::Float64,
+            self.device());
+        scalar_vec_run(SCALAR_VEC_DIV, self.data_ptr<double>(),
+                       result.data_ptr<double>(), self.numel(),
+                       other.to<double>());
+        return result;
+    }
+#endif
+
 #if defined(__x86_64__)
     if (self.dtype() == DType::Float32 && result_dtype == DType::Float32 &&
         !other.isComplex() && self.is_contiguous() && (cpu_has_avx512() || cpu_has_avx2f())) {
@@ -4197,6 +4319,24 @@ Tensor div_scalar_kernel(const Tensor& self, const Scalar& other) {
 
 // Inplace Scalar
 Tensor& add_scalar_inplace_kernel(Tensor& self, const Scalar& other, const Scalar& alpha) {
+#if defined(_M_X64)
+    // The in-place form walks the same buffer as source and destination; the
+    // tier walk loads a lane before it stores it, so aliasing is safe.
+    if ((self.dtype() == DType::Float32 || self.dtype() == DType::Float64) &&
+        !other.isComplex() && !alpha.isComplex() && self.is_contiguous()) {
+        if (self.dtype() == DType::Float32) {
+            const float scalar = alpha.to<float>() * other.to<float>();
+            scalar_vec_run(SCALAR_VEC_ADD, self.data_ptr<float>(),
+                           self.data_ptr<float>(), self.numel(), scalar);
+        } else {
+            const double scalar = alpha.to<double>() * other.to<double>();
+            scalar_vec_run(SCALAR_VEC_ADD, self.data_ptr<double>(),
+                           self.data_ptr<double>(), self.numel(), scalar);
+        }
+        return self;
+    }
+#endif
+
 #if defined(__x86_64__)
     if ((self.dtype() == DType::Float32 || self.dtype() == DType::Float64) &&
         !other.isComplex() && !alpha.isComplex() && self.is_contiguous() &&
@@ -4240,6 +4380,23 @@ Tensor& add_scalar_inplace_kernel(Tensor& self, const Scalar& other, const Scala
 }
 
 Tensor& sub_scalar_inplace_kernel(Tensor& self, const Scalar& other, const Scalar& alpha) {
+#if defined(_M_X64)
+    if ((self.dtype() == DType::Float32 || self.dtype() == DType::Float64) &&
+        !other.isComplex() && !alpha.isComplex() && self.is_contiguous()) {
+        if (self.dtype() == DType::Float32) {
+            const float scalar = alpha.to<float>() * other.to<float>();
+            scalar_vec_run(SCALAR_VEC_ADD, self.data_ptr<float>(),
+                           self.data_ptr<float>(), self.numel(),
+                           static_cast<double>(-scalar));
+        } else {
+            const double scalar = alpha.to<double>() * other.to<double>();
+            scalar_vec_run(SCALAR_VEC_ADD, self.data_ptr<double>(),
+                           self.data_ptr<double>(), self.numel(), -scalar);
+        }
+        return self;
+    }
+#endif
+
 #if defined(__x86_64__)
     if ((self.dtype() == DType::Float32 || self.dtype() == DType::Float64) &&
         !other.isComplex() && !alpha.isComplex() && self.is_contiguous() &&
@@ -4284,6 +4441,22 @@ Tensor& sub_scalar_inplace_kernel(Tensor& self, const Scalar& other, const Scala
 }
 
 Tensor& mul_scalar_inplace_kernel(Tensor& self, const Scalar& other) {
+#if defined(_M_X64)
+    if ((self.dtype() == DType::Float32 || self.dtype() == DType::Float64) &&
+        !other.isComplex() && self.is_contiguous()) {
+        if (self.dtype() == DType::Float32) {
+            scalar_vec_run(SCALAR_VEC_MUL, self.data_ptr<float>(),
+                           self.data_ptr<float>(), self.numel(),
+                           static_cast<double>(other.to<float>()));
+        } else {
+            scalar_vec_run(SCALAR_VEC_MUL, self.data_ptr<double>(),
+                           self.data_ptr<double>(), self.numel(),
+                           other.to<double>());
+        }
+        return self;
+    }
+#endif
+
 #if defined(__x86_64__)
     if (self.dtype() == DType::Float32 && !other.isComplex() &&
         self.is_contiguous() && (cpu_has_avx512() || cpu_has_avx2f())) {
@@ -4328,6 +4501,22 @@ Tensor& mul_scalar_inplace_kernel(Tensor& self, const Scalar& other) {
 }
 
 Tensor& div_scalar_inplace_kernel(Tensor& self, const Scalar& other) {
+#if defined(_M_X64)
+    if ((self.dtype() == DType::Float32 || self.dtype() == DType::Float64) &&
+        !other.isComplex() && self.is_contiguous()) {
+        if (self.dtype() == DType::Float32) {
+            scalar_vec_run(SCALAR_VEC_DIV, self.data_ptr<float>(),
+                           self.data_ptr<float>(), self.numel(),
+                           static_cast<double>(other.to<float>()));
+        } else {
+            scalar_vec_run(SCALAR_VEC_DIV, self.data_ptr<double>(),
+                           self.data_ptr<double>(), self.numel(),
+                           other.to<double>());
+        }
+        return self;
+    }
+#endif
+
 #if defined(__x86_64__)
     if (self.dtype() == DType::Float32 && !other.isComplex() &&
         self.is_contiguous() && (cpu_has_avx512() || cpu_has_avx2f())) {
