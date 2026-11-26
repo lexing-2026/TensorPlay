@@ -111,8 +111,21 @@ Tensor distance_slope(const Tensor& diff, const Tensor& dist, double p) {
 // of its distances to every row of x2, weighted by the gradient arriving for
 // each distance.  (The gradient for x2 is the same question asked the other
 // way round.)
+//
+// For p == 2 the slope is (x1 - x2) / d, so the whole gather collapses to
+//   g_i = x1_i * sum_j(grad_ij / d_ij) - sum_j(grad_ij / d_ij) x2_j,
+// a row sum plus one matmul.  The generic expression below materialises the
+// (N, M, D) difference tensor instead; at 256x256 pairs that is 16.7M floats
+// and several elementwise passes over it, which is why the op sat ~80x behind.
 Tensor _cdist_backward_native(const Tensor& grad, const Tensor& x1, const Tensor& x2,
                               double p, const Tensor& cdist) {
+    if (p == 2) {
+        const Tensor safe_dist = ops::where(
+            ops::eq(cdist, Scalar(0)), ops::ones_like(cdist), cdist);
+        const Tensor inv_dist = ops::div(grad, safe_dist);
+        const Tensor row_sum = ops::sum(inv_dist, {-1}, true);
+        return ops::sub(ops::mul(x1, row_sum), ops::matmul(inv_dist, x2));
+    }
     const Tensor diff = ops::sub(ops::unsqueeze(x1, -2), ops::unsqueeze(x2, -3));
     const Tensor slope = distance_slope(diff, ops::unsqueeze(cdist, -1), p);
     return ops::sum(ops::mul(slope, ops::unsqueeze(grad, -1)), {-2}, false);
