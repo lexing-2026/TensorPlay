@@ -85,6 +85,7 @@ set(P10_SOURCES
     src/backend/cpu/MaxPooling.cpp
     src/backend/cpu/TensorShape.cpp
     src/backend/cpu/LinearAlgebra.cpp
+    src/backend/cpu/FunctionOfAMatrixUtils.cpp
     src/backend/cpu/TensorFactories.cpp
     src/backend/cpu/Itertools.cpp
     src/backend/cpu/PadKernels.cpp
