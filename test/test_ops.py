@@ -136,6 +136,22 @@ class TestOps(unittest.TestCase):
         got = tp.ops.tp._compute_linear_combination(x, coeff)
         self.assertEqual(got.tolist(), [[-1.0, 0.0]])
 
+    def test_multinomial_seeded_rows_are_reproducible(self):
+        # Parallel row walks must not share generator state; the same seed
+        # has to answer the same draws.
+        probs = tp.tensor([
+            [0.2, 0.3, 0.5],
+            [0.5, 0.25, 0.25],
+            [0.1, 0.1, 0.8],
+        ])
+        tp.manual_seed(1234)
+        first = tp.multinomial(probs, 16, replacement=True).tolist()
+        tp.manual_seed(1234)
+        second = tp.multinomial(probs, 16, replacement=True).tolist()
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), 3)
+        self.assertTrue(all(0 <= v < 3 for row in first for v in row))
+
 class TestOpPackets(unittest.TestCase):
     def test_inplace_packet_call_reaches_the_kernel(self):
         # Ops whose resolver is not exposed as a C function answer from
