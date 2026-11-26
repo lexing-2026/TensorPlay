@@ -1485,6 +1485,17 @@ Tensor ctc_loss_backward_impl(const Tensor& grad_out, const Tensor& log_probs,
     return grad;
 }
 
+// `_ctc_loss` reads its lengths as integers. The reference takes int32 and
+// int64 ranks and rejects everything else with the argument's own name, so the
+// unpack converts through int64 instead of viewing the buffer as int64.
+std::vector<int64_t> ctc_lengths_vector(const Tensor& lengths, const char* name) {
+    if (lengths.dtype() != DType::Int64 && lengths.dtype() != DType::Int32)
+        TP_THROW(RuntimeError, std::string(name) + " must be integral");
+    auto flat = lengths.to(DType::Int64).contiguous();
+    const int64_t* p = flat.data_ptr<int64_t>();
+    return std::vector<int64_t>(p, p + flat.numel());
+}
+
 }  // namespace
 
 Tensor _ctc_loss_backward_cpu(const Tensor& grad, const Tensor& log_probs,
@@ -1493,12 +1504,8 @@ Tensor _ctc_loss_backward_cpu(const Tensor& grad, const Tensor& log_probs,
                               const Tensor& neg_log_likelihood,
                               const Tensor& log_alpha, int64_t blank,
                               bool zero_infinity) {
-    auto in_l = input_lengths.contiguous();
-    auto tg_l = target_lengths.contiguous();
-    std::vector<int64_t> il(in_l.data_ptr<int64_t>(),
-                            in_l.data_ptr<int64_t>() + in_l.numel());
-    std::vector<int64_t> tl(tg_l.data_ptr<int64_t>(),
-                            tg_l.data_ptr<int64_t>() + tg_l.numel());
+    std::vector<int64_t> il = ctc_lengths_vector(input_lengths, "input_lengths");
+    std::vector<int64_t> tl = ctc_lengths_vector(target_lengths, "target_lengths");
     if (log_probs.dtype() == DType::Float64)
         return ctc_loss_backward_impl<double>(
             grad.contiguous(), log_probs.contiguous(), targets.contiguous(),
@@ -1518,12 +1525,8 @@ std::tuple<Tensor, Tensor> _ctc_loss_cpu(const Tensor& log_probs,
                                          const Tensor& target_lengths,
                                          int64_t blank, bool zero_infinity) {
     (void)zero_infinity;
-    auto in_l = input_lengths.contiguous();
-    auto tg_l = target_lengths.contiguous();
-    std::vector<int64_t> il(in_l.data_ptr<int64_t>(),
-                            in_l.data_ptr<int64_t>() + in_l.numel());
-    std::vector<int64_t> tl(tg_l.data_ptr<int64_t>(),
-                            tg_l.data_ptr<int64_t>() + tg_l.numel());
+    std::vector<int64_t> il = ctc_lengths_vector(input_lengths, "input_lengths");
+    std::vector<int64_t> tl = ctc_lengths_vector(target_lengths, "target_lengths");
     if (log_probs.dtype() == DType::Float64)
         return ctc_loss_impl<double>(log_probs.contiguous(),
                                      targets.contiguous(), il, tl, blank);
