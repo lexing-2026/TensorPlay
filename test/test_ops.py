@@ -110,5 +110,22 @@ class TestOpPackets(unittest.TestCase):
         self.assertTrue(tp.allclose(z, tp.tensor([1.0, 2.0])))
         self.assertTrue(tp.allclose(out, tp.tensor([1.0, 2.0])))
 
+    def test_packet_call_retries_the_other_overloads(self):
+        # fill_ binds fill_.Tensor first; a Python number only binds
+        # fill_.Scalar, and the packet must reach it instead of stopping at
+        # the first entry's signature check.
+        x = tp.ones((2, 2))
+        tp.ops.tp.fill_(x, 3.0)
+        self.assertTrue(tp.allclose(x, tp.full((2, 2), 3.0)))
+
+        y = tp.ones((2, 2))
+        tp.ops.tp.fill_(y, 3)
+        self.assertTrue(tp.allclose(y, tp.full((2, 2), 3.0)))
+
+    def test_packet_call_reports_every_candidate(self):
+        with self.assertRaises(TypeError) as raised:
+            tp.ops.tp.fill_(tp.ones((2, 2)), object())
+        self.assertIn("no overload of", str(raised.exception))
+
 if __name__ == '__main__':
     unittest.main()

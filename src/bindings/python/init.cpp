@@ -562,7 +562,16 @@ PyObject* packet_vectorcall(PyObject* self, PyObject* const* args, size_t nargsf
                             PyObject* kwnames) {
     PyObject* entry = reinterpret_cast<PacketSlots*>(self)->entry;
     if (entry != nullptr) {
-        return PyObject_Vectorcall(entry, args, nargsf, kwnames);
+        PyObject* result = PyObject_Vectorcall(entry, args, nargsf, kwnames);
+        if (result == nullptr && PyErr_ExceptionMatches(PyExc_TypeError)) {
+            // The bound overload rejected the arguments on its signature, so
+            // the Python body walks the packet's remaining overloads before
+            // reporting that none of them bind.
+            PyErr_Clear();
+            return packet_python_call(self, args, PyVectorcall_NARGS(nargsf),
+                                      kwnames);
+        }
+        return result;
     }
     return packet_python_call(self, args, PyVectorcall_NARGS(nargsf), kwnames);
 }
