@@ -18,6 +18,7 @@
 #include <numeric>
 #include <optional>
 #include <vector>
+#include <atomic>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -8999,6 +9000,69 @@ struct ExtremumValuePairOps {
 
 // so the scan is parallelized with SIMD accumulators inside
 // binary_kernel_reduce_vec instead of one serial scalar pass.
+#if defined(_M_X64)
+// Whole-tensor extrema at the vector width of the tier this TU is compiled for.
+// The GCC build answers this from try_max_real_avx512; that body has per-function
+// target attributes MSVC cannot spell, so the call fell through to
+// binary_kernel_reduce_vec and its TensorIterator setup.
+//
+// Chunks are cut on grain boundaries, each answers a vector accumulator, and
+// the chunk answers are folded scalar.  A NaN lane ORs into the accumulator the
+// same way the scalar reference propagates it, and the fold repeats that rule.
+template <typename T, bool Maximum>
+T extrema_all_vec(const T* data, int64_t n) {
+    using V = Vectorized<T>;
+    constexpr int64_t W = V::size();
+    const int64_t grain = tensorplay::parallel::GRAIN_SIZE;
+    const int64_t chunks = (n + grain - 1) / grain;
+    const T identity = Maximum ? std::numeric_limits<T>::lowest()
+                               : std::numeric_limits<T>::max();
+    const T nan = std::numeric_limits<T>::quiet_NaN();
+    std::vector<T> partial(static_cast<size_t>(chunks), identity);
+    // The split hands out ranges that need not start on a grain boundary, so
+    // a range takes the next free slot instead of indexing by begin / grain.
+    std::atomic<int64_t> next_slot{0};
+
+    tensorplay::parallel::parallel_for(0, n, grain, [&](int64_t begin, int64_t end) {
+        V acc(identity);
+        V nan_acc(T(0));
+        int64_t i = begin;
+        for (; i + W <= end; i += W) {
+            const V v = V::loadu(data + i);
+            nan_acc = nan_acc | v.isnan();
+            acc = Maximum ? maximum(acc, v) : minimum(acc, v);
+        }
+        T best = Maximum ? acc.reduce_max() : acc.reduce_min();
+        // A NaN lane is all-ones (i.e. a NaN bit pattern), so reduce_max on the
+        // mask would drop it; read the mask lanes out instead.
+        alignas(64) T lanes[W];
+        nan_acc.store(lanes);
+        for (int k = 0; k < static_cast<int>(W); ++k) {
+            if (lanes[k] != T(0)) { best = nan; break; }
+        }
+        for (; i < end; ++i) {
+            const T v = data[i];
+            if (v != v || best != best) best = nan;
+            else if (Maximum) best = (best < v) ? v : best;
+            else best = (v < best) ? v : best;
+        }
+        const int64_t slot = next_slot.fetch_add(1, std::memory_order_relaxed);
+        if (static_cast<size_t>(slot) < partial.size()) {
+            partial[static_cast<size_t>(slot)] = best;
+        }
+    });
+
+    T best = partial[0];
+    for (size_t k = 1; k < partial.size(); ++k) {
+        const T v = partial[k];
+        if (v != v || best != best) { best = nan; continue; }
+        if (Maximum) best = (best < v) ? v : best;
+        else best = (v < best) ? v : best;
+    }
+    return best;
+}
+#endif
+
 Tensor max_kernel_impl(const Tensor& self) {
     if (self.numel() == 0) {
         // over an empty tensor has no identity.
@@ -9033,6 +9097,21 @@ Tensor max_kernel_impl(const Tensor& self) {
         }
     }
 #undef TP_MAX_DIRECT_FOLD_CASE
+
+#if defined(_M_X64)
+    if (input.numel() > kMaxDirectFoldElements) {
+        if (input.dtype() == DType::Float32) {
+            *out.data_ptr<float>() = extrema_all_vec<float, true>(
+                input.data_ptr<float>(), input.numel());
+            return out;
+        }
+        if (input.dtype() == DType::Float64) {
+            *out.data_ptr<double>() = extrema_all_vec<double, true>(
+                input.data_ptr<double>(), input.numel());
+            return out;
+        }
+    }
+#endif
 
 #if defined(__x86_64__)
     if (input.is_contiguous() &&
@@ -9265,6 +9344,21 @@ Tensor min_kernel_impl(const Tensor& self) {
         }
     }
 #undef TP_MIN_DIRECT_FOLD_CASE
+
+#if defined(_M_X64)
+    if (input.numel() > kMaxDirectFoldElements) {
+        if (input.dtype() == DType::Float32) {
+            *out.data_ptr<float>() = extrema_all_vec<float, false>(
+                input.data_ptr<float>(), input.numel());
+            return out;
+        }
+        if (input.dtype() == DType::Float64) {
+            *out.data_ptr<double>() = extrema_all_vec<double, false>(
+                input.data_ptr<double>(), input.numel());
+            return out;
+        }
+    }
+#endif
 
     TensorIterator iter = TensorIterator::reduce_op(out, input);
 

@@ -4,10 +4,13 @@
 #include "Exception.h"
 #include "Parallel.h"
 #include "NormRowHelpers.h"
+#include "cpu/LayerNormRowKernels.h"
 #include "MemoryFormat.h"
 
 namespace tensorplay {
 namespace cpu {
+
+DEFINE_DISPATCH(lnrow_stub);
 
 namespace {
 
@@ -723,7 +726,32 @@ static Tensor layer_norm_cpu_impl(
     // once through the row's data.
     const int64_t row_grain = std::max<int64_t>(
         1, tensorplay::parallel::GRAIN_SIZE / std::max<int64_t>(inner_size, 1));
-    
+
+#if defined(_M_X64)
+    // The row primitives (stats + affine) are tier chunk walks here: on MSVC
+    // NormRowHelpers' AVX bodies do not compile, so this f32 row loop was the
+    // serial reference.
+    if (input.dtype() == DType::Float32 && inner_size > 0 && outer_size > 0) {
+        const float* in_ptr = input_c.data_ptr<float>();
+        float* out_ptr = out.data_ptr<float>();
+        const float* w_ptr = (weight_opt.has_value() && weight_opt->defined()) ? weight_opt->data_ptr<float>() : nullptr;
+        const float* b_ptr = (bias_opt.has_value() && bias_opt->defined()) ? bias_opt->data_ptr<float>() : nullptr;
+        int stats_dtype = -1;
+        void* mo = nullptr;
+        void* ro = nullptr;
+        if (mean_out || rstd_out) {
+            stats_dtype = static_cast<int>((mean_out ? mean_out : rstd_out)->dtype());
+            if (mean_out) mo = mean_out->data_ptr();
+            if (rstd_out) ro = rstd_out->data_ptr();
+        }
+        tensorplay::parallel::parallel_for(0, outer_size, row_grain, [&](int64_t rb, int64_t re) {
+            lnrow_stub(DeviceType::CPU, in_ptr, out_ptr, rb, re, inner_size, eps,
+                       w_ptr, b_ptr, mo, ro, stats_dtype);
+        });
+        return out;
+    }
+#endif
+
     if (input.dtype() == DType::Float32) {
         float* out_ptr = out.data_ptr<float>();
         const float* in_ptr = input_c.data_ptr<float>();
