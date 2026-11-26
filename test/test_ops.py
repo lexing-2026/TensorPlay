@@ -163,7 +163,7 @@ class TestOps(unittest.TestCase):
     def test_embedding_bag_backward_accumulates_repeated_indices(self):
         weight = tp.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
         indices = tp.tensor([0, 1, 0], dtype=tp.int64)
-        offsets = tp.tensor([0, 2], dtype=tp.int64)
+        offsets = tp.tensor([0, 3], dtype=tp.int64)
         output, offset2bag, bag_size, max_indices = tp.ops.tp._embedding_bag(
             weight, indices, offsets, False, 0, False, None, False, -1)
         grad = tp.tensor([[1.0, 2.0]])
