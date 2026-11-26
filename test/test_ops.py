@@ -160,6 +160,16 @@ class TestOps(unittest.TestCase):
         self.assertEqual(s.col_indices().tolist(), [0, 2, 0, 1, 2])
         self.assertEqual(s.values().tolist(), [1.0, 2.0, 3.0, 4.0, 5.0])
 
+    def test_native_batch_norm_legit_updates_running_stats(self):
+        x = tp.tensor([[1.0, 2.0], [3.0, 4.0]])
+        rm = tp.zeros((2,))
+        rv = tp.ones((2,))
+        out, save_mean, save_invstd = tp.ops.tp._native_batch_norm_legit(
+            x, tp.ones((2,)), tp.zeros((2,)), rm, rv, True, 0.1, 1e-5)
+        self.assertEqual(tuple(out.shape), (2, 2))
+        self.assertAlmostEqual(rm[0].item(), 0.2, places=5)
+        self.assertAlmostEqual(rm[1].item(), 0.3, places=5)
+
 class TestOpPackets(unittest.TestCase):
     def test_inplace_packet_call_reaches_the_kernel(self):
         # Ops whose resolver is not exposed as a C function answer from

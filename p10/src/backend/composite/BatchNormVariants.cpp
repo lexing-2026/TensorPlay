@@ -71,6 +71,14 @@ std::tuple<Tensor, Tensor, Tensor> native_batch_norm_legit_no_training_native(
                                   false, momentum, eps);
 }
 
+std::tuple<Tensor, Tensor, Tensor> native_batch_norm_legit_native(
+        const Tensor& input, const std::optional<Tensor>& weight,
+        const std::optional<Tensor>& bias, Tensor& running_mean,
+        Tensor& running_var, bool training, double momentum, double eps) {
+    return ops::native_batch_norm(input, weight, bias, running_mean,
+                                  running_var, training, momentum, eps);
+}
+
 } // namespace composite
 
 TENSORPLAY_LIBRARY_IMPL(Composite, BatchNormVariantComposite) {
@@ -79,6 +87,7 @@ TENSORPLAY_LIBRARY_IMPL(Composite, BatchNormVariantComposite) {
     m.impl("_batch_norm_no_update", composite::batch_norm_no_update_native);
     m.impl("_native_batch_norm_legit_no_training",
            composite::native_batch_norm_legit_no_training_native);
+    m.impl("_native_batch_norm_legit", composite::native_batch_norm_legit_native);
 }
 
 } // namespace tensorplay
