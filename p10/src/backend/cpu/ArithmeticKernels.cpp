@@ -3688,14 +3688,36 @@ Tensor& mul_inplace_kernel(Tensor& self, const Tensor& other) {
     }
     #endif
 
+    // The destination is also an operand here, and VML leaves that alias alone:
+    // every x *= y over packed float32 data came back unchanged while the
+    // out-of-place form stayed correct.  Fold the two buffers in one pass
+    // instead, reading self and storing the product back over it.
     bool optimized = false;
     if (self.dtype() == DType::Float32 && other.dtype() == DType::Float32 &&
         self.is_contiguous() && other.is_contiguous() && self.shape() == other.shape()) {
-        #ifdef USE_MKL
         int64_t n = self.numel();
-        vsMul((int)n, self.data_ptr<float>(), other.data_ptr<float>(), self.data_ptr<float>());
+        float* s_ptr = self.data_ptr<float>();
+        const float* o_ptr = other.data_ptr<float>();
+#if defined(__AVX512F__)
+        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+            int64_t i = begin;
+            for (; i + 16 <= end; i += 16)
+                _mm512_storeu_ps(s_ptr + i, _mm512_mul_ps(_mm512_loadu_ps(s_ptr + i),
+                                                          _mm512_loadu_ps(o_ptr + i)));
+            for (; i < end; ++i) s_ptr[i] *= o_ptr[i];
+        });
+#elif defined(__AVX2__)
+        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+            int64_t i = begin;
+            for (; i + 8 <= end; i += 8)
+                _mm256_storeu_ps(s_ptr + i, _mm256_mul_ps(_mm256_loadu_ps(s_ptr + i),
+                                                          _mm256_loadu_ps(o_ptr + i)));
+            for (; i < end; ++i) s_ptr[i] *= o_ptr[i];
+        });
+#else
+        for (int64_t i = 0; i < n; ++i) s_ptr[i] *= o_ptr[i];
+#endif
         optimized = true;
-        #endif
     }
 
 #if defined(__x86_64__)
