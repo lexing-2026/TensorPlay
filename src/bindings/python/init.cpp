@@ -473,8 +473,11 @@ PyObject* op_packet_call(PyObject* packet, PyObject* /*defining_class*/,
     }
     Py_XDECREF(entry);
     if (PyErr_Occurred() != nullptr) PyErr_Clear();
+    // Look the body up on the type: an instance lookup hands back a bound
+    // method that already carries the packet, while the call below puts the
+    // packet in front of the arguments, so the body saw it twice.
     PyObject* body = g_packet_body_name != nullptr
-        ? PyObject_GetAttr(packet, g_packet_body_name)
+        ? PyObject_GetAttr(reinterpret_cast<PyObject*>(Py_TYPE(packet)), g_packet_body_name)
         : nullptr;
     if (body == nullptr) return nullptr;
     // The Python body takes the packet as its first argument, so the call is
@@ -519,8 +522,11 @@ struct PacketSlots {
 
 PyObject* packet_python_call(PyObject* packet, PyObject* const* args,
                              Py_ssize_t nargs, PyObject* kwnames) {
+    // Look the body up on the type: an instance lookup hands back a bound
+    // method that already carries the packet, while the call below puts the
+    // packet in front of the arguments, so the body saw it twice.
     PyObject* body = g_packet_body_name != nullptr
-        ? PyObject_GetAttr(packet, g_packet_body_name)
+        ? PyObject_GetAttr(reinterpret_cast<PyObject*>(Py_TYPE(packet)), g_packet_body_name)
         : nullptr;
     if (body == nullptr) return nullptr;
     // The Python body takes the packet as its first argument, so the call is

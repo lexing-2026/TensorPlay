@@ -92,5 +92,23 @@ class TestOps(unittest.TestCase):
         self.assertEqual(len(chunks2), 3)
         self.assertEqual(chunks2[0].shape, tp.Size([4]))
 
+class TestOpPackets(unittest.TestCase):
+    def test_inplace_packet_call_reaches_the_kernel(self):
+        # Ops whose resolver is not exposed as a C function answer from
+        # __call_py__; the call slot must not hand the body the packet twice.
+        x = tp.tensor([1.0, -2.0, 4.0])
+        tp.ops.tp.neg_(x)
+        self.assertTrue(tp.allclose(x, tp.tensor([-1.0, 2.0, -4.0])))
+
+        y = tp.tensor([4.0, 9.0])
+        tp.ops.tp.sqrt_(y)
+        self.assertTrue(tp.allclose(y, tp.tensor([2.0, 3.0])))
+
+    def test_packet_call_leaves_the_source_untouched(self):
+        z = tp.tensor([1.0, -2.0])
+        out = tp.ops.tp.abs_(z)
+        self.assertTrue(tp.allclose(z, tp.tensor([1.0, 2.0])))
+        self.assertTrue(tp.allclose(out, tp.tensor([1.0, 2.0])))
+
 if __name__ == '__main__':
     unittest.main()
