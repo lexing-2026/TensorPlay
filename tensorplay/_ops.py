@@ -256,7 +256,10 @@ class OpOverloadPacket(_C._PacketBase):
     def __call_py__(self, /, *args: Any, **kwargs: Any) -> Any:
         resolver = self._resolver
         if resolver is not None:
-            return resolver(*args, **kwargs)
+            try:
+                return resolver(*args, **kwargs)
+            except TypeError as exc:
+                return self._call_overloads(args, kwargs, exc)
         overload = self._single_overload
         if overload is not None:
             try:
@@ -274,6 +277,20 @@ class OpOverloadPacket(_C._PacketBase):
             except TypeError as exc:
                 errors.append(f"{overload}: {exc}")
         raise TypeError(f"no overload of {self._qualified_op_name} accepts these arguments:\n  " + "\n  ".join(errors))
+
+    def _call_overloads(self, args: tuple[Any, ...], kwargs: dict[str, Any], cause: TypeError) -> Any:
+        # The entry bound to a packet is one fixed overload; a call it rejects
+        # on its signature is retried over the rest before giving up.
+        errors: list[str] = [f"{self._qualified_op_name}: {cause}"]
+        for overload in self._overloads.values():
+            try:
+                return overload(*args, **kwargs)
+            except TypeError as exc:
+                errors.append(f"{overload}: {exc}")
+        raise TypeError(
+            f"no overload of {self._qualified_op_name} accepts these arguments:\n  "
+            + "\n  ".join(errors)
+        ) from None
 
     def __repr__(self) -> str:
         return f"<OpOverloadPacket(op='{self._namespace}.{self._opname}')>"
