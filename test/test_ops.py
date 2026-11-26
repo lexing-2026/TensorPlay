@@ -170,6 +170,14 @@ class TestOps(unittest.TestCase):
         self.assertAlmostEqual(rm[0].item(), 0.2, places=5)
         self.assertAlmostEqual(rm[1].item(), 0.3, places=5)
 
+    def test_slow_conv_transpose3d_reaches_the_cpu_slot(self):
+        x = tp.ones((1, 1, 2, 2, 2))
+        w = tp.ones((1, 1, 2, 2, 2))
+        out = tp.ops.tp.slow_conv_transpose3d(
+            x, w, [2, 2, 2], None, [1, 1, 1], [0, 0, 0], [0, 0, 0], [1, 1, 1])
+        self.assertEqual(tuple(out.shape), (1, 1, 3, 3, 3))
+        self.assertAlmostEqual(out.sum().item(), 8.0, places=5)
+
 class TestOpPackets(unittest.TestCase):
     def test_inplace_packet_call_reaches_the_kernel(self):
         # Ops whose resolver is not exposed as a C function answer from
