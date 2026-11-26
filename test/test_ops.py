@@ -109,15 +109,17 @@ class TestOps(unittest.TestCase):
         self.assertEqual(samples[3].tolist(), [0] * 8)
 
     def test_cdist_backward_p2_gathers_pairs_by_matmul(self):
-        x1 = tp.tensor([[1.0, 2.0], [4.0, 6.0]])
-        x2 = tp.tensor([[0.0, 0.0], [3.0, 4.0]])
+        a = [[1.0, 2.0], [4.0, 6.0]]
+        b = [[0.0, 0.0], [3.0, 4.0]]
+        x1 = tp.tensor(a)
+        x2 = tp.tensor(b)
         leaf = x1.clone().requires_grad_(True)
         tp.cdist(leaf, x2, 2.0).sum().backward()
         want = []
         for i in range(2):
             row = [0.0, 0.0]
             for j in range(2):
-                diff = [x1[i][k] - x2[j][k] for k in range(2)]
+                diff = [a[i][k] - b[j][k] for k in range(2)]
                 dist = math.sqrt(sum(v * v for v in diff))
                 for k in range(2):
                     row[k] += diff[k] / dist
