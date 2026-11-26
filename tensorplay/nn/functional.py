@@ -3793,12 +3793,43 @@ def linear_cross_entropy(
     target.
 
     Equivalent to ``cross_entropy(linear(input, linear_weight), target,
-    **kwargs)`` (reference path; chunked/fused options are ignored).
+    **kwargs)``, but on CUDA the vocabulary projection and the loss share one
+    buffer: the loss is evaluated in place over the ``[tokens, vocab]`` logits
+    and its backward replaces those logits with their gradient, so no
+    probability buffer, no ``log_softmax`` output and no fp32 upcast are ever
+    allocated.  See :mod:`tensorplay.nn._fused_ce` for the arithmetic.
+
+    The fused path serves ``reduction`` in ``{"mean", "sum", "none"}`` with
+    ``weight=None``, ``label_smoothing == 0`` and 2-D ``input``; anything else
+    (class weights, smoothing, higher-rank input, other devices) falls back to
+    the composed reference.
     """
     if options is not None:
         warnings.warn(
             "linear_cross_entropy: ``options`` ignored; reference path used.",
             stacklevel=2,
+        )
+    if _capturing():
+        # Capture replays traced operations, and the fused path's per-row
+        # scratch vectors are allocated inside the call: a graph would freeze
+        # them at their capture-time values.  Compose the reference here -- the
+        # same arithmetic, every step traced -- and keep the fused walk for
+        # eager execution.
+        logits = linear(input, linear_weight, linear_bias)
+        ig = -100 if ignore_index is None else ignore_index
+        return cross_entropy(logits, target, weight=weight, ignore_index=ig,
+                             reduction=reduction, label_smoothing=label_smoothing)
+    if (
+        weight is None
+        and label_smoothing == 0.0
+        and reduction in ("mean", "sum", "none")
+    ):
+        from tensorplay.nn._fused_ce import fused_linear_cross_entropy
+
+        ig = -100 if ignore_index is None else ignore_index
+        return fused_linear_cross_entropy(
+            input, linear_weight, target, linear_bias,
+            ignore_index=ig, reduction=reduction,
         )
     logits = linear(input, linear_weight, linear_bias)
     ig = -100 if ignore_index is None else ignore_index
