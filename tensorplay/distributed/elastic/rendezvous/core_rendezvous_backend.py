@@ -10,6 +10,7 @@ import base64
 import json
 import os
 import tempfile
+import time
 
 from tensorplay.distributed import FileStore, Store, StoreTimeoutError, TCPStore
 
@@ -123,20 +124,35 @@ class CoreRendezvousBackend(RendezvousBackend):
         except RendezvousConnectionError:
             return b""
 
-    def _exists(self, key: str) -> bool:
+    _PROBE_ATTEMPTS = 3
+    _PROBE_BACKOFF = 0.25
+
+    def _probe_once(self, key: str) -> bool:
         probe = getattr(self._store, "has", None)
         if probe is not None:
+            return bool(probe(key))
+        self._store.get(key, timeout=0.3)
+        return True
+
+    def _exists(self, key: str) -> bool:
+        last_error: Exception | None = None
+        for attempt in range(self._PROBE_ATTEMPTS):
             try:
-                return bool(probe(key))
+                return self._probe_once(key)
             except Exception as e:
-                raise self._store_error("probe", e) from e
-        try:
-            self._store.get(key, timeout=0.3)
-            return True
-        except Exception as e:
-            if isinstance(e, StoreTimeoutError) and "could not connect" not in str(e):
-                return False
-            raise self._store_error("probe", e) from e
+                if (
+                    isinstance(e, StoreTimeoutError)
+                    and "could not connect" not in str(e)
+                ):
+                    return False
+                last_error = e
+                if attempt + 1 < self._PROBE_ATTEMPTS:
+                    # A saturated store can transiently reject a probe; retrying
+                    # keeps the rendezvous agent alive instead of turning one
+                    # slow check into a fatal rendezvous failure.
+                    time.sleep(self._PROBE_BACKOFF * (2 ** attempt))
+        assert last_error is not None
+        raise self._store_error("probe", last_error) from last_error
 
     def _call_store(self, store_op: str, *args, **kwargs):
         try:
