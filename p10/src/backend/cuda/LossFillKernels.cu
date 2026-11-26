@@ -1436,9 +1436,9 @@ TENSORPLAY_LIBRARY_IMPL(CUDA, LossFillKernels) {
     m.impl("huber_loss_backward", huber_loss_backward_cuda);
     m.impl("binary_cross_entropy", binary_cross_entropy_cuda);
     m.impl("binary_cross_entropy_backward", binary_cross_entropy_backward_cuda);
-    m.impl("nll_loss", nll_loss_cuda);
+    m.impl("nll_loss_forward", nll_loss_cuda);
     m.impl("nll_loss_backward", nll_loss_backward_cuda);
-    m.impl("nll_loss2d", nll_loss2d_cuda);
+    m.impl("nll_loss2d_forward", nll_loss2d_cuda);
     m.impl("nll_loss2d_backward", nll_loss2d_backward_cuda);
 
     // out-variants: run the value kernel, then transfer into the caller's

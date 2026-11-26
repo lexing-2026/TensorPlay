@@ -13095,7 +13095,7 @@ class TestVulkanLikelihoodLoss(unittest.TestCase):
         x = self._device(logits, dtype)
         t = self._codes(codes)
         w = None if weight is None else self._device(weight, dtype)
-        out, reported = tensorplay._C.nll_loss(
+        out, reported = tensorplay._C.nll_loss_forward(
             x, t, w, {"none": 0, "mean": 1, "sum": 2}[reduction], ignore)
         answered = (tensorplay.float16 if dtype == np.float16
                     else tensorplay.float32)
@@ -13169,7 +13169,7 @@ class TestVulkanLikelihoodLoss(unittest.TestCase):
         logits = np.log(np.linspace(0.05, 0.95, 20).reshape(4, 5))
         x = self._device(logits)
         losses, _, _ = self._rows(logits, [0, 3, 1, 4], None, -100)
-        out, _ = tensorplay._C.nll_loss(
+        out, _ = tensorplay._C.nll_loss_forward(
             x, self._codes([0, 3, 1, 4], np.int32), None, 2, -100)
         self.assertAlmostEqual(
             float(self._back(out)), float(losses.sum()), places=4)
@@ -13179,14 +13179,14 @@ class TestVulkanLikelihoodLoss(unittest.TestCase):
         weight = np.array([1.5, 0.5, 2.0, 0.25, 1.0], np.float32)
         x = self._device(logits)
         t = self._codes(2)
-        out, reported = tensorplay._C.nll_loss(x, t, self._device(weight), 1, -100)
+        out, reported = tensorplay._C.nll_loss_forward(x, t, self._device(weight), 1, -100)
         self.assertEqual(tuple(out.shape), ())
         self.assertAlmostEqual(
             float(self._back(out)), float(-logits[2] * weight[2]) / weight[2],
             places=4)
         self.assertAlmostEqual(float(self._back(reported)), float(weight[2]), places=4)
         # Unreduced, the same row keeps its loss and still reports its weight.
-        out, reported = tensorplay._C.nll_loss(x, t, None, 0, -100)
+        out, reported = tensorplay._C.nll_loss_forward(x, t, None, 0, -100)
         self.assertEqual(tuple(out.shape), ())
         self.assertAlmostEqual(float(self._back(out)), float(-logits[2]), places=4)
         self.assertAlmostEqual(float(self._back(reported)), 1.0, places=4)
@@ -13204,11 +13204,11 @@ class TestVulkanLikelihoodLoss(unittest.TestCase):
 
     def test_nothing_to_average_answers_with_nothing(self):
         empty = np.zeros((0, 5), np.float32)
-        out, reported = tensorplay._C.nll_loss(
+        out, reported = tensorplay._C.nll_loss_forward(
             self._device(empty), self._codes([]), None, 1, -100)
         self.assertTrue(bool(np.isnan(float(self._back(out)))))
         self.assertEqual(float(self._back(reported)), 0.0)
-        out, reported = tensorplay._C.nll_loss(
+        out, reported = tensorplay._C.nll_loss_forward(
             self._device(empty), self._codes([]), None, 2, -100)
         self.assertEqual(float(self._back(out)), 0.0)
         self.assertEqual(float(self._back(reported)), 0.0)
@@ -13273,14 +13273,14 @@ class TestVulkanLikelihoodLoss(unittest.TestCase):
         x = self._device(logits, np.float16)
         losses, _, _ = self._rows(logits, [2], None, -100, np.float16)
         for codes in (self._codes(2), self._codes(2, np.int32)):
-            out, reported = tensorplay._C.nll_loss(x, codes, None, 2, -100)
+            out, reported = tensorplay._C.nll_loss_forward(x, codes, None, 2, -100)
             self.assertEqual(tuple(out.shape), ())
             self.assertEqual(out.dtype, tensorplay.float16)
             self.assertEqual(reported.dtype, tensorplay.float16)
             self.assertAlmostEqual(
                 float(self._back(out)), float(losses.sum()), delta=6e-3)
         # Unreduced, the same row keeps its loss and reports its own weight.
-        out, reported = tensorplay._C.nll_loss(x, self._codes(2), None, 0, -100)
+        out, reported = tensorplay._C.nll_loss_forward(x, self._codes(2), None, 0, -100)
         self.assertEqual(out.dtype, tensorplay.float16)
         self.assertAlmostEqual(float(self._back(out)), float(-logits[2]),
                                delta=6e-3)
@@ -13324,7 +13324,7 @@ class TestVulkanLikelihoodLoss(unittest.TestCase):
         x = self._device(logits)
         t = self._codes([0, 3, 1, 4])
         with self.assertRaisesRegex(RuntimeError, "Float32 and Float16"):
-            tensorplay._C.nll_loss(
+            tensorplay._C.nll_loss_forward(
                 tensorplay.zeros((4, 5), device="vulkan",
                                  dtype=tensorplay.int32),
                 t, None, 1, -100)
@@ -13332,16 +13332,16 @@ class TestVulkanLikelihoodLoss(unittest.TestCase):
             tensorplay._C.nll_loss_backward(
                 self._codes([1, 1, 1, 1]), x, t, None, 0, -100, None)
         with self.assertRaisesRegex(RuntimeError, "1d row"):
-            tensorplay._C.nll_loss(
+            tensorplay._C.nll_loss_forward(
                 self._device(np.ones((2, 3, 4), np.float32)),
                 self._codes([0, 3]), None, 1, -100)
         with self.assertRaisesRegex(RuntimeError, "expected a target of"):
-            tensorplay._C.nll_loss(x, self._codes([0, 3]), None, 1, -100)
+            tensorplay._C.nll_loss_forward(x, self._codes([0, 3]), None, 1, -100)
         with self.assertRaisesRegex(RuntimeError, "cover every class"):
-            tensorplay._C.nll_loss(
+            tensorplay._C.nll_loss_forward(
                 x, t, self._device(np.ones(3, np.float32)), 1, -100)
         with self.assertRaisesRegex(RuntimeError, "invalid reduction"):
-            tensorplay._C.nll_loss(x, t, None, 5, -100)
+            tensorplay._C.nll_loss_forward(x, t, None, 5, -100)
         with self.assertRaisesRegex(RuntimeError, "one value to every row"):
             tensorplay._C.nll_loss_backward(
                 self._device(np.float32(1.0)), x, t, None, 0, -100, None)

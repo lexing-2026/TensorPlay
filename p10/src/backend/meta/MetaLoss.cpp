@@ -595,7 +595,7 @@ TENSORPLAY_LIBRARY_IMPL(Meta, MetaLoss) {
     m.impl("tp_l1_loss", l1_loss_kernel);
     m.impl("tp_kl_div", kl_div_kernel);
     m.impl("tp_poisson_nll_loss", poisson_nll_loss_kernel);
-    m.impl("nll_loss", nll_loss_kernel);
+    m.impl("nll_loss_forward", nll_loss_kernel);
     m.impl("huber_loss", huber_loss_kernel);
     m.impl("huber_loss_backward", huber_loss_backward_kernel);
     m.impl("smooth_l1_loss_backward", smooth_l1_loss_backward_kernel);

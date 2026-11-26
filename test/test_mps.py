@@ -554,21 +554,21 @@ class TestMPSLosses(unittest.TestCase):
         log_probs = tp.tensor([[-0.5, -1.0, -2.0], [-1.5, -0.2, -0.8]],
                               dtype=tp.float32, device="mps")
         target = tp.tensor([0, 1], dtype=tp.int64).mps()
-        loss, total = tp.nll_loss(log_probs, target)
+        loss, total = tp._C.nll_loss_forward(log_probs, target)
         self.assertAlmostEqual(loss.item(), 0.35, places=5)
         self.assertAlmostEqual(total.item(), 2.0, places=5)
 
-        loss0 = tp.nll_loss(log_probs, target, reduction=0)
+        loss0 = tp._C.nll_loss_forward(log_probs, target, reduction=0)
         self.assertTrue(tp.allclose(loss0[0].cpu(), tp.tensor([0.5, 0.2]), atol=1e-6))
 
         w = tp.tensor([2.0, 1.0, 1.0], dtype=tp.float32, device="mps")
-        loss_w, total_w = tp.nll_loss(log_probs, target, weight=w)
+        loss_w, total_w = tp._C.nll_loss_forward(log_probs, target, weight=w)
         self.assertAlmostEqual(loss_w.item(), (1.0 + 0.2) / 3.0, places=5)
 
     def test_nll_loss_ignore_index(self):
         log_probs = tp.tensor([[-0.5, -1.0], [-1.5, -0.2]], dtype=tp.float32, device="mps")
         target = tp.tensor([0, -100], dtype=tp.int64).mps()
-        loss, total = tp.nll_loss(log_probs, target, ignore_index=-100)
+        loss, total = tp._C.nll_loss_forward(log_probs, target, ignore_index=-100)
         self.assertAlmostEqual(loss.item(), 0.5, places=5)
         self.assertAlmostEqual(total.item(), 1.0, places=5)
 

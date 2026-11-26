@@ -127,5 +127,13 @@ class TestOpPackets(unittest.TestCase):
             tp.ops.tp.fill_(tp.ones((2, 2)), object())
         self.assertIn("no overload of", str(raised.exception))
 
+    def test_nll_loss_returns_the_loss_tensor(self):
+        logits = tp.tensor([[0.0, -1.0], [-1.0, 0.0]])
+        target = tp.tensor([0, 1], dtype=tp.int64)
+        loss = tp.ops.tp.nll_loss(logits, target)
+        self.assertIsInstance(loss, tp.Tensor)
+        self.assertEqual(tuple(loss.shape), ())
+        self.assertAlmostEqual(loss.item(), 0.0, places=6)
+        self.assertIsInstance(tp.nll_loss(logits, target), tp.Tensor)
 if __name__ == '__main__':
     unittest.main()

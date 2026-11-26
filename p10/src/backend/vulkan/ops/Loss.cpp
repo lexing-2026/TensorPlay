@@ -1123,7 +1123,7 @@ Tensor kl_div_backward_kernel(
 } // namespace tensorplay
 
 TENSORPLAY_LIBRARY_IMPL(Vulkan, LossKernels) {
-  m.impl("nll_loss", &tensorplay::vulkan::ops::nll_loss_kernel);
+  m.impl("nll_loss_forward", &tensorplay::vulkan::ops::nll_loss_kernel);
   m.impl(
       "nll_loss_backward",
       &tensorplay::vulkan::ops::nll_loss_backward_kernel);

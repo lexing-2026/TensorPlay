@@ -583,9 +583,9 @@ TENSORPLAY_LIBRARY_IMPL(MPS, LossKernels) {
   m.impl("huber_loss_backward", huber_loss_backward_kernel);
   m.impl("binary_cross_entropy", binary_cross_entropy_kernel);
   m.impl("binary_cross_entropy_backward", binary_cross_entropy_backward_kernel);
-  m.impl("nll_loss", nll_loss_kernel);
+  m.impl("nll_loss_forward", nll_loss_kernel);
   m.impl("nll_loss_backward", nll_loss_backward_kernel);
-  m.impl("nll_loss2d", nll_loss2d_kernel);
+  m.impl("nll_loss2d_forward", nll_loss2d_kernel);
   m.impl("nll_loss2d_backward", nll_loss2d_backward_kernel);
 }
 

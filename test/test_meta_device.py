@@ -623,7 +623,7 @@ def test_loss_shapes():
     target = tp.empty((2,), dtype=tp.int64, device="meta")
     loss = tp.nn.functional.nll_loss(x, target)
     assert tuple(loss.shape) == ()
-    raw, total = tp._C.nll_loss(x, target, None, 1, -100)
+    raw, total = tp._C.nll_loss_forward(x, target, None, 1, -100)
     assert tuple(raw.shape) == ()
     assert tuple(total.shape) == ()
 
@@ -3450,15 +3450,15 @@ def test_loss_dtype_tables():
         tp._C.smooth_l1_loss(t32, t32, 0.0, -1.0)
     # The scored loss runs over the four wide element types only.
     tgt = _meta(2, dtype=tp.int64)
-    raw, total = tp._C.nll_loss(_meta(2, 4, dtype=tp.float16), tgt, None, 1, -100)
+    raw, total = tp._C.nll_loss_forward(_meta(2, 4, dtype=tp.float16), tgt, None, 1, -100)
     assert raw.dtype == tp.float16
     assert total.dtype == tp.float16
-    raw, total = tp._C.nll_loss(_meta(2, 4, dtype=tp.bfloat16), tgt, None, 1, -100)
+    raw, total = tp._C.nll_loss_forward(_meta(2, 4, dtype=tp.bfloat16), tgt, None, 1, -100)
     assert raw.dtype == tp.bfloat16
     assert total.dtype == tp.bfloat16
     for dt in (tp.int64, tp.bool):
         with pytest.raises(NotImplementedError):
-            tp._C.nll_loss(_meta(2, 4, dtype=dt), tgt, None, 1, -100)
+            tp._C.nll_loss_forward(_meta(2, 4, dtype=dt), tgt, None, 1, -100)
     # The logarithmic loss blends a logarithm and a fractional shift, so
     # whole-number planes answer at single precision; the weight joins the
     # promotion.

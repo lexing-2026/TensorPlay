@@ -274,6 +274,11 @@ def _output_meta(
     return TensorMeta((), (), result.dtype)
 
 
+def _nll_loss_handler(operation: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> DTensor:
+    """Public ``nll_loss`` returns the loss tensor; the pair belongs to forward."""
+    result, _total_weight = _nll_loss_forward_handler(operation, args, kwargs)
+    return result
+
 def _nll_loss_forward_handler(
     operation: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
 ) -> tuple[DTensor, Any]:
@@ -568,7 +573,7 @@ _CUSTOM_LOSS_HANDLERS = {
     "log_softmax": _log_softmax_handler,
     "_log_softmax": _log_softmax_handler,
     "_log_softmax_backward_data": _log_softmax_backward_handler,
-    "nll_loss": _nll_loss_forward_handler,
+    "nll_loss": _nll_loss_handler,
     "nll_loss_forward": _nll_loss_forward_handler,
     "nll_loss2d": _nll_loss_forward_handler,
     "nll_loss2d_forward": _nll_loss_forward_handler,

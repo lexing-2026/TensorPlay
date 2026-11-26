@@ -1573,9 +1573,9 @@ Tensor ctc_loss_tensor_cpu(const Tensor& log_probs, const Tensor& targets,
 }
 
 TENSORPLAY_LIBRARY_IMPL(CPU, LossKernels) {
-    m.impl("nll_loss", nll_loss_kernel);
+    m.impl("nll_loss_forward", nll_loss_kernel);
     m.impl("nll_loss_backward", nll_loss_backward_kernel);
-    m.impl("nll_loss2d", nll_loss2d_kernel);
+    m.impl("nll_loss2d_forward", nll_loss2d_kernel);
     m.impl("nll_loss2d_backward", nll_loss2d_backward_kernel);
     m.impl("_ctc_loss", _ctc_loss_cpu);
     m.impl("_ctc_loss_backward", _ctc_loss_backward_cpu);

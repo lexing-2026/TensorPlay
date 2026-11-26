@@ -297,7 +297,7 @@ class LossFamilyCuda(unittest.TestCase):
         logits = tp.tensor([[0.1, 2.0, -0.5], [1.5, 0.2, -0.2]],
                            device=self._dev())
         target = tp.tensor([1, 0], dtype=tp.int64, device=self._dev())
-        out, tw = tp._C.nll_loss(logits, target, None, 1, -100)
+        out, tw = tp._C.nll_loss_forward(logits, target, None, 1, -100)
         lr = torch.tensor([[0.1, 2.0, -0.5], [1.5, 0.2, -0.2]],
                           requires_grad=True)
         trt = torch.tensor([1, 0])
@@ -308,14 +308,14 @@ class LossFamilyCuda(unittest.TestCase):
                                     logits, target, None, 1, -100, tw)
         self.assertTrue(close(g.cpu(), gref, 1e-4))
         # none reduction returns per-row losses
-        out0, _ = tp._C.nll_loss(logits, target, None, 0, -100)
+        out0, _ = tp._C.nll_loss_forward(logits, target, None, 0, -100)
         self.assertEqual(tuple(out0.shape), (2,))
 
     def test_nll_loss2d(self):
         logits = tp.randn(2, 3, 4, 4, device=self._dev())
         target = tp.randint(0, 3, (2, 4, 4), dtype=tp.int64,
                             device=self._dev())
-        out, tw = tp._C.nll_loss2d(logits, target, None, 1, -100)
+        out, tw = tp._C.nll_loss2d_forward(logits, target, None, 1, -100)
         lr = torch.tensor(logits.cpu().tolist(), requires_grad=True)
         trt = torch.tensor(target.cpu().tolist())
         ref = torch.nn.functional.nll_loss(lr, trt, reduction="mean")
