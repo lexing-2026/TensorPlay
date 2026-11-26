@@ -372,18 +372,20 @@ std::vector<Tensor> unflatten_dense_tensors_native(
     return outputs;
 }
 
-std::tuple<Tensor, Tensor> nll_loss_forward_native(
+Tensor nll_loss_native(
         const Tensor& self, const Tensor& target,
         const std::optional<Tensor>& weight, int64_t reduction,
         int64_t ignore_index) {
-    return ops::nll_loss(self, target, weight, reduction, ignore_index);
+    return std::get<0>(ops::nll_loss_forward(
+        self, target, weight, reduction, ignore_index));
 }
 
-std::tuple<Tensor, Tensor> nll_loss2d_forward_native(
+Tensor nll_loss2d_native(
         const Tensor& self, const Tensor& target,
         const std::optional<Tensor>& weight, int64_t reduction,
         int64_t ignore_index) {
-    return ops::nll_loss2d(self, target, weight, reduction, ignore_index);
+    return std::get<0>(ops::nll_loss2d_forward(
+        self, target, weight, reduction, ignore_index));
 }
 
 std::tuple<Tensor, Tensor, Tensor> _lu_with_info_native(const Tensor& self,
@@ -424,8 +426,8 @@ TENSORPLAY_LIBRARY_IMPL(Composite, ShapeMiscComposite) {
     m.impl("_resize_output_", composite::_resize_output__native);
     m.impl("flatten_dense_tensors", composite::flatten_dense_tensors_native);
     m.impl("unflatten_dense_tensors", composite::unflatten_dense_tensors_native);
-    m.impl("nll_loss_forward", composite::nll_loss_forward_native);
-    m.impl("nll_loss2d_forward", composite::nll_loss2d_forward_native);
+    m.impl("nll_loss", composite::nll_loss_native);
+    m.impl("nll_loss2d", composite::nll_loss2d_native);
     m.impl("_lu_with_info", composite::_lu_with_info_native);
 }
 

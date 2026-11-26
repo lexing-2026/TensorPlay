@@ -197,7 +197,7 @@ def test_likelihood_loss_in_narrow_planes():
                     w = (tp.tensor(weight, dtype=tp_dtype,
                                    device=tp.device("cpu"))
                          if weighted else None)
-                    got, reported = tp._C.nll_loss(x, t, w, reduction, -100)
+                    got, reported = tp._C.nll_loss_forward(x, t, w, reduction, -100)
                     wanted, normalizer, weight_sum = _narrow_loss_rows(
                         host, codes, weight, reduction)
                     answer = got.detach().to(tp.float32).numpy().astype(np.float64)
@@ -224,7 +224,7 @@ def test_likelihood_loss_in_narrow_planes():
                     # axis, so the walk reads it through a layout of its own.
                     x = x.detach().requires_grad_(True)
                     seed = 1.0 if reduction == 1 else 1.0 / weight_sum
-                    traced, _ = tp._C.nll_loss(x, t, w, reduction, -100)
+                    traced = tp._C.nll_loss(x, t, w, reduction, -100)
                     scale = traced.sum() * seed if reduction == 0 else traced * seed
                     (grad,) = tp.autograd.grad(scale, [x])
                     expected = np.zeros((rows, classes), np.float64)
@@ -248,8 +248,8 @@ def test_likelihood_loss_in_narrow_planes():
         codes = np.arange(rows) % classes
         x = tp.tensor(host, dtype=tp_dtype,
                       device=tp.device("cpu")).requires_grad_(True)
-        traced, _ = tp._C.nll_loss(x, tp.tensor(codes, device=tp.device("cpu")),
-                                   None, 0, -100)
+        traced = tp._C.nll_loss(x, tp.tensor(codes, device=tp.device("cpu")),
+                              None, 0, -100)
         (grad,) = tp.autograd.grad(traced[::2].sum(), [x])
         wanted = np.zeros((rows, classes), np.float64)
         for i in range(0, rows, 2):
