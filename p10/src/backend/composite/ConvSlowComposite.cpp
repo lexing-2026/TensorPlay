@@ -252,3 +252,11 @@ TENSORPLAY_LIBRARY_IMPL(Composite, ConvSlowComposite) {
     m.impl("slow_conv_dilated2d", slow_conv_dilated2d_native);
     m.impl("slow_conv_dilated3d", slow_conv_dilated3d_native);
 }
+
+TENSORPLAY_LIBRARY_IMPL(CPU, ConvSlowCPU) {
+    using namespace tensorplay::composite;
+    // The composite registration above is shadowed by the generated CPU
+    // NotImplemented stub; these ops lower to conv_transpose3d / conv3d, so
+    // the same body is the CPU kernel.
+    m.impl("slow_conv_transpose3d", slow_conv_transpose3d_native);
+}
