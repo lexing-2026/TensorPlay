@@ -33,6 +33,69 @@ void select_chunk(const T* a, const T* b, T* d, int64_t n, int op,
     int64_t i = 0;
 
     if (op == 0) {
+        // ATen's shape for the bounded pair: max with the lower bound first,
+        // then min with the upper.  `max` and `min` answer their *second*
+        // operand when either input is a NaN, and the value sits second in
+        // both, so a NaN lane survives -- the same contract as vec::clamp
+        // below, in two instructions instead of the compare/blend ladder.
+#if defined(__AVX512F__) || defined(__AVX2__)
+        if constexpr (std::is_same<T, float>::value) {
+#if defined(__AVX512F__)
+            const __m512 vlo = _mm512_set1_ps(static_cast<float>(p0));
+            const __m512 vhi = _mm512_set1_ps(static_cast<float>(p1));
+            constexpr int64_t K = 16;
+            for (; i + K <= n; i += K) {
+                const __m512 v = _mm512_loadu_ps(a + i);
+                _mm512_storeu_ps(d + i,
+                                 _mm512_min_ps(vhi, _mm512_max_ps(vlo, v)));
+            }
+#else
+            const __m256 vlo = _mm256_set1_ps(static_cast<float>(p0));
+            const __m256 vhi = _mm256_set1_ps(static_cast<float>(p1));
+            constexpr int64_t K = 8;
+            for (; i + K <= n; i += K) {
+                const __m256 v = _mm256_loadu_ps(a + i);
+                _mm256_storeu_ps(d + i,
+                                 _mm256_min_ps(vhi, _mm256_max_ps(vlo, v)));
+            }
+#endif
+            for (; i < n; ++i) {
+                float v = a[i];
+                if (v < static_cast<float>(p0)) v = static_cast<float>(p0);
+                if (v > static_cast<float>(p1)) v = static_cast<float>(p1);
+                d[i] = v;
+            }
+            return;
+        }
+        if constexpr (std::is_same<T, double>::value) {
+#if defined(__AVX512F__)
+            const __m512d vlo = _mm512_set1_pd(p0);
+            const __m512d vhi = _mm512_set1_pd(p1);
+            constexpr int64_t K = 8;
+            for (; i + K <= n; i += K) {
+                const __m512d v = _mm512_loadu_pd(a + i);
+                _mm512_storeu_pd(d + i,
+                                 _mm512_min_pd(vhi, _mm512_max_pd(vlo, v)));
+            }
+#else
+            const __m256d vlo = _mm256_set1_pd(p0);
+            const __m256d vhi = _mm256_set1_pd(p1);
+            constexpr int64_t K = 4;
+            for (; i + K <= n; i += K) {
+                const __m256d v = _mm256_loadu_pd(a + i);
+                _mm256_storeu_pd(d + i,
+                                 _mm256_min_pd(vhi, _mm256_max_pd(vlo, v)));
+            }
+#endif
+            for (; i < n; ++i) {
+                double v = a[i];
+                if (v < p0) v = p0;
+                if (v > p1) v = p1;
+                d[i] = v;
+            }
+            return;
+        }
+#endif
         const V lo(static_cast<T>(p0));
         const V hi(static_cast<T>(p1));
         for (; i + W <= n; i += W) {

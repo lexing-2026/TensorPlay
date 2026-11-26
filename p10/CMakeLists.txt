@@ -860,7 +860,8 @@ function(tp_add_cpu_kernel_isa_tier TIER)
         set(_wrapper "${CMAKE_CURRENT_BINARY_DIR}/cpu_kernel_tiers/${KERNEL_NAME}.${TIER}.cpp")
         set(IMPL "${CMAKE_CURRENT_SOURCE_DIR}/${KERNEL_SRC}")
         file(CONFIGURE OUTPUT "${_wrapper}" CONTENT "#include \"@IMPL@\"\n" @ONLY)
-        set(_defs CPU_CAPABILITY_${TIER} CPU_CAPABILITY=${TIER})
+        set(_defs CPU_CAPABILITY_${TIER} CPU_CAPABILITY=${TIER}
+            HAVE_${TIER}_CPU_DEFINITION)
         # ComplexKernels owns the DispatchStub definitions; only its DEFAULT
         # copy emits them.
         if(KERNEL_NAME STREQUAL "ComplexKernels")
@@ -936,15 +937,15 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
         # (add_compile_definitions), so every tier sees the same DispatchStub
         # layout; only CPU_CAPABILITY differs per copy.
         target_compile_definitions(p10_kernel_default_${KERNEL_NAME} PRIVATE
-            P10_EXPORTS CPU_CAPABILITY_DEFAULT CPU_CAPABILITY=DEFAULT)
-        if(NOT MSVC)
-            target_compile_definitions(p10_kernel_default_${KERNEL_NAME} PRIVATE
-                HAVE_AVX2_CPU_DEFINITION)
-        endif()
-        # MSVC omits the ISA tiers: its static archive is already near the
-        # COFF 4 GiB ceiling, and a tier that is not compiled must not declare
-        # a dispatch slot either.
-        if(TP_CXX_AVX512_FOUND AND NOT MSVC)
+            P10_EXPORTS CPU_CAPABILITY_DEFAULT CPU_CAPABILITY=DEFAULT
+            HAVE_AVX2_CPU_DEFINITION)
+        # 8b63438 dropped both tiers on MSVC while chasing a Windows numeric
+        # mismatch; with the tiers gone every kernel in the matrix collapses
+        # to its scalar default (gelu 6x, erf 5x, max 16x on this box), so the
+        # perf work has no effect at all.  They are back, and the dispatch
+        # slots keep their capability macros -- a build that omits a tier
+        # simply never declares its slot.
+        if(TP_CXX_AVX512_FOUND)
             target_compile_definitions(p10_kernel_default_${KERNEL_NAME} PRIVATE
                 HAVE_AVX512_CPU_DEFINITION)
         endif()
@@ -964,10 +965,8 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
     endforeach()
     list(APPEND P10_SOURCES ${TP_CPU_KERNEL_DEFAULT_OBJS})
     # Linked after all baseline code; see Note [Linking ISA-tier kernel copies].
-    if(NOT MSVC)
-        tp_add_cpu_kernel_isa_tier(AVX2 ${TP_AVX2_TIER_FLAGS})
-    endif()
-    if(TP_CXX_AVX512_FOUND AND NOT MSVC)
+    tp_add_cpu_kernel_isa_tier(AVX2 ${TP_AVX2_TIER_FLAGS})
+    if(TP_CXX_AVX512_FOUND)
         # Same flag set as the AVX512 capability entry.
         tp_add_cpu_kernel_isa_tier(AVX512 ${TP_AVX512_TIER_FLAGS})
     endif()
