@@ -744,6 +744,90 @@ def test_linear_cross_entropy_reference_equivalence():
                   msg="linear_cross_entropy")
 
 
+def test_fused_cross_entropy_cpu_falls_back():
+    # The kernels read CUDA buffers; off CUDA the entry point must compose the
+    # reference instead of reaching them.
+    from tensorplay.nn._fused_ce import fused_linear_cross_entropy, is_eligible
+
+    rng = np.random.RandomState(68)
+    feats = rng.randn(5, 4).astype(np.float32)
+    w = rng.randn(6, 4).astype(np.float32)
+    t = np.array([0, 3, 5, 1, 2], dtype=np.int64)
+    logits = _mk(feats) @ _mk(w).t()
+    assert not is_eligible(logits, _mk(t))
+    got = fused_linear_cross_entropy(_mk(feats), _mk(w), _mk(t), None,
+                                     ignore_index=-100, reduction="mean")
+    want = torch.nn.functional.cross_entropy(torch.tensor(feats) @ torch.tensor(w).t(),
+                                             torch.tensor(t))
+    assert_reference_close(got, want.detach().numpy(), rtol=1e-6, atol=1e-6,
+                  msg="fused gracefull fallback")
+
+
+@pytest.mark.skipif(not tp.cuda.is_available(), reason="needs CUDA")
+def test_fused_cross_entropy_matches_fp32_reference():
+    # fp32 logits in, fp32 loss arithmetic out: the fused walk must agree with
+    # log_softmax + nll_loss to reduction-order noise, including a vocabulary
+    # size that is not a multiple of the kernel block.
+    from tensorplay.nn._fused_ce import fused_cross_entropy
+
+    for vocab in (3, 100, 4097):
+        logits = (tp.randn(7, vocab, device="cuda") * 2.0)
+        picks = [0, vocab - 1, 1, vocab // 2, 0, max(vocab - 2, 0),
+                 min(3, vocab - 1)]
+        target = tp.tensor(picks, dtype=tp.int64, device="cuda")
+        ref_in = logits.clone().requires_grad_(True)
+        want = F.cross_entropy(ref_in, target)
+        want.backward()
+        got_in = logits.clone().requires_grad_(True)
+        got = fused_cross_entropy(got_in, target)
+        got.backward()
+        assert_reference_close(got, float(want.detach()), rtol=1e-5, atol=1e-6,
+                              msg=f"fused CE loss at vocab {vocab}")
+        assert_reference_close(
+            got_in.grad, ref_in.grad,
+            rtol=1e-5, atol=1e-8, msg=f"fused CE grad at vocab {vocab}")
+
+
+@pytest.mark.skipif(not tp.cuda.is_available(), reason="needs CUDA")
+def test_fused_cross_entropy_honours_ignore_index():
+    from tensorplay.nn._fused_ce import fused_cross_entropy
+
+    logits = tp.randn(6, 64, device="cuda")
+    target = tp.tensor([0, 7, -100, 63, -100, 5], dtype=tp.int64, device="cuda")
+    ref_in = logits.clone().requires_grad_(True)
+    want = F.cross_entropy(ref_in, target, ignore_index=-100)
+    want.backward()
+    got_in = logits.clone().requires_grad_(True)
+    got = fused_cross_entropy(got_in, target, ignore_index=-100)
+    got.backward()
+    assert_reference_close(got, float(want.detach()), rtol=1e-6, atol=1e-7,
+                          msg="fused CE with ignore_index")
+    assert_reference_close(got_in.grad, ref_in.grad, rtol=1e-6, atol=1e-8,
+                          msg="fused CE grad with ignore_index")
+    # ignored rows contribute neither loss nor gradient
+    assert float(got_in.grad[2].abs().max()) == 0.0
+    assert float(got_in.grad[4].abs().max()) == 0.0
+
+    # The sentinel need not be negative; the gather must stay in range either
+    # way.  Here it is one past the last class, which is what an unmasked
+    # padding token looks like when the vocabulary itself is the sentinel.
+    sentinel = 64
+    target2 = tp.tensor([0, 7, sentinel, 63, sentinel, 5], dtype=tp.int64,
+                        device="cuda")
+    ref2_in = logits.clone().requires_grad_(True)
+    want2 = F.cross_entropy(ref2_in, target2, ignore_index=sentinel)
+    want2.backward()
+    got2_in = logits.clone().requires_grad_(True)
+    got2 = fused_cross_entropy(got2_in, target2, ignore_index=sentinel)
+    got2.backward()
+    assert_reference_close(got2, float(want2.detach()), rtol=1e-6, atol=1e-7,
+                          msg="fused CE with a positive ignore_index")
+    assert_reference_close(got2_in.grad, ref2_in.grad, rtol=1e-6, atol=1e-8,
+                          msg="fused CE grad with a positive ignore_index")
+    assert float(got2_in.grad[2].abs().max()) == 0.0
+    assert float(got2_in.grad[4].abs().max()) == 0.0
+
+
 def test_grouped_mm_stubs_raise():
     # grouped_mm is a real op backed by the native grouped GEMM.
     a = np.random.RandomState(0).randn(4, 8).astype(np.float64)
