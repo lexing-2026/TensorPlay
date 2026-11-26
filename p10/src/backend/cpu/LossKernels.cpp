@@ -1383,6 +1383,10 @@ Tensor ctc_loss_backward_impl(const Tensor& grad_out, const Tensor& log_probs,
     int64_t S = targets.size(1);
     int64_t M = 2 * S + 1;
 
+    if (grad_out.numel() != 1 && grad_out.numel() != N)
+        TP_THROW(RuntimeError,
+                 "_ctc_loss_backward: grad_output must hold one entry per sequence");
+
     // eq (16) collection detects untouched entries via that sentinel.
     Tensor grad = Tensor::empty_like(log_probs);
     scalar_t* gp_init = grad.data_ptr<scalar_t>();
@@ -1468,7 +1472,11 @@ Tensor ctc_loss_backward_impl(const Tensor& grad_out, const Tensor& log_probs,
 
         // wrap up with the remaining items of eq (16); note the dense softmax
         // training-time log_softmax, so unused labels receive exp(lp) * gr.
-        scalar_t gr = gop[b];
+        // A reduced loss hands over one scalar while a caller that separates
+        // each sequence hands over one entry per sequence.  Indexing the
+        // scalar by b walked past its storage, which is where the access
+        // violation showed up once the batch grew.
+        scalar_t gr = grad_out.numel() == 1 ? gop[0] : gop[b];
         for (int64_t t = 0; t < il; ++t) {
             const scalar_t* lpt = lpb + (t * N) * C;
             scalar_t* gt = gb + (t * N) * C;
