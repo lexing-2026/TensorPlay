@@ -89,11 +89,34 @@ Tensor multinomial_kernel_cpu(const Tensor& self, int64_t num_samples, bool repl
   if (num_samples == 0) return result;
 
   Generator& gen = generator.has_value() ? *generator : default_generator();
+  std::vector<double> cdf(cols);
   for (int64_t r = 0; r < rows; ++r) {
     const float* row = pdata + r * cols;
     if (replacement) {
+      // Build the cumulative distribution once per row.  Recomputing the row
+      // sum and walking it linearly for every draw made the cost
+      // O(rows * samples * cols); a binary search per draw is
+      // O(rows * (cols + samples * log(cols))) and allocates nothing per
+      // sample.
+      double total = 0.0;
+      for (int64_t c = 0; c < cols; ++c) {
+        total += static_cast<double>(row[c]);
+        cdf[c] = total;
+      }
+      if (!(total > 0)) {
+        for (int64_t s = 0; s < num_samples; ++s) {
+          rdata[is_1d ? s : r * num_samples + s] = 0;
+        }
+        continue;
+      }
+      uniform_real_distribution<double> uniform(0.0, 1.0);
       for (int64_t s = 0; s < num_samples; ++s) {
-        rdata[is_1d ? s : r * num_samples + s] = sample_discrete(gen, row, row + cols);
+        double pick = uniform(&gen) * total;
+        // upper_bound matches the old `pick < cum` comparison: a draw that
+        // lands exactly on a boundary advances past that category.
+        auto it = std::upper_bound(cdf.begin(), cdf.end(), pick);
+        int64_t idx = it == cdf.end() ? cols - 1 : it - cdf.begin();
+        rdata[is_1d ? s : r * num_samples + s] = idx;
       }
     } else {
       // Without replacement: repeatedly sample from the remaining mass,
