@@ -128,6 +128,14 @@ class TestOps(unittest.TestCase):
             for got, ref in zip(got_row, want_row):
                 self.assertAlmostEqual(got, ref, places=5)
 
+    def test_compute_linear_combination_cpu_kernel(self):
+        # The implementation lived in FunctionOfAMatrixUtils.cpp but was not
+        # in the CPU source list, so dispatch stopped at NotImplementedError.
+        x = tp.tensor([[1.0, 2.0], [3.0, 4.0]])
+        coeff = tp.tensor([[2.0, -1.0]])
+        got = tp.ops.tp._compute_linear_combination(x, coeff)
+        self.assertEqual(got.tolist(), [[-1.0, 0.0]])
+
 class TestOpPackets(unittest.TestCase):
     def test_inplace_packet_call_reaches_the_kernel(self):
         # Ops whose resolver is not exposed as a C function answer from
