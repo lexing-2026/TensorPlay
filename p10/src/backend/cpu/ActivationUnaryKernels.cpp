@@ -18,17 +18,41 @@ namespace {
 // parallel_for / GRAIN_SIZE live under tensorplay::parallel.
 using namespace tensorplay::parallel;
 
+// sigmoid(x) = 1 / (1 + exp(-x)), silu(x) = x * sigmoid(x).
+//
+// `vecunary::run_f32` is the GCC build's body: on a compiler without
+// per-function ISA attributes (MSVC) its vector form does not exist and every
+// element would fall into the scalar tail even though this TU is compiled at a
+// full tier width.  Writing the two activations against the vector layer here
+// keeps both toolchains on the same loop.
+template <typename T>
+void sigmoid_silu_walk(const T* src, T* dst, int64_t n, bool silu) {
+    using V = vec::Vectorized<T>;
+    constexpr int64_t W = V::size();
+    int64_t i = 0;
+    for (; i + W <= n; i += W) {
+        const V x = V::loadu(src + i);
+        const V den = V(T(1)) + x.neg().exp();
+        (silu ? x / den : V(T(1)) / den).store(dst + i);
+    }
+    for (; i < n; ++i) {
+        const T den = T(1) + std::exp(-src[i]);
+        dst[i] = silu ? static_cast<T>(src[i] / den)
+                      : static_cast<T>(T(1) / den);
+    }
+}
+
 void sigmoid_f32_impl(const float* src, float* dst, int64_t n) {
-    vecunary::run_f32(vecunary::VOp::Sigmoid, {}, src, dst, 0, n);
+    sigmoid_silu_walk(src, dst, n, false);
 }
 void silu_f32_impl(const float* src, float* dst, int64_t n) {
-    vecunary::run_f32(vecunary::VOp::Silu, {}, src, dst, 0, n);
+    sigmoid_silu_walk(src, dst, n, true);
 }
 void sigmoid_f64_impl(const double* src, double* dst, int64_t n) {
-    vecunary::run_f64(vecunary::VOp::Sigmoid, {}, src, dst, 0, n);
+    sigmoid_silu_walk(src, dst, n, false);
 }
 void silu_f64_impl(const double* src, double* dst, int64_t n) {
-    vecunary::run_f64(vecunary::VOp::Silu, {}, src, dst, 0, n);
+    sigmoid_silu_walk(src, dst, n, true);
 }
 
 // The backward of a softmax over the last dim.  Every row answers
