@@ -170,6 +170,18 @@ class TestOps(unittest.TestCase):
         self.assertAlmostEqual(rm[0].item(), 0.2, places=5)
         self.assertAlmostEqual(rm[1].item(), 0.3, places=5)
 
+    def test_embedding_bag_backward_accumulates_repeated_indices(self):
+        weight = tp.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+        indices = tp.tensor([0, 1, 0], dtype=tp.int64)
+        offsets = tp.tensor([0, 3], dtype=tp.int64)
+        output, offset2bag, bag_size, max_indices = tp.ops.tp._embedding_bag(
+            weight, indices, offsets, False, 0, False, None, False, -1)
+        grad = tp.tensor([[1.0, 2.0]])
+        got = tp.ops.tp._embedding_bag_backward(
+            grad, indices, offsets, offset2bag, bag_size, max_indices,
+            3, False, 0, False, None)
+        self.assertEqual(got.tolist(), [[2.0, 4.0], [1.0, 2.0], [0.0, 0.0]])
+
 class TestOpPackets(unittest.TestCase):
     def test_inplace_packet_call_reaches_the_kernel(self):
         # Ops whose resolver is not exposed as a C function answer from
