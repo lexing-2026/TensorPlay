@@ -58,16 +58,16 @@ def test_int4_weight_only_cpu_matmul_matches_eager():
     assert tp.allclose(result, expected, atol=1e-6)
 
 
-def test_int8_weight_pack_matmul_refuses_on_cpu():
-    def fn(x, weight, scales):
-        return _weight_int8pack_mm(x, weight, scales)
+def test_int8_weight_pack_matmul_matches_dequantized_reference():
+    weight_codes = tp.tensor([[1.0, -2.0], [3.0, 4.0]])
+    weight = tp.quantize_per_tensor(weight_codes, 1.0, 0, tp.qint8)
+    x = tp.tensor([[1.0, 2.0], [3.0, 4.0]])
+    scales = tp.tensor([1.0, 2.0])
 
-    x = tp.randn(2, 8)
-    weight = tp.zeros((4, 8), dtype=tp.qint8)
-    scales = tp.randn(4)
-
-    with pytest.raises(NotImplementedError, match="Kernel not found"):
-        _compile_and_call(fn, x, weight, scales)
+    expected = tp.matmul(x, tp.dequantize(weight).transpose(0, 1)) * scales.unsqueeze(1)
+    result = _weight_int8pack_mm(x, weight, scales)
+    assert result.shape == (2, 2)
+    assert tp.allclose(result, expected)
 
 
 def test_dynamic_quant_matmul_4bit_refuses_on_cpu():
