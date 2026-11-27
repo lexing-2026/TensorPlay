@@ -276,7 +276,7 @@ class TestOps(unittest.TestCase):
             src, embed, 1, qkv_weight, qkv_bias, proj_weight, proj_bias,
             True, True, 1e-5, ones_e, zeros_e, ones_e, zeros_e,
             eye, zeros_e, eye, zeros_e, None, None)
-        norm = tp.layer_norm(src, [embed], ones_e, zeros_e, 1e-5, True)
+        norm = tp.layer_norm(src, [embed], ones_e, zeros_e, 1e-5)
         expected = src + tp.gelu(norm)
         self.assertEqual(tuple(out.shape), (1, 2, 2))
         self.assertTrue(tp.allclose(out, expected, atol=1e-5))
