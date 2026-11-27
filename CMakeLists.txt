@@ -1699,6 +1699,12 @@ if(MSVC)
         # archive is formed for them.
         target_link_libraries(_C PRIVATE p10_cuda)
     endif()
+    if(TARGET p10_cpu_isa)
+        # AVX2 tier copies live in their own object library so p10's archive
+        # stays under lib.exe's 4 GiB ceiling.  Linking the objects after
+        # p10 keeps the baseline inline definitions selected first.
+        target_link_libraries(_C PRIVATE p10_cpu_isa)
+    endif()
 endif()
 
 # target_compile_definitions(_C PRIVATE TP_STATIC_BUILD)
