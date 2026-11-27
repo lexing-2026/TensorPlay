@@ -190,6 +190,22 @@ class TestOps(unittest.TestCase):
             3, False, 0, False, None)
         self.assertEqual(got.tolist(), [[2.0, 4.0], [1.0, 2.0], [0.0, 0.0]])
 
+    def test_batch_norm_update_stats_lerps_running_stats(self):
+        x = tp.tensor([[1.0, 2.0], [3.0, 4.0]])
+        rm = tp.zeros((2,))
+        rv = tp.ones((2,))
+        out_mean, out_var = tp.ops.tp.batch_norm_update_stats(x, rm, rv, 0.1)
+        self.assertAlmostEqual(out_mean[0].item(), 0.2, places=5)
+        self.assertAlmostEqual(out_mean[1].item(), 0.3, places=5)
+        self.assertAlmostEqual(out_var[0].item(), 1.1, places=5)
+
+    def test_cholesky_solve_helper_matches_the_public_op(self):
+        b = tp.tensor([[2.0], [3.0]])
+        factor = tp.tensor([[2.0, 0.0], [1.0, 2.0]])
+        got = tp.ops.tp._cholesky_solve_helper(b, factor, False)
+        ref = tp.ops.tp.cholesky_solve(b, factor, False)
+        self.assertTrue(tp.allclose(got, ref))
+
 class TestOpPackets(unittest.TestCase):
     def test_inplace_packet_call_reaches_the_kernel(self):
         # Ops whose resolver is not exposed as a C function answer from

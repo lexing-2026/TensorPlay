@@ -634,6 +634,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, BatchLinearAlgebra) {
     m.impl("cholesky", cholesky_cpu);
     m.impl("cholesky_inverse", cholesky_inverse_cpu);
     m.impl("cholesky_solve", cholesky_solve_cpu);
+    m.impl("_cholesky_solve_helper", cholesky_solve_cpu);
     m.impl("triangular_solve", triangular_solve_cpu);
     m.impl("svd", svd_cpu);
 }
