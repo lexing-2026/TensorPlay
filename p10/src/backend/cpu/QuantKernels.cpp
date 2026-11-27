@@ -1,3 +1,4 @@
+#include "QuantNative.h"
 #include "QuantKernels.h"
 #include "QuantElementwise.h"
 #include "cpu/QuantizedElementwiseKernels.h"
