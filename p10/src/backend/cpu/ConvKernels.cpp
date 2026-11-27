@@ -270,13 +270,12 @@ void onednn_matmul_gemm(bool transA, bool transB, int64_t M, int64_t N, int64_t 
 
     dnnl::memory src_mem(entry->user_src, eng, const_cast<float*>(A));
     dnnl::memory wei_mem(entry->user_wei, eng, const_cast<float*>(B));
-    dnnl::memory dst_mem(entry->user_dst, eng, C);
 
     // Result buffer: the primitive computes dst = src * weights; the
-    // alpha/beta combination is applied afterwards.
+    // alpha/beta combination is applied afterwards.  The direct path below
+    // writes the user buffer, so the staging copy is only built for a caller
+    // that actually needs the mix.
     int64_t out_count = M * N;
-    std::vector<float> tmp(out_count, 0.0f);
-    dnnl::memory tmp_mem(entry->user_dst, eng, tmp.data());
 
     Storage src_tmp, wei_tmp;
     if (entry->reorder_src) {
@@ -291,6 +290,25 @@ void onednn_matmul_gemm(bool transA, bool transB, int64_t M, int64_t N, int64_t 
         dnnl::reorder(wei_mem, m).execute(s, wei_mem, m);
         wei_mem = m;
     }
+
+    // dst == C * 1.0 + 0.0 is the only shape the 1x1 projection asks for, and
+    // there the plain destination descriptor already matches the user buffer:
+    // writing C directly drops a full-size staging buffer and the copy back
+    // (two 1.6 MB streams per image at 128x56x56).
+    if (!entry->reorder_dst && alpha == 1.0f && beta == 0.0f) {
+        dnnl::memory direct_dst(entry->user_dst, eng, C);
+        entry->prim.execute(s, {
+            {DNNL_ARG_SRC, src_mem},
+            {DNNL_ARG_WEIGHTS, wei_mem},
+            {DNNL_ARG_DST, direct_dst},
+            {DNNL_ARG_SCRATCHPAD, sit->second},
+        });
+        s.wait();
+        return;
+    }
+
+    std::vector<float> tmp(out_count, 0.0f);
+    dnnl::memory tmp_mem(entry->user_dst, eng, tmp.data());
 
     entry->prim.execute(s, {
         {DNNL_ARG_SRC, src_mem},
