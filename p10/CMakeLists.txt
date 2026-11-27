@@ -879,6 +879,9 @@ function(tp_add_cpu_kernel_isa_tier TIER)
     endforeach()
 endfunction()
 function(tp_p10_append_isa_tier_sources)
+    if(MSVC)
+        return()
+    endif()
     get_property(_sources GLOBAL PROPERTY TP_P10_ISA_TIER_SOURCES)
     if(_sources)
         target_sources(p10 PRIVATE ${_sources})
@@ -937,13 +940,11 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
         # layout; only CPU_CAPABILITY differs per copy.
         target_compile_definitions(p10_kernel_default_${KERNEL_NAME} PRIVATE
             P10_EXPORTS CPU_CAPABILITY_DEFAULT CPU_CAPABILITY=DEFAULT)
-        if(NOT MSVC)
-            target_compile_definitions(p10_kernel_default_${KERNEL_NAME} PRIVATE
-                HAVE_AVX2_CPU_DEFINITION)
-        endif()
-        # MSVC omits the ISA tiers: its static archive is already near the
-        # COFF 4 GiB ceiling, and a tier that is not compiled must not declare
-        # a dispatch slot either.
+        target_compile_definitions(p10_kernel_default_${KERNEL_NAME} PRIVATE
+            HAVE_AVX2_CPU_DEFINITION)
+        # MSVC builds the AVX2 tier as a separate object library: its static
+        # archive is already near the COFF 4 GiB ceiling, so the tier objects
+        # cannot join p10. AVX512 stays off until that split is proven.
         if(TP_CXX_AVX512_FOUND AND NOT MSVC)
             target_compile_definitions(p10_kernel_default_${KERNEL_NAME} PRIVATE
                 HAVE_AVX512_CPU_DEFINITION)
@@ -964,9 +965,7 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
     endforeach()
     list(APPEND P10_SOURCES ${TP_CPU_KERNEL_DEFAULT_OBJS})
     # Linked after all baseline code; see Note [Linking ISA-tier kernel copies].
-    if(NOT MSVC)
-        tp_add_cpu_kernel_isa_tier(AVX2 ${TP_AVX2_TIER_FLAGS})
-    endif()
+    tp_add_cpu_kernel_isa_tier(AVX2 ${TP_AVX2_TIER_FLAGS})
     if(TP_CXX_AVX512_FOUND AND NOT MSVC)
         # Same flag set as the AVX512 capability entry.
         tp_add_cpu_kernel_isa_tier(AVX512 ${TP_AVX512_TIER_FLAGS})
@@ -1137,6 +1136,26 @@ else()
     endforeach()
 endif()
 add_library(p10 ${P10_SOURCES})
+
+if(MSVC)
+    # The AVX2 tier copies are compiled as a separate object library: p10's
+    # static archive is already near lib.exe's 4 GiB COFF ceiling, and adding
+    # one more copy of every tier TU to it pushes the archive over.  The
+    # objects are linked into _C after p10 instead, exactly like p10_cuda.
+    get_property(_tp_isa_sources GLOBAL PROPERTY TP_P10_ISA_TIER_SOURCES)
+    if(_tp_isa_sources)
+        add_library(p10_cpu_isa OBJECT ${_tp_isa_sources})
+        add_dependencies(p10_cpu_isa generate_code)
+        target_include_directories(p10_cpu_isa PRIVATE
+            "$<TARGET_PROPERTY:p10,INCLUDE_DIRECTORIES>")
+        target_compile_definitions(p10_cpu_isa PRIVATE
+            "$<TARGET_PROPERTY:p10,COMPILE_DEFINITIONS>")
+        target_compile_options(p10_cpu_isa PRIVATE
+            "$<TARGET_PROPERTY:p10,COMPILE_OPTIONS>")
+        set_target_properties(p10_cpu_isa PROPERTIES
+            POSITION_INDEPENDENT_CODE ON)
+    endif()
+endif()
 if(MSVC AND USE_CUDA)
     # The archiver builds one image out of everything it is handed, and the
     # CUDA backend no longer fits in the image the COFF format allows.  Compile
@@ -1157,6 +1176,9 @@ if(MSVC)
         set_property(TARGET p10 PROPERTY INTERPROCEDURAL_OPTIMIZATION ON)
         if(TARGET p10_cuda)
             set_property(TARGET p10_cuda PROPERTY INTERPROCEDURAL_OPTIMIZATION ON)
+        endif()
+        if(TARGET p10_cpu_isa)
+            set_property(TARGET p10_cpu_isa PROPERTY INTERPROCEDURAL_OPTIMIZATION ON)
         endif()
         foreach(KERNEL_SRC ${TP_CPU_KERNEL_SRCS})
             get_filename_component(KERNEL_NAME ${KERNEL_SRC} NAME_WE)
@@ -1213,9 +1235,7 @@ endif()
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
     # Tell DispatchStub (and every TU) that AVX2 kernel copies exist, so the
     # AVX2 dispatch slots are registered and selected at runtime.
-    if(NOT MSVC)
-        target_compile_definitions(p10 PUBLIC HAVE_AVX2_CPU_DEFINITION)
-    endif()
+    target_compile_definitions(p10 PUBLIC HAVE_AVX2_CPU_DEFINITION)
     if(TP_CXX_AVX512_FOUND AND NOT MSVC)
         target_compile_definitions(p10 PUBLIC HAVE_AVX512_CPU_DEFINITION)
     endif()
