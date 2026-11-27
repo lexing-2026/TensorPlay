@@ -5475,7 +5475,7 @@ def nll_loss(self, target, weight=None, reduction=_RED_MEAN, ignore_index=-100):
             f"weight tensor should be defined either for all {n_classes} classes or no classes "
             f"but got weight tensor of shape: {list(weight.shape)}"
         )
-    return _nll_forward(self, target, weight, reduction, ignore_index)
+    return _nll_forward(self, target, weight, reduction, ignore_index)[0]
 
 
 def _softmax_amax(x, dim):

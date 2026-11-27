@@ -820,6 +820,121 @@ Tensor nested_softmax_with_shape(const Tensor& scores, const Tensor& query) {
 
 } // namespace
 
+// ---------------------------------------------------------------------------
+// Jagged <-> padded dense conversion along the leading ragged axis.
+// ---------------------------------------------------------------------------
+
+Tensor jagged_to_padded_dense_forward_cpu(
+    const Tensor& values, const std::vector<Tensor>& offsets_list,
+    const std::vector<int64_t>& max_lengths, double padding_value) {
+    if (offsets_list.size() != 1 || max_lengths.size() != 1) {
+        TP_THROW(RuntimeError,
+                 "_jagged_to_padded_dense_forward(): only a single jagged "
+                 "dim is supported for now");
+    }
+    const Tensor& offsets = offsets_list[0];
+    if (offsets.dim() != 1 || offsets.dtype() != DType::Int64) {
+        TP_THROW(RuntimeError,
+                 "_jagged_to_padded_dense_forward(): expected 1-D Int64 "
+                 "offsets");
+    }
+    if (values.dim() < 1) {
+        TP_THROW(RuntimeError,
+                 "_jagged_to_padded_dense_forward(): expected values of rank "
+                 "at least 1");
+    }
+    const int64_t batch = offsets.size(0) - 1;
+    const int64_t max_length = max_lengths[0];
+    if (max_length < 0) {
+        TP_THROW(ValueError,
+                 "_jagged_to_padded_dense_forward(): max_length must be "
+                 "non-negative");
+    }
+    std::vector<int64_t> padded_shape{batch, max_length};
+    for (int64_t j = 1; j < values.dim(); ++j) {
+        padded_shape.push_back(values.size(j));
+    }
+    Tensor padded = Tensor::full(padded_shape, Scalar(padding_value),
+                                 values.dtype(), values.device());
+    const Tensor off = offsets.contiguous();
+    const int64_t* op = off.data_ptr<int64_t>();
+    for (int64_t i = 0; i < batch; ++i) {
+        const int64_t start = op[i];
+        const int64_t end = op[i + 1];
+        if (start < 0 || end < start || end > values.size(0)) {
+            TP_THROW(RuntimeError,
+                     "_jagged_to_padded_dense_forward(): offsets must be "
+                     "non-decreasing and within the values buffer");
+        }
+        const int64_t length = std::min(end - start, max_length);
+        if (length == 0) {
+            continue;
+        }
+        padded.select(0, i)
+            .narrow(0, 0, length)
+            .copy_(values.narrow(0, start, length));
+    }
+    return padded;
+}
+
+Tensor padded_dense_to_jagged_forward_cpu(
+    const Tensor& padded, const std::vector<Tensor>& offsets_list,
+    std::optional<int64_t> total_l) {
+    if (offsets_list.size() != 1) {
+        TP_THROW(RuntimeError,
+                 "_padded_dense_to_jagged_forward(): only a single jagged "
+                 "dim is supported for now");
+    }
+    const Tensor& offsets = offsets_list[0];
+    if (offsets.dim() != 1 || offsets.dtype() != DType::Int64) {
+        TP_THROW(RuntimeError,
+                 "_padded_dense_to_jagged_forward(): expected 1-D Int64 "
+                 "offsets");
+    }
+    if (padded.dim() < 2) {
+        TP_THROW(RuntimeError,
+                 "_padded_dense_to_jagged_forward(): expected a padded batch "
+                 "of rank at least 2");
+    }
+    const Tensor off = offsets.contiguous();
+    const int64_t batch = off.size(0) - 1;
+    const int64_t* op = off.data_ptr<int64_t>();
+    const int64_t final_offset = op[batch];
+    const int64_t total_length = total_l.value_or(final_offset);
+    if (total_l.has_value() && final_offset != total_length) {
+        TP_THROW(RuntimeError,
+                 "_padded_dense_to_jagged_forward(): final offset should "
+                 "match total_L value");
+    }
+    std::vector<int64_t> values_shape{total_length};
+    for (int64_t j = 2; j < padded.dim(); ++j) {
+        values_shape.push_back(padded.size(j));
+    }
+    Tensor values = Tensor::empty(values_shape, padded.dtype(),
+                                  padded.device());
+    for (int64_t i = 0; i < batch; ++i) {
+        const int64_t start = op[i];
+        const int64_t end = op[i + 1];
+        const int64_t length = end - start;
+        if (start < 0 || length < 0 || end > total_length) {
+            TP_THROW(RuntimeError,
+                     "_padded_dense_to_jagged_forward(): offsets must be "
+                     "non-decreasing and within total_L");
+        }
+        if (length > padded.size(1)) {
+            TP_THROW(RuntimeError,
+                     "_padded_dense_to_jagged_forward(): batch item length "
+                     "exceeds the padded max length");
+        }
+        if (length == 0) {
+            continue;
+        }
+        values.narrow(0, start, length)
+            .copy_(padded.select(0, i).narrow(0, 0, length));
+    }
+    return values;
+}
+
 TENSORPLAY_LIBRARY_IMPL(Composite, NestedTensorKernels) {
     m.impl("_nested_tensor_from_tensor_list", nested_from_tensor_list);
     m.impl("_nested_view_from_buffer", nested_view_from_buffer);
@@ -870,5 +985,9 @@ TENSORPLAY_LIBRARY_IMPL(Composite, NestedTensorKernels) {
     m.impl("_nested_tensor_softmax_with_shape", nested_softmax_with_shape);
 }
 
+TENSORPLAY_LIBRARY_IMPL(CPU, NestedTensorCPUKernels) {
+    m.impl("_jagged_to_padded_dense_forward", jagged_to_padded_dense_forward_cpu);
+    m.impl("_padded_dense_to_jagged_forward", padded_dense_to_jagged_forward_cpu);
+}
 } // namespace composite
 } // namespace tensorplay

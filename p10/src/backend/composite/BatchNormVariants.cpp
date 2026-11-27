@@ -71,6 +71,25 @@ std::tuple<Tensor, Tensor, Tensor> native_batch_norm_legit_no_training_native(
                                   false, momentum, eps);
 }
 
+std::tuple<Tensor, Tensor, Tensor> native_batch_norm_legit_native(
+        const Tensor& input, const std::optional<Tensor>& weight,
+        const std::optional<Tensor>& bias, Tensor& running_mean,
+        Tensor& running_var, bool training, double momentum, double eps) {
+    return ops::native_batch_norm(input, weight, bias, running_mean,
+                                  running_var, training, momentum, eps);
+}
+
+std::tuple<Tensor, Tensor> batch_norm_update_stats_native(
+        const Tensor& input, const std::optional<Tensor>& running_mean,
+        const std::optional<Tensor>& running_var, double momentum) {
+    // The training normalization already owns the running-statistics update,
+    // including the unbiased variance factor; its normalized output is unused
+    // here.  The caller's tensors are updated in place.
+    ops::native_batch_norm(input, std::nullopt, std::nullopt, running_mean,
+                           running_var, true, momentum, 1e-5);
+    return {running_mean.value_or(Tensor()), running_var.value_or(Tensor())};
+}
+
 } // namespace composite
 
 TENSORPLAY_LIBRARY_IMPL(Composite, BatchNormVariantComposite) {
@@ -79,6 +98,14 @@ TENSORPLAY_LIBRARY_IMPL(Composite, BatchNormVariantComposite) {
     m.impl("_batch_norm_no_update", composite::batch_norm_no_update_native);
     m.impl("_native_batch_norm_legit_no_training",
            composite::native_batch_norm_legit_no_training_native);
+    m.impl("batch_norm_update_stats", composite::batch_norm_update_stats_native);
+    m.impl("_native_batch_norm_legit", composite::native_batch_norm_legit_native);
 }
 
 } // namespace tensorplay
+
+
+TENSORPLAY_LIBRARY_IMPL(CPU, BatchNormUpdateStatsCPU) {
+    m.impl("batch_norm_update_stats",
+           tensorplay::composite::batch_norm_update_stats_native);
+}

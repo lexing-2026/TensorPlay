@@ -3,6 +3,7 @@
 #include "Tensor.h"
 #include "Dispatcher.h"
 #include "Exception.h"
+#include "tensorplay/ops/TPXOpsGenerated.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -20,6 +21,8 @@
 
 namespace tensorplay {
 namespace cpu {
+
+namespace ops = tensorplay::tpx::ops;
 
 DEFINE_DISPATCH(bag_forward_stub);
 DEFINE_DISPATCH(bag_dense_backward_stub);
@@ -401,6 +404,27 @@ Tensor _embedding_bag_per_sample_weights_backward_cpu(
 // The public spellings dispatch through the same forward as the internal one;
 // the no-padding form pins the sentinel the default argument carries, and the
 // padding form maps an absent index to the same sentinel.
+// Dispatcher entry point: per-sample weights use their dedicated reduction,
+// everything else goes to the dense scatter-add; `sparse` only changes the
+// layout of the returned gradient.
+Tensor _embedding_bag_backward_cpu(
+        const Tensor& grad, const Tensor& indices, const Tensor& offsets,
+        const Tensor& offset2bag, const Tensor& bag_size,
+        const Tensor& maximum_indices, int64_t num_weights,
+        bool scale_grad_by_freq, int64_t mode, bool sparse,
+        const std::optional<Tensor>& per_sample_weights, int64_t padding_idx) {
+    Tensor result;
+    if (per_sample_weights.has_value() && per_sample_weights->defined()) {
+        result = _embedding_bag_per_sample_weights_backward_cpu(
+            grad, *per_sample_weights, indices, offsets, offset2bag, mode, padding_idx);
+    } else {
+        result = _embedding_bag_dense_backward_cpu(
+            grad, indices, offset2bag, bag_size, maximum_indices, num_weights,
+            scale_grad_by_freq, mode, std::nullopt, padding_idx);
+    }
+    return sparse ? ops::to_sparse(result) : result;
+}
+
 std::tuple<Tensor, Tensor, Tensor, Tensor> embedding_bag_cpu(
         const Tensor& weight, const Tensor& indices, const Tensor& offsets,
         bool scale_grad_by_freq, int64_t mode, bool sparse,
@@ -423,6 +447,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, EmbeddingBagKernels) {
     m.impl("_embedding_bag", _embedding_bag_cpu);
     m.impl("_embedding_bag_forward_only", _embedding_bag_forward_only_cpu);
     m.impl("_embedding_bag_dense_backward", _embedding_bag_dense_backward_cpu);
+    m.impl("_embedding_bag_backward", _embedding_bag_backward_cpu);
     m.impl("_embedding_bag_per_sample_weights_backward",
            _embedding_bag_per_sample_weights_backward_cpu);
     m.impl("embedding_bag", embedding_bag_cpu);

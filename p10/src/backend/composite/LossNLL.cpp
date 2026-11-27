@@ -27,12 +27,12 @@ Tensor nll_loss_nd_native(const Tensor& self, const Tensor& target,
     }
 
     if (self.dim() == 1 || self.dim() == 2) {
-        return std::get<0>(ops::nll_loss(
-            self, target, weight, reduction, ignore_index));
+        return ops::nll_loss(
+            self, target, weight, reduction, ignore_index);
     }
     if (self.dim() == 4) {
-        return std::get<0>(ops::nll_loss2d(
-            self, target, weight, reduction, ignore_index));
+        return ops::nll_loss2d(
+            self, target, weight, reduction, ignore_index);
     }
 
     const int64_t n = self.size(0);
@@ -60,8 +60,8 @@ Tensor nll_loss_nd_native(const Tensor& self, const Tensor& target,
         target_view = target_view.view({n, 0, 0});
     }
 
-    Tensor result = std::get<0>(ops::nll_loss2d(
-        input_view, target_view, weight, reduction, ignore_index));
+    Tensor result = ops::nll_loss2d(
+        input_view, target_view, weight, reduction, ignore_index);
     if (reduction != 0) {
         return result;
     }

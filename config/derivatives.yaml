@@ -513,18 +513,18 @@
 - name: _safe_softmax(Tensor self, int dim, ScalarType? dtype=None) -> Tensor
   self: _softmax_backward_data(grad, result, dim, self.dtype())
 
-- name: nll_loss(Tensor self, Tensor target, Tensor? weight=None, int reduction=1, int ignore_index=-100) -> (Tensor output, Tensor total_weight)
-  self: nll_loss_backward(grad, self, target, weight, reduction, ignore_index, total_weight)
+- name: nll_loss(Tensor self, Tensor target, Tensor? weight=None, int reduction=1, int ignore_index=-100) -> Tensor
+  self: nll_loss_backward(grad, self, target, weight, reduction, ignore_index, std::get<1>(nll_loss_forward(self, target, weight, reduction, ignore_index)))
 
-- name: nll_loss2d(Tensor self, Tensor target, Tensor? weight=None, int reduction=1, int ignore_index=-100) -> (Tensor output, Tensor total_weight)
-  self: nll_loss2d_backward(grad, self, target, weight, reduction, ignore_index, total_weight)
+- name: nll_loss2d(Tensor self, Tensor target, Tensor? weight=None, int reduction=1, int ignore_index=-100) -> Tensor
+  self: nll_loss2d_backward(grad, self, target, weight, reduction, ignore_index, std::get<1>(nll_loss2d_forward(self, target, weight, reduction, ignore_index)))
 
 - name: nll_loss_backward(Tensor grad_output, Tensor self, Tensor target, Tensor? weight=None, int reduction=1, SymInt ignore_index=-100, Tensor? total_weight=None) -> Tensor
-  grad_output: std::get<0>(nll_loss(grad, target, weight, reduction, ignore_index))
+  grad_output: nll_loss(grad, target, weight, reduction, ignore_index)
   self: zeros_like(grad)
 
 - name: nll_loss2d_backward(Tensor grad_output, Tensor self, Tensor target, Tensor? weight=None, int reduction=1, SymInt ignore_index=-100, Tensor? total_weight=None) -> Tensor
-  grad_output: std::get<0>(nll_loss2d(grad, target, weight, reduction, ignore_index))
+  grad_output: nll_loss2d(grad, target, weight, reduction, ignore_index)
   self: zeros_like(grad)
 
 # its native backward (target is class indices, non-differentiable);

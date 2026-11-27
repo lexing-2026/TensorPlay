@@ -827,16 +827,13 @@ def nll_loss(input, target, weight=None, size_average=None, ignore_index=-100,
     reduction_enum = _nll_loss_red_enum(reduction)
 
     if input.dim() <= 2:
-        # nll_loss returns (output, total_weight)
-        output, _ = _C.nll_loss(input, target, weight, reduction_enum, ignore_index)
-        return output
+        return _C.nll_loss(input, target, weight, reduction_enum, ignore_index)
 
     if input.dim() == 4:
         # input with (N, H, W) target; autograd flows through
         # nll_loss2d_backward.
         t = target if target.dtype == DType.int64 else target.to(DType.int64)
-        output, _ = _C.nll_loss2d(input, t, weight, reduction_enum, ignore_index)
-        return output
+        return _C.nll_loss2d(input, t, weight, reduction_enum, ignore_index)
 
     # every spatial position acts as its own batch row, so move classes last,
     # flatten to (-1, C), run the 2-D kernel and restore the target shape.
@@ -851,7 +848,7 @@ def nll_loss(input, target, weight=None, size_average=None, ignore_index=-100,
     t = target.contiguous().reshape(-1)
     if t.dtype != DType.int64:
         t = t.to(DType.int64)
-    output, _ = _C.nll_loss(x, t, weight, reduction_enum, ignore_index)
+    output = _C.nll_loss(x, t, weight, reduction_enum, ignore_index)
     if reduction == 'none':
         output = output.reshape(target.size())
     return output
@@ -881,10 +878,9 @@ def cross_entropy(input, target, weight=None, size_average=None, ignore_index=-1
         red = 1 if reduction == 'mean' else (
             2 if reduction == 'sum' else (0 if reduction == 'none' else -1))
         if red >= 0:
-            output, _ = _C.nll_loss(
+            return _C.nll_loss(
                 _C.log_softmax(input, 1, tensorplay.undefined),
                 target, None, red, ignore_index)
-            return output
 
     class_dim = 0 if input.dim() == 1 else 1
     n_classes = input.size(class_dim)

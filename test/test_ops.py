@@ -1,3 +1,4 @@
+import math
 import unittest
 import tensorplay as tp
 
@@ -92,6 +93,193 @@ class TestOps(unittest.TestCase):
         self.assertEqual(len(chunks2), 3)
         self.assertEqual(chunks2[0].shape, tp.Size([4]))
 
+    def test_multinomial_replacement_uses_one_cdf_per_row(self):
+        # One-hot rows must sample the same index for every draw; this pins
+        # the CDF shape and the binary search, including the zero-mass row.
+        probs = tp.tensor([
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+        ])
+        samples = tp.multinomial(probs, 8, replacement=True)
+        self.assertEqual(tuple(samples.shape), (4, 8))
+        self.assertEqual(samples[0].tolist(), [1] * 8)
+        self.assertEqual(samples[2].tolist(), [0] * 8)
+        self.assertEqual(samples[3].tolist(), [0] * 8)
+
+    def test_cdist_backward_p2_gathers_pairs_by_matmul(self):
+        a = [[1.0, 2.0], [4.0, 6.0]]
+        b = [[0.0, 0.0], [3.0, 4.0]]
+        x1 = tp.tensor(a)
+        x2 = tp.tensor(b)
+        leaf = x1.clone().requires_grad_(True)
+        tp.cdist(leaf, x2, 2.0).sum().backward()
+        want = []
+        for i in range(2):
+            row = [0.0, 0.0]
+            for j in range(2):
+                diff = [a[i][k] - b[j][k] for k in range(2)]
+                dist = math.sqrt(sum(v * v for v in diff))
+                for k in range(2):
+                    row[k] += diff[k] / dist
+            want.append(row)
+        for got_row, want_row in zip(leaf.grad.tolist(), want):
+            for got, ref in zip(got_row, want_row):
+                self.assertAlmostEqual(got, ref, places=5)
+
+    def test_compute_linear_combination_cpu_kernel(self):
+        # The implementation lived in FunctionOfAMatrixUtils.cpp but was not
+        # in the CPU source list, so dispatch stopped at NotImplementedError.
+        x = tp.tensor([[1.0, 2.0], [3.0, 4.0]])
+        coeff = tp.tensor([[2.0, -1.0]])
+        got = tp.ops.tp._compute_linear_combination(x, coeff)
+        self.assertEqual(got.tolist(), [[-1.0, 0.0]])
+
+    def test_multinomial_seeded_rows_are_reproducible(self):
+        # Parallel row walks must not share generator state; the same seed
+        # has to answer the same draws.
+        probs = tp.tensor([
+            [0.2, 0.3, 0.5],
+            [0.5, 0.25, 0.25],
+            [0.1, 0.1, 0.8],
+        ])
+        tp.manual_seed(1234)
+        first = tp.multinomial(probs, 16, replacement=True).tolist()
+        tp.manual_seed(1234)
+        second = tp.multinomial(probs, 16, replacement=True).tolist()
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), 3)
+        self.assertTrue(all(0 <= v < 3 for row in first for v in row))
+
+    def test_internal_to_sparse_csr_matches_the_public_conversion(self):
+        d = tp.tensor([[1.0, 0.0, 2.0], [0.0, 0.0, 0.0], [3.0, 4.0, 5.0]])
+        s = tp.ops.tp._to_sparse_csr(d)
+        self.assertTrue(s.is_sparse_csr())
+        self.assertEqual(s.crow_indices().tolist(), [0, 2, 2, 5])
+        self.assertEqual(s.col_indices().tolist(), [0, 2, 0, 1, 2])
+        self.assertEqual(s.values().tolist(), [1.0, 2.0, 3.0, 4.0, 5.0])
+
+    def test_native_batch_norm_legit_updates_running_stats(self):
+        x = tp.tensor([[1.0, 2.0], [3.0, 4.0]])
+        rm = tp.zeros((2,))
+        rv = tp.ones((2,))
+        out, save_mean, save_invstd = tp.ops.tp._native_batch_norm_legit(
+            x, tp.ones((2,)), tp.zeros((2,)), rm, rv, True, 0.1, 1e-5)
+        self.assertEqual(tuple(out.shape), (2, 2))
+        self.assertAlmostEqual(rm[0].item(), 0.2, places=5)
+        self.assertAlmostEqual(rm[1].item(), 0.3, places=5)
+
+    def test_slow_conv_transpose3d_reaches_the_cpu_slot(self):
+        x = tp.ones((1, 1, 2, 2, 2))
+        w = tp.ones((1, 1, 2, 2, 2))
+        out = tp.ops.tp.slow_conv_transpose3d(
+            x, w, [2, 2, 2], None, [1, 1, 1], [0, 0, 0], [0, 0, 0], [1, 1, 1])
+        self.assertEqual(tuple(out.shape), (1, 1, 3, 3, 3))
+        self.assertAlmostEqual(out.sum().item(), 64.0, places=5)
+
+    def test_embedding_bag_backward_accumulates_repeated_indices(self):
+        weight = tp.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+        indices = tp.tensor([0, 1, 0], dtype=tp.int64)
+        offsets = tp.tensor([0, 3], dtype=tp.int64)
+        output, offset2bag, bag_size, max_indices = tp.ops.tp._embedding_bag(
+            weight, indices, offsets, False, 0, False, None, False, -1)
+        grad = tp.tensor([[1.0, 2.0]])
+        got = tp.ops.tp._embedding_bag_backward(
+            grad, indices, offsets, offset2bag, bag_size, max_indices,
+            3, False, 0, False, None)
+        self.assertEqual(got.tolist(), [[2.0, 4.0], [1.0, 2.0], [0.0, 0.0]])
+
+    def test_batch_norm_update_stats_lerps_running_stats(self):
+        x = tp.tensor([[1.0, 2.0], [3.0, 4.0]])
+        rm = tp.zeros((2,))
+        rv = tp.ones((2,))
+        out_mean, out_var = tp.ops.tp.batch_norm_update_stats(x, rm, rv, 0.1)
+        self.assertAlmostEqual(out_mean[0].item(), 0.2, places=5)
+        self.assertAlmostEqual(out_mean[1].item(), 0.3, places=5)
+        self.assertAlmostEqual(out_var[0].item(), 1.1, places=5)
+
+    def test_cholesky_solve_helper_matches_the_public_op(self):
+        b = tp.tensor([[2.0], [3.0]])
+        factor = tp.tensor([[2.0, 0.0], [1.0, 2.0]])
+        got = tp.ops.tp._cholesky_solve_helper(b, factor, False)
+        ref = tp.ops.tp.cholesky_solve(b, factor, False)
+        self.assertTrue(tp.allclose(got, ref))
+
+    def test_validate_compressed_sparse_indices_checks_csr_ranges(self):
+        crow = tp.tensor([0, 2, 2, 5], dtype=tp.int64)
+        col = tp.tensor([0, 2, 0, 1, 2], dtype=tp.int64)
+        tp.ops.tp._validate_compressed_sparse_indices(True, crow, col, 3, 3, 5)
+        with self.assertRaises(RuntimeError):
+            tp.ops.tp._validate_compressed_sparse_indices(
+                True, tp.tensor([0, 2, 2, 4], dtype=tp.int64), col, 3, 3, 5)
+        with self.assertRaises(RuntimeError):
+            tp.ops.tp._validate_compressed_sparse_indices(
+                True, crow, tp.tensor([0, 2, 0, 1, 9], dtype=tp.int64), 3, 3, 5)
+
+    def test_weight_int8pack_mm_dequantizes_weights_and_scales_rows(self):
+        x = tp.tensor([[1.0, 2.0], [3.0, 4.0]])
+        weight = tp.quantize_per_tensor(
+            tp.tensor([[1.0, -2.0], [3.0, 4.0]]), 1.0, 0, tp.qint8)
+        got = tp.ops.tp._weight_int8pack_mm(x, weight, tp.tensor([1.0, 2.0]))
+        self.assertEqual(tuple(got.shape), (2, 2))
+        self.assertEqual(got.dtype, tp.float32)
+        self.assertTrue(tp.allclose(got, tp.tensor([[-3.0, 22.0], [-5.0, 50.0]])))
+
+        with self.assertRaises(TypeError):
+            tp.ops.tp._weight_int8pack_mm(x, tp.tensor([1.0, 2.0]), tp.tensor([1.0, 2.0]))
+        with self.assertRaises(ValueError):
+            tp.ops.tp._weight_int8pack_mm(
+                x, weight, tp.tensor([1.0]))
+    def test_jagged_padded_dense_round_trip(self):
+        values = tp.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+        offsets = tp.tensor([0, 2, 3], dtype=tp.int64)
+
+        padded = tp.ops.tp._jagged_to_padded_dense_forward(
+            values, [offsets], [2], 0.0)
+        self.assertEqual(tuple(padded.shape), (2, 2, 2))
+        self.assertEqual(padded.tolist(), [
+            [[1.0, 2.0], [3.0, 4.0]],
+            [[5.0, 6.0], [0.0, 0.0]],
+        ])
+
+        dense = tp.tensor([[[1.0, 2.0]], [[5.0, 6.0]]])
+        restored = tp.ops.tp._padded_dense_to_jagged_forward(
+            dense, [tp.tensor([0, 1, 2], dtype=tp.int64)])
+        self.assertEqual(restored.tolist(), [[1.0, 2.0], [5.0, 6.0]])
+    def test_dyn_quant_4bit_pack_and_matmul(self):
+        # Two packed bytes, one output row, channelwise blocks of four.
+        weights = tp.tensor([[0x21, 0x43]], dtype=tp.uint8)
+        scales_zeros = tp.tensor([2.0])
+        bias = tp.tensor([3.0])
+        packed = tp.ops.tp._dyn_quant_pack_4bit_weight(
+            weights, scales_zeros, bias, 4, 4, 1)
+        self.assertEqual(tuple(packed.shape), (4,))
+        self.assertEqual(packed.tolist(), [33.0, 67.0, 2.0, 3.0])
+
+        x = tp.tensor([[1.0, 1.0, 1.0, 1.0]])
+        got = tp.ops.tp._dyn_quant_matmul_4bit(x, packed, 4, 4, 1)
+        self.assertEqual(tuple(got.shape), (1, 1))
+        self.assertTrue(tp.allclose(got, tp.tensor([[-41.0]])))
+    def test_transformer_encoder_layer_forward(self):
+        src = tp.tensor([[[1.0, 2.0], [3.0, 5.0]]])
+        embed = 2
+        zeros_e = tp.zeros(embed)
+        ones_e = tp.ones(embed)
+        qkv_weight = tp.zeros((3 * embed, embed))
+        qkv_bias = tp.zeros(3 * embed)
+        proj_weight = tp.zeros((embed, embed))
+        proj_bias = tp.zeros(embed)
+        eye = tp.tensor([[1.0, 0.0], [0.0, 1.0]])
+
+        out = tp.ops.tp._transformer_encoder_layer_fwd(
+            src, embed, 1, qkv_weight, qkv_bias, proj_weight, proj_bias,
+            True, True, 1e-5, ones_e, zeros_e, ones_e, zeros_e,
+            eye, zeros_e, eye, zeros_e, None, None)
+        norm = tp.layer_norm(src, [embed], ones_e, zeros_e, 1e-5)
+        expected = src + tp.gelu(norm)
+        self.assertEqual(tuple(out.shape), (1, 2, 2))
+        self.assertTrue(tp.allclose(out, expected, atol=1e-5))
 class TestOpPackets(unittest.TestCase):
     def test_inplace_packet_call_reaches_the_kernel(self):
         # Ops whose resolver is not exposed as a C function answer from
@@ -127,5 +315,13 @@ class TestOpPackets(unittest.TestCase):
             tp.ops.tp.fill_(tp.ones((2, 2)), object())
         self.assertIn("no overload of", str(raised.exception))
 
+    def test_nll_loss_returns_the_loss_tensor(self):
+        logits = tp.tensor([[0.0, -1.0], [-1.0, 0.0]])
+        target = tp.tensor([0, 1], dtype=tp.int64)
+        loss = tp.ops.tp.nll_loss(logits, target)
+        self.assertIsInstance(loss, tp.Tensor)
+        self.assertEqual(tuple(loss.shape), ())
+        self.assertAlmostEqual(loss.item(), 0.0, places=6)
+        self.assertIsInstance(tp.nll_loss(logits, target), tp.Tensor)
 if __name__ == '__main__':
     unittest.main()

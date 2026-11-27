@@ -2603,11 +2603,8 @@
     CPU: grid_sampler_3d_backward_cpu
     CUDA: grid_sampler_3d_backward_cuda
 
-- func: nll_loss(Tensor self, Tensor target, Tensor? weight=None, int reduction=1, SymInt ignore_index=-100) -> (Tensor output, Tensor total_weight)
+- func: nll_loss(Tensor self, Tensor target, Tensor? weight=None, int reduction=1, SymInt ignore_index=-100) -> Tensor
   variants: function
-  dispatch:
-    CPU: nll_loss_kernel
-    CUDA: nll_loss_cuda
 
 - func: nll_loss_backward(Tensor grad_output, Tensor self, Tensor target, Tensor? weight=None, int reduction=1, SymInt ignore_index=-100, Tensor? total_weight=None) -> Tensor
   variants: function
@@ -2616,11 +2613,8 @@
     CUDA: nll_loss_backward_cuda
 
 # (N, H, W) target; every spatial position is an independent batch row.
-- func: nll_loss2d(Tensor self, Tensor target, Tensor? weight=None, int reduction=1, SymInt ignore_index=-100) -> (Tensor output, Tensor total_weight)
+- func: nll_loss2d(Tensor self, Tensor target, Tensor? weight=None, int reduction=1, SymInt ignore_index=-100) -> Tensor
   variants: function
-  dispatch:
-    CPU: nll_loss2d_kernel
-    CUDA: nll_loss2d_cuda
 
 - func: nll_loss2d_backward(Tensor grad_output, Tensor self, Tensor target, Tensor? weight=None, int reduction=1, SymInt ignore_index=-100, Tensor? total_weight=None) -> Tensor
   variants: function
@@ -10261,6 +10255,9 @@
   variants: function
 - func: nll_loss_forward(Tensor self, Tensor target, Tensor? weight, int reduction, SymInt ignore_index) -> (Tensor output, Tensor total_weight)
   variants: function
+  dispatch:
+    CPU: nll_loss_kernel
+    CUDA: nll_loss_cuda
 - func: nll_loss_backward.grad_input(Tensor grad_output, Tensor self, Tensor target, Tensor? weight, int reduction, SymInt ignore_index, Tensor total_weight, *, Tensor(a!) grad_input) -> Tensor(a!)
   variants: function
 - func: nll_loss2d.out(Tensor self, Tensor target, Tensor? weight=None, int reduction=Mean, SymInt ignore_index=-100, *, Tensor(a!) out) -> Tensor(a!)
@@ -10269,6 +10266,9 @@
   variants: function
 - func: nll_loss2d_forward(Tensor self, Tensor target, Tensor? weight, int reduction, SymInt ignore_index) -> (Tensor output, Tensor total_weight)
   variants: function
+  dispatch:
+    CPU: nll_loss2d_kernel
+    CUDA: nll_loss2d_cuda
 - func: nll_loss2d_backward.grad_input(Tensor grad_output, Tensor self, Tensor target, Tensor? weight, int reduction, SymInt ignore_index, Tensor total_weight, *, Tensor(a!) grad_input) -> Tensor(a!)
   variants: function
 - func: smooth_l1_loss.out(Tensor self, Tensor target, int reduction=Mean, float beta=1.0, *, Tensor(a!) out) -> Tensor(a!)
