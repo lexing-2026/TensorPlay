@@ -226,9 +226,9 @@ class TestOps(unittest.TestCase):
         self.assertEqual(got.dtype, tp.float32)
         self.assertTrue(tp.allclose(got, tp.tensor([[-3.0, 22.0], [-5.0, 50.0]])))
 
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(TypeError):
             tp.ops.tp._weight_int8pack_mm(x, tp.tensor([1.0, 2.0]), tp.tensor([1.0, 2.0]))
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(TypeError):
             tp.ops.tp._weight_int8pack_mm(
                 x, weight, tp.tensor([1.0]))
 class TestOpPackets(unittest.TestCase):
