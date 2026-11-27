@@ -206,6 +206,17 @@ class TestOps(unittest.TestCase):
         ref = tp.ops.tp.cholesky_solve(b, factor, False)
         self.assertTrue(tp.allclose(got, ref))
 
+    def test_validate_compressed_sparse_indices_checks_csr_ranges(self):
+        crow = tp.tensor([0, 2, 2, 5], dtype=tp.int64)
+        col = tp.tensor([0, 2, 0, 1, 2], dtype=tp.int64)
+        tp.ops.tp._validate_compressed_sparse_indices(True, crow, col, 3, 3, 5)
+        with self.assertRaises(RuntimeError):
+            tp.ops.tp._validate_compressed_sparse_indices(
+                True, tp.tensor([0, 2, 2, 4], dtype=tp.int64), col, 3, 3, 5)
+        with self.assertRaises(RuntimeError):
+            tp.ops.tp._validate_compressed_sparse_indices(
+                True, crow, tp.tensor([0, 2, 0, 1, 9], dtype=tp.int64), 3, 3, 5)
+
 class TestOpPackets(unittest.TestCase):
     def test_inplace_packet_call_reaches_the_kernel(self):
         # Ops whose resolver is not exposed as a C function answer from
