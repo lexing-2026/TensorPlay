@@ -142,7 +142,19 @@ inline void vec_run(vecunary::VOp op, const vecunary::VParams& prm,
 // on every worker: compute-bound transcendental walks at 100k elements lose
 // ~1.5x when the grain lets only two thirds of the pool join, and a 2048-wide
 // chunk still amortizes the handoff by three orders of magnitude.
+#ifdef _MSC_VER
+// On MSVC the region is a vcomp fork-join (the build has -openmp and no
+// per-function ISA attributes to route around it), measured at ~3 us per call
+// against ~1 us for the native pool's spinning handoff.  That moves the
+// crossover up: a 4K-element exp walk (0.3 us a thousand) is faster on the
+// calling thread than split two ways, and 4K-element abs/neg/relu/square walks
+// are a few hundred ns of work altogether, so those keep the global grain.
+constexpr int64_t kUnaryGrain = 4096;
+constexpr int64_t kFlatUnaryGrain = 32768;
+#else
 constexpr int64_t kUnaryGrain = 2048;
+constexpr int64_t kFlatUnaryGrain = 2048;
+#endif
 
 // Elementwise compute is storage-order agnostic, so a channels-last input is
 // processed in its own physical order and the result keeps that layout
@@ -359,6 +371,30 @@ Tensor unary_op_kernel(const Tensor& self, Func func,
             || (dt == DType::Float16 && vecunary::f16c_available())
             || dt == DType::BFloat16);
     const bool contiguous_path = flat_layout_pair(self, result);
+
+#if defined(_M_X64)
+    // MSVC: the vector bodies of VecUnary.h carry GCC target attributes, so
+    // vec_ready() is false here and the walk below is the scalar lambda, one
+    // element at a time (abs over 4K elements measured 3.5 us against 0.3 us
+    // for the vector walk).  A contiguous Float32 map whose tier body exists
+    // in UnaryVecKernelsImpl.cpp takes that stub; the rest keeps the walk.
+    if (vec_op != vecunary::VOp::None && contiguous_path &&
+        dt == DType::Float32 &&
+        (vec_op == vecunary::VOp::Abs || vec_op == vecunary::VOp::Neg ||
+         vec_op == vecunary::VOp::Square || vec_op == vecunary::VOp::Relu)) {
+        const float* src = self.data_ptr<float>();
+        float* dst = result.data_ptr<float>();
+        const int uop = static_cast<int>(vec_op);
+        const int udt = static_cast<int>(DType::Float32);
+        parallel_for(0, n, kFlatUnaryGrain, [&](int64_t begin, int64_t end) {
+            if (!unary_vec_stub(DeviceType::CPU, src, dst, begin, end, uop,
+                                vec_prm.p0, vec_prm.p1, vec_prm.p2, udt)) {
+                for (int64_t i = begin; i < end; ++i) dst[i] = func(src[i]);
+            }
+        });
+        return result;
+    }
+#endif
 
     #define OP_CASE(ctype, name) \
     case DType::name: { \
@@ -2964,7 +3000,9 @@ Tensor clamp_write(const Tensor& self, const std::optional<Scalar>& min,
 #if defined(_M_X64)
     // The bounded pair is a tier chunk walk: vec::clamp is the same
     // min(max(lo, v), hi) the GCC clamp_f32_avx* bodies spell out, and a NaN
-    // lane keeps its NaN through both compares.
+    // lane keeps its NaN through both compares.  It beats the local AVX2 strip
+    // (8 lanes) because the tier body runs 16 lanes at a time and a 1M clamp
+    // is L3-resident, so lanes -- not bytes -- decide the time.
     if (n > 0 &&
         (self.dtype() == DType::Float32 || self.dtype() == DType::Float64)) {
         const double lo = min.has_value()

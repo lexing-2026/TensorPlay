@@ -90,10 +90,99 @@ void transpose_copy_tiled(T* dst, const T* src, int64_t rows, int64_t cols) {
 // one side scalar and cache-line scattered, so the tile is transposed inside
 // registers/L1 first and both global directions then move whole 16-element
 // runs.
+#if defined(_M_X64)
+// An 8x8 block of floats turned a quarter turn.  The eight loads walk the
+// source columns (each one a run of eight along the source row direction), the
+// unpack/shuffle ladder interleaves them, and the two 128-bit halves are put
+// back together with a permute so that every store is a packed run of the
+// destination row.
+inline void transpose_tile8_f32(float* d, int64_t dstride, const float* s,
+                                int64_t sstride) {
+    const __m256 r0 = _mm256_loadu_ps(s + 0 * sstride);
+    const __m256 r1 = _mm256_loadu_ps(s + 1 * sstride);
+    const __m256 r2 = _mm256_loadu_ps(s + 2 * sstride);
+    const __m256 r3 = _mm256_loadu_ps(s + 3 * sstride);
+    const __m256 r4 = _mm256_loadu_ps(s + 4 * sstride);
+    const __m256 r5 = _mm256_loadu_ps(s + 5 * sstride);
+    const __m256 r6 = _mm256_loadu_ps(s + 6 * sstride);
+    const __m256 r7 = _mm256_loadu_ps(s + 7 * sstride);
+
+    const __m256 t0 = _mm256_unpacklo_ps(r0, r1);
+    const __m256 t1 = _mm256_unpackhi_ps(r0, r1);
+    const __m256 t2 = _mm256_unpacklo_ps(r2, r3);
+    const __m256 t3 = _mm256_unpackhi_ps(r2, r3);
+    const __m256 t4 = _mm256_unpacklo_ps(r4, r5);
+    const __m256 t5 = _mm256_unpackhi_ps(r4, r5);
+    const __m256 t6 = _mm256_unpacklo_ps(r6, r7);
+    const __m256 t7 = _mm256_unpackhi_ps(r6, r7);
+
+    const __m256 u0 = _mm256_shuffle_ps(t0, t2, _MM_SHUFFLE(1, 0, 1, 0));
+    const __m256 u1 = _mm256_shuffle_ps(t0, t2, _MM_SHUFFLE(3, 2, 3, 2));
+    const __m256 u2 = _mm256_shuffle_ps(t1, t3, _MM_SHUFFLE(1, 0, 1, 0));
+    const __m256 u3 = _mm256_shuffle_ps(t1, t3, _MM_SHUFFLE(3, 2, 3, 2));
+    const __m256 u4 = _mm256_shuffle_ps(t4, t6, _MM_SHUFFLE(1, 0, 1, 0));
+    const __m256 u5 = _mm256_shuffle_ps(t4, t6, _MM_SHUFFLE(3, 2, 3, 2));
+    const __m256 u6 = _mm256_shuffle_ps(t5, t7, _MM_SHUFFLE(1, 0, 1, 0));
+    const __m256 u7 = _mm256_shuffle_ps(t5, t7, _MM_SHUFFLE(3, 2, 3, 2));
+
+    _mm256_storeu_ps(d + 0 * dstride, _mm256_permute2f128_ps(u0, u4, 0x20));
+    _mm256_storeu_ps(d + 1 * dstride, _mm256_permute2f128_ps(u1, u5, 0x20));
+    _mm256_storeu_ps(d + 2 * dstride, _mm256_permute2f128_ps(u2, u6, 0x20));
+    _mm256_storeu_ps(d + 3 * dstride, _mm256_permute2f128_ps(u3, u7, 0x20));
+    _mm256_storeu_ps(d + 4 * dstride, _mm256_permute2f128_ps(u0, u4, 0x31));
+    _mm256_storeu_ps(d + 5 * dstride, _mm256_permute2f128_ps(u1, u5, 0x31));
+    _mm256_storeu_ps(d + 6 * dstride, _mm256_permute2f128_ps(u2, u6, 0x31));
+    _mm256_storeu_ps(d + 7 * dstride, _mm256_permute2f128_ps(u3, u7, 0x31));
+}
+#endif
+
 template <typename T>
 void transpose_blocked_lda(T* dst, const T* src, int64_t rows, int64_t cols,
                            int64_t lda) {
     constexpr int64_t block = 16;
+#if defined(_M_X64)
+    // Eight bytes of a float tile are one AVX2 register, so an 8x8 block of
+    // f32 moves through registers: eight strided loads in, eight packed
+    // stores out, and the transpose itself is unpack/shuffle/permute lane
+    // work instead of eight scalar copies per column.  The portable body
+    // below stays for every other width and for the partial tiles on the
+    // right and bottom edges.
+    if (sizeof(T) == 4) {
+        const int64_t tile_rows = (rows + block - 1) / block;
+        const int64_t tile_cols = (cols + block - 1) / block;
+        parallel::parallel_for(0, tile_rows * tile_cols, 1,
+            [=](int64_t begin, int64_t end) {
+                alignas(64) T tile[block * block];
+                for (int64_t tile_id = begin; tile_id < end; ++tile_id) {
+                    const int64_t row0 = (tile_id / tile_cols) * block;
+                    const int64_t col0 = (tile_id % tile_cols) * block;
+                    const int64_t nr = std::min(block, rows - row0);
+                    const int64_t nc = std::min(block, cols - col0);
+                    if (nr == block && nc == block) {
+                        const float* s = reinterpret_cast<const float*>(src);
+                        float* d = reinterpret_cast<float*>(dst);
+                        for (int64_t sub = 0; sub < 4; ++sub) {
+                            const int64_t r = row0 + (sub / 2) * 8;
+                            const int64_t c = col0 + (sub % 2) * 8;
+                            transpose_tile8_f32(d + r * cols + c, cols,
+                                                s + c * lda + r, lda);
+                        }
+                        continue;
+                    }
+                    for (int64_t c = 0; c < nc; ++c) {
+                        std::memcpy(tile + c * block, src + (col0 + c) * lda + row0,
+                                    static_cast<size_t>(nr) * sizeof(T));
+                    }
+                    for (int64_t r = 0; r < nr; ++r) {
+                        const T* t = tile + r;
+                        T* d = dst + (row0 + r) * cols + col0;
+                        for (int64_t c = 0; c < nc; ++c) d[c] = t[c * block];
+                    }
+                }
+            });
+        return;
+    }
+#endif
     const int64_t tile_rows = (rows + block - 1) / block;
     const int64_t tile_cols = (cols + block - 1) / block;
     parallel::parallel_for(0, tile_rows * tile_cols, 1,
@@ -104,17 +193,19 @@ void transpose_blocked_lda(T* dst, const T* src, int64_t rows, int64_t cols,
                 const int64_t col0 = (tile_id % tile_cols) * block;
                 const int64_t nr = std::min(block, rows - row0);
                 const int64_t nc = std::min(block, cols - col0);
-                // tile[r][c] is filled from contiguous source runs (one column
-                // at a time) and then written back as contiguous destination
-                // runs, so no global access is scattered.
+                // tile[c][r] is one contiguous source run per column, so the
+                // fill is a run of copies and only the write-back walks the
+                // tile by rows.  Copying whole runs instead of elements pays
+                // off because the source stride between columns is the one
+                // direction around a 2 KB row, not the run itself.
                 for (int64_t c = 0; c < nc; ++c) {
-                    const T* s = src + (col0 + c) * lda + row0;
-                    for (int64_t r = 0; r < nr; ++r) tile[r * block + c] = s[r];
+                    std::memcpy(tile + c * block, src + (col0 + c) * lda + row0,
+                                static_cast<size_t>(nr) * sizeof(T));
                 }
                 for (int64_t r = 0; r < nr; ++r) {
-                    std::memcpy(dst + (row0 + r) * cols + col0,
-                                tile + r * block,
-                                static_cast<size_t>(nc) * sizeof(T));
+                    const T* t = tile + r;
+                    T* d = dst + (row0 + r) * cols + col0;
+                    for (int64_t c = 0; c < nc; ++c) d[c] = t[c * block];
                 }
             }
         });

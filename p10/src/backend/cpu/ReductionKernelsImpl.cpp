@@ -4534,8 +4534,12 @@ static bool try_extremum_integral_dim_avx512(
 }
 
 }  // namespace
+#endif  // __x86_64__
 
 // Full-tensor contiguous sum; returns false -> caller uses the iterator path.
+// The body is written against the tier's Vectorized<T> and the portable
+// parallel_for, so it is compiled on MSVC as well; the x86 guard above only
+// exists for the per-function target attributes the rest of that section needs.
 static bool try_sum_real(const void* xv, int64_t n, DType dt, double* out) {
     if (n < 4096) return false;
     constexpr int64_t kGrain = 32768;
@@ -4571,6 +4575,7 @@ static bool try_sum_real(const void* xv, int64_t n, DType dt, double* out) {
     return false;
 }
 
+#if defined(__x86_64__)
 __attribute__((target("avx512f")))
 float max_f32_chunk_avx512(const float* x, int64_t b, int64_t e,
                            bool* has_nan) {
@@ -4932,9 +4937,9 @@ Tensor sum_kernel_impl(const Tensor& self, DType dtype) {
         input = self.to(out_dtype);
     }
 
-    // try_sum_real is defined in the x86 section above; the other
-    // architectures reach the iterator below.
-#if defined(__x86_64__)
+    // try_sum_real is defined above for every tier TU; the iterator below is
+    // the fallback for the non-contiguous and non-real cases.
+#if defined(__x86_64__) || defined(_M_X64)
     if ((acc_dtype == DType::Float32 || acc_dtype == DType::Float64) &&
         input.dtype() == acc_dtype && input.is_contiguous() &&
         input.numel() > 0) {
@@ -9061,6 +9066,50 @@ T extrema_all_vec(const T* data, int64_t n) {
     }
     return best;
 }
+
+// Extremum over the last dimension of a contiguous tensor with the index
+// kept alongside the value.  The GCC build answers this from
+// try_extremum_lastdim_real, whose body has per-function target attributes
+// MSVC cannot spell, so the MSVC build fell through to the scalar line walk
+// in the dtype switch (one compare and one branch per element).  The index
+// travels with the value at the tier's vector width (vec::row_extremum), so
+// a row resolves in one vector pass; a NaN reports its first position and
+// equal candidates keep the earliest one, as the scalar walk does.
+template <bool IsMax>
+static bool try_lastdim_extremum_vec(const Tensor& input, Tensor& values,
+                                     int64_t* indices, int64_t outer,
+                                     int64_t d_size) {
+    if (outer <= 0 || d_size < 32 || !input.is_contiguous()) return false;
+    const int64_t row_grain = std::max<int64_t>(
+        1, GRAIN_SIZE / std::max<int64_t>(d_size, 1));
+    if (input.dtype() == DType::Float32) {
+        const float* in = input.data_ptr<float>();
+        float* out = values.data_ptr<float>();
+        parallel_for(0, outer, row_grain, [&](int64_t begin, int64_t end) {
+            for (int64_t row = begin; row < end; ++row) {
+                const auto found = vec::row_extremum<IsMax>(
+                    in + row * d_size, d_size);
+                out[row] = found.first;
+                indices[row] = found.second;
+            }
+        });
+        return true;
+    }
+    if (input.dtype() == DType::Float64) {
+        const double* in = input.data_ptr<double>();
+        double* out = values.data_ptr<double>();
+        parallel_for(0, outer, row_grain, [&](int64_t begin, int64_t end) {
+            for (int64_t row = begin; row < end; ++row) {
+                const auto found = vec::row_extremum<IsMax>(
+                    in + row * d_size, d_size);
+                out[row] = found.first;
+                indices[row] = found.second;
+            }
+        });
+        return true;
+    }
+    return false;
+}
 #endif
 
 Tensor max_kernel_impl(const Tensor& self) {
@@ -9194,6 +9243,12 @@ std::tuple<Tensor, Tensor> max_dim_kernel_impl(const Tensor& self, int64_t dim0,
     }
     if (try_extremum_reduced_columns<true>(
             sc, vals, idxs.data_ptr<int64_t>(), outer, d_size, inner)) {
+        return {vals, idxs};
+    }
+#endif
+#if defined(_M_X64)
+    if (inner == 1 && try_lastdim_extremum_vec<true>(
+            sc, vals, idxs.data_ptr<int64_t>(), outer, d_size)) {
         return {vals, idxs};
     }
 #endif
@@ -9439,6 +9494,12 @@ std::tuple<Tensor, Tensor> min_dim_kernel_impl(const Tensor& self, int64_t dim0,
     }
     if (try_extremum_reduced_columns<false>(
             sc, vals, idxs.data_ptr<int64_t>(), outer, d_size, inner)) {
+        return {vals, idxs};
+    }
+#endif
+#if defined(_M_X64)
+    if (inner == 1 && try_lastdim_extremum_vec<false>(
+            sc, vals, idxs.data_ptr<int64_t>(), outer, d_size)) {
         return {vals, idxs};
     }
 #endif
@@ -10681,7 +10742,7 @@ Tensor argmax_kernel_impl(const Tensor& self, std::optional<int64_t> dim, bool k
     std::vector<int64_t> out_shape = compute_reduction_shape(self, {d}, keepdim);
     Tensor out = Tensor::empty(out_shape, DType::Int64, self.device());
     int64_t* out_data = out.data_ptr<int64_t>();
-#if defined(__x86_64__)
+#if defined(__x86_64__) || defined(_M_X64)
     if (inner == 1 && try_argmax_lastdim_real<true>(
             sc.data_ptr(), out_data, outer, d_size, sc.dtype())) {
         return out;
@@ -10827,7 +10888,7 @@ Tensor argmin_kernel_impl(const Tensor& self, std::optional<int64_t> dim, bool k
     std::vector<int64_t> out_shape = compute_reduction_shape(self, {d}, keepdim);
     Tensor out = Tensor::empty(out_shape, DType::Int64, self.device());
     int64_t* out_data = out.data_ptr<int64_t>();
-#if defined(__x86_64__)
+#if defined(__x86_64__) || defined(_M_X64)
     if (inner == 1 && try_argmax_lastdim_real<false>(
             sc.data_ptr(), out_data, outer, d_size, sc.dtype())) {
         return out;

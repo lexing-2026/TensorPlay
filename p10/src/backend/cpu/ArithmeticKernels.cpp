@@ -1999,6 +1999,52 @@ bool try_add_tensor_iterator_out(const Tensor& self, const Tensor& other,
     return true;
 }
 
+#if defined(_M_X64)
+// Same-shape, same-dtype, both-contiguous real operands: one unit-stride pass
+// through the tier-compiled walk in ScalarArithVecKernelsImpl.cpp.  The GCC
+// build answers this shape from the AVX2/AVX512 blocks inside each kernel
+// below, which carry per-function target attributes; MSVC cannot compile those
+// blocks, and the generic iterator a kernel otherwise lands on costs about
+// 4 us to build -- more than the whole pass over 4K elements.  Returns false
+// (and leaves `out` untouched) when the pair is not the flat one, so the
+// caller keeps its broadcast / promotion / layout handling.
+enum : int { kFlatAdd = 0, kFlatSub = 1, kFlatMul = 2, kFlatDiv = 3 };
+
+static bool flat_binary_pair(const Tensor& self, const Tensor& other,
+                             int code, Tensor& out) {
+    const DType dt = self.dtype();
+    if (dt != DType::Float32 && dt != DType::Float64) return false;
+    if (other.dtype() != dt || !(self.shape() == other.shape())) return false;
+    if (!self.is_contiguous() || !other.is_contiguous()) return false;
+#ifdef USE_ONEDNN
+    if (self.unsafeGetTensorImpl()->has_onednn_md() ||
+        other.unsafeGetTensorImpl()->has_onednn_md()) return false;
+#endif
+    const int64_t n = self.numel();
+    out = Tensor::empty(static_cast<std::vector<int64_t>>(self.shape()), dt,
+                        self.device());
+    const int udt = static_cast<int>(dt);
+    if (dt == DType::Float32) {
+        const float* a = self.data_ptr<float>();
+        const float* b = other.data_ptr<float>();
+        float* y = out.data_ptr<float>();
+        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+            binary_vec_stub(DeviceType::CPU, a + begin, b + begin, y + begin,
+                            end - begin, code, udt);
+        });
+    } else {
+        const double* a = self.data_ptr<double>();
+        const double* b = other.data_ptr<double>();
+        double* y = out.data_ptr<double>();
+        parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+            binary_vec_stub(DeviceType::CPU, a + begin, b + begin, y + begin,
+                            end - begin, code, udt);
+        });
+    }
+    return true;
+}
+#endif
+
 Tensor add_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha) {
 #if defined(__x86_64__)
     bool plain_layout = true;
@@ -2362,6 +2408,23 @@ Tensor add_kernel(const Tensor& self, const Tensor& other, const Scalar& alpha) 
                  });
             }
             #elif defined(__AVX2__)
+            #if defined(_M_X64)
+            // MSVC: this TU is /arch:AVX2, so the 8-wide loop below is what the
+            // compiler can inline; on an AVX-512 host the tier-compiled stub
+            // runs the same sum at full width.  Plain + and - only -- the alpha
+            // forms keep the loop.
+            if (self_contig.is_contiguous() && other_contig.is_contiguous() &&
+                result_contig.is_contiguous() &&
+                (std::abs(alpha_val - 1.0f) < 1e-6 ||
+                 std::abs(alpha_val + 1.0f) < 1e-6)) {
+                const int code = std::abs(alpha_val - 1.0f) < 1e-6 ? kFlatAdd : kFlatSub;
+                const int udt = static_cast<int>(DType::Float32);
+                parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                    binary_vec_stub(DeviceType::CPU, s_ptr + begin, o_ptr + begin,
+                                    r_ptr + begin, end - begin, code, udt);
+                });
+            } else
+            #endif
             if (std::abs(alpha_val - 1.0f) < 1e-6) {
                  parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
                  for (int64_t i = begin; i < end; i += 8) {
@@ -2922,6 +2985,12 @@ Tensor mul_kernel(const Tensor& self, const Tensor& other) {
         vsMul(n, a, b, y);
         #endif
     };
+#if defined(_M_X64)
+    {
+        Tensor flat;
+        if (flat_binary_pair(self, other, kFlatMul, flat)) return flat;
+    }
+#endif
     return binary_op_kernel_impl(self, other, op, mkl_op, true, false, BIN_MUL);
 }
 
@@ -3150,6 +3219,12 @@ Tensor div_kernel(const Tensor& self, const Tensor& other) {
         vsDiv(n, a, b, y);
         #endif
     };
+#if defined(_M_X64)
+    {
+        Tensor flat;
+        if (flat_binary_pair(self, other, kFlatDiv, flat)) return flat;
+    }
+#endif
     return binary_op_kernel_impl(self, other, op, mkl_op, true, true, BIN_DIV);
 }
 
@@ -3910,6 +3985,7 @@ Tensor& div_inplace_kernel(Tensor& self, const Tensor& other) {
 
 
 DEFINE_DISPATCH(scalar_vec_stub);
+DEFINE_DISPATCH(binary_vec_stub);
 
 #if defined(_M_X64)
 namespace {

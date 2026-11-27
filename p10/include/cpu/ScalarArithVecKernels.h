@@ -29,5 +29,17 @@ using scalar_vec_fn = void (*)(const void* a, void* y, int64_t n,
 
 DECLARE_DISPATCH(scalar_vec_fn, scalar_vec_stub)
 
+// Same-shape, same-dtype, both-contiguous tensor OP tensor for the real
+// arithmetic kernels (mul.Tensor, div.Tensor and the sum/difference forms).
+// `a`, `b` and `y` are the three flat buffers, `n` the element count, `code`
+// 0 add, 1 sub, 2 mul, 3 div, and `dtype` the common DType enumerator cast to
+// int (Float32 or Float64 only).  The caller has already checked shapes,
+// dtypes and contiguity, so the walk is one unit-stride pass; a case that does
+// not meet those conditions stays on the generic iterator path.
+using binary_vec_fn = void (*)(const void* a, const void* b, void* y,
+                               int64_t n, int code, int dtype);
+
+DECLARE_DISPATCH(binary_vec_fn, binary_vec_stub)
+
 } // namespace cpu
 } // namespace tensorplay

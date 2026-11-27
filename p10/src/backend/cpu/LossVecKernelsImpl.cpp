@@ -1308,7 +1308,7 @@ template <typename T>
 double nll_weight_total_typed(const int64_t* target, const T* weight,
                               int64_t rows, int64_t ignore_index,
                               bool has_weight) {
-    return parallel_ranges(rows, 1, [&](int64_t begin, int64_t end) -> double {
+    return parallel_ranges(rows, 256, [&](int64_t begin, int64_t end) -> double {
         double total = 0.0;
         for (int64_t r = begin; r < end; ++r) {
             if (target[r] != ignore_index) {
@@ -1328,26 +1328,14 @@ std::tuple<double, double> nll_rows_typed(const T* input,
                                           int64_t ignore_index,
                                           bool has_weight) {
     const double loss = parallel_ranges(
-        rows, 1, [&](int64_t begin, int64_t end) -> double {
+        rows, 512, [&](int64_t begin, int64_t end) -> double {
             double total = 0.0;
-            // Each row answers one element from its own 2 KB class strip, so
-            // the walk is a chain of cold cache lines and TLB entries.  Ask
-            // for the row a few steps ahead while the current one is in flight.
-            constexpr int64_t kPrefetchAhead = 8;
+            // One element per row, and the rows are 2 KB apart, so the walk is
+            // a chain of cold lines.  ATen's NLL loop does exactly this with no
+            // software prefetch: the out-of-order window already keeps several
+            // rows in flight, and a T0 hint 16 rows ahead only evicts the line
+            // before it is wanted.
             for (int64_t r = begin; r < end; ++r) {
-                const int64_t ahead = r + kPrefetchAhead;
-                if (ahead < end) {
-                    const int64_t at = target[ahead];
-                    if (at != ignore_index) {
-#if defined(_MSC_VER)
-                        _mm_prefetch(reinterpret_cast<const char*>(
-                                         input + ahead * cols + at),
-                                     _MM_HINT_T0);
-#else
-                        __builtin_prefetch(input + ahead * cols + at, 0, 1);
-#endif
-                    }
-                }
                 const int64_t t = target[r];
                 double row_loss = 0.0;
                 if (t != ignore_index) {
@@ -1375,7 +1363,7 @@ void nll_grad_typed(const T* grad_output, const int64_t* target,
     const bool per_row = reduction == 0;
     const double inv_tw =
         (reduction == 1 && total_weight > 0.0) ? 1.0 / total_weight : 1.0;
-    parallel_ranges(rows, 1, [&](int64_t begin, int64_t end) -> double {
+    parallel_ranges(rows, 256, [&](int64_t begin, int64_t end) -> double {
         for (int64_t r = begin; r < end; ++r) {
             const int64_t t = target[r];
             if (t == ignore_index) continue;

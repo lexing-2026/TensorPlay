@@ -18,6 +18,7 @@
 #include "OutWrite.h"
 #include "Parallel.h"
 #include "Tensor.h"
+#include "cpu/UnaryVecKernels.h"
 #include "cpu/VecUnary.h"
 #include "TypePromotion.h"
 #include "Utils.h"
@@ -164,6 +165,23 @@ inline Tensor float_math_vec_kernel(const Tensor& self, F f, const char* name,
     } else {
         const float* sp = w.data_ptr<float>();
         float* dp = t.data_ptr<float>();
+#if defined(_M_X64)
+        // MSVC: run_f32 has no vector body to pick (VecUnary.h's carries GCC
+        // target attributes), so the ops the tier stub cannot answer keep the
+        // portable walk below and only the ones it does answer skip it -- the
+        // reference run is what exp/erf and friends still measure against.
+        if (op != vecunary::VOp::None) {
+            const int uop = static_cast<int>(op);
+            const int udt = static_cast<int>(DType::Float32);
+            parallel::parallel_for(0, n, parallel::GRAIN_SIZE, [&](int64_t b, int64_t e) {
+                if (!unary_vec_stub(DeviceType::CPU, sp, dp, b, e, uop,
+                                    prm.p0, prm.p1, prm.p2, udt)) {
+                    vecunary::run_f32(op, prm, sp, dp, b, e);
+                }
+            });
+            return t;
+        }
+#endif
         parallel::parallel_for(0, n, parallel::GRAIN_SIZE, [&](int64_t b, int64_t e) {
             vecunary::run_f32(op, prm, sp, dp, b, e);
         });
