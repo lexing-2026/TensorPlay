@@ -2115,9 +2115,12 @@ Tensor norm_sparse_dim_cpu(const Tensor& self,
 TENSORPLAY_LIBRARY_IMPL(SparseCPU, SparseNormKernels) {
     m.impl("norm", norm_sparse_cpu);
     m.impl("norm.dim", norm_sparse_dim_cpu);
-    m.impl("_validate_compressed_sparse_indices",
-           validate_compressed_sparse_indices_cpu);
 }
 
 } // namespace cpu
 } // namespace tensorplay
+
+TENSORPLAY_LIBRARY_IMPL(CPU, SparseValidationKernels) {
+    m.impl("_validate_compressed_sparse_indices",
+           tensorplay::cpu::validate_compressed_sparse_indices_cpu);
+}
