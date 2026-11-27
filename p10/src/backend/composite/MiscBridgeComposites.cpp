@@ -276,6 +276,66 @@ Tensor _to_sparse_csr_impl(const Tensor& self,
     return ops::to_sparse_csr(self);
 }
 
+Tensor encoder_layer_norm(const Tensor& x, int64_t embed_dim, double eps,
+                          const Tensor& weight, const Tensor& bias) {
+    return std::get<0>(ops::native_layer_norm(
+        x, {embed_dim}, std::optional<Tensor>(weight),
+        std::optional<Tensor>(bias), eps));
+}
+
+Tensor encoder_ffn(const Tensor& input, const Tensor& w1, const Tensor& b1,
+                   const Tensor& w2, const Tensor& b2, bool use_gelu) {
+    Tensor flat = input.reshape({input.size(0) * input.size(1), input.size(2)});
+    Tensor hidden = ops::addmm(b1, flat, ops::transpose(w1, 0, 1), Scalar(1),
+                               Scalar(1));
+    if (use_gelu) {
+        hidden = ops::gelu(hidden);
+    }
+    hidden = hidden.reshape({input.size(0), input.size(1), -1});
+    Tensor flat_out =
+        hidden.reshape({hidden.size(0) * hidden.size(1), hidden.size(2)});
+    Tensor out = ops::addmm(b2, flat_out, ops::transpose(w2, 0, 1), Scalar(1),
+                            Scalar(1));
+    return out.reshape({input.size(0), input.size(1), -1});
+}
+
+Tensor transformer_encoder_layer_fwd_impl(
+    const Tensor& src, int64_t embed_dim, int64_t num_heads,
+    const Tensor& qkv_weight, const Tensor& qkv_bias,
+    const Tensor& proj_weight, const Tensor& proj_bias, bool use_gelu,
+    bool norm_first, double eps, const Tensor& norm_weight_1,
+    const Tensor& norm_bias_1, const Tensor& norm_weight_2,
+    const Tensor& norm_bias_2, const Tensor& ffn_weight_1,
+    const Tensor& ffn_bias_1, const Tensor& ffn_weight_2,
+    const Tensor& ffn_bias_2, std::optional<Tensor> mask,
+    std::optional<int64_t> mask_type) {
+    if (src.numel() == 0) {
+        return ops::clone(src);
+    }
+    Tensor x = src;
+    if (norm_first) {
+        x = encoder_layer_norm(x, embed_dim, eps, norm_weight_1, norm_bias_1);
+    }
+    x = std::get<0>(ops::_native_multi_head_attention(
+        x, x, x, embed_dim, num_heads, qkv_weight, qkv_bias, proj_weight,
+        proj_bias, mask, false, true, mask_type));
+    x = ops::add(x, src);
+    if (!norm_first) {
+        x = encoder_layer_norm(x, embed_dim, eps, norm_weight_1, norm_bias_1);
+    }
+
+    const Tensor pre_ffn = x;
+    if (norm_first) {
+        x = encoder_layer_norm(x, embed_dim, eps, norm_weight_2, norm_bias_2);
+    }
+    x = encoder_ffn(x, ffn_weight_1, ffn_bias_1, ffn_weight_2, ffn_bias_2,
+                    use_gelu);
+    x = ops::add(x, pre_ffn);
+    if (!norm_first) {
+        x = encoder_layer_norm(x, embed_dim, eps, norm_weight_2, norm_bias_2);
+    }
+    return x;
+}
 TENSORPLAY_LIBRARY_IMPL(Composite, MiscBridgeComposites) {
     m.impl("copysign_.Scalar", copysign__scalar);
     m.impl("copysign.Scalar_out", copysign_scalar_out);
@@ -296,6 +356,10 @@ TENSORPLAY_LIBRARY_IMPL(Composite, MiscBridgeComposites) {
     m.impl("_masked_scale", _masked_scale_impl);
     m.impl("_to_sparse", _to_sparse_impl);
     m.impl("_to_sparse_csr", _to_sparse_csr_impl);
+}
+
+TENSORPLAY_LIBRARY_IMPL(CPU, TransformerEncoderCPU) {
+    m.impl("_transformer_encoder_layer_fwd", transformer_encoder_layer_fwd_impl);
 }
 
 } // namespace composite
