@@ -2903,9 +2903,23 @@ Tensor& angle_out_cpu(const Tensor& self, Tensor& out) {
 
 // --- Binary/Ternary Kernels ---
 
-#if defined(__x86_64__)
+#if defined(__x86_64__) || defined(_M_X64)
+// MSVC builds this file at /arch:AVX2, so the 256-bit body is the widest it can
+// emit there; the 512-bit bodies stay GCC-only and the runtime check below
+// skips them.  The target attribute is what lets a baseline GCC translation
+// unit carry an AVX2/AVX512 body at all.
+#if defined(_MSC_VER)
+#define TP_CLAMP_MSVC 1
+#define TP_CLAMP_TARGET_512
+#define TP_CLAMP_TARGET_256
+#else
+#define TP_CLAMP_MSVC 0
+#define TP_CLAMP_TARGET_512 __attribute__((target("avx512f")))
+#define TP_CLAMP_TARGET_256 __attribute__((target("avx2")))
+#endif
 namespace {
-__attribute__((target("avx512f")))
+#if !TP_CLAMP_MSVC
+TP_CLAMP_TARGET_512
 void clamp_f32_avx512(const float* src, float* dst, int64_t n,
                       float lo, float hi) {
     const __m512 vlo = _mm512_set1_ps(lo);
@@ -2925,7 +2939,7 @@ void clamp_f32_avx512(const float* src, float* dst, int64_t n,
     }
 }
 
-__attribute__((target("avx512f")))
+TP_CLAMP_TARGET_512
 void clamp_f64_avx512(const double* src, double* dst, int64_t n,
                       double lo, double hi) {
     const __m512d vlo = _mm512_set1_pd(lo);
@@ -2945,9 +2959,11 @@ void clamp_f64_avx512(const double* src, double* dst, int64_t n,
     }
 }
 
+#endif  // !TP_CLAMP_MSVC
+
 // 256-bit twins.  The bound stays the first operand of max/min, so a NaN
 // lane is returned unchanged exactly like the scalar tail.
-__attribute__((target("avx2")))
+TP_CLAMP_TARGET_256
 void clamp_f32_avx2(const float* src, float* dst, int64_t n,
                     float lo, float hi) {
     const __m256 vlo = _mm256_set1_ps(lo);
@@ -2967,7 +2983,7 @@ void clamp_f32_avx2(const float* src, float* dst, int64_t n,
     }
 }
 
-__attribute__((target("avx2")))
+TP_CLAMP_TARGET_256
 void clamp_f64_avx2(const double* src, double* dst, int64_t n,
                     double lo, double hi) {
     const __m256d vlo = _mm256_set1_pd(lo);
@@ -3029,13 +3045,31 @@ Tensor clamp_write(const Tensor& self, const std::optional<Scalar>& min,
     }
 #endif
 
-#if defined(__x86_64__)
+#if defined(__x86_64__) || defined(_M_X64)
     if ((vecunary::avx512_available() || vecunary::avx2_available()) &&
         (self.dtype() == DType::Float32 || self.dtype() == DType::Float64)) {
         const double lo = min.has_value()
             ? min->toDouble() : -std::numeric_limits<double>::infinity();
         const double hi = max.has_value()
             ? max->toDouble() : std::numeric_limits<double>::infinity();
+#if TP_CLAMP_MSVC
+        // No 512-bit body exists in this translation unit, so the widest
+        // compiled form is the 256-bit twin.
+        if (self.dtype() == DType::Float32) {
+            const float* src = self_contig.data_ptr<float>();
+            float* dst = result.data_ptr<float>();
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                clamp_f32_avx2(src + begin, dst + begin, end - begin,
+                               static_cast<float>(lo), static_cast<float>(hi));
+            });
+        } else {
+            const double* src = self_contig.data_ptr<double>();
+            double* dst = result.data_ptr<double>();
+            parallel_for(0, n, GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+                clamp_f64_avx2(src + begin, dst + begin, end - begin, lo, hi);
+            });
+        }
+#else
         const bool use512 = vecunary::avx512_available();
         if (self.dtype() == DType::Float32) {
             const float* src = self_contig.data_ptr<float>();
@@ -3060,6 +3094,7 @@ Tensor clamp_write(const Tensor& self, const std::optional<Scalar>& min,
                                    lo, hi);
             });
         }
+#endif
         return result;
     }
 #endif
