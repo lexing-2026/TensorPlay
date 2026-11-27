@@ -10,7 +10,6 @@
 #include "Scalar.h"
 #include "SizesAndStrides.h"
 #include "Utils.h"
-#include "tensorplay/ops/TPXOpsGenerated.h"
 #include "cpu/vec/vec.h"
 
 #include <cmath>
@@ -28,8 +27,6 @@
 
 namespace tensorplay {
 namespace cpu {
-
-namespace ops = tensorplay::tpx::ops;
 
 using namespace tensorplay::parallel;
 
@@ -3760,18 +3757,28 @@ Tensor _weight_int8pack_mm_cpu(const Tensor& self, const Tensor& mat2,
     if (B == 0 || N == 0 || K == 0) {
         return Tensor::empty({B, N}, self.dtype(), self.device());
     }
-    Tensor weight = Tensor::empty({N, K}, DType::Float32, self.device());
-    const int8_t* source = mat2.data_ptr<int8_t>();
-    float* destination = weight.data_ptr<float>();
-    const int64_t numel = N * K;
-    for (int64_t i = 0; i < numel; ++i) {
-        destination[i] = static_cast<float>(source[i]);
-    }
-    const Tensor product = ops::matmul(
-        self.to(DType::Float32), ops::transpose(weight, 0, 1));
-    return ops::mul(product,
-                    ops::unsqueeze(scales.to(DType::Float32), 0))
-        .to(self.dtype());
+    const Tensor xf = self.to(DType::Float32).contiguous();
+    const Tensor sf = scales.to(DType::Float32).contiguous();
+    const Tensor wf = mat2.contiguous();
+    const int8_t* weight = wf.data_ptr<int8_t>();
+    const float* x = xf.data_ptr<float>();
+    const float* scale = sf.data_ptr<float>();
+    Tensor out = Tensor::empty({B, N}, DType::Float32, self.device());
+    float* result = out.data_ptr<float>();
+    parallel_for(0, B * N, 64, [&](int64_t begin, int64_t end) {
+        for (int64_t i = begin; i < end; ++i) {
+            const int64_t b = i / N;
+            const int64_t n = i % N;
+            float acc = 0.0f;
+            const float* row = x + b * K;
+            const int8_t* codes = weight + n * K;
+            for (int64_t k = 0; k < K; ++k) {
+                acc += static_cast<float>(codes[k]) * row[k];
+            }
+            result[i] = acc * scale[n];
+        }
+    });
+    return out.to(self.dtype());
 }
 
 TENSORPLAY_LIBRARY_IMPL(CPU, QuantKernels) {
