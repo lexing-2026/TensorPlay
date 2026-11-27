@@ -1,6 +1,6 @@
 cff-version: 1.2.0
-message: "If you use TensorPlay in your research or teaching, please cite it as below."
-title: "TensorPlay: A simple deep learning framework designed for educational purposes and small-scale experiments"
+message: "If you use TensorPlay in your research or projects, please cite it as below."
+title: "TensorPlay: A full-stack deep learning framework with multi-backend kernels, explicit autograd, and built-in LLM, SNN and quantum stacks"
 type: software
 authors:
   - name: zlx
@@ -9,10 +9,13 @@ authors:
 repository-code: "https://github.com/lexing-2026/TensorPlay"
 url: "https://tensorplay.cn"
 license: Apache-2.0
-version: 1.0.0
+version: 1.4.0a0
 keywords:
   - deep-learning
+  - full-stack
+  - multi-backend
   - autograd
-  - cuda
-  - education
   - tensor
+  - cuda
+  - spiking-neural-networks
+  - quantum-simulation

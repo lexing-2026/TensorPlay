@@ -8,10 +8,10 @@
 
 <div align="center">
 <h3>
-    <samp>Read the whole stack.</samp>
+    <samp>Every layer. Every backend. One framework.</samp>
 </h3>
 <p>
-    <samp>A learner-first, DIY-ready framework for tensors, kernels, and custom hardware.</samp>
+    <samp>Full-stack deep learning — tensors, kernels, autograd, compiler, LLM / SNN / quantum — on CPU, CUDA, ROCm, Vulkan, MPS and accelerators.</samp>
 </p>
 
 <p>
@@ -111,15 +111,15 @@
 
 --------------------------------------------------------------------------------
 
-TensorPlay is a learner-first deep learning framework. It combines NumPy-style tensor computation with GPU acceleration and neural networks trained by an explicit computation-graph autograd engine. The entire stack — Python API, C++ core, CUDA kernels, compiler — is written to be read end to end: no black box between your model and the hardware.
+TensorPlay is a full-stack deep learning framework. NumPy-style tensors with GPU acceleration, an explicit computation-graph autograd engine, a JIT compiler, and domain stacks for language models, spiking networks and quantum simulation live in one coherent codebase. The same dispatcher reaches eight backend families, and every layer stays in the open — no opaque binary core between your model and the hardware.
 
 <!-- toc -->
 
 - [About TensorPlay](#about-tensorplay)
-  - [A Transparent Tensor Library](#a-transparent-tensor-library)
+  - [A Full-Stack Framework](#a-full-stack-framework)
   - [Why TensorPlay](#why-tensorplay)
-    - [Familiar and Python-First](#familiar-and-python-first)
-    - [DIY Hardware Acceleration](#diy-hardware-acceleration)
+    - [A Familiar, Python-First Surface](#a-familiar-python-first-surface)
+    - [Multi-Backend by Design](#multi-backend-by-design)
     - [An Explicit Autograd Engine](#an-explicit-autograd-engine)
     - [Extensions Without Pain](#extensions-without-pain)
 - [Installation](#installation)
@@ -151,7 +151,7 @@ TensorPlay is a learner-first deep learning framework. It combines NumPy-style t
 
 ## About TensorPlay
 
-### A Transparent Tensor Library
+### A Full-Stack Framework
 
 At a granular level, TensorPlay consists of the following components:
 
@@ -186,7 +186,7 @@ flowchart TB
 
 ### Supported Backends and Devices
 
-TensorPlay dispatches to eight backend families — five built in, each with a transparent, readable kernel table, plus three accelerator backends added through the two extension paths: MetaX in-tree (like ROCm, a build flag over shared sources), and Cambricon MLU and Huawei Ascend NPU as out-of-tree plugins over the `PrivateUse1` device slot (see [adding a device backend](docs/source/notes/backends.md)):
+TensorPlay dispatches to eight backend families — five built in, each with a readable kernel table, plus three accelerator backends added through the two extension paths: MetaX in-tree (like ROCm, a build flag over shared sources), and Cambricon MLU and Huawei Ascend NPU as out-of-tree plugins over the `PrivateUse1` device slot (see [adding a device backend](docs/source/notes/backends.md)):
 
 | Backend | Target hardware | How to enable | Check availability |
 | ---- | ---- | ---- | ---- |
@@ -203,25 +203,26 @@ One GPU backend per build: `USE_CUDA`, `USE_ROCM` and `USE_METAX` are mutually e
 
 ### Why TensorPlay
 
-TensorPlay is built on a philosophy of **transparency**: you can trace every operation from Python into the C++ core without getting lost in abstraction layers.
+TensorPlay is built to cover the whole workflow — from tensors and kernels to compilers and domain stacks — without locking you to one accelerator or hiding the parts you may want to change.
 
-- **Pure and readable implementations.** Dive into the logic of every operator — from autograd to memory management. No black boxes.
-- **DIY acceleration.** Simplified CPU and CUDA backends are a playground for experimenting with custom hardware kernels and learning parallel computing.
-- **Modular autograd.** The decoupled TPX engine builds computation graphs explicitly, making backpropagation easy to understand and extend.
-- **Research ready.** Prototype new layer types, optimizers, custom operators and storage formats with minimal boilerplate.
-- **Instantly familiar API.** If you have worked with mainstream deep learning frameworks, the mental model carries over — spend your time on internals, not syntax.
+- **One coherent stack.** Tensors, autograd, `nn`, optimizers, data loading, the compiler and the domain libraries share the same core instead of being stitched together after the fact.
+- **Eight backends, one API.** CPU, CUDA, ROCm/HIP, MetaX, Vulkan, MPS, Cambricon MLU and Ascend NPU run the same programs; accelerators plug in without forking the framework.
+- **Explicit, decoupled autograd.** TPX builds computation graphs explicitly, so gradients are traceable and replaceable rather than implicit magic.
+- **Domain stacks built in.** Language models, spiking neural networks and quantum simulation sit alongside the tensor core — no separate libraries to install and wire up.
+- **Open at every layer.** Implementations stay readable and the public surface is pure Python, so internals are a place to work, not a black box.
+- **Instantly familiar API.** If you have worked with mainstream deep learning frameworks, the mental model carries over — spend your time on the work, not on syntax.
 
-#### Familiar and Python-First
+#### A Familiar, Python-First Surface
 
 TensorPlay is not a thin binding over an opaque engine. The public surface — `tensorplay`, `nn`, `optim`, `data` — is pure Python you can read end to end, and every call crosses a small, explicit boundary into the C++ core. Stack traces, error messages and the debugger show *your* code, not framework plumbing.
 
-#### DIY Hardware Acceleration
+#### Multi-Backend by Design
 
-The CPU, CUDA, Vulkan and MPS backends are deliberately simplified: one kernel family per file, one registration macro per unit, no hidden scheduling. That makes them a playground for learning parallel computing and prototyping kernels — bring your own device backend and wire it into the dispatcher without touching the framework itself. On macOS the MPS backend is enabled automatically and follows the same readable structure with one Objective-C++/Metal kernel file per operator family. The out-of-tree [`tensorplay-mlu`](https://github.com/ohtensorplay/tensorplay-mlu) and [`tensorplay-npu`](https://github.com/ohtensorplay/tensorplay-npu) plugins are that idea shipped: complete device backends — allocator, hooks, kernels, profiler — living outside this repository.
+One dispatcher, eight backend families: CPU, CUDA, ROCm/HIP, MetaX, Vulkan and MPS are built in, while Cambricon MLU and Huawei Ascend NPU arrive as out-of-tree plugins. Backends are selected by device, not by rewriting the model, and accelerators can be added without touching the framework itself. On macOS the MPS backend is enabled automatically with one Objective-C++/Metal kernel file per operator family. The out-of-tree [`tensorplay-mlu`](https://github.com/ohtensorplay/tensorplay-mlu) and [`tensorplay-npu`](https://github.com/ohtensorplay/tensorplay-npu) plugins are that design shipped: complete device backends — allocator, hooks, kernels, profiler — living outside this repository.
 
 #### An Explicit Autograd Engine
 
-The autograd engine (TPX) is a standalone library, fully decoupled from the core. Computation graphs are built and executed explicitly — no hidden state — so backpropagation is something you can read, trace and extend in an afternoon.
+The autograd engine (TPX) is a standalone library, fully decoupled from the core. Computation graphs are built and executed explicitly — no hidden state — so backpropagation stays traceable and replaceable.
 
 #### Extensions Without Pain
 
@@ -248,7 +249,7 @@ out = lif(tp.rand(8, 4, 16))   # [8, 4, 16] spike train with fused BPTT
 
 ### Quantum Simulation
 
-`tensorplay.quantum` is a pure-Python quantum simulator for research-sized registers, with the same transparent, autograd-compatible tensors underneath:
+`tensorplay.quantum` is a pure-Python quantum simulator for research-sized registers, built on the same autograd-compatible tensor core:
 
 - **Circuits & ansätze** — a gate-table `Circuit` covering standard and multi-controlled gates, plus `qft_circuit`, `real_amplitudes`, `efficient_su2` and `nlocal_circuit` variational templates with trainable angles.
 - **States & data loading** — `zeros_state` / `plus_state` / `basis_state` / `random_state`, `encode_state` amplitude encoding of classical features, `product_state`, `density_mixture` eigendecomposition, `partial_trace`.
@@ -590,7 +591,7 @@ Metric kernels use fused reductions where possible. On CPU (AVX2, 8 threads), se
 | MAE (10k×64) | 0.01 ms | 0.04 ms | 2.8× |
 | Kendall tau-b (n=200) | 4.8 ms | 124 ms | 26× |
 
-Measured highlights from the [white paper](docs/whitepaper/main.pdf), §9 — a snapshot of current `main`: the dispatcher adds the same sub-1% sliver on CPU, CUDA and Vulkan paths; the CUDA backend covers 1,262 unique ops (97% of the CPU surface, 1,233 ops); the Vulkan teaching backend ships 224 ops backed by 6.8k lines of GLSL shaders across 102 files. The **MPS** backend adds Metal-accelerated kernels on macOS — tensor ops, convolutions, attention/LLM kernels (RMSNorm, SDPA, top-k sampling, fused AdamW) — with its own operator benchmark and a CI performance floor ([`bench_mps_operator.py`](benchmark/bench_mps_operator.py), [`mps_benchmark.yml`](.github/workflows/mps_benchmark.yml)). The **ROCm** lane builds and smoke-tests AMD/HIP wheels in the ROCm container on every release and nightly run. The pytest suite defines <!-- tp-stats:tests-collected:begin -->3,660<!-- tp-stats:tests-collected:end --> test functions.
+Measured highlights from the [white paper](docs/whitepaper/main.pdf), §9 — a snapshot of current `main`: the dispatcher adds the same sub-1% sliver on CPU, CUDA and Vulkan paths; the CUDA backend covers 1,262 unique ops (97% of the CPU surface, 1,233 ops); the Vulkan backend ships 224 ops backed by 6.8k lines of GLSL shaders across 102 files. The **MPS** backend adds Metal-accelerated kernels on macOS — tensor ops, convolutions, attention/LLM kernels (RMSNorm, SDPA, top-k sampling, fused AdamW) — with its own operator benchmark and a CI performance floor ([`bench_mps_operator.py`](benchmark/bench_mps_operator.py), [`mps_benchmark.yml`](.github/workflows/mps_benchmark.yml)). The **ROCm** lane builds and smoke-tests AMD/HIP wheels in the ROCm container on every release and nightly run. The pytest suite defines <!-- tp-stats:tests-collected:begin -->3,660<!-- tp-stats:tests-collected:end --> test functions.
 
 Scripts and methodology: [benchmark/README.md](benchmark/README.md).
 

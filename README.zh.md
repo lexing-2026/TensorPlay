@@ -8,10 +8,10 @@
 
 <div align="center">
 <h3>
-    <samp>Read the whole stack.</samp>
+    <samp>每一层、每个后端，一个框架。</samp>
 </h3>
 <p>
-    <samp>一个面向学习者的 DIY 友好型框架，为张量、内核与自定义硬件而生。</samp>
+    <samp>全栈深度学习——张量、内核、自动微分、编译器到 LLM / SNN / 量子，覆盖 CPU、CUDA、ROCm、Vulkan、MPS 与各类加速器。</samp>
 </p>
 
 <p>
@@ -110,15 +110,15 @@
     <p><sub><a href="https://www.bilibili.com/video/BV1JcaD64E8H">在 B 站观看完整影片</a></sub></p>
 </div>
 
-TensorPlay 是一个面向学习者的深度学习框架：它融合了类 NumPy 的张量计算与 GPU 加速，并配以建立在显式计算图（DAG）之上的自动微分引擎来训练神经网络。整个技术栈——Python API、C++ 核心、CUDA 内核、编译器——都写成可以从头读到尾：模型与硬件之间没有黑盒。
+TensorPlay 是一个全栈深度学习框架：类 NumPy 的张量计算与 GPU 加速、显式计算图（DAG）自动微分引擎、JIT 编译器，以及面向语言模型、脉冲网络与量子模拟的领域栈，统一在一套代码库中。同一个 dispatcher 分派到八大后端家族，每一层都保持可读可改——模型与硬件之间不存在不透明的二进制核心。
 
 <!-- toc -->
 
 - [关于 TensorPlay](#关于-tensorplay)
-  - [一个透明的张量库](#一个透明的张量库)
+  - [一个全栈框架](#一个全栈框架)
   - [为什么选择 TensorPlay](#为什么选择-tensorplay)
-    - [亲切且 Python 优先](#亲切且-python-优先)
-    - [DIY 硬件加速](#diy-硬件加速)
+    - [熟悉且 Python 优先的对外层](#熟悉且-python-优先的对外层)
+    - [多后端原生设计](#多后端原生设计)
     - [显式的自动微分引擎](#显式的自动微分引擎)
     - [无痛扩展](#无痛扩展)
 - [安装](#安装)
@@ -150,7 +150,7 @@ TensorPlay 是一个面向学习者的深度学习框架：它融合了类 NumPy
 
 ## 关于 TensorPlay
 
-### 一个透明的张量库
+### 一个全栈框架
 
 在更细的粒度上，TensorPlay 由以下组件构成：
 
@@ -185,7 +185,7 @@ flowchart TB
 
 ### 支持的后端与设备
 
-TensorPlay 将请求分派到八大后端家族——五个内置后端，各自有一张透明、可读的内核表，另有三个加速器后端通过两条扩展路径接入：MetaX 走树内集成（与 ROCm 类似，是基于共享源码的构建开关），Cambricon MLU 与华为昇腾 NPU 则是 `PrivateUse1` 设备槽上的树外插件（参见[添加设备后端](docs/source/notes/backends.md)）：
+TensorPlay 将请求分派到八大后端家族——五个内置后端，各自有一张可读的内核表，另有三个加速器后端通过两条扩展路径接入：MetaX 走树内集成（与 ROCm 类似，是基于共享源码的构建开关），Cambricon MLU 与华为昇腾 NPU 则是 `PrivateUse1` 设备槽上的树外插件（参见[添加设备后端](docs/source/notes/backends.md)）：
 
 | 后端 | 目标硬件 | 启用方式 | 可用性检测 |
 | ---- | ---- | ---- | ---- |
@@ -202,25 +202,26 @@ TensorPlay 将请求分派到八大后端家族——五个内置后端，各自
 
 ### 为什么选择 TensorPlay
 
-TensorPlay 以**透明架构**为设计哲学：每个操作都能从 Python 追踪到 C++ 核心，而不会迷失在抽象层中。
+TensorPlay 的目标是覆盖从张量、内核到编译器与领域栈的完整链路，同时不把你锁死在单一加速器上，也不隐藏你可能想改动的部分。
 
-- **纯粹且可读的实现。** 深入理解每个算子的底层逻辑——从自动微分到内存管理，没有黑盒。
-- **DIY 硬件加速。** 简化的 CPU/CUDA 后端是实验自定义硬件内核、学习并行计算原理的游乐场。
-- **模块化自动微分。** 解耦的 TPX 引擎显式构建计算图，反向传播的原理一目了然，且易于扩展。
-- **研究就绪。** 以极少的样板代码原型化新的层类型、优化器、自定义算子与存储格式。
-- **亲切的 API 风格。** 用过主流深度学习框架的话，心智模型可以直接迁移——把时间花在理解内部机制上，而不是语法上。
+- **一套连贯的全栈。** 张量、自动微分、`nn`、优化器、数据加载、编译器与领域库共享同一个核心，而不是事后拼接起来的几套系统。
+- **八后端，一套 API。** CPU、CUDA、ROCm/HIP、MetaX、Vulkan、MPS、寒武纪 MLU 与昇腾 NPU 运行同一份程序；接入加速器无需 fork 整个框架。
+- **显式、解耦的自动微分。** TPX 显式构建计算图，梯度可追踪、可替换，而不是隐含的魔法。
+- **领域栈原生内建。** 语言模型、脉冲神经网络与量子模拟与张量核心并列存在——不需要另装库再接线。
+- **每一层都开放。** 实现保持可读，对外层是纯 Python，内部机制是你能动手的地方，而不是黑盒。
+- **熟悉的 API 风格。** 用过主流深度学习框架的话，心智模型可以直接迁移——把时间花在要解决的问题上，而不是语法上。
 
-#### 亲切且 Python 优先
+#### 熟悉且 Python 优先的对外层
 
 TensorPlay 不是套在不透明引擎上的薄封装。公开接口——`tensorplay`、`nn`、`optim`、`data`——是能从头读到尾的纯 Python 代码，每次调用都会经过一个简短、显式的边界进入 C++ 核心。堆栈跟踪、错误信息和调试器里显示的是**你的**代码，而不是框架的水管工。
 
-#### DIY 硬件加速
+#### 多后端原生设计
 
-CPU、CUDA、Vulkan 与 MPS 后端刻意做了简化：每个文件一族内核、每个单元一个注册宏、没有隐藏的调度。这让它们成为学习并行计算、原型化内核的游乐场——带上你自己的设备后端接入 dispatcher，不需要改动框架本身。在 macOS 上，MPS 后端会自动启用，并遵循同样的可读结构——每个算子家族对应一个 Objective-C++/Metal 内核文件。
+一个 dispatcher，八大后端家族：CPU、CUDA、ROCm/HIP、MetaX、Vulkan 与 MPS 内置，寒武纪 MLU 与华为昇腾 NPU 以树外插件形式接入。后端按设备选择，不需要重写模型；接入新加速器也无需改动框架本身。在 macOS 上，MPS 后端自动启用，每个算子家族对应一个 Objective-C++/Metal 内核文件。树外的 [`tensorplay-mlu`](https://github.com/ohtensorplay/tensorplay-mlu) 与 [`tensorplay-npu`](https://github.com/ohtensorplay/tensorplay-npu) 插件就是这一设计的实例：完整的设备后端——分配器、钩子、内核、性能分析器——活在本仓库之外。
 
 #### 显式的自动微分引擎
 
-自动微分引擎（TPX）是独立库，与核心完全解耦。计算图的构建与执行都是显式的——没有隐藏状态——反向传播是你一个下午就能读懂、追踪并扩展的东西。
+自动微分引擎（TPX）是独立库，与核心完全解耦。计算图的构建与执行都是显式的——没有隐藏状态——反向传播始终保持可追踪、可替换。
 
 #### 无痛扩展
 
@@ -247,7 +248,7 @@ out = lif(tp.rand(8, 4, 16))   # [8, 4, 16] 脉冲序列，融合 BPTT
 
 ### 量子模拟
 
-`tensorplay.quantum` 是面向科研规模寄存器的纯 Python 量子模拟器，底层复用同一套透明、支持自动微分的张量：
+`tensorplay.quantum` 是面向科研规模寄存器的纯 Python 量子模拟器，构建在同一套支持自动微分的张量核心之上：
 
 - **电路与变分拟设** —— 门表驱动的 `Circuit` 覆盖标准门与多控门，另有 `qft_circuit`、`real_amplitudes`、`efficient_su2` 与 `nlocal_circuit` 可训练变分模板。
 - **态制备与数据装载** —— `zeros_state` / `plus_state` / `basis_state` / `random_state`、经典特征的幅度编码 `encode_state`、`product_state`、`density_mixture` 谱分解、`partial_trace`。
@@ -589,7 +590,7 @@ trace = ActivationPatching(model).causal_trace(clean_ids, corrupted_ids, target_
 | MAE（10k×64） | 0.01 ms | 0.04 ms | 2.8× |
 | Kendall tau-b（n=200） | 4.8 ms | 124 ms | 26× |
 
-实测亮点（见[白皮书](docs/whitepaper/main.pdf) §9，对应当前 `main` 的快照）：dispatcher 在 CPU、CUDA 与 Vulkan 路径上都只增加不到 1% 的开销；CUDA 后端覆盖 1,262 个独立算子（CPU 面 1,233 个的 97%）；Vulkan 教学后端交付 224 个算子，背后是 102 个文件、6.8k 行 GLSL shader。**MPS** 后端在 macOS 上提供 Metal 加速内核——张量算子、卷积、注意力/LLM 内核（RMSNorm、SDPA、top-k 采样、融合 AdamW）——并配有独立算子基准与 CI 性能底线（[`bench_mps_operator.py`](benchmark/bench_mps_operator.py)、[`mps_benchmark.yml`](.github/workflows/mps_benchmark.yml)）。**ROCm** 渠道在每次发布与 nightly 运行中于 ROCm 容器内构建并冒烟测试 AMD/HIP wheel。pytest 套件共定义 <!-- tp-stats:tests-collected:begin -->3,660<!-- tp-stats:tests-collected:end --> 个测试函数。
+实测亮点（见[白皮书](docs/whitepaper/main.pdf) §9，对应当前 `main` 的快照）：dispatcher 在 CPU、CUDA 与 Vulkan 路径上都只增加不到 1% 的开销；CUDA 后端覆盖 1,262 个独立算子（CPU 面 1,233 个的 97%）；Vulkan 后端交付 224 个算子，背后是 102 个文件、6.8k 行 GLSL shader。**MPS** 后端在 macOS 上提供 Metal 加速内核——张量算子、卷积、注意力/LLM 内核（RMSNorm、SDPA、top-k 采样、融合 AdamW）——并配有独立算子基准与 CI 性能底线（[`bench_mps_operator.py`](benchmark/bench_mps_operator.py)、[`mps_benchmark.yml`](.github/workflows/mps_benchmark.yml)）。**ROCm** 渠道在每次发布与 nightly 运行中于 ROCm 容器内构建并冒烟测试 AMD/HIP wheel。pytest 套件共定义 <!-- tp-stats:tests-collected:begin -->3,660<!-- tp-stats:tests-collected:end --> 个测试函数。
 
 脚本与方法论：[benchmark/README.md](benchmark/README.md)。
 
