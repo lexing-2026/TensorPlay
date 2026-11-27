@@ -122,7 +122,16 @@
 namespace tp_cpu_detail {
 // XCR0's XMM/YMM (bits 1-2) and opmask/ZMM (bits 5-7) state bits: the OS has
 // to have enabled them before any VEX/EVEX-encoded instruction is legal.
-#if defined(__AVX__) || defined(__AVX2__) || defined(__AVX512F__)
+#if defined(_MSC_VER)
+// MSVC declares _xgetbv() on every x86 target, independent of /arch, and
+// emits the XGETBV instruction inline.  Gating it on __AVX__ made this return
+// 0 in the baseline TUs -- and the baseline TU is exactly where the dispatcher
+// probes the CPU, so detection reported DEFAULT on any MSVC build whose
+// DEFAULT copies were not compiled with /arch.
+inline unsigned long long xcr0() {
+  return _xgetbv(0);
+}
+#elif defined(__AVX__) || defined(__AVX2__) || defined(__AVX512F__)
 inline unsigned long long xcr0() {
   return _xgetbv(0);
 }

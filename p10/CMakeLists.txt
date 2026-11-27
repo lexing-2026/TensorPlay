@@ -855,6 +855,7 @@ set_source_files_properties(${GEN_CPP} ${GEN_TPX_OPS_CPP} ${GEN_HOST_FALLBACK_CP
 # Windows archive keeps the same member order, which /WHOLEARCHIVE follows.
 function(tp_add_cpu_kernel_isa_tier TIER)
     # ARGN: the ISA compile options of the tier.
+    set(_tier_srcs)
     foreach(KERNEL_SRC ${TP_CPU_KERNEL_SRCS})
         get_filename_component(KERNEL_NAME ${KERNEL_SRC} NAME_WE)
         set(_wrapper "${CMAKE_CURRENT_BINARY_DIR}/cpu_kernel_tiers/${KERNEL_NAME}.${TIER}.cpp")
@@ -876,14 +877,50 @@ function(tp_add_cpu_kernel_isa_tier TIER)
             COMPILE_OPTIONS "${ARGN}"
             OBJECT_DEPENDS "${IMPL}"
             SKIP_UNITY_BUILD_INCLUSION ON)
-        set_property(GLOBAL APPEND PROPERTY TP_P10_ISA_TIER_SOURCES "${_wrapper}")
+        list(APPEND _tier_srcs "${_wrapper}")
     endforeach()
-endfunction()
-function(tp_p10_append_isa_tier_sources)
-    get_property(_sources GLOBAL PROPERTY TP_P10_ISA_TIER_SOURCES)
-    if(_sources)
-        target_sources(p10 PRIVATE ${_sources})
+    if(NOT _tier_srcs)
+        return()
     endif()
+    # One OBJECT library per capability, created here in the p10 directory.
+    # Staying in this directory is what makes the directory-scoped capability
+    # macros (add_compile_definitions below) apply to the copies exactly as
+    # they do to the DEFAULT copies and to DispatchStub.cpp: one single
+    # CPUDispatchStubImpl layout, hence one single get_call_ptr symbol.
+    #
+    # The objects reach the module directly instead of through p10.lib, so the
+    # COFF 4 GiB archive cap (lib.exe answered LNK1248 at 4.29 GiB) never sees
+    # them.  Torch's Codegen appends its capability copies to ATen_CPU_SRCS
+    # rather than to a static library for the same reason.
+    set(_lib p10_isa_${TIER})
+    add_library(${_lib} OBJECT ${_tier_srcs})
+    set_target_properties(${_lib} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    if(MSVC)
+        target_compile_options(${_lib} PRIVATE /bigobj)
+    endif()
+    target_compile_options(${_lib} PRIVATE ${ARGN})
+    target_compile_definitions(${_lib} PRIVATE
+        P10_EXPORTS CPU_CAPABILITY_${TIER} CPU_CAPABILITY=${TIER})
+    target_include_directories(${_lib} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include ${GEN_BASE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../tpx/include)
+    target_compile_definitions(${_lib} PRIVATE ${BLAS_COMPILE_DEFS})
+    add_dependencies(${_lib} generate_code)
+    set_property(GLOBAL APPEND PROPERTY TP_P10_ISA_TARGETS ${_lib})
+endfunction()
+
+function(tp_p10_wire_isa_objects)
+    # Runs deferred in the top-level directory, where _C exists.  It only hands
+    # the module the objects: every compile setting lives on the object
+    # library, so nothing here depends on the directory it is called from.
+    get_property(_isa GLOBAL PROPERTY TP_P10_ISA_TARGETS)
+    if(NOT _isa OR NOT TARGET _C)
+        return()
+    endif()
+    foreach(_t ${_isa})
+        target_sources(_C PRIVATE $<TARGET_OBJECTS:${_t}>)
+        add_dependencies(_C ${_t})
+    endforeach()
 endfunction()
 set(TP_CPU_KERNEL_SRCS
     src/backend/cpu/QuantizedElementwiseKernels.cpp
@@ -925,6 +962,14 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
         set(TP_AVX2_TIER_FLAGS -mavx2 -mfma -mf16c)
         set(TP_AVX512_TIER_FLAGS -mavx512f -mavx512bw -mavx512vl -mavx512dq -mfma)
     endif()
+    # Torch's Codegen does this with directory-scoped compile definitions so
+    # that *every* TU -- DEFAULT copies, capability copies and DispatchStub.cpp
+    # -- sees the same stub layout.  Without it the capability copies declare
+    # one get_call_ptr signature and the dispatcher another.
+    add_compile_definitions(HAVE_AVX2_CPU_DEFINITION)
+    if(TP_CXX_AVX512_FOUND)
+        add_compile_definitions(HAVE_AVX512_CPU_DEFINITION)
+    endif()
     foreach(KERNEL_SRC ${TP_CPU_KERNEL_SRCS})
         get_filename_component(KERNEL_NAME ${KERNEL_SRC} NAME_WE)
         add_library(p10_kernel_default_${KERNEL_NAME} OBJECT ${KERNEL_SRC})
@@ -937,18 +982,7 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
         # (add_compile_definitions), so every tier sees the same DispatchStub
         # layout; only CPU_CAPABILITY differs per copy.
         target_compile_definitions(p10_kernel_default_${KERNEL_NAME} PRIVATE
-            P10_EXPORTS CPU_CAPABILITY_DEFAULT CPU_CAPABILITY=DEFAULT
-            HAVE_AVX2_CPU_DEFINITION)
-        # 8b63438 dropped both tiers on MSVC while chasing a Windows numeric
-        # mismatch; with the tiers gone every kernel in the matrix collapses
-        # to its scalar default (gelu 6x, erf 5x, max 16x on this box), so the
-        # perf work has no effect at all.  They are back, and the dispatch
-        # slots keep their capability macros -- a build that omits a tier
-        # simply never declares its slot.
-        if(TP_CXX_AVX512_FOUND)
-            target_compile_definitions(p10_kernel_default_${KERNEL_NAME} PRIVATE
-                HAVE_AVX512_CPU_DEFINITION)
-        endif()
+            P10_EXPORTS CPU_CAPABILITY_DEFAULT CPU_CAPABILITY=DEFAULT)
         target_include_directories(p10_kernel_default_${KERNEL_NAME} PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/include ${GEN_BASE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../tpx/include)
         target_compile_definitions(p10_kernel_default_${KERNEL_NAME} PRIVATE
@@ -965,10 +999,23 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
     endforeach()
     list(APPEND P10_SOURCES ${TP_CPU_KERNEL_DEFAULT_OBJS})
     # Linked after all baseline code; see Note [Linking ISA-tier kernel copies].
+    # Both tiers are built on every x86 toolchain, MSVC included.  They reach
+    # the module as objects (p10_isa_objs), so p10's archive never carries them
+    # and the COFF 4 GiB cap that lib.exe enforces on it (LNK1248) does not
+    # apply.  Torch's Codegen appends its capability copies to ATen_CPU_SRCS
+    # the same way.
     tp_add_cpu_kernel_isa_tier(AVX2 ${TP_AVX2_TIER_FLAGS})
     if(TP_CXX_AVX512_FOUND)
         # Same flag set as the AVX512 capability entry.
         tp_add_cpu_kernel_isa_tier(AVX512 ${TP_AVX512_TIER_FLAGS})
+    endif()
+    # The copies reach the module, never the archive (see
+    # tp_p10_wire_isa_objects); p10.lib stays around 3.9 GiB, below the COFF cap.
+    if(CMAKE_VERSION VERSION_LESS 3.19)
+        tp_p10_wire_isa_objects()
+    else()
+        cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}"
+            CALL tp_p10_wire_isa_objects)
     endif()
 elseif(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(powerpc|ppc)64")
     # PowerPC: one DEFAULT copy plus one VSX copy. VSX is a baseline feature
@@ -1164,6 +1211,18 @@ if(MSVC)
                     PROPERTY INTERPROCEDURAL_OPTIMIZATION ON)
             endif()
         endforeach()
+        # The capability copies keep their normal /O2 inlining.  /GL on them
+        # would defer the vector-class math (erf, exp, ...) to the final LTCG
+        # pass, and a small inline method called once per vector from a giant
+        # switch is exactly what LTCG declines to inline across this module;
+        # ATen compiles its kernel TUs without LTO for the same reason.  p10
+        # itself keeps IPO, which is what the module size needs.
+        get_property(_isa GLOBAL PROPERTY TP_P10_ISA_TARGETS)
+        foreach(_t ${_isa})
+            if(TARGET ${_t})
+                set_property(TARGET ${_t} PROPERTY INTERPROCEDURAL_OPTIMIZATION OFF)
+            endif()
+        endforeach()
     endif()
 endif()
 if(USE_METAX)
@@ -1192,15 +1251,6 @@ if(APPLE AND USE_MPS)
     add_dependencies(p10 mps_shaders)
     target_include_directories(p10 PRIVATE ${MPS_SHADER_GEN_DIR})
 endif()
-# The ISA-tier copies join last, after the sources other directories add to
-# p10 (tpx); see Note [Linking ISA-tier kernel copies].
-if(CMAKE_VERSION VERSION_LESS 3.19)
-    # No deferred calls: the tiers still follow every p10 source here.
-    tp_p10_append_isa_tier_sources()
-else()
-    cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}"
-        CALL tp_p10_append_isa_tier_sources)
-endif()
 # Enable UNITY_BUILD for faster compilation
 set_target_properties(p10 PROPERTIES UNITY_BUILD OFF)
 if(MSVC)
@@ -1211,11 +1261,12 @@ if(MSVC)
 endif()
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
     # Tell DispatchStub (and every TU) that AVX2 kernel copies exist, so the
-    # AVX2 dispatch slots are registered and selected at runtime.
-    if(NOT MSVC)
-        target_compile_definitions(p10 PUBLIC HAVE_AVX2_CPU_DEFINITION)
-    endif()
-    if(TP_CXX_AVX512_FOUND AND NOT MSVC)
+    # AVX2 dispatch slots are registered and selected at runtime.  Directive
+    # scope matches torch's `add_compile_definitions("HAVE_AVX2_CPU_DEFINITION")`:
+    # every TU must see the same stub layout, and the capability copies now
+    # exist on MSVC too.
+    target_compile_definitions(p10 PUBLIC HAVE_AVX2_CPU_DEFINITION)
+    if(TP_CXX_AVX512_FOUND)
         target_compile_definitions(p10 PUBLIC HAVE_AVX512_CPU_DEFINITION)
     endif()
 elseif(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(powerpc|ppc)64" AND TP_CXX_VSX_FOUND)

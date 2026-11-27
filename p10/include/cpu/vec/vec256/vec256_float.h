@@ -224,9 +224,15 @@ struct Vectorized<float> {
     const __m256 abs_x = _mm256_andnot_ps(sign_bit, values);
     const __m256 t = _mm256_div_ps(
         one, _mm256_fmadd_ps(_mm256_set1_ps(poly::kErfTailScale), abs_x, one));
-    __m256 p = _mm256_set1_ps(poly::kErfTail[4]);
-    for (int i = 3; i >= 0; --i)
-      p = _mm256_fmadd_ps(p, t, _mm256_set1_ps(poly::kErfTail[i]));
+    // Written out, the way ATen's vec256_float.h writes it: a loop over the
+    // coefficient array keeps the array in memory and spends four chained
+    // broadcasts on it, which costs more than the division and the
+    // exponential together.
+    __m256 p = _mm256_fmadd_ps(_mm256_set1_ps(poly::kErfTail[4]), t,
+                               _mm256_set1_ps(poly::kErfTail[3]));
+    p = _mm256_fmadd_ps(p, t, _mm256_set1_ps(poly::kErfTail[2]));
+    p = _mm256_fmadd_ps(p, t, _mm256_set1_ps(poly::kErfTail[1]));
+    p = _mm256_fmadd_ps(p, t, _mm256_set1_ps(poly::kErfTail[0]));
     p = _mm256_mul_ps(p, t);
     const __m256 decay = tensorplay::tpsleef::exp(
         _mm256_xor_ps(sign_bit, _mm256_mul_ps(values, values)));
