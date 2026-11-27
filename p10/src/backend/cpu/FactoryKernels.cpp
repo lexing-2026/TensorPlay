@@ -19,6 +19,10 @@
 #include <algorithm>
 #include <cstring>
 
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
+
 namespace tensorplay {
 namespace cpu {
 
@@ -123,13 +127,45 @@ Tensor rand_kernel(const std::vector<int64_t>& size, DType dtype, Device device)
 namespace {
 // E|z|^2 == 1; complex rand draws components uniform on [0, 1).
 constexpr double kComplexComponentStd = 0.7071067811865476;  // 1/sqrt(2)
+
+// A 4 MB zero fill through a single std::memset rides one core's store
+// bandwidth (82 GB/s here, against torch's 336 GB/s because at::zero_ spreads
+// the walk over the intra-op pool).  Split the buffer into 256 KB chunks --
+// big enough that the per-chunk call overhead disappears, small enough that
+// the pool fills every core.  A buffer that small, or a call that already
+// sits inside an OpenMP region, keeps the plain memset.
+void zero_fill(void* data, size_t nbytes) {
+    constexpr size_t kChunk = 256 * 1024;
+#if defined(_OPENMP)
+    if (nbytes > kChunk && !omp_in_parallel()) {
+#else
+    if (nbytes > kChunk) {
+#endif
+        const int64_t chunks =
+            static_cast<int64_t>((nbytes + kChunk - 1) / kChunk);
+        tensorplay::parallel::parallel_for(0, chunks, 1,
+                                           [&](int64_t begin, int64_t end) {
+                                               for (int64_t c = begin; c < end; ++c) {
+                                                   const size_t off =
+                                                       static_cast<size_t>(c) * kChunk;
+                                                   const size_t len = std::min(
+                                                       kChunk, nbytes - off);
+                                                   std::memset(
+                                                       static_cast<char*>(data) + off,
+                                                       0, len);
+                                               }
+                                           });
+        return;
+    }
+    std::memset(data, 0, nbytes);
+}
 }  // namespace
 
 Tensor zeros_kernel(const std::vector<int64_t>& size, DType dtype, Device device, bool pin_memory) {
     Tensor t = allocate_cpu_tensor(size, dtype, pin_memory);
     size_t nbytes = t.numel() * t.itemsize();
     if (t.data_ptr()) {
-        std::memset(t.data_ptr(), 0, nbytes);
+        zero_fill(t.data_ptr(), nbytes);
     }
     return t;
 }
