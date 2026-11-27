@@ -879,7 +879,7 @@ Tensor jagged_to_padded_dense_forward_cpu(
 
 Tensor padded_dense_to_jagged_forward_cpu(
     const Tensor& padded, const std::vector<Tensor>& offsets_list,
-    const std::optional<int64_t>& total_l) {
+    std::optional<int64_t> total_l) {
     if (offsets_list.size() != 1) {
         TP_THROW(RuntimeError,
                  "_padded_dense_to_jagged_forward(): only a single jagged "
