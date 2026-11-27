@@ -354,6 +354,20 @@ Tensor unsqueeze_kernel(const Tensor& self, int64_t dim) {
 
 namespace {
 
+// The streaming store needs AVX2 in this translation unit: the base p10 objects
+// build at DEFAULT on GCC (MSVC compiles this file at /arch:AVX2), so the
+// intrinsic sits in its own function carrying the target attribute -- called
+// straight from the walk below it is a "target specific option mismatch".
+#if defined(__GNUC__) && !defined(__AVX2__)
+__attribute__((target("avx2")))
+#endif
+void stream_run_f32(float* out, const float* src, int64_t len) {
+    int64_t i = 0;
+    for (; i + 8 <= len; i += 8)
+        _mm256_stream_ps(out + i, _mm256_loadu_ps(src + i));
+    for (; i < len; ++i) out[i] = src[i];
+}
+
 // Concatenation along a dimension whose slices are contiguous runs.  Each input
 // contributes `size * inner` consecutive elements per outer index, and the
 // destination is written once and read only after cat() returns, so a long run
@@ -375,10 +389,7 @@ void cat_runs_f32(float* dst, const float* const* srcs, const int64_t* sizes,
             const float* src = srcs[k] + (o * sizes[k] * inner);
             float* out = dst + (o * out_at_dim + prefix) * inner;
             if (len >= 512 && ((reinterpret_cast<uintptr_t>(out) & 31u) == 0)) {
-                int64_t i = 0;
-                for (; i + 8 <= len; i += 8)
-                    _mm256_stream_ps(out + i, _mm256_loadu_ps(src + i));
-                for (; i < len; ++i) out[i] = src[i];
+                stream_run_f32(out, src, len);
             } else {
                 std::memcpy(out, src, static_cast<size_t>(len) * sizeof(float));
             }

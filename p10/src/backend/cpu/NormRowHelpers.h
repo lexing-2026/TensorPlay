@@ -211,7 +211,7 @@ inline void stats_f64_512(const double* x, int64_t n, double eps,
 // ---------------------------------------------------------------------------
 
 template <bool HW, bool HB>
-__attribute__((target("avx2")))
+__attribute__((target("avx2,fma")))
 inline void apply_f32_256(const float* in, float* out, int64_t n,
                           float mean, float rstd, const float* w, const float* b) {
     const __m256 vm = _mm256_set1_ps(mean);
@@ -233,7 +233,7 @@ inline void apply_f32_256(const float* in, float* out, int64_t n,
 }
 
 template <bool HW, bool HB>
-__attribute__((target("avx2")))
+__attribute__((target("avx2,fma")))
 inline void apply_group_f32_256(const float* in, float* out,
                                 int64_t channels, int64_t spatial,
                                 float mean, float rstd,
@@ -256,7 +256,7 @@ inline void apply_group_f32_256(const float* in, float* out,
     }
 }
 
-__attribute__((target("avx2")))
+__attribute__((target("avx2,fma")))
 inline void stats_f32_256(const float* x, int64_t n, float eps,
                           float* mean_out, float* rstd_out) {
     __m256 s0 = _mm256_setzero_ps(), s1 = _mm256_setzero_ps();
@@ -298,7 +298,7 @@ inline void stats_f32_256(const float* x, int64_t n, float eps,
 }
 
 template <bool HW, bool HB>
-__attribute__((target("avx2")))
+__attribute__((target("avx2,fma")))
 inline void apply_f64_256(const double* in, double* out, int64_t n,
                           double mean, double rstd, const double* w, const double* b) {
     const __m256d vm = _mm256_set1_pd(mean);
@@ -319,7 +319,7 @@ inline void apply_f64_256(const double* in, double* out, int64_t n,
     }
 }
 
-__attribute__((target("avx2")))
+__attribute__((target("avx2,fma")))
 inline void stats_f64_256(const double* x, int64_t n, double eps,
                           double* mean_out, double* rstd_out) {
     __m256d s0 = _mm256_setzero_pd(), s1 = _mm256_setzero_pd();

@@ -16,6 +16,18 @@ namespace tensorplay {
 namespace cpu {
 namespace blk16 {
 
+// GCC refuses to inline an AVX2 body into a baseline caller, and an inline
+// definition here would be pulled into exactly that caller: the attribute says
+// which ISA the body needs, noinline keeps it out of the baseline translation
+// unit that calls it.  MSVC compiles these files at /arch:AVX2 and needs
+// neither.
+#if defined(__GNUC__) && !defined(__AVX2__)
+#define TP_BLK16_TARGET __attribute__((target("avx2"), noinline))
+#else
+#define TP_BLK16_TARGET
+#endif
+
+
 // dst[k][j] = src[j][k] for j, k in [0, 16), with rows spaced by the given
 // element strides.  Use (16, spatial) for blocked -> NCHW and (spatial, 16)
 // for NCHW -> blocked.
@@ -25,13 +37,17 @@ namespace blk16 {
 // anyway: it drops the read-for-ownership traffic (a 25 MB plane costs 77 MB
 // of bandwidth with plain stores and 51 MB without).  The caller must then
 // guarantee 32-byte alignment on every destination row.
+// GCC compiles a lambda body under its own attributes, not the enclosing
+// function's, so the store is a free function carrying the target instead.
 template <bool NT>
-inline void transpose_tile(const float* src, int64_t src_row_stride,
+TP_BLK16_TARGET inline void store_tile(float* p, __m256 v) {
+    if constexpr (NT) _mm256_stream_ps(p, v);
+    else _mm256_storeu_ps(p, v);
+}
+
+template <bool NT>
+TP_BLK16_TARGET inline void transpose_tile(const float* src, int64_t src_row_stride,
                            float* dst, int64_t dst_row_stride) {
-    auto store = [](float* p, __m256 v) {
-        if constexpr (NT) _mm256_stream_ps(p, v);
-        else _mm256_storeu_ps(p, v);
-    };
     for (int h = 0; h < 2; ++h) {
         for (int p = 0; p < 2; ++p) {
             __m256 r0 = _mm256_loadu_ps(src + (p * 8 + 0) * src_row_stride + h * 8);
@@ -62,28 +78,28 @@ inline void transpose_tile(const float* src, int64_t src_row_stride,
             __m256 s7 = _mm256_shuffle_ps(t5, t7, 0xEE);
 
             float* out = dst + (h * 8) * dst_row_stride + p * 8;
-            store(out + 0 * dst_row_stride, _mm256_permute2f128_ps(s0, s4, 0x20));
-            store(out + 1 * dst_row_stride, _mm256_permute2f128_ps(s1, s5, 0x20));
-            store(out + 2 * dst_row_stride, _mm256_permute2f128_ps(s2, s6, 0x20));
-            store(out + 3 * dst_row_stride, _mm256_permute2f128_ps(s3, s7, 0x20));
-            store(out + 4 * dst_row_stride, _mm256_permute2f128_ps(s0, s4, 0x31));
-            store(out + 5 * dst_row_stride, _mm256_permute2f128_ps(s1, s5, 0x31));
-            store(out + 6 * dst_row_stride, _mm256_permute2f128_ps(s2, s6, 0x31));
-            store(out + 7 * dst_row_stride, _mm256_permute2f128_ps(s3, s7, 0x31));
+            store_tile<NT>(out + 0 * dst_row_stride, _mm256_permute2f128_ps(s0, s4, 0x20));
+            store_tile<NT>(out + 1 * dst_row_stride, _mm256_permute2f128_ps(s1, s5, 0x20));
+            store_tile<NT>(out + 2 * dst_row_stride, _mm256_permute2f128_ps(s2, s6, 0x20));
+            store_tile<NT>(out + 3 * dst_row_stride, _mm256_permute2f128_ps(s3, s7, 0x20));
+            store_tile<NT>(out + 4 * dst_row_stride, _mm256_permute2f128_ps(s0, s4, 0x31));
+            store_tile<NT>(out + 5 * dst_row_stride, _mm256_permute2f128_ps(s1, s5, 0x31));
+            store_tile<NT>(out + 6 * dst_row_stride, _mm256_permute2f128_ps(s2, s6, 0x31));
+            store_tile<NT>(out + 7 * dst_row_stride, _mm256_permute2f128_ps(s3, s7, 0x31));
         }
     }
 }
 
 // Whether a plane of `spatial` pixels can take the non-temporal path: every
 // destination row then starts at a 32-byte boundary.
-inline bool nt_eligible(const void* dst, int64_t spatial) {
+TP_BLK16_TARGET inline bool nt_eligible(const void* dst, int64_t spatial) {
     return (spatial % 8 == 0) && ((reinterpret_cast<uintptr_t>(dst) % 32) == 0);
 }
 
 // Converts `blocks` channel blocks of `spatial` pixels, stored as
 // [block][pixel][16], into [channel][pixel] planes.  The tail of a plane whose
 // pixel count is not a multiple of 16 is copied element by element.
-inline void blocked_to_planes(const float* src, float* dst,
+TP_BLK16_TARGET inline void blocked_to_planes(const float* src, float* dst,
                               int64_t blocks, int64_t spatial, bool nt) {
     const bool fast = nt && nt_eligible(dst, spatial);
     for (int64_t b = 0; b < blocks; ++b) {
@@ -105,7 +121,7 @@ inline void blocked_to_planes(const float* src, float* dst,
 }
 
 // The inverse: [channel][pixel] planes into [block][pixel][16] blocks.
-inline void planes_to_blocks(const float* src, float* dst,
+TP_BLK16_TARGET inline void planes_to_blocks(const float* src, float* dst,
                              int64_t blocks, int64_t spatial, bool nt) {
     const bool fast = nt && nt_eligible(dst, spatial);
     for (int64_t b = 0; b < blocks; ++b) {
@@ -130,7 +146,7 @@ inline void planes_to_blocks(const float* src, float* dst,
 // `pixel_stride` floats wide and whose channel 16b..16b+15 belong to block b.
 // This is the ordinary NCHW -> NHWC conversion (stride 16 only when the image
 // happens to have exactly 16 channels).
-inline void planes_to_pixels(const float* src, float* dst,
+TP_BLK16_TARGET inline void planes_to_pixels(const float* src, float* dst,
                              int64_t blocks, int64_t spatial,
                              int64_t pixel_stride, bool nt) {
     const bool fast = nt && (pixel_stride % 8 == 0) &&
@@ -160,7 +176,7 @@ inline void planes_to_pixels(const float* src, float* dst,
 // the destination stores sequential, and a sequential destination is what
 // makes non-temporal stores pay off: the same conversion then reads 25 MB and
 // writes 25 MB instead of also reading the destination for ownership.
-inline void planes_to_pixels64(const float* src, float* dst,
+TP_BLK16_TARGET inline void planes_to_pixels64(const float* src, float* dst,
                                int64_t spatial, int64_t pixel_stride, bool nt) {
     const bool fast = nt && (pixel_stride % 8 == 0) &&
                       ((reinterpret_cast<uintptr_t>(dst) % 32) == 0);
