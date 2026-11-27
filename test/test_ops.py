@@ -247,6 +247,20 @@ class TestOps(unittest.TestCase):
         restored = tp.ops.tp._padded_dense_to_jagged_forward(
             dense, [tp.tensor([0, 1, 2], dtype=tp.int64)])
         self.assertEqual(restored.tolist(), [[1.0, 2.0], [5.0, 6.0]])
+    def test_dyn_quant_4bit_pack_and_matmul(self):
+        # Two packed bytes, one output row, channelwise blocks of four.
+        weights = tp.tensor([[0x21, 0x43]], dtype=tp.uint8)
+        scales_zeros = tp.tensor([2.0])
+        bias = tp.tensor([3.0])
+        packed = tp.ops.tp._dyn_quant_pack_4bit_weight(
+            weights, scales_zeros, bias, 4, 4, 1)
+        self.assertEqual(tuple(packed.shape), (4,))
+        self.assertEqual(packed.tolist(), [33.0, 67.0, 2.0, 3.0])
+
+        x = tp.tensor([[1.0, 1.0, 1.0, 1.0]])
+        got = tp.ops.tp._dyn_quant_matmul_4bit(x, packed, 4, 4, 1)
+        self.assertEqual(tuple(got.shape), (1, 1))
+        self.assertTrue(tp.allclose(got, tp.tensor([[-41.0]])))
 class TestOpPackets(unittest.TestCase):
     def test_inplace_packet_call_reaches_the_kernel(self):
         # Ops whose resolver is not exposed as a C function answer from
