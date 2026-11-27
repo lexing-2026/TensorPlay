@@ -217,6 +217,20 @@ class TestOps(unittest.TestCase):
             tp.ops.tp._validate_compressed_sparse_indices(
                 True, crow, tp.tensor([0, 2, 0, 1, 9], dtype=tp.int64), 3, 3, 5)
 
+    def test_weight_int8pack_mm_dequantizes_weights_and_scales_rows(self):
+        x = tp.tensor([[1.0, 2.0], [3.0, 4.0]])
+        weight = tp.quantize_per_tensor(
+            tp.tensor([[1.0, -2.0], [3.0, 4.0]]), 1.0, 0, tp.qint8)
+        got = tp.ops.tp._weight_int8pack_mm(x, weight, tp.tensor([1.0, 2.0]))
+        self.assertEqual(tuple(got.shape), (2, 2))
+        self.assertEqual(got.dtype, tp.float32)
+        self.assertTrue(tp.allclose(got, tp.tensor([[-3.0, 22.0], [-5.0, 50.0]])))
+
+        with self.assertRaises(TypeError):
+            tp.ops.tp._weight_int8pack_mm(x, tp.tensor([1.0, 2.0]), tp.tensor([1.0, 2.0]))
+        with self.assertRaises(ValueError):
+            tp.ops.tp._weight_int8pack_mm(
+                x, weight, tp.tensor([1.0]))
 class TestOpPackets(unittest.TestCase):
     def test_inplace_packet_call_reaches_the_kernel(self):
         # Ops whose resolver is not exposed as a C function answer from
