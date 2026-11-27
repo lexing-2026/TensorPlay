@@ -261,6 +261,25 @@ class TestOps(unittest.TestCase):
         got = tp.ops.tp._dyn_quant_matmul_4bit(x, packed, 4, 4, 1)
         self.assertEqual(tuple(got.shape), (1, 1))
         self.assertTrue(tp.allclose(got, tp.tensor([[-41.0]])))
+    def test_transformer_encoder_layer_forward(self):
+        src = tp.tensor([[[1.0, 2.0], [3.0, 5.0]]])
+        embed = 2
+        zeros_e = tp.zeros(embed)
+        ones_e = tp.ones(embed)
+        qkv_weight = tp.zeros((3 * embed, embed))
+        qkv_bias = tp.zeros(3 * embed)
+        proj_weight = tp.zeros((embed, embed))
+        proj_bias = tp.zeros(embed)
+        eye = tp.tensor([[1.0, 0.0], [0.0, 1.0]])
+
+        out = tp.ops.tp._transformer_encoder_layer_fwd(
+            src, embed, 1, qkv_weight, qkv_bias, proj_weight, proj_bias,
+            True, True, 1e-5, ones_e, zeros_e, ones_e, zeros_e,
+            eye, zeros_e, eye, zeros_e, None, None)
+        norm = tp.layer_norm(src, [embed], ones_e, zeros_e, 1e-5)
+        expected = src + tp.gelu(norm)
+        self.assertEqual(tuple(out.shape), (1, 2, 2))
+        self.assertTrue(tp.allclose(out, expected, atol=1e-5))
 class TestOpPackets(unittest.TestCase):
     def test_inplace_packet_call_reaches_the_kernel(self):
         # Ops whose resolver is not exposed as a C function answer from
