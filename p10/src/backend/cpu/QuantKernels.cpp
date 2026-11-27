@@ -3782,6 +3782,127 @@ Tensor _weight_int8pack_mm_cpu(const Tensor& self, const Tensor& mat2,
     return out.to(self.dtype());
 }
 
+// Dynamic int4 weight-only packing: the fallback stores the nibble codes,
+// the fp32 scales/zeros and the optional bias in one flat fp32 buffer, which
+// is exactly what `_dyn_quant_matmul_4bit` consumes below.
+Tensor _dyn_quant_pack_4bit_weight_cpu(
+    const Tensor& weights, const Tensor& scales_zeros,
+    const std::optional<Tensor>& bias, int64_t block_size, int64_t in_features,
+    int64_t out_features) {
+    if (weights.dtype() != DType::UInt8) {
+        TP_THROW(TypeError,
+                 "_dyn_quant_pack_4bit_weight(): weight must be UInt8");
+    }
+    if (weights.numel() != out_features * in_features / 2) {
+        TP_THROW(ValueError,
+                 "_dyn_quant_pack_4bit_weight(): packed weight size does not "
+                 "match out_features * in_features / 2");
+    }
+    if (!(block_size == in_features ||
+          (block_size % 32 == 0 && in_features % block_size == 0))) {
+        TP_THROW(ValueError,
+                 "_dyn_quant_pack_4bit_weight(): block_size must divide "
+                 "in_features and be a multiple of 32");
+    }
+    if (scales_zeros.numel() != out_features * (in_features / block_size)) {
+        TP_THROW(ValueError,
+                 "_dyn_quant_pack_4bit_weight(): scales_zeros size does not "
+                 "match out_features * (in_features / block_size)");
+    }
+    if (bias.has_value() && bias->numel() != out_features) {
+        TP_THROW(ValueError,
+                 "_dyn_quant_pack_4bit_weight(): bias length must match "
+                 "out_features");
+    }
+    std::vector<Tensor> parts{
+        weights.to(DType::Float32).reshape({weights.numel()}),
+        scales_zeros.to(DType::Float32).reshape({scales_zeros.numel()}),
+    };
+    if (bias.has_value()) {
+        parts.push_back(bias->to(DType::Float32).reshape({bias->numel()}));
+    }
+    return Tensor::cat(parts, 0);
+}
+
+Tensor _dyn_quant_matmul_4bit_cpu(const Tensor& inp,
+                                  const Tensor& packed_weights,
+                                  int64_t block_size, int64_t in_features,
+                                  int64_t out_features) {
+    if (inp.dtype() != DType::Float32 &&
+        !(inp.dtype() == DType::BFloat16 && block_size == in_features)) {
+        TP_THROW(TypeError,
+                 "_dyn_quant_matmul_4bit(): input must be float32, or "
+                 "bfloat16 for channelwise quantization");
+    }
+    if (!(block_size == in_features ||
+          (block_size % 32 == 0 && in_features % block_size == 0))) {
+        TP_THROW(ValueError,
+                 "_dyn_quant_matmul_4bit(): block_size must divide "
+                 "in_features and be a multiple of 32");
+    }
+    const int64_t M = inp.size(0);
+    const int64_t weights_elements = out_features * in_features / 2;
+    const int64_t scale_elements =
+        out_features * (in_features / block_size);
+    if (packed_weights.numel() < weights_elements + scale_elements) {
+        TP_THROW(ValueError,
+                 "_dyn_quant_matmul_4bit(): packed weight buffer is too "
+                 "small");
+    }
+    Tensor packed = packed_weights.to(DType::Float32).contiguous();
+    Tensor codes =
+        packed.narrow(0, 0, weights_elements).to(DType::UInt8).contiguous();
+    Tensor tail =
+        packed.narrow(0, weights_elements,
+                      packed.size(0) - weights_elements)
+            .contiguous();
+    Tensor scales = tail.narrow(0, 0, scale_elements).contiguous();
+    std::optional<Tensor> bias;
+    const int64_t bias_elements = tail.size(0) - scale_elements;
+    if (bias_elements > 0) {
+        if (bias_elements != out_features) {
+            TP_THROW(ValueError,
+                     "_dyn_quant_matmul_4bit(): bias length must match "
+                     "out_features");
+        }
+        bias = tail.narrow(0, scale_elements, bias_elements).contiguous();
+    }
+    const Tensor x = inp.to(DType::Float32).contiguous();
+    const int8_t* wc = reinterpret_cast<const int8_t*>(codes.data_ptr());
+    const float* xp = x.data_ptr<float>();
+    const float* sp = scales.data_ptr<float>();
+    const float* bp = bias.has_value() ? bias->data_ptr<float>() : nullptr;
+    Tensor out =
+        Tensor::empty({M, out_features}, DType::Float32, inp.device());
+    float* dst = out.data_ptr<float>();
+    const int64_t blocks = in_features / block_size;
+    parallel_for(0, M * out_features, 32, [&](int64_t begin, int64_t end) {
+        for (int64_t i = begin; i < end; ++i) {
+            const int64_t row = i / out_features;
+            const int64_t col = i % out_features;
+            float acc = 0.0f;
+            const float* lhs = xp + row * in_features;
+            const int8_t* packed_row = wc + col * (in_features / 2);
+            for (int64_t block = 0; block < blocks; ++block) {
+                const float scale = sp[col * blocks + block];
+                const int64_t base = block * block_size;
+                for (int64_t k = 0; k < block_size; ++k) {
+                    const int64_t index = base + k;
+                    const uint8_t byte =
+                        static_cast<uint8_t>(packed_row[index / 2]);
+                    const int32_t code =
+                        (index % 2 == 0) ? (byte & 0x0F) : (byte >> 4);
+                    acc += lhs[index] * static_cast<float>(code - 8) * scale;
+                }
+            }
+            if (bp != nullptr) {
+                acc += bp[col];
+            }
+            dst[i] = acc;
+        }
+    });
+    return out.to(inp.dtype());
+}
 TENSORPLAY_LIBRARY_IMPL(CPU, QuantKernels) {
     m.impl("quantize_per_tensor", quantize_per_tensor_cpu);
     m.impl("quantize_per_channel", quantize_per_channel_cpu);
@@ -3792,6 +3913,8 @@ TENSORPLAY_LIBRARY_IMPL(CPU, QuantKernels) {
     m.impl("choose_scale_float8", choose_scale_float8_cpu);
     m.impl("quantized_linear", quantized_linear_cpu);
     m.impl("_weight_int8pack_mm", _weight_int8pack_mm_cpu);
+    m.impl("_dyn_quant_pack_4bit_weight", _dyn_quant_pack_4bit_weight_cpu);
+    m.impl("_dyn_quant_matmul_4bit", _dyn_quant_matmul_4bit_cpu);
     m.impl("quantized_linear_dynamic", quantized_linear_dynamic_cpu);
     m.impl("quantized_add", quantized_add_cpu);
     m.impl("quantized_sub", quantized_sub_cpu);
