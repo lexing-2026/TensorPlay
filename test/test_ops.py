@@ -228,7 +228,7 @@ class TestOps(unittest.TestCase):
 
         with self.assertRaises(TypeError):
             tp.ops.tp._weight_int8pack_mm(x, tp.tensor([1.0, 2.0]), tp.tensor([1.0, 2.0]))
-        with self.assertRaises(TypeError):
+        with self.assertRaises(ValueError):
             tp.ops.tp._weight_int8pack_mm(
                 x, weight, tp.tensor([1.0]))
 class TestOpPackets(unittest.TestCase):
