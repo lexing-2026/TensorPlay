@@ -231,6 +231,22 @@ class TestOps(unittest.TestCase):
         with self.assertRaises(ValueError):
             tp.ops.tp._weight_int8pack_mm(
                 x, weight, tp.tensor([1.0]))
+    def test_jagged_padded_dense_round_trip(self):
+        values = tp.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+        offsets = tp.tensor([0, 2, 3], dtype=tp.int64)
+
+        padded = tp.ops.tp._jagged_to_padded_dense_forward(
+            values, [offsets], [2], 0.0)
+        self.assertEqual(tuple(padded.shape), (2, 2, 2))
+        self.assertEqual(padded.tolist(), [
+            [[1.0, 2.0], [3.0, 4.0]],
+            [[5.0, 6.0], [0.0, 0.0]],
+        ])
+
+        dense = tp.tensor([[[1.0, 2.0]], [[5.0, 6.0]]])
+        restored = tp.ops.tp._padded_dense_to_jagged_forward(
+            dense, [tp.tensor([0, 1, 2], dtype=tp.int64)])
+        self.assertEqual(restored.tolist(), [[1.0, 2.0], [5.0, 6.0]])
 class TestOpPackets(unittest.TestCase):
     def test_inplace_packet_call_reaches_the_kernel(self):
         # Ops whose resolver is not exposed as a C function answer from
