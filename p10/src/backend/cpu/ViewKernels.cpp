@@ -8,6 +8,12 @@
 #include <numeric>
 #include <algorithm>
 #include <limits>
+#include <cmath>
+#include <cstring>
+#include "Parallel.h"
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
 
 namespace tensorplay {
 namespace cpu {
@@ -346,6 +352,54 @@ Tensor unsqueeze_kernel(const Tensor& self, int64_t dim) {
 
 // --- Joining Ops ---
 
+namespace {
+
+// The streaming store needs AVX2 in this translation unit: the base p10 objects
+// build at DEFAULT on GCC (MSVC compiles this file at /arch:AVX2), so the
+// intrinsic sits in its own function carrying the target attribute -- called
+// straight from the walk below it is a "target specific option mismatch".
+#if defined(__GNUC__) && !defined(__AVX2__)
+__attribute__((target("avx2")))
+#endif
+void stream_run_f32(float* out, const float* src, int64_t len) {
+    int64_t i = 0;
+    for (; i + 8 <= len; i += 8)
+        _mm256_stream_ps(out + i, _mm256_loadu_ps(src + i));
+    for (; i < len; ++i) out[i] = src[i];
+}
+
+// Concatenation along a dimension whose slices are contiguous runs.  Each input
+// contributes `size * inner` consecutive elements per outer index, and the
+// destination is written once and read only after cat() returns, so a long run
+// moves with non-temporal stores instead of fetching the lines it overwrites:
+// for four 2048x2048 halves along dim 1 that is 128 MB of traffic instead of
+// 192 MB.  Runs shorter than 2 KB keep memcpy, where the fetch does not
+// dominate.
+void cat_runs_f32(float* dst, const float* const* srcs, const int64_t* sizes,
+                  int64_t nsrc, int64_t outer, int64_t inner,
+                  int64_t out_at_dim) {
+    const int64_t runs = outer * nsrc;
+    parallel::parallel_for(0, runs, 1, [&](int64_t b, int64_t e) {
+        for (int64_t r = b; r < e; ++r) {
+            const int64_t o = r / nsrc;
+            const int64_t k = r - o * nsrc;
+            int64_t prefix = 0;
+            for (int64_t j = 0; j < k; ++j) prefix += sizes[j];
+            const int64_t len = sizes[k] * inner;
+            const float* src = srcs[k] + (o * sizes[k] * inner);
+            float* out = dst + (o * out_at_dim + prefix) * inner;
+            if (len >= 512 && ((reinterpret_cast<uintptr_t>(out) & 31u) == 0)) {
+                stream_run_f32(out, src, len);
+            } else {
+                std::memcpy(out, src, static_cast<size_t>(len) * sizeof(float));
+            }
+        }
+    });
+    _mm_sfence();
+}
+
+}  // namespace
+
 Tensor cat_kernel(const std::vector<Tensor>& tensors, int64_t dim) {
     // check_cat_no_zero_dim -> legacy_cat_wrap_dim -> non-empty check ->
     // first-valid-tensor selection -> shape checks -> result_type promotion.
@@ -411,6 +465,33 @@ Tensor cat_kernel(const std::vector<Tensor>& tensors, int64_t dim) {
     }
 
     Tensor out = Tensor::empty(out_shape, out_dtype, tensors[0].device());
+
+    // Every input of the same float type and dense layout lets the result be
+    // filled run by run, without the slice/copy_ pair per input.
+    if (out_dtype == DType::Float32 && valid >= 0) {
+        bool dense = true;
+        for (const auto& t : tensors) {
+            if (join_detail::should_skip(t)) continue;
+            if (t.dtype() != DType::Float32 || !t.is_contiguous()) { dense = false; break; }
+        }
+        if (dense) {
+            std::vector<const float*> srcs;
+            std::vector<int64_t> sizes;
+            for (const auto& t : tensors) {
+                if (join_detail::should_skip(t)) continue;
+                srcs.push_back(t.data_ptr<float>());
+                sizes.push_back(t.size(dim));
+            }
+            int64_t outer = 1;
+            for (int64_t d = 0; d < dim; ++d) outer *= out.size(d);
+            int64_t inner = 1;
+            for (int64_t d = dim + 1; d < out.dim(); ++d) inner *= out.size(d);
+            cat_runs_f32(out.data_ptr<float>(), srcs.data(), sizes.data(),
+                         static_cast<int64_t>(sizes.size()), outer, inner,
+                         out.size(dim));
+            return out;
+        }
+    }
 
     int64_t offset = 0;
     for (const auto& t : tensors) {

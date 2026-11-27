@@ -8,6 +8,7 @@
 #include "OneDNNContext.h"
 #include "Allocator.h"
 #include "GradMode.h"
+#include "cpu/BlockTranspose.h"
 #include <memory>
 #include <vector>
 #include <cmath>
@@ -269,13 +270,12 @@ void onednn_matmul_gemm(bool transA, bool transB, int64_t M, int64_t N, int64_t 
 
     dnnl::memory src_mem(entry->user_src, eng, const_cast<float*>(A));
     dnnl::memory wei_mem(entry->user_wei, eng, const_cast<float*>(B));
-    dnnl::memory dst_mem(entry->user_dst, eng, C);
 
     // Result buffer: the primitive computes dst = src * weights; the
-    // alpha/beta combination is applied afterwards.
+    // alpha/beta combination is applied afterwards.  The direct path below
+    // writes the user buffer, so the staging copy is only built for a caller
+    // that actually needs the mix.
     int64_t out_count = M * N;
-    std::vector<float> tmp(out_count, 0.0f);
-    dnnl::memory tmp_mem(entry->user_dst, eng, tmp.data());
 
     Storage src_tmp, wei_tmp;
     if (entry->reorder_src) {
@@ -290,6 +290,25 @@ void onednn_matmul_gemm(bool transA, bool transB, int64_t M, int64_t N, int64_t 
         dnnl::reorder(wei_mem, m).execute(s, wei_mem, m);
         wei_mem = m;
     }
+
+    // dst == C * 1.0 + 0.0 is the only shape the 1x1 projection asks for, and
+    // there the plain destination descriptor already matches the user buffer:
+    // writing C directly drops a full-size staging buffer and the copy back
+    // (two 1.6 MB streams per image at 128x56x56).
+    if (!entry->reorder_dst && alpha == 1.0f && beta == 0.0f) {
+        dnnl::memory direct_dst(entry->user_dst, eng, C);
+        entry->prim.execute(s, {
+            {DNNL_ARG_SRC, src_mem},
+            {DNNL_ARG_WEIGHTS, wei_mem},
+            {DNNL_ARG_DST, direct_dst},
+            {DNNL_ARG_SCRATCHPAD, sit->second},
+        });
+        s.wait();
+        return;
+    }
+
+    std::vector<float> tmp(out_count, 0.0f);
+    dnnl::memory tmp_mem(entry->user_dst, eng, tmp.data());
 
     entry->prim.execute(s, {
         {DNNL_ARG_SRC, src_mem},
@@ -1037,8 +1056,40 @@ static bool conv2d_onednn(const Tensor& input, const Tensor& weight, const Tenso
             // For 1x1 convolutions, we used to force NHWC, but this causes reorders if previous layer is blocked.
             // Let OneDNN decide globally.
             bool is_1x1 = (key.kh == 1 && key.kw == 1 && key.sh == 1 && key.sw == 1 && key.ph_t == 0 && key.ph_b == 0 && key.pw_l == 0 && key.pw_r == 0);
-            auto src_tag = nhwc_act ? memory::format_tag::nhwc : memory::format_tag::any;
-            auto dst_tag = nhwc_act ? memory::format_tag::nhwc : memory::format_tag::any;
+            // A shallow activation (C <= 4) has nothing to gain from a blocked
+            // layout: the reorder of the 3-channel source costs more than the
+            // kernel saves.  TP_CONV_NCHW=1 forces plain NCHW for comparison.
+            static const bool force_nchw = std::getenv("TP_CONV_NCHW") != nullptr;
+            // A 16-channel blocked activation is the layout the engine's own
+            // jit convolution kernels are written for; until now the engine
+            // was left free to pick NHWC instead, which costs a full
+            // activation reorder on both sides.  TP_CONV_NO_BLOCK16 restores
+            // that pick for comparison.
+            static const bool no_block16 = std::getenv("TP_CONV_NO_BLOCK16") != nullptr;
+            // The source and destination decide separately: a 3-channel source
+            // cannot be blocked, while its 64-channel destination still gains
+            // from the layout the jit kernels write natively.
+            const bool src_block16 = !nhwc_act && !no_block16 && input.size(1) % 16 == 0;
+            const bool dst_block16 = !nhwc_act && !no_block16 && output.size(1) % 16 == 0;
+            // The 16-channel output is converted back to NCHW with a tiled
+            // transpose instead of the engine's reorder; TP_CONV_OLD_DST
+            // restores the reorder for comparison.
+            static const bool blk_dst_fast = std::getenv("TP_CONV_OLD_DST") == nullptr;
+            // Non-temporal stores on the conversions are only worth it where
+            // the rows land sequentially; the two directions differ there, so
+            // each side is switched on its own for measurement.
+            constexpr bool nt_in = false;
+            constexpr bool nt_out = false;
+            const bool flat_nchw = !nhwc_act &&
+                (force_nchw || input.size(1) <= 4);
+            auto src_tag = nhwc_act ? memory::format_tag::nhwc
+                                    : (flat_nchw ? memory::format_tag::nchw
+                                                 : (src_block16 ? memory::format_tag::nChw16c
+                                                                : memory::format_tag::any));
+            auto dst_tag = nhwc_act ? memory::format_tag::nhwc
+                                    : (force_nchw ? memory::format_tag::nchw
+                                                  : (dst_block16 ? memory::format_tag::nChw16c
+                                                                 : memory::format_tag::any));
             
             auto src_md = memory::desc(src_dims, dt, src_tag);
             auto dst_md = memory::desc(dst_dims, dt, dst_tag);
@@ -1065,6 +1116,9 @@ static bool conv2d_onednn(const Tensor& input, const Tensor& weight, const Tenso
                 dnnl::algorithm algo = get_onednn_algo(key.kh, key.kw);
                 convolution_forward::primitive_desc conv_pd;
                 primitive_attr conv_attr;
+                // Pin the working buffer next to the primitive instead of
+                // letting the library allocate one on every execute call.
+                conv_attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
                 if (fused_relu) {
                     post_ops conv_ops;
                     conv_ops.append_eltwise(algorithm::eltwise_relu, 0.0f, 0.0f);
@@ -1171,7 +1225,26 @@ static bool conv2d_onednn(const Tensor& input, const Tensor& weight, const Tenso
              reordered_input_storage = Storage(req_size, allocator);
 
              src_mem = memory(expected_src_md, eng, reordered_input_storage.data());
-             
+
+             // A plain NCHW source going into 16-channel blocks is the same
+             // tiled transpose as the output side (in the other direction),
+             // and it is faster than the engine's reorder as well.
+             const bool plain_in =
+                 user_src_md == memory::desc(src_dims, dt, memory::format_tag::nchw);
+             const bool blocked_in =
+                 expected_src_md == memory::desc(src_dims, dt, memory::format_tag::nChw16c);
+             if (blk_dst_fast && plain_in && blocked_in &&
+                 dt == dnnl::memory::data_type::f32 && input.size(1) % 16 == 0) {
+                 const int64_t spatial = input.size(2) * input.size(3);
+                 const int64_t blocks = input.size(0) * (input.size(1) / 16);
+                 const float* in_ptr = static_cast<const float*>(input.data_ptr());
+                 float* out_ptr = static_cast<float*>(reordered_input_storage.data());
+                 parallel_for(0, blocks, 1, [&](int64_t begin, int64_t end) {
+                     blk16::planes_to_blocks(in_ptr + begin * 16 * spatial,
+                                             out_ptr + begin * spatial * 16,
+                                             end - begin, spatial, nt_in);
+                 });
+             } else {
              reorder r_prim;
              bool r_found = false;
              for (const auto& item : cached_entry.reorder_input_cache) {
@@ -1194,6 +1267,7 @@ static bool conv2d_onednn(const Tensor& input, const Tensor& weight, const Tenso
                  }
              }
              r_prim.execute(s, user_src_mem, src_mem);
+             }
         } else {
              src_mem = user_src_mem;
         }
@@ -1356,7 +1430,39 @@ static bool conv2d_onednn(const Tensor& input, const Tensor& weight, const Tenso
         
         if (need_reorder_dst) {
              auto user_dst_mem = memory(user_dst_md, eng, output.data_ptr());
-             reorder(dst_mem, user_dst_mem).execute(s, dst_mem, user_dst_mem);
+             // A plain NCHW destination filled from a 16-channel block is a
+             // 16x16 tiled transpose, and doing it here beats the engine's own
+             // reorder (which costs 2.4 ms against 1.2 ms at 32x64x56x56).
+             const bool plain_out =
+                 user_dst_md == memory::desc(dst_dims, dt, memory::format_tag::nchw);
+             if (blk_dst_fast && plain_out && dt == dnnl::memory::data_type::f32 &&
+                 output.size(1) % 16 == 0) {
+                 const int64_t spatial = output.size(2) * output.size(3);
+                 const int64_t blocks = output.size(0) * (output.size(1) / 16);
+                 const float* src = static_cast<const float*>(blocked_storage_handle.data());
+                 float* dst = static_cast<float*>(output.data_ptr());
+                 parallel_for(0, blocks, 1, [&](int64_t begin, int64_t end) {
+                     blk16::blocked_to_planes(src + begin * spatial * 16,
+                                              dst + begin * 16 * spatial,
+                                              end - begin, spatial, nt_out);
+                 });
+             } else {
+             // The destination reorder sits on the critical path of every
+             // convolution: pinning the scratchpad to the primitive keeps it
+             // from allocating a working buffer on every call, which is what
+             // the library's default mode does.
+             primitive_attr rattr;
+             rattr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+             auto rpd = reorder::primitive_desc(dst_mem, user_dst_mem, rattr);
+             reorder r_prim(rpd);
+             std::unordered_map<int, memory> rargs{
+                 {DNNL_ARG_FROM, dst_mem}, {DNNL_ARG_TO, user_dst_mem}};
+             if (rpd.scratchpad_desc().get_size() > 0) {
+                 rargs.insert({DNNL_ARG_SCRATCHPAD,
+                               memory(rpd.scratchpad_desc(), eng)});
+             }
+             r_prim.execute(s, rargs);
+             }
         }
         
         s.wait();
@@ -3034,7 +3140,11 @@ namespace {
 // claimed because only this backend understands that layout.
 bool onednn_claims_conv2d(const Tensor& input, const Tensor& weight,
                           int64_t sH, int64_t sW, int64_t dH, int64_t dW,
-                          int64_t groups) {
+                          int64_t groups, int64_t pad_sum, bool cl_out) {
+    // TP_CONV_NATIVE=1 keeps every call on the native kernels; it exists so the
+    // two backends can be compared on the same shape without editing code.
+    static const bool native_only = std::getenv("TP_CONV_NATIVE") != nullptr;
+    if (native_only) return false;
     if (!tensorplay::globalContext().userEnabledMkldnn()) return false;
     if (input.unsafeGetTensorImpl()->has_onednn_md()) return true;
     // Reduced-precision activations have no native kernel behind this call:
@@ -3047,6 +3157,16 @@ bool onednn_claims_conv2d(const Tensor& input, const Tensor& weight,
     const int64_t N = input.size(0);
     const int64_t kH = weight.size(2);
     const int64_t kW = weight.size(3);
+    // A pure 1x1 projection on a contiguous NCHW batch measures faster on the
+    // native GEMM than in the engine (3.5 ms against 4.5 ms at
+    // 32x64x56x56), and the batch walk there runs the GEMM on the calling
+    // thread instead of on the intra-op pool, so the results stay exact.
+    // Channels-last requests stay with the engine: the native kernel writes
+    // NCHW.
+    if (N > 1 && kH == 1 && kW == 1 && !strided && !dilated &&
+        groups == 1 && pad_sum == 0 && !cl_out) {
+        return false;
+    }
     const bool shape_prefers_onednn =
         strided || dilated || N >= 16 || kW != 1 || kH != 1 ||
         tensorplay::parallel::get_num_threads() > 1;
@@ -3198,7 +3318,8 @@ static Tensor conv2d_cpu_impl(const Tensor& input_arg, const Tensor& weight_arg,
 #ifdef USE_ONEDNN
     // oneDNN claims the call first when enabled and its shape heuristics hold;
     // otherwise the call falls through to NNPACK or the native kernels.
-    if (onednn_claims_conv2d(input, weight, sH, sW, dH, dW, groups)) {
+    if (onednn_claims_conv2d(input, weight, sH, sW, dH, dW, groups,
+                             pH_top + pH_bottom + pW_left + pW_right, use_cl)) {
         handled = conv2d_onednn(input, weight, bias, stride, pH_top, pH_bottom, pW_left, pW_right, dilation, groups, out, fused_relu);
     }
 #endif
@@ -3242,7 +3363,25 @@ static Tensor conv2d_cpu_impl(const Tensor& input_arg, const Tensor& weight_arg,
         const float* in_ptr = input.data_ptr<float>();
         const float* w_ptr = weight.data_ptr<float>();
         float* out_ptr = out.data_ptr<float>();
-        
+
+        // Optimization: 1x1 Conv check (Stride 1, Pad 0)
+        const bool is_1x1 = (kH == 1 && kW == 1 && sH == 1 && sW == 1 && dH == 1 && dW == 1 &&
+                             pH_top == 0 && pH_bottom == 0 && pW_left == 0 && pW_right == 0);
+
+        // A 1x1 projection feeds the GEMM one raw activation block per batch
+        // image, and that GEMM hands its partitioning back to the intra-op
+        // pool.  Driving it from inside this OpenMP batch loop nests the two
+        // and every image past the first two comes back wrong (verified
+        // against torch for N=4 and N=32), so the batch walk stays on the
+        // calling thread here and oneDNN threads each GEMM on its own.
+        if (is_1x1 && groups == 1 && N > 1) {
+            for (int64_t n = 0; n < N; ++n) {
+                gemm_direct(false, false, C_out, out_spatial, C_in, 1.0f,
+                            w_ptr, C_in,
+                            in_ptr + n * C_in * out_spatial, out_spatial,
+                            0.0f, out_ptr + n * C_out * out_spatial, out_spatial);
+            }
+        } else {
         // Parallelize over batch size N
         // Each thread needs its own 'col' buffer
         #ifdef _OPENMP
@@ -3252,10 +3391,6 @@ static Tensor conv2d_cpu_impl(const Tensor& input_arg, const Tensor& weight_arg,
             #ifdef USE_MKL
             mkl_set_num_threads_local(1);
             #endif
-
-            // Optimization: 1x1 Conv check (Stride 1, Pad 0)
-            bool is_1x1 = (kH == 1 && kW == 1 && sH == 1 && sW == 1 && dH == 1 && dW == 1 && 
-                           pH_top == 0 && pH_bottom == 0 && pW_left == 0 && pW_right == 0);
 
             // Optimization: Avoid zero-initialization using unique_ptr + new[]
             std::unique_ptr<float[]> col_buffer;
@@ -3367,6 +3502,7 @@ static Tensor conv2d_cpu_impl(const Tensor& input_arg, const Tensor& weight_arg,
                                 0.0f, out_n_g, out_spatial);
                 }
             }
+        }
         }
         
         // Add bias if present (Parallelized)
@@ -7622,3 +7758,5 @@ TENSORPLAY_LIBRARY_IMPL(CPU, ConvKernels) {
 
 } // namespace cpu
 } // namespace tensorplay
+
+

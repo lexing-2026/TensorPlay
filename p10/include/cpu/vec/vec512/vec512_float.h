@@ -15,6 +15,7 @@
 #include "cpu/vec/vec_base.h"
 #include "cpu/vec/ErfPoly.h"
 #include "cpu/vec/SleefShims.h"
+#include "cpu/vec/ExpFast512.h"
 #include "cpu/SpecialMath.h"
 
 #include <algorithm>
@@ -286,25 +287,46 @@ struct Vectorized<float> {
     // One five-term form covers the whole range: the reciprocal argument maps
     // [0, inf) onto (0, 1], so a single polynomial serves both the linear
     // region and the tail and no lane takes a branch.
+    //
+    // Past 3.9 erf is within 2e-8 of 1, so the argument is clamped there first:
+    // that keeps exp(-x*x) in [1.6e-7, 1], which lets the exponential skip its
+    // saturation masks and its degree-6 term.
     namespace poly = tensorplay::vecmath;
     const __m512 sign_bit = _mm512_set1_ps(-0.0f);
     const __m512 one = _mm512_set1_ps(1.0f);
+    const __m512 sat = _mm512_set1_ps(3.9000288f);
     const __m512 abs_x = _mm512_andnot_ps(sign_bit, values);
-    const __m512 t = _mm512_div_ps(
-        one, _mm512_fmadd_ps(_mm512_set1_ps(poly::kErfTailScale), abs_x, one));
-    __m512 p = _mm512_set1_ps(poly::kErfTail[4]);
-    for (int i = 3; i >= 0; --i)
-      p = _mm512_fmadd_ps(p, t, _mm512_set1_ps(poly::kErfTail[i]));
+    const __m512 a = _mm512_min_ps(abs_x, sat);
+    // The reciprocal is a Newton step on vrcp14ps instead of vdivps: the
+    // argument here is 1 + 0.3276*|x| inside [1, 2.28], where the 14-bit seed
+    // is already within 6e-5, and one Newton step leaves 4e-9 -- four orders
+    // tighter than the 5e-7 the polynomial itself carries.
+    const __m512 d = _mm512_fmadd_ps(_mm512_set1_ps(poly::kErfTailScale), a, one);
+    const __m512 t0 = _mm512_rcp14_ps(d);
+    const __m512 e = _mm512_fnmadd_ps(d, t0, one);
+    const __m512 t = _mm512_fmadd_ps(t0, e, t0);
+    // Horner chain written out, the way ATen's vec512_float.h writes it: a
+    // loop over the coefficient array keeps the array in memory and spends
+    // four chained broadcasts on it, which is ~26 cycles per vector -- visibly
+    // more than the division and the exponential together.
+    __m512 p = _mm512_fmadd_ps(_mm512_set1_ps(poly::kErfTail[4]), t,
+                               _mm512_set1_ps(poly::kErfTail[3]));
+    p = _mm512_fmadd_ps(p, t, _mm512_set1_ps(poly::kErfTail[2]));
+    p = _mm512_fmadd_ps(p, t, _mm512_set1_ps(poly::kErfTail[1]));
+    p = _mm512_fmadd_ps(p, t, _mm512_set1_ps(poly::kErfTail[0]));
     p = _mm512_mul_ps(p, t);
-    const __m512 decay = tensorplay::tpsleef::exp(
-        _mm512_xor_ps(sign_bit, _mm512_mul_ps(values, values)));
+    const __m512 decay = tensorplay::vecfast::exp_neg_square_tight512(a);
     const __m512 r = _mm512_sub_ps(one, _mm512_mul_ps(p, decay));
-    return _mm512_or_ps(_mm512_and_ps(sign_bit, values), r);
+    const __m512 out = _mm512_or_ps(_mm512_and_ps(sign_bit, values), r);
+    // NaN in / NaN out: min() maps a NaN lane onto its second operand, so the
+    // saturated value would otherwise turn into a finite result.
+    return _mm512_mask_mov_ps(
+        out, _mm512_cmp_ps_mask(values, values, _CMP_UNORD_Q), values);
   }  Vectorized<float> erfc() const {
     return tensorplay::tpsleef::erfc(values);
   }
   Vectorized<float> exp() const {
-    return tensorplay::tpsleef::exp(values);
+    return tensorplay::vecfast::exp512(values);
   }
   Vectorized<float> exp2() const {
     return tensorplay::tpsleef::exp2(values);
@@ -313,10 +335,10 @@ struct Vectorized<float> {
     return tensorplay::tpsleef::expm1(values);
   }
   Vectorized<float> exp_u20() const {
-    return tensorplay::tpsleef::exp(values);
+    return tensorplay::vecfast::exp512(values);
   }
   Vectorized<float> fexp_u20() const {
-    return tensorplay::tpsleef::exp(values);
+    return tensorplay::vecfast::exp512(values);
   }
   Vectorized<float> fmod(const Vectorized<float>& q) const {
     __at_align__ float tmp[size()];

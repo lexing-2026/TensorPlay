@@ -1387,23 +1387,25 @@ template <typename T>
 double nll2d_rows_typed(const T* input, const int64_t* target, const T* weight,
                         T* out, int64_t batch, int64_t classes, int64_t hw,
                         int64_t ignore_index, bool has_weight) {
-    return parallel_ranges(batch, hw, [&](int64_t begin, int64_t end) -> double {
+    // Flatten to one unit per sampled score: the batch is only 8 wide here,
+    // so ranges over the batch hand the whole 8x784 problem to one thread.
+    // 512 scores per range keeps every core fed and keeps the target walk
+    // dense, the way the flat nll row loop does.
+    return parallel_ranges(batch * hw, 512, [&](int64_t begin, int64_t end) -> double {
         double total = 0.0;
-        for (int64_t b = begin; b < end; ++b) {
+        for (int64_t r = begin; r < end; ++r) {
+            const int64_t b = r / hw;
+            const int64_t pos = r - b * hw;
             const T* base = input + b * classes * hw;
-            const int64_t* trow = target + b * hw;
-            T* orow = out ? out + b * hw : nullptr;
-            for (int64_t pos = 0; pos < hw; ++pos) {
-                const int64_t t = trow[pos];
-                double row_loss = 0.0;
-                if (t != ignore_index) {
-                    const double w =
-                        has_weight ? static_cast<double>(weight[t]) : 1.0;
-                    row_loss = -static_cast<double>(base[t * hw + pos]) * w;
-                }
-                total += row_loss;
-                if (orow) orow[pos] = static_cast<T>(row_loss);
+            const int64_t t = target[r];
+            double row_loss = 0.0;
+            if (t != ignore_index) {
+                const double w =
+                    has_weight ? static_cast<double>(weight[t]) : 1.0;
+                row_loss = -static_cast<double>(base[t * hw + pos]) * w;
             }
+            total += row_loss;
+            if (out) out[r] = static_cast<T>(row_loss);
         }
         return total;
     });
