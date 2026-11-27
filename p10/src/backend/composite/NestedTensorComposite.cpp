@@ -985,7 +985,7 @@ TENSORPLAY_LIBRARY_IMPL(Composite, NestedTensorKernels) {
     m.impl("_nested_tensor_softmax_with_shape", nested_softmax_with_shape);
 }
 
-TENSORPLAY_LIBRARY_IMPL(CPU, NestedTensorKernels) {
+TENSORPLAY_LIBRARY_IMPL(CPU, NestedTensorCPUKernels) {
     m.impl("_jagged_to_padded_dense_forward", jagged_to_padded_dense_forward_cpu);
     m.impl("_padded_dense_to_jagged_forward", padded_dense_to_jagged_forward_cpu);
 }
