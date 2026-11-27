@@ -773,6 +773,45 @@ Tensor compressed_to_csr_cpu(const Tensor& self) {
         static_cast<std::vector<int64_t>>(self.shape()));
 }
 
+void validate_compressed_sparse_indices_cpu(
+        bool is_crow, const Tensor& compressed_idx, const Tensor& plain_idx,
+        int64_t cdim, int64_t dim, int64_t nnz) {
+    TP_CHECK(compressed_idx.dim() == 1 && plain_idx.dim() == 1,
+             "_validate_compressed_sparse_indices: indices must be 1-D");
+    const int64_t compressed_len = cdim + (is_crow ? 1 : 0);
+    TP_CHECK(compressed_idx.numel() == compressed_len,
+             "_validate_compressed_sparse_indices: compressed index length ",
+             compressed_idx.numel(), " != ", compressed_len);
+    TP_CHECK(plain_idx.numel() == nnz,
+             "_validate_compressed_sparse_indices: plain index length ",
+             plain_idx.numel(), " != nnz ", nnz);
+    const Tensor compressed = compressed_idx.to(DType::Int64).contiguous();
+    const Tensor plain = plain_idx.to(DType::Int64).contiguous();
+    const int64_t* crow = compressed.data_ptr<int64_t>();
+    const int64_t* col = plain.data_ptr<int64_t>();
+    if (is_crow) {
+        TP_CHECK(crow[0] == 0,
+                 "_validate_compressed_sparse_indices: crow_indices[0] must be 0");
+        TP_CHECK(crow[cdim] == nnz,
+                 "_validate_compressed_sparse_indices: crow_indices[-1] must equal nnz");
+        for (int64_t i = 1; i <= cdim; ++i) {
+            const int64_t step = crow[i] - crow[i - 1];
+            TP_CHECK(step >= 0 && step <= dim,
+                     "_validate_compressed_sparse_indices: crow_indices must be "
+                     "non-decreasing and each row at most ", dim, " wide");
+        }
+    } else {
+        for (int64_t i = 0; i < cdim; ++i) {
+            TP_CHECK(crow[i] >= 0 && crow[i] <= nnz,
+                     "_validate_compressed_sparse_indices: compressed index out of range");
+        }
+    }
+    for (int64_t i = 0; i < nnz; ++i) {
+        TP_CHECK(col[i] >= 0 && col[i] < dim,
+                 "_validate_compressed_sparse_indices: plain index out of range");
+    }
+}
+
 Tensor to_sparse_csr_cpu(const Tensor& self) {
     if (self.dim() != 2) {
         TP_THROW(RuntimeError,
@@ -2076,6 +2115,8 @@ Tensor norm_sparse_dim_cpu(const Tensor& self,
 TENSORPLAY_LIBRARY_IMPL(SparseCPU, SparseNormKernels) {
     m.impl("norm", norm_sparse_cpu);
     m.impl("norm.dim", norm_sparse_dim_cpu);
+    m.impl("_validate_compressed_sparse_indices",
+           validate_compressed_sparse_indices_cpu);
 }
 
 } // namespace cpu
