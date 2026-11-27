@@ -1,4 +1,3 @@
-#include "QuantNative.h"
 #include "QuantKernels.h"
 #include "QuantElementwise.h"
 #include "cpu/QuantizedElementwiseKernels.h"
@@ -11,6 +10,7 @@
 #include "Scalar.h"
 #include "SizesAndStrides.h"
 #include "Utils.h"
+#include "tensorplay/ops/TPXOpsGenerated.h"
 #include "cpu/vec/vec.h"
 
 #include <cmath>
@@ -28,6 +28,8 @@
 
 namespace tensorplay {
 namespace cpu {
+
+namespace ops = tensorplay::tpx::ops;
 
 using namespace tensorplay::parallel;
 
@@ -3730,6 +3732,48 @@ Tensor quantized_conv3d_cpu(
         dilation, groups);
 }
 
+// Weight-only int8 GEMM: `self` is the fp activation matrix [B, K], `mat2`
+// the raw int8 weight [N, K], and `scales` one multiplier per output row.
+Tensor _weight_int8pack_mm_cpu(const Tensor& self, const Tensor& mat2,
+                              const Tensor& scales) {
+    if (mat2.dtype() != DType::QInt8) {
+        TP_THROW(TypeError, "_weight_int8pack_mm(): weight must be QInt8");
+    }
+    if (self.dim() != 2 || mat2.dim() != 2 || scales.dim() != 1) {
+        TP_THROW(ValueError,
+                 "_weight_int8pack_mm(): expected 2-D activations [B,K], "
+                 "2-D weight [N,K] and 1-D scales [N]");
+    }
+    if (!isFloatingType(self.dtype())) {
+        TP_THROW(TypeError,
+                 "_weight_int8pack_mm(): activations must be floating point");
+    }
+    const int64_t B = self.size(0);
+    const int64_t K = self.size(1);
+    const int64_t N = mat2.size(0);
+    if (mat2.size(1) != K) {
+        TP_THROW(ValueError, "_weight_int8pack_mm(): K dimension mismatch");
+    }
+    if (scales.size(0) != N) {
+        TP_THROW(ValueError, "_weight_int8pack_mm(): scales length mismatch");
+    }
+    if (B == 0 || N == 0 || K == 0) {
+        return Tensor::empty({B, N}, self.dtype(), self.device());
+    }
+    Tensor weight = Tensor::empty({N, K}, DType::Float32, self.device());
+    const int8_t* source = mat2.data_ptr<int8_t>();
+    float* destination = weight.data_ptr<float>();
+    const int64_t numel = N * K;
+    for (int64_t i = 0; i < numel; ++i) {
+        destination[i] = static_cast<float>(source[i]);
+    }
+    const Tensor product = ops::matmul(
+        self.to(DType::Float32), ops::transpose(weight, 0, 1));
+    return ops::mul(product,
+                    ops::unsqueeze(scales.to(DType::Float32), 0))
+        .to(self.dtype());
+}
+
 TENSORPLAY_LIBRARY_IMPL(CPU, QuantKernels) {
     m.impl("quantize_per_tensor", quantize_per_tensor_cpu);
     m.impl("quantize_per_channel", quantize_per_channel_cpu);
@@ -3739,6 +3783,7 @@ TENSORPLAY_LIBRARY_IMPL(CPU, QuantKernels) {
     m.impl("dequantize_affine_float8", dequantize_affine_float8_cpu);
     m.impl("choose_scale_float8", choose_scale_float8_cpu);
     m.impl("quantized_linear", quantized_linear_cpu);
+    m.impl("_weight_int8pack_mm", _weight_int8pack_mm_cpu);
     m.impl("quantized_linear_dynamic", quantized_linear_dynamic_cpu);
     m.impl("quantized_add", quantized_add_cpu);
     m.impl("quantized_sub", quantized_sub_cpu);
